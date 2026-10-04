@@ -277,13 +277,17 @@ fn format_expr(e: &HirExpr) -> String {
             object,
             method,
             args,
+            super_class,
         } => {
             let args = args
                 .iter()
                 .map(|expr| format_expr(expr))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{}.{method}({args})", format_expr(object))
+            match super_class {
+                Some(base) => format!("super({base}).{method}({args})"),
+                None => format!("{}.{method}({args})", format_expr(object)),
+            }
         }
         HirExprKind::ObjectLiteral { class, fields } => {
             let mut rendered = Vec::with_capacity(fields.len());

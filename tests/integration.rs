@@ -95,6 +95,8 @@ mod method_receiver_roots;
 mod run_queue_metrics;
 #[path = "integration/static_dependency_graph.rs"]
 mod static_dependency_graph;
+#[path = "integration/super_method_calls.rs"]
+mod super_method_calls;
 
 #[path = "integration/module_lir_bodies.rs"]
 mod module_lir_bodies;

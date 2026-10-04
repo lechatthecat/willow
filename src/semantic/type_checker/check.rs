@@ -1911,6 +1911,9 @@ impl TypeChecker {
             }
             // A builtin method has no Willow body but a known lowering, so it
             // resolves to its intrinsic target instead of an unknown site.
+            Expr::MethodCall(call) if self.is_super_receiver(&call.object) => {
+                self.super_call_target(call).into_iter().collect()
+            }
             Expr::MethodCall(call) => self
                 .expr_types
                 .get(&call.object.id())
@@ -1966,7 +1969,9 @@ impl TypeChecker {
         };
         // Preserve the typed receiver for build-wide dispatch. Direct static
         // calls and constructors deliberately do not enter this set.
-        let virtual_call = if let Expr::MethodCall(call) = expr {
+        let virtual_call = if let Expr::MethodCall(call) = expr
+            && !self.is_super_receiver(&call.object)
+        {
             self.expr_types.get(&call.object.id()).and_then(|ty| {
                 let (Type::Named(name) | Type::Generic(name, _)) = ty else {
                     return None;
@@ -2084,6 +2089,20 @@ impl TypeChecker {
                     self.push(diag);
                     return Type::Void;
                 }
+                if name == "super" {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0851,
+                            "`super` is not a value",
+                        )
+                        .with_label(Label::primary(*span, "`super` used as a value"))
+                        .with_help(
+                            "call a base-class method with `super.method(...)`, or read fields through `self`",
+                        ),
+                    );
+                    return Self::error_type();
+                }
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -2092,7 +2111,9 @@ impl TypeChecker {
                     )
                     .with_label(Label::primary(*span, "not found in this scope")),
                 );
-                Type::I64
+                // The error type suppresses cascades: a use of the missing name
+                // must not be judged as some guessed type (willow-jz15.48).
+                Self::error_type()
             }
             Expr::Binary(_) | Expr::Unary(_) => self.check_operator_tree(expr),
             Expr::Call(c) => {
@@ -2244,6 +2265,11 @@ impl TypeChecker {
                         )),
                     );
                     return Type::Void;
+                }
+                if let Expr::Var(_, super_span, _) = &m.object
+                    && self.is_super_receiver(&m.object)
+                {
+                    return self.check_super_method_call(m, *super_span);
                 }
                 let obj_ty = self.check_expr(&m.object);
                 if Self::is_error_type(&obj_ty) {

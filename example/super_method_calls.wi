@@ -1,0 +1,48 @@
+// `super.method(args)` from an overriding method (willow-jz15.48).
+//
+// `super.describe()` calls the implementation the BASE class resolves
+// `describe` to. That call is direct: it never goes through `self`'s vtable,
+// so an override can extend its base's behaviour without recursing into
+// itself. The receiver is still `self`. Any virtual call inside the base body,
+// such as `self.unit()` below, therefore still reaches the most-derived
+// override.
+//
+// The chain works at any depth. `Express` overrides `describe` and calls
+// `super.describe()`. `Parcel` defines nothing, so that call resolves to
+// `Shipment::describe`, the nearest definition above `Express`.
+
+open class Shipment {
+    pub weight: i64;
+
+    pub open fn unit(self) -> String { return "kg"; }
+
+    pub open fn describe(self) -> String {
+        return format("shipment {}{}", self.weight, self.unit());
+    }
+
+    pub open fn cost(self) -> i64 { return self.weight * 2; }
+}
+
+open class Parcel extends Shipment {
+    pub override fn unit(self) -> String { return " kg (parcel)"; }
+
+    pub open override fn cost(self) -> i64 { return super.cost() + 5; }
+}
+
+class Express extends Parcel {
+    pub override fn describe(self) -> String {
+        return "express " + super.describe();
+    }
+
+    pub override fn cost(self) -> i64 { return super.cost() * 3; }
+}
+
+fn report(s: Shipment) {
+    println(format("{} costs {}", s.describe(), s.cost()));
+}
+
+fn main() {
+    report(new Shipment(4));
+    report(new Parcel(4));
+    report(new Express(4));
+}

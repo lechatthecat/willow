@@ -1391,6 +1391,16 @@ impl CaptureScan<'_> {
             }
             return;
         }
+        // `super.method()` calls through `self`, so it captures the receiver too.
+        if name == "super"
+            && !self.bound_inside("super")
+            && self.checker.symbols.lookup_var("super").is_none()
+        {
+            if self.checker.symbols.lookup_var("self").is_some() {
+                self.checker.push_self_capture_error(span);
+            }
+            return;
+        }
         if self.bound_inside(name) {
             return; // bound inside the lambda
         }

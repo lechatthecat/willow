@@ -256,6 +256,9 @@ pub enum LirRvalue {
         args: Vec<LirOperand>,
         arg_types: Vec<Type>,
         result: Type,
+        /// `Some(base)` for `super.method(...)`: call `base`'s resolved
+        /// implementation directly instead of dispatching on the receiver.
+        super_class: Option<TypeId>,
     },
     StringLiteral(String),
     FunctionRef {

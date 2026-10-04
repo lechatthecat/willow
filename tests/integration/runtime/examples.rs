@@ -56,6 +56,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/async_frame_reclaim.wi",
             "199990000\ntrue\n108890\ntrue\ntrue\ntrue\n2001000\ntrue\n",
         ),
+        ("example/async_frame_store.wi", "201200\n106\n1835976\n"),
         (
             "example/shared_cancellation_cleanup.wi",
             "shared cleanup\nouter cleanup\nasync cleanup\ndone\n",
@@ -519,6 +520,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
         ("example/types.wi", "10\n2.5\n10\n78.53975\ntrue\n"),
         ("example/super_class.wi", "3 cats:\nann\njohn\nben\n"),
+        (
+            "example/super_method_calls.wi",
+            "shipment 4kg costs 8\nshipment 4 kg (parcel) costs 13\nexpress shipment 4 kg (parcel) costs 39\n",
+        ),
         (
             "example/gc_safety_temporaries.wi",
             "Hx!\na!b!\nv!\np!q!r!\nn!\nbad!\n7!\n",

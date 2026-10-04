@@ -158,10 +158,12 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
             object: _,
             method,
             args,
+            super_class,
         } => HirExprKind::MethodCall {
             object: Box::new(empty_expr()),
             method: method.clone(),
             args: expr_slots(args.len()),
+            super_class: *super_class,
         },
         HirExprKind::ObjectLiteral { class, fields } => HirExprKind::ObjectLiteral {
             class: *class,
@@ -814,6 +816,7 @@ mod tests {
                 object: Box::new(child),
                 method: "method".into(),
                 args: vec![leaf()],
+                super_class: None,
             },
             11 => HirExprKind::ObjectLiteral {
                 class: "C".into(),

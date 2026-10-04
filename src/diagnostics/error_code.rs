@@ -134,6 +134,7 @@ error_codes! {
     E0848, // subclass constructor requires unsupported base initialization
     E0849, // constructor `init` must declare explicit self
     E0850, // constructor `init` cannot use `static`/`fn` method syntax
+    E0851, // invalid `super` use: no receiver, no base class, or not `super.method(...)`
     // Ternary E09xx
     E0901,
     E0902,

@@ -4274,6 +4274,7 @@ fn supported_expr_node<'n>(
             object,
             method,
             args,
+            ..
         } => match &object.ty {
             Type::Array(elem) => {
                 let shape_ok = match method.as_str() {
@@ -7026,6 +7027,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 method,
                 args,
                 result,
+                super_class,
                 ..
             } => {
                 if self.flat_method_frame_enabled(method) {
@@ -7061,6 +7063,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_flat_class_method(
                         receiver,
                         receiver_ty,
+                        *super_class,
                         method,
                         &args,
                         result,
@@ -9839,7 +9842,8 @@ mod tests {
                     method: "get".into(),
                     args: vec![],
                     arg_types: vec![],
-                    result: Type::String
+                    result: Type::String,
+                    super_class: None,
                 },
                 &[],
                 ctx
@@ -12699,6 +12703,7 @@ mod tests {
                 }),
                 method: "itself".to_string(),
                 args: Vec::new(),
+                super_class: None,
             },
             ty,
             span: crate::diagnostics::Span::dummy(),
@@ -13209,6 +13214,7 @@ mod tests {
                 }),
                 method: "toString".to_string(),
                 args: Vec::new(),
+                super_class: None,
             },
             ty: Type::String,
             span,

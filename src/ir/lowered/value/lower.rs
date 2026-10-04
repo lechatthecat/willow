@@ -367,7 +367,7 @@ fn scalar(
         HirExprKind::Var(name) => names.contains_key(name),
         HirExprKind::Lambda { captures, .. } => captures.iter().all(|capture| names.contains_key(&capture.source)),
         HirExprKind::Print { value, .. } => matches!(value.ty, Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never),
-        HirExprKind::MethodCall { object, method, args } => crate::semantic::intrinsics::resolve(&object.ty, method, args.len()).is_some_and(|resolved|
+        HirExprKind::MethodCall { object, method, args, .. } => crate::semantic::intrinsics::resolve(&object.ty, method, args.len()).is_some_and(|resolved|
             !(is_async && resolved.intrinsic.is_suspension_point()) && resolved.return_type(|i| args.get(i).map(|arg| arg.ty.clone())) == node.ty) || enum_method(&object.ty, method) || instance_method(&object.ty, method, args, callables),
         HirExprKind::Call { callee, args } => if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
             matches!(&locals[local.0 as usize].ty, Type::Fn(params, result) | Type::Closure(params, result) if !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && **result == node.ty && params.len() == args.len() && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution)))
@@ -596,6 +596,7 @@ fn lower(
                     object,
                     method,
                     args,
+                    ..
                 } = &node.kind
                 else {
                     unreachable!()
@@ -763,10 +764,12 @@ fn lower(
                         object,
                         method,
                         args,
+                        super_class,
                     } => match &object.ty {
-                        Type::Named(owner) | Type::Generic(owner, _) => {
-                            Some((FunctionId::method(*owner, method), args))
-                        }
+                        Type::Named(owner) | Type::Generic(owner, _) => Some((
+                            FunctionId::method(super_class.unwrap_or(*owner), method),
+                            args,
+                        )),
                         _ => None,
                     },
                     HirExprKind::New { class, args } => {
@@ -877,6 +880,7 @@ fn lower(
                         object,
                         method,
                         args,
+                        ..
                     } if instance_method(&object.ty, method, args, callables) => {
                         work.push(Work::Finish(node));
                         work.extend(arguments(args, targets.as_deref()));
@@ -1299,6 +1303,7 @@ fn lower(
                 object,
                 method,
                 args,
+                super_class,
             } => {
                 let receiver = values[&std::ptr::from_ref(&**object)].clone();
                 let operands = args
@@ -1342,6 +1347,7 @@ fn lower(
                         args: operands,
                         arg_types,
                         result: node.ty.clone(),
+                        super_class: *super_class,
                     }
                 };
                 LirOperand::Local(emit(

@@ -451,6 +451,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         plan
     }
 
+    /// How `super.method_name(...)` inside a subclass of `base_class` is
+    /// emitted (willow-jz15.48): a direct call to the implementation `base_class`
+    /// resolves `method_name` to, so an override can extend the inherited body
+    /// instead of re-dispatching to itself. Only that one body can run, so its
+    /// own panic summary is the call site's.
+    pub(super) fn plan_super_call(
+        &self,
+        base_class: &str,
+        method_name: &str,
+    ) -> std::rc::Rc<VirtualCallPlan> {
+        let (summary, defining) = self.own_dispatch_summary(base_class, method_name);
+        let Some(static_class) = defining else {
+            panic!(
+                "compiler invariant violated: checked `super.{method_name}` on `{base_class}` has no implementation"
+            );
+        };
+        std::rc::Rc::new(VirtualCallPlan {
+            mangled: class_method_symbol_name(self.known_modules, &static_class, method_name),
+            static_class,
+            may_panic: summary.may_panic,
+            virtual_slot: None,
+        })
+    }
+
     /// Load the function address in virtual slot `slot` of `self_ptr`'s class.
     ///
     /// Two dependent loads: word 0 of every object points at its class

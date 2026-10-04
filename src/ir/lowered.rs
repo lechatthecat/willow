@@ -1587,7 +1587,9 @@ impl Builder {
                 object,
                 method,
                 args,
+                super_class,
             } => HirExprKind::MethodCall {
+                super_class: *super_class,
                 object: Box::new(capture(self, "self", object)),
                 method: method.clone(),
                 args: args
@@ -1696,6 +1698,7 @@ impl Builder {
                 object,
                 method,
                 args,
+                ..
             } if builtin_types::unary_arg(&object.ty, B::Channel).is_some() => {
                 let receiver = self.lower_operand_before_suspend(object)?;
                 let channel_name = self.synthetic_name("channel");
@@ -2342,6 +2345,7 @@ impl Builder {
                                 object,
                                 method,
                                 args,
+                                ..
                             } if method_signature(&self.resolution, &object.ty, method)
                                 .is_some_and(|signature| {
                                     (!signature.is_static || matches!(&object.ty, Type::Named(name) | Type::Generic(name, _) if self.resolution.interfaces.contains_key(name)))
@@ -2817,6 +2821,7 @@ impl Builder {
                         object,
                         method,
                         args,
+                        super_class,
                     } = &expr.kind
                     else {
                         unreachable!()
@@ -2851,7 +2856,7 @@ impl Builder {
                     };
                     pending.extend(
                         arguments(
-                            FunctionId::method(*owner, method),
+                            FunctionId::method(super_class.unwrap_or(*owner), method),
                             args,
                             &method_signature(&self.resolution, &object.ty, method)
                                 .expect("method signature")
@@ -2866,6 +2871,7 @@ impl Builder {
                         object,
                         method,
                         args,
+                        super_class,
                     } = &expr.kind
                     else {
                         unreachable!()
@@ -2892,6 +2898,7 @@ impl Builder {
                             args,
                             arg_types,
                             result: expr.ty.clone(),
+                            super_class: *super_class,
                         },
                         span: expr.span,
                     });
@@ -4501,6 +4508,7 @@ impl Builder {
                         object: Box::new(arr_var.clone()),
                         method: "len".to_string(),
                         args: vec![],
+                        super_class: None,
                     },
                     ty: Type::I64,
                     span,

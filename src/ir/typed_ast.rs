@@ -566,6 +566,10 @@ pub enum HirExprKind {
         object: Box<HirExpr>,
         method: String,
         args: Vec<HirExpr>,
+        /// `Some(base)` for `super.method(args)`: `object` is `self`, and the
+        /// call targets the implementation `base` resolves `method` to —
+        /// directly, never through `self`'s vtable (willow-jz15.48).
+        super_class: Option<TypeId>,
     },
     /// `Class { field: value, ... }` object literal; `ty` is the class type.
     ObjectLiteral {

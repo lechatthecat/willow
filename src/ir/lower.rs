@@ -1828,6 +1828,36 @@ fn lower_field_access_expr(
     lower_value_args
 )]
 fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    // `super.method(args)`: the receiver is `self`, and the checker typed the
+    // `super` receiver as the base class whose implementation is called.
+    if let Expr::Var(name, span, id) = &m.object
+        && name == "super"
+        && ctx.lookup("super").is_none()
+    {
+        let base = ctx.tables.expr_type(id);
+        let (Some(Type::Named(base)), Some(ty)) = (&base, ctx.tables.expr_type(&m.id)) else {
+            return Err(unsupported(m.span, "unresolved `super` method call"));
+        };
+        let Some(binding) = ctx.lookup("self") else {
+            return Err(unsupported(*span, "`super` outside an instance method"));
+        };
+        let object = HirExpr {
+            kind: HirExprKind::Var(binding.hir_name.to_string()),
+            ty: binding.ty.clone().into(),
+            span: *span,
+        };
+        let args = lower_value_args(&m.args, ctx)?;
+        return Ok(HirExpr {
+            kind: HirExprKind::MethodCall {
+                object: Box::new(object),
+                method: m.method.clone(),
+                args,
+                super_class: Some(base.as_str().into()),
+            },
+            ty: ty.into(),
+            span: m.span,
+        });
+    }
     let object = lower_expr(&m.object, ctx)?;
     let ty = if let Some(ty) = builtin_method_type(&object.ty.to_source(), &m.method) {
         ty
@@ -1848,6 +1878,7 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
             object: Box::new(object),
             method: m.method.clone(),
             args,
+            super_class: None,
         },
         ty: ty.into(),
         span: m.span,

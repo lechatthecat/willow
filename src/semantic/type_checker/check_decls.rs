@@ -514,6 +514,84 @@ impl TypeChecker {
         self.check_call_args_against_param_infos(&param_infos, &s.args);
     }
 
+    /// Whether `object` is the `super` receiver of `super.method(...)`: the
+    /// bare name, unless a local binding of that name shadows it.
+    pub(super) fn is_super_receiver(&self, object: &Expr) -> bool {
+        matches!(object, Expr::Var(name, ..) if name == "super")
+            && self.symbols.lookup_var("super").is_none()
+    }
+
+    /// `super.method(args)` (willow-jz15.48): call the implementation the
+    /// current class's BASE resolves `method` to, on `self`. Typed exactly as
+    /// `method` called on a base-typed receiver; the `super` receiver itself is
+    /// recorded as the base class so lowering and the call graph can name the
+    /// statically selected body.
+    pub(super) fn check_super_method_call(&mut self, m: &MethodCallExpr, super_span: Span) -> Type {
+        let base = if self.symbols.lookup_var("self").is_none() {
+            Err((
+                "`super` can only be used inside an instance method".to_string(),
+                "no `self` receiver here",
+            ))
+        } else {
+            match self.local.current_class.clone() {
+                None => Err((
+                    "`super` can only be used inside a class method".to_string(),
+                    "no current class",
+                )),
+                Some(current) => self
+                    .symbols
+                    .lookup_class(&current)
+                    .and_then(|class| class.base_class.clone())
+                    .filter(|base| self.symbols.lookup_class(base).is_some())
+                    .ok_or_else(|| {
+                        (
+                            format!("class `{current}` has no base class for `super`"),
+                            "no base class",
+                        )
+                    }),
+            }
+        };
+        let base = match base {
+            Ok(base) => base,
+            Err((message, label)) => {
+                for arg in &m.args {
+                    self.check_expr(&arg.expr);
+                }
+                self.push(
+                    Diagnostic::new(Severity::Error, ErrorCode::E0851, message)
+                        .with_label(Label::primary(super_span, label)),
+                );
+                return Self::error_type();
+            }
+        };
+        let receiver = Type::Named(base.clone());
+        self.expr_types.insert(m.object.id(), receiver.clone());
+        self.check_task_method_call(&receiver, m);
+        if let Some(defining) = self.resolved_method_class(&base, &m.method) {
+            self.record_lock_effect_call(
+                FunctionId::method(TypeId::from_source_name(&defining), m.method.as_str()),
+                m.span,
+            );
+        }
+        self.resolve_method(&receiver, &m.method, &m.args, m.span)
+    }
+
+    /// The one body `super.method(...)` runs, for the call graph; `None` when
+    /// `call` is not a resolved `super` call.
+    pub(super) fn super_call_target(&self, call: &MethodCallExpr) -> Option<FunctionId> {
+        if !self.is_super_receiver(&call.object) {
+            return None;
+        }
+        let Some(Type::Named(base)) = self.expr_types.get(&call.object.id()) else {
+            return None;
+        };
+        let defining = self.resolved_method_class(base, &call.method)?;
+        Some(FunctionId::method(
+            TypeId::from_source_name(&defining),
+            call.method.as_str(),
+        ))
+    }
+
     /// Type-check `new Class(args...)` (willow-scq2 §10): resolve the class, pick
     /// the explicit `init` or the implicit memberwise constructor, check
     /// visibility and arguments, and yield `Class`.

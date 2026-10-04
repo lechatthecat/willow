@@ -58,6 +58,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         receiver: Value,
         receiver_ty: &Type,
+        super_class: Option<crate::semantic::ids::TypeId>,
         method: &str,
         args: &[Value],
         ret_ty: &Type,
@@ -65,10 +66,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         receiver_rooted: bool,
         frame_prepared: bool,
     ) -> cranelift_codegen::ir::Value {
-        let class = class_name_for_object_type(receiver_ty)
-            .expect("class receiver type vetted by LIR eligibility");
         let self_ptr = receiver;
-        let plan = self.plan_virtual_call(&class.to_string(), method);
+        // `super.method()` names its implementation statically: a direct call
+        // to what the base class resolves `method` to, never the vtable slot.
+        let plan = match super_class {
+            Some(base) => self.plan_super_call(&base.to_string(), method),
+            None => {
+                let class = class_name_for_object_type(receiver_ty)
+                    .expect("class receiver type vetted by LIR eligibility");
+                self.plan_virtual_call(&class.to_string(), method)
+            }
+        };
         let mangled = plan.mangled.as_str();
         let virtual_slot = plan.virtual_slot;
 
