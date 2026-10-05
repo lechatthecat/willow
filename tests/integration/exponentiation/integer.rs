@@ -1,4 +1,4 @@
-//! Integer values, precedence, wrapping, and literal/dynamic agreement.
+//! Integer values, precedence, release wrapping, and literal/dynamic agreement.
 
 use crate::support::*;
 
@@ -135,10 +135,11 @@ fn main() {
 // ── 6. Wrapping overflow ─────────────────────────────────────────────────────
 
 #[test]
-fn pow_int_06_overflow_wraps_like_multiplication() {
-    // `**` is a multiplication chain, so it wraps modulo 2^64 exactly as `*`
-    // does — it must not trap and must not saturate.
-    let (out, ok) = compile_and_run(
+fn pow_int_06_release_overflow_wraps_like_multiplication() {
+    // `**` is a multiplication chain, so a release build wraps it modulo 2^64
+    // exactly as `*` — it must not trap and must not saturate. Debug builds
+    // raise `integer overflow` instead (willow-jz15.14, integer_overflow.rs).
+    let (out, ok) = compile_and_run_release(
         r#"
 fn pow(base: i64, exponent: i64) -> i64 {
     return base ** exponent;
@@ -327,8 +328,9 @@ fn main() {
 // ── 24. Extreme bases ────────────────────────────────────────────────────────
 
 #[test]
-fn pow_int_24_extreme_bases_wrap_instead_of_trapping() {
-    let (out, ok) = compile_and_run(
+fn pow_int_24_extreme_bases_wrap_in_release_builds() {
+    // Debug builds report these as `integer overflow` (willow-jz15.14).
+    let (out, ok) = compile_and_run_release(
         r#"
 fn pow(base: i64, exponent: i64) -> i64 {
     return base ** exponent;

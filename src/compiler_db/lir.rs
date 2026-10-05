@@ -49,11 +49,14 @@ pub(crate) struct LirQueries {
     store: Rc<ArtifactStore>,
     units: QueryTable<UnitId, LirUnit>,
     bodies: QueryTable<BodyId, usize>,
+    /// Debug builds check integer overflow (willow-jz15.14).
+    overflow_checks: bool,
 }
 
 impl LirQueries {
-    pub(crate) fn new(store: Rc<ArtifactStore>) -> Self {
+    pub(crate) fn new(store: Rc<ArtifactStore>, overflow_checks: bool) -> Self {
         Self {
+            overflow_checks,
             tracking: Default::default(),
             store,
             units: QueryTable::named("lir_unit"),
@@ -209,7 +212,7 @@ impl LirQueries {
                     }
                 }
                 let (hir, diagnostics) = lower::lower_program_with(program, tables);
-                let source = lowered::lower_source_program(&hir);
+                let source = lowered::lower_source_program_with(&hir, self.overflow_checks);
                 let mut result = LirInventory {
                     diagnostics,
                     functions: Vec::new(),
@@ -322,7 +325,7 @@ mod tests {
         let expected = lowered::lower_program(&hir);
         let count = expected.functions.len() + expected.lambdas.len();
         let artifacts = UnitArtifacts::new().unwrap();
-        let queries = LirQueries::new(Rc::clone(&artifacts.store));
+        let queries = LirQueries::new(Rc::clone(&artifacts.store), true);
         let diagnostics = queries
             .lower_unit(UnitId::ENTRY, &program, &index, &tables)
             .unwrap();

@@ -3,6 +3,13 @@ use cranelift_module::Module;
 
 use super::*;
 
+/// `willow_int_overflow_panic` operator kinds (willow-jz15.14).
+pub(super) const INT_OVERFLOW_ADD: i64 = 0;
+pub(super) const INT_OVERFLOW_SUB: i64 = 1;
+pub(super) const INT_OVERFLOW_MUL: i64 = 2;
+pub(super) const INT_OVERFLOW_NEG: i64 = 3;
+pub(super) const INT_OVERFLOW_POW: i64 = 4;
+
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_string_literal(&mut self, value: &str) -> cranelift_codegen::ir::Value {
         if let Some(data_id) = self.string_literals.get(value) {
@@ -233,6 +240,95 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_void_runtime_call("willow_int_div_panic", &[kind, file_ptr, line_val, col_val]);
         // Runtime returning without raising would otherwise reach the unsafe
         // arithmetic. Treat that as an ABI violation.
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+    }
+
+    /// Whether `+ - * **` and unary `-` on `i64` are checked for signed
+    /// overflow: debug builds raise a recoverable panic, release builds wrap
+    /// (willow-jz15.14).
+    pub(super) fn overflow_checks(&self) -> bool {
+        self.build_mode == BuildMode::Debug
+    }
+
+    /// Signed `+`, `-` or `*` and its overflow flag. Shared by the debug
+    /// operator checks and the explicit `checked_*` methods.
+    pub(super) fn emit_overflowing_binop(
+        &mut self,
+        op: &BinOp,
+        lhs: cranelift_codegen::ir::Value,
+        rhs: cranelift_codegen::ir::Value,
+    ) -> (cranelift_codegen::ir::Value, cranelift_codegen::ir::Value) {
+        let ins = self.builder.ins();
+        match op {
+            BinOp::Add => ins.sadd_overflow(lhs, rhs),
+            BinOp::Sub => ins.ssub_overflow(lhs, rhs),
+            BinOp::Mul => ins.smul_overflow(lhs, rhs),
+            _ => unreachable!("only + - * have an overflowing form"),
+        }
+    }
+
+    /// Signed negation and its overflow flag (`-i64::MIN`).
+    pub(super) fn emit_overflowing_neg(
+        &mut self,
+        operand: cranelift_codegen::ir::Value,
+    ) -> (cranelift_codegen::ir::Value, cranelift_codegen::ir::Value) {
+        let negated = self.builder.ins().ineg(operand);
+        let overflowed = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, operand, i64::MIN);
+        (negated, overflowed)
+    }
+
+    /// Debug-build `+ - *` on `i64`: raise a recoverable panic on overflow.
+    pub(super) fn emit_checked_int_binop(
+        &mut self,
+        op: &BinOp,
+        lhs: cranelift_codegen::ir::Value,
+        rhs: cranelift_codegen::ir::Value,
+        span: crate::diagnostics::Span,
+    ) -> cranelift_codegen::ir::Value {
+        let (value, overflowed) = self.emit_overflowing_binop(op, lhs, rhs);
+        let kind = match op {
+            BinOp::Add => INT_OVERFLOW_ADD,
+            BinOp::Sub => INT_OVERFLOW_SUB,
+            _ => INT_OVERFLOW_MUL,
+        };
+        self.emit_int_overflow_guard(overflowed, kind, span);
+        value
+    }
+
+    /// Branch to a cold `willow_int_overflow_panic` path when `overflowed`
+    /// (an `i8` flag) is set. Each site keeps its own block: the unwind path
+    /// depends on the cleanup scope active at that site.
+    pub(super) fn emit_int_overflow_guard(
+        &mut self,
+        overflowed: cranelift_codegen::ir::Value,
+        kind: i64,
+        span: crate::diagnostics::Span,
+    ) {
+        let panic_block = self.builder.create_block();
+        let ok_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(overflowed, panic_block, &[], ok_block, &[]);
+
+        self.builder.switch_to_block(panic_block);
+        self.builder.seal_block(panic_block);
+        self.builder.set_cold_block(panic_block);
+        let kind = self.builder.ins().iconst(types::I64, kind);
+        let source_file = self.source_file.to_string();
+        let file_ptr = self.emit_string_literal(&source_file);
+        let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
+        let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
+        self.emit_void_runtime_call(
+            "willow_int_overflow_panic",
+            &[kind, file_ptr, line_val, col_val],
+        );
+        // Runtime returning without raising is an ABI violation.
         self.builder.ins().trap(TrapCode::unwrap_user(1));
 
         self.builder.switch_to_block(ok_block);

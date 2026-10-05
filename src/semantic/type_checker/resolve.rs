@@ -1246,6 +1246,28 @@ impl TypeChecker {
         }
     }
 
+    /// Explicit wrapping/checked integer arithmetic (willow-jz15.14). Kept out
+    /// of line: `resolve_method` recurses through nested calls, so its frame
+    /// size bounds how deep a call chain the checker accepts.
+    #[inline(never)]
+    fn resolve_i64_overflow_method(
+        &mut self,
+        method_name: &str,
+        args: &[CallArg],
+        span: Span,
+    ) -> Option<Type> {
+        let params: &[Type] = match method_name {
+            "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "checked_add" | "checked_sub"
+            | "checked_mul" => &[Type::I64],
+            "wrapping_neg" | "checked_neg" => &[],
+            _ => return None,
+        };
+        self.check_call_argument_count(method_name, params.len(), args.len(), span);
+        self.check_value_call_args(params, args);
+        crate::semantic::intrinsics::resolve(&Type::I64, method_name, params.len())
+            .map(|resolution| resolution.return_type(|_| None))
+    }
+
     pub(super) fn resolve_method(
         &mut self,
         obj_ty: &Type,
@@ -1268,6 +1290,11 @@ impl TypeChecker {
                     .expect("String method signature has an intrinsic")
                     .return_type(|_| None);
             }
+        }
+        if *obj_ty == Type::I64
+            && let Some(ty) = self.resolve_i64_overflow_method(method_name, args, span)
+        {
+            return ty;
         }
         // Built-in `toString()` on primitives: `i64`/`f64`/`bool`/`String` ->
         // `String` (willow-fvfc). Class `toString()` falls through to normal

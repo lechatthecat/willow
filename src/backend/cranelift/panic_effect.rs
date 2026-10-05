@@ -481,11 +481,22 @@ mod tests {
     #[test]
     fn pure_recursive_scc_is_no_panic() {
         let effects = analyze(
-            "fn even(n: i64) -> bool { if n == 0 { return true; } return odd(n - 1); }\n\
-             fn odd(n: i64) -> bool { if n == 0 { return false; } return even(n - 1); }",
+            "fn even(n: i64) -> bool { if n == 0 { return true; } return odd(n / 2); }\n\
+             fn odd(n: i64) -> bool { if n == 0 { return false; } return even(n / 2); }",
         );
         assert_eq!(effects.get("even"), Some(&false));
         assert_eq!(effects.get("odd"), Some(&false));
+    }
+
+    // Standalone analysis assumes debug overflow checks (willow-jz15.14).
+    #[test]
+    fn checked_integer_arithmetic_is_may_panic() {
+        let effects = analyze(
+            "fn dec(n: i64) -> i64 { return n - 1; }\n\
+             fn halve(n: i64) -> i64 { return n / 2; }",
+        );
+        assert_eq!(effects.get("dec"), Some(&true));
+        assert_eq!(effects.get("halve"), Some(&false));
     }
 
     #[test]
@@ -527,7 +538,7 @@ mod tests {
     #[test]
     fn self_method_edges_participate_in_fixpoint() {
         let effects = analyze(
-            "class Work { pub fn safe(self, n: i64) -> i64 { return n - 1; }\n\
+            "class Work { pub fn safe(self, n: i64) -> i64 { return n / 2; }\n\
              pub fn unsafe(self) { self.safe(1); panic(\"x\"); }\n\
              pub fn reaches(self) { self.unsafe(); } }",
         );

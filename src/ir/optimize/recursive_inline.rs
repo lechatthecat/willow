@@ -10,7 +10,9 @@ use crate::ir::typed_ast::{HirExpr, HirExprKind};
 use crate::parser::ast::BinOp;
 use crate::semantic::ids::SemanticType as Type;
 
-pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction) {
+/// With `overflow_checks` (debug builds), checked integer arithmetic is a
+/// fault whose call stack must keep every recursive frame (willow-jz15.14).
+pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_checks: bool) {
     const MAX_DEPTH: u32 = 3;
     const MAX_INSTRUCTIONS: usize = 256;
     const MAX_BLOCKS: usize = 64;
@@ -57,6 +59,9 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction) {
                         .iter()
                         .any(|op| matches!(op, LirOperand::Reference { .. }))
                     {
+                        return;
+                    }
+                    if overflow_checks && value.has_overflow_check() {
                         return;
                     }
                     match value {

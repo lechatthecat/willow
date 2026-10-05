@@ -7,7 +7,8 @@
 //!
 //! Perspectives:
 //!   01 a field getter adds no root and no poll per method
-//!   02 arithmetic and comparisons stay leaves
+//!   02 arithmetic and comparisons stay leaves in release; debug overflow
+//!      checks (willow-jz15.14) add a panic path, so debug keeps the root/poll
 //!   03 a literal divisor other than 0/-1 stays a leaf and keeps no guard
 //!   04 a parameter divisor keeps the guard and the entry root
 //!   05 a literal 0 divisor still panics
@@ -156,13 +157,21 @@ fn field_getter_adds_no_root_or_poll() {
 #[test]
 fn arithmetic_and_comparison_stay_leaves() {
     let body = "(self, k: i64) -> bool { return (self.n * k + 3 - k) > (self.n * 2); }";
-    assert_eq!(method_delta("fn", body, ROOT), [0, 0]);
-    assert_eq!(method_delta("fn", body, POLL), [0, 0]);
+    // `[debug, release]`: checked debug arithmetic can panic, so the method
+    // is not a leaf there (willow-jz15.14); release wraps and stays a leaf.
+    for symbol in [ROOT, POLL] {
+        let [debug, release] = method_delta("fn", body, symbol);
+        assert_eq!(release, 0, "{symbol}");
+        assert!(debug >= 4, "{symbol}: debug={debug}");
+    }
+    let compare = "(self, k: i64) -> bool { return self.n > k; }";
+    assert_eq!(method_delta("fn", compare, ROOT), [0, 0]);
+    assert_eq!(method_delta("fn", compare, POLL), [0, 0]);
 }
 
 #[test]
 fn literal_divisor_stays_a_leaf() {
-    let body = "(self) -> i64 { return self.n / 7 + self.n % 3; }";
+    let body = "(self) -> bool { return self.n / 7 > self.n % 3; }";
     assert_eq!(method_delta("fn", body, ROOT), [0, 0]);
     assert_eq!(method_delta("fn", body, POLL), [0, 0]);
 }
@@ -234,7 +243,12 @@ fn free_leaf_function_has_no_poll() {
     for release in [false, true] {
         let source = |n: usize| {
             let fns: String = (0..n)
-                .map(|i| format!("fn f{i}(a: i64, b: i64) -> i64 {{ return a * b + {i}; }}\n"))
+                .map(|i| {
+                    format!(
+                        "fn f{i}(a: i64, b: i64) -> bool {{ return a / {} < b; }}\n",
+                        i + 2
+                    )
+                })
                 .collect();
             format!("{fns}fn main() {{ println(f0(2, 3)); }}")
         };
@@ -250,7 +264,8 @@ fn free_leaf_function_has_no_poll() {
 fn direct_leaf_calls_have_no_panic_bracket() {
     for release in [false, true] {
         let source = |calls: usize| {
-            let body = "total = total + c.get();".repeat(calls);
+            // `wrapping_add` keeps the caller free of debug overflow checks.
+            let body = "total = total.wrapping_add(c.get());".repeat(calls);
             format!(
                 "class C {{ pub n: i64; pub fn get(self) -> i64 {{ return self.n; }} }}\n\
                  fn main() {{ let c = new C(1); let mut total = 0; {body} println(total); }}"
@@ -264,9 +279,11 @@ fn direct_leaf_calls_have_no_panic_bracket() {
     }
 }
 
-/// `calls` interface calls of `Shape.area` with the given implementers.
+/// `calls` interface calls of `Shape.area` with the given implementers. The
+/// caller sums with `wrapping_add` and the leaves avoid `+ - *`, so debug
+/// overflow checks (willow-jz15.14) do not change either side.
 fn interface_source(implementers: &str, calls: usize) -> String {
-    let body = "total = total + s.area();".repeat(calls);
+    let body = "total = total.wrapping_add(s.area());".repeat(calls);
     format!(
         "interface Shape {{ fn area(self) -> i64; }}\n{implementers}\n\
          fn run(s: Shape) -> i64 {{ let mut total = 0; {body} return total; }}\n\
@@ -281,7 +298,7 @@ fn interface_delta(implementers: &str, env: &[(&str, &str)], symbol: &str) -> [u
     })
 }
 
-const LEAVES: &str = "class Square implements Shape { pub side: i64; pub fn area(self) -> i64 { return self.side * self.side; } }\n\
+const LEAVES: &str = "class Square implements Shape { pub side: i64; pub fn area(self) -> i64 { return self.side; } }\n\
      class Line implements Shape { pub len: i64; pub fn area(self) -> i64 { return self.len / 2; } }";
 
 #[test]
@@ -417,7 +434,7 @@ fn interface_leaf_calls_survive_gc_stress() {
     let (out, ok) = compile_and_run_gc_stress_all(&source);
     assert!(ok, "{out}");
     let expected: i64 = (0..40)
-        .map(|i: i64| if i % 2 == 0 { i * i } else { i / 2 })
+        .map(|i: i64| if i % 2 == 0 { i } else { i / 2 })
         .sum();
     assert_eq!(out, format!("{expected}\n"));
 }
@@ -427,7 +444,7 @@ fn field_only_function_is_no_panic_for_callers() {
     for release in [false, true] {
         let source = "class C { pub n: i64; }\n\
              fn read(c: C) -> i64 { return c.n; }\n\
-             fn twice(c: C) -> i64 { return read(c) + read(c); }\n\
+             fn twice(c: C) -> i64 { return read(c).wrapping_add(read(c)); }\n\
              fn main() { println(twice(new C(4))); }";
         assert_eq!(
             count(source, &[], release, PANIC_DEPTH),

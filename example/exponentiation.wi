@@ -4,8 +4,8 @@
 // into a chain of multiplications, and everything else — a variable, or even a
 // constant expression like `1 + 2`, since nothing folds those yet — becomes a
 // bounded loop that squares its way through the exponent's bits. Both give the
-// same value; only the emitted code differs. Overflow wraps modulo 2^64, the
-// same as an ordinary `*`.
+// same value; only the emitted code differs. Overflow follows an ordinary
+// `*`: debug builds panic, release builds wrap modulo 2^64.
 //
 // Rules the code below relies on:
 //
@@ -67,8 +67,10 @@ fn main() {
     let exponent = 3;
     println(4 ** exponent);
 
-    // Overflow wraps, exactly like repeated multiplication.
-    println(2 ** 64);
+    // Overflow panics in debug builds and wraps in release builds, exactly
+    // like `*`. `wrapping_mul` wraps in every build: 2**32 * 2**32 is 0.
+    let half = 2 ** 32;
+    println(half.wrapping_mul(half));
 
     // A power is an ordinary operand elsewhere.
     let big: bool = 2 ** 10 > 1000;

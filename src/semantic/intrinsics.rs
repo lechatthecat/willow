@@ -59,6 +59,23 @@ pub enum Intrinsic {
     F64ToString,
     /// `bool.toString()` → `willow_bool_to_string`.
     BoolToString,
+    /// `i64.wrapping_add(i64)`: two's-complement `+` in every build mode
+    /// (willow-jz15.14). Inline, like the other explicit overflow operations.
+    I64WrappingAdd,
+    /// `i64.wrapping_sub(i64)`.
+    I64WrappingSub,
+    /// `i64.wrapping_mul(i64)`.
+    I64WrappingMul,
+    /// `i64.wrapping_neg()`: `i64::MIN` negates to itself.
+    I64WrappingNeg,
+    /// `i64.checked_add(i64)` → `Option<i64>`, `None` on overflow.
+    I64CheckedAdd,
+    /// `i64.checked_sub(i64)` → `Option<i64>`.
+    I64CheckedSub,
+    /// `i64.checked_mul(i64)` → `Option<i64>`.
+    I64CheckedMul,
+    /// `i64.checked_neg()` → `Option<i64>`, `None` for `i64::MIN`.
+    I64CheckedNeg,
     /// `String.toString()` — the identity, and the only intrinsic that emits no
     /// code at all.
     StringToString,
@@ -227,6 +244,14 @@ impl Intrinsic {
         Intrinsic::I64ToString,
         Intrinsic::F64ToString,
         Intrinsic::BoolToString,
+        Intrinsic::I64WrappingAdd,
+        Intrinsic::I64WrappingSub,
+        Intrinsic::I64WrappingMul,
+        Intrinsic::I64WrappingNeg,
+        Intrinsic::I64CheckedAdd,
+        Intrinsic::I64CheckedSub,
+        Intrinsic::I64CheckedMul,
+        Intrinsic::I64CheckedNeg,
         Intrinsic::StringToString,
         Intrinsic::StringLen,
         Intrinsic::StringSubstring,
@@ -305,6 +330,8 @@ impl Intrinsic {
             F64ToString => &["willow_f64_to_string"],
             BoolToString => &["willow_bool_to_string"],
             StringToString | TaskResult => &[],
+            I64WrappingAdd | I64WrappingSub | I64WrappingMul | I64WrappingNeg | I64CheckedAdd
+            | I64CheckedSub | I64CheckedMul | I64CheckedNeg => &[],
             StringLen => &["willow_string_len"],
             StringSubstring => &["willow_string_substring"],
             StringSplit => &["willow_string_split"],
@@ -505,6 +532,25 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
             ("trim", 0) => Some((Intrinsic::StringTrim, Type::String)),
             ("repeat", 1) => Some((Intrinsic::StringRepeat, Type::String)),
             ("starts_with", 1) => Some((Intrinsic::StringStartsWith, Type::Bool)),
+            _ => None,
+        };
+        if let Some((intrinsic, ty)) = entry {
+            return Some(ResolvedMethod::fixed(intrinsic, ty));
+        }
+    }
+    // Explicit overflow behavior, independent of the build mode
+    // (willow-jz15.14).
+    if matches!(recv, Type::I64) {
+        let option = || B::Option.apply(vec![Type::I64]);
+        let entry = match (method, arity) {
+            ("wrapping_add", 1) => Some((Intrinsic::I64WrappingAdd, Type::I64)),
+            ("wrapping_sub", 1) => Some((Intrinsic::I64WrappingSub, Type::I64)),
+            ("wrapping_mul", 1) => Some((Intrinsic::I64WrappingMul, Type::I64)),
+            ("wrapping_neg", 0) => Some((Intrinsic::I64WrappingNeg, Type::I64)),
+            ("checked_add", 1) => Some((Intrinsic::I64CheckedAdd, option())),
+            ("checked_sub", 1) => Some((Intrinsic::I64CheckedSub, option())),
+            ("checked_mul", 1) => Some((Intrinsic::I64CheckedMul, option())),
+            ("checked_neg", 0) => Some((Intrinsic::I64CheckedNeg, option())),
             _ => None,
         };
         if let Some((intrinsic, ty)) = entry {
@@ -1329,6 +1375,14 @@ mod tests {
             "child",
             "attach",
             "finish",
+            "wrapping_add",
+            "wrapping_sub",
+            "wrapping_mul",
+            "wrapping_neg",
+            "checked_add",
+            "checked_sub",
+            "checked_mul",
+            "checked_neg",
         ];
         let mut seen = std::collections::HashSet::new();
         for recv in &receivers {
@@ -1358,7 +1412,7 @@ mod tests {
         assert_eq!(unique.len(), Intrinsic::ALL.len(), "duplicate in ALL");
         assert_eq!(
             Intrinsic::ALL.len(),
-            52,
+            60,
             "Intrinsic::ALL must list every variant; update the count when adding one"
         );
     }
@@ -1555,6 +1609,20 @@ fn f() {
 }
 "#;
 
+    const INTEGERS: &str = r#"
+fn f() {
+    let n = 42;
+    let a = n.wrapping_add(1);
+    let b = n.wrapping_sub(1);
+    let c = n.wrapping_mul(2);
+    let d = n.wrapping_neg();
+    let e = n.checked_add(1);
+    let g = n.checked_sub(1);
+    let h = n.checked_mul(2);
+    let i = n.checked_neg();
+}
+"#;
+
     const ARRAYS: &str = r#"
 import std::collections::Array;
 
@@ -1674,6 +1742,13 @@ async fn f() {
     #[test]
     fn p37_scalar_to_string_agrees() {
         assert_agrees(SCALARS, 5);
+    }
+
+    /// Perspective 37b: the explicit `i64` overflow methods. `wrapping_*`
+    /// return `i64`; `checked_*` return `Option<i64>` (willow-jz15.14).
+    #[test]
+    fn p37b_integer_overflow_methods_agree() {
+        assert_agrees(INTEGERS, 8);
     }
 
     /// Perspective 38: the whole `Array<T>` surface, plus the `FrozenArray<T>`
@@ -1845,6 +1920,7 @@ fn f() {
         let mut reached: std::collections::HashSet<Intrinsic> = std::collections::HashSet::new();
         for (src, expected) in [
             (SCALARS, 5),
+            (INTEGERS, 8),
             (STRINGS, 7),
             (ARRAYS, 6),
             (MAPS, 9),

@@ -47,8 +47,9 @@ fn pow_int_25_abi_declares_the_raiser_and_integer_powers_import_no_float_pow() {
     // that the result stays exact: 3**40 is 12157665459056928801, which is not
     // representable in an f64. A lowering that detoured through `pow(f64, f64)`
     // would return the nearest double, 12157665459056928768, and wrap to a
-    // different i64.
-    let (out, ok) = compile_and_run(
+    // different i64. The value overflows, so this runs a release build, which
+    // wraps (a debug build panics on the overflow).
+    let (out, ok) = compile_and_run_release(
         r#"
 fn pow(base: i64, exponent: i64) -> i64 {
     return base ** exponent;

@@ -102,6 +102,30 @@ pub extern "C" fn willow_int_div_panic(kind: i64, file: *const u8, line: i32, co
     crate::panic_context::raise_language_message_at(what, file, line.into(), col.into());
 }
 
+/// Debug-build signed overflow check failure (willow-jz15.14). `kind`:
+/// 0 = `+`, 1 = `-`, 2 = `*`, 3 = unary `-`, 4 = `**`. Release builds wrap
+/// and never call this. `file` is a WillowString pointer.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_int_overflow_panic(kind: i64, file: *const u8, line: i32, col: i32) {
+    crate::panic_context::raise_language_message_at(
+        int_overflow_message(kind),
+        file,
+        line.into(),
+        col.into(),
+    );
+}
+
+fn int_overflow_message(kind: i64) -> &'static str {
+    match kind {
+        0 => "integer overflow: `+`",
+        1 => "integer overflow: `-`",
+        2 => "integer overflow: `*`",
+        3 => "integer overflow: negation of `i64::MIN`",
+        _ => "integer overflow: `**`",
+    }
+}
+
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_abort(file: *const u8, line: i32) {
@@ -115,6 +139,21 @@ pub extern "C" fn willow_abort(file: *const u8, line: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn int_overflow_messages_name_the_operator() {
+        let messages: Vec<_> = (0..5).map(int_overflow_message).collect();
+        assert_eq!(
+            messages,
+            [
+                "integer overflow: `+`",
+                "integer overflow: `-`",
+                "integer overflow: `*`",
+                "integer overflow: negation of `i64::MIN`",
+                "integer overflow: `**`",
+            ]
+        );
+    }
     use crate::gc::{runtime_test_guard, willow_gc_init};
     use crate::string::willow_string_alloc;
 

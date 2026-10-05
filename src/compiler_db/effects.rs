@@ -131,6 +131,10 @@ pub(crate) struct EffectQueries {
     roots: std::cell::RefCell<HashMap<UnitId, Vec<BodyId>>>,
     names: HashMap<String, UnitId>,
     dependencies: Option<std::rc::Rc<super::dependencies::ModuleDependencies>>,
+    /// Debug builds check `+ - * **` and unary `-` on `i64` for overflow
+    /// (willow-jz15.14), which makes those operators recoverable faults.
+    /// Release builds wrap. Sessions without a mode stay conservative.
+    overflow_checks: bool,
 }
 impl Default for EffectQueries {
     fn default() -> Self {
@@ -153,6 +157,7 @@ impl Default for EffectQueries {
             roots: Default::default(),
             names: HashMap::new(),
             dependencies: None,
+            overflow_checks: true,
         }
     }
 }
@@ -165,9 +170,11 @@ impl EffectQueries {
     pub(crate) fn new(
         modules: &[crate::module::ResolvedModule],
         dependencies: std::rc::Rc<super::dependencies::ModuleDependencies>,
+        overflow_checks: bool,
     ) -> Self {
         let mut result = Self {
             dependencies: Some(dependencies),
+            overflow_checks,
             ..Self::default()
         };
         for module in modules {
@@ -542,6 +549,7 @@ pub(crate) fn solve_unit<N>(
 ) -> UnitEffects {
     crate::query_stats::add(crate::query_stats::Counter::NonpreemptibleHelpers, 1);
     let index = origins.map(|(index, _)| index);
+    let overflow_checks = origins.is_none_or(|(_, queries)| queries.overflow_checks);
     let mut pending = Vec::new();
     let mut helpers = HashMap::new();
     for item in &program.items {
@@ -671,7 +679,14 @@ pub(crate) fn solve_unit<N>(
             if let Some((_, queries)) = origins {
                 queries.scanned.set(queries.scanned.get() + 1);
             }
-            Ok(scan_direct_effects(id, body_id, body, types, index))
+            Ok(scan_direct_effects(
+                id,
+                body_id,
+                body,
+                types,
+                index,
+                overflow_checks,
+            ))
         };
         let queries = origins.and_then(|(_, effects)| effects.body_queries.borrow().upgrade());
         let direct_bodies = match queries {
@@ -952,6 +967,7 @@ fn scan_direct_effects<N>(
     body: &Block,
     types: &HashMap<ExprId, Type<N>>,
     index: Option<&super::ids::BodyIndex>,
+    overflow_checks: bool,
 ) -> Vec<DirectBodyEffects> {
     let mut pending = vec![(id, body_id, body)];
     let mut result = Vec::new();
@@ -961,6 +977,7 @@ fn scan_direct_effects<N>(
             panics: false,
             panic_span: None,
             expr_types: types,
+            overflow_checks,
         };
         let mut loop_span = None;
         let mut may_io = false;
@@ -1093,6 +1110,7 @@ struct HazardVisitor<'a, N> {
     panics: bool,
     panic_span: Option<crate::diagnostics::Span>,
     expr_types: &'a HashMap<ExprId, Type<N>>,
+    overflow_checks: bool,
 }
 
 impl<N> HazardVisitor<'_, N> {
@@ -1158,9 +1176,23 @@ impl<N> HazardVisitor<'_, N> {
                 let guarded_division = matches!(expr.op, BinOp::Div | BinOp::Rem)
                     && !matches!(ty, Some(Type::F64))
                     && !matches!(expr.rhs, Expr::Integer(divisor, ..) if divisor != 0 && divisor != -1);
-                if concat || guarded_division || expr.op == BinOp::Pow {
+                // Debug builds check integer `+ - *` for overflow.
+                let checked = self.overflow_checks
+                    && matches!(expr.op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                    && !matches!(ty, Some(Type::F64));
+                if concat || guarded_division || checked || expr.op == BinOp::Pow {
                     self.mark_direct(expression.span());
                 }
+            }
+            // Debug builds check integer negation of `i64::MIN`; a negated
+            // literal is at least `-i64::MAX` and cannot overflow.
+            Expr::Unary(unary)
+                if self.overflow_checks
+                    && unary.op == UnaryOp::Neg
+                    && !matches!(unary.expr, Expr::Integer(..))
+                    && !matches!(self.expr_types.get(&unary.id), Some(Type::F64)) =>
+            {
+                self.mark_direct(expression.span());
             }
             // Strict await can turn cancellation into a language panic.
             // TaskResult awaits are intentionally not distinguished here:
@@ -1321,6 +1353,7 @@ mod tests {
                     panics: false,
                     panic_span: None,
                     expr_types: &HashMap::<ExprId, Type<TypeId>>::new(),
+                    overflow_checks: true,
                 };
                 hazards.visit_block(&function.body);
                 assert!(hazards.panics);
@@ -1336,6 +1369,38 @@ mod tests {
         let (program, errors) = crate::parser::Parser::new(tokens).parse();
         assert!(errors.is_empty(), "{errors:?}");
         program
+    }
+
+    #[test]
+    fn integer_arithmetic_may_panic_only_with_overflow_checks() {
+        // Without expression types `+` stays a possible string concatenation,
+        // which may panic regardless of the mode, so it is not listed here.
+        for (body, checked_panics) in [
+            ("return a - 1;", true),
+            ("return a * 2;", true),
+            ("return -a;", true),
+            ("return -5;", false),
+            ("if a < 1 { return 0; } return a;", false),
+        ] {
+            let program = program(&format!("fn f(a: i64) -> i64 {{ {body} }}"));
+            let Item::Function(function) = &program.items[0] else {
+                unreachable!()
+            };
+            for overflow_checks in [true, false] {
+                let mut hazards = HazardVisitor {
+                    panics: false,
+                    panic_span: None,
+                    expr_types: &HashMap::<ExprId, Type<TypeId>>::new(),
+                    overflow_checks,
+                };
+                hazards.visit_block(&function.body);
+                assert_eq!(
+                    hazards.panics,
+                    checked_panics && overflow_checks,
+                    "{body} overflow_checks={overflow_checks}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1425,6 +1490,7 @@ mod tests {
             &function.body,
             &HashMap::<ExprId, Type>::new(),
             None,
+            true,
         );
         assert_eq!(direct.len(), 2);
         assert!(direct[0].lock_span.is_none());
@@ -1448,6 +1514,7 @@ mod tests {
             &old.body,
             &HashMap::<ExprId, Type>::new(),
             None,
+            true,
         );
         let mut correspondence = super::super::syntax::Correspondence::default();
         correspondence.reconcile(&before, &mut after).unwrap();
@@ -1478,6 +1545,7 @@ mod tests {
             &old.body,
             &HashMap::<ExprId, Type>::new(),
             None,
+            true,
         );
         let mut correspondence = super::super::syntax::Correspondence::default();
         correspondence.reconcile(&before, &mut after).unwrap();

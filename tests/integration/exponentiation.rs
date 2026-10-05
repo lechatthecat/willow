@@ -25,7 +25,7 @@
 //!   3  exponent 0 is 1 for every base, including 0 and negatives
 //!   4  exponent 1 returns the base unchanged
 //!   5  negative base parity (odd exponent negative, even exponent positive)
-//!   6  overflow wraps modulo 2^64, exactly like `*`
+//!   6  release overflow wraps modulo 2^64, exactly like `*` (debug panics)
 //!   7  right associativity
 //!   8  precedence over `*`, `/`, `%`, `+`, `-`
 //!   9  binds tighter than prefix `-`

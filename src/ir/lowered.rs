@@ -676,8 +676,19 @@ thread_local! {
 }
 
 /// Lower every function (free functions and class methods, flattened as
-/// `Class::method`) of a typed-HIR program to basic blocks.
+/// `Class::method`) of a typed-HIR program to basic blocks, with debug-build
+/// overflow checks (the conservative choice for callers without a mode).
 pub(crate) fn lower_source_program(program: &HirProgram) -> SourceProgram {
+    lower_source_program_with(program, true)
+}
+
+/// `overflow_checks` is set for debug builds, whose checked integer
+/// arithmetic is a fault that leaf/recursive inlining must not move across a
+/// call-stack frame (willow-jz15.14).
+pub(crate) fn lower_source_program_with(
+    program: &HirProgram,
+    overflow_checks: bool,
+) -> SourceProgram {
     let resolution = std::rc::Rc::new(program.resolution.clone());
     let mut functions = Vec::with_capacity(program.functions.len());
     let mut lambdas = Vec::new();
@@ -692,7 +703,7 @@ pub(crate) fn lower_source_program(program: &HirProgram) -> SourceProgram {
         }
     }
     value::lower_calls(&mut functions, &mut lambdas, &program.resolution);
-    super::optimize::inline_scalar_leaves(&mut functions);
+    super::optimize::inline_scalar_leaves(&mut functions, overflow_checks);
     // The lifted graph is the sole owner of each executable lambda body.
     // Enclosing expressions retain only closure construction metadata.
     for function in functions
@@ -700,7 +711,7 @@ pub(crate) fn lower_source_program(program: &HirProgram) -> SourceProgram {
         .chain(lambdas.iter_mut().map(|lambda| &mut lambda.function))
     {
         super::optimize::eliminate_tail_recursion(function);
-        super::optimize::inline_scalar_recursion(function);
+        super::optimize::inline_scalar_recursion(function, overflow_checks);
         super::optimize::unroll_scalar_loops(function);
         lifetime::clear_dead_temporaries(function);
         function.async_frame = if function.is_async {

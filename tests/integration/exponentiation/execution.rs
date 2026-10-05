@@ -174,9 +174,15 @@ fn main() {
 }
 "#;
 
-    let (out, ok) = compile_and_run(SOURCE);
+    // `pow(2, 64)` wraps to 0 only in release; debug builds panic on the
+    // overflow (willow-jz15.14).
+    let (out, ok) = compile_and_run_release(SOURCE);
     assert!(ok, "{out}");
     assert_eq!(out, "1024\n243\n243\n0\n-8\n512\n-32\n1\n");
+    let (out, ok) = compile_and_run_check_exit(SOURCE);
+    assert!(!ok, "{out}");
+    assert!(out.starts_with("1024\n243\n243\n"), "{out}");
+    assert!(out.contains("integer overflow: `**`"), "{out}");
 }
 
 #[test]
@@ -212,7 +218,7 @@ fn pow(base: i64, exponent: i64) -> i64 {
 fn main() {
     println(2 ** 10);
     println(pow(3, 13));
-    println(pow(2, 63));
+    println(pow(0 - 2, 63));
     println(-3 ** 3);
     println(pow(0 - 1, 63));
 }

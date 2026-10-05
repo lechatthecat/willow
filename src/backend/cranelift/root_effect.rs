@@ -87,8 +87,11 @@ pub(super) fn may_push_gc_roots(function: &LirFunction) -> bool {
 /// receiver (willow-8hq4.14). The same instruction set also has no panic
 /// path, so nothing jumps to the panic-return block either.
 ///
+/// Debug builds pass `overflow_checks`: their checked integer arithmetic has
+/// a panic path (willow-jz15.14).
+///
 /// Unknown operations, terminators and parameter modes fail closed.
-pub(super) fn is_safepoint_free_leaf(function: &LirFunction) -> bool {
+pub(super) fn is_safepoint_free_leaf(function: &LirFunction, overflow_checks: bool) -> bool {
     if function.is_async
         || !function.captures.is_empty()
         || function.params.iter().any(|p| p.by_reference)
@@ -132,7 +135,9 @@ pub(super) fn is_safepoint_free_leaf(function: &LirFunction) -> bool {
                         }
                         _ => false,
                     };
-                    operation_is_safe && value.operands().into_iter().all(&operand_is_value)
+                    operation_is_safe
+                        && !(overflow_checks && value.has_overflow_check())
+                        && value.operands().into_iter().all(&operand_is_value)
                 }
                 LirInst::Let { value, ty, .. } => identity(value, ty),
                 LirInst::Assign { local, value, .. } => {
@@ -220,15 +225,64 @@ mod tests {
                     },
                 })
                 .collect();
-            assert!(is_safepoint_free_leaf(&function), "blocks={n}");
+            assert!(is_safepoint_free_leaf(&function, true), "blocks={n}");
             function.blocks[n - 1].terminator = Terminator::Jump(BlockId(0));
-            assert!(!is_safepoint_free_leaf(&function), "cycle blocks={n}");
+            assert!(!is_safepoint_free_leaf(&function, true), "cycle blocks={n}");
             function.blocks[n - 1].terminator = Terminator::Jump(BlockId(n));
             assert!(
-                !is_safepoint_free_leaf(&function),
+                !is_safepoint_free_leaf(&function, true),
                 "invalid target blocks={n}"
             );
         }
+    }
+
+    #[test]
+    fn leaf_proof_rejects_overflow_checked_arithmetic_in_debug_only() {
+        use crate::diagnostics::Span;
+        use crate::parser::ast::UnaryOp;
+        let leaf = |value: LirRvalue| {
+            let mut function = LirFunction::empty_artifact_region();
+            function.blocks = vec![LirBlock {
+                id: BlockId(0),
+                instrs: vec![LirInst::Compute {
+                    local: crate::ir::lowered::LirLocalId(0),
+                    value,
+                    span: Span::dummy(),
+                }],
+                recovery: Vec::new(),
+                terminator: Terminator::Return(None),
+            }];
+            function
+        };
+        let binary = |op: BinOp, ty: Type| LirRvalue::Binary {
+            op,
+            lhs: LirOperand::Int(1),
+            rhs: LirOperand::Int(2),
+            operand_ty: ty,
+        };
+        let negate = |operand: LirOperand| LirRvalue::Unary {
+            op: UnaryOp::Neg,
+            operand,
+            ty: Type::I64,
+        };
+        for op in [BinOp::Add, BinOp::Sub, BinOp::Mul] {
+            let function = leaf(binary(op.clone(), Type::I64));
+            assert!(!is_safepoint_free_leaf(&function, true), "{op:?}");
+            assert!(is_safepoint_free_leaf(&function, false), "{op:?}");
+        }
+        let float = leaf(binary(BinOp::Add, Type::F64));
+        assert!(is_safepoint_free_leaf(&float, true));
+        let compare = leaf(binary(BinOp::Lt, Type::I64));
+        assert!(is_safepoint_free_leaf(&compare, true));
+        // Negating a constant other than i64::MIN cannot overflow.
+        assert!(is_safepoint_free_leaf(
+            &leaf(negate(LirOperand::Int(5))),
+            true
+        ));
+        assert!(!is_safepoint_free_leaf(
+            &leaf(negate(LirOperand::Int(i64::MIN))),
+            true
+        ));
     }
 
     #[test]
@@ -251,11 +305,17 @@ mod tests {
                     },
                 })
                 .collect();
-            assert!(is_safepoint_free_leaf(&function), "shared exit blocks={n}");
+            assert!(
+                is_safepoint_free_leaf(&function, true),
+                "shared exit blocks={n}"
+            );
             for i in (1..n).step_by(2) {
                 function.blocks[i].terminator = Terminator::Return(None);
             }
-            assert!(is_safepoint_free_leaf(&function), "many exits blocks={n}");
+            assert!(
+                is_safepoint_free_leaf(&function, true),
+                "many exits blocks={n}"
+            );
         }
     }
 }

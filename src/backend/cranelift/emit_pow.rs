@@ -2,9 +2,17 @@
 //!
 //! Integer exponentiation is a compiler primitive, not a runtime call: a
 //! non-negative *literal* exponent unrolls into a multiplication chain and
-//! everything else becomes a bounded exponentiation-by-squaring loop. Every
-//! multiplication is a Cranelift `imul`, so overflow wraps modulo 2^64 exactly
-//! like an ordinary Willow `*`.
+//! everything else becomes a bounded exponentiation-by-squaring loop. Overflow
+//! follows an ordinary Willow `*` (willow-jz15.14): release builds wrap modulo
+//! 2^64 and debug builds raise a recoverable `integer overflow: `**`` panic.
+//!
+//! The debug check is exact. The schedule squares the accumulator only while
+//! exponent bits remain, so every square and every folded partial product is a
+//! power `base^m` with `m <= exponent`; for `|base| >= 2` and `m < exponent`
+//! that magnitude is at most 2^62. An intermediate therefore overflows only
+//! when the true result does, and `(-2) ** 63 == i64::MIN` passes. The product
+//! the dynamic loop computes for an even bit is discarded, so its flag is
+//! masked by the bit.
 //!
 //! The unroll decision reads the already-emitted exponent's `iconst`.
 //! LIR constant folding reduces pure integer expressions first, so both `3`
@@ -96,14 +104,14 @@ impl FuncGen<'_, '_> {
             // A negative constant cannot produce an integer, and the checker
             // already rejected the literal form (E0204). A negative that still
             // reaches here takes the dynamic path and raises at runtime.
-            Some(constant) if constant >= 0 => self.emit_pow_i64_const(base, constant as u64),
+            Some(constant) if constant >= 0 => self.emit_pow_i64_const(base, constant as u64, span),
             _ => self.emit_pow_i64_dynamic(base, exponent, span),
         }
     }
 
     /// Literal exponent: no branch, no loop, no runtime call — just the `imul`
     /// chain from [`pow_unroll_steps`].
-    fn emit_pow_i64_const(&mut self, base: Value, exponent: u64) -> Value {
+    fn emit_pow_i64_const(&mut self, base: Value, exponent: u64, span: Span) -> Value {
         let steps = pow_unroll_steps(exponent);
         let mut accumulator = base;
         let mut result: Option<Value> = None;
@@ -112,11 +120,11 @@ impl FuncGen<'_, '_> {
                 PowStep::Mul => {
                     result = Some(match result {
                         None => accumulator,
-                        Some(current) => self.builder.ins().imul(current, accumulator),
+                        Some(current) => self.emit_pow_mul(current, accumulator, None, span),
                     });
                 }
                 PowStep::Square => {
-                    accumulator = self.builder.ins().imul(accumulator, accumulator);
+                    accumulator = self.emit_pow_mul(accumulator, accumulator, None, span);
                 }
             }
         }
@@ -174,7 +182,7 @@ impl FuncGen<'_, '_> {
         let (accumulator, remaining, result) = (live[0], live[1], live[2]);
         let low_bit = self.builder.ins().band_imm_u(remaining, 1);
         let is_odd = self.builder.ins().icmp_imm_s(IntCC::Equal, low_bit, 1);
-        let multiplied = self.builder.ins().imul(result, accumulator);
+        let multiplied = self.emit_pow_mul(result, accumulator, Some(is_odd), span);
         let next_result = self.builder.ins().select(is_odd, multiplied, result);
         let next_remaining = self.builder.ins().ushr_imm_u(remaining, 1);
         let finished = self
@@ -191,7 +199,7 @@ impl FuncGen<'_, '_> {
 
         self.builder.switch_to_block(advance_block);
         self.builder.seal_block(advance_block);
-        let next_accumulator = self.builder.ins().imul(accumulator, accumulator);
+        let next_accumulator = self.emit_pow_mul(accumulator, accumulator, None, span);
         self.builder.ins().jump(
             header_block,
             &[
@@ -206,6 +214,22 @@ impl FuncGen<'_, '_> {
         self.builder.switch_to_block(exit_block);
         self.builder.seal_block(exit_block);
         self.builder.block_params(exit_block)[0]
+    }
+
+    /// One schedule multiplication. Debug builds guard its overflow flag,
+    /// masked by `used` when the product may be discarded.
+    fn emit_pow_mul(&mut self, lhs: Value, rhs: Value, used: Option<Value>, span: Span) -> Value {
+        if !self.overflow_checks() {
+            return self.builder.ins().imul(lhs, rhs);
+        }
+        let (product, overflowed) =
+            self.emit_overflowing_binop(&crate::parser::ast::BinOp::Mul, lhs, rhs);
+        let overflowed = match used {
+            Some(used) => self.builder.ins().band(overflowed, used),
+            None => overflowed,
+        };
+        self.emit_int_overflow_guard(overflowed, super::emit_expr::INT_OVERFLOW_POW, span);
+        product
     }
 
     /// Raise the negative-exponent language fault and terminate the block. The
@@ -324,7 +348,8 @@ mod tests {
         assert_eq!(evaluate(&pow_unroll_steps(0), -3), 1);
     }
 
-    /// Perspective 8: overflow wraps modulo 2^64, exactly like repeated `*`.
+    /// Perspective 8: in release builds overflow wraps modulo 2^64, exactly
+    /// like repeated `*` (debug builds check each step instead).
     #[test]
     fn pow_plan_08_overflow_wraps_like_multiplication() {
         let steps = pow_unroll_steps(21);

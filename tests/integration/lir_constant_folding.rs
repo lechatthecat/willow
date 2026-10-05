@@ -12,7 +12,7 @@ fn main() {
     println(base() ** (1 + 2));
     println(base() ** (3 - 3));
     println(base() * (3 - 3));
-    println(9223372036854775807 + 1);
+    println(9223372036854775806 + 1);
     println((-7) / (1 + 2));
     println((-7) % (1 + 2));
     println(false && (base() == 2));
@@ -24,7 +24,7 @@ fn main() {
     assert!(ok, "{out}");
     assert_eq!(
         out,
-        "base 8\nbase 1\nbase 0\n-9223372036854775808\n-2\n-1\nfalse\ntrue\nrecovered\n"
+        "base 8\nbase 1\nbase 0\n9223372036854775807\n-2\n-1\nfalse\ntrue\nrecovered\n"
     );
 }
 

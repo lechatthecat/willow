@@ -6,6 +6,15 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
 
 ### Breaking
 
+- **`i64` overflow now panics in debug builds.** `+`, `-`, `*`, `**` and
+  prefix `-` used to wrap silently, while division by zero panicked. A debug
+  build (the default) now raises a recoverable panic such as
+  ``integer overflow: `+` `` at the operator's location; `--release` builds
+  still wrap. New `i64` methods state the intent explicitly and behave the
+  same in both modes: `wrapping_add/sub/mul(i64)`, `wrapping_neg()`,
+  `checked_add/sub/mul(i64) -> Option<i64>` and `checked_neg()`. Code that
+  relies on modular arithmetic (hashes, PRNGs) should use `wrapping_*`
+  (willow-jz15.14).
 - **E0810 now rejects recursive synchronous helpers called from task context.**
   Previously the non-preemptibility analysis seeded only from helpers that
   contained a loop, so a loop-free recursive helper — the classic

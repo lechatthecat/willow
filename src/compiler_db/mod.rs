@@ -67,6 +67,7 @@ impl CompilerDb {
         dependencies: dependencies::ModuleDependencies,
     ) -> Self {
         let dependencies = std::rc::Rc::new(dependencies);
+        let overflow_checks = inputs.options.target.build_mode == crate::BuildMode::Debug;
         Self {
             _symbols: crate::semantic::ids::SymbolInterner::current(),
             references: Default::default(),
@@ -74,7 +75,10 @@ impl CompilerDb {
             declarations: std::rc::Rc::new(declarations::DeclarationQueries::new(
                 std::rc::Rc::clone(&store),
             )),
-            lir: std::rc::Rc::new(lir::LirQueries::new(std::rc::Rc::clone(&store))),
+            lir: std::rc::Rc::new(lir::LirQueries::new(
+                std::rc::Rc::clone(&store),
+                overflow_checks,
+            )),
             typed_bodies: std::rc::Rc::new(body::BodyQueries::new(
                 store,
                 std::rc::Rc::clone(&bodies),
@@ -84,6 +88,7 @@ impl CompilerDb {
             effects: std::rc::Rc::new(effects::EffectQueries::new(
                 modules,
                 std::rc::Rc::clone(&dependencies),
+                overflow_checks,
             )),
             bodies,
             dependencies,

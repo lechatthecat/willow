@@ -1499,7 +1499,11 @@ impl UnitCodegenContext<'_> {
         };
         // A safepoint-free leaf neither roots its GC parameters nor reaches
         // the panic-return block (willow-8hq4.14).
-        let unrooted = !is_main && super::root_effect::is_safepoint_free_leaf(&lir_fn);
+        let unrooted = !is_main
+            && super::root_effect::is_safepoint_free_leaf(
+                &lir_fn,
+                self.build_mode == BuildMode::Debug,
+            );
         if panic_return_block.is_some()
             && !unrooted
             && super::root_effect::may_push_gc_roots(&lir_fn)
@@ -2488,7 +2492,10 @@ impl UnitCodegenContext<'_> {
         };
         // Instance methods bind a rooted `self`, even for scalar bodies, unless
         // the body can never reach a safepoint (willow-8hq4.14).
-        let unrooted = super::root_effect::is_safepoint_free_leaf(&lir_fn);
+        let unrooted = super::root_effect::is_safepoint_free_leaf(
+            &lir_fn,
+            self.build_mode == BuildMode::Debug,
+        );
         if panic_return_block.is_some()
             && !unrooted
             && (!m.is_static || super::root_effect::may_push_gc_roots(&lir_fn))

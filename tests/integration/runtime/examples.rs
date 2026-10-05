@@ -524,6 +524,11 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
              recovered: negative exponent in integer `**`: -3\ndone\n1024\n0.125\n\
              1.414213562373095\n3\n4\n",
         ),
+        (
+            "example/integer_overflow.wi",
+            "-9223372036854775808\n9223372036854775807\n-2\n-9223372036854775808\n\
+             None\nSome(42)\nNone\nSome(42)\nrecovered: integer overflow: `+`\ndone\n",
+        ),
         ("example/grouped_imports.wi", "42\n"),
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),

@@ -3,7 +3,8 @@
 use super::support::{
     TestProject, compile_and_collect_relocation_targets,
     compile_and_collect_relocation_targets_all, compile_and_collect_relocation_targets_mode,
-    compile_and_run_release, compile_and_run_with_env, compile_with_compiler_env,
+    compile_and_run_release, compile_and_run_with_env, compile_release_with_compiler_env,
+    compile_with_compiler_env,
 };
 
 const PURE_RECURSION: &str = r#"
@@ -53,10 +54,12 @@ fn panic_snapshots_reduce_three_surviving_straight_line_reads() {
 
 #[test]
 fn panic_snapshots_do_not_add_reads_to_pure_calls() {
-    for release in [false, true] {
-        let targets = compile_and_collect_relocation_targets_mode(PURE_RECURSION, &[], release);
-        assert!(!has_target(&targets, "willow_panic_depth"));
-    }
+    // Pure only in release: debug overflow checks make `fib` may-panic
+    // (willow-jz15.14).
+    let targets = compile_and_collect_relocation_targets_mode(PURE_RECURSION, &[], true);
+    assert!(!has_target(&targets, "willow_panic_depth"));
+    let targets = compile_and_collect_relocation_targets_mode(PURE_RECURSION, &[], false);
+    assert!(has_target(&targets, "willow_panic_depth"));
 }
 
 #[test]
@@ -239,10 +242,19 @@ fn has_target(targets: &[String], name: &str) -> bool {
 
 #[test]
 fn pe_01_pure_recursive_function_is_reported_no_panic() {
+    // Release: `i64` arithmetic has no overflow check, so `fib` is pure.
+    let (ok, stderr) =
+        compile_release_with_compiler_env(PURE_RECURSION, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    assert!(ok, "{stderr}");
+    assert!(stderr.contains("[panic-effects] fib: no-panic"), "{stderr}");
+    // Debug: checked `+`/`-` can raise an overflow panic (willow-jz15.14).
     let (ok, stderr) =
         compile_with_compiler_env(PURE_RECURSION, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
-    assert!(stderr.contains("[panic-effects] fib: no-panic"), "{stderr}");
+    assert!(
+        stderr.contains("[panic-effects] fib: may-panic"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -265,7 +277,7 @@ fn main() {}
 
 #[test]
 fn pe_03_proven_pure_call_graph_emits_no_panic_depth_relocation() {
-    let targets = compile_and_collect_relocation_targets(PURE_RECURSION, &[]);
+    let targets = compile_and_collect_relocation_targets_mode(PURE_RECURSION, &[], true);
     assert!(!has_target(&targets, "willow_panic_depth"), "{targets:?}");
     // Task-aware synchronous cancellation restores GC roots independently of
     // panic propagation. Its root-depth relocation does not make this pure
@@ -432,7 +444,7 @@ fn pe_08_safe_static_method_omits_its_call_check() {
 class Math { pub static fn twice(n: i64) -> i64 { return n * 2; } }
 fn main() { println(Math::twice(21)); }
 "#;
-    let targets = compile_and_collect_relocation_targets(source, &[]);
+    let targets = compile_and_collect_relocation_targets_mode(source, &[], true);
     assert!(!has_target(&targets, "willow_panic_depth"), "{targets:?}");
 }
 
@@ -559,7 +571,7 @@ fn pe_15_cross_module_pure_summary_reaches_entry_call_site() {
             ),
         ],
     );
-    let compile = project.compile_with_env("main.wi", &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    let compile = project.compile_release_with_env("main.wi", &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     let stderr = String::from_utf8_lossy(&compile.stderr);
     assert!(compile.status.success(), "{stderr}");
     assert!(
@@ -586,7 +598,7 @@ fn pe_16_cross_module_static_method_alias_carries_no_panic_summary() {
             ),
         ],
     );
-    let compile = project.compile_with_env("main.wi", &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    let compile = project.compile_release_with_env("main.wi", &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     let stderr = String::from_utf8_lossy(&compile.stderr);
     assert!(compile.status.success(), "{stderr}");
     assert!(
@@ -755,7 +767,7 @@ control <- clean\n\
 #[test]
 fn pe_25_walk_reaches_a_hazard_in_every_nested_expression_slot() {
     let (ok, stderr) =
-        compile_with_compiler_env(SHARED_AST_WALK, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+        compile_release_with_compiler_env(SHARED_AST_WALK, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
     for function in [
         "hidden_in_ternary",
@@ -871,7 +883,8 @@ fn main() {
     println(no_hazard(3));
 }
 "#;
-    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    let (ok, stderr) =
+        compile_release_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
     for function in [
         "in_while_body",
@@ -909,7 +922,8 @@ fn main() {
     println(defines_only(1));
 }
 "#;
-    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    let (ok, stderr) =
+        compile_release_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
     assert!(
         stderr.contains("[panic-effects] defines_only: no-panic"),
@@ -1138,7 +1152,7 @@ fn main() { println(safe_wrapper()); }
             ),
         ],
     );
-    let compile = project.compile_with_env("main.wi", &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    let compile = project.compile_release_with_env("main.wi", &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     let stderr = String::from_utf8_lossy(&compile.stderr);
     assert!(compile.status.success(), "{stderr}");
     assert!(
@@ -1166,7 +1180,8 @@ fn nested() {
 }
 fn main() { nested(); println(1); }
 "#;
-    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    let (ok, stderr) =
+        compile_release_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
     assert!(
         stderr.contains("[panic-effects] $lambda.0: no-panic"),
@@ -1198,7 +1213,8 @@ fn main() {
     println(defines(1));
 }
 "#;
-    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    let (ok, stderr) =
+        compile_release_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
     assert!(
         stderr.contains("[panic-effects] $lambda.0: may-panic"),

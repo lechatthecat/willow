@@ -1,7 +1,10 @@
 //! Backend-independent, stack-bounded constant folding for lowered bodies.
 //!
 //! Only pure scalar subtrees are replaced. Faulting arithmetic stays in the IR
-//! so runtime panic/recovery behavior and source locations remain intact.
+//! so runtime panic/recovery behavior and source locations remain intact. An
+//! overflowing `+ - * **` or negation is such a fault in debug builds and
+//! wraps in release builds (willow-jz15.14); folding is build-mode
+//! independent, so it leaves both for the backend.
 mod recursive_inline;
 pub(crate) use recursive_inline::inline_scalar_recursion;
 
@@ -32,20 +35,24 @@ fn binary(op: &BinOp, lhs: Constant, rhs: Constant) -> Option<Constant> {
     use Constant::*;
     Some(match (lhs, rhs) {
         (Int(a), Int(b)) => match op {
-            Add => Int(a.wrapping_add(b)),
-            Sub => Int(a.wrapping_sub(b)),
-            Mul => Int(a.wrapping_mul(b)),
+            Add => Int(a.checked_add(b)?),
+            Sub => Int(a.checked_sub(b)?),
+            Mul => Int(a.checked_mul(b)?),
             Div => Int(a.checked_div(b)?),
             Rem => Int(a.checked_rem(b)?),
             Pow if b >= 0 => {
-                // Bounded by the exponent's bit width, including i64::MAX.
+                // Bounded by the exponent's bit width, including i64::MAX. The
+                // backend's schedule: square only while bits remain, so an
+                // intermediate overflows exactly when the result does.
                 let (mut base, mut exponent, mut result) = (a, b as u64, 1i64);
                 while exponent != 0 {
                     if exponent & 1 != 0 {
-                        result = result.wrapping_mul(base);
+                        result = result.checked_mul(base)?;
                     }
                     exponent >>= 1;
-                    base = base.wrapping_mul(base);
+                    if exponent != 0 {
+                        base = base.checked_mul(base)?;
+                    }
                 }
                 Int(result)
             }
@@ -80,7 +87,7 @@ pub(crate) fn fold_expr(expr: &mut HirExpr) {
             HirExprKind::Int(n) if node.ty == Type::I64 => Some(Constant::Int(*n)),
             HirExprKind::Bool(b) => Some(Constant::Bool(*b)),
             HirExprKind::Unary { op, operand } => match (op, get(operand)) {
-                (UnaryOp::Neg, Some(Constant::Int(n))) => Some(Constant::Int(n.wrapping_neg())),
+                (UnaryOp::Neg, Some(Constant::Int(n))) => n.checked_neg().map(Constant::Int),
                 (UnaryOp::Not, Some(Constant::Bool(b))) => Some(Constant::Bool(!b)),
                 _ => None,
             },
@@ -241,7 +248,11 @@ pub(crate) fn eliminate_dead_values(
         .iter()
         .map(|local| (local.name.as_str(), local.id))
         .collect();
+    // Debug builds check integer `+ - * **` and negation for overflow
+    // (willow-jz15.14), so a dead one still reports its fault. Release keeps a
+    // dead wrapping op only until Cranelift's own dead-code elimination.
     let pure = |value: &LirRvalue| match value {
+        _ if value.has_overflow_check() => false,
         LirRvalue::Use(_) | LirRvalue::Unary { .. } => true,
         LirRvalue::FunctionRef { .. } => true,
         LirRvalue::Binary {
@@ -677,7 +688,12 @@ pub(crate) fn unroll_scalar_loops(function: &mut super::lowered::SourceFunction)
 /// Inline only bounded, single-block scalar leaves. No allocation, calls,
 /// faults, loops, references, or cleanup can cross this transformation.
 /// Keeping the expansion budget small also bounds work between safepoints.
-pub(crate) fn inline_scalar_leaves(functions: &mut [super::lowered::SourceFunction]) {
+/// With `overflow_checks` (debug builds), checked integer arithmetic is such a
+/// fault: its call stack must name the callee (willow-jz15.14).
+pub(crate) fn inline_scalar_leaves(
+    functions: &mut [super::lowered::SourceFunction],
+    overflow_checks: bool,
+) {
     // Whole-program resolution flattened aggregate constructors after the
     // per-function pass. Eliminate those before selecting scalar callees.
     for function in functions.iter_mut() {
@@ -700,7 +716,7 @@ pub(crate) fn inline_scalar_leaves(functions: &mut [super::lowered::SourceFuncti
             _ => return None,
         })
     }
-    fn candidate(function: &super::lowered::SourceFunction) -> Option<Leaf> {
+    fn candidate(function: &super::lowered::SourceFunction, overflow_checks: bool) -> Option<Leaf> {
         if function.is_async
             || function.blocks.len() != 1
             || !function.captures.is_empty()
@@ -726,6 +742,9 @@ pub(crate) fn inline_scalar_leaves(functions: &mut [super::lowered::SourceFuncti
         for instruction in &block.instrs {
             match instruction {
                 SourceInst::Compute { local, value, span } => {
+                    if overflow_checks && value.has_overflow_check() {
+                        return None;
+                    }
                     match value {
                         LirRvalue::Use(_) | LirRvalue::Unary { .. } => {}
                         LirRvalue::Binary { op, .. }
@@ -764,7 +783,9 @@ pub(crate) fn inline_scalar_leaves(functions: &mut [super::lowered::SourceFuncti
     }
     let leaves: HashMap<FunctionId, Leaf> = functions
         .iter()
-        .filter_map(|function| candidate(function).map(|leaf| (function.name, leaf)))
+        .filter_map(|function| {
+            candidate(function, overflow_checks).map(|leaf| (function.name, leaf))
+        })
         .collect();
     for function in functions {
         let mut names: std::collections::HashSet<_> = function
@@ -1076,10 +1097,75 @@ mod tests {
         super::super::lowered::lower_source_program(&hir)
     }
 
+    fn lowered_with(source: &str, overflow_checks: bool) -> super::super::lowered::SourceProgram {
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (ast, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let (hir, errors) = crate::ir::lower::lower_program(&ast);
+        assert!(errors.is_empty(), "{errors:?}");
+        super::super::lowered::lower_source_program_with(&hir, overflow_checks)
+    }
+
+    fn count_computes(
+        program: &super::super::lowered::SourceProgram,
+        name: &str,
+        matches: impl Fn(&super::super::lowered::LirRvalue) -> bool,
+    ) -> usize {
+        let f = program
+            .functions
+            .iter()
+            .find(|f| f.name.is_free_named(name))
+            .unwrap();
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.instrs)
+            .filter(|i| matches!(i, SourceInst::Compute { value, .. } if matches(value)))
+            .count()
+    }
+
+    #[test]
+    fn folding_leaves_overflowing_integer_arithmetic_to_the_backend() {
+        use super::super::lowered::LirRvalue;
+        let program = lowered(
+            r#"
+fn add() -> i64 { return 9223372036854775807 + 1; }
+fn sub() -> i64 { return 0 - 9223372036854775807 - 2; }
+fn mul() -> i64 { return 4294967296 * 4294967296; }
+fn neg() -> i64 { return -(0 - 9223372036854775807 - 1); }
+fn pow() -> i64 { return 2 ** 63; }
+fn fits() -> i64 { return (9223372036854775806 + 1) * 1 - 0 + (0 - 2) ** 63 - (0 - 9223372036854775807 - 1); }
+"#,
+        );
+        let arithmetic =
+            |value: &LirRvalue| matches!(value, LirRvalue::Binary { .. } | LirRvalue::Unary { .. });
+        for name in ["add", "sub", "mul", "neg", "pow"] {
+            assert_eq!(count_computes(&program, name, arithmetic), 1, "{name}");
+        }
+        assert_eq!(count_computes(&program, "fits", arithmetic), 0);
+    }
+
+    #[test]
+    fn debug_overflow_checks_keep_faulting_leaves_out_of_line() {
+        use super::super::lowered::LirRvalue;
+        let source = r#"
+fn d(a: i64, b: i64) -> i64 { return a * b; }
+fn f(a: f64, b: f64) -> f64 { return a * b; }
+fn mid(a: i64, x: f64) -> f64 { println(d(a, a)); return f(x, x); }
+"#;
+        let call = |callee: &'static str| move |value: &LirRvalue| matches!(value, LirRvalue::DirectCall { callee: c, .. } if c.is_free_named(callee));
+        let debug = lowered_with(source, true);
+        assert_eq!(count_computes(&debug, "mid", call("d")), 1);
+        assert_eq!(count_computes(&debug, "mid", call("f")), 0);
+        let release = lowered_with(source, false);
+        assert_eq!(count_computes(&release, "mid", call("d")), 0);
+        assert_eq!(count_computes(&release, "mid", call("f")), 0);
+    }
+
     #[test]
     fn tail_recursion_removes_only_safe_tail_calls() {
         use super::super::lowered::LirRvalue;
-        let program = lowered(
+        // Release: debug overflow checks keep `fib` out of line (willow-jz15.14).
+        let program = lowered_with(
             r#"
 fn sum(n: i64, acc: i64) -> i64 { if n == 0 { return acc; } return sum(n - 1, acc + n); }
 fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
@@ -1087,6 +1173,7 @@ fn cleanup(n: i64) -> i64 { defer { println(n); } if n == 0 { return n; } return
 fn reference(n: i64, acc: & i64) -> i64 { if n == 0 { return acc; } return reference(n - 1, &acc); }
 fn managed(n: i64, s: String) -> String { if n == 0 { return s; } return managed(n - 1, s); }
 "#,
+            false,
         );
         for (name, expected) in [
             ("sum", 0),
@@ -1109,7 +1196,9 @@ fn managed(n: i64, s: String) -> String { if n == 0 { return s; } return managed
     #[test]
     fn recursive_inlining_is_bounded_and_excludes_effects_faults_and_large_bodies() {
         use super::super::lowered::LirRvalue;
-        let program = lowered(
+        // Release: debug overflow checks make `small` a faulting body
+        // (willow-jz15.14), covered by `debug_overflow_checks_keep_faulting_leaves_out_of_line`.
+        let program = lowered_with(
             r#"
 fn small(n: i64) -> i64 { if n < 2 { return n; } return small(n-1) + small(n-2); }
 fn fault(n: i64) -> i64 { if n < 2 { return n; } return fault(n-1) / n; }
@@ -1117,6 +1206,7 @@ fn effect(n: i64) -> i64 { println(n); if n < 2 { return n; } return effect(n-1)
 fn wide(n: i64) -> i64 { if n < 2 { return n; } return wide(n-1) + wide(n-2) + wide(n-3); }
 fn cycle(n: i64) -> i64 { let mut x = n; while x > 2 { x = x-1; } if n < 2 { return n; } return cycle(n-1) + x; }
 "#,
+            false,
         );
         for (name, expected) in [
             ("small", 16),
@@ -1398,43 +1488,62 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
     #[test]
     fn inlines_small_scalar_leaves_but_preserves_faulting_calls() {
         use super::super::lowered::LirRvalue;
-        let program = lowered(
-            "fn twice(x: i64) -> i64 { return x * 2; } fn divide(x: i64, y: i64) -> i64 { return x / y; } fn f(x: i64, y: i64) -> i64 { return twice(x) + divide(x, y); }",
-        );
-        let function = program
-            .functions
-            .iter()
-            .find(|f| f.name == "f".into())
-            .unwrap();
-        let callees: Vec<_> = function
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instrs)
-            .filter_map(|inst| {
-                if let SourceInst::Compute {
-                    value: LirRvalue::DirectCall { callee, .. },
-                    ..
-                } = inst
-                {
-                    Some(callee.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(callees, ["divide"]);
+        let source = "fn twice(x: i64) -> i64 { return x * 2; } fn divide(x: i64, y: i64) -> i64 { return x / y; } fn f(x: i64, y: i64) -> i64 { return twice(x) + divide(x, y); }";
+        // Debug overflow checks make `twice` faulting too (willow-jz15.14).
+        for (overflow_checks, expected) in [(false, &["divide"][..]), (true, &["twice", "divide"])]
+        {
+            let program = lowered_with(source, overflow_checks);
+            let function = program
+                .functions
+                .iter()
+                .find(|f| f.name == "f".into())
+                .unwrap();
+            let callees: Vec<_> = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .filter_map(|inst| {
+                    if let SourceInst::Compute {
+                        value: LirRvalue::DirectCall { callee, .. },
+                        ..
+                    } = inst
+                    {
+                        Some(callee.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(callees, expected, "overflow_checks={overflow_checks}");
+        }
     }
 
     #[test]
     fn dce_removes_dead_scalar_dependency_chains() {
-        let program = lowered("fn f(x: i64) { (x * 2) + 1; }");
-        assert!(
-            !program.functions[0]
-                .blocks
-                .iter()
-                .flat_map(|block| &block.instrs)
-                .any(|inst| matches!(inst, SourceInst::Compute { .. }))
-        );
+        // DCE runs per function before the build mode is known, so a checked
+        // `i64` chain stays in both modes: debug must still report its
+        // overflow (willow-jz15.14) and release leaves the dead wrapping op to
+        // Cranelift's own dead-code elimination.
+        for (source, kept) in [
+            (
+                "fn f(x: f64, y: i64) { (x * 2.0) + 1.0; (y < 2) == true; }",
+                false,
+            ),
+            ("fn f(x: i64) { (x * 2) + 1; }", true),
+        ] {
+            for overflow_checks in [false, true] {
+                let program = lowered_with(source, overflow_checks);
+                assert_eq!(
+                    program.functions[0]
+                        .blocks
+                        .iter()
+                        .flat_map(|block| &block.instrs)
+                        .any(|inst| matches!(inst, SourceInst::Compute { .. })),
+                    kept,
+                    "{source} overflow_checks={overflow_checks}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1530,8 +1639,14 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
     }
 
     #[test]
-    fn preserves_arithmetic_faults_and_wraps_successful_operations() {
+    fn preserves_arithmetic_faults_and_overflow_and_folds_successful_operations() {
+        // Overflow is left to the backend, which checks or wraps per build
+        // mode (willow-jz15.14).
         for (op, a, b) in [
+            (BinOp::Add, i64::MAX, 1),
+            (BinOp::Sub, i64::MIN, 1),
+            (BinOp::Mul, i64::MAX, 2),
+            (BinOp::Pow, 2, 63),
             (BinOp::Div, 1, 0),
             (BinOp::Rem, 1, 0),
             (BinOp::Div, i64::MIN, -1),
@@ -1544,10 +1659,10 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
             assert_eq!(expr, original);
         }
         for (op, a, b, expected) in [
-            (BinOp::Add, i64::MAX, 1, i64::MIN),
-            (BinOp::Sub, i64::MIN, 1, i64::MAX),
-            (BinOp::Mul, i64::MAX, 2, -2),
-            (BinOp::Pow, 2, 63, i64::MIN),
+            (BinOp::Add, i64::MAX - 1, 1, i64::MAX),
+            (BinOp::Sub, i64::MIN + 1, 1, i64::MIN),
+            (BinOp::Mul, i64::MIN / 2, 2, i64::MIN),
+            (BinOp::Pow, -2, 63, i64::MIN),
             (BinOp::Pow, -1, i64::MAX, -1),
             (BinOp::Div, -7, 3, -2),
             (BinOp::Rem, -7, 3, -1),

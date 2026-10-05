@@ -1,0 +1,48 @@
+// Integer overflow policy.
+//
+// A debug build (the default) checks `+`, `-`, `*`, `**` and prefix `-` on
+// `i64` and panics on overflow; `willow build --release` wraps instead. The
+// explicit methods below behave the same way in both builds.
+
+fn add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+
+fn show(value: Option<i64>) -> String {
+    match value {
+        Some(n) => {
+            return "Some(" + n.toString() + ")";
+        }
+        None => {
+            return "None";
+        }
+    }
+}
+
+fn main() {
+    let max = 9223372036854775807;
+    let min = 0 - max - 1;
+
+    // Explicit wrapping: modular arithmetic, e.g. for hashes.
+    println(max.wrapping_add(1));
+    println(min.wrapping_sub(1));
+    println(max.wrapping_mul(2));
+    println(min.wrapping_neg());
+
+    // Explicit checking: overflow becomes `None`.
+    println(show(max.checked_add(1)));
+    println(show(40.checked_add(2)));
+    println(show(min.checked_neg()));
+    println(show(7.checked_mul(6)));
+
+    // Plain operators panic on overflow in a debug build. The panic is
+    // recoverable, like division by zero.
+    if true {
+        defer match recover() {
+            Some(info) => println("recovered: " + info.message),
+            None => println("no overflow"),
+        }
+        println(add(max, 1));
+    }
+    println("done");
+}

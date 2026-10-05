@@ -806,6 +806,27 @@ impl TestProject {
         command.output().expect("failed to run compiler")
     }
 
+    /// [`Self::compile_with_env`] with `--release`.
+    pub(super) fn compile_release_with_env(
+        &self,
+        entry: &str,
+        env: &[(&str, &str)],
+    ) -> std::process::Output {
+        let src_path = self.root.join(entry);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
+        command.args([
+            "build",
+            path_str(&src_path),
+            "-o",
+            path_str(&self.bin_path),
+            "--release",
+        ]);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command.output().expect("failed to run compiler")
+    }
+
     /// [`Self::compile`] with `--release`, for a perspective that must hold in
     /// the build mode carrying none of the debug instrumentation.
     pub(super) fn compile_release(&self, entry: &str) -> std::process::Output {
@@ -1052,6 +1073,23 @@ pub(super) fn assert_compile_error_contains(source: &str, expected_parts: &[&str
 }
 
 pub(super) fn compile_with_compiler_env(source: &str, env: &[(&str, &str)]) -> (bool, String) {
+    compile_with_compiler_env_mode(source, env, false)
+}
+
+/// [`compile_with_compiler_env`] for a `--release` build, where `i64`
+/// arithmetic carries no debug overflow checks (willow-jz15.14).
+pub(super) fn compile_release_with_compiler_env(
+    source: &str,
+    env: &[(&str, &str)],
+) -> (bool, String) {
+    compile_with_compiler_env_mode(source, env, true)
+}
+
+fn compile_with_compiler_env_mode(
+    source: &str,
+    env: &[(&str, &str)],
+    release: bool,
+) -> (bool, String) {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_drc_{}.wi", id));
     let bin_path = temp_path(format!("willow_drc_{}", id));
@@ -1059,6 +1097,9 @@ pub(super) fn compile_with_compiler_env(source: &str, env: &[(&str, &str)]) -> (
     let compiler = env!("CARGO_BIN_EXE_willow");
     let mut cmd = Command::new(compiler);
     cmd.args(["build", &src_path, "-o", &bin_path]);
+    if release {
+        cmd.arg("--release");
+    }
     cmd.env_remove("WILLOW_DATA_RACE_CHECK");
     cmd.env_remove("WILLOW_WORKERS");
     // The only backend switch left is the log (willow-0g8j.3 retired the

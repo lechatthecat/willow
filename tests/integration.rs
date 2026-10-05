@@ -180,6 +180,8 @@ mod runtime_safety_matrix;
 mod concurrency;
 #[path = "integration/exponentiation.rs"]
 mod exponentiation;
+#[path = "integration/integer_overflow.rs"]
+mod integer_overflow;
 #[path = "integration/option_interface_context.rs"]
 mod option_interface_context;
 #[path = "integration/option_nil_deprecation.rs"]

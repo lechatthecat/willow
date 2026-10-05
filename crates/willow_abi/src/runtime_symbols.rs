@@ -328,6 +328,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // --- panic ---
     PANIC_ALLOC; "willow_nil_deref" => ([Ptr, I32, I32, Ptr] -> None);
     PANIC_ALLOC; "willow_int_div_panic" => ([I64, Ptr, I32, I32] -> None);
+    PANIC_ALLOC; "willow_int_overflow_panic" => ([I64, Ptr, I32, I32] -> None);
     NONE; "willow_panic" => ([Ptr] -> None);
     NONE; "willow_main_fail" => ([Ptr] -> None);
     NONE; "willow_panic_at" => ([Ptr, Ptr, I32, I32] -> None);

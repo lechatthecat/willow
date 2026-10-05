@@ -1433,7 +1433,8 @@ fn lir_sync_poll_blocks(f: &LirFunction) -> Vec<bool> {
 /// A bounded scalar early return needs no safepoint. Move the entry poll to
 /// the other branch, including its runtime address/context lookups. Restrict
 /// this to acyclic bodies so loop guards keep their invocation-cached inputs.
-fn lir_defer_entry_poll(f: &LirFunction, poll: &mut [bool]) -> bool {
+/// Like a division guard, a debug overflow check has a panic path.
+fn lir_defer_entry_poll(f: &LirFunction, poll: &mut [bool], overflow_checks: bool) -> bool {
     use crate::ir::lowered::LirRvalue as V;
     let scalar = |ty: &Type| matches!(ty, Type::I64 | Type::F64 | Type::Bool);
     if f.is_async
@@ -1460,11 +1461,16 @@ fn lir_defer_entry_poll(f: &LirFunction, poll: &mut [bool]) -> bool {
     let bounded = |block: &LirBlock| {
         block.instrs.len() <= 8
             && block.instrs.iter().all(|inst| match inst {
-                LirInst::Compute { value, .. } => match value {
-                    V::Use(_) | V::Unary { .. } => true,
-                    V::Binary { op, .. } => !matches!(op, BinOp::Div | BinOp::Rem | BinOp::Pow),
-                    _ => false,
-                },
+                LirInst::Compute { value, .. } => {
+                    !(overflow_checks && value.has_overflow_check())
+                        && match value {
+                            V::Use(_) | V::Unary { .. } => true,
+                            V::Binary { op, .. } => {
+                                !matches!(op, BinOp::Div | BinOp::Rem | BinOp::Pow)
+                            }
+                            _ => false,
+                        }
+                }
                 LirInst::Let { .. } | LirInst::Assign { .. } | LirInst::ClearScopeRoots { .. } => {
                     true
                 }
@@ -5055,12 +5061,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut poll_blocks = lir_sync_poll_blocks(f);
         // A bounded body that cannot reach a safepoint needs no poll at all;
         // the caller's polls already bound the work around it (willow-8hq4.14).
-        let unpolled = coop.is_none() && super::root_effect::is_safepoint_free_leaf(f);
+        let unpolled =
+            coop.is_none() && super::root_effect::is_safepoint_free_leaf(f, self.overflow_checks());
         if unpolled {
             poll_blocks.fill(false);
         }
-        let deferred_poll =
-            coop.is_none() && !unpolled && lir_defer_entry_poll(f, &mut poll_blocks);
+        let deferred_poll = coop.is_none()
+            && !unpolled
+            && lir_defer_entry_poll(f, &mut poll_blocks, self.overflow_checks());
         // SSA carries the delayed activity lookup through later joins and
         // inlined recursive bodies. The zero entry value is used only on the
         // bounded return path; every path containing calls crosses a poll.
@@ -7382,9 +7390,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 result
             }
             LirRvalue::Unary { op, operand, ty } => {
+                let checked = self.overflow_checks()
+                    && crate::ir::lowered::value::is_overflow_checked_unary(op, operand, ty);
                 let operand = self.emit_lir_operand(function, operand);
                 match op {
                     UnaryOp::Neg if *ty == Type::F64 => self.builder.ins().fneg(operand),
+                    UnaryOp::Neg if checked => {
+                        let (negated, overflowed) = self.emit_overflowing_neg(operand);
+                        self.emit_int_overflow_guard(
+                            overflowed,
+                            super::emit_expr::INT_OVERFLOW_NEG,
+                            span,
+                        );
+                        negated
+                    }
                     UnaryOp::Neg => self.builder.ins().ineg(operand),
                     UnaryOp::Not => {
                         let one = self.builder.ins().iconst(types::I8, 1);
@@ -7521,6 +7540,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     } else {
                         self.emit_pow_i64(lhs, rhs, span)
                     }
+                } else if !float
+                    && self.overflow_checks()
+                    && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                {
+                    self.emit_checked_int_binop(op, lhs, rhs, span)
                 } else {
                     self.emit_lir_binop(op, lhs, rhs, float)
                 }
@@ -7755,6 +7779,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         use Intrinsic::*;
         match intrinsic {
             StringToString | TaskResult => receiver,
+            // Explicit overflow behavior ignores the build mode (willow-jz15.14).
+            I64WrappingAdd => self.builder.ins().iadd(receiver, args[0]),
+            I64WrappingSub => self.builder.ins().isub(receiver, args[0]),
+            I64WrappingMul => self.builder.ins().imul(receiver, args[0]),
+            I64WrappingNeg => self.builder.ins().ineg(receiver),
+            I64CheckedAdd | I64CheckedSub | I64CheckedMul | I64CheckedNeg => {
+                let (value, overflowed) = match intrinsic {
+                    I64CheckedAdd => self.emit_overflowing_binop(&BinOp::Add, receiver, args[0]),
+                    I64CheckedSub => self.emit_overflowing_binop(&BinOp::Sub, receiver, args[0]),
+                    I64CheckedMul => self.emit_overflowing_binop(&BinOp::Mul, receiver, args[0]),
+                    _ => self.emit_overflowing_neg(receiver),
+                };
+                // `Option<i64>` is a scalar pair: tag 0 `Some`, 1 `None` with
+                // a zero payload, as `emit_alloc_option_none` builds it.
+                let tag = self.builder.ins().uextend(types::I64, overflowed);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let payload = self.builder.ins().select(overflowed, zero, value);
+                self.emit_pair(tag, payload)
+            }
             StringLen => self.emit_value_runtime_call("willow_string_len", &[receiver]),
             StringSubstring => self
                 .emit_value_runtime_call("willow_string_substring", &[receiver, args[0], args[1]]),
@@ -10001,7 +10044,7 @@ mod tests {
             &["fib"],
         );
         let mut poll = lir_sync_poll_blocks(&f);
-        assert!(lir_defer_entry_poll(&f, &mut poll));
+        assert!(lir_defer_entry_poll(&f, &mut poll, false));
         assert!(!poll[0]);
         let mut pending = vec![0];
         let mut visited = HashSet::new();
@@ -10034,9 +10077,24 @@ mod tests {
             let (f, _) = lir_fn_and_tables(source, "f", &["f"]);
             let mut poll = lir_sync_poll_blocks(&f);
             let original = poll.clone();
-            assert!(!lir_defer_entry_poll(&f, &mut poll), "{source}");
+            assert!(!lir_defer_entry_poll(&f, &mut poll, false), "{source}");
             assert_eq!(poll, original);
         }
+    }
+
+    #[test]
+    fn entry_poll_stays_before_debug_overflow_checks() {
+        let (f, _) = lir_fn_and_tables(
+            "fn f(n: i64) -> i64 { if n * 3 < 2 { return n; } return f(n-1) + 1; }",
+            "f",
+            &["f"],
+        );
+        let mut poll = lir_sync_poll_blocks(&f);
+        let original = poll.clone();
+        assert!(!lir_defer_entry_poll(&f, &mut poll, true));
+        assert_eq!(poll, original);
+        assert!(lir_defer_entry_poll(&f, &mut poll, false));
+        assert!(!poll[0]);
     }
 
     #[test]

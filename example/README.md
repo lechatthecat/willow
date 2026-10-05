@@ -143,6 +143,39 @@ infinities, retain their bits. NaN keys raise the recoverable runtime panic
 keep IEEE semantics, and NaN remains valid as a map value. Map `toString()`
 sorts entries by rendered key text for deterministic output.
 
+## Integer arithmetic
+
+[Integer overflow](integer_overflow.wi) shows the `i64` overflow policy:
+
+- Debug builds (the default `willow build`) check `+`, `-`, `*`, `**` and
+  prefix `-` on `i64`. On overflow they raise the recoverable panic
+  ``integer overflow: `<op>` `` (for negation, ``integer overflow: negation of
+  `i64::MIN` ``) at the operator's `file:line:col`. `defer` and `recover()`
+  can catch it, as they can a division by zero.
+- `willow build --release` does not check these operators: they wrap modulo
+  2^64 (two's complement).
+- Division and remainder by zero, and `i64::MIN / -1` and `i64::MIN % -1`,
+  panic in every build.
+- Constant expressions fold only when the result fits. An overflowing constant
+  expression follows the same per-build rule at run time.
+
+The explicit methods behave the same in both builds:
+
+| Method | Result and semantics |
+| --- | --- |
+| `wrapping_add(other: i64)` | `i64` sum modulo 2^64. |
+| `wrapping_sub(other: i64)` | `i64` difference modulo 2^64. |
+| `wrapping_mul(other: i64)` | `i64` product modulo 2^64. |
+| `wrapping_neg()` | `i64` negation modulo 2^64; `i64::MIN` stays `i64::MIN`. |
+| `checked_add(other: i64)` | `Option<i64>`: `Some(sum)`, or `None` on overflow. |
+| `checked_sub(other: i64)` | `Option<i64>`: `Some(difference)`, or `None` on overflow. |
+| `checked_mul(other: i64)` | `Option<i64>`: `Some(product)`, or `None` on overflow. |
+| `checked_neg()` | `Option<i64>`: `Some(-value)`, or `None` for `i64::MIN`. |
+
+Code that relies on modular arithmetic, such as hashes or random-number
+generators, should use the `wrapping_*` methods so that it does not panic in
+debug builds.
+
 ## String methods
 
 `String.len()` returns an `i64` UTF-8 byte count in constant time, excluding

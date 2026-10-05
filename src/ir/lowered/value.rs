@@ -310,7 +310,31 @@ pub enum LirRvalue {
     },
 }
 
+/// Integer operators that debug builds check for signed overflow
+/// (willow-jz15.14). Release builds wrap them; `**` additionally keeps its
+/// negative-exponent guard in both modes.
+pub fn is_overflow_checked_binary(op: &BinOp, operand_ty: &Type) -> bool {
+    *operand_ty == Type::I64 && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow)
+}
+
+/// Integer negation faults only for `i64::MIN`, so negating any other constant
+/// needs no check. A folded `i64::MIN` constant operand keeps the check.
+pub fn is_overflow_checked_unary(op: &UnaryOp, operand: &LirOperand, ty: &Type) -> bool {
+    *op == UnaryOp::Neg
+        && *ty == Type::I64
+        && !matches!(operand, LirOperand::Int(value) if *value != i64::MIN)
+}
+
 impl LirRvalue {
+    /// Whether debug overflow checks give this operation a fault path.
+    pub fn has_overflow_check(&self) -> bool {
+        match self {
+            Self::Binary { op, operand_ty, .. } => is_overflow_checked_binary(op, operand_ty),
+            Self::Unary { op, operand, ty } => is_overflow_checked_unary(op, operand, ty),
+            _ => false,
+        }
+    }
+
     pub fn is_well_typed(&self, locals: &[LirLocal], destination: LirLocalId) -> bool {
         let Some(destination) = locals.get(destination.0 as usize) else {
             return false;

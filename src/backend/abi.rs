@@ -502,6 +502,7 @@ mod alloc_effects_tests {
         "willow_channel_new_bounded",
         "willow_nil_deref",
         "willow_int_div_panic",
+        "willow_int_overflow_panic",
         "willow_panic_raise",
         "willow_async_frame_alloc",
         "willow_select_idle_wait",
