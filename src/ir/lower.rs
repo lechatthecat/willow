@@ -1431,6 +1431,8 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
                 let operand = values.pop().expect("lowered unary operand");
                 let ty = match unary.op {
                     UnaryOp::Neg => operand.ty.clone(),
+                    // `!` is bitwise on `i64` and logical on `bool`.
+                    UnaryOp::Not if operand.ty == Type::I64 => Type::I64,
                     UnaryOp::Not => Type::Bool,
                 };
                 HirExpr {
@@ -2852,9 +2854,17 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
 fn binary_result_type(op: &BinOp, lhs_ty: &Type) -> Type {
     match op {
         // Arithmetic preserves the (already type-checked) operand type.
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Pow => {
-            lhs_ty.clone()
-        }
+        BinOp::Add
+        | BinOp::Sub
+        | BinOp::Mul
+        | BinOp::Div
+        | BinOp::Rem
+        | BinOp::Pow
+        | BinOp::BitAnd
+        | BinOp::BitOr
+        | BinOp::BitXor
+        | BinOp::Shl
+        | BinOp::Shr => lhs_ty.clone(),
         // Comparisons and logical operators always produce `Bool`.
         BinOp::Eq
         | BinOp::Ne

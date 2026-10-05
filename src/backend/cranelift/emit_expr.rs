@@ -9,6 +9,8 @@ pub(super) const INT_OVERFLOW_SUB: i64 = 1;
 pub(super) const INT_OVERFLOW_MUL: i64 = 2;
 pub(super) const INT_OVERFLOW_NEG: i64 = 3;
 pub(super) const INT_OVERFLOW_POW: i64 = 4;
+pub(super) const INT_OVERFLOW_SHL: i64 = 5;
+pub(super) const INT_OVERFLOW_SHR: i64 = 6;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_string_literal(&mut self, value: &str) -> cranelift_codegen::ir::Value {
@@ -299,6 +301,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         self.emit_int_overflow_guard(overflowed, kind, span);
         value
+    }
+
+    /// Debug-build `<<`/`>>` on `i64`: raise a recoverable panic when the
+    /// amount is outside `0..64` (willow-jz15.8). One unsigned compare covers
+    /// negative amounts too.
+    pub(super) fn emit_checked_shift(
+        &mut self,
+        op: &BinOp,
+        lhs: cranelift_codegen::ir::Value,
+        rhs: cranelift_codegen::ir::Value,
+        span: crate::diagnostics::Span,
+    ) -> cranelift_codegen::ir::Value {
+        let out_of_range =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, rhs, 64);
+        let kind = if *op == BinOp::Shl {
+            INT_OVERFLOW_SHL
+        } else {
+            INT_OVERFLOW_SHR
+        };
+        self.emit_int_overflow_guard(out_of_range, kind, span);
+        if *op == BinOp::Shl {
+            self.builder.ins().ishl(lhs, rhs)
+        } else {
+            self.builder.ins().sshr(lhs, rhs)
+        }
     }
 
     /// Branch to a cold `willow_int_overflow_panic` path when `overflowed`

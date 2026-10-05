@@ -1,0 +1,75 @@
+// Bitwise and shift operators on `i64`.
+//
+// `&`, `|`, `^`, `<<` and `>>` take two `i64` operands, and prefix `!` on an
+// `i64` flips every bit (on a `bool` it is still logical not). Precedence
+// follows Rust: `|` < `^` < `&` < `<<`/`>>` < `+`/`-`, all looser than the
+// arithmetic operators and tighter than comparisons. `>>` is arithmetic: it
+// keeps the sign bit.
+
+const READ: i64 = 1;
+const WRITE: i64 = 2;
+const EXEC: i64 = 4;
+
+fn has(flags: i64, flag: i64) -> bool {
+    return flags & flag != 0;
+}
+
+fn popcount(value: i64) -> i64 {
+    let mut x = value;
+    let mut count = 0;
+    while x != 0 {
+        x &= x.wrapping_sub(1);
+        count += 1;
+    }
+    return count;
+}
+
+fn shift_left(value: i64, amount: i64) -> i64 {
+    return value << amount;
+}
+
+fn main() {
+    // Flags: combine with `|`, test with `&`, clear with `& !flag`.
+    let mut perms = READ | WRITE;
+    println(has(perms, WRITE));
+    perms &= !WRITE;
+    println(has(perms, WRITE));
+    perms |= EXEC;
+    println(perms);
+
+    // Precedence: `1 + 2 << 3` is `(1 + 2) << 3`, and `6 & 3 == 2` compares
+    // the masked value.
+    println(1 + 2 << 3);
+    println(6 & 3 == 2);
+    println(1 | 2 ^ 3 & 4);
+
+    // Arithmetic right shift keeps the sign; `!x` is `-x - 1`.
+    println(-16 >> 2);
+    println(!6);
+
+    // A small bitset and an XOR-swap.
+    let mut set = 0;
+    set |= 1 << 3;
+    set |= 1 << 10;
+    set ^= 1 << 3;
+    println(popcount(set));
+    let mut a = 12;
+    let mut b = 34;
+    a ^= b;
+    b ^= a;
+    a ^= b;
+    println(a);
+    println(b);
+
+    // A shift amount outside 0..64 panics in a debug build; a release build
+    // uses its low six bits. Losing high bits with `<<` never panics.
+    println(shift_left(3, 62));
+    if true {
+        defer match recover() {
+            Some(info) => println("recovered: " + info.message),
+            None => println("no panic"),
+        }
+        println(shift_left(1, 64));
+    }
+    println("done");
+}

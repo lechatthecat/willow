@@ -7405,6 +7405,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         negated
                     }
                     UnaryOp::Neg => self.builder.ins().ineg(operand),
+                    UnaryOp::Not if *ty == Type::I64 => self.builder.ins().bnot(operand),
                     UnaryOp::Not => {
                         let one = self.builder.ins().iconst(types::I8, 1);
                         self.builder.ins().bxor(operand, one)
@@ -7495,6 +7496,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // A literal divisor other than 0 and -1 can trip neither the
                 // zero nor the overflow guard (willow-8hq4.14).
                 let unguarded_divisor = matches!(rhs, crate::ir::lowered::LirOperand::Int(divisor) if *divisor != 0 && *divisor != -1);
+                let checked_shift = self.overflow_checks()
+                    && crate::ir::lowered::value::is_overflow_checked_binary(op, rhs, operand_ty)
+                    && matches!(op, BinOp::Shl | BinOp::Shr);
                 let lhs = self.emit_lir_operand(function, lhs);
                 let rhs = self.emit_lir_operand(function, rhs);
                 if *operand_ty == Type::String {
@@ -7545,6 +7549,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
                 {
                     self.emit_checked_int_binop(op, lhs, rhs, span)
+                } else if checked_shift {
+                    self.emit_checked_shift(op, lhs, rhs, span)
                 } else {
                     self.emit_lir_binop(op, lhs, rhs, float)
                 }
@@ -7605,6 +7611,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 BinOp::Ge => ins.fcmp(FloatCC::GreaterThanOrEqual, l, r),
                 BinOp::And | BinOp::Or => unreachable!("short-circuit ops rejected"),
                 BinOp::Pow => unreachable!("`f64 **` is lowered by emit_pow_f64"),
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+                    unreachable!("bitwise operators on f64 are rejected by the checker")
+                }
             };
         }
         match op {
@@ -7613,6 +7622,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             BinOp::Mul => ins.imul(l, r),
             BinOp::Div => ins.sdiv(l, r),
             BinOp::Rem => ins.srem(l, r),
+            BinOp::BitAnd => ins.band(l, r),
+            BinOp::BitOr => ins.bor(l, r),
+            BinOp::BitXor => ins.bxor(l, r),
+            // Cranelift masks the amount to its low six bits, the release
+            // contract for out-of-range shifts (willow-jz15.8).
+            BinOp::Shl => ins.ishl(l, r),
+            BinOp::Shr => ins.sshr(l, r),
             BinOp::Eq => ins.icmp(IntCC::Equal, l, r),
             BinOp::Ne => ins.icmp(IntCC::NotEqual, l, r),
             BinOp::Lt => ins.icmp(IntCC::SignedLessThan, l, r),

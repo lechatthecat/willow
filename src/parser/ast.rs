@@ -1165,6 +1165,15 @@ pub enum BinOp {
     /// `**`. Right-associative and tighter than `*` and unary negation, so
     /// `-2 ** 2` is `-(2 ** 2)` and `2 ** 3 ** 2` is `2 ** (3 ** 2)`.
     Pow,
+    /// Bitwise `&`, `|`, `^` on `i64` (willow-jz15.8).
+    BitAnd,
+    BitOr,
+    BitXor,
+    /// `<<` and arithmetic (sign-extending) `>>` on `i64`. The shift amount
+    /// must be in `0..64`: out of range panics in debug builds and is masked
+    /// to its low six bits in release builds.
+    Shl,
+    Shr,
     Eq,
     Ne,
     Lt,
@@ -1176,6 +1185,14 @@ pub enum BinOp {
 }
 
 impl BinOp {
+    /// Bitwise and shift operators, which apply only to `i64` (willow-jz15.8).
+    pub fn is_integer_only(&self) -> bool {
+        matches!(
+            self,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+        )
+    }
+
     pub fn symbol(&self) -> &'static str {
         match self {
             BinOp::Add => "+",
@@ -1184,6 +1201,11 @@ impl BinOp {
             BinOp::Div => "/",
             BinOp::Rem => "%",
             BinOp::Pow => "**",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
             BinOp::Eq => "==",
             BinOp::Ne => "!=",
             BinOp::Lt => "<",
@@ -1199,6 +1221,7 @@ impl BinOp {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     Neg,
+    /// `!`: logical not on `bool`, bitwise not on `i64` (willow-jz15.8).
     Not,
 }
 

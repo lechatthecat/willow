@@ -1176,10 +1176,13 @@ impl<N> HazardVisitor<'_, N> {
                 let guarded_division = matches!(expr.op, BinOp::Div | BinOp::Rem)
                     && !matches!(ty, Some(Type::F64))
                     && !matches!(expr.rhs, Expr::Integer(divisor, ..) if divisor != 0 && divisor != -1);
-                // Debug builds check integer `+ - *` for overflow.
+                // Debug builds check integer `+ - *` for overflow and a shift
+                // amount outside `0..64` unless it is an in-range literal.
                 let checked = self.overflow_checks
-                    && matches!(expr.op, BinOp::Add | BinOp::Sub | BinOp::Mul)
-                    && !matches!(ty, Some(Type::F64));
+                    && (matches!(expr.op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                        && !matches!(ty, Some(Type::F64))
+                        || matches!(expr.op, BinOp::Shl | BinOp::Shr)
+                            && !matches!(expr.rhs, Expr::Integer(amount, ..) if (0..64).contains(&amount)));
                 if concat || guarded_division || checked || expr.op == BinOp::Pow {
                     self.mark_direct(expression.span());
                 }
@@ -1381,6 +1384,15 @@ mod tests {
             ("return -a;", true),
             ("return -5;", false),
             ("if a < 1 { return 0; } return a;", false),
+            // Shifts check a runtime amount; an in-range literal cannot fault.
+            ("return 1 << a;", true),
+            ("return a >> a;", true),
+            ("return a << 64;", true),
+            ("return a >> -1;", true),
+            ("return a << 63;", false),
+            ("return a >> 0;", false),
+            ("return a & 3 | a ^ 5;", false),
+            ("return !a;", false),
         ] {
             let program = program(&format!("fn f(a: i64) -> i64 {{ {body} }}"));
             let Item::Function(function) = &program.items[0] else {

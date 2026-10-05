@@ -172,14 +172,19 @@ fn main() {
 }
 
 #[test]
-fn test_diagnostic_unary_not_requires_bool_details() {
+fn test_diagnostic_unary_not_requires_bool_or_i64_details() {
+    // `!` is logical on `bool` and bitwise on `i64` (willow-jz15.8).
     assert_compile_error_contains(
         r#"
 fn main() {
-    println(!1);
+    println(!1.0);
 }
 "#,
-        &["error[E0202]", "unary `!`", "requires `bool`"],
+        &[
+            "error[E0202]",
+            "unary `!`",
+            "requires `bool` or `i64`, found `f64`",
+        ],
     );
 }
 
@@ -316,7 +321,9 @@ fn main() {
 }
 
 #[test]
-fn test_diagnostic_single_ampersand_outside_call_arg_is_invalid() {
+fn test_diagnostic_bitwise_and_on_bool_suggests_logical_and() {
+    // Binary `&` is the `i64` bitwise operator (willow-jz15.8); on `bool`
+    // operands it points at `&&`.
     assert_compile_error_contains(
         r#"
 fn main() {
@@ -324,11 +331,12 @@ fn main() {
 }
 "#,
         &[
-            "error[E0102]",
-            "`&` is only valid before a call argument",
+            "error[E0202]",
+            "cannot apply operator `&` to `bool` and `bool`",
             ":3:18",
             "3 |     println(true & false);",
-            "                 ^ `&` is only valid before a call argument",
+            "                 ^ `&` is defined only for `i64` operands",
+            "for `bool` operands, use `&&`",
         ],
     );
 }
@@ -351,9 +359,9 @@ fn main() {
 }
 
 #[test]
-fn test_diagnostic_single_pipe_in_call_is_parse_error() {
-    // `|` is now the lambda-param delimiter, so `true | false` inside a call
-    // is a parse error (unexpected token while expecting `)` or `,`).
+fn test_diagnostic_single_pipe_on_bool_is_an_error() {
+    // Binary `|` is the `i64` bitwise operator (willow-jz15.8), so
+    // `true | false` is a type error; logical or is `||`.
     assert!(expect_compile_error(
         r#"
 fn main() {
@@ -560,11 +568,11 @@ fn main() {
 }
 
 #[test]
-fn test_error_unary_not_requires_bool() {
+fn test_error_unary_not_rejects_string() {
     assert!(expect_compile_error(
         r#"
 fn main() {
-    println(!1);
+    println(!"text");
 }
 "#
     ));

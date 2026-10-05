@@ -242,6 +242,40 @@ impl TypeChecker {
                 }
                 lty
             }
+            // Bitwise and shift operators are integer-only (willow-jz15.8):
+            // `bool` uses `&&`/`||`, and there is no `f64` bit pattern access.
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+                if lty != Type::I64 || rty != Type::I64 {
+                    let mut diagnostic = Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0202,
+                        format!(
+                            "cannot apply operator `{}` to `{}` and `{}`",
+                            b.op.symbol(),
+                            type_name(&lty),
+                            type_name(&rty)
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        b.span,
+                        format!("`{}` is defined only for `i64` operands", b.op.symbol()),
+                    ));
+                    if lty == Type::Bool && rty == Type::Bool {
+                        let logical = match b.op {
+                            BinOp::BitAnd => Some("&&"),
+                            BinOp::BitOr => Some("||"),
+                            BinOp::BitXor => Some("!="),
+                            _ => None,
+                        };
+                        if let Some(logical) = logical {
+                            diagnostic = diagnostic
+                                .with_help(format!("for `bool` operands, use `{logical}`"));
+                        }
+                    }
+                    self.push(diagnostic);
+                }
+                Type::I64
+            }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 if (lty != Type::I64 && lty != Type::F64) || lty != rty {
                     self.push(
@@ -404,6 +438,8 @@ impl TypeChecker {
                 }
                 ty
             }
+            // Bitwise complement on `i64` (willow-jz15.8).
+            UnaryOp::Not if ty == Type::I64 => Type::I64,
             UnaryOp::Not => {
                 if ty != Type::Bool {
                     self.push(
@@ -414,7 +450,7 @@ impl TypeChecker {
                         )
                         .with_label(Label::primary(
                             u.span,
-                            format!("requires `bool`, found `{}`", type_name(&ty)),
+                            format!("requires `bool` or `i64`, found `{}`", type_name(&ty)),
                         )),
                     );
                 }
@@ -627,8 +663,13 @@ mod operator_tree_tests {
             ("-(1 + 2) * -3", Type::I64, 0),
             ("1 + true", Type::I64, 1),
             ("-false", Type::Bool, 1),
-            ("!1", Type::Bool, 1),
+            ("!1", Type::I64, 0),
+            ("!1.0", Type::Bool, 1),
             ("2 ** -1", Type::I64, 1),
+            ("6 & 3 | 1 ^ 2 << 1 >> 1", Type::I64, 0),
+            ("1 & 2 == 0", Type::Bool, 0),
+            ("true & false", Type::I64, 1),
+            ("1.0 << 1", Type::I64, 1),
         ];
         for (expression, expected, error_count) in cases {
             let source = format!("fn probe() {{ let value = {expression}; }}");

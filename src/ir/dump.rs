@@ -415,22 +415,7 @@ fn format_pattern(p: &HirPattern) -> String {
 /// The source spelling of a binary operator. Shared with backend
 /// diagnostics so an operator is named the same way everywhere.
 pub(crate) fn binop_str(op: &BinOp) -> &'static str {
-    match op {
-        BinOp::Add => "+",
-        BinOp::Sub => "-",
-        BinOp::Mul => "*",
-        BinOp::Div => "/",
-        BinOp::Rem => "%",
-        BinOp::Pow => "**",
-        BinOp::Eq => "==",
-        BinOp::Ne => "!=",
-        BinOp::Lt => "<",
-        BinOp::Le => "<=",
-        BinOp::Gt => ">",
-        BinOp::Ge => ">=",
-        BinOp::And => "&&",
-        BinOp::Or => "||",
-    }
+    op.symbol()
 }
 
 fn unaryop_str(op: &UnaryOp) -> &'static str {

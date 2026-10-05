@@ -469,6 +469,13 @@ impl Parser {
     pub(super) fn parse_expr_stmt(&mut self) -> Result<Stmt, Diagnostic> {
         let span = self.current_span();
         let mut expr = self.parse_expr()?;
+        if let Some(op) = self.shift_assign_op() {
+            self.advance();
+            self.advance();
+            let rhs = self.parse_expr()?;
+            self.expect(TokenKind::Semicolon)?;
+            return self.make_compound_assignment(expr, op, rhs, span);
+        }
         if let Some(op) = compound_assignment_op(self.peek_kind()) {
             self.advance();
             let rhs = self.parse_expr()?;
@@ -681,6 +688,9 @@ fn compound_assignment_op(token: &TokenKind) -> Option<BinOp> {
         TokenKind::StarEq => BinOp::Mul,
         TokenKind::SlashEq => BinOp::Div,
         TokenKind::PercentEq => BinOp::Rem,
+        TokenKind::AmpersandEq => BinOp::BitAnd,
+        TokenKind::PipeEq => BinOp::BitOr,
+        TokenKind::CaretEq => BinOp::BitXor,
         _ => return None,
     })
 }

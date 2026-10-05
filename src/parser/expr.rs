@@ -158,8 +158,13 @@ impl Parser {
     }
 
     pub(super) fn parse_cmp(&mut self) -> Result<Expr, Diagnostic> {
-        let mut lhs = self.parse_add()?;
+        let mut lhs = self.parse_bitwise()?;
         loop {
+            // `<<=` / `>>=` end the expression: the statement parser reads
+            // them as compound assignments.
+            if self.shift_assign_op().is_some() {
+                break;
+            }
             let op = match self.peek_kind() {
                 TokenKind::EqEq => BinOp::Eq,
                 TokenKind::BangEq => BinOp::Ne,
@@ -171,7 +176,7 @@ impl Parser {
             };
             let span = self.current_span();
             self.advance();
-            let rhs = self.parse_add()?;
+            let rhs = self.parse_bitwise()?;
             lhs = Expr::Binary(Box::new(BinaryExpr {
                 op,
                 lhs,
@@ -181,6 +186,57 @@ impl Parser {
             }));
         }
         Ok(lhs)
+    }
+
+    /// `|`, `^`, `&`, `<<` and `>>`, all left-associative. They bind tighter
+    /// than comparisons and looser than arithmetic, from loosest to tightest
+    /// `|`, `^`, `&`, then the shifts (Rust's order), so `x & mask == 0` is
+    /// `(x & mask) == 0` and `1 << n - 1` is `1 << (n - 1)` (willow-jz15.8).
+    ///
+    /// One operator-precedence loop covers all four levels: a function per
+    /// level would add three continuations to every expression parse.
+    pub(super) fn parse_bitwise(&mut self) -> Result<Expr, Diagnostic> {
+        fn reduce(operands: &mut Vec<Expr>, (op, span, _): (BinOp, Span, u8)) {
+            let rhs = operands.pop().expect("bitwise right operand");
+            let lhs = operands.pop().expect("bitwise left operand");
+            operands.push(Expr::Binary(Box::new(BinaryExpr {
+                op,
+                lhs,
+                rhs,
+                span,
+                id: ExprId::fresh(),
+            })));
+        }
+        let mut operands = vec![self.parse_add()?];
+        let mut operators: Vec<(BinOp, Span, u8)> = Vec::new();
+        loop {
+            let (op, precedence, width) = match self.peek_kind() {
+                TokenKind::Pipe => (BinOp::BitOr, 0, 1),
+                TokenKind::Caret => (BinOp::BitXor, 1, 1),
+                TokenKind::Ampersand => (BinOp::BitAnd, 2, 1),
+                _ => match self.shift_op() {
+                    Some(op) => (op, 3, 2),
+                    None => break,
+                },
+            };
+            while operators
+                .last()
+                .is_some_and(|&(_, _, top)| top >= precedence)
+            {
+                reduce(&mut operands, operators.pop().expect("checked operator"));
+            }
+            let mut span = self.current_span();
+            for _ in 0..width {
+                span = span.to(self.current_span());
+                self.advance();
+            }
+            operators.push((op, span, precedence));
+            operands.push(self.parse_add()?);
+        }
+        while let Some(operator) = operators.pop() {
+            reduce(&mut operands, operator);
+        }
+        Ok(operands.pop().expect("bitwise operand"))
     }
 
     pub(super) fn parse_add(&mut self) -> Result<Expr, Diagnostic> {

@@ -176,6 +176,8 @@ mod runtime;
 #[path = "integration/runtime_safety_matrix.rs"]
 mod runtime_safety_matrix;
 
+#[path = "integration/bitwise_operators.rs"]
+mod bitwise_operators;
 #[path = "integration/concurrency.rs"]
 mod concurrency;
 #[path = "integration/exponentiation.rs"]

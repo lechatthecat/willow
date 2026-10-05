@@ -103,7 +103,8 @@ pub extern "C" fn willow_int_div_panic(kind: i64, file: *const u8, line: i32, co
 }
 
 /// Debug-build signed overflow check failure (willow-jz15.14). `kind`:
-/// 0 = `+`, 1 = `-`, 2 = `*`, 3 = unary `-`, 4 = `**`. Release builds wrap
+/// 0 = `+`, 1 = `-`, 2 = `*`, 3 = unary `-`, 4 = `**`, 5 = `<<` and 6 = `>>`
+/// with an amount outside `0..64` (willow-jz15.8). Release builds wrap
 /// and never call this. `file` is a WillowString pointer.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -122,7 +123,9 @@ fn int_overflow_message(kind: i64) -> &'static str {
         1 => "integer overflow: `-`",
         2 => "integer overflow: `*`",
         3 => "integer overflow: negation of `i64::MIN`",
-        _ => "integer overflow: `**`",
+        4 => "integer overflow: `**`",
+        5 => "integer overflow: `<<` shift amount outside 0..64",
+        _ => "integer overflow: `>>` shift amount outside 0..64",
     }
 }
 
@@ -142,7 +145,7 @@ mod tests {
 
     #[test]
     fn int_overflow_messages_name_the_operator() {
-        let messages: Vec<_> = (0..5).map(int_overflow_message).collect();
+        let messages: Vec<_> = (0..7).map(int_overflow_message).collect();
         assert_eq!(
             messages,
             [
@@ -151,6 +154,8 @@ mod tests {
                 "integer overflow: `*`",
                 "integer overflow: negation of `i64::MIN`",
                 "integer overflow: `**`",
+                "integer overflow: `<<` shift amount outside 0..64",
+                "integer overflow: `>>` shift amount outside 0..64",
             ]
         );
     }

@@ -312,9 +312,18 @@ pub enum LirRvalue {
 
 /// Integer operators that debug builds check for signed overflow
 /// (willow-jz15.14). Release builds wrap them; `**` additionally keeps its
-/// negative-exponent guard in both modes.
-pub fn is_overflow_checked_binary(op: &BinOp, operand_ty: &Type) -> bool {
-    *operand_ty == Type::I64 && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow)
+/// negative-exponent guard in both modes. A shift checks its amount against
+/// `0..64` (willow-jz15.8), so a literal amount in range needs no check;
+/// release builds mask the amount to its low six bits.
+pub fn is_overflow_checked_binary(op: &BinOp, rhs: &LirOperand, operand_ty: &Type) -> bool {
+    *operand_ty == Type::I64
+        && match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow => true,
+            BinOp::Shl | BinOp::Shr => {
+                !matches!(rhs, LirOperand::Int(amount) if (0..64).contains(amount))
+            }
+            _ => false,
+        }
 }
 
 /// Integer negation faults only for `i64::MIN`, so negating any other constant
@@ -329,7 +338,12 @@ impl LirRvalue {
     /// Whether debug overflow checks give this operation a fault path.
     pub fn has_overflow_check(&self) -> bool {
         match self {
-            Self::Binary { op, operand_ty, .. } => is_overflow_checked_binary(op, operand_ty),
+            Self::Binary {
+                op,
+                rhs,
+                operand_ty,
+                ..
+            } => is_overflow_checked_binary(op, rhs, operand_ty),
             Self::Unary { op, operand, ty } => is_overflow_checked_unary(op, operand, ty),
             _ => false,
         }
@@ -419,7 +433,7 @@ impl LirRvalue {
                     && destination.ty == *expected
                     && match op {
                         UnaryOp::Neg => matches!(expected, Type::I64 | Type::F64),
-                        UnaryOp::Not => *expected == Type::Bool,
+                        UnaryOp::Not => matches!(expected, Type::Bool | Type::I64),
                     }
             }
             Self::Binary {
@@ -442,7 +456,8 @@ impl LirRvalue {
                     && destination.ty == result
                     && !matches!(op, BinOp::And | BinOp::Or)
                     && match operand_ty {
-                        Type::I64 | Type::F64 => true,
+                        Type::I64 => true,
+                        Type::F64 => !op.is_integer_only(),
                         Type::Bool => matches!(op, BinOp::Eq | BinOp::Ne),
                         Type::String => matches!(op, BinOp::Add | BinOp::Eq | BinOp::Ne),
                         Type::Named(_) | Type::Generic(_, _) => matches!(op, BinOp::Eq | BinOp::Ne),

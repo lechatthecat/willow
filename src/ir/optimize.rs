@@ -40,6 +40,13 @@ fn binary(op: &BinOp, lhs: Constant, rhs: Constant) -> Option<Constant> {
             Mul => Int(a.checked_mul(b)?),
             Div => Int(a.checked_div(b)?),
             Rem => Int(a.checked_rem(b)?),
+            BitAnd => Int(a & b),
+            BitOr => Int(a | b),
+            BitXor => Int(a ^ b),
+            // An amount outside `0..64` is a debug fault and a masked shift in
+            // release builds, so it stays for the backend.
+            Shl if (0..64).contains(&b) => Int(a << b),
+            Shr if (0..64).contains(&b) => Int(a >> b),
             Pow if b >= 0 => {
                 // Bounded by the exponent's bit width, including i64::MAX. The
                 // backend's schedule: square only while bits remain, so an
@@ -89,6 +96,7 @@ pub(crate) fn fold_expr(expr: &mut HirExpr) {
             HirExprKind::Unary { op, operand } => match (op, get(operand)) {
                 (UnaryOp::Neg, Some(Constant::Int(n))) => n.checked_neg().map(Constant::Int),
                 (UnaryOp::Not, Some(Constant::Bool(b))) => Some(Constant::Bool(!b)),
+                (UnaryOp::Not, Some(Constant::Int(n))) => Some(Constant::Int(!n)),
                 _ => None,
             },
             HirExprKind::Binary { op, lhs, rhs } => match (get(lhs), get(rhs)) {
@@ -1614,6 +1622,20 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
     }
 
     #[test]
+    fn folds_integer_bitwise_not() {
+        let mut expr = HirExpr {
+            kind: HirExprKind::Unary {
+                op: UnaryOp::Not,
+                operand: Box::new(bin(BinOp::BitOr, int(4), int(1))),
+            },
+            ty: Type::I64,
+            span: Span::dummy(),
+        };
+        fold_expr(&mut expr);
+        assert_eq!(expr, int(-6));
+    }
+
+    #[test]
     fn folds_constant_exponent_but_preserves_dynamic_base() {
         let base = HirExpr {
             kind: HirExprKind::Call {
@@ -1652,6 +1674,11 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
             (BinOp::Div, i64::MIN, -1),
             (BinOp::Rem, i64::MIN, -1),
             (BinOp::Pow, 2, -1),
+            // Out-of-range shift amounts fault or mask per build mode.
+            (BinOp::Shl, 1, 64),
+            (BinOp::Shl, 1, -1),
+            (BinOp::Shr, -1, 64),
+            (BinOp::Shr, 1, i64::MIN),
         ] {
             let mut expr = bin(op, int(a), int(b));
             let original = expr.clone();
@@ -1666,6 +1693,13 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
             (BinOp::Pow, -1, i64::MAX, -1),
             (BinOp::Div, -7, 3, -2),
             (BinOp::Rem, -7, 3, -1),
+            (BinOp::BitAnd, -6, 255, 250),
+            (BinOp::BitOr, 12, 10, 14),
+            (BinOp::BitXor, 12, 10, 6),
+            (BinOp::Shl, 1, 63, i64::MIN),
+            (BinOp::Shl, 3, 0, 3),
+            (BinOp::Shr, -16, 2, -4),
+            (BinOp::Shr, i64::MIN, 63, -1),
         ] {
             let mut expr = bin(op, int(a), int(b));
             fold_expr(&mut expr);

@@ -40,6 +40,18 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
   synchronous-stack preemption ships, at which point recursive SCCs preempt
   instead of erroring. See `example/task_recursion_rejected.wi`.
 
+### Added
+
+- **Bitwise and shift operators on `i64`.** `&`, `|`, `^`, `<<`, `>>` and
+  their compound assignments (`&=`, `|=`, `^=`, `<<=`, `>>=`) now work on
+  `i64`, and prefix `!` on an `i64` is bitwise not (on `bool` it is still
+  logical not). Precedence follows Rust: `|` < `^` < `&` < shifts, all between
+  comparisons and `+`/`-`. `>>` is arithmetic. A shift amount outside `0..64`
+  panics in debug builds with
+  ``integer overflow: `<<` shift amount outside 0..64``; `--release` masks it
+  to the low six bits. Using `&` or `|` on `bool` is still error E0202, now
+  with a hint to use `&&`/`||`. See `example/bitwise_operators.wi`.
+
 ### Fixed
 
 - **Class `extends` cycles are now rejected with E0426.** A ring such as

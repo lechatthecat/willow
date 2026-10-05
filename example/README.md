@@ -176,6 +176,26 @@ Code that relies on modular arithmetic, such as hashes or random-number
 generators, should use the `wrapping_*` methods so that it does not panic in
 debug builds.
 
+[Bitwise operators](bitwise_operators.wi) shows `&`, `|`, `^`, `<<`, `>>`
+and prefix `!` on `i64`, with the compound forms `&=`, `|=`, `^=`, `<<=` and
+`>>=`:
+
+- They accept only `i64` operands. On `bool`, use `&&`, `||` and `!=`.
+  Prefix `!` is bitwise not on `i64` and logical not on `bool`; there is no
+  `~` operator.
+- Precedence follows Rust, from loosest to tightest: `||`, `&&`, comparisons,
+  `|`, `^`, `&`, `<<`/`>>`, `+`/`-`, `*`/`/`/`%`, prefix `-`/`!`, `**`. All
+  binary operators are left-associative except `**`. So `1 + 2 << 3` is 24 and
+  `flags & READ != 0` compares the masked value.
+- `>>` is an arithmetic shift: it copies the sign bit, so `-16 >> 2` is -4.
+- A shift amount outside `0..64` raises the recoverable panic
+  ``integer overflow: `<<` shift amount outside 0..64`` (or `` `>>` ``) in a
+  debug build. A `--release` build uses the amount's low six bits. `<<` never
+  checks for bits shifted out of the top, so `3 << 62` is a valid negative
+  number.
+- `<<` and `>>` are written without a space between the two characters.
+  A generic type such as `Option<Option<i64>>` still closes normally.
+
 ## String methods
 
 `String.len()` returns an `i64` UTF-8 byte count in constant time, excluding

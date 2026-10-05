@@ -80,8 +80,14 @@ pub enum TokenKind {
     GtEq,
     And,
     Ampersand,
+    /// `&=`, `|=`, `^=` and `^` (willow-jz15.8). `<<`/`>>` and their
+    /// compound forms are adjacent `<`/`>` tokens assembled by the parser.
+    AmpersandEq,
     Or,
     Pipe,
+    PipeEq,
+    Caret,
+    CaretEq,
     Bang,
     Question,
 

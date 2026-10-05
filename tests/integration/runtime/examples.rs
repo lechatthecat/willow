@@ -533,6 +533,11 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "-9223372036854775808\n9223372036854775807\n-2\n-9223372036854775808\n\
              None\nSome(42)\nNone\nSome(42)\nrecovered: integer overflow: `+`\ndone\n",
         ),
+        (
+            "example/bitwise_operators.wi",
+            "true\nfalse\n5\n24\ntrue\n3\n-4\n-7\n1\n34\n12\n-4611686018427387904\n\
+             recovered: integer overflow: `<<` shift amount outside 0..64\ndone\n",
+        ),
         ("example/grouped_imports.wi", "42\n"),
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),

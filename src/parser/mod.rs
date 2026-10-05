@@ -23,6 +23,59 @@ pub struct Parser {
     /// rest of the surrounding item (which used to cascade into a false
     /// `missing entry point` on `main`).
     recovered_errors: Vec<Diagnostic>,
+    /// `ternary_colon_table` for `tokens`, built on the first ambiguous `?`.
+    ternary_colon: std::cell::OnceCell<Vec<bool>>,
+}
+
+/// A token that ends a `?`-ternary colon scan at any nesting depth.
+fn ends_ternary_scan(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Semicolon
+            | TokenKind::Eq
+            | TokenKind::LBrace
+            | TokenKind::RBrace
+            | TokenKind::FatArrow
+            | TokenKind::Eof
+    )
+}
+
+/// For each token position `i` (plus one past the end), whether scanning
+/// forward from `i` at nesting depth 0 meets a `Colon` before the expression
+/// ends: `;`, `=`, `{`, `}`, `=>` or EOF at any depth, or `,` or an unbalanced
+/// `)`/`]` at depth 0. Inside a `(`/`[` group, colons and commas are skipped.
+/// One forward pass matches each group with its closer, and one backward pass
+/// fills the answers, so the table costs O(tokens).
+fn ternary_colon_table(tokens: &[Token]) -> Vec<bool> {
+    // For an opener, the position just past its closer, or `None` when a
+    // boundary or EOF comes first.
+    let mut after_group = vec![None; tokens.len()];
+    let mut open = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            TokenKind::LParen | TokenKind::LBracket => open.push(i),
+            TokenKind::RParen | TokenKind::RBracket => {
+                if let Some(opener) = open.pop() {
+                    after_group[opener] = Some(i + 1);
+                }
+            }
+            kind if ends_ternary_scan(kind) => open.clear(),
+            _ => {}
+        }
+    }
+    let mut colon_ahead = vec![false; tokens.len() + 1];
+    for i in (0..tokens.len()).rev() {
+        colon_ahead[i] = match &tokens[i].kind {
+            TokenKind::Colon => true,
+            TokenKind::Comma | TokenKind::RParen | TokenKind::RBracket => false,
+            TokenKind::LParen | TokenKind::LBracket => {
+                after_group[i].is_some_and(|next: usize| colon_ahead[next])
+            }
+            kind if ends_ternary_scan(kind) => false,
+            _ => colon_ahead[i + 1],
+        };
+    }
+    colon_ahead
 }
 
 #[willow_continuations::parser]
@@ -34,6 +87,7 @@ impl Parser {
             pos: 0,
             allow_object_literals: true,
             recovered_errors: Vec::new(),
+            ternary_colon: std::cell::OnceCell::new(),
         }
     }
 
@@ -168,11 +222,14 @@ impl Parser {
         //   1. Unambiguous expression starts → ternary.
         //   2. Ambiguous tokens that ALSO continue a binary/lambda expression
         //      (`Minus`: `r? - 1` vs `c ? -1 : 2`; `Or`: `r? || b` vs
-        //      `c ? || 1 : || 2`) → resolved by scanning ahead for the
-        //      ternary's mandatory `:` at the same nesting level.
+        //      `c ? || 1 : || 2`; `Pipe`: `r? | m` vs `c ? |x| x : f`) →
+        //      resolved by scanning ahead for the ternary's mandatory `:` at
+        //      the same nesting level.
         //   3. Everything else → try-propagate.
         match next {
-            Some(TokenKind::Minus | TokenKind::Or) => !self.ternary_colon_ahead(next_pos + 1),
+            Some(TokenKind::Minus | TokenKind::Or | TokenKind::Pipe) => {
+                !self.ternary_colon_ahead(next_pos + 1)
+            }
             _ => !matches!(
                 next,
                 Some(
@@ -185,14 +242,12 @@ impl Parser {
                         | TokenKind::LParen
                         | TokenKind::LBracket
                         | TokenKind::Bang
-                        | TokenKind::Ampersand
                         | TokenKind::Nil
                         | TokenKind::New
                         | TokenKind::SelfKw
                         | TokenKind::Match
                         | TokenKind::Await
                         | TokenKind::Select
-                        | TokenKind::Pipe
                         | TokenKind::Print
                         | TokenKind::Println
                 )
@@ -201,33 +256,44 @@ impl Parser {
     }
 
     /// Disambiguate an ambiguous token after `?` by looking for the ternary's
-    /// mandatory `:` before the expression can end. Scans from `from`, tracking
-    /// `(`/`[` nesting; a `Colon` at nesting level 0 means the `?` opened a
-    /// ternary. Statement/argument boundaries (`;`, `=`, `{`, `}`, `,`, `=>`,
-    /// unbalanced `)`/`]`, EOF) end the scan as try-propagate.
+    /// mandatory `:` before the expression can end: a `Colon` at nesting
+    /// level 0 from `from` means the `?` opened a ternary. Statement/argument
+    /// boundaries (`;`, `=`, `{`, `}`, `,`, `=>`, unbalanced `)`/`]`, EOF) end
+    /// the scan as try-propagate. The answers for every position come from one
+    /// O(tokens) table built on first use, so a statement with many ambiguous
+    /// `?` (`a? | b? | c?`) is not rescanned per `?`.
     fn ternary_colon_ahead(&self, from: usize) -> bool {
-        let mut depth: i32 = 0;
-        for token in self.tokens.iter().skip(from) {
-            match &token.kind {
-                TokenKind::LParen | TokenKind::LBracket => depth += 1,
-                TokenKind::RParen | TokenKind::RBracket => {
-                    if depth == 0 {
-                        return false; // closes an enclosing group — expression ended
-                    }
-                    depth -= 1;
-                }
-                TokenKind::Colon if depth == 0 => return true,
-                TokenKind::Semicolon
-                | TokenKind::Eq
-                | TokenKind::LBrace
-                | TokenKind::RBrace
-                | TokenKind::FatArrow
-                | TokenKind::Eof => return false,
-                TokenKind::Comma if depth == 0 => return false,
-                _ => {}
-            }
+        self.ternary_colon
+            .get_or_init(|| ternary_colon_table(&self.tokens))
+            .get(from)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// The kind of the token after the current one when the two touch, so a
+    /// two-token operator such as `<<` is never assembled from `< <`.
+    fn adjacent_next_kind(&self) -> Option<&TokenKind> {
+        let current = &self.tokens[self.pos];
+        let next = self.tokens.get(self.pos + 1)?;
+        (current.span.end == next.span.start).then_some(&next.kind)
+    }
+
+    /// `<<` or `>>` at the current position.
+    fn shift_op(&self) -> Option<BinOp> {
+        match (self.peek_kind(), self.adjacent_next_kind()?) {
+            (TokenKind::Lt, TokenKind::Lt) => Some(BinOp::Shl),
+            (TokenKind::Gt, TokenKind::Gt) => Some(BinOp::Shr),
+            _ => None,
         }
-        false
+    }
+
+    /// `<<=` or `>>=` (a `<`/`>` touching `<=`/`>=`) at the current position.
+    fn shift_assign_op(&self) -> Option<BinOp> {
+        match (self.peek_kind(), self.adjacent_next_kind()?) {
+            (TokenKind::Lt, TokenKind::LtEq) => Some(BinOp::Shl),
+            (TokenKind::Gt, TokenKind::GtEq) => Some(BinOp::Shr),
+            _ => None,
+        }
     }
 
     fn eat(&mut self, kind: TokenKind) -> bool {
@@ -1592,19 +1658,18 @@ class ProtectedCtor { prot init(self) {} }
             | TokenKind::LParen
             | TokenKind::LBracket
             | TokenKind::Bang
-            | TokenKind::Ampersand // reference marker only exists in call args
             | TokenKind::New
             | TokenKind::SelfKw
             | TokenKind::Match
             | TokenKind::Await
             | TokenKind::Select
-            | TokenKind::Pipe
             | TokenKind::Print
             | TokenKind::Println => AfterQuestion::Ternary,
 
             // `r? - 1` (binary minus on the try result) vs `c ? -1 : 2`
             // (negative then-branch); `r? || b` vs `c ? || 1 : || 2` (lambda).
-            TokenKind::Minus | TokenKind::Or => AfterQuestion::Contextual,
+            // `r? | m` (bitwise or) vs `c ? |x| x : f` (lambda).
+            TokenKind::Minus | TokenKind::Or | TokenKind::Pipe => AfterQuestion::Contextual,
 
             // Binary/postfix operators and punctuation cannot start an
             // expression → try-propagate.
@@ -1626,6 +1691,13 @@ class ProtectedCtor { prot init(self) {} }
             | TokenKind::Gt
             | TokenKind::GtEq
             | TokenKind::And
+            // `&` before an expression only marks a call argument, so after
+            // `?` it is always the bitwise operator.
+            | TokenKind::Ampersand
+            | TokenKind::AmpersandEq
+            | TokenKind::PipeEq
+            | TokenKind::Caret
+            | TokenKind::CaretEq
             | TokenKind::Question
             | TokenKind::Semicolon
             | TokenKind::Colon
@@ -1744,8 +1816,12 @@ class ProtectedCtor { prot init(self) {} }
             TokenKind::GtEq,
             TokenKind::And,
             TokenKind::Ampersand,
+            TokenKind::AmpersandEq,
             TokenKind::Or,
             TokenKind::Pipe,
+            TokenKind::PipeEq,
+            TokenKind::Caret,
+            TokenKind::CaretEq,
             TokenKind::Bang,
             TokenKind::Question,
             TokenKind::Semicolon,
@@ -2231,6 +2307,144 @@ class ProtectedCtor { prot init(self) {} }
             panic!("expected a let statement");
         };
         shape(&let_stmt.init)
+    }
+
+    // ── Bitwise and shift precedence (willow-jz15.8) ────────────────────────
+    #[test]
+    fn bitwise_precedence_follows_rust() {
+        assert_eq!(expr_shape("a | b ^ c & d"), "(a | (b ^ (c & d)))");
+        assert_eq!(expr_shape("a & b << c"), "(a & (b << c))");
+        assert_eq!(expr_shape("1 << n - 1"), "(1 << (n - 1))");
+        assert_eq!(expr_shape("a >> 2 * b"), "(a >> (2 * b))");
+        assert_eq!(expr_shape("x & m == 0"), "((x & m) == 0)");
+        assert_eq!(expr_shape("a | b < c"), "((a | b) < c)");
+        assert_eq!(
+            expr_shape("a == b && c | d != 0"),
+            "((a == b) && ((c | d) != 0))"
+        );
+        assert_eq!(expr_shape("!a & -b"), "((!a) & (-b))");
+        assert_eq!(expr_shape("2 ** 3 << 1"), "((2 ** 3) << 1)");
+    }
+
+    #[test]
+    fn bitwise_operators_are_left_associative() {
+        assert_eq!(expr_shape("a - b << c >> d"), "(((a - b) << c) >> d)");
+        assert_eq!(expr_shape("a & b & c"), "((a & b) & c)");
+        assert_eq!(expr_shape("a ^ b ^ c"), "((a ^ b) ^ c)");
+        assert_eq!(expr_shape("a | b | c"), "((a | b) | c)");
+    }
+
+    #[test]
+    fn shift_needs_touching_angle_brackets() {
+        let program = parse_ok("fn main() { let x = 1 << 2; }");
+        let Stmt::Let(let_stmt) = &first_function(&program).body.stmts[0] else {
+            panic!("expected a let statement");
+        };
+        let Expr::Binary(b) = &let_stmt.init else {
+            panic!("expected a binary expression");
+        };
+        // The operator span covers both characters.
+        assert_eq!(b.span.end - b.span.start, 2);
+        assert!(!parse_errors("fn main() { let x = 1 < < 2; }").is_empty());
+        assert!(!parse_errors("fn main() { let mut x = 1; x < <= 2; }").is_empty());
+    }
+
+    #[test]
+    fn nested_generic_closer_is_not_a_shift() {
+        parse_ok("fn main() { let x: Option<Option<i64>> = None; let y = x; }");
+        parse_ok(
+            "fn main() { let x: Map<i64, Option<Option<i64>>> = new Map<i64, Option<Option<i64>>>(); }",
+        );
+    }
+
+    /// The per-position rescan that `ternary_colon_table` replaces.
+    fn ternary_colon_scan(tokens: &[Token], from: usize) -> bool {
+        let mut depth: i32 = 0;
+        for token in tokens.iter().skip(from) {
+            match &token.kind {
+                TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Colon if depth == 0 => return true,
+                kind if ends_ternary_scan(kind) => return false,
+                TokenKind::Comma if depth == 0 => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn ternary_colon_table_matches_a_rescan_at_every_position() {
+        for source in [
+            "fn main() { let f = c ? |x: i64| x | 1 : |x: i64| x & 1; }",
+            "fn f(o: Option<i64>) -> Option<i64> { return Some(o? | (a ? b : c) | g(x, y: z)); }",
+            "fn main() { let v = c ? [1, 2][0] : (p ? 1 : 2); h(a? | b, [x ? 1 : 2]); }",
+            "fn main() { let v = (a ? ( b : c; d ] : e) ) : x; match y { _ => z ? 1 : 2 } }",
+            "fn main() { let v = a ? (b",
+        ] {
+            let tokens = Lexer::new(source).tokenize().expect("lexing failed");
+            let table = ternary_colon_table(&tokens);
+            assert_eq!(table.len(), tokens.len() + 1, "{source}");
+            for (from, &ahead) in table.iter().enumerate() {
+                assert_eq!(
+                    ahead,
+                    ternary_colon_scan(&tokens, from),
+                    "{source} at token {from}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_try_or_chain_parses_as_bitwise_or() {
+        let operands = 2000;
+        let chain = (0..operands)
+            .map(|i| format!("o{i}?"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let program = parse_ok(&format!(
+            "fn f(o0: Option<i64>) -> Option<i64> {{ return Some({chain}); }}"
+        ));
+        let Stmt::Return(ReturnStmt {
+            value: Some(Expr::Call(call)),
+            ..
+        }) = &first_function(&program).body.stmts[0]
+        else {
+            panic!("expected a `Some(...)` call");
+        };
+        let mut ors = 0;
+        let mut expr = &call.args[0].expr;
+        while let Expr::Binary(b) = expr {
+            assert_eq!(b.op, BinOp::BitOr);
+            ors += 1;
+            expr = &b.lhs;
+        }
+        assert_eq!(ors, operands - 1);
+    }
+
+    #[test]
+    fn compound_bitwise_assignments_desugar_to_binary_ops() {
+        for (op, expected) in [
+            ("&=", BinOp::BitAnd),
+            ("|=", BinOp::BitOr),
+            ("^=", BinOp::BitXor),
+            ("<<=", BinOp::Shl),
+            (">>=", BinOp::Shr),
+        ] {
+            let program = parse_ok(&format!("fn main() {{ let mut x = 1; x {op} 3; }}"));
+            let Stmt::Assign(assign) = &first_function(&program).body.stmts[1] else {
+                panic!("{op}: expected an assignment");
+            };
+            let Expr::Binary(b) = &assign.value else {
+                panic!("{op}: expected a binary value");
+            };
+            assert_eq!(b.op, expected, "{op}");
+        }
     }
 
     // Perspective 1: a bare power parses as one Binary node with BinOp::Pow.

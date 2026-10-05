@@ -167,6 +167,9 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some(b'&') {
                     self.advance();
                     TokenKind::And
+                } else if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::AmpersandEq
                 } else {
                     TokenKind::Ampersand
                 }
@@ -176,8 +179,20 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some(b'|') {
                     self.advance();
                     TokenKind::Or
+                } else if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::PipeEq
                 } else {
                     TokenKind::Pipe
+                }
+            }
+            b'^' => {
+                self.advance();
+                if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::CaretEq
+                } else {
+                    TokenKind::Caret
                 }
             }
             b'"' => return self.lex_string().map(Some),
@@ -738,6 +753,29 @@ mod tests {
     }
 
     // ── Integer literals: invalid ────────────────────────────────────────────
+
+    // Bitwise operators (willow-jz15.8): `<`/`>` stay single tokens so the
+    // parser can tell `>>` from two generic closers.
+    #[test]
+    fn bitwise_operator_tokens() {
+        assert_eq!(
+            kinds("& &= && | |= || ^ ^= << >>= ").unwrap(),
+            vec![
+                TokenKind::Ampersand,
+                TokenKind::AmpersandEq,
+                TokenKind::And,
+                TokenKind::Pipe,
+                TokenKind::PipeEq,
+                TokenKind::Or,
+                TokenKind::Caret,
+                TokenKind::CaretEq,
+                TokenKind::Lt,
+                TokenKind::Lt,
+                TokenKind::Gt,
+                TokenKind::GtEq,
+            ]
+        );
+    }
 
     // Perspective 18: an obviously-too-big integer is E0052 (was silently 0).
     #[test]
