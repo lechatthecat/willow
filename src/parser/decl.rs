@@ -142,6 +142,15 @@ impl Parser {
             TokenKind::Fn => Ok(Item::Function(self.parse_fn(public, is_async)?)),
             TokenKind::Class => Ok(Item::Class(self.parse_class(public, is_open)?)),
             TokenKind::Enum => Ok(Item::Enum(self.parse_enum_decl(public)?)),
+            TokenKind::Const if is_open => Err(self.err(
+                ErrorCode::E0105,
+                "`open` cannot be used on a `const` declaration",
+            )),
+            TokenKind::Const if is_async => Err(self.err(
+                ErrorCode::E0105,
+                "`async` cannot be used on a `const` declaration",
+            )),
+            TokenKind::Const => Ok(Item::Function(self.parse_const(public)?)),
             TokenKind::Interface if is_open => Err(self.err(
                 ErrorCode::E0105,
                 "`open` cannot be used on an interface declaration",
@@ -154,7 +163,7 @@ impl Parser {
             _ if is_async => Err(self.err(ErrorCode::E0105, "`async` can only be used on `fn`")),
             _ => Err(self.err(
                 ErrorCode::E0105,
-                "expected `fn`, `class`, `enum`, or `interface`",
+                "expected `fn`, `class`, `enum`, `interface`, or `const`",
             )),
         }
     }
@@ -760,6 +769,82 @@ impl Parser {
             return_type,
             body,
             span,
+            constant: None,
+        })
+    }
+
+    /// `[pub] const NAME: T = literal;` (willow-jz15.10). The constant is
+    /// represented as a zero-parameter function returning the literal and
+    /// carrying the value in [`FunctionDecl::constant`]; see there.
+    pub(super) fn parse_const(&mut self, public: bool) -> Result<FunctionDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(TokenKind::Const)?;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::Colon)?;
+        let type_span = self.current_span();
+        let return_type = self.parse_type()?;
+        let type_span = type_span.to(self.previous_span());
+        self.expect(TokenKind::Eq)?;
+        let value = self.parse_expr()?;
+        let end = self.current_span();
+        self.expect(TokenKind::Semicolon)?;
+        let span = start.to(end);
+        let constant = const_literal(&value).ok_or_else(|| {
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0109,
+                format!("`const {name}` must be initialized with a literal"),
+            )
+            .with_label(Label::primary(value.span(), "not a literal"))
+            .with_help("use an integer, float, `true`/`false`, or string literal")
+        })?;
+        if !matches!(
+            return_type,
+            Type::I64 | Type::F64 | Type::Bool | Type::String
+        ) {
+            return Err(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0110,
+                format!(
+                    "`const {name}` cannot have type `{}`",
+                    crate::semantic::type_checker::types::type_name(&return_type)
+                ),
+            )
+            .with_label(Label::primary(type_span, "unsupported constant type"))
+            .with_help("a constant's type must be `i64`, `f64`, `bool`, or `String`"));
+        }
+        if constant.ty() != return_type {
+            let type_name = crate::semantic::type_checker::types::type_name::<String>;
+            let declared = type_name(&return_type);
+            return Err(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0110,
+                format!(
+                    "mismatched types: `const {name}` is declared `{declared}`, but its value is `{}`",
+                    type_name(&constant.ty())
+                ),
+            )
+            .with_label(Label::primary(value.span(), format!("expected `{declared}`")))
+            .with_label(Label::secondary(type_span, "declared type")));
+        }
+        let return_span = value.span();
+        let body = Block {
+            id: BodyId::fresh(),
+            stmts: vec![Stmt::Return(ReturnStmt {
+                value: Some(value),
+                span: return_span,
+            })],
+            span,
+        };
+        Ok(FunctionDecl {
+            name,
+            public,
+            is_async: false,
+            params: Vec::new(),
+            return_type,
+            body,
+            span,
+            constant: Some(constant),
         })
     }
 
@@ -796,5 +881,21 @@ impl Parser {
             span,
             type_span,
         })
+    }
+}
+
+/// The value of a `const` initializer: a literal, or a negated numeric literal.
+fn const_literal(expr: &Expr) -> Option<ConstValue> {
+    match expr {
+        Expr::Integer(value, ..) => Some(ConstValue::Integer(*value)),
+        Expr::Float(value, ..) => Some(ConstValue::Float(*value)),
+        Expr::Bool(value, ..) => Some(ConstValue::Bool(*value)),
+        Expr::String(value, ..) => Some(ConstValue::String(value.clone())),
+        Expr::Unary(unary) if matches!(unary.op, UnaryOp::Neg) => match &unary.expr {
+            Expr::Integer(value, ..) => value.checked_neg().map(ConstValue::Integer),
+            Expr::Float(value, ..) => Some(ConstValue::Float(-*value)),
+            _ => None,
+        },
+        _ => None,
     }
 }

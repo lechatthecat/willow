@@ -141,6 +141,10 @@ pub struct FuncInfo {
     pub is_async: bool,
     pub declaration_span: Span,
     pub module_path: Option<String>,
+    /// The value of a module-level `const` (willow-jz15.10); `None` for every
+    /// callable function. A constant's name is a value of `return_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constant: Option<crate::parser::ast::ConstValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -657,6 +661,7 @@ mod tests {
             is_async: false,
             declaration_span: Span::dummy(),
             module_path: None,
+            constant: None,
         }
     }
 

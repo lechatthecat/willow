@@ -3458,6 +3458,7 @@ mod tests {
                 span: crate::diagnostics::Span::dummy(),
             },
             span: crate::diagnostics::Span::dummy(),
+            constant: None,
         };
 
         assert_eq!(

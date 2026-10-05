@@ -41,6 +41,8 @@ pub enum TokenKind {
     Select,
     Match,
     Enum,
+    /// `const NAME: T = literal;` module-level constant (willow-jz15.10).
+    Const,
     ColonColon,
 
     // Types
@@ -142,6 +144,7 @@ impl TokenKind {
             Self::Select => Some("select"),
             Self::Match => Some("match"),
             Self::Enum => Some("enum"),
+            Self::Const => Some("const"),
             Self::I64 => Some("i64"),
             Self::F64 => Some("f64"),
             Self::Bool => Some("bool"),

@@ -1423,3 +1423,33 @@ fn length_queries_attribute_only_panic_allocation_and_resolved_dispatch_stays_kn
         }
     }
 }
+
+#[test]
+fn constants_report_their_value_type_and_references() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/limits.wi"),
+        "module limits;\npub const MAX: i64 = 3;\npub const SPARE: bool = true;\n",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import limits;\nimport limits::MAX;\nfn main() { println(MAX + limits::MAX); }\n",
+    )
+    .unwrap();
+    let symbol = f.json(&["symbol", "limits::MAX"], 0);
+    assert_eq!(symbol["result"]["type_display"], "i64", "{symbol}");
+    let refs = f.json(&["refs", "limits::MAX"], 0);
+    assert_eq!(refs["result"]["total"], 3, "{refs}");
+    let renamed = f.run(&["rename", "limits::SPARE", "UNUSED"]);
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    let source = fs::read_to_string(f.0.join("src/limits.wi")).unwrap();
+    assert!(
+        source.contains("pub const UNUSED: bool = true;"),
+        "{source}"
+    );
+}

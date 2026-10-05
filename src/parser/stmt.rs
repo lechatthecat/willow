@@ -74,6 +74,12 @@ impl Parser {
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt, Diagnostic> {
         match self.peek_kind().clone() {
             TokenKind::Let => self.parse_let(),
+            TokenKind::Const => Err(self
+                .err(
+                    ErrorCode::E0105,
+                    "`const` declarations are only allowed at module level",
+                )
+                .with_help("move it outside the function, or use `let` for a local value")),
             TokenKind::If => self.parse_if(),
             TokenKind::While => self.parse_while(),
             TokenKind::Break => {

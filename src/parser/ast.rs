@@ -377,6 +377,34 @@ pub struct FunctionDecl {
     pub return_type: Type,
     pub body: Block,
     pub span: Span,
+    /// `Some` for a module-level `const NAME: T = literal;` (willow-jz15.10).
+    /// The parser represents a constant as a zero-parameter function whose
+    /// body returns the literal, so declaration registration, visibility,
+    /// item imports and incremental tracking treat it like any other item;
+    /// the checker resolves the bare name as a VALUE of type `T`, and
+    /// lowering inlines this literal at each use instead of calling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constant: Option<ConstValue>,
+}
+
+/// The compile-time value of a module-level `const` (willow-jz15.10).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ConstValue {
+    Integer(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+}
+
+impl ConstValue {
+    pub fn ty(&self) -> Type {
+        match self {
+            Self::Integer(_) => Type::I64,
+            Self::Float(_) => Type::F64,
+            Self::Bool(_) => Type::Bool,
+            Self::String(_) => Type::String,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -949,6 +977,16 @@ pub struct StaticCallExpr {
     pub span: Span,
     /// Exact member token, even when qualifier or arguments use the same name.
     pub method_span: Span,
+}
+
+impl StaticCallExpr {
+    /// `Path::Member` written without parentheses: the parser reads an
+    /// uppercase member as a fieldless enum variant, so this is also how a
+    /// module's `const` (`config::LIMIT`, willow-jz15.10) arrives. The call
+    /// span ends at the member token exactly when no argument list follows.
+    pub fn is_bare_member(&self) -> bool {
+        self.args.is_empty() && self.span.end == self.method_span.end
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

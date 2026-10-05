@@ -1,0 +1,14 @@
+// settings.wi — module-level constants shared with main.wi.
+module settings;
+
+pub const MAX_RETRIES: i64 = 3;
+pub const TIMEOUT_SECS: f64 = 2.5;
+pub const VERBOSE: bool = false;
+pub const APP_NAME: String = "willow-demo";
+
+// A private constant is usable only inside this module.
+const BACKOFF_STEP: i64 = 100;
+
+pub fn backoff_ms(attempt: i64) -> i64 {
+    return attempt * BACKOFF_STEP;
+}

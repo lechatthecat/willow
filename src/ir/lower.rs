@@ -235,6 +235,20 @@ impl<'a> CheckerTables<'a> {
             .unwrap_or(&[])
     }
 
+    /// The value of the module-level `const` a bare name resolves to in this
+    /// unit (its own, or one an item import bound), willow-jz15.10.
+    fn constant(&self, name: &str) -> Option<&crate::parser::ast::ConstValue> {
+        self.symbols?.lookup_func(name)?.constant.as_ref()
+    }
+
+    /// The value of `module::NAME` when it names a module-level `const`.
+    fn module_constant(&self, module: &str, name: &str) -> Option<&crate::parser::ast::ConstValue> {
+        self.symbols?
+            .lookup_module_func(module, name)?
+            .constant
+            .as_ref()
+    }
+
     fn enum_variant_resolution(&self, id: &ExprId) -> Option<&String> {
         self.enum_variant_resolutions.and_then(|m| m.get(id))
     }
@@ -1265,6 +1279,18 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
     }
 }
 
+/// The literal one use of a module-level `const` stands for (willow-jz15.10).
+fn const_literal(value: &crate::parser::ast::ConstValue, span: Span) -> HirExpr {
+    use crate::parser::ast::ConstValue;
+    let kind = match value {
+        ConstValue::Integer(n) => HirExprKind::Int(*n),
+        ConstValue::Float(f) => HirExprKind::Float(*f),
+        ConstValue::Bool(b) => HirExprKind::Bool(*b),
+        ConstValue::String(s) => HirExprKind::Str(s.clone()),
+    };
+    lit(kind, value.ty(), span)
+}
+
 /// Each non-trivial arm of [`lower_expr_inner`] lives in its own function so a
 /// nested expression costs one SMALL frame per level instead of one frame
 /// holding every arm's locals at once: a debug build gives the match's frame
@@ -1302,6 +1328,12 @@ fn lower_var_expr(
             ty: ty.into(),
             span,
         });
+    }
+    // A module-level `const` (willow-jz15.10): inline its literal. Locals
+    // were resolved above, so a binding of the same name still shadows it,
+    // exactly as in the checker.
+    if let Some(value) = ctx.tables.constant(name) {
+        return Ok(const_literal(value, span));
     }
     // A named top-level function used as a value (`apply(10, double)`,
     // willow-0g8j.2.2). The checker types the bare identifier as the
@@ -1936,6 +1968,11 @@ fn lower_object_literal_expr(
 
 #[inline(never)]
 fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    // `config::LIMIT` names a module's `const` before any class (willow-jz15.10),
+    // matching the checker's precedence.
+    if let Some(value) = ctx.tables.module_constant(&s.class, &s.field) {
+        return Ok(const_literal(value, s.span));
+    }
     // `Enum::Variant` (fieldless) parses like a static property read.
     let resolved = ctx.tables.static_call_class(&s.id, &s.class);
     let class = if resolved == "Self" {
@@ -1988,6 +2025,14 @@ fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<Hi
     lower_value_args
 )]
 fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    // `config::LIMIT`: an uppercase bare member parses like a fieldless
+    // variant; a module's `const` takes precedence, as in the checker
+    // (willow-jz15.10).
+    if s.is_bare_member()
+        && let Some(value) = ctx.tables.module_constant(&s.class, &s.method)
+    {
+        return Ok(const_literal(value, s.span));
+    }
     // `Enum::Variant(args)` construction parses like a static call.
     let class = if s.class == "Self" {
         ctx.current_class.as_deref().unwrap_or(&s.class)
@@ -3428,6 +3473,7 @@ mod tests {
                                 span,
                             },
                             span,
+                            constant: None,
                         })],
                     };
                     let (hir, diagnostics) = lower_program(&program);

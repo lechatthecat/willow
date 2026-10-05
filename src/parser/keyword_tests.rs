@@ -1,7 +1,7 @@
 use super::*;
 use crate::lexer::Lexer;
 
-const KEYWORDS: &str = "fn let mut if else while break continue defer for in return print println true false nil class pub prot open override static new extends interface implements self import module as async await select match enum i64 f64 bool";
+const KEYWORDS: &str = "fn let mut if else while break continue defer for in return print println true false nil class pub prot open override static new extends interface implements self import module as async await select match enum const i64 f64 bool";
 
 #[test]
 fn keyword_identifier_diagnostics_all_spellings() {

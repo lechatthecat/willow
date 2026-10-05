@@ -42,6 +42,8 @@ error_codes! {
     E0106,
     E0107,
     E0108,
+    E0109, // `const` initializer is not a literal (willow-jz15.10)
+    E0110, // `const` type is unsupported or does not match its literal
     // Type checker E02xx
     E0201,
     E0202,

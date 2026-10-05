@@ -200,6 +200,8 @@ mod stack_switch_capability;
 mod symbol_conflicts;
 #[path = "integration/toolchain.rs"]
 mod toolchain;
+#[path = "integration/top_level_const.rs"]
+mod top_level_const;
 
 #[path = "integration/gc_scalable_bitmap.rs"]
 mod gc_scalable_bitmap;

@@ -1668,6 +1668,7 @@ class ProtectedCtor { prot init(self) {} }
             | TokenKind::As
             | TokenKind::Async
             | TokenKind::Enum
+            | TokenKind::Const
             | TokenKind::I64
             | TokenKind::Bool
             | TokenKind::F64 => AfterQuestion::Try,
@@ -1714,6 +1715,7 @@ class ProtectedCtor { prot init(self) {} }
             TokenKind::Select,
             TokenKind::Match,
             TokenKind::Enum,
+            TokenKind::Const,
             TokenKind::ColonColon,
             TokenKind::I64,
             TokenKind::Bool,

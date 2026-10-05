@@ -786,8 +786,28 @@ impl TypeChecker {
                 Pattern::Wildcard(_, _) => {
                     has_wildcard = true;
                 }
-                Pattern::Binding { .. } => {
+                Pattern::Binding { name, span, .. } => {
                     has_wildcard = true; // binding covers everything
+                    // Patterns do not compare against constants: the name
+                    // would silently bind a new variable instead.
+                    if self.symbols.lookup_var(name).is_none()
+                        && let Some(info) = self.symbols.lookup_func(name)
+                        && info.constant.is_some()
+                    {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1205,
+                                format!("constant `{name}` cannot be used as a match pattern"),
+                            )
+                            .with_label(Label::primary(*span, "would bind a new variable"))
+                            .with_label(Label::secondary(
+                                info.declaration_span,
+                                "constant declared here",
+                            ))
+                            .with_help("write the literal value, or compare with `if`"),
+                        );
+                    }
                 }
                 Pattern::LiteralBool(b, span, _) => {
                     if scrutinee_ty != Type::Bool {

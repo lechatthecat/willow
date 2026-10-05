@@ -78,6 +78,46 @@ impl TypeChecker {
         }
     }
 
+    /// A `const` and a function of the same name in one file share the item
+    /// namespace. Codegen reports the clash only once checking succeeds, and
+    /// registration here is last-wins, so a use would be checked against the
+    /// wrong declaration first. Keep the first one and report the second.
+    fn reject_constant_redeclaration(&mut self, f: &FunctionDecl) -> bool {
+        let Some(first) = self.symbols.lookup_func(&f.name) else {
+            return false;
+        };
+        let first_span = first.declaration_span;
+        if first_span == f.span
+            || first_span.file_id != f.span.file_id
+            || (first.constant.is_none() && f.constant.is_none())
+        {
+            return false;
+        }
+        let kind = |constant: bool| if constant { "constant" } else { "function" };
+        let mut earlier = (first_span, kind(first.constant.is_some()));
+        let mut later = (f.span, kind(f.constant.is_some()));
+        // An imported module's items are pre-registered last-wins, so the
+        // registered one may be the later declaration.
+        if earlier.0.start > later.0.start {
+            std::mem::swap(&mut earlier, &mut later);
+        }
+        let ((first_span, first_kind), (second_span, second_kind)) = (earlier, later);
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0706,
+                format!(
+                    "{second_kind} `{}` is already declared as a {first_kind}",
+                    f.name
+                ),
+            )
+            .with_label(Label::primary(second_span, "second declaration"))
+            .with_label(Label::secondary(first_span, "first declared here"))
+            .with_help("rename one of them"),
+        );
+        true
+    }
+
     /// Check the ENTRY program: the file named on the command line.
     ///
     /// Its `main` is the process entry point, which is the one body allowed to
@@ -195,6 +235,9 @@ impl TypeChecker {
                     );
                     continue;
                 }
+                if self.reject_constant_redeclaration(f) {
+                    continue;
+                }
                 let params = self.normalize_param_types(&f.params);
                 let param_infos = self.normalize_param_infos(&f.params);
                 let return_type = self.normalize_type(&f.return_type, f.span);
@@ -208,6 +251,7 @@ impl TypeChecker {
                         is_async: f.is_async,
                         declaration_span: f.span,
                         module_path: None,
+                        constant: f.constant.clone(),
                     },
                 );
             }
@@ -1351,7 +1395,29 @@ impl TypeChecker {
                     return;
                 }
                 let info = self.symbols.lookup_var(&s.name).cloned();
+                let constant = info
+                    .is_none()
+                    .then(|| self.symbols.lookup_func(&s.name))
+                    .flatten()
+                    .filter(|f| f.constant.is_some())
+                    .map(|f| f.declaration_span);
                 match info {
+                    None if constant.is_some() => self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0301,
+                            format!("cannot assign to constant `{}`", s.name),
+                        )
+                        .with_label(Label::primary(s.span, "cannot assign"))
+                        .with_label(Label::secondary(
+                            constant.unwrap_or(s.span),
+                            "declared as a constant here",
+                        ))
+                        .with_help(format!(
+                            "declare a mutable local instead: `let mut {} = ...`",
+                            s.name.to_lowercase()
+                        )),
+                    ),
                     None => self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -2022,6 +2088,34 @@ impl TypeChecker {
         sites.targets.extend(targets);
     }
 
+    /// `LIMIT()` where `LIMIT` is a module-level `const` (willow-jz15.10): a
+    /// constant is a value, never a callable function, even though it is
+    /// registered in the function namespace.
+    pub(super) fn reject_constant_call(
+        &mut self,
+        name: &str,
+        info: &FuncInfo,
+        args: &[CallArg],
+        span: Span,
+    ) -> Type {
+        for arg in args {
+            self.check_expr(&arg.expr);
+        }
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0201,
+                format!(
+                    "cannot call constant `{name}` of type `{}`",
+                    type_name(&info.return_type)
+                ),
+            )
+            .with_label(Label::primary(span, "constants are values, not functions"))
+            .with_help(format!("use `{name}` without parentheses")),
+        );
+        Self::error_type()
+    }
+
     fn check_expr_inner(&mut self, expr: &Expr) -> Type {
         match expr {
             Expr::Integer(_, _, _) => Type::I64,
@@ -2045,6 +2139,11 @@ impl TypeChecker {
                 }
                 // Named function used as a value: `apply(10, double)` where `double: fn(...)`
                 if let Some(info) = self.symbols.lookup_func(name) {
+                    // A module-level `const` is a value of its declared type,
+                    // inlined by lowering (willow-jz15.10).
+                    if info.constant.is_some() {
+                        return info.return_type.clone();
+                    }
                     let params = info.params.clone();
                     let ret = info.return_type.clone();
                     return Type::Fn(params, Box::new(ret));
@@ -2183,6 +2282,9 @@ impl TypeChecker {
 
                 // Direct call to a named function.
                 if let Some(info) = self.symbols.lookup_func(&c.callee).cloned() {
+                    if info.constant.is_some() {
+                        return self.reject_constant_call(&c.callee, &info, &c.args, c.span);
+                    }
                     if info.params.len() != c.args.len() {
                         self.push(
                             Diagnostic::new(
@@ -2283,6 +2385,15 @@ impl TypeChecker {
                 let result = self.check_receiver_method_call(&obj_ty, m);
                 self.record_builtin_method_use(m, references, errors);
                 result
+            }
+            Expr::StaticCall(s)
+                if s.is_bare_member()
+                    && self
+                        .symbols
+                        .lookup_module_func(&s.class, &s.method)
+                        .is_some_and(|info| info.constant.is_some()) =>
+            {
+                self.resolve_static_field_read(&s.class, &s.method, s.span)
             }
             Expr::StaticCall(s) => {
                 self.record_static_builtin_lock_effect(s);

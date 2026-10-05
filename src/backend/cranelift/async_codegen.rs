@@ -916,6 +916,7 @@ impl UnitCodegenContext<'_> {
                 span: m.span,
             },
             span: m.span,
+            constant: None,
         };
         let (sites, lock_sites) = self.compile_coop_main_poll(
             &poll_symbol,

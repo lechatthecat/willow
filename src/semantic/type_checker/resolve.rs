@@ -176,6 +176,7 @@ impl TypeChecker {
                 is_async: false,
                 declaration_span: Span::dummy(),
                 module_path: None,
+                constant: None,
             },
         );
     }
@@ -193,6 +194,7 @@ impl TypeChecker {
                     is_async: false,
                     declaration_span: Span::dummy(),
                     module_path: None,
+                    constant: None,
                 },
             );
         }
@@ -206,6 +208,7 @@ impl TypeChecker {
                 is_async: false,
                 declaration_span: Span::dummy(),
                 module_path: None,
+                constant: None,
             },
         );
         self.symbols.define_func(
@@ -218,6 +221,7 @@ impl TypeChecker {
                 is_async: false,
                 declaration_span: Span::dummy(),
                 module_path: None,
+                constant: None,
             },
         );
         for name in [
@@ -270,6 +274,7 @@ impl TypeChecker {
                     is_async: false,
                     declaration_span: Span::dummy(),
                     module_path: None,
+                    constant: None,
                 },
             );
         }
@@ -285,6 +290,7 @@ impl TypeChecker {
                 is_async: false,
                 declaration_span: Span::dummy(),
                 module_path: None,
+                constant: None,
             },
         );
         let sleep_params = vec![Type::I64];
@@ -298,6 +304,7 @@ impl TypeChecker {
                 is_async: false,
                 declaration_span: Span::dummy(),
                 module_path: None,
+                constant: None,
             },
         );
         self.symbols.define_func(
@@ -310,6 +317,7 @@ impl TypeChecker {
                 is_async: false,
                 declaration_span: Span::dummy(),
                 module_path: None,
+                constant: None,
             },
         );
     }
@@ -352,6 +360,7 @@ impl TypeChecker {
                         is_async: false,
                         declaration_span: Span::dummy(),
                         module_path: None,
+                        constant: None,
                     },
                 ))
             })
@@ -652,6 +661,7 @@ impl TypeChecker {
                             is_async: f.is_async,
                             declaration_span: f.span,
                             module_path: Some(path.to_string()),
+                            constant: f.constant.clone(),
                         },
                     );
                 }
@@ -2089,6 +2099,10 @@ impl TypeChecker {
                     );
                     Type::Void
                 }
+                Some(fi) if fi.constant.is_some() => {
+                    let qualified = format!("{class_name}::{method_name}");
+                    self.reject_constant_call(&qualified, &fi, args, span)
+                }
                 Some(fi) => {
                     self.record_method_use(
                         method_name,
@@ -2445,6 +2459,29 @@ impl TypeChecker {
         field: &str,
         span: Span,
     ) -> Type {
+        // `config::LIMIT`: a module-qualified `const` (willow-jz15.10). A
+        // module's constants take precedence over a same-named class, exactly
+        // as HIR lowering resolves the read.
+        if let Some(info) = self
+            .symbols
+            .lookup_module_func(class_name, field)
+            .filter(|info| info.constant.is_some())
+            .cloned()
+        {
+            self.record_method_use(field, "function", span, info.declaration_span, &[]);
+            if !info.public {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0402,
+                        format!("constant `{class_name}::{field}` is private"),
+                    )
+                    .with_label(Label::primary(span, "private constant"))
+                    .with_help(format!("make it public with `pub const {field}`")),
+                );
+            }
+            return info.return_type;
+        }
         let Some(resolved) = self.resolve_static_call_class_name(class_name, span) else {
             return Type::Void;
         };

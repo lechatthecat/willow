@@ -1,0 +1,25 @@
+// constants — module-level `const` declarations.
+//
+// `const NAME: T = literal;` names a value of type i64, f64, bool or String.
+// The initializer is a literal (a leading `-` is allowed on numbers). A
+// constant is read like a variable, never called; it cannot be assigned. It
+// follows the same visibility and import rules as a function: `pub const` is
+// visible to importers through `module::NAME` or `import module::NAME`.
+import settings;
+import settings::APP_NAME as Name;
+
+const GREETING: String = "hello";
+const OFFSET: i64 = -1;
+
+fn main() {
+    println(GREETING + " from " + Name);
+    let mut attempt = 0;
+    while attempt < settings::MAX_RETRIES {
+        println(settings::backoff_ms(attempt + 1) + OFFSET);
+        attempt += 1;
+    }
+    println(settings::TIMEOUT_SECS * 2.0);
+    if !settings::VERBOSE {
+        println("quiet");
+    }
+}

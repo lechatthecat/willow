@@ -417,6 +417,7 @@ impl<'a> Lexer<'a> {
             "select" => TokenKind::Select,
             "match" => TokenKind::Match,
             "enum" => TokenKind::Enum,
+            "const" => TokenKind::Const,
             "i64" => TokenKind::I64,
             "f64" => TokenKind::F64,
             "bool" => TokenKind::Bool,

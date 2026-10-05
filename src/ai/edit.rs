@@ -1139,7 +1139,7 @@ fn structured_changes(
                 super::rename::validate_name(&name)?;
                 let marker = declaration
                     .iter()
-                    .position(|t| t.kind == TokenKind::Fn)
+                    .position(|t| matches!(t.kind, TokenKind::Fn | TokenKind::Const))
                     .context("unsupported declaration")?;
                 let old = match &declaration
                     .get(marker + 1)
@@ -1236,7 +1236,7 @@ fn structured_changes(
                             let b = ts.partition_point(|t| t.span.end <= location.end);
                             let marker = ts[a..b]
                                 .iter()
-                                .position(|t| t.kind == TokenKind::Fn)
+                                .position(|t| matches!(t.kind, TokenKind::Fn | TokenKind::Const))
                                 .context("unsupported rename declaration")?
                                 + a;
                             let t = ts

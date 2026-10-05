@@ -1161,6 +1161,7 @@ impl UnitCodegenContext<'_> {
             return_type: return_type.to_source(),
             body,
             span: l.span,
+            constant: None,
         };
         self.compile_function_named(name, &f, semantic_body)
     }
@@ -1291,7 +1292,12 @@ impl UnitCodegenContext<'_> {
         } else {
             Linkage::Local
         };
-        self.claim_symbol(symbol_name, format!("function `{}`", f.name), f.span)?;
+        let kind = if f.constant.is_some() {
+            "constant"
+        } else {
+            "function"
+        };
+        self.claim_symbol(symbol_name, format!("{kind} `{}`", f.name), f.span)?;
         let id = self
             .output
             .module
@@ -1745,6 +1751,7 @@ impl UnitCodegenContext<'_> {
                     span: init.span(),
                 },
                 span: init.span(),
+                constant: None,
             };
             let static_body = self.static_initializer_body(init)?;
             let symbol =

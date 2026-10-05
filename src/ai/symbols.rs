@@ -127,24 +127,43 @@ pub(super) fn declarations(
     // Reuse registered signatures, including normalized import identities.
     // AST spellings alone are not the checked type of a declaration.
     let mut types = HashMap::new();
-    let mut signature = |span: Span, params: &[Param], resolved: &[Type], result: &Type| {
-        types.insert(span, Type::Fn(resolved.to_vec(), Box::new(result.clone())));
-        for (param, ty) in params.iter().zip(resolved) {
-            types.insert(param.span, ty.clone());
-        }
-    };
+    let mut signature =
+        |span: Span, params: &[Param], resolved: &[Type], result: &Type, constant| {
+            // A `const` is a zero-parameter function internally; report its value type.
+            let ty = if constant {
+                result.clone()
+            } else {
+                Type::Fn(resolved.to_vec(), Box::new(result.clone()))
+            };
+            types.insert(span, ty);
+            for (param, ty) in params.iter().zip(resolved) {
+                types.insert(param.span, ty.clone());
+            }
+        };
     for item in &program.items {
         match item {
             Item::Function(f) => {
                 if let Some(info) = checked.lookup_func(&f.name) {
-                    signature(f.span, &f.params, &info.params, &info.return_type);
+                    signature(
+                        f.span,
+                        &f.params,
+                        &info.params,
+                        &info.return_type,
+                        info.constant.is_some(),
+                    );
                 }
             }
             Item::Class(c) => {
                 if let Some(info) = checked.lookup_class(&c.name) {
                     for method in &c.methods {
                         if let Some(m) = info.methods.get(&method.name) {
-                            signature(method.span, &method.params, &m.params, &m.return_type);
+                            signature(
+                                method.span,
+                                &method.params,
+                                &m.params,
+                                &m.return_type,
+                                false,
+                            );
                         }
                     }
                 }
@@ -153,7 +172,13 @@ pub(super) fn declarations(
                 if let Some(info) = checked.lookup_interface(&i.name) {
                     for method in &i.methods {
                         if let Some(m) = info.methods.get(&method.name) {
-                            signature(method.span, &method.params, &m.params, &m.return_type);
+                            signature(
+                                method.span,
+                                &method.params,
+                                &m.params,
+                                &m.return_type,
+                                false,
+                            );
                         }
                     }
                 }
@@ -219,10 +244,14 @@ pub(super) fn declarations(
                     &f.name,
                     "function",
                     f.span,
-                    Some(Type::Fn(
-                        f.params.iter().map(|p| p.ty.clone()).collect(),
-                        Box::new(f.return_type.clone()),
-                    )),
+                    Some(if f.constant.is_some() {
+                        f.return_type.clone()
+                    } else {
+                        Type::Fn(
+                            f.params.iter().map(|p| p.ty.clone()).collect(),
+                            Box::new(f.return_type.clone()),
+                        )
+                    }),
                 );
                 for p in &f.params {
                     declare(&p.name, "parameter", p.span, Some(p.ty.clone()));

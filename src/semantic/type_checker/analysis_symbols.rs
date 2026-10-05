@@ -314,10 +314,11 @@ impl TypeChecker {
                             name,
                             "function",
                             info.declaration_span,
-                            Some(Type::Fn(
-                                info.params.clone(),
-                                Box::new(info.return_type.clone()),
-                            )),
+                            Some(if info.constant.is_some() {
+                                info.return_type.clone()
+                            } else {
+                                Type::Fn(info.params.clone(), Box::new(info.return_type.clone()))
+                            }),
                         );
                         self.analysis_symbols
                             .reference(*span, name, d, "value", false);
