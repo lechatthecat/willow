@@ -227,23 +227,35 @@ fn location(value: &Value) -> String {
 fn human(value: &Value, options: &Options) -> String {
     let result = &value["result"];
     if options.command == "rename" && result["status"] == "ok" {
+        let count = |key: &str, noun: &str| {
+            let n = result[key].as_u64().unwrap_or(0);
+            format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+        };
+        let files = count("files_changed", "file");
+        let edits = format!(
+            "{} ({}, {})",
+            count("edits", "edit"),
+            count("declarations_updated", "declaration"),
+            count("references_updated", "reference")
+        );
+        let new_name = options.new_name.as_deref().unwrap();
         if result["dry_run"] == true {
-            return result["changes"]
+            let mut output: Vec<_> = result["changes"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .filter_map(|c| c["diff"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
+                .collect();
+            let summary = format!(
+                "Dry run: rename {} -> {new_name} would change {files}\n{edits}\nNo files changed",
+                options.selector
+            );
+            output.push(&summary);
+            return output.join("\n");
         }
         let mut output = format!(
-            "Renamed {} -> {}\n{} files changed\n{} edits ({} declarations, {} references)\nValidation: passed",
-            options.selector,
-            options.new_name.as_deref().unwrap(),
-            result["files_changed"],
-            result["edits"],
-            result["declarations_updated"],
-            result["references_updated"]
+            "Renamed {} -> {new_name}\n{files} changed\n{edits}\nValidation: passed",
+            options.selector
         );
         if options.verbose {
             output.push_str(&format!(

@@ -185,6 +185,11 @@ pub struct TypeChecker {
     static_reads: HashMap<FunctionId, HashSet<FunctionId>>,
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
     analysis_symbols: crate::semantic::analysis_symbols::Facts,
+    /// Latest `analysis_symbols.references` index of a member use per call
+    /// start, so builtin-call classification is O(1) instead of rescanning
+    /// argument references. Entries are validated on read because
+    /// `analysis_symbols` is swapped per body.
+    member_uses: HashMap<(crate::diagnostics::FileId, usize), usize>,
     capture_call_sites: bool,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
     effect_inputs: crate::compiler_db::effects::EffectInputs,
@@ -324,6 +329,7 @@ impl TypeChecker {
             static_reads: HashMap::new(),
             analysis_calls: HashMap::new(),
             analysis_symbols: Default::default(),
+            member_uses: HashMap::new(),
             capture_call_sites: false,
             task_method_calls: Vec::new(),
             effect_inputs: Default::default(),

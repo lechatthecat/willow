@@ -253,7 +253,13 @@ impl DirectSession {
             }],
         };
         if dry_run {
-            return edit::preview_analyzed(&self.session.snapshot, request);
+            let mut preview = edit::preview_analyzed(&self.session.snapshot, request)?;
+            let summary = rename_summary(&preview);
+            preview
+                .as_object_mut()
+                .context("rename preview is not an object")?
+                .extend(summary);
+            return Ok(preview);
         }
         let workspace = edit::Workspace::open(Path::new(self.workspace()))?;
         let preview = workspace.prepare_analyzed(
@@ -269,13 +275,12 @@ impl DirectSession {
         let mut emitter = crate::diagnostics::HumanEmitter;
         workspace.validate(transaction, &mut emitter)?;
         workspace.apply_with_rollback(transaction, &mut emitter)?;
-        let changes = preview["changes"].as_array().map_or(0, Vec::len);
-        let edits = preview["work"]["patches"].as_u64().unwrap_or(0);
-        let declarations = preview["work"]["declarations"].as_u64().unwrap_or(0);
-        let references = edits.saturating_sub(declarations);
-        Ok(
-            json!({"status":"ok","old":selector,"new":name,"files_changed":changes,"references_updated":references,"declarations_updated":declarations,"edits":edits,"validation":"passed","transaction":transaction}),
-        )
+        let mut result = json!({"status":"ok","old":selector,"new":name,"validation":"passed","transaction":transaction});
+        result
+            .as_object_mut()
+            .unwrap()
+            .extend(rename_summary(&preview));
+        Ok(result)
     }
     fn source(&mut self, path: &str) -> Result<&SourceIndex> {
         if !self.sources.contains_key(path) {
@@ -454,6 +459,11 @@ impl DirectSession {
                 .as_ref()
                 .is_some_and(|ids| !ids.contains(&symbol.id))
             {
+                continue;
+            }
+            // Builtin member calls are rename evidence, not name-selectable
+            // symbols: `len` must not become ambiguous with `Array::len`.
+            if located.is_none() && symbol.kind == "builtin-method" {
                 continue;
             }
             if filter.kind.as_ref().is_some_and(|k| k != &symbol.kind)
@@ -901,6 +911,20 @@ fn selector_typo_distance(a: &str, b: &[char]) -> Option<usize> {
     }
     let distance = previous[b.len() + limit - a.len()];
     (distance <= limit).then_some(distance)
+}
+
+/// File and edit counts shared by rename dry-run previews and applied renames.
+fn rename_summary(preview: &Value) -> serde_json::Map<String, Value> {
+    let changes = preview["changes"].as_array().map_or(0, Vec::len);
+    let edits = preview["work"]["patches"].as_u64().unwrap_or(0);
+    let declarations = preview["work"]["declarations"].as_u64().unwrap_or(0);
+    let references = edits.saturating_sub(declarations);
+    serde_json::Map::from_iter([
+        ("files_changed".to_owned(), json!(changes)),
+        ("edits".to_owned(), json!(edits)),
+        ("declarations_updated".to_owned(), json!(declarations)),
+        ("references_updated".to_owned(), json!(references)),
+    ])
 }
 
 #[cfg(test)]

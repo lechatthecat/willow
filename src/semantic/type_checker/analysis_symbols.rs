@@ -213,6 +213,10 @@ impl TypeChecker {
             span.end = arg.span.start;
         }
         if self.capture_call_sites {
+            self.member_uses.insert(
+                (span.file_id, span.start),
+                self.analysis_symbols.references.len(),
+            );
             self.analysis_symbols.reference(
                 span,
                 name,
@@ -221,6 +225,41 @@ impl TypeChecker {
                 true,
             );
         }
+    }
+    /// A successfully checked member call that recorded no source method is a
+    /// builtin (`Array::len`, `AtomicI64::add`, `String::len`, ...). Record it
+    /// as a proven non-source target so rename can skip same-spelled tokens.
+    /// O(1): the indexed member use counts only if it was recorded after
+    /// `start` (receiver chains such as `a.m().len()` share this start).
+    pub(super) fn record_builtin_method_use(
+        &mut self,
+        call: &MethodCallExpr,
+        start: usize,
+        errors: usize,
+    ) {
+        if !self.capture_call_sites
+            || self.error_generation != errors
+            || self
+                .member_uses
+                .get(&(call.span.file_id, call.span.start))
+                .is_some_and(|&i| {
+                    i >= start
+                        && self.analysis_symbols.references.get(i).is_some_and(|r| {
+                            r.role == "member"
+                                && r.span.file_id == call.span.file_id
+                                && r.span.start == call.span.start
+                        })
+                })
+        {
+            return;
+        }
+        self.record_method_use(
+            &call.method,
+            "builtin-method",
+            call.span,
+            Span::new(0, 0, 0, 0),
+            &call.args,
+        );
     }
     pub(super) fn record_type_use(&mut self, written: &str, normalized: &Type, span: Span) {
         if !self.capture_call_sites {

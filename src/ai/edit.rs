@@ -927,6 +927,24 @@ pub(super) fn preview_analyzed(snapshot: &Snapshot, request: Request) -> Result<
     )
 }
 
+/// Member-call tokens the type checker proved to be builtin methods
+/// (`items.len()`, `counter.add(1)`): never source rename targets.
+fn builtin_member_points<'a>(
+    snapshot: &'a Snapshot,
+    root: &Path,
+) -> std::collections::HashSet<(&'a Path, usize)> {
+    snapshot
+        .semantic
+        .references
+        .iter()
+        .filter(|r| r.target.starts_with("builtin:builtin-method:"))
+        .filter_map(|r| {
+            let path = Path::new(&r.location.path).strip_prefix(root).ok()?;
+            Some((path, r.location.start))
+        })
+        .collect()
+}
+
 fn structured_changes(
     snapshot: &Snapshot,
     root: &Path,
@@ -1045,6 +1063,9 @@ fn structured_changes(
     let mut semantic_renames = has_member_rename
         .then(|| super::rename::Index::new(snapshot, root, &identifiers, &qualifiers));
     let mut renamed = std::collections::HashSet::new();
+    // Built lazily, once per request, only when a same-spelled token is not a
+    // proven declaration/reference of the renamed function.
+    let mut builtin_members = None;
     for operation in operations {
         let id = match &operation {
             Operation::Rename { function, .. } | Operation::ReplaceBody { function, .. } => {
@@ -1129,12 +1150,43 @@ fn structured_changes(
                     _ => anyhow::bail!("unsupported declaration name"),
                 };
                 ensure!(name != *old, "rename has no effect");
-                if let Some(&(path, span)) = identifiers
-                    .get(name.as_str())
-                    .and_then(|occurrences| occurrences.first())
-                {
+                if let Some(occurrences) = identifiers.get(name.as_str()) {
+                    // Cite the conflicting declaration rather than an import or a
+                    // use of it: source declarations rank before import aliases,
+                    // then the first occurrence. Error path only: one scan of the
+                    // symbols spelled `name` plus that spelling's occurrences.
+                    let declarations: std::collections::HashMap<_, _> = snapshot
+                        .semantic
+                        .symbols
+                        .iter()
+                        .filter(|s| s.name.rsplit("::").next() == Some(name.as_str()))
+                        .filter_map(|s| {
+                            let l = s.location.as_ref()?;
+                            let path = Path::new(&l.path).strip_prefix(root).ok()?;
+                            Some(((path, l.start), usize::from(s.kind == "import")))
+                        })
+                        .collect();
+                    let declaration = occurrences
+                        .iter()
+                        .filter_map(|occurrence @ (path, span)| {
+                            Some((
+                                declarations.get(&(Path::new(path), span.start))?,
+                                occurrence,
+                            ))
+                        })
+                        .min_by_key(|(rank, _)| **rank);
+                    let (message, &(path, span)) = match declaration {
+                        Some((_, found)) => (
+                            "rename destination conflicts with an existing declaration",
+                            found,
+                        ),
+                        None => (
+                            "rename destination already occurs in workspace",
+                            &occurrences[0],
+                        ),
+                    };
                     return Err(Rejection {
-                        message: "rename destination already occurs in workspace".into(),
+                        message: message.into(),
                         location: RejectionLocation {
                             path: path.into(),
                             start: span.start,
@@ -1239,6 +1291,12 @@ fn structured_changes(
                 }
                 for &(p, span) in identifiers.get(old.as_str()).into_iter().flatten() {
                     if !allowed.get(p).is_some_and(|a| a.contains(&span.start)) {
+                        if builtin_members
+                            .get_or_insert_with(|| builtin_member_points(snapshot, root))
+                            .contains(&(Path::new(p), span.start))
+                        {
+                            continue;
+                        }
                         let ts = &tokens[p];
                         let index = ts.partition_point(|t| t.span.start < span.start);
                         let reason = match index
@@ -1996,7 +2054,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_destination_collision_reports_first_occurrence() {
+    fn rename_destination_collision_reports_declaration() {
         for count in [1, 16, 64] {
             let helper = format!(
                 "// answer is only a comment\npub fn answer() -> i64 {{ return 2; }}\npub fn value() -> i64 {{ {} return 1; }}",
@@ -2014,7 +2072,7 @@ mod tests {
             let rejection = error.downcast_ref::<Rejection>().unwrap();
             assert_eq!(
                 rejection.message,
-                "rename destination already occurs in workspace"
+                "rename destination conflicts with an existing declaration"
             );
             let location = &rejection.location;
             let start = helper.find("fn answer").unwrap() + 3;
@@ -2028,6 +2086,33 @@ mod tests {
             assert_eq!(&helper[location.start..location.end], "answer");
             assert!(error.to_string().ends_with("at helper.wi:2:8"));
         }
+    }
+
+    #[test]
+    fn rename_destination_collision_prefers_declaration_over_earlier_import() {
+        let lib = "pub fn answer() -> i64 { return 2; }";
+        let error = rename_helper_value(&[
+            HELPER,
+            ("lib.wi", lib),
+            (
+                "app.wi",
+                "import lib::{answer};\npub fn run() -> i64 { return answer(); }",
+            ),
+            (
+                "main.wi",
+                "import app;\nimport helper;\nfn main() { println(app::run() + helper::value()); }",
+            ),
+        ])
+        .err()
+        .unwrap();
+        let rejection = error.downcast_ref::<Rejection>().unwrap();
+        assert_eq!(
+            rejection.message,
+            "rename destination conflicts with an existing declaration"
+        );
+        let l = &rejection.location;
+        assert_eq!((l.path.as_str(), l.line, l.column), ("lib.wi", 1, 8));
+        assert_eq!(&lib[l.start..l.end], "answer");
     }
 
     #[test]

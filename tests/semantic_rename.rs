@@ -33,6 +33,21 @@ impl Fixture {
         );
         serde_json::from_slice(&output.stdout).unwrap()
     }
+    fn human(&self, args: &[&str], code: i32) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .current_dir(&self.0)
+            .args(args)
+            .args(["--source", "main.wi"])
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(code), "{text}");
+        text
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -802,5 +817,197 @@ fn rename_keywords_name_the_reserved_word_for_all_target_kinds() {
             );
             assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
         }
+    }
+}
+
+const BUILTIN_NAMED_VEC: &str = "pub class Vec3 {
+    pub x: f64;
+    pub fn len(self) -> f64 { return self.x; }
+    pub fn add(self, o: Vec3) -> Vec3 { return new Vec3(self.x + o.x); }
+    pub fn unwrap(self) -> f64 { return self.x; }
+    pub fn toString(self) -> String { return \"v\" + self.x.toString(); }
+}
+pub interface Sized { fn len(self) -> f64; }
+pub class Box implements Sized { pub n: f64; pub fn len(self) -> f64 { return self.n; } }
+pub fn min(a: f64, b: f64) -> f64 { if a < b { return a; } return b; }
+pub fn max(a: f64, b: f64) -> f64 { if a > b { return a; } return b; }
+";
+const BUILTIN_NAMED_MAIN: &str = "import vec::{Vec3, Sized, Box, max, min};
+import std::collections::{Array, Map};
+fn size(s: Sized) -> f64 { return s.len(); }
+fn main() {
+    let items: Array<i64> = [1, 2, 3];
+    let frozen = items.freeze();
+    let words: Map<String, i64> = Map::new();
+    words.insert(\"a\", 1);
+    let s = \"abc\";
+    let o: Option<i64> = Some(4);
+    let rays = AtomicI64::new(0);
+    rays.add(items.len() + frozen.len() + words.len() + s.len() + o.unwrap());
+    let v = new Vec3(1.0).add(new Vec3(2.0));
+    println(v.len() + v.unwrap() + size(new Box(2.0)) + max(1.0, 2.0) + min(1.0, 2.0));
+    println(v.toString() + items.len().toString() + s.toString());
+    println(rays.load());
+}
+";
+
+/// Builtin member calls (Array/FrozenArray/Map/String/Option/AtomicI64 and
+/// primitive `toString`) are proven non-targets, so user methods sharing their
+/// spelling rename without touching builtin calls and the program still runs.
+#[test]
+fn user_methods_named_like_builtins_rename_without_touching_builtin_calls() {
+    for (selector, old, new, edits) in [
+        ("vec::Vec3::len", "len", "length", 2),
+        ("vec::Vec3::add", "add", "plus", 2),
+        ("vec::Vec3::unwrap", "unwrap", "value", 2),
+        ("vec::Vec3::toString", "toString", "show", 2),
+        ("vec::Sized::len", "len", "measure", 3),
+        ("vec::Box::len", "len", "measure", 3),
+    ] {
+        let f = Fixture::new(BUILTIN_NAMED_MAIN);
+        f.write("vec.wi", BUILTIN_NAMED_VEC);
+        let preview = f.run(&["rename", selector, new, "--dry-run"], 0);
+        assert_eq!(preview["result"]["edits"], edits, "{selector}: {preview}");
+        assert_eq!(
+            fs::read_to_string(f.0.join("main.wi")).unwrap(),
+            BUILTIN_NAMED_MAIN
+        );
+        let applied = f.run(&["rename", selector, new], 0);
+        assert_eq!(applied["result"]["edits"], edits, "{selector}");
+        assert_eq!(applied["result"]["validation"], "passed");
+        let main = fs::read_to_string(f.0.join("main.wi")).unwrap();
+        // Every builtin call keeps its spelling.
+        for builtin in [
+            "items.len()",
+            "frozen.len()",
+            "words.len()",
+            "s.len()",
+            "o.unwrap()",
+            "rays.add(",
+            "items.len().toString()",
+            "s.toString()",
+        ] {
+            assert!(
+                main.contains(builtin),
+                "{selector}: {builtin} changed\n{main}"
+            );
+        }
+        let changed = main.matches(&format!(".{new}(")).count()
+            + fs::read_to_string(f.0.join("vec.wi"))
+                .unwrap()
+                .matches(&format!("fn {new}("))
+                .count();
+        assert_eq!(changed, edits, "{selector} {old}->{new}\n{main}");
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .current_dir(&f.0)
+            .args(["run", "main.wi"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "11\nv33abc\n14\n",
+            "{selector}"
+        );
+    }
+}
+
+#[test]
+fn rename_collision_cites_conflicting_declaration_not_import() {
+    let f = Fixture::new(BUILTIN_NAMED_MAIN);
+    f.write("vec.wi", BUILTIN_NAMED_VEC);
+    let result = f.run(&["rename", "vec::min", "max"], 1);
+    assert_eq!(
+        result["message"],
+        "rename destination conflicts with an existing declaration at vec.wi:11:8"
+    );
+    assert_eq!(result["location"]["path"], "vec.wi");
+    assert_eq!(
+        (&result["location"]["line"], &result["location"]["column"]),
+        (&11.into(), &8.into())
+    );
+    // A destination spelled only by builtin calls has no declaration to cite.
+    let result = f.run(&["rename", "vec::min", "load"], 1);
+    assert_eq!(
+        result["message"],
+        "rename destination already occurs in workspace at main.wi:16:18"
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join("main.wi")).unwrap(),
+        BUILTIN_NAMED_MAIN
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join("vec.wi")).unwrap(),
+        BUILTIN_NAMED_VEC
+    );
+}
+
+#[test]
+fn rename_dry_run_reports_counts_with_singular_and_plural_nouns() {
+    let f = Fixture::new("fn value() -> i64 { return 1; } fn main() { println(value()); }");
+    let preview = f.run(&["rename", "value", "answer", "--dry-run"], 0);
+    for (key, expected) in [
+        ("files_changed", 1),
+        ("edits", 2),
+        ("declarations_updated", 1),
+        ("references_updated", 1),
+    ] {
+        assert_eq!(preview["result"][key], expected, "{key}");
+    }
+    let text = f.human(&["rename", "value", "answer", "--dry-run"], 0);
+    assert!(text.contains("-fn value()"), "{text}");
+    assert!(
+        text.ends_with(
+            "Dry run: rename value -> answer would change 1 file\n2 edits (1 declaration, 1 reference)\nNo files changed\n"
+        ),
+        "{text}"
+    );
+    let text = f.human(&["rename", "value", "answer"], 0);
+    assert!(
+        text.starts_with("Renamed value -> answer\n1 file changed\n2 edits (1 declaration, 1 reference)\nValidation: passed"),
+        "{text}"
+    );
+    let f = Fixture::new(BUILTIN_NAMED_MAIN);
+    f.write("vec.wi", BUILTIN_NAMED_VEC);
+    let text = f.human(&["rename", "vec::Sized::len", "measure", "--dry-run"], 0);
+    assert!(
+        text.contains("would change 2 files\n3 edits (2 declarations, 1 reference)\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn free_function_named_like_builtin_method_renames_past_builtin_calls() {
+    let source = "import std::collections::Array;\nfn len(x: i64) -> i64 { return x + 1; }\nfn main() { let items: Array<i64> = [1]; println(len(items.len()) + \"ab\".len()); }";
+    let f = Fixture::new(source);
+    let applied = f.run(&["rename", "len", "size"], 0);
+    assert_eq!(applied["result"]["edits"], 2);
+    let main = fs::read_to_string(f.0.join("main.wi")).unwrap();
+    assert!(main.contains("fn size(x: i64)"), "{main}");
+    assert!(
+        main.contains("println(size(items.len()) + \"ab\".len())"),
+        "{main}"
+    );
+}
+
+/// Deeply nested builtin calls in arguments, and builtin calls chained on a
+/// user-method result, are each classified once without rescanning arguments.
+#[test]
+fn nested_builtin_arguments_and_chains_are_proven_non_targets() {
+    for depth in [1usize, 16, 64] {
+        let nested = format!("{}0{}", "rays.add(".repeat(depth), ")".repeat(depth));
+        let source = format!(
+            "class P {{ pub n: i64; pub fn add(self, x: i64) -> i64 {{ return self.n + x; }} }}\nfn main() {{ let rays = AtomicI64::new(0); let p = new P(1); println(p.add({nested}).toString() + p.add(1).toString().len().toString()); }}"
+        );
+        let f = Fixture::new(&source);
+        let applied = f.run(&["rename", "main::P::add", "plus"], 0);
+        assert_eq!(applied["result"]["edits"], 3, "depth={depth}");
+        let main = fs::read_to_string(f.0.join("main.wi")).unwrap();
+        assert_eq!(main.matches("rays.add(").count(), depth, "{main}");
+        assert_eq!(main.matches("p.plus(").count(), 2, "{main}");
     }
 }

@@ -493,7 +493,7 @@ fn imported_interface_lock_checks_allow_pure_and_reject_waiting_bodies() {
 #[test]
 fn condition_diagnostics_preserve_errors_and_do_not_cascade_through_cached_bodies() {
     for (expression, mismatch) in [
-        ("\"abc\".starts_with(\"a\")", false),
+        ("\"abc\".missing(\"a\")", false),
         ("empty()", true),
         ("(match true { _ => 1, true => 2 })", true),
     ] {
@@ -985,7 +985,7 @@ fn buildgraph_rename_counts_all_edits() {
     let output = f.run(&["rename", "order::Order::value", "get"]);
     assert!(output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("2 edits (1 declarations, 1 references)")
+        String::from_utf8_lossy(&output.stdout).contains("2 edits (1 declaration, 1 reference)")
     );
 }
 

@@ -2278,32 +2278,11 @@ impl TypeChecker {
                     }
                     return Self::error_type();
                 }
-                self.record_builtin_lock_effect(&obj_ty, m);
-                if let Some(ret) = self.check_option_result_method_call(&obj_ty, m) {
-                    return ret;
-                }
-                if let Some(ret) = self.check_concurrency_method_call(&obj_ty, m) {
-                    return ret;
-                }
-                if let Some(ret) = self.check_array_method_call(&obj_ty, m) {
-                    return ret;
-                }
-                if let Some(ret) = self.check_frozen_array_method_call(&obj_ty, m) {
-                    return ret;
-                }
-                if let Some(ret) = self.check_map_method_call(&obj_ty, m) {
-                    return ret;
-                }
-                if let Some(ret) = self.check_frozen_map_method_call(&obj_ty, m) {
-                    return ret;
-                }
-                self.check_task_method_call(&obj_ty, m);
-
-                for callee in self.method_effect_ids(&obj_ty, &m.method) {
-                    self.record_lock_effect_call(callee, m.span);
-                }
-
-                self.resolve_method(&obj_ty, &m.method, &m.args, m.span)
+                let references = self.analysis_symbols.references.len();
+                let errors = self.error_generation;
+                let result = self.check_receiver_method_call(&obj_ty, m);
+                self.record_builtin_method_use(m, references, errors);
+                result
             }
             Expr::StaticCall(s) => {
                 self.record_static_builtin_lock_effect(s);
@@ -2616,6 +2595,36 @@ impl TypeChecker {
         }
 
         range_type()
+    }
+
+    /// Member calls on an already-checked, non-error receiver.
+    fn check_receiver_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) -> Type {
+        self.record_builtin_lock_effect(obj_ty, m);
+        if let Some(ret) = self.check_option_result_method_call(obj_ty, m) {
+            return ret;
+        }
+        if let Some(ret) = self.check_concurrency_method_call(obj_ty, m) {
+            return ret;
+        }
+        if let Some(ret) = self.check_array_method_call(obj_ty, m) {
+            return ret;
+        }
+        if let Some(ret) = self.check_frozen_array_method_call(obj_ty, m) {
+            return ret;
+        }
+        if let Some(ret) = self.check_map_method_call(obj_ty, m) {
+            return ret;
+        }
+        if let Some(ret) = self.check_frozen_map_method_call(obj_ty, m) {
+            return ret;
+        }
+        self.check_task_method_call(obj_ty, m);
+
+        for callee in self.method_effect_ids(obj_ty, &m.method) {
+            self.record_lock_effect_call(callee, m.span);
+        }
+
+        self.resolve_method(obj_ty, &m.method, &m.args, m.span)
     }
 }
 
