@@ -9743,7 +9743,7 @@ mod tests {
     #[test]
     fn divergent_preparations_scale_with_nesting() {
         use crate::ir::lowered::LirRvalue as V;
-        for depth in [8, 32, 128] {
+        for depth in [8, 32, 128, 1024] {
             let expression = format!(
                 "{}panic(\"stop\"){}",
                 "c.take(&x, ".repeat(depth),
