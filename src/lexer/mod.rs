@@ -337,54 +337,203 @@ impl<'a> Lexer<'a> {
         Err(self.err_unterminated_string_at(start, line, col))
     }
 
+    /// Lexes a numeric literal. Rules (willow-jz15.55):
+    ///
+    /// - `0x` (hex), `0o` (octal) and `0b` (binary) prefixes introduce an
+    ///   integer literal; hex digits may be either case, the prefix must be
+    ///   lowercase.
+    /// - `_` is a digit separator. It may appear only between two digits, or
+    ///   directly after a radix prefix (`0x_FF`); a leading, trailing or
+    ///   doubled `_` is rejected. Decimal integers and both halves of a float
+    ///   accept separators too.
+    /// - An integer literal must fit `i64` whatever its radix, so
+    ///   `0xFFFF_FFFF_FFFF_FFFF` is out of range rather than `-1` (as in Rust).
     fn lex_number(&mut self) -> Result<TokenKind, Diagnostic> {
         let start = self.pos;
         let line = self.line;
         let col = self.col;
-        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-            self.advance();
+        if self.bytes[self.pos] == b'0' {
+            let radix = match self.bytes.get(self.pos + 1) {
+                Some(b'x' | b'X') => Some(16),
+                Some(b'o' | b'O') => Some(8),
+                Some(b'b' | b'B') => Some(2),
+                _ => None,
+            };
+            if let Some(radix) = radix {
+                return self.lex_prefixed_integer(radix, start, line, col);
+            }
         }
+        self.skip_decimal_digits();
         // check for decimal point
         if self.pos + 1 < self.bytes.len()
             && self.bytes[self.pos] == b'.'
             && self.bytes[self.pos + 1].is_ascii_digit()
         {
             self.advance(); // consume '.'
-            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-                self.advance();
-            }
+            self.skip_decimal_digits();
             let s = &self.src[start..self.pos];
-            let f: f64 = s.parse().unwrap_or(0.0);
+            // Only the separator rules apply; a float half may exceed `i64`.
+            for part in s.split('.') {
+                match scan_digits(part.as_bytes(), 10) {
+                    Ok(_) | Err(NumberError::OutOfRange) => {}
+                    Err(err) => {
+                        return Err(self.err_numeric_literal(err, s, 10, start, line, col));
+                    }
+                }
+            }
+            let f: f64 = if s.contains('_') {
+                s.replace('_', "").parse()
+            } else {
+                s.parse()
+            }
+            .unwrap_or(0.0);
             return Ok(TokenKind::Float(f));
         }
         let s = &self.src[start..self.pos];
         // A digit sequence that overflows `i64` was previously silently parsed
         // as 0, miscompiling the program. Report it as a source-aware error.
-        match s.parse::<i64>() {
+        match scan_digits(s.as_bytes(), 10) {
             Ok(n) => Ok(TokenKind::Integer(n)),
-            Err(_) => Err(self.err_integer_out_of_range(s, start, line, col)),
+            Err(err) => Err(self.err_numeric_literal(err, s, 10, start, line, col)),
         }
     }
 
-    fn err_integer_out_of_range(
+    fn skip_decimal_digits(&mut self) {
+        while self.pos < self.bytes.len()
+            && (self.bytes[self.pos].is_ascii_digit() || self.bytes[self.pos] == b'_')
+        {
+            self.advance();
+        }
+    }
+
+    /// Lexes `0x…`/`0o…`/`0b…`. The body takes every following identifier
+    /// byte so that `0b102` or `0xFG` is one malformed literal with a precise
+    /// diagnostic rather than a literal glued to an identifier.
+    fn lex_prefixed_integer(
+        &mut self,
+        radix: u32,
+        start: usize,
+        line: usize,
+        col: usize,
+    ) -> Result<TokenKind, Diagnostic> {
+        self.advance(); // '0'
+        self.advance(); // prefix letter
+        while self.pos < self.bytes.len()
+            && (self.bytes[self.pos].is_ascii_alphanumeric() || self.bytes[self.pos] == b'_')
+        {
+            self.advance();
+        }
+        let s = &self.src[start..self.pos];
+        if self.bytes[start + 1].is_ascii_uppercase() {
+            return Err(self.err_numeric_literal(
+                NumberError::UppercasePrefix,
+                s,
+                radix,
+                start,
+                line,
+                col,
+            ));
+        }
+        let body = &s.as_bytes()[2..];
+        // One `_` may directly follow the prefix (`0x_FF`).
+        let body = match body {
+            [b'_', rest @ ..] if rest.first().is_some_and(|b| b.is_ascii_alphanumeric()) => rest,
+            _ => body,
+        };
+        match scan_digits(body, radix) {
+            Ok(n) => Ok(TokenKind::Integer(n)),
+            Err(NumberError::InvalidDigit(offset)) => {
+                // Translate the body offset back to a literal offset.
+                let offset = s.len() - body.len() + offset;
+                Err(self.err_numeric_literal(
+                    NumberError::InvalidDigit(offset),
+                    s,
+                    radix,
+                    start,
+                    line,
+                    col,
+                ))
+            }
+            Err(err) => Err(self.err_numeric_literal(err, s, radix, start, line, col)),
+        }
+    }
+
+    fn err_numeric_literal(
         &self,
+        err: NumberError,
         lit: &str,
+        radix: u32,
         start: usize,
         line: usize,
         col: usize,
     ) -> Diagnostic {
         let span = self.span_at(start, self.pos, line, col);
-        Diagnostic::new(
-            Severity::Error,
-            ErrorCode::E0052,
-            format!("integer literal `{lit}` out of range for `i64`"),
-        )
-        .with_label(Label::primary(span, "value does not fit in `i64`"))
-        .with_help(format!(
-            "`i64` values range from {} to {}",
-            i64::MIN,
-            i64::MAX
-        ))
+        let (kind, prefix, digits) = match radix {
+            16 => ("hexadecimal", "0x", "`0`-`9` and `a`-`f` (either case)"),
+            8 => ("octal", "0o", "`0`-`7`"),
+            2 => ("binary", "0b", "`0` and `1`"),
+            _ => ("decimal", "", "`0`-`9`"),
+        };
+        match err {
+            NumberError::OutOfRange => {
+                let diag = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0052,
+                    format!("integer literal `{lit}` out of range for `i64`"),
+                )
+                .with_label(Label::primary(span, "value does not fit in `i64`"))
+                .with_help(format!(
+                    "`i64` values range from {} to {}",
+                    i64::MIN,
+                    i64::MAX
+                ));
+                if radix == 10 {
+                    diag
+                } else {
+                    diag.with_help(
+                        "a literal cannot set the sign bit; write all bits set as `!0` \
+                         and the sign bit as `1 << 63`",
+                    )
+                }
+            }
+            NumberError::InvalidDigit(offset) => {
+                let digit = lit.as_bytes()[offset] as char;
+                let span = self.span_at(start + offset, start + offset + 1, line, col + offset);
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0054,
+                    format!("invalid digit `{digit}` in {kind} literal `{lit}`"),
+                )
+                .with_label(Label::primary(span, format!("not a {kind} digit")))
+                .with_help(format!("{kind} digits are {digits}"))
+            }
+            NumberError::NoDigits => Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0054,
+                format!("{kind} literal `{lit}` has no digits"),
+            )
+            .with_label(Label::primary(
+                span,
+                format!("expected digits after `{prefix}`"),
+            )),
+            NumberError::MisplacedSeparator => Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0054,
+                format!("misplaced `_` in numeric literal `{lit}`"),
+            )
+            .with_label(Label::primary(span, "`_` must sit between two digits"))
+            .with_help(
+                "a `_` separator may appear only between two digits, or directly after \
+                 a `0x`, `0o` or `0b` prefix",
+            ),
+            NumberError::UppercasePrefix => Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0054,
+                format!("uppercase radix prefix in `{lit}`"),
+            )
+            .with_label(Label::primary(span, "radix prefix must be lowercase"))
+            .with_help(format!("write `{prefix}`")),
+        }
     }
 
     fn lex_ident_or_keyword(&mut self) -> TokenKind {
@@ -551,6 +700,58 @@ impl<'a> Lexer<'a> {
 
     fn span_at(&self, start: usize, end: usize, line: usize, col: usize) -> Span {
         Span::in_file(self.file_id, start, end, line, col)
+    }
+}
+
+/// Why a digit sequence is not a valid `i64` literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumberError {
+    /// Byte offset of the first byte that is not a digit of the radix.
+    InvalidDigit(usize),
+    NoDigits,
+    MisplacedSeparator,
+    OutOfRange,
+    UppercasePrefix,
+}
+
+/// Validates `digits` (digits of `radix` and `_` separators, no prefix) and
+/// returns their value in one pass. Errors are reported in priority order:
+/// the first invalid digit, then an empty body, then a misplaced separator,
+/// then overflow, so the diagnostic names the most specific problem.
+fn scan_digits(digits: &[u8], radix: u32) -> Result<i64, NumberError> {
+    let mut value: i64 = 0;
+    let mut overflow = false;
+    let mut count = 0usize;
+    let mut misplaced = false;
+    for (i, &b) in digits.iter().enumerate() {
+        if b == b'_' {
+            // A separator needs a digit on both sides.
+            let after = digits.get(i + 1).is_some_and(|n| *n != b'_');
+            if i == 0 || !after {
+                misplaced = true;
+            }
+            continue;
+        }
+        let Some(d) = (b as char).to_digit(radix) else {
+            return Err(NumberError::InvalidDigit(i));
+        };
+        count += 1;
+        match value
+            .checked_mul(radix as i64)
+            .and_then(|v| v.checked_add(d as i64))
+        {
+            Some(v) => value = v,
+            None => overflow = true,
+        }
+    }
+    if count == 0 {
+        Err(NumberError::NoDigits)
+    } else if misplaced {
+        Err(NumberError::MisplacedSeparator)
+    } else if overflow {
+        Err(NumberError::OutOfRange)
+    } else {
+        Ok(value)
     }
 }
 
@@ -1058,5 +1259,229 @@ mod tests {
                 TokenKind::Semicolon
             ]
         );
+    }
+
+    // ── Radix prefixes and digit separators (willow-jz15.55) ─────────────────
+
+    fn ints(src: &str) -> Vec<i64> {
+        kinds(src)
+            .unwrap()
+            .into_iter()
+            .map(|k| match k {
+                TokenKind::Integer(n) => n,
+                other => panic!("expected an integer, got {other:?}"),
+            })
+            .collect()
+    }
+
+    // Radix 1: each prefix reads its digits in its own base.
+    #[test]
+    fn radix_01_prefixes() {
+        assert_eq!(ints("0xff 0o17 0b1011 0x0"), vec![255, 15, 11, 0]);
+    }
+
+    // Radix 2: hex digits may be upper or lower case, mixed.
+    #[test]
+    fn radix_02_hex_digit_case() {
+        assert_eq!(ints("0xFF 0xfF 0xDeadBeef"), vec![255, 255, 0xDEAD_BEEF]);
+    }
+
+    // Radix 3: `i64::MAX` is reachable in every radix.
+    #[test]
+    fn radix_03_i64_max_in_every_radix() {
+        let max = format!("0b{:b} 0o{:o} 0x7FFF_FFFF_FFFF_FFFF", i64::MAX, i64::MAX);
+        assert_eq!(ints(&max), vec![i64::MAX; 3]);
+    }
+
+    // Radix 4: one past `i64::MAX` is E0052 in every radix; the sign-bit help
+    // explains how to spell such masks.
+    #[test]
+    fn radix_04_sign_bit_is_out_of_range() {
+        for src in [
+            "0x8000_0000_0000_0000",
+            "0o1000000000000000000000",
+            "0b1000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            let d = first_error(src);
+            assert_eq!(d.code, ErrorCode::E0052, "{src}");
+            assert!(d.helps.iter().any(|h| h.contains("!0")), "{src}");
+        }
+    }
+
+    // Radix 5: all bits set is rejected rather than wrapping to -1 (as Rust).
+    #[test]
+    fn radix_05_all_bits_set_is_rejected() {
+        let d = first_error("0xFFFF_FFFF_FFFF_FFFF");
+        assert_eq!(d.code, ErrorCode::E0052);
+        assert!(d.message.contains("0xFFFF_FFFF_FFFF_FFFF"));
+    }
+
+    // Radix 6: very long hex bodies are rejected without panicking.
+    #[test]
+    fn radix_06_very_long_hex_is_out_of_range() {
+        let d = first_error(&format!("0x{}", "F".repeat(200)));
+        assert_eq!(d.code, ErrorCode::E0052);
+    }
+
+    // Radix 7: leading zeros after the prefix keep the value in range.
+    #[test]
+    fn radix_07_leading_zeros() {
+        assert_eq!(
+            ints("0x0000_0000_0000_0000_00FF 0b0001 007"),
+            vec![255, 1, 7]
+        );
+    }
+
+    // Radix 8: invalid digits are E0054 pointing at the offending byte.
+    #[test]
+    fn radix_08_invalid_digit_span() {
+        let d = first_error("0b102");
+        assert_eq!(d.code, ErrorCode::E0054);
+        assert!(d.message.contains("invalid digit `2` in binary literal"));
+        let span = d.labels[0].span;
+        assert_eq!((span.start, span.end, span.col), (4, 5, 5));
+    }
+
+    // Radix 9: octal rejects 8/9 and hex rejects letters past `f`.
+    #[test]
+    fn radix_09_invalid_digit_per_radix() {
+        assert!(first_error("0o78").message.contains("octal"));
+        let d = first_error("0xFG");
+        assert_eq!(d.code, ErrorCode::E0054);
+        assert!(d.message.contains("`G`"));
+    }
+
+    // Radix 10: a bare prefix has no digits.
+    #[test]
+    fn radix_10_no_digits() {
+        for src in ["0x", "0b", "0o", "0x_", "0x;"] {
+            let d = first_error(src);
+            assert_eq!(d.code, ErrorCode::E0054, "{src}");
+            assert!(d.message.contains("has no digits"), "{src}");
+        }
+    }
+
+    // Radix 11: uppercase prefixes are rejected with a lowercase suggestion.
+    #[test]
+    fn radix_11_uppercase_prefix() {
+        let d = first_error("0XFF");
+        assert_eq!(d.code, ErrorCode::E0054);
+        assert!(d.helps.iter().any(|h| h.contains("`0x`")));
+        assert_eq!(first_error("0B1").code, ErrorCode::E0054);
+        assert_eq!(first_error("0O7").code, ErrorCode::E0054);
+    }
+
+    // Radix 12: separators between digits are ignored in every radix.
+    #[test]
+    fn separator_12_between_digits() {
+        assert_eq!(
+            ints("1_000_000 0xFF_FF 0b1111_0000 0o7_7"),
+            vec![1_000_000, 0xFFFF, 0b1111_0000, 0o77]
+        );
+    }
+
+    // Radix 13: one separator may follow the prefix.
+    #[test]
+    fn separator_13_after_prefix() {
+        assert_eq!(ints("0x_FF 0b_1"), vec![255, 1]);
+    }
+
+    // Radix 14: trailing, doubled, or prefix-doubled separators are E0054.
+    #[test]
+    fn separator_14_misplaced() {
+        for src in ["1_", "1__0", "0xFF_", "0x__FF", "0b1__0"] {
+            let d = first_error(src);
+            assert_eq!(d.code, ErrorCode::E0054, "{src}");
+            assert!(d.message.contains("misplaced `_`"), "{src}");
+        }
+    }
+
+    // Radix 15: a leading `_` is still an identifier, not a number.
+    #[test]
+    fn separator_15_leading_underscore_is_ident() {
+        assert_eq!(
+            kinds("_1").unwrap(),
+            vec![TokenKind::Ident("_1".to_string())]
+        );
+    }
+
+    // Radix 16: floats accept separators in both halves and keep their value.
+    #[test]
+    fn separator_16_float() {
+        assert_eq!(
+            kinds("1_000.5 2.718_5").unwrap(),
+            vec![TokenKind::Float(1000.5), TokenKind::Float(2.7185)]
+        );
+    }
+
+    // Radix 17: a misplaced separator next to the float point is rejected.
+    #[test]
+    fn separator_17_float_misplaced() {
+        assert_eq!(first_error("1_.5").code, ErrorCode::E0054);
+        assert_eq!(first_error("1.5_").code, ErrorCode::E0054);
+    }
+
+    // Radix 18: a float whose integer half exceeds `i64` is still a float.
+    #[test]
+    fn separator_18_large_float_is_not_out_of_range() {
+        assert_eq!(
+            kinds("99999999999999999999.5").unwrap(),
+            vec![TokenKind::Float(99999999999999999999.5)]
+        );
+    }
+
+    // Radix 19: decimal overflow still reports E0052 when separators are used.
+    #[test]
+    fn separator_19_decimal_overflow_with_separators() {
+        let d = first_error("9_223_372_036_854_775_808");
+        assert_eq!(d.code, ErrorCode::E0052);
+        assert_eq!(ints("9_223_372_036_854_775_807"), vec![i64::MAX]);
+    }
+
+    // Radix 20: a prefixed literal stops at `.`, operators and delimiters, and
+    // its span covers exactly the literal.
+    #[test]
+    fn radix_20_boundaries_and_span() {
+        assert_eq!(
+            kinds("0xF..0b11").unwrap(),
+            vec![
+                TokenKind::Integer(15),
+                TokenKind::DotDot,
+                TokenKind::Integer(3)
+            ]
+        );
+        assert_eq!(
+            kinds("(0xff)+0o1").unwrap(),
+            vec![
+                TokenKind::LParen,
+                TokenKind::Integer(255),
+                TokenKind::RParen,
+                TokenKind::Plus,
+                TokenKind::Integer(1)
+            ]
+        );
+        let toks = Lexer::new("  0x_FF ").tokenize().unwrap();
+        assert_eq!((toks[0].span.start, toks[0].span.end), (2, 7));
+    }
+
+    // Radix 21: lexing recovers after a malformed literal and reports later
+    // errors too.
+    #[test]
+    fn radix_21_recovers_after_error() {
+        let errs = Lexer::new("0b2 + 0xFFFF_FFFF_FFFF_FFFF + 0x")
+            .tokenize()
+            .unwrap_err();
+        let codes: Vec<_> = errs.iter().map(|d| d.code).collect();
+        assert_eq!(
+            codes,
+            vec![ErrorCode::E0054, ErrorCode::E0052, ErrorCode::E0054]
+        );
+    }
+
+    // Radix 22: a plain `0` and decimal numbers starting with `0` are unchanged.
+    #[test]
+    fn radix_22_zero_forms_unchanged() {
+        assert_eq!(ints("0 01 0"), vec![0, 1, 0]);
+        assert_eq!(kinds("0.5").unwrap(), vec![TokenKind::Float(0.5)]);
     }
 }

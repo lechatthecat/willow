@@ -535,7 +535,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "example/bitwise_operators.wi",
-            "true\nfalse\n5\n24\ntrue\n3\n-4\n-7\n1\n34\n12\n-4611686018427387904\n\
+            "true\nfalse\n5\n52\n255\n40\n24\ntrue\n3\n-4\n-7\n1\n34\n12\n-4611686018427387904\n\
              recovered: integer overflow: `<<` shift amount outside 0..64\ndone\n",
         ),
         ("example/grouped_imports.wi", "42\n"),

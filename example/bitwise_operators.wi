@@ -5,10 +5,13 @@
 // follows Rust: `|` < `^` < `&` < `<<`/`>>` < `+`/`-`, all looser than the
 // arithmetic operators and tighter than comparisons. `>>` is arithmetic: it
 // keeps the sign bit.
+//
+// Masks read best in hex (`0xFF`), octal (`0o755`) or binary (`0b1010`), and
+// `_` separates digit groups (`0b1111_0000`, `1_000_000`).
 
-const READ: i64 = 1;
-const WRITE: i64 = 2;
-const EXEC: i64 = 4;
+const READ: i64 = 0b001;
+const WRITE: i64 = 0b010;
+const EXEC: i64 = 0b100;
 
 fn has(flags: i64, flag: i64) -> bool {
     return flags & flag != 0;
@@ -36,6 +39,12 @@ fn main() {
     println(has(perms, WRITE));
     perms |= EXEC;
     println(perms);
+
+    // Masking and extracting fields with hex and binary literals.
+    let color = 0x12_34_56;
+    println((color >> 8) & 0xFF);
+    println(0b1111_0000 | 0x0F);
+    println(0o755 & 0o070);
 
     // Precedence: `1 + 2 << 3` is `(1 + 2) << 3`, and `6 & 3 == 2` compares
     // the masked value.
