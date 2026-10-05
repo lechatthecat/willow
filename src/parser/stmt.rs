@@ -1,6 +1,6 @@
 use super::Parser;
 use super::ast::*;
-use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
+use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::lexer::token::TokenKind;
 
 #[willow_continuations::parser]
@@ -392,14 +392,27 @@ impl Parser {
     /// synthetic else block, so later phases see ordinary nested `IfStmt`s.
     /// Rungs are collected in a loop and folded from the last one, so a long
     /// ladder costs no parser recursion.
+    ///
+    /// Any rung may be `if let P = e { }` (willow-jz15.6). It folds into
+    /// `match e { P => { then }, _ => { else } }`, so pattern checking,
+    /// exhaustiveness, binding scopes and GC roots are the `match` ones.
     pub(super) fn parse_if(&mut self) -> Result<Stmt, Diagnostic> {
+        enum Head {
+            Cond(Expr),
+            Let(Pattern, Expr),
+        }
         let mut rungs = Vec::new();
         let mut else_block = loop {
             let span = self.current_span();
             self.expect(TokenKind::If)?;
-            let cond = self.parse_control_head()?;
+            let head = if self.eat(TokenKind::Let) {
+                let (pattern, scrutinee) = self.parse_let_head()?;
+                Head::Let(pattern, scrutinee)
+            } else {
+                Head::Cond(self.parse_control_head()?)
+            };
             let then_block = self.parse_block()?;
-            rungs.push((span, cond, then_block));
+            rungs.push((span, head, then_block));
             if !self.eat(TokenKind::Else) {
                 break None;
             }
@@ -408,16 +421,33 @@ impl Parser {
             }
         };
         loop {
-            let (span, cond, then_block) = rungs.pop().expect("parse_if pushes a rung");
+            let (span, head, then_block) = rungs.pop().expect("parse_if pushes a rung");
             let end = else_block
                 .as_ref()
                 .map_or(then_block.span, |b: &Block| b.span);
-            let stmt = Stmt::If(IfStmt {
-                cond,
-                then_block,
-                else_block,
-                span,
-            });
+            let stmt = match head {
+                Head::Cond(cond) => Stmt::If(IfStmt {
+                    cond,
+                    then_block,
+                    else_block,
+                    span,
+                }),
+                Head::Let(pattern, scrutinee) => {
+                    let fallback = else_block.unwrap_or_else(|| Block {
+                        id: crate::parser::ast::BodyId::fresh(),
+                        stmts: Vec::new(),
+                        span: then_block.span,
+                    });
+                    Self::let_match(
+                        MatchSource::IfLet,
+                        span.to(end),
+                        pattern,
+                        scrutinee,
+                        then_block,
+                        fallback,
+                    )
+                }
+            };
             if rungs.is_empty() {
                 return Ok(stmt);
             }
@@ -429,12 +459,82 @@ impl Parser {
         }
     }
 
+    /// `while c { }`, or `while let P = e { }` (willow-jz15.6), which becomes
+    /// `while true { match e { P => { body }, _ => { break; } } }`: the
+    /// scrutinee is re-evaluated before every iteration, `continue` re-tests
+    /// it, and `break` leaves the loop.
     pub(super) fn parse_while(&mut self) -> Result<Stmt, Diagnostic> {
         let span = self.current_span();
         self.expect(TokenKind::While)?;
+        if self.eat(TokenKind::Let) {
+            let (pattern, scrutinee) = self.parse_let_head()?;
+            let body = self.parse_block()?;
+            let whole = span.to(body.span);
+            let exit = Block {
+                id: crate::parser::ast::BodyId::fresh(),
+                stmts: vec![Stmt::Break(span)],
+                span: body.span,
+            };
+            let matched =
+                Self::let_match(MatchSource::WhileLet, whole, pattern, scrutinee, body, exit);
+            return Ok(Stmt::While(WhileStmt {
+                cond: Expr::Bool(true, span, ExprId::fresh()),
+                body: Block {
+                    id: crate::parser::ast::BodyId::fresh(),
+                    stmts: vec![matched],
+                    span: whole,
+                },
+                span,
+            }));
+        }
         let cond = self.parse_control_head()?;
         let body = self.parse_block()?;
         Ok(Stmt::While(WhileStmt { cond, body, span }))
+    }
+
+    /// `P = e` after `if let` / `while let`. The scrutinee is a control head,
+    /// so `{` opens the body rather than an object literal.
+    fn parse_let_head(&mut self) -> Result<(Pattern, Expr), Diagnostic> {
+        let pattern = self.parse_pattern()?;
+        self.expect(TokenKind::Eq)?;
+        let scrutinee = self.parse_control_head()?;
+        Ok((pattern, scrutinee))
+    }
+
+    /// The two-arm `match` an `if let` / `while let` stands for.
+    fn let_match(
+        source: MatchSource,
+        span: Span,
+        pattern: Pattern,
+        scrutinee: Expr,
+        then_block: Block,
+        fallback: Block,
+    ) -> Stmt {
+        let then_span = pattern.span().to(then_block.span);
+        let fallback_span = fallback.span;
+        Stmt::Expr(ExprStmt {
+            expr: Expr::Match(Box::new(MatchExpr {
+                id: ExprId::fresh(),
+                scrutinee: Box::new(scrutinee),
+                arms: vec![
+                    MatchArm {
+                        pattern,
+                        guard: None,
+                        body: MatchBody::Block(then_block),
+                        span: then_span,
+                    },
+                    MatchArm {
+                        pattern: Pattern::Wildcard(fallback_span, PatternId::fresh()),
+                        guard: None,
+                        body: MatchBody::Block(fallback),
+                        span: fallback_span,
+                    },
+                ],
+                span,
+                source,
+            })),
+            span,
+        })
     }
 
     pub(super) fn parse_for(&mut self) -> Result<Stmt, Diagnostic> {

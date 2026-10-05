@@ -214,6 +214,9 @@ fn push_expr<'a>(pending: &mut Vec<AstEvent<'a>>, node: &'a Expr) {
             for arm in &expr.arms {
                 pending.push(AstEvent::EnterScope);
                 pending.push(AstEvent::Pattern(&arm.pattern));
+                if let Some(guard) = &arm.guard {
+                    pending.push(AstEvent::Expr(guard));
+                }
                 match &arm.body {
                     MatchBody::Expr(body) => pending.push(AstEvent::Expr(body)),
                     MatchBody::Block(body) => pending.push(AstEvent::Block(body)),

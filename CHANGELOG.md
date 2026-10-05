@@ -42,6 +42,16 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
 
 ### Added
 
+- **`if let`, `while let` and match guards.** `if let P = e { ... }` (with
+  optional `else` / `else if let` / `else if`) runs its block when `e` matches
+  `P`, and `while let P = e { ... }` loops while it does; `P`'s bindings are
+  scoped to the block. A match arm may carry a guard, `P if cond => ...`,
+  evaluated after `P` binds; a false guard tries the next arm. A guarded arm
+  never counts toward exhaustiveness (E1202/E1206/E1207 still demand an
+  unguarded arm), and a non-`bool` guard is error E0203. An irrefutable
+  `if let`/`while let` pattern is warning W1201. Let chains
+  (`if let P = e && cond`) and nested patterns are not supported. See
+  `example/if_let_guards.wi`.
 - **Bitwise and shift operators on `i64`.** `&`, `|`, `^`, `<<`, `>>` and
   their compound assignments (`&=`, `|=`, `^=`, `<<=`, `>>=`) now work on
   `i64`, and prefix `!` on an `i64` is bitwise not (on `bool` it is still

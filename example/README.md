@@ -40,6 +40,28 @@ The type spelling `T?` is retained as parser sugar and means exactly
 `Option<Option<T>>`. Willow does not implicitly wrap a `T` as `Some(T)`.
 See `option_absence.wi`, `gc_linked_list.wi`, and `nil_safe_chain.wi`.
 
+## `if let`, `while let` and match guards
+
+[if_let_guards.wi](if_let_guards.wi) matches a single pattern without a full
+`match`:
+
+```willow
+if let Some(port) = config { println(port); } else { println("no port"); }
+while let Some(top) = stack.pop() { total = total + top; }
+```
+
+The pattern's bindings exist only inside the first block. `else if let` and
+`else if` chain as usual. `while let` evaluates its scrutinee again before every
+iteration and stops at the first value that does not match; `break` and
+`continue` work as in `while`.
+
+A `match` arm may add a guard, `P if cond => ...`. The guard runs after `P`
+binds and sees its bindings. When the guard is false, the next arm is tried. A
+guarded arm never makes a match exhaustive, so `match n { x if x > 0 => 1, 0 =>
+2 }` is still error E1206; add an unguarded arm such as `_ => ...`. A guard must
+be `bool` (E0203). Let chains (`if let P = e && cond`) and nested patterns are
+not supported; bind first and test inside the block.
+
 ## Asynchronous filesystem operations
 
 The unsuffixed `fs::read_to_string`, `fs::write_string`, `fs::exists`, and

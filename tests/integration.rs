@@ -184,6 +184,8 @@ mod concurrency;
 mod exponentiation;
 #[path = "integration/integer_overflow.rs"]
 mod integer_overflow;
+#[path = "integration/match_guards_if_let.rs"]
+mod match_guards_if_let;
 #[path = "integration/option_interface_context.rs"]
 mod option_interface_context;
 #[path = "integration/option_nil_deprecation.rs"]

@@ -371,6 +371,7 @@ impl HirExpr {
             HirExprKind::Match { scrutinee, arms } => {
                 let mut out = vec![&**scrutinee];
                 for arm in arms {
+                    out.extend(&arm.guard);
                     out.extend(nested_exprs(&arm.body));
                 }
                 out
@@ -662,6 +663,9 @@ pub enum HirSelectCaseKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirMatchArm {
     pub pattern: HirPattern,
+    /// `pattern if guard` (willow-jz15.6): a `bool` evaluated with the
+    /// pattern's bindings in scope. False falls through to the next arm.
+    pub guard: Option<HirExpr>,
     pub body: Vec<HirStmt>,
     pub ty: Type,
     pub span: Span,

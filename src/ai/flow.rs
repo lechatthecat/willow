@@ -389,10 +389,15 @@ impl Body {
                         .patterns
                         .get(&arm.pattern.id())
                         .unwrap_or(&arm.pattern);
-                    let target = match &arm.body {
+                    let mut target = match &arm.body {
                         MatchBody::Expr(e) => self.expr(jobs, e, operation, exits),
                         MatchBody::Block(b) => self.block(jobs, b, operation, exits),
                     };
+                    // A guard runs before the body; when it fails, a later
+                    // arm (another fork branch) is taken instead.
+                    if let Some(guard) = &arm.guard {
+                        target = self.expr(jobs, guard, target, exits);
+                    }
                     // Literal scrutinees rule out impossible literal arms. For
                     // other predicates retain structural alternatives, not a
                     // claim that their conjunction is executable.
@@ -404,13 +409,14 @@ impl Body {
                     if compatible && !covered {
                         arms.push(target);
                     }
-                    covered |= matches!(pattern, Pattern::Wildcard(..) | Pattern::Binding { .. })
-                        || compatible
-                            && matches!(
-                                (&*m.scrutinee, pattern),
-                                (Expr::Bool(..), Pattern::LiteralBool(..))
-                                    | (Expr::Integer(..), Pattern::LiteralInt(..))
-                            );
+                    covered |= arm.guard.is_none()
+                        && (matches!(pattern, Pattern::Wildcard(..) | Pattern::Binding { .. })
+                            || compatible
+                                && matches!(
+                                    (&*m.scrutinee, pattern),
+                                    (Expr::Bool(..), Pattern::LiteralBool(..))
+                                        | (Expr::Integer(..), Pattern::LiteralInt(..))
+                                ));
                 }
                 let fork = self.node(m.span, arms, false);
                 self.expr(jobs, &m.scrutinee, fork, exits)

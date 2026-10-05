@@ -1,0 +1,67 @@
+// `if let`, `while let` and match guards (willow-jz15.6).
+//
+// `if let P = e { ... } else { ... }` runs the first block when `e` matches `P`,
+// with `P`'s bindings in scope there only. `while let P = e { ... }` loops while
+// `e` (evaluated afresh each iteration) still matches. A match arm may carry a
+// guard, `P if cond => ...`: the guard runs after `P` binds, and when it is
+// false the next arm is tried. A guarded arm never counts toward exhaustiveness,
+// so a match still needs an unguarded arm for every case.
+
+import std::collections::Array;
+
+enum Shape { Circle(i64), Rect(i64, i64) }
+
+class Stack {
+    pub items: Array<i64>;
+    pub fn pop(self) -> Option<i64> {
+        if self.items.len() == 0 { return None; }
+        return Some(self.items.pop());
+    }
+}
+
+fn describe(s: Shape) -> String {
+    return match s {
+        Shape::Rect(w, h) if w == h => "square",
+        Shape::Rect(w, h) => "rectangle",
+        Shape::Circle(r) if r == 0 => "point",
+        Shape::Circle(r) => "circle",
+    };
+}
+
+fn sign(n: i64) -> String {
+    return match n {
+        x if x < 0 => "negative",
+        0 => "zero",
+        _ => "positive",
+    };
+}
+
+fn main() {
+    println(describe(Shape::Rect(2, 2)));
+    println(describe(Shape::Rect(2, 3)));
+    println(describe(Shape::Circle(0)));
+    println(sign(-4));
+    println(sign(0));
+
+    let config: Option<i64> = Some(8080);
+    if let Some(port) = config {
+        println(port);
+    }
+
+    let missing: Option<i64> = None;
+    if let Some(port) = missing {
+        println(port);
+    } else if let Some(fallback) = config {
+        println(fallback + 1);
+    } else {
+        println("no port");
+    }
+
+    let stack = new Stack([1, 2, 3, 4]);
+    let mut total = 0;
+    while let Some(top) = stack.pop() {
+        if top == 3 { continue; }
+        total = total + top;
+    }
+    println(total);
+}

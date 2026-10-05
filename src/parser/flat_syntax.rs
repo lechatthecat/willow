@@ -324,16 +324,19 @@ mod tests {
                 arms: vec![
                     MatchArm {
                         pattern: Pattern::Wildcard(span, PatternId::fresh()),
+                        guard: None,
                         body: MatchBody::Block(block()),
                         span,
                     },
                     MatchArm {
                         pattern: Pattern::Wildcard(span, PatternId::fresh()),
+                        guard: None,
                         body: MatchBody::Expr(Box::new(leaf(0))),
                         span,
                     },
                 ],
                 span,
+                source: MatchSource::Match,
             })),
             Expr::Select(SelectExpr {
                 id: ExprId::fresh(),

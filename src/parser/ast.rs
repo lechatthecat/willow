@@ -1143,6 +1143,10 @@ pub enum MatchBody {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    /// `pattern if guard => body` (willow-jz15.6). Evaluated after the
+    /// pattern's bindings are in scope; a false guard falls through to the
+    /// next arm, so a guarded arm never counts toward exhaustiveness.
+    pub guard: Option<Expr>,
     pub body: MatchBody,
     pub span: Span,
 }
@@ -1153,6 +1157,21 @@ pub struct MatchExpr {
     pub scrutinee: Box<Expr>,
     pub arms: Vec<MatchArm>,
     pub span: Span,
+    /// The surface syntax this `match` was written as. `if let` / `while let`
+    /// are parsed into a `match` whose last arm is a synthetic `_`
+    /// (willow-jz15.6); only diagnostics look at this.
+    pub source: MatchSource,
+}
+
+/// Which surface form produced a [`MatchExpr`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum MatchSource {
+    #[default]
+    Match,
+    /// `if let P = e { .. } [else { .. }]` → `match e { P => { .. }, _ => { .. } }`.
+    IfLet,
+    /// `while let P = e { .. }` → `while true { match e { P => { .. }, _ => { break; } } }`.
+    WhileLet,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

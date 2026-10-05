@@ -491,6 +491,9 @@ pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollec
         Expr::Match(match_expr) => {
             normalize_std_collection_expr(&mut match_expr.scrutinee, imports);
             for arm in &mut match_expr.arms {
+                if let Some(guard) = &mut arm.guard {
+                    normalize_std_collection_expr(guard, imports);
+                }
                 match &mut arm.body {
                     MatchBody::Expr(body) => normalize_std_collection_expr(body, imports),
                     MatchBody::Block(block) => normalize_std_collection_block(block, imports),

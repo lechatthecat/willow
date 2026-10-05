@@ -662,6 +662,33 @@ impl TypeChecker {
         }
     }
 
+    /// A match guard is a `bool` condition checked with the arm's pattern
+    /// bindings in scope (willow-jz15.6).
+    fn check_match_guard(&mut self, guard: &Expr) {
+        let errors_before = self.error_generation;
+        let guard_ty = self.check_expr(guard);
+        if guard_ty != Type::Bool
+            && !Self::is_error_type(&guard_ty)
+            && self.error_generation == errors_before
+        {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0203,
+                    format!(
+                        "match guard must be `bool`, found `{}`",
+                        type_name(&guard_ty)
+                    ),
+                )
+                .with_label(Label::primary(
+                    guard.span(),
+                    format!("expected `bool`, found `{}`", type_name(&guard_ty)),
+                ))
+                .with_help("use an explicit comparison, e.g. `!= 0`"),
+            );
+        }
+    }
+
     pub(super) fn check_match_expr(&mut self, m: &MatchExpr) -> Type {
         // The type this `match` flows into, when it was reached through
         // `check_expr_expecting` (willow-0g8j.3). Taken, not borrowed: a
@@ -693,6 +720,9 @@ impl TypeChecker {
                         );
                     }
                 }
+                if let Some(guard) = &arm.guard {
+                    self.check_match_guard(guard);
+                }
                 self.check_match_body(&arm.body, expected.as_ref());
                 self.symbols.pop_scope();
             }
@@ -721,12 +751,44 @@ impl TypeChecker {
         for arm in &m.arms {
             // Check if arm is unreachable (after a wildcard/binding)
             if has_wildcard && !found_unreachable {
-                self.push(
-                    Diagnostic::new(Severity::Warning, ErrorCode::W1201, "unreachable match arm")
-                        .with_label(Label::primary(arm.span, "this arm is unreachable")),
-                );
+                let diagnostic = match m.source {
+                    MatchSource::Match => Diagnostic::new(
+                        Severity::Warning,
+                        ErrorCode::W1201,
+                        "unreachable match arm",
+                    )
+                    .with_label(Label::primary(arm.span, "this arm is unreachable")),
+                    // The unreachable arm is the synthetic `_` (willow-jz15.6):
+                    // point at the pattern that made it so.
+                    MatchSource::IfLet | MatchSource::WhileLet => {
+                        let form = if m.source == MatchSource::IfLet {
+                            "if let"
+                        } else {
+                            "while let"
+                        };
+                        let mut diagnostic = Diagnostic::new(
+                            Severity::Warning,
+                            ErrorCode::W1201,
+                            format!("irrefutable `{form}` pattern"),
+                        )
+                        .with_label(Label::primary(
+                            m.arms[0].pattern.span(),
+                            "this pattern always matches",
+                        ));
+                        diagnostic = if m.source == MatchSource::IfLet {
+                            diagnostic.with_help("use `let` instead; the `else` branch never runs")
+                        } else {
+                            diagnostic.with_help("the loop only ends through `break` or `return`")
+                        };
+                        diagnostic
+                    }
+                };
+                self.push(diagnostic);
                 found_unreachable = true;
             }
+            // A guarded arm may decline a value its pattern matches, so it
+            // covers nothing for exhaustiveness (willow-jz15.6).
+            let covers = arm.guard.is_none();
 
             // Reinterpret `Ok(v)` / `Closed` as enum-variant patterns when the
             // scrutinee is an enum, and record the reinterpretation for the
@@ -784,10 +846,10 @@ impl TypeChecker {
             // Validate pattern and track coverage
             match pattern {
                 Pattern::Wildcard(_, _) => {
-                    has_wildcard = true;
+                    has_wildcard |= covers;
                 }
                 Pattern::Binding { name, span, .. } => {
-                    has_wildcard = true; // binding covers everything
+                    has_wildcard |= covers; // binding covers everything
                     // Patterns do not compare against constants: the name
                     // would silently bind a new variable instead.
                     if self.symbols.lookup_var(name).is_none()
@@ -824,9 +886,9 @@ impl TypeChecker {
                         );
                     }
                     if *b {
-                        has_true = true;
+                        has_true |= covers;
                     } else {
-                        has_false = true;
+                        has_false |= covers;
                     }
                 }
                 Pattern::LiteralInt(_, span, _) => {
@@ -892,7 +954,9 @@ impl TypeChecker {
                             );
                         }
                     }
-                    covered_variants.insert(variant.clone());
+                    if covers {
+                        covered_variants.insert(variant.clone());
+                    }
                 }
                 Pattern::EnumVariantTuple {
                     enum_name,
@@ -989,7 +1053,9 @@ impl TypeChecker {
                             }
                         }
                     }
-                    covered_variants.insert(variant.clone());
+                    if covers {
+                        covered_variants.insert(variant.clone());
+                    }
                 }
                 Pattern::ClassDowncast {
                     class_name, span, ..
@@ -1103,6 +1169,9 @@ impl TypeChecker {
                         declaration_span: *bspan,
                     },
                 );
+            }
+            if let Some(guard) = &arm.guard {
+                self.check_match_guard(guard);
             }
             let arm_ty = self.check_match_body(
                 &arm.body,

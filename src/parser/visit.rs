@@ -232,6 +232,9 @@ pub fn walk_expr<V: AstVisitor + ?Sized>(visitor: &mut V, expr: &Expr) {
             for arm in &expr.arms {
                 visitor.enter_scope();
                 visitor.visit_pattern(&arm.pattern);
+                if let Some(guard) = &arm.guard {
+                    visitor.visit_expr(guard);
+                }
                 match &arm.body {
                     MatchBody::Expr(body) => visitor.visit_expr(body),
                     MatchBody::Block(body) => visitor.visit_block(body),

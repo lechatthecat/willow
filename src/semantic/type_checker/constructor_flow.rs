@@ -362,9 +362,15 @@ impl<'a> Graph<'a> {
                         Expr::Match(m) => {
                             let mut arms = Vec::with_capacity(m.arms.len());
                             for arm in &m.arms {
-                                arms.push(match &arm.body {
+                                let body = match &arm.body {
                                     MatchBody::Block(b) => self.block(b, next, flow),
                                     MatchBody::Expr(e) => self.expr(e, next, flow),
+                                };
+                                // A failed guard falls through to a later
+                                // arm, which the fork already reaches.
+                                arms.push(match &arm.guard {
+                                    Some(guard) => self.expr(guard, body, flow),
+                                    None => body,
                                 });
                             }
                             // Exhaustiveness is checked separately (E1206).

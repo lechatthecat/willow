@@ -91,6 +91,9 @@ fn expr_children<'a>(node: &'a Expr, visit: &mut impl FnMut(NodeRef<'a>)) {
         Expr::Match(v) => {
             visit(NodeRef::Expr(&v.scrutinee));
             for arm in &v.arms {
+                if let Some(guard) = &arm.guard {
+                    visit(NodeRef::Expr(guard));
+                }
                 match &arm.body {
                     MatchBody::Expr(v) => visit(NodeRef::Expr(v)),
                     MatchBody::Block(b) => {
@@ -268,6 +271,9 @@ fn expr_children_mut<'a>(node: &'a mut Expr, visit: &mut impl FnMut(NodeMut<'a>)
         Expr::Match(v) => {
             visit(NodeMut::Expr(&mut v.scrutinee));
             for arm in &mut v.arms {
+                if let Some(guard) = &mut arm.guard {
+                    visit(NodeMut::Expr(guard));
+                }
                 match &mut arm.body {
                     MatchBody::Expr(v) => visit(NodeMut::Expr(v)),
                     MatchBody::Block(b) => {
@@ -482,12 +488,12 @@ clone_shell_struct!(LambdaExpr {
     syntax: [body]
 });
 clone_shell_struct!(MatchExpr {
-    metadata: [id, span],
+    metadata: [id, span, source],
     syntax: [scrutinee, arms]
 });
 clone_shell_struct!(MatchArm {
     metadata: [pattern, span],
-    syntax: [body]
+    syntax: [guard, body]
 });
 clone_shell_struct!(LetStmt {
     metadata: [name, mutable, ty, span],

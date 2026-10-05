@@ -359,8 +359,13 @@ fn format_expr(e: &HirExpr) -> String {
                     for s in &arm.body {
                         format_stmt(s, 0, &mut body_text);
                     }
+                    let guard = arm
+                        .guard
+                        .as_ref()
+                        .map(|guard| format!(" if {}", format_expr(guard)))
+                        .unwrap_or_default();
                     format!(
-                        "{} => {{ {} }}",
+                        "{}{guard} => {{ {} }}",
                         format_pattern(&arm.pattern),
                         body_text.trim_end().replace('\n', " ")
                     )

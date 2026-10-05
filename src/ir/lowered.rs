@@ -1787,15 +1787,16 @@ impl Builder {
         let merge = self.new_block();
         for (index, arm) in arms.iter().enumerate() {
             // A wildcard or a whole-value binding always applies, so it needs
-            // no test and nothing after it is reachable.
-            let always_matches = matches!(
+            // no test, and without a guard nothing after it is reachable.
+            let irrefutable = matches!(
                 arm.pattern,
                 HirPattern::Wildcard | HirPattern::Binding { .. }
             );
+            let always_matches = irrefutable && arm.guard.is_none();
             let is_last = index + 1 == arms.len();
             let arm_block = self.new_block();
             let next = (!always_matches && !is_last).then(|| self.new_block());
-            if always_matches {
+            if irrefutable {
                 self.terminate(SourceTerminator::Jump(arm_block));
             } else {
                 let test_name = self.synthetic_name("match_test");
@@ -1843,6 +1844,23 @@ impl Builder {
                     bindings,
                     span: arm.span,
                 });
+            }
+            // `pattern if guard` (willow-jz15.6): the guard sees the bindings.
+            // A false guard leaves the arm scope, dropping its roots exactly
+            // as the body's fallthrough does, and tries the next arm.
+            if let Some(guard) = &arm.guard {
+                let accepted = self.lower_condition(guard);
+                let body_block = self.new_block();
+                let rejected = self.new_block();
+                self.terminate(SourceTerminator::Branch {
+                    cond: accepted,
+                    then_block: body_block,
+                    else_block: rejected,
+                });
+                self.switch_to(rejected);
+                self.push_scope_root_clears(arm_scope);
+                self.terminate(SourceTerminator::Jump(next.unwrap_or(merge)));
+                self.switch_to(body_block);
             }
             self.lower_match_arm_body(&arm.body, destination);
             // After the body: an arm that produces a value has already copied it

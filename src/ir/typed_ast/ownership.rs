@@ -215,6 +215,7 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
                 .iter()
                 .map(|arm| HirMatchArm {
                     pattern: arm.pattern.clone(),
+                    guard: arm.guard.as_ref().map(|_| empty_expr()),
                     body: stmt_slots(arm.body.len()),
                     ty: arm.ty.clone(),
                     span: arm.span,
@@ -464,6 +465,7 @@ fn expr_children_mut(source: &mut HirExpr) -> Vec<NodeMut<'_>> {
         HirExprKind::Match { scrutinee, arms } => {
             out.push(NodeMut::Expr(scrutinee));
             for arm in arms {
+                out.extend(arm.guard.as_mut().map(NodeMut::Expr));
                 out.extend(arm.body.iter_mut().map(NodeMut::Stmt));
             }
         }
@@ -560,6 +562,7 @@ fn expr_children(source: &HirExpr) -> Vec<NodeRef<'_>> {
         HirExprKind::Match { scrutinee, arms } => {
             out.push(NodeRef::Expr(scrutinee));
             for arm in arms {
+                out.extend(arm.guard.as_ref().map(NodeRef::Expr));
                 out.extend(arm.body.iter().map(NodeRef::Stmt));
             }
         }
@@ -738,7 +741,8 @@ impl HirExpr {
 
     /// Rewrite a tree before its children with heap-owned continuation slots.
     /// Returning false prunes the replaced subtree. When scoped bodies are
-    /// excluded, match scrutinees remain visible but their statements do not.
+    /// excluded, match scrutinees remain visible but their arm guards and
+    /// statements do not: both see the arm's pattern bindings.
     pub(crate) fn visit_mut_preorder(
         &mut self,
         include_scoped_bodies: bool,
@@ -751,7 +755,14 @@ impl HirExpr {
                     if !visit(expr) {
                         continue;
                     }
-                    expr_children_mut(expr)
+                    if !include_scoped_bodies && matches!(expr.kind, HirExprKind::Match { .. }) {
+                        let HirExprKind::Match { scrutinee, .. } = &mut expr.kind else {
+                            unreachable!()
+                        };
+                        vec![NodeMut::Expr(scrutinee)]
+                    } else {
+                        expr_children_mut(expr)
+                    }
                 }
                 NodeMut::Stmt(stmt) if include_scoped_bodies => stmt_children_mut(stmt),
                 NodeMut::Stmt(_) => continue,
@@ -858,6 +869,7 @@ mod tests {
                 scrutinee: Box::new(leaf()),
                 arms: vec![HirMatchArm {
                     pattern: HirPattern::Wildcard,
+                    guard: None,
                     body: vec![HirStmt::Expr(child)],
                     ty: Type::I64,
                     span,

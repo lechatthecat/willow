@@ -1090,6 +1090,12 @@ impl Parser {
         while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
             let arm_start = self.current_span();
             let pattern = self.parse_pattern()?;
+            // `pattern if guard => body` (willow-jz15.6).
+            let guard = if self.eat(TokenKind::If) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.expect(TokenKind::FatArrow)?;
             let body = if matches!(self.peek_kind(), TokenKind::LBrace) {
                 let block = self.parse_block()?;
@@ -1123,6 +1129,7 @@ impl Parser {
             let arm_span = arm_start.to(arm_end);
             arms.push(MatchArm {
                 pattern,
+                guard,
                 body,
                 span: arm_span,
             });
@@ -1138,6 +1145,7 @@ impl Parser {
             arms,
             span,
             id: ExprId::fresh(),
+            source: MatchSource::Match,
         })))
     }
 }

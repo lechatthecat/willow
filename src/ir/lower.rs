@@ -2665,6 +2665,10 @@ fn lower_match(
             }
         };
 
+        let guard = match &arm.guard {
+            Some(guard) => Some(lower_expr(guard, ctx)?),
+            None => None,
+        };
         let (body, arm_ty) = match &arm.body {
             MatchBody::Expr(e) => {
                 let value = lower_expr(e, ctx)?;
@@ -2684,6 +2688,7 @@ fn lower_match(
         ctx.pop_scope();
         arms.push(HirMatchArm {
             pattern,
+            guard,
             body,
             ty: arm_ty,
             span: arm.span,

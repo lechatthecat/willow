@@ -2522,6 +2522,11 @@ fn minimal_unsupported_scoped_expr<'e>(
                 if !supported_pattern(&arm.pattern, &scrutinee.ty, ctx, &mut arm_names) {
                     continue;
                 }
+                if let Some(guard) = &arm.guard
+                    && let Some(inner) = minimal_unsupported_expr(guard, ctx, &arm_names)
+                {
+                    return Some(inner);
+                }
                 // A diverging arm is admissible on its own terms, so it must
                 // not be reported as the reason a match around it failed.
                 if arm_diverges(arm)
@@ -3402,6 +3407,11 @@ fn supported_match<'n>(
     arms.iter().all(|arm| {
         let mut arm_names = names.clone();
         if !supported_pattern(&arm.pattern, &scrutinee.ty, ctx, &mut arm_names) {
+            return false;
+        }
+        if let Some(guard) = &arm.guard
+            && !supported_expr(guard, ctx, &arm_names)
+        {
             return false;
         }
         if arm_diverges(arm) {
@@ -10600,6 +10610,7 @@ mod tests {
                                     )),
                                     arms: vec![HirMatchArm {
                                         pattern: HirPattern::Wildcard,
+                                        guard: None,
                                         body,
                                         ty: Type::Void,
                                         span,
@@ -10714,6 +10725,7 @@ mod tests {
                                         )),
                                         arms: vec![HirMatchArm {
                                             pattern: HirPattern::Wildcard,
+                                            guard: None,
                                             body: vec![HirStmt::Expr(expr)],
                                             ty: Type::I64,
                                             span,
@@ -16074,6 +16086,7 @@ fn f() {
         let span = crate::diagnostics::Span::dummy();
         let arm = |value: i64| HirMatchArm {
             pattern: HirPattern::LiteralInt(value),
+            guard: None,
             body: vec![HirStmt::Return {
                 value: Some(HirExpr {
                     kind: HirExprKind::Int(value),
@@ -16088,6 +16101,7 @@ fn f() {
         let mut arms = vec![arm(0)];
         arms.push(HirMatchArm {
             pattern: HirPattern::Wildcard,
+            guard: None,
             ..arm(1)
         });
         let scrutinee = HirExpr {
@@ -16135,6 +16149,7 @@ fn f() {
         };
         let arm = |body: Vec<HirStmt>| HirMatchArm {
             pattern: HirPattern::Wildcard,
+            guard: None,
             body,
             ty: Type::Never,
             span,
@@ -16281,6 +16296,7 @@ fn f() {
         let span = crate::diagnostics::Span::dummy();
         let arm = |value: i64| HirMatchArm {
             pattern: HirPattern::LiteralInt(value),
+            guard: None,
             body: vec![HirStmt::Return {
                 value: Some(HirExpr {
                     kind: HirExprKind::Int(value),
@@ -16295,6 +16311,7 @@ fn f() {
         let mut arms = vec![arm(0)];
         arms.push(HirMatchArm {
             pattern: HirPattern::Wildcard,
+            guard: None,
             ..arm(1)
         });
         assert!(match_diverges(&arms));

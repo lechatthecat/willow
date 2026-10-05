@@ -13,6 +13,8 @@ mod class_cycle_tests;
 mod constructor_flow;
 mod diagnostics;
 #[cfg(test)]
+mod match_guard_tests;
+#[cfg(test)]
 mod never_tests;
 mod resolve;
 mod returns;
