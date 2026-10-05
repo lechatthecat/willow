@@ -531,8 +531,8 @@ pub(super) fn epoch_objects(
     }
     for chunk in &state.tlab_chunks {
         assert!(
-            chunk.owner_state.is_none(),
-            "epoch index requires retired TLABs"
+            chunk.owner_state.is_none() && !chunk.needs_index(),
+            "epoch index requires retired, indexed TLABs"
         );
         for &offset in &chunk.header_offsets {
             // Retirement validates physical headers once; subsequent snapshots

@@ -1197,6 +1197,34 @@ fn object_in_retired_chunk(
     interior: bool,
 ) -> Option<HeapObject> {
     let relative = address.checked_sub(chunk.base as usize + GC_HEADER_SIZE)?;
+    let offset = if chunk.needs_index() {
+        // Not indexed yet (willow-8hq4.21): its start bits name exactly its
+        // published headers. O(chunk words) for an interior lookup.
+        if interior {
+            chunk.mark_bitmap.last_start_in(0, relative)?
+        } else {
+            (relative < chunk.used
+                && relative.is_multiple_of(GC_REGION_MARK_GRANULE)
+                && chunk.mark_bitmap.is_marked(relative))
+            .then_some(relative)?
+        }
+    } else {
+        indexed_header_offset(chunk, relative, interior)?
+    };
+    // SAFETY: a validated header index or a published start bit names a
+    // header; chunk storage cannot be released while the caller holds the
+    // heap mutex.
+    let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())?;
+    if !object.allocated() {
+        return None;
+    }
+    let payload = object.payload().as_ptr() as usize;
+    ((!interior && payload == address)
+        || (interior && address >= payload && address < object.as_ptr() as usize + object.size()))
+    .then_some(object)
+}
+
+fn indexed_header_offset(chunk: &BumpChunk, relative: usize, interior: bool) -> Option<usize> {
     let index = if interior {
         chunk
             .header_offsets
@@ -1216,17 +1244,7 @@ fn object_in_retired_chunk(
             })
             .ok()?
     };
-    let offset = usize::from(chunk.header_offsets[index]);
-    // SAFETY: retirement validated this immutable physical-header index; chunk
-    // storage cannot be released while the caller holds the heap mutex.
-    let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())?;
-    if !object.allocated() {
-        return None;
-    }
-    let payload = object.payload().as_ptr() as usize;
-    ((!interior && payload == address)
-        || (interior && address >= payload && address < object.as_ptr() as usize + object.size()))
-    .then_some(object)
+    Some(usize::from(chunk.header_offsets[index]))
 }
 
 fn old_region_objects(state: &GcState) -> impl Iterator<Item = HeapObject> + '_ {

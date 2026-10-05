@@ -138,9 +138,9 @@ pub(super) fn register_tlab_state(state: &mut GcState, address: usize) {
     });
 }
 
-pub(super) fn retire_tlab_locked(state: &mut GcState, address: usize) -> usize {
+pub(super) fn retire_tlab_locked(state: &mut GcState, address: usize) {
     let Some(record) = state.tlab_states.get_mut(&address) else {
-        return 0;
+        return;
     };
     // Fold the active chunk into the retired totals so the derived counts stay
     // continuous across retirement.
@@ -163,54 +163,73 @@ pub(super) fn retire_tlab_locked(state: &mut GcState, address: usize) -> usize {
             chunk.header_offsets.is_empty(),
             "TLAB indexed more than once"
         );
-        // The owner is stopped or retiring its own chunk; generated headers
-        // are now immutable except for collector liveness/generation fields.
-        // Take header addresses from the published start bits rather than
-        // chasing `offset += size`: each header load is then independent of
-        // the previous one, and the size chain is only compared, never used
-        // as an address (willow-8hq4.16). An unpublished header shows up as
-        // a gap and an extra bit as an overlap.
-        let used = chunk.used;
-        let mut expected = 0;
-        let mut offsets = std::mem::take(&mut chunk.header_offsets);
-        chunk.mark_bitmap.bits.for_each_set(|index| {
-            let offset = index * GC_REGION_MARK_GRANULE;
-            assert!(
-                offset == expected && offset < used,
-                "generated TLAB header was not published"
-            );
-            // SAFETY: `offset` is inside the retired prefix and equals the
-            // end of the previous validated object, so it names a header.
-            let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast()).unwrap();
-            let size = object.size();
-            assert!(
-                size >= GC_HEADER_SIZE
-                    && size <= used - offset
-                    && size.is_multiple_of(GC_REGION_MARK_GRANULE),
-                "corrupt retired TLAB header"
-            );
-            offsets.push(u16::try_from(offset).expect("TLAB offset fits bounded chunk"));
-            expected = offset + size;
-        });
-        assert!(expected == used, "generated TLAB header was not published");
-        chunk.header_offsets = offsets;
-        // Every header but the slow-path first object came from the fast path.
+        // Header indexing is deferred to the first walk that needs it
+        // (`index_retired_chunk`), so a nursery chunk that dies entirely in
+        // the next minor collection is never walked (willow-8hq4.21). Every
+        // start bit but the slow-path first object came from the fast path.
         record.retired_fast_allocations = record
             .retired_fast_allocations
-            .saturating_add(chunk.header_offsets.len().saturating_sub(1) as u64);
-        return chunk.header_offsets.len();
+            .saturating_add((chunk.mark_bitmap.bits.count() as u64).saturating_sub(1));
     }
-    0
 }
 
-pub(super) fn retire_all_tlabs_locked(state: &mut GcState) -> usize {
+/// Build and validate the header index of a retired chunk that has none yet.
+/// Returns the number of headers indexed: 0 for an indexed or empty chunk.
+/// O(objects in the chunk), at most once per chunk.
+///
+/// The owner is stopped or retired; generated headers are immutable except
+/// for collector liveness/generation fields. Header addresses come from the
+/// published start bits rather than from chasing `offset += size`: each header
+/// load is then independent of the previous one, and the size chain is only
+/// compared, never used as an address (willow-8hq4.16). An unpublished header
+/// shows up as a gap and an extra bit as an overlap.
+pub(super) fn index_retired_chunk(chunk: &mut BumpChunk) -> usize {
+    if !chunk.needs_index() {
+        return 0;
+    }
+    let used = chunk.used;
+    let mut expected = 0;
+    let mut offsets = std::mem::take(&mut chunk.header_offsets);
+    chunk.mark_bitmap.bits.for_each_set(|index| {
+        let offset = index * GC_REGION_MARK_GRANULE;
+        assert!(
+            offset == expected && offset < used,
+            "generated TLAB header was not published"
+        );
+        // SAFETY: `offset` is inside the retired prefix and equals the
+        // end of the previous validated object, so it names a header.
+        let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast()).unwrap();
+        let size = object.size();
+        assert!(
+            size >= GC_HEADER_SIZE
+                && size <= used - offset
+                && size.is_multiple_of(GC_REGION_MARK_GRANULE),
+            "corrupt retired TLAB header"
+        );
+        offsets.push(u16::try_from(offset).expect("TLAB offset fits bounded chunk"));
+        expected = offset + size;
+    });
+    assert!(expected == used, "generated TLAB header was not published");
+    chunk.header_offsets = offsets;
+    chunk.header_offsets.len()
+}
+
+/// Seal every active TLAB without indexing its headers. The minor collector
+/// indexes only the chunks it touches; other callers use
+/// `retire_all_tlabs_locked`.
+pub(super) fn retire_all_tlabs_unindexed(state: &mut GcState) {
     sync_tlab_accounting(state);
     let addresses: Vec<usize> = state.tlab_states.keys().copied().collect();
-    let mut headers = 0;
     for address in addresses {
-        headers += retire_tlab_locked(state, address);
+        retire_tlab_locked(state, address);
     }
-    headers
+}
+
+/// Seal every active TLAB and index every retired chunk that still lacks its
+/// header index. Returns the headers indexed. O(chunks + newly indexed headers).
+pub(super) fn retire_all_tlabs_locked(state: &mut GcState) -> usize {
+    retire_all_tlabs_unindexed(state);
+    state.tlab_chunks.iter_mut().map(index_retired_chunk).sum()
 }
 
 pub(super) fn retire_tlabs_with_work(

@@ -2256,6 +2256,10 @@ fn root_handshake_resumes_early_mutator_and_replays_unretired_tlab_deletion() {
                 unsafe {
                     store_gc_reference(parent as *mut *mut u8, std::ptr::null_mut());
                 }
+                // The concurrent-phase barrier buffers the deletion in its
+                // cycle shard (willow-jz15.53); publish it as a safepoint
+                // would, without reaching one.
+                barrier::flush_satb_current(false);
                 assert!(epoch.is_marked(child), "pre-retirement deletion was lost");
                 deleted.store(true, Ordering::Release);
                 while !finished.load(Ordering::Acquire) {

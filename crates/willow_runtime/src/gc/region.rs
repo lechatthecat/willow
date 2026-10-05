@@ -93,7 +93,17 @@ pub(super) struct BumpChunk {
     pub(super) concurrent_marks: Arc<concurrent_bitmap::ConcurrentMarkBits>,
     /// All physical headers in a retired chunk, sorted by offset. Reclaimed
     /// headers remain valid until chunk release; lookups check allocated().
+    /// Built lazily by `index_retired_chunk`: a retired chunk without it was
+    /// never swept or promoted from, so its start bits name exactly its
+    /// published headers, all allocated and young.
     pub(super) header_offsets: Vec<u16>,
+}
+
+impl BumpChunk {
+    /// A retired, nonempty chunk whose header index is not built yet.
+    pub(super) fn needs_index(&self) -> bool {
+        self.owner_state.is_none() && self.used != 0 && self.header_offsets.is_empty()
+    }
 }
 
 pub(super) struct TlabStateRecord {

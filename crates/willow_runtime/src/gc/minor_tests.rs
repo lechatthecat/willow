@@ -2,7 +2,7 @@
 
 use super::{MinorCollector, MinorRoots, PinSource, verify_no_pin_enabled};
 use crate::gc::{
-    GC_HEADER_SIZE, drop_registry, reset_internal, retire_all_tlabs_locked, runtime,
+    GC_HEADER_SIZE, drop_registry, reset_internal, retire_all_tlabs_unindexed, runtime,
     runtime_test_guard, tlab_state_for_test, type_registry, verify_old_region_metadata,
     willow_gc_alloc_slow,
 };
@@ -44,7 +44,7 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
             let trace = type_registry().lock().unwrap().clone();
             let drops = drop_registry().lock().unwrap().clone();
             let mut state = runtime().heap.lock().unwrap();
-            retire_all_tlabs_locked(&mut state);
+            retire_all_tlabs_unindexed(&mut state);
             let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
             let (_, work) = MinorCollector::new(&mut state, trace, drops, &mut stop).run(
                 MinorRoots {
@@ -61,8 +61,10 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
                 work.root_scan_bytes,
                 (root_count * size_of::<usize>()) as u64
             );
-            // One sweep walk over 2n source headers plus n - 1 copies; the
-            // young set is not pre-indexed (willow-8hq4.16).
+            // The n chunks holding a node are indexed once and swept once,
+            // plus n - 1 copies; the n dead chunks are released without a
+            // header walk (willow-8hq4.21), and the young set is not
+            // pre-indexed (willow-8hq4.16).
             assert_eq!(stop.metadata_objects, (3 * n - 1) as u64);
             assert_eq!(state.promoted_objects, 1);
             assert_eq!(state.survivor_stats.survivor_copies, (n - 1) as u64);
@@ -106,7 +108,7 @@ fn collect(roots: Vec<*mut u8>) -> crate::gc_telemetry::MarkWork {
     let trace = type_registry().lock().unwrap().clone();
     let drops = drop_registry().lock().unwrap().clone();
     let mut state = runtime().heap.lock().unwrap();
-    retire_all_tlabs_locked(&mut state);
+    retire_all_tlabs_unindexed(&mut state);
     let remembered = std::mem::take(&mut state.remembered_set);
     state.dirty_cards.clear();
     let (_, work) = MinorCollector::new(&mut state, trace, drops, &mut Default::default()).run(
@@ -287,7 +289,7 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
                     }
                 }
                 let mut state = runtime().heap.lock().unwrap();
-                retire_all_tlabs_locked(&mut state);
+                retire_all_tlabs_unindexed(&mut state);
                 let remembered = std::mem::take(&mut state.remembered_set);
                 state.dirty_cards.clear();
                 let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
@@ -308,7 +310,8 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
                     },
                     remembered,
                 );
-                // One sweep walk: sources plus this cycle's survivor copies.
+                // Child chunks are indexed and swept, survivor copies swept;
+                // dead chunks are released unwalked (willow-8hq4.21).
                 let expected = if cycle % 2 == 0 { 3 * young } else { young };
                 assert_eq!(stop.metadata_objects, expected as u64);
                 if young == 0 {
@@ -431,7 +434,7 @@ fn young_source_accepts_only_exact_pre_cycle_young_payloads() {
     let young = willow_gc_alloc_slow(&mut tls, 1, 0, 16, 0);
     assert!(!young.is_null());
     let mut state = runtime().heap.lock().unwrap();
-    retire_all_tlabs_locked(&mut state);
+    retire_all_tlabs_unindexed(&mut state);
     let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
     let mut collector = MinorCollector::new(
         &mut state,
@@ -589,4 +592,218 @@ fn verify_no_pin_accepts_only_non_empty_non_zero_values() {
     assert!(!verify_no_pin_enabled(Some(OsStr::new("0"))));
     assert!(verify_no_pin_enabled(Some(OsStr::new("1"))));
     assert!(verify_no_pin_enabled(Some(OsStr::new("yes"))));
+}
+
+/// Fill `chunks` TLAB chunks with `per_chunk` objects each: the slow-path
+/// first object of `first_type`, then generated-style fast allocations of
+/// `fast_type`. Returns every payload; the last chunk stays active.
+fn fill_chunks(
+    tls: &mut crate::gc::GcTlabState,
+    chunks: usize,
+    per_chunk: usize,
+    first_type: impl Fn(usize) -> u32,
+    fast_type: u32,
+) -> Vec<*mut u8> {
+    use crate::gc::*;
+    use std::sync::atomic::Ordering;
+    // Keep the slow path from collecting the fixture before it is complete.
+    runtime().heap.lock().unwrap().nursery_threshold_bytes = usize::MAX;
+    let size = GC_HEADER_SIZE + 8;
+    let mut payloads = Vec::with_capacity(chunks * per_chunk);
+    for chunk in 0..chunks {
+        payloads.push(willow_gc_alloc_slow(
+            tls,
+            1,
+            i64::from(first_type(chunk)),
+            8,
+            0,
+        ));
+        for _ in 1..per_chunk {
+            let cursor = tls.cursor.load(Ordering::Acquire);
+            initialize_object_at(cursor as *mut u8, size, fast_type, 1, 0).unwrap();
+            publish_tlab_start_for_test(tls, cursor as *mut u8);
+            tls.cursor.store(cursor + size, Ordering::Release);
+            payloads.push((cursor + GC_HEADER_SIZE) as *mut u8);
+        }
+    }
+    payloads
+}
+
+/// Run one minor collection over the production (unindexed) retirement and
+/// return its stop counters.
+fn collect_with_stop(slots: Vec<*mut *mut u8>) -> crate::gc_telemetry::stops::StopWorkV2 {
+    let trace = type_registry().lock().unwrap().clone();
+    let drops = drop_registry().lock().unwrap().clone();
+    let mut state = runtime().heap.lock().unwrap();
+    retire_all_tlabs_unindexed(&mut state);
+    let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
+    MinorCollector::new(&mut state, trace, drops, &mut stop).run(
+        MinorRoots {
+            slots,
+            values: Vec::new(),
+        },
+        Default::default(),
+    );
+    verify_old_region_metadata(&state).unwrap();
+    stop
+}
+
+/// willow-8hq4.21: a nursery chunk without survivors or droppable objects is
+/// released without visiting a header, so minor metadata work is independent
+/// of its object count; a chunk with one survivor is indexed and walked once.
+#[test]
+fn fully_dead_nursery_chunks_are_released_without_header_walks() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    let size = GC_HEADER_SIZE + 8;
+    let chunks = 4;
+    for per_chunk in [1, 16, 256, GC_TLAB_CHUNK_SIZE / size] {
+        for rooted in [false, true] {
+            reset_internal();
+            let mut tls = tlab_state_for_test();
+            let payloads = fill_chunks(&mut tls, chunks, per_chunk, |_| 0, 0);
+            let mut root = payloads[per_chunk / 2];
+            let slots = if rooted {
+                vec![&raw mut root]
+            } else {
+                Vec::new()
+            };
+            let objects = (chunks * per_chunk) as u64;
+            let stop = collect_with_stop(slots);
+            let state = runtime().heap.lock().unwrap();
+            if rooted {
+                // The rooted chunk: index + sweep walk; plus the one copy.
+                assert_eq!(stop.metadata_objects, 2 * per_chunk as u64 + 1);
+                assert_ne!(root, payloads[per_chunk / 2]);
+                assert_eq!(state.survivor_stats.survivor_copies, 1);
+                assert_eq!(state.young_allocated_bytes, size);
+                assert_eq!(state.tlab_chunks.len(), 1);
+            } else {
+                assert_eq!(stop.metadata_objects, 0, "per_chunk={per_chunk}");
+                assert_eq!(state.young_allocated_bytes, 0);
+                assert_eq!(state.allocated_bytes, 0);
+                assert!(state.tlab_chunks.is_empty());
+                assert_eq!(state.tlab_reserved_bytes, 0);
+            }
+            assert_eq!(stop.swept_objects, objects);
+            assert_eq!(state.total_frees, objects - u64::from(rooted));
+            assert_eq!(state.released_bytes, (chunks * GC_TLAB_CHUNK_SIZE) as u64);
+            eprintln!(
+                "dead-chunk per_chunk={per_chunk} rooted={rooted} metadata={} swept={}",
+                stop.metadata_objects, stop.swept_objects
+            );
+            drop(state);
+            reset_internal();
+        }
+    }
+}
+
+/// Drop hooks still run exactly once when the dead-chunk shortcut cannot be
+/// taken: a droppable slow-path first object, or a drop hook registered for
+/// a type that generated code can allocate on the fast path.
+#[test]
+fn droppable_nursery_chunks_are_walked_and_drop_exactly_once() {
+    use crate::gc::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    unsafe fn count_drop(_: *mut u8) {
+        DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+    const GENERATED: u32 = 98_771;
+    let native = willow_abi::runtime_type_ids::NETWORK_HANDLE_TYPE_ID;
+    let _guard = runtime_test_guard();
+    let chunks = 4;
+    let per_chunk = 32;
+    for generated in [false, true] {
+        reset_internal();
+        DROPS.store(0, Ordering::Relaxed);
+        let mut tls = tlab_state_for_test();
+        if generated {
+            willow_register_drop(GENERATED, count_drop);
+            fill_chunks(&mut tls, chunks, per_chunk, |_| 0, GENERATED);
+        } else {
+            // Only even chunks start with an object owning a native resource.
+            willow_register_drop(native, count_drop);
+            fill_chunks(
+                &mut tls,
+                chunks,
+                per_chunk,
+                |chunk| if chunk % 2 == 0 { native } else { 0 },
+                0,
+            );
+        }
+        let stop = collect_with_stop(Vec::new());
+        let (expected_drops, walked_chunks) = if generated {
+            (chunks * (per_chunk - 1), chunks)
+        } else {
+            (chunks / 2, chunks / 2)
+        };
+        assert_eq!(DROPS.load(Ordering::Relaxed), expected_drops);
+        // Each walked chunk is validated once and swept once.
+        assert_eq!(
+            stop.metadata_objects,
+            (2 * walked_chunks * per_chunk) as u64
+        );
+        assert_eq!(stop.swept_objects, (chunks * per_chunk) as u64);
+        {
+            let state = runtime().heap.lock().unwrap();
+            assert!(state.tlab_chunks.is_empty());
+            assert_eq!(state.young_allocated_bytes, 0);
+        }
+        collect_with_stop(Vec::new());
+        assert_eq!(DROPS.load(Ordering::Relaxed), expected_drops);
+        reset_internal();
+    }
+}
+
+/// A chunk retired without its header index is validated when the minor
+/// collector first finds a reachable object in it: gaps and overlaps in its
+/// start bits are still rejected.
+#[test]
+fn minor_rejects_unpublished_and_overlapping_start_bits_in_unindexed_chunk() {
+    use crate::gc::*;
+    use std::sync::atomic::Ordering;
+    let _guard = runtime_test_guard();
+    for extra_bit in [false, true] {
+        reset_internal();
+        let mut tls = tlab_state_for_test();
+        let mut root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+        let bytes = GC_HEADER_SIZE + 8;
+        let cursor = tls.cursor.load(Ordering::Acquire);
+        initialize_object_at(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
+        if extra_bit {
+            publish_tlab_start_for_test(&tls, cursor as *mut u8);
+            publish_tlab_start_for_test(&tls, (cursor + GC_REGION_MARK_GRANULE) as *mut u8);
+        }
+        tls.cursor.store(cursor + bytes, Ordering::Release);
+        let slot = &raw mut root as usize;
+        let result = std::panic::catch_unwind(|| {
+            let mut state = runtime().heap.lock().unwrap_or_else(|p| p.into_inner());
+            retire_all_tlabs_unindexed(&mut state);
+            assert!(state.tlab_chunks[0].needs_index());
+            let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
+            MinorCollector::new(
+                &mut state,
+                Default::default(),
+                Default::default(),
+                &mut stop,
+            )
+            .run(
+                MinorRoots {
+                    slots: vec![slot as *mut *mut u8],
+                    values: Vec::new(),
+                },
+                Default::default(),
+            );
+        });
+        runtime().heap.clear_poison();
+        let payload = result.expect_err("inconsistent start bits must be rejected");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or_default();
+        assert!(message.contains("was not published"), "{message}");
+    }
+    reset_internal();
 }

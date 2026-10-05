@@ -1432,6 +1432,56 @@ fn retired_tlab_header_index_bounds_lookup_work_and_rejects_dead_headers() {
     }
 }
 
+/// willow-8hq4.21: a chunk retired without its header index answers lookups
+/// from its start bits, never from the index, and is indexed once later.
+#[test]
+fn unindexed_retired_tlab_lookups_use_start_bits() {
+    let _guard = runtime_test_guard();
+    for count in [1usize, 16, 256] {
+        reset_internal_for_test();
+        let mut tls = tlab_state_for_test();
+        let first = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+        let base = payload_to_header(first).cast::<u8>();
+        let size = GC_HEADER_SIZE + 8;
+        for index in 1..count {
+            initialize_object_at(unsafe { base.add(index * size) }, size, 0, 0, 0).unwrap();
+            publish_tlab_start_for_test(&tls, unsafe { base.add(index * size) });
+        }
+        tls.cursor
+            .store(base as usize + count * size, Ordering::Release);
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_unindexed(&mut state);
+        let chunk = &state.tlab_chunks[0];
+        assert!(chunk.needs_index());
+        RETIRED_LOOKUP_COMPARISONS.set(0);
+        for index in 0..count {
+            let address = unsafe { base.add(index * size + GC_HEADER_SIZE) } as usize;
+            let object = object_in_retired_chunk(chunk, address, false).unwrap();
+            assert_eq!(object.payload().as_ptr() as usize, address);
+            let interior =
+                object_in_retired_chunk(chunk, address + size - GC_HEADER_SIZE - 1, true);
+            assert_eq!(
+                interior.map(|o| o.payload().as_ptr() as usize),
+                Some(address)
+            );
+            assert!(object_in_retired_chunk(chunk, address + 1, false).is_none());
+            assert!(object_in_retired_chunk(chunk, address - GC_HEADER_SIZE + 8, true).is_none());
+        }
+        assert_eq!(RETIRED_LOOKUP_COMPARISONS.get(), 0);
+        assert!(tlab_payload_generation(&state, first as usize) == Some(GC_GENERATION_YOUNG));
+        let dead = HeapObject::from_raw(base.cast()).unwrap();
+        dead.reclaim_in_place();
+        assert!(object_in_retired_chunk(chunk, first as usize, false).is_none());
+        assert!(object_in_retired_chunk(chunk, first as usize + 1, true).is_none());
+        // Major-path retirement indexes it exactly once.
+        assert_eq!(retire_all_tlabs_locked(&mut state), count);
+        assert!(!state.tlab_chunks[0].needs_index());
+        assert_eq!(retire_all_tlabs_locked(&mut state), 0);
+        drop(state);
+        reset_internal_for_test();
+    }
+}
+
 #[test]
 fn barrier_without_nursery_needs_no_heap_lock_and_keeps_counters() {
     let _guard = runtime_test_guard();

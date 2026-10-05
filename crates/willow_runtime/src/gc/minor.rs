@@ -10,10 +10,10 @@ use super::{
     DropFn, GC_GENERATION_OLD, GC_GENERATION_YOUNG, GC_HEADER_SIZE, GC_REGION_MARK_GRANULE,
     GcHeader, GcPayload, GcState, HeapObject, RegionKind, TraceFn,
     allocate_old_region_object_locked, append_parked_roots, drop_registry,
-    foreign_root_stack_owner_active, foreign_root_stack_owner_active_locked, minor_stack_roots,
-    object_reference_slots, retire_tlabs_with_work, runtime, runtime_root_slots,
-    tlab_payload_generation, type_registry, verify_old_region_metadata, verify_remembered_set,
-    willow_gc_safepoint, with_stw,
+    foreign_root_stack_owner_active, foreign_root_stack_owner_active_locked, index_retired_chunk,
+    minor_stack_roots, object_reference_slots, retire_all_tlabs_unindexed, runtime,
+    runtime_root_slots, tlab_payload_generation, type_registry, verify_old_region_metadata,
+    verify_remembered_set, willow_gc_safepoint, with_stw,
 };
 
 /// Folded-multiply hash for aligned heap addresses. SipHash's DoS resistance
@@ -64,6 +64,11 @@ struct MinorCollector<'a> {
     /// Consulted once per swept young object, so rehashed from the global
     /// SipHash registry once per cycle (O(types)).
     drop_registry: DropMap,
+    /// Whether a drop hook is registered for a type that generated code can
+    /// allocate on the inline TLAB path: any type but an opaque native
+    /// payload, which only the runtime allocates. Normally false, so only a
+    /// chunk's slow-path first object can need a drop hook. O(types) per cycle.
+    generated_drop: bool,
 }
 
 impl<'a> MinorCollector<'a> {
@@ -80,11 +85,17 @@ impl<'a> MinorCollector<'a> {
                 .all(|chunk| chunk.owner_state.is_none()),
             "minor collection requires retired TLABs"
         );
-        // Retirement validated every header of a newly retired chunk, and the
-        // collector wrote every survivor header. Young membership is answered
-        // by the chunk index plus start bitmap, so no per-object index is
-        // built for the (mostly dead) nursery.
+        // A newly retired chunk is validated and indexed only when the cycle
+        // first finds a young object in it (`young_source`) or must walk it in
+        // the sweep; the collector wrote every survivor header. Young
+        // membership is answered by the chunk index plus start bitmap, so no
+        // per-object index is built for the (mostly dead) nursery.
         let source_chunks = state.tlab_chunks.len();
+        let generated_drop = drop_registry.keys().any(|&type_id| {
+            willow_abi::runtime_type_ids::runtime_type(type_id).is_none_or(|runtime| {
+                runtime.layout != willow_abi::runtime_type_ids::TypeLayout::OpaqueNative
+            })
+        });
         Self {
             work: crate::gc_telemetry::MarkWork::default(),
             stop_work,
@@ -96,20 +107,22 @@ impl<'a> MinorCollector<'a> {
             scanned: AddressSet::default(),
             trace_registry,
             drop_registry: drop_registry.into_iter().collect(),
+            generated_drop,
         }
     }
 
     /// The young object whose payload starts at `address`, if it lies in a
     /// nursery or survivor chunk that existed when this cycle began. Chunks
     /// created by `allocate_survivor` are destinations, never sources.
-    /// O(log chunks) for the ordered chunk index, O(1) for the start bit.
-    fn young_source(&self, address: usize) -> Option<HeapObject> {
+    /// O(log chunks) for the ordered chunk index, O(1) for the start bit,
+    /// plus the one-time validation of a chunk not yet indexed.
+    fn young_source(&mut self, address: usize) -> Option<HeapObject> {
         let header = address.checked_sub(GC_HEADER_SIZE)?;
         let index = self.state.tlab_addresses.candidate(header)?;
         if index >= self.source_chunks {
             return None;
         }
-        let chunk = &self.state.tlab_chunks[index];
+        let chunk = &mut self.state.tlab_chunks[index];
         let offset = header - chunk.base as usize;
         if chunk.kind == RegionKind::Pinned
             || offset >= chunk.used
@@ -118,7 +131,12 @@ impl<'a> MinorCollector<'a> {
         {
             return None;
         }
-        // SAFETY: a set start bit inside the retired prefix names a header.
+        // A chunk holding a reachable object is walked by the sweep anyway;
+        // validate its start bits before trusting one (willow-8hq4.21).
+        let indexed = index_retired_chunk(chunk) as u64;
+        self.stop_work.metadata_objects += indexed;
+        self.stop_work.metadata_bytes += indexed * GC_HEADER_SIZE as u64;
+        // SAFETY: a validated start bit inside the retired prefix names a header.
         let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())?;
         (object.allocated() && object.generation() == GC_GENERATION_YOUNG).then_some(object)
     }
@@ -427,6 +445,31 @@ impl<'a> MinorCollector<'a> {
             let base = self.state.tlab_chunks[chunk_index].base;
             let used = self.state.tlab_chunks[chunk_index].used;
             let source = chunk_identities[chunk_index] < self.source_chunks;
+            if self.state.tlab_chunks[chunk_index].needs_index() {
+                // Marking never found a young object here, or `young_source`
+                // would have indexed the chunk: every object in it is dead
+                // and young (willow-8hq4.21).
+                debug_assert!(source, "survivor destinations are indexed");
+                if !self.may_drop(chunk_index) {
+                    // Nothing to run per object: account the whole chunk from
+                    // its bump prefix and start-bit popcount, O(chunk words).
+                    let objects = self.state.tlab_chunks[chunk_index].mark_bitmap.bits.count();
+                    #[cfg(debug_assertions)]
+                    self.verify_dead_chunk(chunk_index);
+                    self.stop_work.swept_objects += objects as u64;
+                    reclaimed_young += objects as u64;
+                    self.state.allocated_bytes = self.state.allocated_bytes.saturating_sub(used);
+                    self.state.young_allocated_bytes =
+                        self.state.young_allocated_bytes.saturating_sub(used);
+                    reclaimed_bytes = reclaimed_bytes.saturating_add(used);
+                    self.release_chunk(chunk_index, &mut chunk_identities);
+                    continue;
+                }
+                // Drop hooks need the per-object walk; validate it first.
+                let indexed = index_retired_chunk(&mut self.state.tlab_chunks[chunk_index]) as u64;
+                self.stop_work.metadata_objects += indexed;
+                self.stop_work.metadata_bytes += indexed * GC_HEADER_SIZE as u64;
+            }
             let mut has_allocated = false;
             let mut has_young = false;
             let mut live_bytes = 0usize;
@@ -509,21 +552,7 @@ impl<'a> MinorCollector<'a> {
             }
             self.state.tlab_chunks[chunk_index].header_offsets = offsets;
             if !has_allocated {
-                let chunk = self.state.tlab_chunks.swap_remove(chunk_index);
-                chunk_identities.swap_remove(chunk_index);
-                let layout =
-                    Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
-                        .expect("TLAB chunk layout remains valid");
-                // SAFETY: every object in this retired chunk was reclaimed or moved.
-                unsafe { dealloc(chunk.base, layout) };
-                self.state.released_bytes = self
-                    .state
-                    .released_bytes
-                    .saturating_add(chunk.capacity as u64);
-                self.state.tlab_reserved_bytes = self
-                    .state
-                    .tlab_reserved_bytes
-                    .saturating_sub(chunk.capacity);
+                self.release_chunk(chunk_index, &mut chunk_identities);
             } else {
                 if !has_young {
                     self.state.tlab_chunks[chunk_index].kind = RegionKind::Pinned;
@@ -547,6 +576,66 @@ impl<'a> MinorCollector<'a> {
         }
         self.state.tlab_addresses.remap(&chunk_positions);
         (reclaimed_bytes, self.work)
+    }
+
+    /// Whether an unindexed source chunk may hold an object with a drop hook.
+    /// O(1): only its slow-path first object at offset 0 can, unless
+    /// `generated_drop`.
+    fn may_drop(&self, chunk_index: usize) -> bool {
+        if self.generated_drop {
+            return true;
+        }
+        let chunk = &self.state.tlab_chunks[chunk_index];
+        // SAFETY: the runtime slow path initialized the header at offset 0 of
+        // this nonempty chunk before publishing it to generated code.
+        let first = HeapObject::from_raw(chunk.base.cast()).expect("chunk base is non-null");
+        self.drop_registry.contains_key(&first.type_id())
+    }
+
+    /// Debug-only check of the unwalked dead-chunk shortcut: its start bits
+    /// tile the bump prefix with allocated young objects without drop hooks.
+    #[cfg(debug_assertions)]
+    fn verify_dead_chunk(&self, chunk_index: usize) {
+        let chunk = &self.state.tlab_chunks[chunk_index];
+        let mut expected = 0;
+        chunk.mark_bitmap.bits.for_each_set(|index| {
+            let offset = index * GC_REGION_MARK_GRANULE;
+            assert_eq!(offset, expected, "generated TLAB header was not published");
+            // SAFETY: `offset` ends the previous object inside the prefix.
+            let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast()).unwrap();
+            assert!(
+                object.allocated()
+                    && object.generation() == GC_GENERATION_YOUNG
+                    && !self.drop_registry.contains_key(&object.type_id())
+                    && !self
+                        .forwarding
+                        .contains_key(&(object.payload().as_ptr() as usize)),
+                "unwalked dead chunk holds a live, old or droppable object"
+            );
+            expected = offset + object.size();
+        });
+        assert_eq!(
+            expected, chunk.used,
+            "generated TLAB header was not published"
+        );
+    }
+
+    /// Free a source chunk none of whose objects remain allocated.
+    fn release_chunk(&mut self, chunk_index: usize, chunk_identities: &mut Vec<usize>) {
+        let chunk = self.state.tlab_chunks.swap_remove(chunk_index);
+        chunk_identities.swap_remove(chunk_index);
+        let layout = Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
+            .expect("TLAB chunk layout remains valid");
+        // SAFETY: every object in this retired chunk was reclaimed or moved.
+        unsafe { dealloc(chunk.base, layout) };
+        self.state.released_bytes = self
+            .state
+            .released_bytes
+            .saturating_add(chunk.capacity as u64);
+        self.state.tlab_reserved_bytes = self
+            .state
+            .tlab_reserved_bytes
+            .saturating_sub(chunk.capacity);
     }
 }
 
@@ -781,7 +870,7 @@ pub(crate) fn minor_collect_internal() {
             }
             {
                 let mut state = runtime().heap.lock().unwrap();
-                retire_tlabs_with_work(&mut state, stop_work);
+                retire_all_tlabs_unindexed(&mut state);
             }
             let roots = minor_stack_roots(coord);
             Some(minor_collect_with_roots(roots, stop_work))

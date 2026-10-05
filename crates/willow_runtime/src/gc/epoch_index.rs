@@ -56,7 +56,13 @@ impl RegionIndex {
                 &chunk.concurrent_marks,
                 false,
             );
-            index.objects += chunk.header_offsets.len();
+            // A chunk retired since the last walk has no header index yet; its
+            // start bits count its headers in O(chunk words).
+            index.objects += if chunk.needs_index() {
+                chunk.mark_bitmap.bits.count()
+            } else {
+                chunk.header_offsets.len()
+            };
         }
         index
     }

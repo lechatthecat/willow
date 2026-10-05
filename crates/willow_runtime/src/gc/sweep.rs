@@ -200,6 +200,11 @@ fn sweep_chunk(
         // start bits concurrently published by generated allocation.
         return (0, false);
     }
+    // A chunk retired after the remark stop is validated before its start
+    // bits are rebuilt from the live objects alone (willow-8hq4.21).
+    let indexed = index_retired_chunk(&mut state.tlab_chunks[chunk_index]) as u64;
+    stop_work.metadata_objects += indexed;
+    stop_work.metadata_bytes += indexed * GC_HEADER_SIZE as u64;
     let was_survivor = state.tlab_chunks[chunk_index].kind == RegionKind::Survivor;
     if was_survivor {
         state.survivor_stats.survivor_space_live -=
