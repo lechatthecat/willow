@@ -16,6 +16,9 @@ pub struct SourceIndex {
     lines: Vec<usize>,
     characters: Vec<usize>,
     line_characters: Vec<usize>,
+    /// Sorted lexer token spans, built on the first position-coverage query.
+    /// `None` when the text does not lex (no coverage filtering then).
+    tokens: std::cell::OnceCell<Option<Vec<(usize, usize)>>>,
     #[cfg(test)]
     search_steps: std::cell::Cell<usize>,
 }
@@ -41,9 +44,30 @@ impl SourceIndex {
             lines,
             characters,
             line_characters,
+            tokens: std::cell::OnceCell::new(),
             #[cfg(test)]
             search_steps: std::cell::Cell::new(0),
         }
+    }
+    /// Whether `byte` lies outside every source token (whitespace, comments,
+    /// end of line). Lexing is linear once per file; each lookup is logarithmic.
+    pub fn is_between_tokens(&self, byte: usize) -> bool {
+        let Some(tokens) = self.tokens.get_or_init(|| {
+            crate::lexer::Lexer::new(&self.text)
+                .tokenize()
+                .ok()
+                .map(|tokens| {
+                    tokens
+                        .iter()
+                        .filter(|t| t.span.start < t.span.end)
+                        .map(|t| (t.span.start, t.span.end))
+                        .collect()
+                })
+        }) else {
+            return false;
+        };
+        let p = tokens.partition_point(|t| t.0 <= byte);
+        p.checked_sub(1).is_none_or(|i| byte >= tokens[i].1)
     }
     pub fn byte(&self, line: usize, column: usize) -> Result<usize> {
         let start = *line
@@ -361,6 +385,7 @@ impl DirectSession {
         let found = match source.text[byte..].chars().next() {
             _ if byte >= line_end => "end of line".to_owned(),
             Some(c) if c.is_whitespace() => "whitespace".to_owned(),
+            Some(_) if source.is_between_tokens(byte) => "a comment".to_owned(),
             Some(c) if c.is_alphanumeric() || c == '_' => {
                 let word = |c: char| c.is_alphanumeric() || c == '_';
                 let token_start = source.text[start..byte]
@@ -593,12 +618,16 @@ impl DirectSession {
                     return Ok(resolved);
                 }
             }
-            let mut result = self.session.query(QueryRequest::TypeAt {
-                revision,
-                file: file.clone(),
-                byte,
-            })["result"]
-                .take();
+            let mut result = if self.source(&file)?.is_between_tokens(byte) {
+                json!({"status":"unknown"})
+            } else {
+                self.session.query(QueryRequest::TypeAt {
+                    revision,
+                    file: file.clone(),
+                    byte,
+                })["result"]
+                    .take()
+            };
             if result["status"] == "unknown" {
                 result["reason"] = json!(format!(
                     "No typed expression or declaration at this position. {}",
@@ -690,7 +719,7 @@ impl DirectSession {
             _ => anyhow::bail!("unsupported direct command"),
         };
         let mut result = self.session.query(request)["result"].take();
-        if command == "symbol" {
+        if command == "symbol" && result["symbol"].get("type_display").is_none() {
             let location = &resolved["symbol"]["location"];
             if let (Some(file), Some(byte)) =
                 (location["path"].as_str(), location["start"].as_u64())

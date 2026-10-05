@@ -398,6 +398,80 @@ fn type_positions_explain_absent_types_and_keep_structured_status() {
 }
 
 #[test]
+fn binding_declarations_report_declared_types_and_gaps_have_no_expression() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "fn apply(f: closure(i64) -> f64, x: i64) -> f64 { return f(x); }\n\
+         fn pick(o: Option<f64>) -> i64 {\n\
+         \x20   return match o {\n\
+         \x20       Some(h) => 1,\n\
+         \x20       None => 0\n\
+         \x20   };\n\
+         }\n\
+         fn main() {\n\
+         \x20   let total = apply(|i: i64| -> f64 { return 1.5; }, 3);\n\
+         \x20   let g: closure(i64) -> i64 = |n| n * 2; let twice = [g(1), 2];\n\
+         \x20   for item in twice { println( item /* note */ ); }\n\
+         \x20   println(pick(Some(total)) + ( 1 ));\n\
+         }\n",
+    )
+    .unwrap();
+    for (selector, expected) in [
+        ("src/main.wi:9:24", "i64"),                 // annotated lambda parameter
+        ("src/main.wi:10:35", "i64"),                // inferred lambda parameter
+        ("src/main.wi:4:14", "f64"),                 // pattern binding in an i64 match
+        ("src/main.wi:9:9", "f64"),                  // let binding
+        ("src/main.wi:11:9", "i64"),                 // for binding
+        ("src/main.wi:1:10", "closure(i64) -> f64"), // function parameter
+        ("src/main.wi:2:9", "Option<f64>"),          // function parameter
+        ("src/main.wi:1:60", "i64"),                 // parameter use
+        ("src/main.wi:3:18", "Option<f64>"),         // scrutinee use
+        ("src/main.wi:12:13", "i64"),                // call expression
+        ("src/main.wi:12:35", "i64"),                // literal inside parentheses
+        ("src/main.wi:11:34", "i64"),                // for binding use
+    ] {
+        let value = f.json(&["type", selector], 0);
+        assert_eq!(
+            value["result"]["type_display"], expected,
+            "{selector}: {value}"
+        );
+    }
+    // The match expression itself still reports its own value type.
+    let value = f.json(&["type", "src/main.wi:3:12"], 0);
+    assert_eq!(value["result"]["type_display"], "i64", "{value}");
+    // Whitespace and comments inside an enclosing expression are not typed.
+    for (selector, found) in [
+        ("src/main.wi:12:34", "whitespace"),
+        ("src/main.wi:12:36", "whitespace"),
+        ("src/main.wi:11:33", "whitespace"),
+        ("src/main.wi:11:38", "whitespace"),
+        ("src/main.wi:11:43", "a comment"),
+        ("src/main.wi:9:31", "whitespace"),
+    ] {
+        let value = f.json(&["type", selector], 1);
+        assert_eq!(value["status"], "unknown", "{selector}: {value}");
+        assert!(value["result"].get("type_display").is_none(), "{value}");
+        let text = String::from_utf8(f.run(&["type", selector]).stdout).unwrap();
+        assert!(
+            text.contains(&format!("found {found}")),
+            "{selector}: {text}"
+        );
+        assert!(!text.contains("Type:"), "{selector}: {text}");
+    }
+    // `symbol` prints exactly one Type line, the declared type.
+    for (selector, expected) in [
+        ("src/main.wi:9:24", "Type: i64"),
+        ("src/main.wi:4:14", "Type: f64"),
+        ("main::pick", "Type: fn(Option<f64>) -> i64"),
+    ] {
+        let text = String::from_utf8(f.run(&["symbol", selector]).stdout).unwrap();
+        let types: Vec<_> = text.lines().filter(|l| l.starts_with("Type:")).collect();
+        assert_eq!(types, [expected], "{selector}: {text}");
+    }
+}
+
+#[test]
 fn effects_human_decodes_masks_and_retains_source_evidence() {
     let f = Fixture::new();
     fs::write(

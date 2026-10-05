@@ -281,9 +281,8 @@ pub struct QuerySession {
     symbols: HashMap<String, usize>,
     symbol_references: HashMap<String, Vec<usize>>,
     symbol_positions: HashMap<String, Vec<(usize, usize, String)>>,
-    write_positions: HashMap<String, Vec<(usize, usize)>>,
     references: HashMap<String, Vec<usize>>,
-    positions: HashMap<String, Vec<(usize, usize, Option<usize>)>>,
+    positions: HashMap<String, Vec<Segment>>,
     callees: Vec<Vec<usize>>,
     dispatch_callers: Vec<Vec<usize>>,
     indirect_references: HashMap<Type, Vec<usize>>,
@@ -291,6 +290,20 @@ pub struct QuerySession {
     pub position_comparisons: usize,
     pub effect_edge_visits: usize,
 }
+/// A maximal source range with one constant typing answer for `TypeAt`.
+struct Segment {
+    start: usize,
+    end: usize,
+    /// Innermost declared token: `Some(true)` for a resolved write
+    /// (authoritative), `Some(false)` for a declaration name such as a binding
+    /// or parameter (used when that declaration is typed).
+    declared: Option<bool>,
+    /// Narrowest enclosing expression; `Some(None)` when several tie.
+    expression: Option<Option<usize>>,
+}
+const EXPRESSION: u8 = 0;
+const DECLARATION: u8 = 1;
+const WRITE: u8 = 2;
 impl QuerySession {
     pub fn new(snapshot: Snapshot) -> Result<Self> {
         snapshot.validate()?;
@@ -301,49 +314,75 @@ impl QuerySession {
             .map(|(i, f)| (f.id.clone(), i))
             .collect();
         let mut references: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut positions: HashMap<String, Vec<usize>> = HashMap::new();
+        // Expression, declaration and write spans share one sweep, so a
+        // position query is a single binary search over one segment index.
+        let mut events: HashMap<String, Vec<(usize, bool, u8, usize)>> = HashMap::new();
+        let mut span = |l: &Location, kind: u8, i: usize| {
+            if l.start < l.end {
+                let file = events.entry(l.path.clone()).or_default();
+                file.push((l.start, true, kind, i));
+                file.push((l.end, false, kind, i));
+            }
+        };
         for (i, e) in snapshot.semantic.expressions.iter().enumerate() {
             if let Some(target) = &e.target {
                 references.entry(target.clone()).or_default().push(i);
             }
-            positions
-                .entry(e.location.path.clone())
-                .or_default()
-                .push(i);
+            span(&e.location, EXPRESSION, i);
         }
-        let positions = positions
+        for (i, symbol) in snapshot.semantic.symbols.iter().enumerate() {
+            if let Some(l) = &symbol.location {
+                span(l, DECLARATION, i);
+            }
+        }
+        for (i, r) in snapshot.semantic.references.iter().enumerate() {
+            if matches!(r.role.as_str(), "write" | "write-element") {
+                span(&r.location, WRITE, i);
+            }
+        }
+        let positions = events
             .into_iter()
-            .map(|(path, ids)| {
-                let mut events = Vec::with_capacity(ids.len() * 2);
-                for i in ids {
-                    let l = &snapshot.semantic.expressions[i].location;
-                    if l.start < l.end {
-                        events.push((l.start, true, i));
-                        events.push((l.end, false, i));
-                    }
-                }
+            .map(|(path, mut events)| {
                 events.sort_unstable();
                 let mut active = std::collections::BTreeSet::new();
+                let mut tokens = [0usize; 3];
                 let mut segments = Vec::new();
                 let mut p = 0;
                 while p < events.len() {
                     let at = events[p].0;
                     while p < events.len() && events[p].0 == at {
-                        let (_, add, i) = events[p];
-                        let l = &snapshot.semantic.expressions[i].location;
-                        let key = (l.end - l.start, i);
-                        if add {
-                            active.insert(key);
+                        let (_, add, kind, i) = events[p];
+                        if kind == EXPRESSION {
+                            let l = &snapshot.semantic.expressions[i].location;
+                            let key = (l.end - l.start, i);
+                            if add {
+                                active.insert(key);
+                            } else {
+                                active.remove(&key);
+                            }
+                        } else if add {
+                            tokens[kind as usize] += 1;
                         } else {
-                            active.remove(&key);
+                            tokens[kind as usize] -= 1;
                         }
                         p += 1;
                     }
-                    if p < events.len() && !active.is_empty() {
+                    let declared = if tokens[WRITE as usize] > 0 {
+                        Some(true)
+                    } else {
+                        (tokens[DECLARATION as usize] > 0).then_some(false)
+                    };
+                    if p < events.len() && (declared.is_some() || !active.is_empty()) {
                         let mut it = active.iter();
-                        let &(width, i) = it.next().unwrap();
-                        let unique = it.next().is_none_or(|&(w, _)| w != width);
-                        segments.push((at, events[p].0, unique.then_some(i)));
+                        let expression = it.next().map(|&(width, i)| {
+                            it.next().is_none_or(|&(w, _)| w != width).then_some(i)
+                        });
+                        segments.push(Segment {
+                            start: at,
+                            end: events[p].0,
+                            declared,
+                            expression,
+                        });
                     }
                 }
                 (path, segments)
@@ -367,15 +406,7 @@ impl QuerySession {
                 ));
             }
         }
-        let mut write_positions: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
         for (i, r) in snapshot.semantic.references.iter().enumerate() {
-            if matches!(r.role.as_str(), "write" | "write-element") {
-                let l = &r.location;
-                write_positions
-                    .entry(l.path.clone())
-                    .or_default()
-                    .push((l.start, l.end));
-            }
             symbol_references
                 .entry(r.target.clone())
                 .or_default()
@@ -410,10 +441,6 @@ impl QuerySession {
         }
         for positions in symbol_positions.values_mut() {
             positions.sort();
-            positions.dedup();
-        }
-        for positions in write_positions.values_mut() {
-            positions.sort_unstable();
             positions.dedup();
         }
         let mut indirect_references: HashMap<Type, Vec<usize>> = HashMap::new();
@@ -452,7 +479,6 @@ impl QuerySession {
             symbols,
             symbol_references,
             symbol_positions,
-            write_positions,
             positions,
             callees,
             dispatch_callers,
@@ -580,30 +606,34 @@ impl QuerySession {
                         .to_string_lossy()
                         .into_owned()
                 };
+                let Some(segments) = self.positions.get(&file) else {
+                    return json!({"revision":self.revision(),"result":self.declared_type_at(&file,byte)});
+                };
+                let p = segments.partition_point(|s| {
+                    self.position_comparisons += 1;
+                    s.start <= byte
+                });
+                let Some(segment) = p
+                    .checked_sub(1)
+                    .map(|p| &segments[p])
+                    .filter(|s| byte < s.end)
+                else {
+                    return json!({"revision":self.revision(),"result":self.declared_type_at(&file,byte)});
+                };
                 // Resolved source write tokens are authoritative: compound lowering
                 // can put several synthetic expressions on the same token span.
-                if let Some(writes) = self.write_positions.get(&file) {
-                    let p = writes.partition_point(|s| {
-                        self.position_comparisons += 1;
-                        s.0 <= byte
-                    });
-                    if p.checked_sub(1).is_some_and(|i| byte < writes[i].1) {
-                        return json!({"revision":self.revision(),"result":self.declared_type_at(&file,byte)});
+                // A declaration name (lambda parameter, pattern binding, let)
+                // lies inside its enclosing expression; report its declared
+                // type unless the declaration itself is untyped.
+                if let Some(write) = segment.declared {
+                    let declared = self.declared_type_at(&file, byte);
+                    if write || matches!(declared["status"].as_str(), Some("ok" | "ambiguous")) {
+                        return json!({"revision":self.revision(),"result":declared});
                     }
                 }
-                let Some(ids) = self.positions.get(&file) else {
+                let Some(index) = segment.expression else {
                     return json!({"revision":self.revision(),"result":self.declared_type_at(&file,byte)});
                 };
-                let p = ids.partition_point(|s| {
-                    self.position_comparisons += 1;
-                    s.0 <= byte
-                });
-                let Some(&(_, end, index)) = p.checked_sub(1).and_then(|p| ids.get(p)) else {
-                    return json!({"revision":self.revision(),"result":self.declared_type_at(&file,byte)});
-                };
-                if byte >= end {
-                    return json!({"revision":self.revision(),"result":self.declared_type_at(&file,byte)});
-                }
                 let Some(index) = index else {
                     return json!({"revision":self.revision(),"result":{"status":"ambiguous"}});
                 };

@@ -332,13 +332,16 @@ fn human(value: &Value, options: &Options) -> String {
             lines.push(format!("ID: {}", selected["id"].as_str().unwrap_or("?")));
         }
     }
-    if let Some(ty) = result["symbol"]["type_display"].as_str() {
+    if let Some(ty) = result["symbol"]["type_display"]
+        .as_str()
+        .filter(|_| result["type_display"].is_null())
+    {
         lines.push(format!("Type: {ty}"));
     }
     if options.command == "type" {
         match result["status"].as_str() {
             Some("unknown") if willow_compiler::ai::direct::split_location(&options.selector).is_none() => lines.push("No symbol matches this selector and its filters. Use a qualified symbol name or file:line:column on an identifier or expression.".into()),
-            Some("unknown") => lines.push("No typed expression or declaration was found at this position (keywords and whitespace may have no type). Place the cursor on an expression or identifier, or use `willow type QUALIFIED_SYMBOL`.".into()),
+            Some("unknown") => lines.push("No typed expression or declaration was found at this position (keywords, whitespace and comments have no type). Place the cursor on an expression or identifier, or use `willow type QUALIFIED_SYMBOL`.".into()),
             Some("unanalyzed") => lines.push("A semantic expression or declaration was found, but its type is unavailable in this analysis. Run `willow check .` for diagnostics; try a typed expression or declaration identifier.".into()),
             Some("ambiguous") => lines.push("Multiple semantic candidates overlap this position. Select a declaration identifier or a qualified symbol.".into()),
             _ => {}
