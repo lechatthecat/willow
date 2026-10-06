@@ -64,7 +64,7 @@ Willow used 8 workers. Comparison runtimes were Go 1.27.0 and OpenJDK 26.0.2 usi
 | --- | ---: | ---: | ---: |
 | idle_spawn 100k | **106.0** | 119.4 | 91.7 |
 | wake_fanout | 163.4 | **14.2** | 190.6 |
-| yield_switch | **1297.8** | 1481.1 | 575.7 |
+| yield_switch | 1297.8 | 1481.1 | **575.7** |
 | ping_pong | 1710.5 | **167.2** | 783.6 |
 | gc_scheduler | 1234.6 | **139.7** | 151.8 |
 | channel_select_fan_in | 2579.4 | **222.5** | 536.9 |
