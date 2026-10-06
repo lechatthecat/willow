@@ -12,12 +12,23 @@
 //!   is reachable only through cold blocks as cold.
 //! * The DFS places a two-way branch's *second* successor immediately after
 //!   it. [`lir_loop_depths`] lets the LIR emitter orient a branch so the
-//!   successor that stays inside more loops is the fall-through, placing a
-//!   loop's body after its header and its exit after the loop.
+//!   successor that stays inside more call-free loops is the fall-through,
+//!   placing such a loop's body after its header and its exit after the loop.
 //!
 //! Both only change placement; no instruction executes differently.
+//!
+//! Orientation is limited to loops that call no compiled function
+//! (willow-3za7). It also changes the dominator-tree visiting order of
+//! Cranelift's egraph elaboration: once a loop's body is visited before its
+//! exit, Cranelift hoists argument-free values such as the `func_addr` targets
+//! of guarded interface dispatch out of the loop. Across the loop's calls each
+//! one then holds a callee-saved register, and the loop's own state spills to
+//! the stack (virtual_dispatch: 57 -> 67 ms). A loop that calls keeps the
+//! source order, whose exit-first visit leaves those values at their uses.
+//! Runtime helpers behind inline fast paths, such as an array push, do not
+//! count.
 
-use crate::ir::lowered::{LirFunction, Terminator};
+use crate::ir::lowered::{LirFunction, LirInst, LirRvalue, Terminator};
 use cranelift_codegen::entity::EntitySet;
 use cranelift_codegen::ir::Function;
 
@@ -59,11 +70,47 @@ thread_local! {
     static CAPTURE: std::cell::RefCell<Option<Vec<Function>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The number of DFS-backedge loops containing each LIR block. A loop is the
-/// set of blocks that reach a backedge source without passing its header, so
-/// the work is O((blocks + edges) * loop nesting depth).
-pub(super) fn lir_loop_depths(f: &LirFunction) -> Vec<u32> {
+/// Loop nesting of each LIR block.
+pub(super) struct LoopDepths {
+    /// The number of loops containing the block.
+    pub(super) all: Vec<u32>,
+    /// The number of those loops whose every block ends in a jump or branch
+    /// and calls no compiled function ([`calls_compiled_code`]).
+    pub(super) call_free: Vec<u32>,
+}
+
+/// Whether `inst` calls a compiled Willow function or method. Intrinsics and
+/// runtime helpers do not count: an array push or index keeps its runtime call
+/// on a cold slow path, and their callees are not dispatch targets.
+fn calls_compiled_code(inst: &LirInst) -> bool {
+    matches!(
+        inst,
+        LirInst::Compute {
+            value: LirRvalue::DirectCall { .. }
+                | LirRvalue::IndirectCall { .. }
+                | LirRvalue::StaticCall { .. }
+                | LirRvalue::MethodCall { .. }
+                | LirRvalue::ConstructorCall { .. },
+            ..
+        }
+    )
+}
+
+/// The DFS-backedge loops containing each LIR block. A loop is the set of
+/// blocks that reach a backedge source without passing its header, so the
+/// work is O((blocks + edges) * loop nesting depth + instructions).
+pub(super) fn lir_loop_depths(f: &LirFunction) -> LoopDepths {
     let n = f.blocks.len();
+    let block_call_free: Vec<bool> = f
+        .blocks
+        .iter()
+        .map(|block| {
+            matches!(
+                block.terminator,
+                Terminator::Jump(_) | Terminator::Branch { .. }
+            ) && !block.instrs.iter().any(calls_compiled_code)
+        })
+        .collect();
     let successors: Vec<Vec<usize>> = f
         .blocks
         .iter()
@@ -102,33 +149,44 @@ pub(super) fn lir_loop_depths(f: &LirFunction) -> Vec<u32> {
             }
         }
     }
-    let mut depth = vec![0u32; n];
+    let mut depths = LoopDepths {
+        all: vec![0u32; n],
+        call_free: vec![0u32; n],
+    };
     // `mark[b] == header + 1` records membership in the current loop
     // without clearing a per-loop set.
     let mut mark = vec![0usize; n];
     let mut pending = Vec::new();
+    let mut body = Vec::new();
     for (header, sources) in backedges.iter().enumerate() {
         if sources.is_empty() {
             continue;
         }
         mark[header] = header + 1;
-        depth[header] += 1;
+        body.clear();
+        body.push(header);
         pending.extend(sources.iter().copied());
         while let Some(block) = pending.pop() {
             if mark[block] == header + 1 {
                 continue;
             }
             mark[block] = header + 1;
-            depth[block] += 1;
+            body.push(block);
             pending.extend(predecessors[block].iter().copied());
         }
+        let call_free = body.iter().all(|&block| block_call_free[block]);
+        for &block in &body {
+            depths.all[block] += 1;
+            depths.call_free[block] += u32::from(call_free);
+        }
     }
-    depth
+    depths
 }
 
 /// Whether a LIR `Branch` should be emitted with its targets swapped so the
-/// `then` successor, which stays inside more loops, is placed after it.
-pub(super) fn prefer_then_fallthrough(f: &LirFunction, depths: &[u32], block: usize) -> bool {
+/// `then` successor, which stays inside more call-free loops, is placed after
+/// it.
+pub(super) fn prefer_then_fallthrough(f: &LirFunction, depths: &LoopDepths, block: usize) -> bool {
     let Terminator::Branch {
         then_block,
         else_block,
@@ -137,7 +195,7 @@ pub(super) fn prefer_then_fallthrough(f: &LirFunction, depths: &[u32], block: us
     else {
         return false;
     };
-    depths[then_block.0] > depths[else_block.0]
+    depths.call_free[then_block.0] > depths.call_free[else_block.0]
 }
 
 #[cfg(test)]

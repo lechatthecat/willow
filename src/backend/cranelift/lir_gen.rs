@@ -5090,7 +5090,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.def_var(var, zero);
             var
         });
-        let loop_polls = (0..f.blocks.len()).any(|i| poll_blocks[i] && loop_depths[i] > 0);
+        let loop_polls = (0..f.blocks.len()).any(|i| poll_blocks[i] && loop_depths.all[i] > 0);
         let poll_spare =
             (coop.is_none() && !unpolled && loop_polls).then(|| self.emit_sync_poll_spare());
         let sync_poll = (coop.is_none() && !deferred_poll && !unpolled)
@@ -5225,7 +5225,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 ledger: &mut ledger,
             };
             let block_poll = if deferred_poll && poll_blocks[i] {
-                let spare = poll_spare.filter(|_| loop_depths[i] > 0);
+                let spare = poll_spare.filter(|_| loop_depths.all[i] > 0);
                 let poll = self.emit_sync_poll_gates(spare);
                 self.builder
                     .def_var(deferred_active.expect("delayed poll activity"), poll.active);
@@ -5251,7 +5251,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 &blocks,
                 &f.return_type,
                 block_coop,
-                block_poll.map(|poll| (poll, loop_depths[i] > 0)),
+                block_poll.map(|poll| (poll, loop_depths.all[i] > 0)),
                 super::block_layout::prefer_then_fallthrough(f, &loop_depths, i),
                 &mut defer_ctx,
             );
@@ -16444,7 +16444,15 @@ fn f() {
     /// Branch blocks whose `then` successor is laid out next (willow-nzsg),
     /// every branch block, and each block's loop depth.
     fn then_fallthroughs(src: &str, name: &str) -> (Vec<usize>, Vec<usize>, Vec<u32>) {
-        let (f, _tables) = lir_fn_and_tables(src, name, &[name]);
+        then_fallthroughs_in(src, name, &[name])
+    }
+
+    fn then_fallthroughs_in(
+        src: &str,
+        name: &str,
+        fns: &[&str],
+    ) -> (Vec<usize>, Vec<usize>, Vec<u32>) {
+        let (f, _tables) = lir_fn_and_tables(src, name, fns);
         let depths = super::super::block_layout::lir_loop_depths(&f);
         let flipped = (0..f.blocks.len())
             .filter(|&i| super::super::block_layout::prefer_then_fallthrough(&f, &depths, i))
@@ -16455,7 +16463,7 @@ fn f() {
             .filter(|b| matches!(b.terminator, Terminator::Branch { .. }))
             .map(|b| b.id.0)
             .collect();
-        (flipped, branches, depths)
+        (flipped, branches, depths.all)
     }
 
     // Lowering repeats a `while` condition in several copies of the body;
@@ -16525,6 +16533,66 @@ fn f() {
         );
         // Every branch here is a loop condition whose exit leaves a loop.
         assert_eq!(flipped, branches, "{depths:?}");
+    }
+
+    // A loop that calls keeps source order (willow-3za7): Cranelift then
+    // visits its exit before its body and leaves the body's constant callee
+    // addresses at their uses instead of holding each in a callee-saved
+    // register across the calls. A call-free loop inside it is still oriented.
+    #[test]
+    fn layout_orients_only_call_free_loops() {
+        let direct = "fn g(x: i64) -> i64 { return x + 1; }
+                      fn f(n: i64) -> i64 {
+                          let mut t = 0;
+                          let mut i = 0;
+                          while i < n {
+                              let mut j = 0;
+                              while j < n { t = t + j; j = j + 1; }
+                              t = t + g(i);
+                              i = i + 1;
+                          }
+                          return t;
+                      }";
+        let (flipped, branches, depths) = then_fallthroughs_in(direct, "f", &["f", "g"]);
+        let edges = back_edges_of(direct, "f", &["f", "g"]);
+        let inner: Vec<usize> = edges
+            .iter()
+            .map(|&(_, header)| header)
+            .filter(|&header| depths[header] == 2)
+            .collect();
+        let outer: Vec<usize> = edges
+            .iter()
+            .map(|&(_, header)| header)
+            .filter(|&header| depths[header] == 1)
+            .collect();
+        assert!(!inner.is_empty() && !outer.is_empty(), "{depths:?}");
+        assert!(
+            inner.iter().all(|header| flipped.contains(header)),
+            "{flipped:?} {depths:?}"
+        );
+        assert!(
+            outer.iter().all(|header| !flipped.contains(header)),
+            "{flipped:?} {depths:?}"
+        );
+        assert!(flipped.len() < branches.len());
+
+        // The virtual_dispatch shape: guarded interface calls in the body.
+        let dispatch = "import std::collections::Array;
+                        interface Shape { fn area(self) -> i64; }
+                        class Square implements Shape {
+                            pub side: i64;
+                            pub fn area(self) -> i64 { return self.side * self.side; }
+                        }
+                        fn f(shapes: Array<Shape>, n: i64) -> i64 {
+                            let mut sum = 0;
+                            let mut i = 0;
+                            while i < n { sum = sum + shapes[i].area(); i = i + 1; }
+                            return sum;
+                        }";
+        let (flipped, branches, depths) = then_fallthroughs(dispatch, "f");
+        assert!(depths.iter().any(|&depth| depth > 0));
+        assert!(!branches.is_empty());
+        assert!(flipped.is_empty(), "{flipped:?} {depths:?}");
     }
 
     /// (unrooted temporaries, synthetic array temporaries) of `f`.
