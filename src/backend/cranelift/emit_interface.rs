@@ -613,7 +613,7 @@ fn descendant_ids(base_of: &HashMap<i64, i64>, ancestor_id: i64) -> HashSet<i64>
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
     use super::*;
@@ -1089,6 +1089,14 @@ fn main() {}
     }
 
     fn compile_dispatch_fixture(source: &str) -> Vec<u8> {
+        compile_fixture_with(source, &CompilerOptions::debug())
+    }
+
+    /// Compile one standalone source through the full backend.
+    pub(in crate::backend::cranelift) fn compile_fixture_with(
+        source: &str,
+        options: &CompilerOptions,
+    ) -> Vec<u8> {
         let tokens = crate::lexer::Lexer::new(source)
             .tokenize()
             .expect("fixture should lex");
@@ -1104,8 +1112,7 @@ fn main() {}
             checker.errors
         );
 
-        let mut codegen =
-            Codegen::for_tests(&CompilerOptions::debug()).expect("codegen should initialize");
+        let mut codegen = Codegen::for_tests(options).expect("codegen should initialize");
         for info in checker.symbols.enums.values() {
             codegen.register_enum_info(info.to_semantic());
         }

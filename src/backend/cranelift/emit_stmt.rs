@@ -1,6 +1,20 @@
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
+use cranelift_codegen::ir::{
+    InstBuilder, MemFlagsData, StackSlot, StackSlotData, StackSlotKind, Value, condcodes::IntCC,
+    types,
+};
 
 use super::*;
+
+/// The gates a synchronous safepoint reads (see `emit_sync_safepoint`).
+#[derive(Clone, Copy)]
+pub(super) struct SyncPoll {
+    /// The task stack's countdown, or null outside task stacks.
+    pub(super) active: Value,
+    stop: Value,
+    /// `active`, or the frame's spare countdown when `active` is null, for
+    /// functions with loop polls.
+    countdown: Option<(Value, StackSlot)>,
+}
 
 #[willow_continuations::methods(
     emit_deferred_action,
@@ -335,17 +349,50 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    /// The frame's spare countdown, armed at function entry. Outside task
+    /// stacks the poll counter is null, and loop polls decrement this slot
+    /// instead, so they never branch on the counter's presence.
+    pub(super) fn emit_sync_poll_spare(&mut self) -> StackSlot {
+        let spare = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            4,
+            2,
+        ));
+        let full = self.builder.ins().iconst(types::I32, i64::from(i32::MAX));
+        self.stack_store(full, spare);
+        spare
+    }
+
+    /// Look up the gates of `emit_sync_safepoint` for the current invocation.
+    pub(super) fn emit_sync_poll_gates(&mut self, spare: Option<StackSlot>) -> SyncPoll {
+        let active = self.emit_value_runtime_call("willow_sync_poll_counter", &[]);
+        let stop = self.emit_value_runtime_call("willow_gc_stop_flag", &[]);
+        let countdown = spare.map(|spare| {
+            let ptr_ty = reference_type(self.module.target_config());
+            let spare_addr = self.builder.ins().stack_addr(ptr_ty, spare, 0);
+            (self.builder.ins().select(active, active, spare_addr), spare)
+        });
+        SyncPoll {
+            active,
+            stop,
+            countdown,
+        }
+    }
+
     /// Preserve the native call chain when a synchronous helper exhausts its
     /// task budget. Ordinary synchronous loops only load the live GC gate;
     /// they enter the runtime when a collector actually requests a stop.
-    /// Inside a task native stack, `poll_counter` is the stack's inline
+    /// Inside a task native stack, `poll.active` is the stack's inline
     /// countdown: each safepoint decrements it and the runtime is entered only
     /// when the batch the runtime granted is used up (willow-jz15.40).
-    pub(super) fn emit_sync_safepoint(
-        &mut self,
-        poll_counter: cranelift_codegen::ir::Value,
-        gc_stop_flag: cranelift_codegen::ir::Value,
-    ) {
+    ///
+    /// A loop poll (`in_loop`) decrements the countdown unconditionally:
+    /// outside task stacks that is the frame's spare, which only rearms after
+    /// `i32::MAX` polls. Its fast path then has one gate branch and one
+    /// countdown branch, neither taken, instead of a taken branch around the
+    /// countdown whose cost depends on code alignment (willow-nzsg). The
+    /// entry poll keeps the presence test, so calls pay no spare setup.
+    pub(super) fn emit_sync_safepoint(&mut self, poll: SyncPoll, in_loop: bool) {
         // Atomic loads cannot be hoisted out of the source loop. The GC flag
         // may change concurrently even though the counter address is
         // invocation-constant (nested scheduler drives restore the enclosing
@@ -353,26 +400,34 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let stop = self
             .builder
             .ins()
-            .atomic_load(types::I8, MemFlagsData::trusted(), gc_stop_flag);
+            .atomic_load(types::I8, MemFlagsData::trusted(), poll.stop);
         let slow = self.builder.create_block();
         self.builder.set_cold_block(slow);
         let counted = self.builder.create_block();
-        let countdown = self.builder.create_block();
         let resume = self.builder.create_block();
         self.builder.ins().brif(stop, slow, &[], counted, &[]);
         self.builder.switch_to_block(counted);
         self.builder.seal_block(counted);
-        // Null outside task stacks: synchronous main/thread code never counts.
-        self.builder
-            .ins()
-            .brif(poll_counter, countdown, &[], resume, &[]);
-        self.builder.switch_to_block(countdown);
-        self.builder.seal_block(countdown);
+        let spare = poll.countdown.filter(|_| in_loop);
+        let countdown = match spare {
+            Some((countdown, _)) => countdown,
+            None => {
+                // Null outside task stacks: synchronous main/thread code
+                // never counts.
+                let countdown = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(poll.active, countdown, &[], resume, &[]);
+                self.builder.switch_to_block(countdown);
+                self.builder.seal_block(countdown);
+                poll.active
+            }
+        };
         // Only this thread's generated code and runtime touch the countdown.
         let flags = MemFlagsData::trusted();
-        let left = self.builder.ins().load(types::I32, flags, poll_counter, 0);
+        let left = self.builder.ins().load(types::I32, flags, countdown, 0);
         let left = self.builder.ins().iadd_imm_s(left, -1);
-        self.builder.ins().store(flags, left, poll_counter, 0);
+        self.builder.ins().store(flags, left, countdown, 0);
         let expired = self
             .builder
             .ins()
@@ -380,6 +435,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().brif(expired, slow, &[], resume, &[]);
         self.builder.switch_to_block(slow);
         self.builder.seal_block(slow);
+        if let Some((_, spare)) = spare {
+            // The runtime refills a task stack's counter; the spare is
+            // unused there, so rearming it unconditionally is harmless.
+            let full = self.builder.ins().iconst(types::I32, i64::from(i32::MAX));
+            self.stack_store(full, spare);
+        }
         let cancelled = self.emit_value_runtime_call("willow_sync_safepoint", &[]);
         self.emit_sync_cancel_branch(cancelled);
         self.builder
@@ -827,6 +888,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     where
         F: FnOnce(&mut Self),
     {
+        self.emit_runtime_call_late_args(name, |_| args.to_vec(), after_call)
+    }
+
+    /// [`Self::emit_runtime_call_with_cleanup`] with arguments produced right
+    /// before the call itself, after any panic-depth snapshot. A cold caller
+    /// reloads spilled operands here so they are not live across that
+    /// snapshot call (willow-nzsg).
+    pub(super) fn emit_runtime_call_late_args<A, F>(
+        &mut self,
+        name: &str,
+        args: A,
+        after_call: F,
+    ) -> Option<cranelift_codegen::ir::Value>
+    where
+        A: FnOnce(&mut Self) -> Vec<cranelift_codegen::ir::Value>,
+        F: FnOnce(&mut Self),
+    {
         let symbol = crate::backend::abi::runtime_symbol(name)
             .unwrap_or_else(|| panic!("runtime call `{name}` is missing from the ABI schema"));
         let effects = symbol.effects();
@@ -854,7 +932,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(name)
             .unwrap_or_else(|| panic!("backend: undeclared runtime symbol `{name}`"));
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
-        let call = self.builder.ins().call(fref, args);
+        let args = args(self);
+        let call = self.builder.ins().call(fref, &args);
         let result = self.builder.inst_results(call).first().copied();
         assert!(
             self.builder.inst_results(call).len() <= 1,
@@ -937,6 +1016,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .ins()
             .icmp(IntCC::UnsignedGreaterThan, depth_after, depth_before);
         let panicked = self.builder.create_block();
+        // Only a callee that raised takes this edge; the unwind it starts is
+        // sunk with it (see `block_layout`).
+        self.builder.set_cold_block(panicked);
         let normal = self.builder.create_block();
         self.builder.ins().brif(raised, panicked, &[], normal, &[]);
 

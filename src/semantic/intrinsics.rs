@@ -322,7 +322,8 @@ impl Intrinsic {
     /// receiver representations (a channel's element suffix, an atomic's
     /// width). Inline fast paths are covered by their runtime fallback: an
     /// array length reads the header inline and calls `willow_array_len` only
-    /// for a null receiver. Keep in step with `emit_flat_intrinsic_inner`.
+    /// for a null receiver or a malformed negative length. Keep in step with
+    /// `emit_flat_intrinsic_inner`.
     pub fn runtime_symbols(self) -> &'static [&'static str] {
         use Intrinsic::*;
         match self {

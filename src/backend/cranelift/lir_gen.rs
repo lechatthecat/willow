@@ -1372,7 +1372,7 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
 /// distinguishes "the same scope is still open" from "one closed and another
 /// opened", which a depth alone cannot.
 /// The LIR blocks control can reach directly from `block`.
-fn lir_block_successors(block: &LirBlock) -> Vec<usize> {
+pub(super) fn lir_block_successors(block: &LirBlock) -> Vec<usize> {
     match &block.terminator {
         Terminator::Jump(target) => vec![target.0],
         Terminator::Branch {
@@ -5069,6 +5069,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let outer_frame_depth = self.callstack_frame_depth;
         let entry = self.builder.current_block().expect("entry block active");
         let mut poll_blocks = lir_sync_poll_blocks(f);
+        let loop_depths = super::block_layout::lir_loop_depths(f);
         // A bounded body that cannot reach a safepoint needs no poll at all;
         // the caller's polls already bound the work around it (willow-8hq4.14).
         let unpolled =
@@ -5089,11 +5090,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.def_var(var, zero);
             var
         });
-        let sync_poll = (coop.is_none() && !deferred_poll && !unpolled).then(|| {
-            let active = self.emit_value_runtime_call("willow_sync_poll_counter", &[]);
-            let stop = self.emit_value_runtime_call("willow_gc_stop_flag", &[]);
-            (active, stop)
-        });
+        let loop_polls = (0..f.blocks.len()).any(|i| poll_blocks[i] && loop_depths[i] > 0);
+        let poll_spare =
+            (coop.is_none() && !unpolled && loop_polls).then(|| self.emit_sync_poll_spare());
+        let sync_poll = (coop.is_none() && !deferred_poll && !unpolled)
+            .then(|| self.emit_sync_poll_gates(poll_spare));
         if coop.is_some() {
             self.bind_coop_lir_locals(f);
             // GC locals that are dead at every suspension deliberately stay
@@ -5103,7 +5104,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.bind_lir_gc_locals(f);
         }
-        self.bind_lir_locals(f);
+        let unrooted = if coop.is_none() {
+            super::transient_roots::unrooted_array_temps(f)
+        } else {
+            HashSet::new()
+        };
+        self.bind_lir_locals(f, &unrooted);
         let mut blocks = vec![entry];
         for _ in 1..f.blocks.len() {
             blocks.push(self.builder.create_block());
@@ -5152,6 +5158,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // that path. So a block is emitted only once an edge has handed it a
         // state; any such order works. A block no edge ever reaches is emitted
         // last, with none (willow-fvt4).
+        let reuse_preds = super::transient_roots::sole_predecessors(f);
+        let mut reuse_exits: Vec<Option<super::transient_roots::LirReuse>> =
+            (0..f.blocks.len()).map(|_| None).collect();
         let mut ready = vec![0usize];
         let mut emitted = vec![false; f.blocks.len()];
         // Which entry states arrived along a normal CFG edge. A recovery
@@ -5216,29 +5225,46 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 ledger: &mut ledger,
             };
             let block_poll = if deferred_poll && poll_blocks[i] {
-                let active = self.emit_value_runtime_call("willow_sync_poll_counter", &[]);
-                let stop = self.emit_value_runtime_call("willow_gc_stop_flag", &[]);
+                let spare = poll_spare.filter(|_| loop_depths[i] > 0);
+                let poll = self.emit_sync_poll_gates(spare);
                 self.builder
-                    .def_var(deferred_active.expect("delayed poll activity"), active);
-                Some((active, stop))
+                    .def_var(deferred_active.expect("delayed poll activity"), poll.active);
+                Some(poll)
             } else {
                 sync_poll.filter(|_| poll_blocks[i])
             };
             let outer_active = self.sync_native_active;
             self.sync_native_active = block_poll
                 .or(sync_poll)
-                .map(|(active, _)| active)
+                .map(|poll| poll.active)
                 .or_else(|| deferred_active.map(|var| self.builder.use_var(var)));
+            // Continue the predecessor's GC-free run only along its edge into
+            // a block without an entry poll (willow-nzsg). The predecessor's
+            // exit dominates this block whatever order emits the two.
+            self.lir_reuse = match reuse_preds[i] {
+                Some(pred) if !poll_blocks[i] => reuse_exits[pred].clone(),
+                _ => None,
+            };
             let recovery_states = self.emit_lir_block(
                 f,
                 block,
                 &blocks,
                 &f.return_type,
                 block_coop,
-                block_poll,
+                block_poll.map(|poll| (poll, loop_depths[i] > 0)),
+                super::block_layout::prefer_then_fallthrough(f, &loop_depths, i),
                 &mut defer_ctx,
             );
             self.sync_native_active = outer_active;
+            let facts = self.lir_reuse.take();
+            if !self.terminated
+                && matches!(
+                    block.terminator,
+                    Terminator::Jump(_) | Terminator::Branch { .. }
+                )
+            {
+                reuse_exits[i] = facts.filter(|facts| facts.carriable());
+            }
             if sync_defers {
                 let exit = LirDeferState {
                     scopes: lir_defer_scopes.clone(),
@@ -5348,6 +5374,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(name)
             .cloned()
             .unwrap_or_else(|| panic!("LIR local `{name}` has no storage"));
+        // Inside a GC-free run an array root slot still holds the owner the
+        // run last read from it (willow-nzsg).
+        let reusable = match storage {
+            VarStorage::Stack { slot, .. }
+                if self.lir_reuse.is_some()
+                    && super::transient_roots::is_array(&function.locals[local.0 as usize].ty) =>
+            {
+                Some(slot)
+            }
+            _ => None,
+        };
+        if let Some(slot) = reusable {
+            let reuse = self.lir_reuse.as_ref().expect("checked above");
+            if let Some(&owner) = reuse.slots.get(&slot) {
+                return owner;
+            }
+            let owner = self.stack_load(reference_type(self.module.target_config()), slot);
+            self.lir_reuse
+                .as_mut()
+                .expect("checked above")
+                .slots
+                .insert(slot, owner);
+            return owner;
+        }
         if function.locals[local.0 as usize].is_gc_owner() {
             let ptr_ty = reference_type(self.module.target_config());
             return match storage {
@@ -5995,7 +6045,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// A local async liveness put in the heap frame is already bound and is
     /// skipped here — and that set is exactly the one that has to survive a
     /// poll return, so a Cranelift variable is sound for everything left.
-    fn bind_lir_locals(&mut self, f: &LirFunction) {
+    fn bind_lir_locals(&mut self, f: &LirFunction, unrooted: &HashSet<LirLocalId>) {
         for block in &f.blocks {
             for inst in &block.instrs {
                 if let LirInst::Compute { value, .. } = inst {
@@ -6017,7 +6067,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if local.parameter || self.vars.contains_key(local.name.as_str()) {
                 continue;
             }
-            if local.is_gc_owner() || is_gc_managed(&local.ty, self.enum_infos) {
+            // See `transient_roots`: no GC point can move these referents
+            // while they are live, so they stay plain SSA values.
+            if (local.is_gc_owner() || is_gc_managed(&local.ty, self.enum_infos))
+                && !unrooted.contains(&local.id)
+            {
                 self.bind_lir_rooted_slot(&local.name, &local.ty, &mut null);
                 continue;
             }
@@ -6060,16 +6114,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         blocks: &[cranelift_codegen::ir::Block],
         return_type: &Type,
         mut coop: Option<(&mut CoopSuspendPoints, cranelift_codegen::ir::Value)>,
-        sync_poll: Option<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)>,
+        sync_poll: Option<(super::emit_stmt::SyncPoll, bool)>,
+        then_fallthrough: bool,
         defers: &mut LirBlockDeferCtx<'_>,
     ) -> Vec<(usize, LirDeferState)> {
         let mut recovery_states = Vec::new();
-        if let Some((active, stop)) = sync_poll
+        if let Some((poll, in_loop)) = sync_poll
             && (self.lir_cleanup_exit.is_none() || block.id.0 != 0)
         {
             // Native stacks preserve SSA values and roots across this hook;
             // function entry and cycle headers cover recursion and loops.
-            self.emit_sync_safepoint(active, stop);
+            self.emit_sync_safepoint(poll, in_loop);
         }
         for (inst_index, inst) in block.instrs.iter().enumerate() {
             // A panic/return has terminated the source path, but a
@@ -6094,6 +6149,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // would inherit the caller's statement (willow-s9ej.7 review).
             if let Some(span) = lir_inst_span(inst) {
                 self.fault_site_span = Some(span);
+            }
+            // A GC point ends the run of reusable loads (willow-nzsg).
+            if coop.is_some() || !super::transient_roots::gc_free(function, inst) {
+                self.lir_reuse = None;
+            } else if self.lir_reuse.is_none() {
+                self.lir_reuse = Some(Default::default());
             }
             match inst {
                 LirInst::Compute { local, value, span } => {
@@ -6394,9 +6455,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 else_block,
             } => {
                 let c = self.emit_lir_operand(function, cond);
-                self.builder
-                    .ins()
-                    .brif(c, blocks[then_block.0], &[], blocks[else_block.0], &[]);
+                if then_fallthrough {
+                    // Cranelift places a branch's second target next; keep
+                    // the loop body after its header (willow-nzsg). The
+                    // optimizer folds the inversion into a compare operand.
+                    let exit = self.builder.ins().icmp_imm_s(IntCC::Equal, c, 0);
+                    self.builder.ins().brif(
+                        exit,
+                        blocks[else_block.0],
+                        &[],
+                        blocks[then_block.0],
+                        &[],
+                    );
+                } else {
+                    self.builder.ins().brif(
+                        c,
+                        blocks[then_block.0],
+                        &[],
+                        blocks[else_block.0],
+                        &[],
+                    );
+                }
             }
             Terminator::CleanupReturn => {
                 let (exit, roots, _) = self
@@ -16360,6 +16439,201 @@ fn f() {
             .filter(|b| lir_terminator_needs_preempt_safepoint(b, &back))
             .map(|b| b.id.0)
             .collect()
+    }
+
+    /// Branch blocks whose `then` successor is laid out next (willow-nzsg),
+    /// every branch block, and each block's loop depth.
+    fn then_fallthroughs(src: &str, name: &str) -> (Vec<usize>, Vec<usize>, Vec<u32>) {
+        let (f, _tables) = lir_fn_and_tables(src, name, &[name]);
+        let depths = super::super::block_layout::lir_loop_depths(&f);
+        let flipped = (0..f.blocks.len())
+            .filter(|&i| super::super::block_layout::prefer_then_fallthrough(&f, &depths, i))
+            .collect();
+        let branches = f
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Branch { .. }))
+            .map(|b| b.id.0)
+            .collect();
+        (flipped, branches, depths)
+    }
+
+    // Lowering repeats a `while` condition in several copies of the body;
+    // every copy's exit test must keep the next iteration as fall-through.
+    #[test]
+    fn layout_while_body_follows_its_header() {
+        let src = "fn f(n: i64) -> i64 {
+                       let mut i = 0;
+                       while i < n { i = i + 1; }
+                       return i;
+                   }";
+        let (flipped, branches, depths) = then_fallthroughs(src, "f");
+        let (latch, header) = back_edges_of(src, "f", &["f"])[0];
+        assert!(flipped.contains(&header), "{depths:?}");
+        assert_eq!(flipped, branches, "{depths:?}");
+        assert_eq!(depths[header], 1);
+        assert_eq!(depths[latch], 1);
+        assert_eq!(depths[0], 0);
+        assert_eq!(depths.iter().filter(|&&depth| depth == 0).count(), 2);
+    }
+
+    #[test]
+    fn layout_keeps_branches_outside_loops_and_break_arms_in_source_order() {
+        let straight = "fn f(c: bool) -> i64 {
+                            let mut v = 0;
+                            if c { v = 1; } else { v = 2; }
+                            return v;
+                        }";
+        let (flipped, branches, depths) = then_fallthroughs(straight, "f");
+        assert!(!branches.is_empty());
+        assert!(flipped.is_empty());
+        assert!(depths.iter().all(|&depth| depth == 0));
+        // `if c { break }` already has its in-loop arm second; `while true`
+        // is a constant branch with no exit arm.
+        let breaking = "fn f(n: i64) -> i64 {
+                            let mut i = 0;
+                            while true { if i >= n { break; } i = i + 1; }
+                            return i;
+                        }";
+        let (flipped, branches, _) = then_fallthroughs(breaking, "f");
+        assert!(!branches.is_empty());
+        assert!(flipped.is_empty(), "{flipped:?}");
+    }
+
+    #[test]
+    fn layout_nested_loop_depths_prefer_the_inner_body() {
+        let src = "fn f(n: i64) -> i64 {
+                       let mut t = 0;
+                       let mut i = 0;
+                       while i < n {
+                           let mut j = 0;
+                           while j < n { t = t + j; j = j + 1; }
+                           i = i + 1;
+                       }
+                       return t;
+                   }";
+        let (flipped, branches, depths) = then_fallthroughs(src, "f");
+        assert_eq!(depths.iter().copied().max(), Some(2), "{depths:?}");
+        let headers: Vec<usize> = back_edges_of(src, "f", &["f"])
+            .into_iter()
+            .map(|(_, header)| header)
+            .collect();
+        assert!(headers.len() >= 2);
+        assert!(
+            headers.iter().all(|header| flipped.contains(header)),
+            "{depths:?}"
+        );
+        // Every branch here is a loop condition whose exit leaves a loop.
+        assert_eq!(flipped, branches, "{depths:?}");
+    }
+
+    /// (unrooted temporaries, synthetic array temporaries) of `f`.
+    fn unrooted_count(src: &str) -> (usize, usize) {
+        let (f, _) = lir_fn_and_tables(src, "f", &["f", "g"]);
+        let temps = f
+            .locals
+            .iter()
+            .filter(|local| local.synthetic && !local.parameter)
+            .filter(|local| super::super::transient_roots::is_array(&local.ty))
+            .count();
+        let unrooted = super::super::transient_roots::unrooted_array_temps(&f);
+        for id in &unrooted {
+            let local = &f.locals[id.0 as usize];
+            assert!(local.synthetic && !local.parameter, "{local:?}");
+            assert!(super::super::transient_roots::is_array(&local.ty));
+        }
+        (unrooted.len(), temps)
+    }
+
+    // willow-nzsg: receiver temporaries read only by `len`/scalar indexing in
+    // a GC-free run need no root.
+    #[test]
+    fn transient_array_temps_skip_roots_only_inside_gc_free_runs() {
+        let plain = "import std::collections::Array;
+                     fn g(i: i64) -> i64 { println(i); return i; }
+                     fn f(xs: Array<i64>) -> i64 {
+                         let mut i = 0;
+                         let mut s = 0;
+                         while i < xs.len() { s = s + xs[i]; i = i + 1; }
+                         return s;
+                     }";
+        // The condition's receiver copy for `len`.
+        assert_eq!(unrooted_count(plain), (1, 1));
+        // An index operand that needs a call copies the receiver first; the
+        // call is a GC point, so that copy keeps its root.
+        assert_eq!(unrooted_count(&plain.replace("xs[i]", "xs[g(i)]")), (1, 2));
+        // Interface boxing between the copy and its read is a GC point.
+        let boxed = "import std::collections::Array;
+                     interface V { fn v() -> i64; }
+                     class B implements V { pub n: i64; pub fn v() -> i64 { return self.n; } }
+                     fn g(i: i64) -> i64 { return i; }
+                     fn f(xs: Array<i64>) -> i64 {
+                         let mut s = 0;
+                         let mut i = 0;
+                         while i < xs.len() { let b: V = new B(i); s = s + b.v() + xs[i]; i = i + 1; }
+                         return s;
+                     }";
+        let (f, _) = lir_fn_and_tables(boxed, "f", &["f", "g"]);
+        let boxing = f
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .filter(|inst| matches!(inst, LirInst::Let { .. }))
+            .filter(|inst| !super::super::transient_roots::gc_free(&f, inst))
+            .count();
+        assert!(boxing >= 1);
+    }
+
+    #[test]
+    fn transient_runs_inherit_only_along_sole_plain_edges() {
+        let looped = "import std::collections::Array;
+                      fn f(xs: Array<i64>) -> i64 {
+                          let mut i = 0;
+                          let mut s = 0;
+                          while i < xs.len() { s = s + xs[i]; i = i + 1; }
+                          return s;
+                      }";
+        let (f, _) = lir_fn_and_tables(looped, "f", &["f"]);
+        let preds = super::super::transient_roots::sole_predecessors(&f);
+        assert_eq!(preds[0], None);
+        let (_, header) = back_edges_of(looped, "f", &["f"])[0];
+        // The header joins the entry and the latch.
+        assert_eq!(preds[header], None);
+        for (block, pred) in preds.iter().enumerate() {
+            if let Some(pred) = *pred {
+                assert!(lir_block_successors(&f.blocks[pred]).contains(&block));
+            }
+        }
+        assert!(preds.iter().any(Option::is_some));
+        // Defers resume blocks outside the terminators: nothing inherits.
+        let deferred = looped.replace("let mut i = 0;", "defer println(\"x\"); let mut i = 0;");
+        let (f, _) = lir_fn_and_tables(&deferred, "f", &["f"]);
+        assert!(
+            super::super::transient_roots::sole_predecessors(&f)
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn transient_reuse_carries_a_bounded_fact_set() {
+        use cranelift_codegen::entity::EntityRef;
+        use cranelift_codegen::ir::{StackSlot, Value};
+        let mut reuse = super::super::transient_roots::LirReuse::default();
+        let facts = super::super::transient_roots::ArrayFacts {
+            len: Value::new(0),
+            buffer: None,
+        };
+        for k in 0..16 {
+            if k % 2 == 0 {
+                reuse.slots.insert(StackSlot::new(k), Value::new(k));
+            } else {
+                reuse.arrays.insert(Value::new(k), facts);
+            }
+        }
+        assert!(reuse.carriable());
+        reuse.arrays.insert(Value::new(99), facts);
+        assert!(!reuse.carriable());
     }
 
     // s1. straight-line code closes no loop.

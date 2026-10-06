@@ -239,6 +239,8 @@ mod constructor_flow;
 
 #[path = "integration/array_fast_paths.rs"]
 mod array_fast_paths;
+#[path = "integration/array_loop_safepoints.rs"]
+mod array_loop_safepoints;
 #[path = "integration/array_reference_store.rs"]
 mod array_reference_store;
 #[path = "integration/async_frame_store.rs"]

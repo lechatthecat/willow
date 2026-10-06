@@ -88,7 +88,7 @@ impl Captured {
             }
             if operation == "array-length-null-panic" {
                 value["witness"]["reason"] = json!(
-                    "Normal Array.len()/FrozenArray.len() reads the length without allocating. Only a null receiver reaches willow_array_len's panic path, which may allocate the panic payload; receiver non-nullness is not proven by this summary."
+                    "Normal Array.len()/FrozenArray.len() reads the length without allocating. Only a null receiver (or a malformed negative length) reaches willow_array_len's panic path, which may allocate the panic payload; receiver non-nullness is not proven by this summary."
                 );
                 if effect == RuntimeEffects::MAY_ALLOCATE.bits() {
                     value["witness"]["cause"]["operation"] = json!("panic-payload-allocation");

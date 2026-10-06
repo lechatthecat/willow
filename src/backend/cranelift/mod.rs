@@ -48,6 +48,7 @@ struct SlotTarget {
 }
 mod ast_passes;
 mod async_codegen;
+mod block_layout;
 mod class_view;
 use class_view::ClassView;
 mod compile;
@@ -74,6 +75,7 @@ mod panic_effect;
 mod root_effect;
 mod std_collection;
 mod symbols;
+mod transient_roots;
 mod type_helpers;
 mod vtable_layout;
 use ast_passes::*;
@@ -1416,6 +1418,12 @@ struct FuncGen<'a, 'b> {
     /// before cleanup begins (willow-s9ej.1).
     defer_stack: DeferStack,
     defer_counter: usize,
+    /// Array loads the current GC-free run of LIR instructions can reuse;
+    /// `None` outside such a run (willow-nzsg).
+    lir_reuse: Option<transient_roots::LirReuse>,
+    /// Frame slot the array fault paths share for their operands; see
+    /// `emit_array_access` (willow-nzsg).
+    array_fault_spill: Option<cranelift_codegen::ir::StackSlot>,
     /// Pre-zeroed registration flags for synchronous defer sites in the
     /// lexical block currently being emitted, keyed by source span.
     sync_defer_flags: HashMap<crate::diagnostics::Span, cranelift_codegen::ir::StackSlot>,
@@ -1666,6 +1674,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value: cranelift_codegen::ir::Value,
         slot: cranelift_codegen::ir::StackSlot,
     ) {
+        if let Some(reuse) = &mut self.lir_reuse {
+            reuse.slots.remove(&slot);
+        }
         let ptr_ty = reference_type(self.module.target_config());
         self.builder.ins().stack_store(ptr_ty, value, slot, 0);
     }

@@ -1,0 +1,166 @@
+// Array loops whose length, owner and bounds checks the compiler shares
+// within a trip, next to loop bodies that change the array or allocate.
+import std::collections::Array;
+
+interface Shape {
+    fn area() -> i64;
+}
+
+class Square implements Shape {
+    pub side: i64;
+    pub fn area() -> i64 { return self.side * self.side; }
+}
+
+fn sum(values: Array<i64>) -> i64 {
+    let mut i: i64 = 0;
+    let mut total: i64 = 0;
+    while i < values.len() {
+        total = total + values[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn sum_with_defer(values: Array<i64>) -> i64 {
+    defer println("summed");
+    let mut i: i64 = 0;
+    let mut total: i64 = 0;
+    while i < values.len() {
+        total = total + values[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn fib(n: i64) -> i64 {
+    if n < 2 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() {
+    let values: Array<i64> = [];
+    let mut i: i64 = 0;
+    while i < 1000 {
+        values.push(i);
+        i = i + 1;
+    }
+    println(sum(values));
+    println(sum_with_defer(values));
+
+    // Reassigning the array inside the body: the next condition reads the
+    // new array's length.
+    let mut current: Array<i64> = [1, 2, 3, 4, 5, 6];
+    let short: Array<i64> = [10, 20];
+    let mut total: i64 = 0;
+    i = 0;
+    while i < current.len() {
+        total = total + current[i];
+        if i == 1 { current = short; }
+        i = i + 1;
+    }
+    println(total);
+
+    // Growing and shrinking inside the body.
+    let grows: Array<i64> = [1];
+    i = 0;
+    while i < grows.len() {
+        if grows.len() < 5 { grows.push(grows[i] * 2); }
+        i = i + 1;
+    }
+    println(grows.len());
+    println(grows[4]);
+    let shrinks: Array<i64> = [1, 2, 3, 4, 5, 6];
+    total = 0;
+    i = 0;
+    while i < shrinks.len() {
+        total = total + shrinks[i];
+        shrinks.pop();
+        i = i + 1;
+    }
+    println(total);
+
+    // Allocation between reads: a collection may move the array.
+    let digits: Array<i64> = [3, 1, 4, 1, 5];
+    let mut text = "";
+    i = 0;
+    while i < digits.len() {
+        text = text + format("{}", digits[i]);
+        i = i + 1;
+    }
+    println(text);
+
+    // An interface value boxed between two reads of the same array.
+    total = 0;
+    i = 0;
+    while i < values.len() && i < 3 {
+        let shape: Shape = new Square(values[i]);
+        total = total + shape.area() + values[i];
+        i = i + 1;
+    }
+    println(total);
+
+    // Frozen arrays, float and bool elements, and writes in the body.
+    let frozen = [2, 4, 6].freeze();
+    total = 0;
+    i = 0;
+    while i < frozen.len() {
+        total = total + frozen[i];
+        i = i + 1;
+    }
+    println(total);
+    let floats: Array<f64> = [0.5, 1.5, 2.0];
+    let mut float_total: f64 = 0.0;
+    i = 0;
+    while i < floats.len() {
+        float_total = float_total + floats[i];
+        i = i + 1;
+    }
+    println(float_total == 4.0);
+    let flags: Array<bool> = [true, false, true, true];
+    let mut set: i64 = 0;
+    i = 0;
+    while i < flags.len() {
+        if flags[i] { set = set + 1; }
+        flags[i] = !flags[i];
+        i = i + 1;
+    }
+    println(set);
+    println(flags[1]);
+    let doubled: Array<i64> = [1, 2, 3];
+    i = 0;
+    while i < doubled.len() {
+        doubled[i] = doubled[i] * 2;
+        i = i + 1;
+    }
+    println(sum(doubled));
+
+    // Two arrays in nested loops.
+    let rows: Array<i64> = [1, 2, 3];
+    let columns: Array<i64> = [10, 20];
+    total = 0;
+    i = 0;
+    while i < rows.len() {
+        let mut j: i64 = 0;
+        while j < columns.len() {
+            total = total + rows[i] * columns[j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    println(total);
+
+    // More reads in one block than the compiler carries between blocks.
+    let wide: Array<i64> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+    total = 0;
+    i = 0;
+    while i < 2 {
+        total = total + wide[0] + wide[1] + wide[2] + wide[3] + wide[4] + wide[5] + wide[6]
+            + wide[7] + wide[8] + wide[9] + wide[10] + wide[11] + wide[12] + wide[13]
+            + wide[14] + wide[15] + wide[16] + wide[17] + wide[18] + wide[19] + wide.len();
+        i = i + 1;
+    }
+    println(total);
+
+    // Recursion without loops keeps its entry safepoint.
+    println(fib(20));
+}

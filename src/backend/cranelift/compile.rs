@@ -1435,6 +1435,8 @@ impl UnitCodegenContext<'_> {
             builder: &mut builder,
             defer_stack: DeferStack::default(),
             defer_counter: 0,
+            lir_reuse: None,
+            array_fault_spill: None,
             sync_defer_flags: HashMap::new(),
             panic_scopes: Vec::new(),
             unavailable_defer_ids: HashSet::new(),
@@ -1612,6 +1614,7 @@ impl UnitCodegenContext<'_> {
         fg.builder.seal_all_blocks();
 
         builder.finalize(self.output.module.target_config());
+        super::block_layout::sink_cold_regions(&mut ctx.func);
         self.output
             .module
             .define_function(func_id, &mut ctx)
@@ -1860,6 +1863,8 @@ impl UnitCodegenContext<'_> {
             builder: &mut builder,
             defer_stack: DeferStack::default(),
             defer_counter: 0,
+            lir_reuse: None,
+            array_fault_spill: None,
             sync_defer_flags: HashMap::new(),
             panic_scopes: Vec::new(),
             unavailable_defer_ids: HashSet::new(),
@@ -2430,6 +2435,8 @@ impl UnitCodegenContext<'_> {
             builder: &mut builder,
             defer_stack: DeferStack::default(),
             defer_counter: 0,
+            lir_reuse: None,
+            array_fault_spill: None,
             sync_defer_flags: HashMap::new(),
             panic_scopes: Vec::new(),
             unavailable_defer_ids: HashSet::new(),
@@ -2586,6 +2593,7 @@ impl UnitCodegenContext<'_> {
         fg.builder.seal_all_blocks();
 
         builder.finalize(self.output.module.target_config());
+        super::block_layout::sink_cold_regions(&mut ctx.func);
         self.output
             .module
             .define_function(func_id, &mut ctx)

@@ -200,6 +200,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Inline nonallocating access; retain ABI panic propagation on cold failures.
     /// A missing index requests len; a supplied word requests a scalar store.
+    ///
+    /// The slow path is entered only for a null array, a negative (malformed)
+    /// length or an out-of-bounds index, and the runtime raises for each of
+    /// them, so it never rejoins the fast path. The fast path therefore
+    /// dominates the code after the access, and a read records the header it
+    /// validated for the rest of the current GC-free run (willow-nzsg). The
+    /// slow path takes its operands as block parameters and spills them to a
+    /// frame slot the function's fault paths share; it reloads them only after
+    /// the panic-depth snapshot call. Operands live across that call would
+    /// otherwise make the register allocator split the loop's values and
+    /// leave moves on the fast path.
     pub(super) fn emit_array_access(
         &mut self,
         array: Value,
@@ -207,41 +218,59 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         word: Option<Value>,
     ) -> Value {
         use willow_abi::array_layout as layout;
-        let inspect = self.builder.create_block();
+        let known = match word {
+            None => self
+                .lir_reuse
+                .as_ref()
+                .and_then(|reuse| reuse.arrays.get(&array).copied()),
+            Some(_) => None,
+        };
+        if let (Some(facts), None) = (known, index) {
+            return facts.len;
+        }
+        let operands: Vec<Value> = std::iter::once(array).chain(index).chain(word).collect();
         let slow = self.builder.create_block();
         self.builder.set_cold_block(slow);
-        let done = self.builder.create_block();
-        self.builder.append_block_param(done, types::I64);
-        let null = self.builder.ins().icmp_imm_s(IntCC::Equal, array, 0);
-        self.builder.ins().brif(null, slow, &[], inspect, &[]);
-        self.builder.switch_to_block(inspect);
-        self.builder.seal_block(inspect);
-        let len = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            array,
-            layout::handle_offset(layout::H_LEN),
-        );
+        for &operand in &operands {
+            let ty = self.builder.func.dfg.value_type(operand);
+            self.builder.append_block_param(slow, ty);
+        }
+        let slow_args: Vec<_> = operands.iter().map(|&operand| operand.into()).collect();
+        let mut facts = match known {
+            Some(facts) => facts,
+            None => {
+                let null = self.builder.ins().icmp_imm_s(IntCC::Equal, array, 0);
+                self.emit_array_guard(null, slow, &slow_args);
+                let len = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    array,
+                    layout::handle_offset(layout::H_LEN),
+                );
+                let negative = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, len, 0);
+                self.emit_array_guard(negative, slow, &slow_args);
+                super::transient_roots::ArrayFacts { len, buffer: None }
+            }
+        };
         let result = if let Some(index) = index {
-            let access = self.builder.create_block();
-            // Unsigned comparison rejects negative indexes; an explicit length
-            // guard also prevents malformed negative lengths from passing.
-            let in_bounds = self.builder.ins().icmp(IntCC::UnsignedLessThan, index, len);
-            let nonnegative =
+            // The length is not negative, so an unsigned comparison also
+            // rejects negative indexes.
+            let out_of_bounds =
                 self.builder
                     .ins()
-                    .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, len, 0);
-            let valid = self.builder.ins().band(in_bounds, nonnegative);
-            self.builder.ins().brif(valid, access, &[], slow, &[]);
-            self.builder.switch_to_block(access);
-            self.builder.seal_block(access);
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, index, facts.len);
+            self.emit_array_guard(out_of_bounds, slow, &slow_args);
             let ptr_ty = reference_type(self.module.target_config());
-            let buffer = self.builder.ins().load(
-                ptr_ty,
-                MemFlagsData::new(),
-                array,
-                layout::handle_offset(layout::H_BUF),
-            );
+            let buffer = match facts.buffer {
+                Some(buffer) => buffer,
+                None => self.builder.ins().load(
+                    ptr_ty,
+                    MemFlagsData::new(),
+                    array,
+                    layout::handle_offset(layout::H_BUF),
+                ),
+            };
+            facts.buffer = Some(buffer);
             let offset = self
                 .builder
                 .ins()
@@ -264,27 +293,73 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .load(types::I64, MemFlagsData::new(), slot, header)
             }
         } else {
-            len
+            facts.len
         };
-        self.builder.ins().jump(done, &[result.into()]);
+        if word.is_none()
+            && let Some(reuse) = &mut self.lir_reuse
+        {
+            reuse.arrays.insert(array, facts);
+        }
+        // The fast path is `done`'s only predecessor, so `result` dominates it.
+        let done = self.builder.create_block();
+        self.builder.ins().jump(done, &[]);
 
         self.builder.switch_to_block(slow);
         self.builder.seal_block(slow);
-        let result = match (index, word) {
-            (Some(index), Some(word)) => {
-                self.emit_void_runtime_call("willow_array_set", &[array, index, word]);
-                self.builder.ins().iconst(types::I64, 0)
-            }
-            (Some(index), None) => {
-                self.emit_value_runtime_call("willow_array_get", &[array, index])
-            }
-            (None, None) => self.emit_value_runtime_call("willow_array_len", &[array]),
-            (None, Some(_)) => unreachable!("array store requires an index"),
+        let params = self.builder.block_params(slow).to_vec();
+        let spill = *self.array_fault_spill.get_or_insert_with(|| {
+            self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                3 * 8,
+                3,
+            ))
+        });
+        let ptr_ty = reference_type(self.module.target_config());
+        for (k, &param) in params.iter().enumerate() {
+            self.builder
+                .ins()
+                .stack_store(ptr_ty, param, spill, 8 * k as i32);
+        }
+        let name = match params.len() {
+            3 => "willow_array_set",
+            2 => "willow_array_get",
+            1 => "willow_array_len",
+            _ => unreachable!("array access takes one to three operands"),
         };
-        self.builder.ins().jump(done, &[result.into()]);
+        let reload = move |this: &mut Self| {
+            params
+                .iter()
+                .enumerate()
+                .map(|(k, &param)| {
+                    let ty = this.builder.func.dfg.value_type(param);
+                    this.builder
+                        .ins()
+                        .stack_load(ptr_ty, ty, spill, 8 * k as i32)
+                })
+                .collect()
+        };
+        self.emit_runtime_call_late_args(name, reload, |_| {});
+        // The runtime raised, so the panic check above has already diverged.
+        if !self.terminated {
+            self.builder.ins().trap(TrapCode::unwrap_user(1));
+        }
+        self.terminated = false;
         self.builder.switch_to_block(done);
         self.builder.seal_block(done);
-        self.builder.block_params(done)[0]
+        result
+    }
+
+    /// Leave for `slow` when `failed`, continuing in a fresh fast-path block.
+    fn emit_array_guard(
+        &mut self,
+        failed: Value,
+        slow: cranelift_codegen::ir::Block,
+        slow_args: &[cranelift_codegen::ir::BlockArg],
+    ) {
+        let next = self.builder.create_block();
+        self.builder.ins().brif(failed, slow, slow_args, next, &[]);
+        self.builder.switch_to_block(next);
+        self.builder.seal_block(next);
     }
 
     /// Scalar buffers have no concurrent GC tracer. Update their live length

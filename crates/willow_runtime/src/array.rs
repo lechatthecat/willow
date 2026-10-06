@@ -326,7 +326,9 @@ unsafe fn copy_scalar_pair(source: *const i64) -> *mut u8 {
     pair
 }
 
-/// Number of elements in `arr`.
+/// Number of elements in `arr`. Raises for a null array and for a malformed
+/// negative length: generated length reads guard both on their fast path and
+/// call here only to raise, so the call must not return normally for either.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
@@ -334,7 +336,12 @@ pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
         raise_with("cannot take the length of a null array");
         return 0;
     }
-    unsafe { handle_word(arr, H_LEN) }
+    let len = unsafe { handle_word(arr, H_LEN) };
+    if len < 0 {
+        raise_with(&format!("malformed array: negative length {len}"));
+        return 0;
+    }
+    len
 }
 
 /// Read the raw 64-bit word at `index`. Callers interpret the bits according to
@@ -1312,6 +1319,35 @@ mod tests {
             "cannot freeze a null array"
         );
         willow_panic_release_recovered(info);
+        replace_current_context(previous);
+    }
+
+    #[test]
+    fn array_len_raises_for_null_and_negative_lengths() {
+        use crate::panic_context::*;
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(906))));
+        let arr = willow_array_new(2, 0);
+        unsafe { set_handle_word(arr, H_LEN, -3) };
+        for (target, message) in [
+            (
+                std::ptr::null_mut(),
+                "cannot take the length of a null array",
+            ),
+            (arr, "malformed array: negative length -3"),
+        ] {
+            assert_eq!(willow_array_len(target), 0);
+            assert_eq!(willow_panic_depth(), 1);
+            willow_panic_enter_defer();
+            let info = willow_panic_recover();
+            willow_panic_leave_defer();
+            assert_eq!(unsafe { panic_info_message(info) }, message);
+            willow_panic_release_recovered(info);
+        }
+        unsafe { set_handle_word(arr, H_LEN, 2) };
+        assert_eq!(willow_array_len(arr), 2);
+        assert_eq!(willow_panic_depth(), 0);
         replace_current_context(previous);
     }
 
