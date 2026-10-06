@@ -1022,8 +1022,8 @@ fn concurrent_trace_reuses_scratch_across_bounded_drains() {
                             },
                         )
                     }),
-                    HashSet::new(),
-                    HashMap::from([(0xFE01, snapshot_scratch_fixture as ConcurrentTraceFn)]),
+                    IdSet::default(),
+                    IdMap::from_iter([(0xFE01, snapshot_scratch_fixture as ConcurrentTraceFn)]),
                     0,
                 );
                 cycle.enqueue(addresses[0] as *mut u8);
@@ -1086,8 +1086,8 @@ fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
                 epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(
                     &runtime().heap.lock().unwrap(),
                 )),
-                HashSet::new(),
-                HashMap::from([(0xFA71, record_marker_thread as ConcurrentTraceFn)]),
+                IdSet::default(),
+                IdMap::from_iter([(0xFA71, record_marker_thread as ConcurrentTraceFn)]),
                 1,
             ));
             cycle.enqueue(addresses[0] as *mut u8);
@@ -1257,8 +1257,8 @@ fn marker_panics_terminate_worker_collector_and_assist() {
                     payload_size: 8,
                 },
             )],
-            HashSet::new(),
-            HashMap::from([(0xFA73, failing_concurrent_trace as ConcurrentTraceFn)]),
+            IdSet::default(),
+            IdMap::from_iter([(0xFA73, failing_concurrent_trace as ConcurrentTraceFn)]),
             1,
         ));
         cycle.enqueue(object as *mut u8);
@@ -1674,8 +1674,8 @@ fn satb_owned_batches_bound_queue_items_and_assist_overshoot() {
                         },
                     )
                 }),
-                HashSet::new(),
-                HashMap::new(),
+                IdSet::default(),
+                IdMap::default(),
                 0,
             );
             let mut buffers = satb::SatbBuffers::new(capacity);
@@ -1732,8 +1732,8 @@ fn assist_work_credit_counts_only_each_consumers_actual_work() {
                         },
                     )
                 }),
-                HashSet::new(),
-                HashMap::new(),
+                IdSet::default(),
+                IdMap::default(),
                 0,
             ));
             cycle.enqueue_satb_batch(&(1..=count).collect::<Vec<_>>());
@@ -1783,8 +1783,8 @@ fn expired_assist_budget_publishes_unfinished_satb_tails_before_returning() {
                     },
                 )
             }),
-            HashSet::new(),
-            HashMap::new(),
+            IdSet::default(),
+            IdMap::default(),
             0,
         );
         cycle.enqueue_satb_batch(&(1..=count).collect::<Vec<_>>());
@@ -1834,8 +1834,8 @@ fn large_bitmap_continuations_bound_scan_work_without_rescanning_prefixes() {
                     },
                 ),
             ],
-            HashSet::new(),
-            HashMap::new(),
+            IdSet::default(),
+            IdMap::default(),
             0,
         );
         cycle.enqueue(root as *mut u8);
@@ -2557,8 +2557,8 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
             let mut state = runtime().heap.lock().unwrap();
             let cycle = Arc::new(ConcurrentCycle::with_index(
                 epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
-                HashSet::new(),
-                HashMap::new(),
+                IdSet::default(),
+                IdMap::default(),
                 0,
             ));
             assert!(cycle.objects.claim(object));
@@ -2750,8 +2750,8 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
         state.satb = satb::SatbBuffers::new(256);
         let cycle = Arc::new(ConcurrentCycle::with_index(
             epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
-            HashSet::new(),
-            HashMap::new(),
+            IdSet::default(),
+            IdMap::default(),
             1,
         ));
         assert!(cycle.objects.claim(parent));
@@ -2852,8 +2852,8 @@ fn marker_pool_shared_budget_bounds_retries_and_preserves_pending_work() {
                         },
                     )
                 }),
-                HashSet::new(),
-                HashMap::new(),
+                IdSet::default(),
+                IdMap::default(),
                 0,
             );
             cycle.slices.insert(0xFA79, budget_retry_slice);
@@ -2906,8 +2906,8 @@ fn concurrent_closure_paces_contention_and_retains_work_until_release() {
             let mut state = runtime().heap.lock().unwrap();
             let mut cycle = ConcurrentCycle::with_index(
                 epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
-                HashSet::new(),
-                HashMap::new(),
+                IdSet::default(),
+                IdMap::default(),
                 0,
             );
             cycle.slices.insert(0xFA79, budget_retry_slice);

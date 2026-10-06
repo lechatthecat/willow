@@ -3,6 +3,7 @@
 mod abi;
 pub use abi::*;
 
+use crate::id_hash::IdMap;
 use crate::native_memory::Mutex;
 use crate::task::{ChannelOwnershipToken, ChannelRole};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -51,8 +52,8 @@ struct WillowChannelState {
     send_waiters: WaiterQueue,
     // Values remain in the traced queue; claims reserve availability, not slots
     // in movable task frames. Reservations cannot outnumber queued values.
-    recv_claims: HashMap<u64, u64>,
-    send_handoffs: HashMap<u64, u64>,
+    recv_claims: IdMap<u64, u64>,
+    send_handoffs: IdMap<u64, u64>,
     next_generation: u64,
     native_tables: [usize; 2],
 }
@@ -260,10 +261,7 @@ fn register_wait(raw: *mut c_void, queue: &mut WaiterQueue, task: u64, role: Cha
     if task == 0 {
         return false;
     }
-    let fresh = queue.ticket(task).is_none();
-    let generation = queue
-        .register_ticket(task)
-        .expect("wait queue generation exhausted");
+    let (generation, fresh) = queue.register_ticket_fresh(task);
     if !crate::scheduler::install_channel_ownership(task, token(raw, role, generation)) {
         queue.remove_ticket(task, generation);
         return false;
@@ -278,12 +276,7 @@ fn clear_wait(raw: *mut c_void, queue: &mut WaiterQueue, task: u64, role: Channe
     }
 }
 
-fn clear_reservation(
-    raw: *mut c_void,
-    owners: &mut HashMap<u64, u64>,
-    task: u64,
-    role: ChannelRole,
-) {
+fn clear_reservation(raw: *mut c_void, owners: &mut IdMap<u64, u64>, task: u64, role: ChannelRole) {
     if let Some(generation) = owners.remove(&task) {
         crate::scheduler::clear_channel_ownership(task, token(raw, role, generation));
     }
@@ -296,6 +289,7 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
         return 1;
     };
     let current = crate::scheduler::willow_sched_current_task();
+    crate::task::prepare_channel_wait_links();
     {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         if state.closed {

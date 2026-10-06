@@ -11,9 +11,9 @@ pub(super) struct ConcurrentCycle {
     pub(super) assist_epoch: u64,
     pub(super) assist_rate: u64,
     pub(super) objects: epoch_index::EpochIndex,
-    pub(super) legacy_traces: HashSet<u32>,
-    pub(super) traces: HashMap<u32, ConcurrentTraceFn>,
-    pub(super) slices: HashMap<u32, ConcurrentTraceSliceFn>,
+    pub(super) legacy_traces: IdSet<u32>,
+    pub(super) traces: IdMap<u32, ConcurrentTraceFn>,
+    pub(super) slices: IdMap<u32, ConcurrentTraceSliceFn>,
     pub(super) worker_failed: std::sync::atomic::AtomicBool,
     pub(super) closing: std::sync::atomic::AtomicBool,
     pub(super) tracing_enabled: std::sync::atomic::AtomicBool,
@@ -85,8 +85,8 @@ impl ConcurrentCycle {
     #[cfg(test)]
     pub(super) fn new(
         objects: impl IntoIterator<Item = (usize, raw_heap::TraceMetadata)>,
-        legacy_traces: HashSet<u32>,
-        traces: HashMap<u32, ConcurrentTraceFn>,
+        legacy_traces: IdSet<u32>,
+        traces: IdMap<u32, ConcurrentTraceFn>,
         roots: usize,
     ) -> Self {
         Self::with_index(
@@ -99,8 +99,8 @@ impl ConcurrentCycle {
 
     pub(super) fn with_index(
         objects: epoch_index::EpochIndex,
-        legacy_traces: HashSet<u32>,
-        traces: HashMap<u32, ConcurrentTraceFn>,
+        legacy_traces: IdSet<u32>,
+        traces: IdMap<u32, ConcurrentTraceFn>,
         roots: usize,
     ) -> Self {
         // One slot per allowed background worker, plus the collector. Assists
@@ -124,7 +124,7 @@ impl ConcurrentCycle {
             active_drains: AtomicUsize::new(0),
             legacy_traces,
             traces,
-            slices: HashMap::new(),
+            slices: IdMap::default(),
             deferred: Mutex::new(Vec::new()),
             unindexed: Mutex::new(HashSet::new()),
             queue,

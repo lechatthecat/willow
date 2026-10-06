@@ -82,6 +82,7 @@ pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return 1;
     };
+    crate::task::prepare_channel_wait_links();
     let mut state = channel.state.lock().expect("channel mutex poisoned");
     let current = crate::scheduler::willow_sched_current_task();
     if state.closed || state.send_handoffs.contains_key(&current) || !state_is_full(&state) {
@@ -115,6 +116,7 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return 1;
     };
+    crate::task::prepare_channel_wait_links();
     let mut state = channel.state.lock().expect("channel mutex poisoned");
     let current = crate::scheduler::willow_sched_current_task();
     if state.recv_claims.contains_key(&current) {

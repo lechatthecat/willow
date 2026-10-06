@@ -7,7 +7,7 @@
 //! synchronous `main` installs a standalone context in `runtime_start`.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::gc::{
@@ -58,6 +58,11 @@ pub struct PanicContext {
     // Contexts can be shared across workers. Publish depth under the state lock;
     // readers need neither that lock nor a worker-local mirror.
     active_depth: AtomicUsize,
+    /// Preemption request flag of the owning task. It shares this immovable
+    /// `Arc` allocation instead of a separate box per task: task records move
+    /// on task-table rehash, and the flag's address must stay valid while a
+    /// worker polls the task (willow-lk92). Unused by synchronous contexts.
+    preempt_flag: AtomicBool,
 }
 
 impl PanicContext {
@@ -66,7 +71,12 @@ impl PanicContext {
             owner,
             state: Mutex::new(PanicState::default()),
             active_depth: AtomicUsize::new(0),
+            preempt_flag: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn preempt_flag(&self) -> &AtomicBool {
+        &self.preempt_flag
     }
 
     pub fn owner(&self) -> u64 {

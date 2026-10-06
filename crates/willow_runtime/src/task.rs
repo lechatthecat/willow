@@ -1,9 +1,10 @@
+use crate::id_hash::IdSet;
 use crate::lock_wait::{LockId, LockWaitLink, LockWaitPhase, RegistrationToken};
 use crate::task_state::{
     AtomicTaskState, BoundaryOutcome, ClaimOutcome, TaskLifecycle, WakeOutcome,
 };
 use crate::wait_queue::WaitQueue;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -123,7 +124,7 @@ pub(crate) struct TaskWaitLinks {
     /// cancelled select task waiter lingers until its awaitee finishes
     /// (willow-o038 review). A set, not a queue: nothing depends on the order
     /// in which one task's awaitees are visited (willow-ezs.2).
-    awaiting: HashSet<RuntimeTaskId>,
+    awaiting: IdSet<RuntimeTaskId>,
     /// Channels this task is registered on as a recv/select waiter — reverse
     /// references so cancellation deregisters in O(registered) instead of
     /// scanning every channel (willow-p4er). Addresses stay live while the
@@ -163,6 +164,33 @@ impl TaskWaitLinks {
             && self.wait_channels.is_empty()
             && self.lock_wait.is_none()
     }
+}
+
+thread_local! {
+    /// A wait box allocated before a channel critical section, so a task that
+    /// parks under the channel mutex does not call the allocator while every
+    /// other waiter on that channel queues behind it (willow-lk92).
+    static SPARE_WAIT_LINKS: std::cell::Cell<Option<Box<TaskWaitLinks>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Ensure this thread holds a spare wait box sized for a one/two-channel
+/// wait. Call before taking a channel mutex; a no-op once a spare exists.
+pub(crate) fn prepare_channel_wait_links() {
+    SPARE_WAIT_LINKS.with(|spare| {
+        let links = spare.take().unwrap_or_else(|| {
+            let mut links = Box::<TaskWaitLinks>::default();
+            links.wait_channels.reserve_exact(2);
+            links
+        });
+        spare.set(Some(links));
+    });
+}
+
+fn take_spare_wait_links() -> Box<TaskWaitLinks> {
+    SPARE_WAIT_LINKS
+        .with(std::cell::Cell::take)
+        .unwrap_or_default()
 }
 
 /// Debug metadata the compiler tags onto a task in debug builds
@@ -233,11 +261,9 @@ pub struct RuntimeTask {
     wait: Option<Box<TaskWaitLinks>>,
     /// Debug name and spawn site, allocated on the first tag (willow-ezs.3).
     debug: Option<Box<TaskDebugInfo>>,
-    /// Stable per-task preemption request flag. Boxed so its address remains
-    /// valid while the scheduler releases its lock and polls the task.
-    preempt_flag: Box<AtomicBool>,
     /// Recoverable language-panic state belongs to the task, never to the OS
-    /// worker that happens to poll it (willow-s9ej.2).
+    /// worker that happens to poll it (willow-s9ej.2). The same allocation
+    /// carries the task's stable preemption request flag (willow-lk92).
     panic_context: Arc<crate::panic_context::PanicContext>,
 }
 
@@ -275,7 +301,6 @@ impl RuntimeTask {
             yield_requested: false,
             wait: None,
             debug: None,
-            preempt_flag: Box::new(AtomicBool::new(false)),
             panic_context: Arc::new(crate::panic_context::PanicContext::new(id)),
         }
     }
@@ -397,7 +422,7 @@ impl RuntimeTask {
 
     /// Install exact ownership; repeated publication of the same token succeeds.
     pub(crate) fn install_channel_ownership(&mut self, token: ChannelOwnershipToken) -> bool {
-        let wait = self.wait_mut();
+        let wait = self.wait.get_or_insert_with(take_spare_wait_links);
         if let Some(index) = wait.channel_index(token.key()) {
             return wait.wait_channels[index] == token;
         }
@@ -410,6 +435,11 @@ impl RuntimeTask {
             }
             index.insert(token.key(), wait.wait_channels.len());
             wait.channel_ownership_index = Some(Box::new(index));
+        } else if wait.wait_channels.is_empty() {
+            // Size the first growth for the common one/two-channel wait: the
+            // default (four tokens) costs every idle parked task 48 bytes it
+            // never uses (willow-lk92). A wider select grows normally later.
+            wait.wait_channels.reserve_exact(2);
         }
         wait.wait_channels.push(token);
         true
@@ -585,7 +615,7 @@ impl RuntimeTask {
 
     /// Stable address passed to the worker's quantum lifecycle while polling.
     pub fn preempt_flag_ptr(&self) -> *const c_void {
-        (&*self.preempt_flag as *const AtomicBool).cast()
+        (self.panic_context.preempt_flag() as *const AtomicBool).cast()
     }
 
     /// The live state of this record, or `None` once it is terminal.
@@ -679,7 +709,7 @@ mod tests {
 
 /// Footprint and lazy-metadata tests for willow-ezs.3.
 ///
-/// Test perspectives (F1–F22):
+/// Test perspectives (F1–F25):
 ///
 /// ```text
 /// F1  a fresh task allocates neither the wait box nor the debug box
@@ -703,6 +733,9 @@ mod tests {
 /// F19 taking channel waits drains and releases in one step
 /// F20 duplicate channel registration is deduplicated
 /// F22 10,000 park/resume cycles return to the ready-task footprint
+/// F23 a one/two-channel wait reserves exactly two tokens; a third grows
+/// F24 the preempt flag keeps its address when the task record moves
+/// F25 a prepared spare lets a channel wait install without allocating
 /// ```
 #[cfg(test)]
 mod footprint {
@@ -775,6 +808,75 @@ mod footprint {
         task.clear_channel_ownership(channel_token(0x1000));
         assert!(!task.owns_wait_links());
         assert!(task.wait_channels().is_empty());
+    }
+
+    #[test]
+    fn f23_small_channel_wait_reserves_exactly_two_tokens() {
+        let mut task = RuntimeTask::new(1);
+        assert!(task.install_channel_ownership(channel_token(0x1000)));
+        let capacity = |task: &RuntimeTask| task.wait.as_ref().unwrap().wait_channels.capacity();
+        assert_eq!(capacity(&task), 2, "F23: idle parked tasks own two slots");
+        assert!(task.install_channel_ownership(channel_token(0x2000)));
+        assert_eq!(capacity(&task), 2, "F23: a second channel fits in place");
+        assert!(task.install_channel_ownership(channel_token(0x3000)));
+        assert_eq!(
+            task.wait_channels(),
+            &[
+                channel_token(0x1000),
+                channel_token(0x2000),
+                channel_token(0x3000)
+            ],
+            "F23: a wider select still grows past two tokens"
+        );
+    }
+
+    #[test]
+    fn f24_preempt_flag_address_survives_task_record_moves() {
+        let task = RuntimeTask::new(1);
+        let flag = task.preempt_flag_ptr();
+        let mut table = std::collections::HashMap::new();
+        table.insert(1, task);
+        for id in 2..1_000 {
+            table.insert(id, RuntimeTask::new(id));
+        }
+        assert_eq!(table[&1].preempt_flag_ptr(), flag, "F24: rehash keeps it");
+        crate::preempt::willow_preempt_request(flag);
+        assert_eq!(
+            crate::preempt::willow_preempt_requested(table[&1].preempt_flag_ptr()),
+            1
+        );
+    }
+
+    #[test]
+    fn f25_prepared_spare_installs_a_channel_wait_without_allocating() {
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+
+        super::prepare_channel_wait_links();
+        let allocs_before = counter::thread_allocations();
+        super::prepare_channel_wait_links();
+        assert_eq!(
+            counter::thread_allocations(),
+            allocs_before,
+            "F25: an existing spare is kept, not replaced"
+        );
+        let mut task = RuntimeTask::new(1);
+        let allocs_before = counter::thread_allocations();
+        assert!(task.install_channel_ownership(channel_token(0x1000)));
+        assert!(task.install_channel_ownership(channel_token(0x2000)));
+        assert_eq!(
+            counter::thread_allocations(),
+            allocs_before,
+            "F25: the critical section reuses the spare box and token slots"
+        );
+        assert_eq!(task.wait.as_ref().unwrap().wait_channels.capacity(), 2);
+        // The spare is consumed: the next task without one allocates in place.
+        let mut other = RuntimeTask::new(2);
+        let allocs_before = counter::thread_allocations();
+        assert!(other.install_channel_ownership(channel_token(0x1000)));
+        assert_eq!(counter::thread_allocations() - allocs_before, 2);
+        assert!(task.clear_channel_ownership(channel_token(0x1000)));
+        assert!(task.clear_channel_ownership(channel_token(0x2000)));
+        assert!(!task.owns_wait_links(), "F25: a drained spare is released");
     }
 
     #[test]

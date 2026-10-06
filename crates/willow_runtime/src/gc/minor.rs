@@ -4,7 +4,7 @@ const TENURE_THRESHOLD: u8 = 2;
 
 use std::alloc::{Layout, dealloc};
 use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::BuildHasherDefault;
 
 use super::{
     DropFn, GC_GENERATION_OLD, GC_GENERATION_YOUNG, GC_HEADER_SIZE, GC_REGION_MARK_GRANULE,
@@ -16,31 +16,9 @@ use super::{
     verify_remembered_set, willow_gc_safepoint, with_stw,
 };
 
-/// Folded-multiply hash for aligned heap addresses. SipHash's DoS resistance
-/// is unnecessary for collector-private address keys and dominated minor
-/// collection time (willow-8hq4.16).
-#[derive(Default)]
-pub(super) struct AddressHasher(u64);
-impl Hasher for AddressHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.write_u64(u64::from(byte));
-        }
-    }
-    fn write_u64(&mut self, value: u64) {
-        let product = u128::from(self.0 ^ value) * 0x9e37_79b9_7f4a_7c15;
-        self.0 = (product as u64) ^ ((product >> 64) as u64);
-    }
-    fn write_u32(&mut self, value: u32) {
-        self.write_u64(u64::from(value));
-    }
-    fn write_usize(&mut self, value: usize) {
-        self.write_u64(value as u64);
-    }
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
+/// Collector-private address keys use the shared folded multiply; SipHash
+/// dominated minor collection time (willow-8hq4.16).
+pub(super) use crate::id_hash::IdHasher as AddressHasher;
 type AddressMap<V> = HashMap<usize, V, BuildHasherDefault<AddressHasher>>;
 type AddressSet = HashSet<usize, BuildHasherDefault<AddressHasher>>;
 type DropMap = HashMap<u32, DropFn, BuildHasherDefault<AddressHasher>>;

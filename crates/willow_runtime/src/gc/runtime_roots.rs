@@ -1,12 +1,11 @@
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use crate::id_hash::{IdMap, hash_u64};
 use std::sync::{Mutex, MutexGuard};
 
 const SHARD_COUNT: usize = 32;
 #[derive(Default)]
 struct Roots {
     // The map is only an index; snapshots never enumerate retained buckets.
-    indices: HashMap<usize, usize>,
+    indices: IdMap<usize, usize>,
     entries: Vec<(usize, usize)>, // (address, owner count)
 }
 
@@ -32,9 +31,7 @@ impl RuntimeRootSet {
     fn shard_index(root: usize) -> usize {
         // Hash the full address: low bits alone collapse aligned objects and
         // page/region-spaced allocations onto the same lock.
-        let mut hasher = DefaultHasher::new();
-        root.hash(&mut hasher);
-        hasher.finish() as usize % SHARD_COUNT
+        hash_u64(root as u64) as usize % SHARD_COUNT
     }
 
     pub(super) fn add(&self, object: *mut u8) {

@@ -71,6 +71,7 @@ use minor::{MinorRoots, PinSource};
 pub(crate) use minor::{deferred_minor_collections_for_test, minor_collect_pinning_for_test};
 use runtime_roots::RuntimeRootSet;
 
+use crate::id_hash::{IdMap, IdSet};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -828,8 +829,8 @@ struct GcRuntime {
     stop_requested: std::sync::atomic::AtomicBool,
     poll_requested: std::sync::atomic::AtomicBool,
     trace_registry: Mutex<HashMap<u32, TraceFn>>,
-    concurrent_trace_registry: Mutex<HashMap<u32, ConcurrentTraceFn>>,
-    concurrent_slice_registry: Mutex<HashMap<u32, ConcurrentTraceSliceFn>>,
+    concurrent_trace_registry: Mutex<IdMap<u32, ConcurrentTraceFn>>,
+    concurrent_slice_registry: Mutex<IdMap<u32, ConcurrentTraceSliceFn>>,
     drop_registry: Mutex<HashMap<u32, DropFn>>,
     /// Advances only when registered hooks are invalidated. Runtime container
     /// types use this to cache per-generation registration without taking the
@@ -854,8 +855,8 @@ impl Default for GcRuntime {
             stop_requested: std::sync::atomic::AtomicBool::new(false),
             poll_requested: std::sync::atomic::AtomicBool::new(false),
             trace_registry: Mutex::new(HashMap::new()),
-            concurrent_trace_registry: Mutex::new(HashMap::new()),
-            concurrent_slice_registry: Mutex::new(HashMap::new()),
+            concurrent_trace_registry: Mutex::new(IdMap::default()),
+            concurrent_slice_registry: Mutex::new(IdMap::default()),
             drop_registry: Mutex::new(HashMap::new()),
             registry_generation: std::sync::atomic::AtomicU64::new(1),
         }

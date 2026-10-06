@@ -581,34 +581,10 @@ impl RunQueues {
 /// count, so no per-operation path scales with it.
 const TASK_TABLE_SHARDS: usize = 256;
 
-/// Hasher for task-id keys (willow-8hq4.18).
-///
-/// Task ids are process-local sequential integers, so SipHash's flooding
-/// resistance buys nothing and costs a keyed multi-round hash per lookup. Ids
-/// in one shard share `id % TASK_TABLE_SHARDS` (the low eight bits), and
-/// hashbrown indexes buckets with the low hash bits and tags with the top
-/// seven, so both ends of the hash must depend on the high id bits.
-#[derive(Debug, Default, Clone, Copy)]
-struct TaskIdHasher(u64);
-
-impl std::hash::Hasher for TaskIdHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.write_u64(u64::from(byte));
-        }
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        // Folded multiply: one widening `mul` whose two halves are xored, so
-        // every input bit reaches both the low and the high output bits.
-        let full = u128::from(self.0 ^ value) * 0x9E37_79B9_7F4A_7C15;
-        self.0 = (full as u64) ^ ((full >> 64) as u64);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
+/// Hasher for task-id keys (willow-8hq4.18). Ids in one shard share
+/// `id % TASK_TABLE_SHARDS` (the low eight bits), so the hash must spread the
+/// high id bits to both ends; the shared folded multiply does.
+use crate::id_hash::IdHasher as TaskIdHasher;
 
 type TaskShard = HashMap<RuntimeTaskId, RuntimeTask, BuildHasherDefault<TaskIdHasher>>;
 

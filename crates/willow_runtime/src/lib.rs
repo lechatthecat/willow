@@ -59,6 +59,7 @@ pub mod future;
 pub mod gc;
 pub mod gc_mark_queue;
 pub mod gc_telemetry;
+pub(crate) mod id_hash;
 pub mod lock;
 pub mod lock_wait;
 pub mod map;

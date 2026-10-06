@@ -24,8 +24,11 @@
 //! unregister/re-register pair (a losing `select` arm that parks again) moves
 //! that waiter to the FIFO tail rather than keeping its original position.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
 use std::hash::Hash;
+
+use crate::id_hash::IdMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WaitEntry<T> {
@@ -36,7 +39,7 @@ struct WaitEntry<T> {
 #[derive(Debug, Clone)]
 pub struct WaitQueue<T> {
     order: VecDeque<WaitEntry<T>>,
-    members: HashMap<T, u64>,
+    members: IdMap<T, u64>,
     next_ticket: u64,
     native_table_bytes: usize,
 }
@@ -45,7 +48,7 @@ impl<T> Default for WaitQueue<T> {
     fn default() -> Self {
         Self {
             order: VecDeque::new(),
-            members: HashMap::new(),
+            members: IdMap::default(),
             next_ticket: 0,
             native_table_bytes: 0,
         }
@@ -66,26 +69,29 @@ impl<T: Copy + Eq + Hash> WaitQueue<T> {
     /// Register `value`. Returns false when it was already registered, so the
     /// caller can skip the reverse-reference bookkeeping that pairs with it.
     pub fn register(&mut self, value: T) -> bool {
-        if self.ticket(value).is_some() {
-            return false;
-        }
-        self.register_ticket(value);
-        true
+        self.register_ticket_fresh(value).1
     }
 
     /// Return the existing registration ticket, or create a fresh FIFO entry.
     pub fn register_ticket(&mut self, value: T) -> Option<u64> {
-        if let Some(ticket) = self.ticket(value) {
-            return Some(ticket);
-        }
+        Some(self.register_ticket_fresh(value).0)
+    }
+
+    /// Registration ticket plus whether this call created it, with one
+    /// membership lookup: channel waits run this under the channel lock.
+    pub fn register_ticket_fresh(&mut self, value: T) -> (u64, bool) {
         let ticket = self.next_ticket;
-        self.next_ticket = self
-            .next_ticket
-            .checked_add(1)
-            .expect("wait queue registration ticket exhausted");
-        self.members.insert(value, ticket);
-        self.order.push_back(WaitEntry { value, ticket });
-        Some(ticket)
+        match self.members.entry(value) {
+            Entry::Occupied(entry) => (*entry.get(), false),
+            Entry::Vacant(entry) => {
+                self.next_ticket = ticket
+                    .checked_add(1)
+                    .expect("wait queue registration ticket exhausted");
+                entry.insert(ticket);
+                self.order.push_back(WaitEntry { value, ticket });
+                (ticket, true)
+            }
+        }
     }
 
     /// Return the current registration generation without changing FIFO order.

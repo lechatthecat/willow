@@ -24,18 +24,18 @@ pub(super) struct RegionIndex {
     // Fixed-size regular regions/chunks intersect a bounded number of pages.
     // Disjoint allocations of at least one page yield at most two candidates
     // per page, even when the underlying allocator does not page-align them.
-    pages: HashMap<usize, [usize; 2]>,
+    pages: IdMap<usize, [usize; 2]>,
     // Dedicated large allocations have exactly one start. Never index their
     // payload pages or allocate mark metadata proportional to payload size.
-    large: HashMap<usize, usize>,
+    large: IdMap<usize, usize>,
     objects: usize,
 }
 impl RegionIndex {
     pub(super) fn capture(state: &GcState) -> Self {
         let mut index = Self {
             regions: Vec::with_capacity(state.old_regions.len() + state.tlab_chunks.len()),
-            pages: HashMap::new(),
-            large: HashMap::new(),
+            pages: IdMap::default(),
+            large: IdMap::default(),
             objects: 0,
         };
         for region in &state.old_regions {
@@ -225,8 +225,8 @@ mod tests {
     fn empty() -> RegionIndex {
         RegionIndex {
             regions: Vec::new(),
-            pages: HashMap::new(),
-            large: HashMap::new(),
+            pages: IdMap::default(),
+            large: IdMap::default(),
             objects: 0,
         }
     }
