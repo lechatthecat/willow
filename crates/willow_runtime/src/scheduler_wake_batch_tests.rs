@@ -156,7 +156,8 @@ fn batch_cancel_race_has_exactly_one_queue_token_and_balanced_blocked_count() {
 #[test]
 fn batch_keeps_blocked_count_until_queue_publication() {
     let (tasks, queues) = fixture(1, true); // ID 1 is BlockedSyscall.
-    let guard = RunQueues::lock(&queues.global);
+    let guard = queues.global_publish_gate.lock().unwrap();
+    queues.pause_global_publish.store(true, Ordering::Release);
     std::thread::scope(|scope| {
         let wake = scope.spawn(|| {
             wake_tasks_outcome_in(&tasks, &queues, &[1], &mut WakeBatchScratch::default())

@@ -79,12 +79,12 @@ fn invalid_local_publisher_counts_actual_global_destination() {
 }
 
 #[test]
-fn steal_counts_visited_victims_and_preserves_lifo() {
+fn steal_counts_visited_victims_and_preserves_fifo() {
     let queues = RunQueues::new(4);
     queues.push_local(2, 1);
     queues.push_local(2, 2);
-    assert_eq!(queues.pop_for_worker(0), Some(2));
     assert_eq!(queues.pop_for_worker(0), Some(1));
+    assert_eq!(queues.pop_for_worker(0), Some(2));
     assert_eq!(
         queues.metrics_snapshot(),
         RunQueueMetricsSnapshot {
@@ -92,8 +92,8 @@ fn steal_counts_visited_victims_and_preserves_lifo() {
             global_pop_attempts: 2,
             steal_attempts: 2,
             steal_successes: 2,
-            // Empty victims are skipped by their length hint (willow-8hq4.19).
-            victim_locks: 2,
+            // Lock-free steals acquire no victim mutex.
+            victim_locks: 0,
             ..Default::default()
         }
     );
@@ -124,7 +124,7 @@ fn empty_scan_and_last_victim_counts_scale_with_workers_and_attempts() {
                 queues.push_local(workers - 1, 42);
                 assert_eq!(queues.pop_for_worker(0), Some(42));
                 let after = queues.metrics_snapshot();
-                assert_eq!(after.victim_locks - metrics.victim_locks, 1);
+                assert_eq!(after.victim_locks, 0);
                 assert_eq!(after.steal_successes, 1);
                 assert_eq!(after.steal_failures, attempts);
             }
@@ -280,7 +280,7 @@ fn global_batch_preserves_fifo_and_counts_ids_at_increasing_sizes() {
 #[test]
 fn empty_global_batch_returns_while_global_mutex_is_held() {
     let queues = RunQueues::new(1);
-    let guard = RunQueues::lock(&queues.global);
+    let guard = queues.locals[0].owner.lock().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -377,8 +377,8 @@ fn wake_routes_by_active_worker_context_not_default_tls_index() {
     let local = scheduler.spawn_parked_placeholder();
     assert!(scheduler.wake(external));
     assert_eq!(
-        RunQueues::lock(&scheduler.run_queues.global).front(),
-        Some(&external)
+        scheduler.run_queues.snapshot().first().copied(),
+        Some(external)
     );
     let old_depth = SCHED_RUN_DEPTH.with(|depth| depth.replace(1));
     let old_worker = CURRENT_WORKER.with(|worker| worker.replace(2));
@@ -386,10 +386,7 @@ fn wake_routes_by_active_worker_context_not_default_tls_index() {
     CURRENT_WORKER.with(|worker| worker.set(old_worker));
     SCHED_RUN_DEPTH.with(|depth| depth.set(old_depth));
     assert!(woke);
-    assert_eq!(
-        RunQueues::lock(&scheduler.run_queues.locals[2]).front(),
-        Some(&local)
-    );
+    assert_eq!(scheduler.run_queues.snapshot().last().copied(), Some(local));
     assert_eq!(scheduler.run_queues.metrics_snapshot().global_pushes, 1);
     assert_eq!(scheduler.run_queues.metrics_snapshot().local_pushes, 1);
 }
@@ -399,8 +396,10 @@ fn global_refill_is_bounded_and_amortizes_successful_global_locks() {
     for count in [64, 256, 4096, 100_000] {
         let queues = RunQueues::new(8);
         queues.push_global_batch(&(0..count).collect::<Vec<_>>());
-        assert_eq!(queues.pop_for_worker(0), Some(0));
-        assert_eq!(RunQueues::lock(&queues.locals[0]).len(), 31);
+        queues.with_owner(0, || {
+            assert_eq!(queues.pop_for_worker(0), Some(0));
+            assert_eq!(queues.locals[0].len.load(Ordering::Acquire), 31);
+        });
         assert_eq!(queues.metrics_snapshot().global_pop_hits, 1);
         assert_eq!(queues.metrics_snapshot().global_pop_attempts, 1);
         let mut seen = std::collections::HashSet::from([0]);
@@ -425,7 +424,7 @@ fn global_burst_notifies_once_and_refill_shares_with_one_successor() {
             SCHED_RUN_DEPTH.with(|depth| depth.set(saved_depth));
             let initial = usize::from(!worker_publisher || size >= 2);
             assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), initial);
-            assert_eq!(queues.pop_for_worker(0), Some(0));
+            queues.with_owner(0, || assert_eq!(queues.pop_for_worker(0), Some(0)));
             let expected = initial + usize::from(size > 2);
             assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), expected);
             println!(
@@ -440,8 +439,10 @@ fn global_burst_notifies_once_and_refill_shares_with_one_successor() {
 fn global_priority_probe_does_not_lock_local_for_refill() {
     let queues = RunQueues::new(2);
     queues.push_global_batch(&(0..64).collect::<Vec<_>>());
-    queues.prefer_global[0].store(true, Ordering::Relaxed);
-    let local = RunQueues::lock(&queues.locals[0]);
+    queues.locals[0]
+        .prefer_global
+        .store(true, Ordering::Relaxed);
+    let local = queues.locals[0].owner.lock().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(|| tx.send(queues.pop_for_worker(0)).unwrap());
@@ -485,12 +486,17 @@ fn worker_spawn_burst_defers_one_notification_until_scheduler_boundary() {
     }
 }
 
-/// Every hint equals its queue's length, read under the queue's own lock
-/// without a `QueueGuard` (whose drop would rewrite the hint).
+/// Quiescent counts equal the underlying injection/deque storage.
 fn assert_hints_match(queues: &RunQueues) {
-    for queue in std::iter::once(&queues.global).chain(&queues.locals) {
-        let locked = queue.queue.lock().unwrap();
-        assert_eq!(queue.len.load(Ordering::Acquire), locked.len());
+    assert_eq!(
+        queues.global_len.load(Ordering::Acquire),
+        queues.global.len()
+    );
+    for queue in &queues.locals {
+        assert_eq!(
+            queue.len.load(Ordering::Acquire),
+            queue.inbox.len() + queue.stealer.len()
+        );
     }
 }
 
@@ -519,17 +525,18 @@ fn t8hq4_19_length_hints_track_every_queue_mutation() {
     queues.push_global(12);
     queues.clear();
     assert_hints_match(&queues);
-    assert!(queues.global.looks_empty());
-    assert!(queues.locals.iter().all(HintedQueue::looks_empty));
+    assert!(queues.global.is_empty());
+    assert!(queues.locals.iter().all(LocalRunQueue::looks_empty));
 }
 
 #[test]
 fn t8hq4_19_empty_probes_take_no_queue_lock() {
     let queues = RunQueues::new(4);
-    // Hold every queue lock: a probe that locks an empty queue would block.
-    let held = std::iter::once(&queues.global)
-        .chain(&queues.locals[1..])
-        .map(|queue| queue.queue.lock().unwrap())
+    // An empty probe must not acquire even the owner handoff locks.
+    let held = queues
+        .locals
+        .iter()
+        .map(|queue| queue.owner.lock().unwrap())
         .collect::<Vec<_>>();
     std::thread::scope(|scope| {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -554,7 +561,7 @@ fn t8hq4_19_empty_probes_take_no_queue_lock() {
 
 #[test]
 fn t8hq4_19_a_published_push_is_never_skipped() {
-    // A push's hint store happens before its unlock, so a probe that starts
+    // A completed push is visible to subsequent probes, so one that starts
     // after the push returns always sees it, locally, globally or by steal.
     for worker in 0..4 {
         let queues = RunQueues::new(4);
@@ -564,4 +571,238 @@ fn t8hq4_19_a_published_push_is_never_skipped() {
         assert_eq!(queues.pop_for_worker(0), Some(2));
         assert_eq!(queues.pop_for_worker(0), None);
     }
+}
+
+#[test]
+fn worker_queue_headers_are_separated_and_priority_stays_worker_local() {
+    assert_eq!(std::mem::align_of::<LocalRunQueue>(), 128);
+    assert_eq!(std::mem::size_of::<LocalRunQueue>() % 128, 0);
+    let queues = RunQueues::new(8);
+    for worker in 0..8 {
+        let address = &queues.locals[worker] as *const LocalRunQueue as usize;
+        assert_eq!(address % 128, 0);
+        assert!(!queues.locals[worker].prefer_global.load(Ordering::Relaxed));
+        assert_eq!(queues.pop_for_worker(worker), None);
+        assert!(queues.locals[worker].prefer_global.load(Ordering::Relaxed));
+        for other in worker + 1..8 {
+            assert!(!queues.locals[other].prefer_global.load(Ordering::Relaxed));
+        }
+    }
+}
+
+#[test]
+fn placeholder_removal_keeps_older_owner_work_before_inbox() {
+    let queues = RunQueues::new(2);
+    queues.with_owner(0, || {
+        queues.push_local(0, 1);
+        queues.push_local(0, 2);
+        queues.push_local(0, 3);
+    });
+    queues.push_local(0, 4); // Off-owner publication goes to the inbox.
+    assert!(queues.remove(2));
+    assert_eq!(queues.pop_for_worker(0), Some(1));
+    assert_eq!(queues.pop_for_worker(0), Some(3));
+    assert_eq!(queues.pop_for_worker(0), Some(4));
+    assert_eq!(queues.len(), 0);
+}
+
+#[test]
+fn owner_and_foreign_inbox_preserve_fifo_after_owner_handoff() {
+    let queues = RunQueues::new(2);
+    queues.with_owner(0, || {
+        queues.push_local(0, 1);
+        queues.push_local(0, 2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| queues.push_local(0, 3)).join().unwrap();
+        });
+        assert_eq!(queues.pop_for_worker(0), Some(1));
+        assert_eq!(queues.pop_for_worker(0), Some(2));
+        assert_eq!(queues.pop_for_worker(0), Some(3));
+    });
+    assert_eq!(queues.len(), 0);
+}
+
+#[test]
+fn concurrent_thieves_take_every_owner_deque_token_once() {
+    const COUNT: usize = 4096;
+    let queues = RunQueues::new(8);
+    let seen = (0..COUNT).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+    queues.with_owner(0, || {
+        for id in 0..COUNT {
+            queues.push_local(0, id as RuntimeTaskId);
+        }
+        std::thread::scope(|scope| {
+            for worker in 1..8 {
+                let queues = &queues;
+                let seen = &seen;
+                scope.spawn(move || {
+                    while let Some(id) = queues.pop_for_worker(worker) {
+                        assert_eq!(seen[id as usize].fetch_add(1, Ordering::Relaxed), 0);
+                    }
+                });
+            }
+        });
+    });
+    assert!(seen.iter().all(|count| count.load(Ordering::Relaxed) == 1));
+    assert_eq!(queues.len(), 0);
+    let metrics = queues.metrics_snapshot();
+    assert_eq!(metrics.steal_successes, COUNT as u64);
+    assert_eq!(metrics.victim_locks, 0);
+}
+
+#[test]
+fn inbox_removal_retains_fifo_with_owner_entries() {
+    let queues = RunQueues::new(1);
+    queues.with_owner(0, || queues.push_local(0, 1));
+    for id in [2, 3, 4] {
+        queues.push_local(0, id);
+    }
+    assert!(queues.remove(2));
+    assert_eq!(
+        (0..3)
+            .map(|_| queues.pop_for_worker(0).unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 3, 4]
+    );
+}
+
+#[test]
+fn snapshot_preserves_owner_and_inbox_placement() {
+    let queues = RunQueues::new(1);
+    queues.with_owner(0, || {
+        queues.push_local(0, 1);
+        queues.push_local(0, 2);
+    });
+    queues.push_local(0, 3);
+    assert_eq!(queues.snapshot(), vec![1, 2, 3]);
+    assert_eq!(queues.snapshot(), vec![1, 2, 3]);
+    assert_eq!(queues.locals[0].stealer.len(), 2);
+    assert_eq!(queues.locals[0].inbox.len(), 1);
+    assert_eq!(
+        (0..3)
+            .map(|_| queues.pop_for_worker(0).unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn snapshot_preserves_current_thread_owner_and_inbox() {
+    let queues = RunQueues::new(1);
+    queues.with_owner(0, || {
+        queues.push_local(0, 1);
+        queues.push_local(0, 2);
+        std::thread::scope(|scope| scope.spawn(|| queues.push_local(0, 3)).join().unwrap());
+        assert_eq!(queues.snapshot(), vec![1, 2, 3]);
+        assert_eq!(queues.snapshot(), vec![1, 2, 3]);
+        assert_eq!(
+            (0..3)
+                .map(|_| queues.pop_for_worker(0).unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    });
+}
+
+#[test]
+fn inbox_removal_fifo_across_source_sizes_and_positions() {
+    for owner_size in [1, 4, 16] {
+        for inbox_size in [1, 4, 16] {
+            for remove_offset in 0..=inbox_size {
+                let queues = RunQueues::new(1);
+                queues.with_owner(0, || {
+                    for id in 0..owner_size {
+                        queues.push_local(0, id);
+                    }
+                });
+                for id in owner_size..owner_size + inbox_size {
+                    queues.push_local(0, id);
+                }
+                let removed = owner_size + remove_offset;
+                assert_eq!(queues.remove(removed), remove_offset < inbox_size);
+                let expected = (0..owner_size + inbox_size)
+                    .filter(|id| *id != removed)
+                    .collect::<Vec<_>>();
+                assert_eq!(queues.snapshot(), expected);
+                for id in expected {
+                    assert_eq!(queues.pop_for_worker(0), Some(id));
+                }
+                assert_eq!(queues.len(), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn active_owner_removal_preserves_mixed_source_fifo() {
+    for removed in [1, 2, 3, 4, 99] {
+        let queues = RunQueues::new(1);
+        queues.with_owner(0, || {
+            for id in [1, 2, 3] {
+                queues.push_local(0, id);
+            }
+            std::thread::scope(|s| s.spawn(|| queues.push_local(0, 4)).join().unwrap());
+            assert_eq!(queues.remove(removed), removed != 99);
+            let expected = (1..=4).filter(|id| *id != removed).collect::<Vec<_>>();
+            assert_eq!(queues.snapshot(), expected);
+            for id in expected {
+                assert_eq!(queues.pop_for_worker(0), Some(id));
+            }
+            assert_eq!(queues.len(), 0);
+        });
+    }
+}
+
+#[test]
+fn foreign_active_owner_removal_leaves_both_sources_untouched() {
+    for removed in [2, 4, 99] {
+        let queues = RunQueues::new(1);
+        let gate = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                queues.with_owner(0, || {
+                    for id in [1, 2, 3] {
+                        queues.push_local(0, id);
+                    }
+                    gate.wait();
+                    gate.wait();
+                })
+            });
+            gate.wait();
+            queues.push_local(0, 4);
+            assert!(!queues.remove(removed));
+            assert_eq!(queues.len(), 4);
+            gate.wait();
+        });
+        assert_eq!(queues.snapshot(), vec![1, 2, 3, 4]);
+        assert_eq!(queues.remove(removed), removed != 99);
+        for id in (1..=4).filter(|id| *id != removed) {
+            assert_eq!(queues.pop_for_worker(0), Some(id));
+        }
+        assert_eq!(queues.len(), 0);
+    }
+}
+
+#[test]
+fn foreign_owner_placeholder_transition_discards_stale_token_on_claim() {
+    let mut scheduler = RuntimeScheduler::with_worker_count(1);
+    let id = scheduler.spawn_placeholder();
+    assert_eq!(scheduler.run_queues.pop_for_worker(0), Some(id));
+    let queues = Arc::clone(&scheduler.run_queues);
+    let gate = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            queues.with_owner(0, || {
+                queues.push_local(0, id);
+                gate.wait();
+                gate.wait();
+            })
+        });
+        gate.wait();
+        scheduler.set_running(id);
+        assert_eq!(queues.len(), 1);
+        assert_eq!(scheduler.claim_ready_for_worker(0), None);
+        assert_eq!(queues.len(), 0);
+        gate.wait();
+    });
 }

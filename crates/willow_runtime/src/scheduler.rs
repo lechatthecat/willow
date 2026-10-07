@@ -1,3 +1,4 @@
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -200,72 +201,164 @@ pub fn runtime_worker_config() -> RuntimeWorkerConfig {
     )
 }
 
-/// Independently synchronized run queues (willow-8agm).
-///
-/// The process-global scheduler no longer owns queue storage behind its task
-/// metadata mutex. Workers pop/steal here first, then take the task-table lock
-/// only to validate the atomic state and acquire the frame. Publishers take a
-/// short queue lock only after the state CAS has granted one queue token.
+/// Worker-owned FIFO deques with concurrent inbound queues (willow-9tls.38).
+/// Foreign or off-drive publishers write to a worker's inbox. The active owner
+/// transfers a bounded batch into its deque; thieves may steal from either
+/// source. The global injection queue accepts concurrent foreign publishers.
 #[derive(Debug)]
 struct RunQueues {
-    locals: Vec<HintedQueue>,
-    /// Alternate local and overflow priority per worker. Always preferring the
-    /// local queue can starve newly spawned or externally woken tasks when
-    /// every worker repeatedly requeues CPU-bound work to itself.
-    prefer_global: Vec<AtomicBool>,
-    global: HintedQueue,
+    locals: Vec<LocalRunQueue>,
+    global: Injector<RuntimeTaskId>,
+    global_len: AtomicUsize,
     metrics: crate::observability::RunQueueMetrics,
     worker_metrics: Vec<crate::observability::RunQueueMetrics>,
     #[cfg(test)]
     idle_notifications: AtomicUsize,
+    #[cfg(test)]
+    pause_global_publish: AtomicBool,
+    #[cfg(test)]
+    global_publish_gate: Mutex<()>,
 }
 
-/// A run queue with a lock-free emptiness hint (willow-8hq4.19).
-///
-/// Every worker probes the global queue on alternate iterations and scans
-/// every other worker's local queue when its own is empty, and those queues
-/// are usually empty. Probes read `len` and skip the lock for an empty queue.
-/// A push that a probe misses is no different from one that lands just after
-/// a locked probe: the worker falls through to the idle path, whose snapshot
-/// counts the queues under their locks (`RunQueues::len`), and the push
-/// itself notifies idle waiters. `QueueGuard` stores `len` before every
-/// unlock, so the hint never lags a completed mutation.
-#[derive(Debug, Default)]
-struct HintedQueue {
-    queue: Mutex<VecDeque<RuntimeTaskId>>,
+/// Keep independently updated worker state apart. The owner is taken once per
+/// drive and returned on exit; successful owner pops never take this mutex.
+/// Every other thread uses the inbox or the lock-free stealer.
+#[repr(align(128))]
+#[derive(Debug)]
+struct LocalRunQueue {
+    inbox: Injector<RuntimeTaskId>,
+    owner: Mutex<Option<Worker<RuntimeTaskId>>>,
+    stealer: Stealer<RuntimeTaskId>,
     len: AtomicUsize,
+    prefer_global: AtomicBool,
 }
 
-impl HintedQueue {
+impl LocalRunQueue {
+    fn new() -> Self {
+        let owner = Worker::new_fifo();
+        let stealer = owner.stealer();
+        Self {
+            inbox: Injector::new(),
+            owner: Mutex::new(Some(owner)),
+            stealer,
+            len: AtomicUsize::new(0),
+            prefer_global: AtomicBool::new(false),
+        }
+    }
+
     fn looks_empty(&self) -> bool {
         self.len.load(Ordering::Acquire) == 0
     }
-}
 
-/// A locked run queue; publishes its length to the hint before unlocking.
-struct QueueGuard<'a> {
-    queue: std::sync::MutexGuard<'a, VecDeque<RuntimeTaskId>>,
-    len: &'a AtomicUsize,
-}
+    fn publish(&self, id: RuntimeTaskId) -> usize {
+        // Count before publication so an idle-stop snapshot cannot miss an
+        // in-progress publisher. A failed early probe only causes a retry.
+        let backlog = self.len.fetch_add(1, Ordering::AcqRel) + 1;
+        let published_to_owner = LOCAL_QUEUE_OWNER.with(|slot| {
+            let slot = slot.borrow();
+            if let Some(owner) = slot
+                .as_ref()
+                .filter(|owner| owner.queue == self as *const _ as usize)
+                && self.inbox.is_empty()
+            {
+                owner.worker.push(id);
+                true
+            } else {
+                false
+            }
+        });
+        if !published_to_owner {
+            self.inbox.push(id);
+        }
+        backlog
+    }
 
-impl std::ops::Deref for QueueGuard<'_> {
-    type Target = VecDeque<RuntimeTaskId>;
+    fn steal(&self) -> Option<RuntimeTaskId> {
+        let id = steal_retry(&self.stealer).or_else(|| steal_retry(&self.inbox));
+        if id.is_some() {
+            self.len.fetch_sub(1, Ordering::AcqRel);
+        }
+        id
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.queue
+    fn pop(&self) -> Option<RuntimeTaskId> {
+        let from_owner = LOCAL_QUEUE_OWNER.with(|slot| {
+            let slot = slot.borrow();
+            let owner = slot
+                .as_ref()
+                .filter(|context| context.queue == self as *const _ as usize)?;
+            owner
+                .worker
+                .pop()
+                .or_else(|| steal_retry_batch(&self.inbox, &owner.worker))
+        });
+        let id = from_owner.or_else(|| self.steal_without_count());
+        if id.is_some() {
+            self.len.fetch_sub(1, Ordering::AcqRel);
+        }
+        id
+    }
+
+    fn steal_without_count(&self) -> Option<RuntimeTaskId> {
+        steal_retry(&self.stealer).or_else(|| steal_retry(&self.inbox))
     }
 }
 
-impl std::ops::DerefMut for QueueGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.queue
+fn steal_retry_batch<T>(inbox: &Injector<T>, owner: &Worker<T>) -> Option<T> {
+    loop {
+        match inbox.steal_batch_and_pop(owner) {
+            Steal::Success(id) => return Some(id),
+            Steal::Empty => return None,
+            Steal::Retry => std::hint::spin_loop(),
+        }
     }
 }
 
-impl Drop for QueueGuard<'_> {
+fn steal_retry<T>(stealer: &impl FnSteal<T>) -> Option<T> {
+    loop {
+        match stealer.steal_one() {
+            Steal::Success(id) => return Some(id),
+            Steal::Empty => return None,
+            Steal::Retry => std::hint::spin_loop(),
+        }
+    }
+}
+
+trait FnSteal<T> {
+    fn steal_one(&self) -> Steal<T>;
+}
+
+impl<T> FnSteal<T> for Injector<T> {
+    fn steal_one(&self) -> Steal<T> {
+        self.steal()
+    }
+}
+impl<T> FnSteal<T> for Stealer<T> {
+    fn steal_one(&self) -> Steal<T> {
+        self.steal()
+    }
+}
+
+struct LocalOwner {
+    queue: usize,
+    worker: Worker<RuntimeTaskId>,
+}
+thread_local! {
+    static LOCAL_QUEUE_OWNER: RefCell<Option<LocalOwner>> = const { RefCell::new(None) };
+}
+
+struct LocalOwnerGuard<'a> {
+    queue: &'a LocalRunQueue,
+    active: bool,
+}
+
+impl Drop for LocalOwnerGuard<'_> {
     fn drop(&mut self) {
-        // Runs before the `queue` field drops, i.e. while still locked.
-        self.len.store(self.queue.len(), Ordering::Release);
+        if self.active {
+            let owner =
+                LOCAL_QUEUE_OWNER.with(|slot| slot.borrow_mut().take().expect("owner missing"));
+            *self.queue.owner.lock().unwrap_or_else(|e| e.into_inner()) = Some(owner.worker);
+        }
     }
 }
 
@@ -275,9 +368,13 @@ impl RunQueues {
         Self {
             #[cfg(test)]
             idle_notifications: AtomicUsize::new(0),
-            locals: (0..worker_count).map(|_| HintedQueue::default()).collect(),
-            prefer_global: (0..worker_count).map(|_| AtomicBool::new(false)).collect(),
-            global: HintedQueue::default(),
+            #[cfg(test)]
+            pause_global_publish: AtomicBool::new(false),
+            #[cfg(test)]
+            global_publish_gate: Mutex::new(()),
+            locals: (0..worker_count).map(|_| LocalRunQueue::new()).collect(),
+            global: Injector::new(),
+            global_len: AtomicUsize::new(0),
             metrics: crate::observability::RunQueueMetrics::default(),
             worker_metrics: (0..worker_count)
                 .map(|_| crate::observability::RunQueueMetrics::default())
@@ -285,14 +382,34 @@ impl RunQueues {
         }
     }
 
-    fn lock(queue: &HintedQueue) -> QueueGuard<'_> {
-        QueueGuard {
-            queue: queue
-                .queue
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            len: &queue.len,
+    fn with_owner<R>(&self, worker: usize, f: impl FnOnce() -> R) -> R {
+        let Some(queue) = self.locals.get(worker) else {
+            return f();
+        };
+        let nested = LOCAL_QUEUE_OWNER.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|owner| owner.queue == queue as *const _ as usize)
+        });
+        if nested {
+            return f();
         }
+        if LOCAL_QUEUE_OWNER.with(|slot| slot.borrow().is_some()) {
+            return f();
+        }
+        let taken = queue.owner.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(owner) = taken else { return f() };
+        LOCAL_QUEUE_OWNER.with(|slot| {
+            *slot.borrow_mut() = Some(LocalOwner {
+                queue: queue as *const _ as usize,
+                worker: owner,
+            });
+        });
+        let _guard = LocalOwnerGuard {
+            queue,
+            active: true,
+        };
+        f()
     }
 
     fn worker_count(&self) -> usize {
@@ -309,10 +426,6 @@ impl RunQueues {
         self.push_global_batch(std::slice::from_ref(&id));
     }
 
-    /// Publish already-granted queue tokens in slice order under one lock.
-    /// Callers must own each token, granted by the task-state machine (e.g.
-    /// `wake` or `claim_queue_slot`) or retained when returning an unclaimed id.
-    /// This storage layer neither validates task lifecycle nor deduplicates ids.
     fn push_global_batch(&self, ids: &[RuntimeTaskId]) {
         self.publish_global_batch(ids, true);
     }
@@ -321,9 +434,6 @@ impl RunQueues {
         let defer = SCHED_RUN_DEPTH.with(|depth| depth.get() > 0);
         self.publish_global_batch(std::slice::from_ref(&id), !defer);
         if defer {
-            // Spawning cannot suspend its publishing worker. Coalesce all
-            // spawns in this poll; flush before its next scheduler probe,
-            // including entry into a nested drive. External spawns stay prompt.
             SPAWN_NOTIFICATION_PENDING.with(|pending| pending.set(true));
         }
     }
@@ -332,15 +442,19 @@ impl RunQueues {
         if ids.is_empty() {
             return;
         }
-        let mut queue = Self::lock(&self.global);
-        let previous_len = queue.len();
-        queue.extend(ids.iter().copied());
-        let backlog = queue.len();
-        drop(queue);
-        // A running publisher can consume a sole continuation itself. Wake
-        // another worker when a burst first contains additional work. Keep
-        // subsequent publications in that burst off the shared notifier.
-        // Foreign publishers must wake a worker even for a single task.
+        #[cfg(test)]
+        if self.pause_global_publish.load(Ordering::Acquire) {
+            drop(
+                self.global_publish_gate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+        }
+        let previous_len = self.global_len.fetch_add(ids.len(), Ordering::AcqRel);
+        for &id in ids {
+            self.global.push(id);
+        }
+        let backlog = previous_len + ids.len();
         if notify {
             let threshold = if SCHED_RUN_DEPTH.with(|depth| depth.get() > 0) {
                 2
@@ -359,11 +473,7 @@ impl RunQueues {
     fn push_local(&self, worker: usize, id: RuntimeTaskId) {
         match self.locals.get(worker) {
             Some(queue) => {
-                let backlog = {
-                    let mut queue = Self::lock(queue);
-                    queue.push_back(id);
-                    queue.len()
-                };
+                let backlog = queue.publish(id);
                 if SCHED_RUN_DEPTH.with(|depth| depth.get() > 0) && worker == current_worker() {
                     notify_local_work(backlog);
                 } else {
@@ -381,19 +491,17 @@ impl RunQueues {
         if ids.is_empty() {
             return;
         }
-        // CURRENT_WORKER defaults to zero even on foreign threads. The drive
-        // depth, unlike that index, distinguishes a worker from an external waker.
         let worker = SCHED_RUN_DEPTH.with(|depth| (depth.get() > 0).then(current_worker));
         if let Some(worker) = worker.filter(|&worker| worker < self.locals.len()) {
-            let backlog = {
-                let mut queue = Self::lock(&self.locals[worker]);
-                queue.extend(ids.iter().copied());
-                queue.len()
-            };
+            let queue = &self.locals[worker];
+            let previous = queue.len.load(Ordering::Acquire);
+            for &id in ids {
+                queue.publish(id);
+            }
             self.worker_metrics[worker]
                 .local_pushes
                 .fetch_add(ids.len() as u64, Ordering::Relaxed);
-            notify_local_work(backlog);
+            notify_local_work(previous + ids.len());
         } else {
             self.push_global_batch(ids);
         }
@@ -401,20 +509,8 @@ impl RunQueues {
 
     #[cfg(test)]
     fn push_local_front(&self, worker: usize, id: RuntimeTaskId) {
-        match self.locals.get(worker) {
-            Some(queue) => {
-                Self::lock(queue).push_front(id);
-                self.worker_metrics[worker]
-                    .local_pushes
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            None => {
-                Self::lock(&self.global).push_front(id);
-                self.metrics.global_pushes.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        self.push_local(worker, id);
     }
-
     #[cfg(test)]
     fn force_push_global(&self, id: RuntimeTaskId) {
         self.push_global(id);
@@ -427,36 +523,41 @@ impl RunQueues {
         refill: bool,
     ) -> Option<RuntimeTaskId> {
         metrics.global_pop_attempts.fetch_add(1, Ordering::Relaxed);
-        if self.global.looks_empty() {
+        if self.global_len.load(Ordering::Acquire) == 0 {
             return None;
         }
-        let mut global = Self::lock(&self.global);
-        let id = global.pop_front()?;
-        // Refill an empty local queue from half the remaining burst, capped
-        // at 31 additional tokens. Do not accumulate global batches behind
-        // existing local work: that changes task/GC lifetimes unnecessarily.
-        let count = if refill && self.locals.len() > 1 && self.locals.get(worker).is_some() {
-            (global.len() / 2).min(31)
-        } else {
-            0
-        };
-        // Lock order is global -> local; no other path holds both locks.
-        let mut refilled = false;
-        if count > 0 {
-            let mut local = Self::lock(&self.locals[worker]);
-            if local.is_empty() {
-                local.extend(global.drain(..count));
-                refilled = true;
-                metrics
-                    .local_pushes
-                    .fetch_add(count as u64, Ordering::Relaxed);
-            }
-        }
-        drop(global);
-        if refilled {
-            // A newly active worker shares a burst with one successor. This
-            // keeps large injected batches parallel without notifying per ID.
-            self.notify_idle();
+        let id = steal_retry(&self.global)?;
+        self.global_len.fetch_sub(1, Ordering::AcqRel);
+        if refill
+            && self.locals.len() > 1
+            && let Some(local) = self.locals.get(worker)
+            && local.looks_empty()
+        {
+            LOCAL_QUEUE_OWNER.with(|slot| {
+                let slot = slot.borrow();
+                if let Some(owner) = slot
+                    .as_ref()
+                    .filter(|ctx| ctx.queue == local as *const _ as usize)
+                {
+                    let count = (self.global_len.load(Ordering::Acquire) / 2).min(31);
+                    let mut transferred = 0;
+                    for _ in 0..count {
+                        let Some(next) = steal_retry(&self.global) else {
+                            break;
+                        };
+                        self.global_len.fetch_sub(1, Ordering::AcqRel);
+                        local.len.fetch_add(1, Ordering::AcqRel);
+                        owner.worker.push(next);
+                        transferred += 1;
+                    }
+                    if transferred > 0 {
+                        metrics
+                            .local_pushes
+                            .fetch_add(transferred, Ordering::Relaxed);
+                        self.notify_idle();
+                    }
+                }
+            });
         }
         metrics.global_pop_hits.fetch_add(1, Ordering::Relaxed);
         Some(id)
@@ -465,25 +566,23 @@ impl RunQueues {
     fn pop_for_worker(&self, worker: usize) -> Option<RuntimeTaskId> {
         let metrics = self.worker_metrics.get(worker).unwrap_or(&self.metrics);
         let prefer_global = self
-            .prefer_global
+            .locals
             .get(worker)
-            .map(|preference| preference.fetch_xor(true, Ordering::Relaxed))
+            .map(|queue| queue.prefer_global.fetch_xor(true, Ordering::Relaxed))
             .unwrap_or(true);
         if prefer_global {
             if let Some(id) = self.pop_global(worker, metrics, false) {
                 return Some(id);
             }
-            if let Some(queue) = self.locals.get(worker)
-                && !queue.looks_empty()
-                && let Some(id) = Self::lock(queue).pop_front()
+            if let Some(queue) = self.locals.get(worker).filter(|queue| !queue.looks_empty())
+                && let Some(id) = queue.pop()
             {
                 metrics.local_pop_hits.fetch_add(1, Ordering::Relaxed);
                 return Some(id);
             }
         } else {
-            if let Some(queue) = self.locals.get(worker)
-                && !queue.looks_empty()
-                && let Some(id) = Self::lock(queue).pop_front()
+            if let Some(queue) = self.locals.get(worker).filter(|queue| !queue.looks_empty())
+                && let Some(id) = queue.pop()
             {
                 metrics.local_pop_hits.fetch_add(1, Ordering::Relaxed);
                 return Some(id);
@@ -492,17 +591,14 @@ impl RunQueues {
                 return Some(id);
             }
         }
-        // One attempt is one steal scan, including the empty single-worker scan.
         metrics.steal_attempts.fetch_add(1, Ordering::Relaxed);
-        let count = self.locals.len();
-        for offset in 1..count {
-            let victim = (worker + offset) % count;
+        for offset in 1..self.locals.len() {
+            let victim = (worker + offset) % self.locals.len();
             let queue = &self.locals[victim];
             if queue.looks_empty() {
                 continue;
             }
-            metrics.victim_locks.fetch_add(1, Ordering::Relaxed);
-            if let Some(id) = Self::lock(queue).pop_back() {
+            if let Some(id) = queue.steal() {
                 metrics.steal_successes.fetch_add(1, Ordering::Relaxed);
                 return Some(id);
             }
@@ -520,54 +616,161 @@ impl RunQueues {
     }
 
     fn remove(&self, id: RuntimeTaskId) -> bool {
-        {
-            let mut global = Self::lock(&self.global);
-            if let Some(index) = global.iter().position(|queued| *queued == id) {
-                global.remove(index);
-                return true;
+        if Self::remove_from(
+            &self.global,
+            &self.global,
+            self.global.len(),
+            &self.global_len,
+            id,
+        ) {
+            return true;
+        }
+        self.locals.iter().any(|queue| {
+            // Only an accessible owner can rotate its deque in place. Never
+            // drain a foreign active owner's deque into its newer inbox.
+            let removed_from_owner = LOCAL_QUEUE_OWNER.with(|slot| {
+                let local = slot.borrow();
+                if let Some(owner) = local
+                    .as_ref()
+                    .filter(|owner| owner.queue == queue as *const _ as usize)
+                {
+                    Some(Self::remove_from_owner(&owner.worker, &queue.len, id))
+                } else {
+                    let owner = queue.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    owner
+                        .as_ref()
+                        .map(|worker| Self::remove_from_owner(worker, &queue.len, id))
+                }
+            });
+            // Physical removal is best-effort when another drive owns this
+            // queue. Leave both sources untouched; normal claim processing
+            // discards tokens made stale by placeholder state transitions.
+            let Some(removed_from_owner) = removed_from_owner else {
+                return false;
+            };
+            removed_from_owner
+                || Self::remove_from(
+                    &queue.inbox,
+                    &queue.inbox,
+                    queue.inbox.len(),
+                    &queue.len,
+                    id,
+                )
+        })
+    }
+
+    fn remove_from_owner(
+        worker: &Worker<RuntimeTaskId>,
+        len: &AtomicUsize,
+        id: RuntimeTaskId,
+    ) -> bool {
+        let mut found = false;
+        for _ in 0..worker.len() {
+            let Some(next) = worker.pop() else { break };
+            if next == id && !found {
+                found = true;
+                len.fetch_sub(1, Ordering::AcqRel);
+            } else {
+                worker.push(next);
             }
         }
-        for queue in &self.locals {
-            let mut queue = Self::lock(queue);
-            if let Some(index) = queue.iter().position(|queued| *queued == id) {
-                queue.remove(index);
-                return true;
+        found
+    }
+
+    // Placeholder-only maintenance. Length stays elevated while retained
+    // tokens are in transit, preserving the idle-stop invariant.
+    fn remove_from(
+        source: &impl FnSteal<RuntimeTaskId>,
+        destination: &Injector<RuntimeTaskId>,
+        count: usize,
+        len: &AtomicUsize,
+        id: RuntimeTaskId,
+    ) -> bool {
+        let mut found = false;
+        for _ in 0..count {
+            let Some(next) = steal_retry(source) else {
+                break;
+            };
+            if next == id && !found {
+                found = true;
+                len.fetch_sub(1, Ordering::AcqRel);
+            } else {
+                destination.push(next);
             }
         }
-        false
+        found
     }
 
     fn len(&self) -> usize {
-        let global = Self::lock(&self.global).len();
-        global
+        self.global_len.load(Ordering::Acquire)
             + self
                 .locals
                 .iter()
-                .map(|queue| Self::lock(queue).len())
+                .map(|queue| queue.len.load(Ordering::Acquire))
                 .sum::<usize>()
     }
 
+    #[cfg(test)]
     fn contains(&self, id: RuntimeTaskId) -> bool {
-        Self::lock(&self.global).contains(&id)
-            || self
-                .locals
-                .iter()
-                .any(|queue| Self::lock(queue).contains(&id))
+        self.snapshot().contains(&id)
     }
-
     #[cfg(test)]
     fn snapshot(&self) -> Vec<RuntimeTaskId> {
-        let mut ids = Self::lock(&self.global).iter().copied().collect::<Vec<_>>();
+        fn inspect(
+            source: &impl FnSteal<RuntimeTaskId>,
+            dest: &Injector<RuntimeTaskId>,
+            n: usize,
+            out: &mut Vec<RuntimeTaskId>,
+        ) {
+            let start = out.len();
+            for _ in 0..n {
+                let Some(id) = steal_retry(source) else { break };
+                out.push(id);
+            }
+            for &id in &out[start..] {
+                dest.push(id);
+            }
+        }
+        let mut ids = Vec::with_capacity(self.len());
+        inspect(&self.global, &self.global, self.global.len(), &mut ids);
         for queue in &self.locals {
-            ids.extend(Self::lock(queue).iter().copied());
+            // Test-only, quiescent inspection: restore each source in place.
+            // A Stealer cannot restore an active foreign owner's deque.
+            let inspect_owner = |worker: &Worker<RuntimeTaskId>, ids: &mut Vec<RuntimeTaskId>| {
+                for _ in 0..worker.len() {
+                    let id = worker.pop().expect("snapshot requires quiescent queues");
+                    ids.push(id);
+                    worker.push(id);
+                }
+            };
+            LOCAL_QUEUE_OWNER.with(|slot| {
+                let local = slot.borrow();
+                if let Some(owner) = local
+                    .as_ref()
+                    .filter(|owner| owner.queue == queue as *const _ as usize)
+                {
+                    inspect_owner(&owner.worker, &mut ids);
+                } else {
+                    let owner = queue.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    let worker = owner
+                        .as_ref()
+                        .expect("snapshot requires inactive or current-thread owners");
+                    inspect_owner(worker, &mut ids);
+                }
+            });
+            inspect(&queue.inbox, &queue.inbox, queue.inbox.len(), &mut ids);
         }
         ids
     }
 
     fn clear(&self) {
-        Self::lock(&self.global).clear();
+        while steal_retry(&self.global).is_some() {
+            self.global_len.fetch_sub(1, Ordering::AcqRel);
+        }
         for queue in &self.locals {
-            Self::lock(queue).clear();
+            while queue.steal_without_count().is_some() {
+                queue.len.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 }
@@ -1080,7 +1283,7 @@ impl RuntimeScheduler {
         self.run_queues.pop_for_worker(worker)
     }
 
-    /// Remove the physical queue entry owned by `id` without changing its
+    /// Best-effort removal of the physical queue entry owned by `id` without changing its
     /// atomic queue token. This is used only by the bookkeeping-placeholder
     /// helpers (`set_running`, direct `park`, and direct terminal completion);
     /// production workers use `pop_for_worker` and never scan a queue.
@@ -3400,7 +3603,9 @@ fn run_parallel_worker(
     let mutator = crate::gc::MutatorRegistration::new();
     let worker_state = Arc::clone(&state);
     with_parallel_context(worker, worker_state, || {
-        scheduler_run_loop(target, worker, Some(state.as_ref()), true, deadline);
+        global_run_queues().with_owner(worker, || {
+            scheduler_run_loop(target, worker, Some(state.as_ref()), true, deadline);
+        });
     });
     set_current_task(None);
     drop(mutator);

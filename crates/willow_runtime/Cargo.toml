@@ -9,6 +9,7 @@ name = "willow_runtime"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+crossbeam-deque = "0.8.6"
 libc = "0.2"
 ryu = "1"
 socket2 = "0.6.5"

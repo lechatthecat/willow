@@ -110,10 +110,9 @@ fn workqueue_steal_takes_back_of_victim_queue() {
     let mut s = RuntimeScheduler::with_worker_count(2);
     s.enqueue_local(1, 1);
     s.enqueue_local(1, 2); // back of victim
-    // Steal takes the back (oldest-pushed / coldest) item first.
-    assert_eq!(s.pop_for_worker(0), Some(2));
-    // Worker 1 still pops its own from the front.
-    assert_eq!(s.pop_for_worker(1), Some(1));
+    // The owner and thief both take the oldest task from the front.
+    assert_eq!(s.pop_for_worker(0), Some(1));
+    assert_eq!(s.pop_for_worker(1), Some(2));
 }
 
 #[test]
@@ -1701,7 +1700,13 @@ fn scheduler_worker_config_sizes_queues_to_requested_count() {
         let scheduler = RuntimeScheduler::with_worker_count(config.active_workers());
         assert_eq!(scheduler.worker_count(), workers);
         assert_eq!(scheduler.run_queues.locals.len(), workers);
-        assert_eq!(scheduler.run_queues.prefer_global.len(), workers);
+        assert!(
+            scheduler
+                .run_queues
+                .locals
+                .iter()
+                .all(|queue| !queue.prefer_global.load(Ordering::Relaxed))
+        );
         assert_eq!(scheduler.run_queues.worker_metrics.len(), workers);
         assert_eq!(scheduler.task_count(), 0);
     }

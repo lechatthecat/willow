@@ -1008,3 +1008,255 @@ fn contention_06_idle_timer_probe() {
         }
     }
 }
+
+// willow-9tls.38: queue-only spawn/steal profiles. No task-table allocation,
+// shared ID allocator, or per-pop shared verification counter in the timed loop.
+#[derive(Clone, Copy, Debug)]
+enum QueueProfile {
+    PrivateLocal,
+    Local,
+    Injection,
+    SpawnSteal,
+    InboxSteal,
+}
+
+fn queue_profile(
+    mode: QueueProfile,
+    workers: usize,
+    per_worker: usize,
+) -> (Duration, crate::observability::RunQueueMetricsSnapshot) {
+    let total = workers * per_worker;
+    let queues = RunQueues::new(
+        workers
+            + usize::from(matches!(
+                mode,
+                QueueProfile::SpawnSteal | QueueProfile::InboxSteal
+            )),
+    );
+    let producer = usize::from(matches!(
+        mode,
+        QueueProfile::SpawnSteal | QueueProfile::InboxSteal
+    ));
+    let start_gate = std::sync::Barrier::new(workers + producer + 1);
+    let publishers_left = AtomicUsize::new(workers);
+    // Allocate verification buffers before timing; each consumer writes only
+    // its own buffer. Injection may grow buffers when work is unevenly shared.
+    // Verify exact identity/multiplicity after timing.
+    let buffers = (0..workers)
+        .map(|_| Vec::with_capacity(per_worker))
+        .collect::<Vec<Vec<RuntimeTaskId>>>();
+    let (elapsed, outputs) = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for (index, mut output) in buffers.into_iter().enumerate() {
+            let private = matches!(mode, QueueProfile::PrivateLocal).then(|| RunQueues::new(1));
+            let queues = &queues;
+            let start_gate = &start_gate;
+            let publishers_left = &publishers_left;
+            handles.push(scope.spawn(move || {
+                let worker = if private.is_some() {
+                    0
+                } else {
+                    index + producer
+                };
+                let queues = private.as_ref().unwrap_or(queues);
+                CURRENT_WORKER.with(|current| current.set(worker));
+                SCHED_RUN_DEPTH.with(|depth| depth.set(1));
+                start_gate.wait();
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                queues.with_owner(worker, || {
+                    if matches!(mode, QueueProfile::Injection) {
+                        for offset in 0..per_worker {
+                            queues.push_spawned((index * per_worker + offset) as RuntimeTaskId);
+                        }
+                        publishers_left.fetch_sub(1, Ordering::Release);
+                        loop {
+                            // Read publication completion BEFORE probing. A final
+                            // push after a failed probe must not be mistaken for EOF.
+                            let published = publishers_left.load(Ordering::Acquire) == 0;
+                            if let Some(id) = queues.pop_for_worker(worker) {
+                                output.push(id);
+                            } else if published {
+                                break;
+                            } else {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "queue profile stalled"
+                                );
+                                std::thread::yield_now();
+                            }
+                        }
+                    } else {
+                        for offset in 0..per_worker {
+                            let id = (index * per_worker + offset) as RuntimeTaskId;
+                            if matches!(mode, QueueProfile::Local | QueueProfile::PrivateLocal) {
+                                queues.push_local(worker, id);
+                            }
+                            loop {
+                                if let Some(id) = queues.pop_for_worker(worker) {
+                                    output.push(id);
+                                    break;
+                                }
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "queue profile stalled"
+                                );
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                });
+                SCHED_RUN_DEPTH.with(|depth| depth.set(0));
+                (
+                    output,
+                    private.map(|queue| {
+                        assert_eq!(queue.len(), 0);
+                        queue.metrics_snapshot()
+                    }),
+                )
+            }));
+        }
+        let publisher = (producer != 0).then(|| {
+            let queues = &queues;
+            let start_gate = &start_gate;
+            scope.spawn(move || {
+                CURRENT_WORKER.with(|current| current.set(0));
+                SCHED_RUN_DEPTH.with(|depth| depth.set(1));
+                let publish = || {
+                    start_gate.wait();
+                    for id in 0..total {
+                        queues.push_local(0, id as RuntimeTaskId);
+                    }
+                };
+                if matches!(mode, QueueProfile::SpawnSteal) {
+                    queues.with_owner(0, || {
+                        LOCAL_QUEUE_OWNER.with(|slot| assert!(slot.borrow().is_some()));
+                        publish();
+                        assert!(queues.locals[0].inbox.is_empty());
+                    });
+                } else {
+                    publish();
+                    assert!(queues.locals[0].stealer.is_empty());
+                }
+                SCHED_RUN_DEPTH.with(|depth| depth.set(0));
+            })
+        });
+        let start = std::time::Instant::now();
+        start_gate.wait();
+        let outputs = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>();
+        if let Some(publisher) = publisher {
+            publisher.join().unwrap();
+        }
+        (start.elapsed(), outputs)
+    });
+    let mut metrics = queues.metrics_snapshot();
+    let mut seen = vec![false; total];
+    for (output, private_metrics) in outputs {
+        if let Some(private_metrics) = private_metrics {
+            metrics.add(private_metrics);
+        }
+        for id in output {
+            assert!((id as usize) < total);
+            assert!(
+                !std::mem::replace(&mut seen[id as usize], true),
+                "duplicate {id}"
+            );
+        }
+    }
+    assert!(seen.into_iter().all(|present| present));
+    assert_eq!(queues.len(), 0);
+    assert_eq!(
+        metrics.local_pop_hits + metrics.global_pop_hits + metrics.steal_successes,
+        total as u64
+    );
+    match mode {
+        QueueProfile::Local | QueueProfile::PrivateLocal => {
+            assert_eq!(metrics.local_pushes, total as u64);
+            assert_eq!(metrics.local_pop_hits, total as u64);
+            assert_eq!(metrics.steal_attempts, 0);
+            assert_eq!(
+                metrics.global_pop_attempts,
+                (workers * (per_worker / 2)) as u64
+            );
+        }
+        QueueProfile::Injection => assert_eq!(metrics.global_pushes, total as u64),
+        QueueProfile::SpawnSteal | QueueProfile::InboxSteal => {
+            assert_eq!(metrics.local_pushes, total as u64);
+            assert_eq!(metrics.steal_successes, total as u64);
+            assert_eq!(metrics.victim_locks, 0);
+            assert_eq!(metrics.global_pushes, 0);
+        }
+    }
+    assert_eq!(
+        metrics.steal_attempts,
+        metrics.steal_successes + metrics.steal_failures
+    );
+    (elapsed, metrics)
+}
+
+#[test]
+fn queue_profile_exact_once_and_path_counts() {
+    let _guard = runtime_test_guard();
+    for mode in [
+        QueueProfile::PrivateLocal,
+        QueueProfile::Local,
+        QueueProfile::Injection,
+        QueueProfile::SpawnSteal,
+        QueueProfile::InboxSteal,
+    ] {
+        for workers in [1, 2, 4, 8] {
+            for per_worker in [1, 16, 256] {
+                queue_profile(mode, workers, per_worker);
+            }
+        }
+    }
+}
+
+/// Includes queue publication, probes, notification decisions and telemetry.
+/// SpawnSteal uses one additional publisher thread and forces every token
+/// through the steal path. Injection uses worker-context deferred spawn notices;
+/// it does not simulate a complete scheduler poll or execute task bodies.
+#[test]
+#[ignore = "queue-only spawn/steal contention profile"]
+fn contention_08_queue_spawn_steal() {
+    let _guard = runtime_test_guard();
+    println!(
+        "queue_case,trial,workers,publishers,per_worker,tokens,elapsed_ns,local_pushes,global_pushes,local_hits,global_hits,global_probes,steals,steal_hits,steal_failures,victim_locks"
+    );
+    for mode in [
+        QueueProfile::PrivateLocal,
+        QueueProfile::Local,
+        QueueProfile::Injection,
+        QueueProfile::SpawnSteal,
+        QueueProfile::InboxSteal,
+    ] {
+        for per_worker in [1024, 16384] {
+            for workers in CONTENTION_THREADS {
+                queue_profile(mode, workers, 256); // Untimed warmup, not reported.
+                for trial in 1..=3 {
+                    let (elapsed, m) = queue_profile(mode, workers, per_worker);
+                    let publishers = usize::from(matches!(
+                        mode,
+                        QueueProfile::SpawnSteal | QueueProfile::InboxSteal
+                    ));
+                    println!(
+                        "{mode:?},{trial},{workers},{publishers},{per_worker},{},{},{},{},{},{},{},{},{},{},{}",
+                        workers * per_worker,
+                        elapsed.as_nanos(),
+                        m.local_pushes,
+                        m.global_pushes,
+                        m.local_pop_hits,
+                        m.global_pop_hits,
+                        m.global_pop_attempts,
+                        m.steal_attempts,
+                        m.steal_successes,
+                        m.steal_failures,
+                        m.victim_locks
+                    );
+                }
+            }
+        }
+    }
+}
