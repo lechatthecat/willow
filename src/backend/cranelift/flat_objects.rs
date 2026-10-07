@@ -204,13 +204,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// The slow path is entered only for a null array, a negative (malformed)
     /// length or an out-of-bounds index, and the runtime raises for each of
     /// them, so it never rejoins the fast path. The fast path therefore
-    /// dominates the code after the access, and a read records the header it
-    /// validated for the rest of the current GC-free run (willow-nzsg). The
-    /// slow path takes its operands as block parameters and spills them to a
-    /// frame slot the function's fault paths share; it reloads them only after
-    /// the panic-depth snapshot call. Operands live across that call would
-    /// otherwise make the register allocator split the loop's values and
-    /// leave moves on the fast path.
+    /// dominates the code after the access, and a read or scalar store
+    /// records the header it validated for the rest of the current GC-free
+    /// run (willow-nzsg, willow-ijui.10). The slow path takes its operands as
+    /// block parameters and spills them to a frame slot the function's fault
+    /// paths share; it reloads them only after the panic-depth snapshot call.
+    /// Operands live across that call would otherwise make the register
+    /// allocator split the loop's values and leave moves on the fast path.
     pub(super) fn emit_array_access(
         &mut self,
         array: Value,
@@ -218,13 +218,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         word: Option<Value>,
     ) -> Value {
         use willow_abi::array_layout as layout;
-        let known = match word {
-            None => self
-                .lir_reuse
-                .as_ref()
-                .and_then(|reuse| reuse.arrays.get(&array).copied()),
-            Some(_) => None,
-        };
+        // A scalar store leaves the header alone, so reads and stores share
+        // the facts of the current GC-free run (willow-ijui.10).
+        let known = self
+            .lir_reuse
+            .as_ref()
+            .and_then(|reuse| reuse.arrays.get(&array).copied());
         if let (Some(facts), None) = (known, index) {
             return facts.len;
         }
@@ -295,9 +294,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             facts.len
         };
-        if word.is_none()
-            && let Some(reuse) = &mut self.lir_reuse
-        {
+        if let Some(reuse) = &mut self.lir_reuse {
             reuse.arrays.insert(array, facts);
         }
         // The fast path is `done`'s only predecessor, so `result` dominates it.

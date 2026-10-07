@@ -243,6 +243,8 @@ mod array_fast_paths;
 mod array_loop_safepoints;
 #[path = "integration/array_reference_store.rs"]
 mod array_reference_store;
+#[path = "integration/array_store_runs.rs"]
+mod array_store_runs;
 #[path = "integration/async_frame_store.rs"]
 mod async_frame_store;
 #[path = "integration/never_values.rs"]

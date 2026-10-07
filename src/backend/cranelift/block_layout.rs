@@ -355,6 +355,29 @@ mod tests {
         assert_eq!((read.hot_loads, read.hot_stores), (6, 1));
     }
 
+    // The array_write_only phase (willow-ijui.10): the store's receiver copy
+    // needs no root, and the store reuses the owner, length and buffer the
+    // condition validated. Per trip: the GC stop flag, the countdown, the
+    // owner, the length and the buffer are loaded; the countdown and the
+    // element are stored.
+    #[test]
+    fn array_write_loop_reuses_condition_facts() {
+        let shapes = assert_compact_loops(
+            "import std::collections::Array;
+            fn main() {
+                let values: Array<i64> = [];
+                let mut i: i64 = 0;
+                while i < 1000 { values.push(0); i = i + 1; }
+                i = 0;
+                while i < values.len() { values[i] = (i % 1000) + 1; i = i + 1; }
+                println(values[3]);
+            }",
+            2,
+        );
+        let write = shapes.last().expect("write loop");
+        assert_eq!((write.hot_loads, write.hot_stores), (5, 2));
+    }
+
     #[test]
     fn loop_exits_by_break_and_nesting_stay_outside_hot_bodies() {
         assert_compact_loops(

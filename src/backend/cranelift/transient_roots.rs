@@ -12,12 +12,12 @@
 //! * it is synthetic, typed `Array<T>`/`FrozenArray<T>`, and written by exactly
 //!   one `Compute`;
 //! * every read is a later instruction of the same block that only inspects
-//!   the array (`len`, or a scalar-element index);
+//!   the array (`len`, a scalar-element index, or a scalar-element store);
 //! * every instruction from the write up to its last read is GC-free on all
-//!   paths that continue: scalar arithmetic, copies, scalar array reads and
-//!   lengths, and root clears. Faults in them (bounds, null, overflow, zero
-//!   divisor) raise and never rejoin, so a recovered panic resumes in another
-//!   block, where the temporary is dead.
+//!   paths that continue: scalar arithmetic, copies, scalar array reads,
+//!   scalar array stores and lengths, and root clears. Faults in them
+//!   (bounds, null, overflow, zero divisor) raise and never rejoin, so a
+//!   recovered panic resumes in another block, where the temporary is dead.
 //!
 //! The block-entry safepoint precedes every instruction of the block. Only
 //! synchronous bodies use this: a cooperative body may suspend at a task
@@ -208,8 +208,9 @@ fn scalar(ty: &Type) -> bool {
     matches!(ty, Type::I64 | Type::F64 | Type::Bool)
 }
 
-/// The array an rvalue reads only through the inline, nonallocating access
-/// path of `emit_array_access`.
+/// The array an rvalue accesses only through the inline, nonallocating
+/// access path of `emit_array_access`: a length, a scalar-element read, or a
+/// scalar-element store (willow-ijui.10).
 fn inspected_array(value: &LirRvalue) -> Option<LirLocalId> {
     match value {
         LirRvalue::IntrinsicCall {
@@ -218,6 +219,13 @@ fn inspected_array(value: &LirRvalue) -> Option<LirLocalId> {
             ..
         } => Some(*array),
         LirRvalue::Index {
+            array: LirOperand::Local(array),
+            element,
+            ..
+        } if scalar(element) => Some(*array),
+        // A scalar element store writes one buffer word: no barrier, no
+        // allocation, and the header (owner, length, buffer) is unchanged.
+        LirRvalue::ArrayStore {
             array: LirOperand::Local(array),
             element,
             ..

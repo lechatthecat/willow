@@ -1,0 +1,217 @@
+// Scalar element stores share the owner, length and buffer facts of the
+// surrounding GC-free run (willow-ijui.10), next to stores whose value
+// allocates, calls, grows the array or runs on a task.
+import std::collections::Array;
+
+interface Shape {
+    fn area() -> i64;
+}
+
+class Square implements Shape {
+    pub side: i64;
+    pub fn area() -> i64 { return self.side * self.side; }
+}
+
+class Holder {
+    pub items: Array<i64>;
+}
+
+fn check(xs: Array<i64>) -> i64 {
+    let mut i: i64 = 0;
+    let mut total: i64 = 0;
+    while i < xs.len() {
+        total = total + xs[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn noisy(v: i64) -> i64 {
+    println(v * 100);
+    return v;
+}
+
+fn fill_through(xs: &mut Array<i64>, n: i64) {
+    let mut i: i64 = 0;
+    while i < xs.len() {
+        xs[i] = n + i;
+        i = i + 1;
+    }
+}
+
+fn fill_with_defer(xs: Array<i64>) {
+    defer println("filled");
+    let mut i: i64 = 0;
+    while i < xs.len() {
+        xs[i] = i * 3;
+        i = i + 1;
+    }
+}
+
+async fn task_fill(n: i64) -> i64 {
+    let xs: Array<i64> = [];
+    let mut i: i64 = 0;
+    while i < n { xs.push(0); i = i + 1; }
+    i = 0;
+    while i < xs.len() {
+        xs[i] = i + 100;
+        i = i + 1;
+    }
+    return check(xs);
+}
+
+fn sync_cases() {
+    // 1. Write loop, then read it back.
+    let values: Array<i64> = [];
+    let mut i: i64 = 0;
+    while i < 1000 { values.push(0); i = i + 1; }
+    i = 0;
+    while i < values.len() { values[i] = i; i = i + 1; }
+    println(check(values));
+
+    // 2-3. f64 and bool write loops.
+    let floats: Array<f64> = [0.0, 0.0, 0.0, 0.0];
+    let flags: Array<bool> = [false, false, false, false];
+    i = 0;
+    while i < floats.len() {
+        floats[i] = 0.5 * 3.0;
+        flags[i] = i % 2 == 0;
+        i = i + 1;
+    }
+    println(floats[0] + floats[3] == 3.0);
+    println(flags[0] && !flags[1] && flags[2]);
+
+    // 4. Store, then read the same element in the same block.
+    let xs: Array<i64> = [1, 2, 3];
+    xs[1] = 20;
+    println(xs[1] + xs[0]);
+
+    // 5. Twenty stores in one block: more than the carried fact cap.
+    let wide: Array<i64> = [0, 0, 0, 0, 0];
+    wide[0] = 1; wide[1] = 2; wide[2] = 3; wide[3] = 4; wide[4] = 5;
+    wide[0] = wide[0] + 1; wide[1] = wide[1] + 1; wide[2] = wide[2] + 1; wide[3] = wide[3] + 1; wide[4] = wide[4] + 1;
+    wide[0] = wide[4] * 2; wide[1] = wide[3] * 2; wide[2] = wide[2] * 2; wide[3] = wide[1] * 2; wide[4] = wide[0] * 2;
+    wide[0] = wide[0] - 1; wide[1] = wide[1] - 1; wide[2] = wide[2] - 1; wide[3] = wide[3] - 1; wide[4] = wide[4] - 1;
+    println(check(wide));
+
+    // 6. A store through one name is visible through its alias.
+    let alias = xs;
+    alias[0] = 9;
+    println(xs[0]);
+
+    // 7. Growth between stores: the second store uses the new buffer.
+    let grow: Array<i64> = [1];
+    i = 0;
+    while i < 40 {
+        grow[0] = grow[0] + 1;
+        grow.push(i);
+        grow[grow.len() - 1] = i * 2;
+        i = i + 1;
+    }
+    println(grow[0]);
+    println(grow[40]);
+    println(grow.len());
+
+    // 8. Shrinking between stores.
+    let shrink: Array<i64> = [5, 6, 7, 8];
+    shrink[3] = 80;
+    shrink.pop();
+    shrink[2] = 70;
+    println(check(shrink));
+
+    // 9. A value that allocates and calls between the copy and the store.
+    let lens: Array<i64> = [0, 0, 0];
+    i = 0;
+    while i < lens.len() {
+        let text = format("item-{}", i);
+        lens[i] = text.len() + i;
+        i = i + 1;
+    }
+    println(check(lens));
+
+    // 10. Interface boxing next to the store.
+    let areas: Array<i64> = [0, 0, 0];
+    i = 0;
+    while i < areas.len() {
+        let shape: Shape = new Square(i + 1);
+        areas[i] = shape.area();
+        i = i + 1;
+    }
+    println(check(areas));
+
+    // 11. Nested indexing: rows[r] is an array, its element a scalar.
+    let rows: Array<Array<i64>> = [[0, 0], [0, 0], [0, 0]];
+    let mut r: i64 = 0;
+    while r < rows.len() {
+        let mut c: i64 = 0;
+        while c < rows[r].len() {
+            rows[r][c] = r * 10 + c;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    println(rows[2][1] + rows[1][0]);
+
+    // 12. A reference parameter's array.
+    let mut through: Array<i64> = [0, 0, 0];
+    fill_through(&through, 5);
+    println(check(through));
+
+    // 13. A store loop in a function with a defer.
+    let deferred: Array<i64> = [0, 0, 0, 0];
+    fill_with_defer(deferred);
+    println(check(deferred));
+
+    // 14. A lambda that captures and stores.
+    let captured: Array<i64> = [0, 0];
+    let set = |k: i64, v: i64| { captured[k] = v; };
+    set(0, 11);
+    set(1, 12);
+    println(check(captured));
+
+    // 15. A field's array.
+    let holder = new Holder([0, 0, 0]);
+    i = 0;
+    while i < holder.items.len() { holder.items[i] = 7; i = i + 1; }
+    println(check(holder.items));
+
+    // 16. Collections between stores of the same array.
+    let moved: Array<i64> = [0, 0, 0];
+    i = 0;
+    while i < moved.len() {
+        moved[i] = i + 1;
+        gc_minor_collect();
+        moved[i] = moved[i] * 10;
+        i = i + 1;
+    }
+    gc_collect();
+    println(check(moved));
+
+    // 17-18. Literals: scalar element stores in one run, and a call between.
+    let lit = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+    println(check(lit));
+    let called = [1, noisy(2), 3];
+    println(check(called));
+    let fl = [1.5, 2.5];
+    let bl = [true, false, true];
+    println(fl[1] - fl[0] == 1.0 && bl[2]);
+
+    // 19. The index read from the same array.
+    let self_index: Array<i64> = [2, 0, 0];
+    self_index[self_index[0]] = 7;
+    println(self_index[2]);
+
+    // 20. Frozen reads are unaffected by later stores.
+    let source: Array<i64> = [1, 2];
+    let frozen = source.freeze();
+    source[0] = 100;
+    println(frozen[0] + source[0]);
+
+}
+
+async fn main() {
+    sync_cases();
+    // 21. A store loop on a task.
+    let task = task_fill(3);
+    println(await task);
+}

@@ -16652,6 +16652,68 @@ fn f() {
         assert!(boxing >= 1);
     }
 
+    // willow-ijui.10: a scalar element store only inspects the receiver copy,
+    // like `len` and scalar reads; a GC point before the store, or a
+    // non-scalar element, keeps the copy rooted.
+    #[test]
+    fn transient_array_temps_cover_scalar_stores() {
+        let plain = "import std::collections::Array;
+                     fn g(i: i64) -> i64 { println(i); return i; }
+                     fn f(xs: Array<i64>) -> i64 {
+                         let mut i = 0;
+                         while i < xs.len() { xs[i] = i + 1; i = i + 1; }
+                         return i;
+                     }";
+        // The condition's `len` copy and the store's receiver copy.
+        assert_eq!(unrooted_count(plain), (2, 2));
+        // The value calls between the copy and the store.
+        assert_eq!(
+            unrooted_count(&plain.replace("xs[i] = i + 1", "xs[i] = g(i)")),
+            (1, 2)
+        );
+        // The index calls too.
+        assert_eq!(
+            unrooted_count(&plain.replace("xs[i] = i + 1", "xs[g(i)] = i")),
+            (1, 2)
+        );
+        for ty in ["f64", "bool"] {
+            let value = if ty == "f64" { "1.5" } else { "true" };
+            let src = plain
+                .replace("Array<i64>", &format!("Array<{ty}>"))
+                .replace("xs[i] = i + 1", &format!("xs[i] = {value}"));
+            assert_eq!(unrooted_count(&src), (2, 2), "{ty}");
+        }
+        // A reference element store may run a barrier: it stays rooted.
+        let strings = "import std::collections::Array;
+                       fn g(i: i64) -> i64 { return i; }
+                       fn f(xs: Array<String>) -> i64 {
+                           let mut i = 0;
+                           while i < xs.len() { xs[i] = \"s\"; i = i + 1; }
+                           return i;
+                       }";
+        assert_eq!(unrooted_count(strings), (1, 2));
+        // The scalar store itself is GC-free; a reference store is not.
+        let stores = |src: &str| {
+            let (f, _) = lir_fn_and_tables(src, "f", &["f", "g"]);
+            f.blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .filter(|inst| {
+                    matches!(
+                        inst,
+                        LirInst::Compute {
+                            value: crate::ir::lowered::LirRvalue::ArrayStore { .. },
+                            ..
+                        }
+                    )
+                })
+                .map(|inst| super::super::transient_roots::gc_free(&f, inst))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(stores(plain), [true]);
+        assert_eq!(stores(strings), [false]);
+    }
+
     #[test]
     fn transient_runs_inherit_only_along_sole_plain_edges() {
         let looped = "import std::collections::Array;
