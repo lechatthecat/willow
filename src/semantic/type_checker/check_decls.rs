@@ -284,12 +284,15 @@ impl TypeChecker {
         self.check_block(&ctor.body);
 
         // E0842: every successful exit must initialize every instance field.
+        // This cached pass treats every call as panicking; a constructor it
+        // flags is decided with the unit's effect facts (willow-ssl7.19).
         let fields: Vec<_> = c.fields.iter().filter(|field| !field.is_static).collect();
         let compute = || {
             super::constructor_flow::uninitialized_fields(
                 &ctor.body,
                 fields.iter().map(|field| field.name.as_str()),
                 &self.expr_types,
+                &super::constructor_flow::every_call_may_panic,
             )
         };
         let missing = match &self.body_queries {
@@ -304,27 +307,8 @@ impl TypeChecker {
             }
             None => std::sync::Arc::new(compute()),
         };
-        for (field, missing) in fields.iter().zip(missing.iter()) {
-            if *missing {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0842,
-                        format!(
-                            "field `{}` is not initialized by constructor `{}::init`",
-                            field.name, c.name
-                        ),
-                    )
-                    .with_label(Label::primary(
-                        ctor.span,
-                        "field left uninitialized on a normal exit",
-                    ))
-                    .with_help(format!(
-                        "assign `self.{} = ...` on every path that returns from the constructor",
-                        field.name
-                    )),
-                );
-            }
+        if missing.contains(&true) {
+            self.pending_constructor_flow.push(ctor.body.id);
         }
 
         self.symbols.pop_scope();
@@ -332,6 +316,57 @@ impl TypeChecker {
         self.local.current_effect_callable = previous_effect_callable;
         self.local.current_return_type = previous_return;
         self.local.in_constructor = previous_ctor;
+    }
+
+    /// Decide E0842 for constructors the call-agnostic pass flagged, now that
+    /// the unit's panic facts are solved. Each flagged constructor is rerun
+    /// once with O(1) indexed lookups per call site.
+    pub(super) fn constructor_flow_diagnostics(
+        &self,
+        program: &Program,
+        pending: &HashSet<BodyId>,
+        call_may_panic: super::constructor_flow::CallMayPanic<'_>,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        for item in &program.items {
+            let Item::Class(c) = item else { continue };
+            for ctor in c
+                .constructors
+                .iter()
+                .filter(|ctor| pending.contains(&ctor.body.id))
+            {
+                let fields: Vec<_> = c.fields.iter().filter(|field| !field.is_static).collect();
+                let missing = super::constructor_flow::uninitialized_fields(
+                    &ctor.body,
+                    fields.iter().map(|field| field.name.as_str()),
+                    &self.expr_types,
+                    call_may_panic,
+                );
+                for (field, missing) in fields.iter().zip(missing) {
+                    if missing {
+                        diagnostics.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0842,
+                                format!(
+                                    "field `{}` is not initialized by constructor `{}::init`",
+                                    field.name, c.name
+                                ),
+                            )
+                            .with_label(Label::primary(
+                                ctor.span,
+                                "field left uninitialized on a normal exit",
+                            ))
+                            .with_help(format!(
+                                "assign `self.{} = ...` on every path that returns from the constructor",
+                                field.name
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+        diagnostics
     }
 
     pub(super) fn check_constructor_inheritance_rules(&mut self, c: &ClassDecl) {

@@ -1,0 +1,61 @@
+// Constructor field initialization uses the checker's panic facts
+// (willow-ssl7.19). Only a defer that calls `recover()` itself can end a
+// panic, so cleanup-only defers never let a constructor return early, and a
+// call proven panic-free cannot reach a recovery exit.
+fn clamp(n: i64) -> i64 {
+    if n < 0 {
+        return 0;
+    }
+    return n;
+}
+
+class Guarded {
+    pub value: i64;
+
+    pub init(self, n: i64) {
+        defer println("guarded cleanup");
+        if n < 0 {
+            panic("negative input");
+        }
+        self.value = n;
+    }
+}
+
+class Resilient {
+    pub value: i64;
+
+    pub init(self, n: i64) {
+        defer match recover() {
+            Some(_) => { println("recovered"); },
+            None => {}
+        };
+        // `clamp` cannot panic, so this constructor cannot resume before
+        // `value` is assigned.
+        let value = clamp(n);
+        self.value = value;
+    }
+}
+
+class Retry {
+    pub value: i64;
+
+    pub init(self, fail: bool) {
+        if true {
+            defer match recover() {
+                Some(_) => { println("inner recovered"); },
+                None => {}
+            };
+            if fail {
+                panic("first attempt");
+            }
+        }
+        // Recovery resumes here, so the assignment still runs.
+        self.value = 7;
+    }
+}
+
+fn main() {
+    println(new Guarded(3).value);
+    println(new Resilient(-5).value);
+    println(new Retry(true).value);
+}

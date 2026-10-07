@@ -2,7 +2,13 @@
 //!
 //! Build a control-flow DAG, then union *possibly uninitialized* fields at
 //! joins. A normal return and fallthrough share one exit; an unrecovered panic
-//! has no edge to it. Registered defers conservatively permit scope recovery. Loop backedges are omitted: assignments only add initialization, and
+//! has no edge to it. Only a defer whose body lexically calls `recover()`
+//! (outside lambdas) can end a panic; recovery is not inherited by helpers, so
+//! other defers merely clean up and leave panics on their outer target.
+//! Calls consult a caller-supplied may-panic oracle keyed by the checked
+//! call expression; the type checker first runs with an all-panicking oracle
+//! and refines only reported constructors with unit effect facts
+//! (willow-ssl7.19). Loop backedges are omitted: assignments only add initialization, and
 //! each abstract branch is already possible on the first iteration. Later
 //! iterations cannot weaken that first-iteration state. `break` reaches the
 //! loop's successor; `continue` and the body tail end this abstract iteration.
@@ -36,16 +42,26 @@ impl Flow {
     };
 }
 
+/// May-panic oracle for one call expression (`Call`, `MethodCall`,
+/// `StaticCall` or `New`). Returning `true` is always sound.
+pub(super) type CallMayPanic<'a> = &'a dyn Fn(&Expr) -> bool;
+
+/// Treat every call as possibly panicking.
+pub(super) fn every_call_may_panic(_: &Expr) -> bool {
+    true
+}
+
 pub(super) fn uninitialized_fields<'a>(
     body: &Block,
     fields: impl Iterator<Item = &'a str>,
     types: &HashMap<ExprId, Type>,
+    call_may_panic: CallMayPanic<'_>,
 ) -> Vec<bool> {
     let fields: HashMap<_, _> = fields.enumerate().map(|(i, name)| (name, i)).collect();
     if fields.is_empty() {
         return Vec::new();
     }
-    let mut graph = Graph::new(&fields, types);
+    let mut graph = Graph::new(&fields, types, call_may_panic);
     let entry = graph.schedule(Input::Block(&body.stmts), EXIT, Flow::ROOT);
     graph.build();
     let (missing, _) = graph.solve(entry);
@@ -81,15 +97,21 @@ struct Graph<'a> {
     work: Vec<Work<'a>>,
     fields: &'a HashMap<&'a str, usize>,
     types: &'a HashMap<ExprId, Type>,
+    call_may_panic: CallMayPanic<'a>,
 }
 
 impl<'a> Graph<'a> {
-    fn new(fields: &'a HashMap<&'a str, usize>, types: &'a HashMap<ExprId, Type>) -> Self {
+    fn new(
+        fields: &'a HashMap<&'a str, usize>,
+        types: &'a HashMap<ExprId, Type>,
+        call_may_panic: CallMayPanic<'a>,
+    ) -> Self {
         Self {
             nodes: vec![Node::default(), Node::default()],
             work: Vec::new(),
             fields,
             types,
+            call_may_panic,
         }
     }
 
@@ -158,24 +180,32 @@ impl<'a> Graph<'a> {
                 Input::Block(stmts) => {
                     let mut active = flow;
                     let mut statements = Vec::with_capacity(stmts.len());
-                    let mut has_defer = false;
+                    let mut recovers = false;
+                    let mut cleanup_may_panic = false;
                     for stmt in stmts {
                         statements.push((stmt, active));
-                        if matches!(stmt, Stmt::Defer(_)) && !has_defer {
-                            // Recovery resumes after this lexical scope. A
-                            // deferred helper may recover, so lack of a direct
-                            // recover() spelling is not proof that it cannot.
+                        let Stmt::Defer(defer) = stmt else { continue };
+                        let cleanup = self.cleanup(&defer.body);
+                        if cleanup.recovers && !recovers {
+                            // Recovery resumes after this lexical scope. Only
+                            // a direct recover() can end a panic: a helper's
+                            // recover() is not eligible (willow-s9ej.3).
                             active.panic_to = if flow.panic_to == DEAD {
                                 next
                             } else {
                                 self.fork(vec![next, flow.panic_to])
                             };
                             active.loop_cleanup_panic_to = active.panic_to;
-                            has_defer = true;
+                            recovers = true;
+                        }
+                        if cleanup.may_panic {
+                            // break/continue run this cleanup on the way out.
+                            active.loop_cleanup_panic_to = active.panic_to;
+                            cleanup_may_panic = true;
                         }
                     }
                     // Cleanup itself may panic into an enclosing recovery scope.
-                    let mut target = if has_defer && flow.panic_to != DEAD {
+                    let mut target = if cleanup_may_panic && flow.panic_to != DEAD {
                         self.fork(vec![next, flow.panic_to])
                     } else {
                         next
@@ -292,7 +322,7 @@ impl<'a> Graph<'a> {
                     // call: a shadowed/user function named panic may return.
                     let next = if self.types.get(&expr.id()) == Some(&Type::Never) {
                         flow.panic_to
-                    } else if flow.panic_to != DEAD && may_panic(expr) {
+                    } else if flow.panic_to != DEAD && self.may_panic(expr) {
                         self.fork(vec![next, flow.panic_to])
                     } else {
                         next
@@ -467,27 +497,79 @@ impl<'a> Graph<'a> {
     }
 }
 
-/// Conservative local hazard classification. Calls include user helpers and
-/// imported code; proving their absence of panic is a separate effect query.
-/// Child operands are evaluated separately, so literals and mere variable
-/// references do not introduce spurious recovery edges.
-fn may_panic(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Call(_)
-            | Expr::MethodCall(_)
-            | Expr::StaticCall(_)
-            | Expr::New(_)
-            | Expr::Index(..)
-            | Expr::Print(..)
+/// What running one deferred body can do: end a panic, or raise one.
+struct Cleanup {
+    recovers: bool,
+    may_panic: bool,
+}
+
+impl Graph<'_> {
+    /// Local hazard classification. Calls ask the oracle, which is backed by
+    /// checker-owned effect facts. Child operands are evaluated separately, so
+    /// literals and mere variable references do not introduce spurious
+    /// recovery edges.
+    fn may_panic(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Call(_) | Expr::MethodCall(_) | Expr::StaticCall(_) | Expr::New(_) => {
+                (self.call_may_panic)(expr)
+            }
+            // Scalar display uses the runtime print rows directly; only
+            // object/interface display can run user `toString` code.
+            Expr::Print(value, ..) => !matches!(
+                self.types.get(&value.id()),
+                Some(Type::I64 | Type::F64 | Type::Bool | Type::String)
+            ),
+            Expr::Index(..)
             | Expr::Binary(_)
             | Expr::Unary(_)
             | Expr::FieldAccess(..)
             | Expr::ArrayLiteral(..)
             | Expr::ObjectLiteral(_)
             | Expr::Await(_)
-            | Expr::Select(_)
-    )
+            | Expr::Select(_) => true,
+            _ => false,
+        }
+    }
+
+    /// One linear walk over a deferred body. Lambdas only run when called,
+    /// and calling one is an unresolved (panicking) call. Nested defers are
+    /// included, which can only over-approximate both answers.
+    fn cleanup(&self, body: &DeferBody) -> Cleanup {
+        use crate::parser::iter::{AstEvent, AstWalk};
+        let mut cleanup = Cleanup {
+            recovers: false,
+            may_panic: false,
+        };
+        let mut walk = AstWalk::new(match body {
+            DeferBody::Expr(expr) => AstEvent::Expr(expr),
+            DeferBody::Block(block) => AstEvent::Block(block),
+        });
+        while let Some(event) = walk.next() {
+            match event {
+                AstEvent::Stmt(stmt) => {
+                    cleanup.may_panic |= match stmt {
+                        Stmt::IndexAssign(_) | Stmt::Lock(_) | Stmt::SuperInit(_) => true,
+                        Stmt::FieldAssign(s) => {
+                            !matches!(&s.object, Expr::Var(name, ..) if name == "self")
+                        }
+                        _ => false,
+                    };
+                }
+                AstEvent::Expr(expr) => {
+                    if matches!(expr, Expr::Lambda(_)) {
+                        walk.skip_children();
+                        continue;
+                    }
+                    cleanup.recovers |=
+                        matches!(expr, Expr::Call(call) if call.callee == "recover");
+                    cleanup.may_panic |=
+                        self.types.get(&expr.id()) == Some(&Type::Never) || self.may_panic(expr);
+                }
+                _ => {}
+            }
+        }
+        cleanup
+    }
 }
 
 /// Persistent binary field set. Uniform subtrees take no allocation. Splitting

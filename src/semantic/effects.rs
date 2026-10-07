@@ -288,7 +288,11 @@ impl<W: Clone + Ord> EffectProblem<W> {
 
         for (position, id) in nodes.iter().enumerate() {
             if let Some(seed) = self.seeds.get(id) {
-                summaries[position].join(seed, RuntimeEffects::ALL);
+                // Seeds may carry the compiler-internal checked-panic bit.
+                summaries[position].join(
+                    seed,
+                    RuntimeEffects::ALL.union(RuntimeEffects::MAY_CHECKED_PANIC),
+                );
             }
             let Some(sites) = graph.get(id) else {
                 if self.bodies.contains(id) {

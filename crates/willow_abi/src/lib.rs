@@ -85,6 +85,13 @@ impl RuntimeEffects {
     pub const MAY_PREEMPT: Self = Self(1 << 3);
     pub const NO_PREEMPT_REGION: Self = Self(1 << 4);
     pub const MAY_PANIC: Self = Self(1 << 5);
+    /// Compiler-internal: the call panics only through checked integer
+    /// arithmetic that this build mode wraps instead. Runtime ABI rows never
+    /// carry it; it keeps checker verdicts independent of the build profile
+    /// while [`RuntimeEffects::MAY_PANIC`] stays exact for code generation.
+    /// It lies outside [`RuntimeEffects::ALL`] and [`RuntimeEffects::BIT_COUNT`]:
+    /// `MAY_PANIC` already implies it, so fail-closed defaults stay sound.
+    pub const MAY_CHECKED_PANIC: Self = Self(1 << 6);
 
     /// Every effect at once. The fail-closed default for a fact the compiler
     /// cannot see: an unanalyzed callee is assumed to do everything.

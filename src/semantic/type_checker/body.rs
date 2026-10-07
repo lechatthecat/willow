@@ -145,6 +145,7 @@ pub(super) struct BodyOutputs {
     lock_direct: HashMap<FunctionId, LockEffectCause>,
     lock_direct_sites: Vec<LockEffectCause>,
     lock_sites: Vec<LockEffectCallsite>,
+    pending_constructor_flow: Vec<BodyId>,
     lambdas: LambdaChildren,
 }
 
@@ -176,6 +177,9 @@ pub(crate) struct TypedBody {
     lock_direct: HashMap<FunctionId, LockEffectCause>,
     lock_direct_sites: Vec<LockEffectCause>,
     lock_sites: Vec<LockEffectCallsite>,
+    /// Constructors whose lexical flow left a field possibly uninitialized;
+    /// unit finish refines them with checker-owned panic facts.
+    pending_constructor_flow: Vec<BodyId>,
     collection_names: HashSet<String>,
     missing_collections: HashSet<String>,
     lambdas: Vec<LambdaSplice>,
@@ -210,6 +214,7 @@ impl TypedBody {
             lock_direct: outputs.lock_direct,
             lock_direct_sites: outputs.lock_direct_sites,
             lock_sites: outputs.lock_sites,
+            pending_constructor_flow: outputs.pending_constructor_flow,
             collection_names,
             missing_collections,
             lambdas: outputs.lambdas.splices,
@@ -388,6 +393,8 @@ impl TypeChecker {
             .direct_sites
             .extend(body.lock_direct_sites);
         self.effect_inputs.sites.extend(body.lock_sites);
+        self.pending_constructor_flow
+            .extend(body.pending_constructor_flow);
         self.fully_qualified_collection_types
             .extend(body.collection_names);
         self.missing_collection_imports_reported
@@ -446,6 +453,10 @@ impl TypeChecker {
             &mut outputs.lock_direct_sites,
         );
         swap(&mut self.effect_inputs.sites, &mut outputs.lock_sites);
+        swap(
+            &mut self.pending_constructor_flow,
+            &mut outputs.pending_constructor_flow,
+        );
         swap(&mut self.lambdas, &mut outputs.lambdas);
     }
 

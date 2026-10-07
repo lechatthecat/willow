@@ -186,6 +186,9 @@ pub struct TypeChecker {
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
     static_reads: HashMap<FunctionId, HashSet<FunctionId>>,
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
+    /// Constructor bodies whose call-agnostic flow reported a missing field;
+    /// `finish_effect_analysis` decides their E0842 with panic facts.
+    pending_constructor_flow: Vec<crate::parser::ast::BodyId>,
     analysis_symbols: crate::semantic::analysis_symbols::Facts,
     /// Latest `analysis_symbols.references` index of a member use per call
     /// start, so builtin-call classification is O(1) instead of rescanning
@@ -330,6 +333,7 @@ impl TypeChecker {
             resolved_calls: HashMap::new(),
             static_reads: HashMap::new(),
             analysis_calls: HashMap::new(),
+            pending_constructor_flow: Vec::new(),
             analysis_symbols: Default::default(),
             member_uses: HashMap::new(),
             capture_call_sites: false,

@@ -19,6 +19,12 @@ use std::{
 };
 
 const PANIC: RuntimeEffects = RuntimeEffects::MAY_PANIC;
+/// Checked arithmetic that this build mode wraps. Every mask that transmits
+/// [`PANIC`] also transmits this bit, so `PANIC | CHECKED_PANIC` of a release
+/// solution equals the overflow-checked solution's `PANIC` exactly.
+const CHECKED_PANIC: RuntimeEffects = RuntimeEffects::MAY_CHECKED_PANIC;
+/// Profile-independent panic summary read by checker verdicts.
+pub(crate) const ANY_PANIC: RuntimeEffects = PANIC.union(CHECKED_PANIC);
 
 use crate::semantic::concurrency::{NonpreemptibleHelper, NonpreemptibleReason};
 const NO_PREEMPT: RuntimeEffects = RuntimeEffects::NO_PREEMPT_REGION;
@@ -382,7 +388,7 @@ impl EffectQueries {
         unit: UnitId,
         body: BodyId,
         id: FunctionId,
-    ) -> Option<(bool, bool, bool)> {
+    ) -> Option<(RuntimeEffects, bool, bool)> {
         let effects = self.units.ready(&unit)?;
         if consumer != unit && self.tracking.borrow().upgrade().is_some() {
             self.source_reads
@@ -394,7 +400,7 @@ impl EffectQueries {
         Some((
             self.effect_capabilities(unit, id)?
                 .runtime
-                .intersects(PANIC),
+                .intersection(ANY_PANIC),
             effects.loop_bodies.contains(&body),
             self.effect_capabilities(unit, id)?.may_io,
         ))
@@ -416,7 +422,7 @@ impl EffectQueries {
     ) -> RuntimeEffects {
         self.external_capabilities(consumer, target, imports)
             .runtime
-            .intersection(PANIC)
+            .intersection(ANY_PANIC)
     }
 
     /// Imported dispatch uses completed capability queries; unavailable units
@@ -618,7 +624,7 @@ pub(crate) fn solve_unit<N>(
         .external_callee(PANIC)
         .unknown_callee(PANIC)
         .missing_body(PANIC)
-        .default_transmit(PANIC.union(LOCK_EFFECT_WAIT));
+        .default_transmit(ANY_PANIC.union(LOCK_EFFECT_WAIT));
     let mut own = HashSet::new();
     let mut loops = HashSet::new();
     let mut loop_spans = HashMap::new();
@@ -650,9 +656,7 @@ pub(crate) fn solve_unit<N>(
                     if source_io {
                         may_io.insert(id);
                     }
-                    if panic {
-                        problem = problem.seed(id, PANIC, None);
-                    }
+                    problem = problem.seed(id, panic, None);
                     if has_loop {
                         loops.insert(id);
                         loop_bodies.insert(body_id);
@@ -729,12 +733,19 @@ pub(crate) fn solve_unit<N>(
                     })),
                 );
             }
-            if direct.panics {
-                let witness = direct.panic_span.map(|span| EffectWitness::Panic {
+            let seed = if direct.panics {
+                Some((PANIC, direct.panic_span))
+            } else if direct.checked_panics {
+                Some((CHECKED_PANIC, direct.checked_span))
+            } else {
+                None
+            };
+            if let Some((panic, span)) = seed {
+                let witness = span.map(|span| EffectWitness::Panic {
                     owner: direct.id,
                     source: (span.file_id.0, span.start, span.end),
                 });
-                problem = problem.seed(direct.id, PANIC, witness);
+                problem = problem.seed(direct.id, panic, witness);
             }
         }
     }
@@ -807,9 +818,9 @@ pub(crate) fn solve_unit<N>(
         );
     }
     for id in graph.ids().chain(callables.keys()).chain(helpers.keys()) {
-        let mut mask = PANIC.union(LOCK_EFFECT_WAIT);
+        let mut mask = ANY_PANIC.union(LOCK_EFFECT_WAIT);
         if callables.get(id) == Some(&true) {
-            mask = PANIC;
+            mask = ANY_PANIC;
         } else if helpers.contains_key(id) {
             mask = mask.union(NO_PREEMPT);
         }
@@ -862,7 +873,7 @@ pub(crate) fn solve_unit<N>(
                 }
                 problem = problem.seed(
                     *target,
-                    external(target).intersection(PANIC),
+                    external(target).intersection(ANY_PANIC),
                     Some(EffectWitness::External(*target)),
                 );
             }
@@ -955,6 +966,11 @@ struct DirectBodyEffects {
     id: FunctionId,
     body: BodyId,
     panics: bool,
+    /// Panics only through checked arithmetic this build mode wraps.
+    #[serde(default)]
+    checked_panics: bool,
+    #[serde(default)]
+    checked_span: Option<crate::diagnostics::Span>,
     panic_span: Option<crate::diagnostics::Span>,
     lock_span: Option<crate::diagnostics::Span>,
     loop_span: Option<crate::diagnostics::Span>,
@@ -975,6 +991,8 @@ fn scan_direct_effects<N>(
     while let Some((id, body_id, body)) = pending.pop() {
         let mut hazards = HazardVisitor {
             panics: false,
+            checked_panics: false,
+            checked_span: None,
             panic_span: None,
             expr_types: types,
             overflow_checks,
@@ -1023,6 +1041,8 @@ fn scan_direct_effects<N>(
             id,
             body: body_id,
             panics: hazards.panics,
+            checked_panics: hazards.checked_panics,
+            checked_span: hazards.checked_span,
             panic_span: hazards.panic_span,
             lock_span,
             loop_span,
@@ -1108,6 +1128,9 @@ pub(crate) fn analyze(
 /// worklist keeps this read-only analysis independent of expression depth.
 struct HazardVisitor<'a, N> {
     panics: bool,
+    /// Checked arithmetic that `overflow_checks == false` wraps.
+    checked_panics: bool,
+    checked_span: Option<crate::diagnostics::Span>,
     panic_span: Option<crate::diagnostics::Span>,
     expr_types: &'a HashMap<ExprId, Type<N>>,
     overflow_checks: bool,
@@ -1116,11 +1139,26 @@ struct HazardVisitor<'a, N> {
 impl<N> HazardVisitor<'_, N> {
     fn mark_direct(&mut self, span: crate::diagnostics::Span) {
         self.panics = true;
-        if self.panic_span.is_none_or(|old| {
-            (span.file_id.0, span.start, span.end) < (old.file_id.0, old.start, old.end)
-        }) {
-            self.panic_span = Some(span);
+        earliest(&mut self.panic_span, span);
+    }
+    /// Checked arithmetic panics only with overflow checks. Without them it
+    /// still feeds the profile-independent [`CHECKED_PANIC`] summary.
+    fn mark_checked(&mut self, span: crate::diagnostics::Span) {
+        if self.overflow_checks {
+            self.mark_direct(span);
+        } else {
+            self.checked_panics = true;
+            earliest(&mut self.checked_span, span);
         }
+    }
+}
+
+/// Keep the first hazard in source order, independent of traversal order.
+fn earliest(slot: &mut Option<crate::diagnostics::Span>, span: crate::diagnostics::Span) {
+    if slot.is_none_or(|old| {
+        (span.file_id.0, span.start, span.end) < (old.file_id.0, old.start, old.end)
+    }) {
+        *slot = Some(span);
     }
 }
 
@@ -1178,24 +1216,24 @@ impl<N> HazardVisitor<'_, N> {
                     && !matches!(expr.rhs, Expr::Integer(divisor, ..) if divisor != 0 && divisor != -1);
                 // Debug builds check integer `+ - *` for overflow and a shift
                 // amount outside `0..64` unless it is an in-range literal.
-                let checked = self.overflow_checks
-                    && (matches!(expr.op, BinOp::Add | BinOp::Sub | BinOp::Mul)
-                        && !matches!(ty, Some(Type::F64))
-                        || matches!(expr.op, BinOp::Shl | BinOp::Shr)
-                            && !matches!(expr.rhs, Expr::Integer(amount, ..) if (0..64).contains(&amount)));
-                if concat || guarded_division || checked || expr.op == BinOp::Pow {
+                let checked = matches!(expr.op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                    && !matches!(ty, Some(Type::F64))
+                    || matches!(expr.op, BinOp::Shl | BinOp::Shr)
+                        && !matches!(expr.rhs, Expr::Integer(amount, ..) if (0..64).contains(&amount));
+                if concat || guarded_division || expr.op == BinOp::Pow {
                     self.mark_direct(expression.span());
+                } else if checked {
+                    self.mark_checked(expression.span());
                 }
             }
             // Debug builds check integer negation of `i64::MIN`; a negated
             // literal is at least `-i64::MAX` and cannot overflow.
             Expr::Unary(unary)
-                if self.overflow_checks
-                    && unary.op == UnaryOp::Neg
+                if unary.op == UnaryOp::Neg
                     && !matches!(unary.expr, Expr::Integer(..))
                     && !matches!(self.expr_types.get(&unary.id), Some(Type::F64)) =>
             {
-                self.mark_direct(expression.span());
+                self.mark_checked(expression.span());
             }
             // Strict await can turn cancellation into a language panic.
             // TaskResult awaits are intentionally not distinguished here:
@@ -1354,6 +1392,8 @@ mod tests {
                     .push(Stmt::Expr(crate::parser::ast::ExprStmt { expr, span }));
                 let mut hazards = HazardVisitor {
                     panics: false,
+                    checked_panics: false,
+                    checked_span: None,
                     panic_span: None,
                     expr_types: &HashMap::<ExprId, Type<TypeId>>::new(),
                     overflow_checks: true,
@@ -1401,6 +1441,8 @@ mod tests {
             for overflow_checks in [true, false] {
                 let mut hazards = HazardVisitor {
                     panics: false,
+                    checked_panics: false,
+                    checked_span: None,
                     panic_span: None,
                     expr_types: &HashMap::<ExprId, Type<TypeId>>::new(),
                     overflow_checks,
@@ -1409,6 +1451,12 @@ mod tests {
                 assert_eq!(
                     hazards.panics,
                     checked_panics && overflow_checks,
+                    "{body} overflow_checks={overflow_checks}"
+                );
+                // Release keeps the same answer in the profile-independent bit.
+                assert_eq!(
+                    hazards.checked_panics,
+                    checked_panics && !overflow_checks,
                     "{body} overflow_checks={overflow_checks}"
                 );
             }

@@ -309,6 +309,7 @@ impl TypeChecker {
         self.resolved_calls.clear();
         self.static_reads.clear();
         self.analysis_calls.clear();
+        self.pending_constructor_flow.clear();
         self.effect_inputs.direct.clear();
         self.effect_inputs.direct_sites.clear();
         self.effect_inputs.sites.clear();
@@ -888,8 +889,75 @@ impl TypeChecker {
             );
         }
         self.nonpreemptible_methods = std::sync::Arc::clone(&effects.helpers);
+        if !self.pending_constructor_flow.is_empty() {
+            let pending: HashSet<_> = std::mem::take(&mut self.pending_constructor_flow)
+                .into_iter()
+                .collect();
+            let external = |target: &FunctionId| match &self.effect_queries {
+                Some((queries, unit)) => queries.external(*unit, target, &imports),
+                None => crate::compiler_db::effects::intrinsic_effects(target)
+                    .unwrap_or(crate::semantic::effects::RuntimeEffects::MAY_PANIC),
+            };
+            let diagnostics = self.constructor_flow_diagnostics(program, &pending, &|call| {
+                self.constructor_call_may_panic(call, &effects.facts, &external)
+            });
+            for diagnostic in diagnostics {
+                self.push(diagnostic);
+            }
+        }
         self.report_task_method_calls();
         self.report_transitive_lock_effects(&effects.facts);
+    }
+
+    /// Whether one constructor call site may panic, from the unit's solved
+    /// facts: O(1) expected per site through the recorded unique target.
+    /// Unknown, indirect, interface and overridable targets stay conservative.
+    fn constructor_call_may_panic(
+        &self,
+        call: &Expr,
+        facts: &crate::semantic::effects::EffectFacts<crate::compiler_db::effects::EffectWitness>,
+        external: &dyn Fn(&FunctionId) -> crate::semantic::effects::RuntimeEffects,
+    ) -> bool {
+        let Some(Some(target)) = self.analysis_calls.get(&call.id()) else {
+            return true;
+        };
+        if let Expr::MethodCall(method) = call
+            && !self.is_super_receiver(&method.object)
+            && !self.final_method_receiver(&method.object, target)
+        {
+            // A subclass in an importing unit could override this target.
+            return true;
+        }
+        // Read the profile-independent summary: checked arithmetic that this
+        // build wraps still counts, so E0842 is the same in debug and release.
+        let panics = crate::compiler_db::effects::ANY_PANIC;
+        match facts.get(target) {
+            Some(summary) => summary.intersects(panics),
+            None => external(target).intersects(panics),
+        }
+    }
+
+    /// True when dynamic dispatch through `receiver` cannot reach code other
+    /// than `target`: the receiver class has no subclasses, or the resolved
+    /// declaring method cannot be overridden. Two indexed lookups, without
+    /// walking the inheritance chain per call site.
+    fn final_method_receiver(&self, receiver: &Expr, target: &FunctionId) -> bool {
+        let Some(Type::Named(class) | Type::Generic(class, _)) =
+            self.expr_types.get(&receiver.id())
+        else {
+            return false;
+        };
+        let Some(info) = self.symbols.lookup_class(class) else {
+            return false;
+        };
+        if !info.is_open {
+            return true;
+        }
+        target
+            .owner_type()
+            .and_then(|owner| self.symbols.classes.get(&owner))
+            .and_then(|declaring| declaring.methods.get(target.name().as_ref()))
+            .is_some_and(|method| method.is_static || !method.is_open && !method.is_override)
     }
 
     fn report_transitive_lock_effects(
@@ -2018,7 +2086,9 @@ impl TypeChecker {
             )],
             _ => return,
         };
-        if self.capture_call_sites {
+        // Constructors always record them: E0842 refinement looks up each
+        // call's panic fact by expression id (willow-ssl7.19).
+        if self.capture_call_sites || self.local.in_constructor {
             // Keep only a unique compiler-resolved target. Polymorphic sites
             // remain explicit unknowns, without copying dispatch fan-out per site.
             self.analysis_calls.insert(

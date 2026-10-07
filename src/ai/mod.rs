@@ -279,10 +279,10 @@ pub(crate) fn capture(
             },
         );
         if let Some(summary) = facts.get(&id) {
-            result
-                .semantic
-                .compiler_effects
-                .insert(id, summary.effects().bits());
+            result.semantic.compiler_effects.insert(
+                id,
+                summary.effects().intersection(RuntimeEffects::ALL).bits(),
+            );
             let witnesses = (0..RuntimeEffects::BIT_COUNT).filter_map(|bit| {
                 let effect = RuntimeEffects::from_bit(bit);
                 if !summary.contains(effect) { return None; }
@@ -305,7 +305,7 @@ pub(crate) fn capture(
                     0
                 }
             },
-            |f| f.effects().bits(),
+            |f| f.effects().intersection(RuntimeEffects::ALL).bits(),
         );
         let mut initializer_calls = crate::semantic::call_graph::CallSites::default();
         let initializer = id.name().starts_with("$static$");
@@ -349,7 +349,7 @@ pub(crate) fn capture(
                         {
                             crate::semantic::intrinsics::builtin_call_runtime_name(&c.callee)
                                 .and_then(willow_abi::runtime_symbol)
-                                .map_or(0, |s| s.effects().bits())
+                                .map_or(0, |s| s.effects().intersection(RuntimeEffects::ALL).bits())
                         }
                         _ => 0,
                     };

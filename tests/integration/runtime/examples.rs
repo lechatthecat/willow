@@ -109,6 +109,14 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/array_fast_paths.wi", "42\ntrue\ntrue\n42\n7\n"),
         ("example/array_growth.wi", "5\n55\n25\n16\n3\n"),
         (
+            "example/array_loop_safepoints.wi",
+            "499500\nsummed\n499500\n3\n5\n16\n6\n31415\n8\n12\ntrue\n3\ntrue\n12\n180\n460\n6765\n",
+        ),
+        (
+            "example/array_store_runs.wi",
+            "499500\ntrue\ntrue\n21\n69\n9\n41\n78\n41\n81\n21\n14\n31\n18\nfilled\n18\n23\n21\n60\n210\n200\n6\ntrue\n7\n101\n303\n",
+        ),
+        (
             "example/array_push_growth.wi",
             "true\ntrue\ntrue\ntrue\ntrue\ntrue\n",
         ),
@@ -159,6 +167,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "2\ntrue\n2\n-1\nhello Alice\n11\n12\nBob\n12\nBob scored 12\n14\n8\n21\n-1\n12\n7\n",
         ),
         ("example/constructor_flow.wi", "zero\n0\none\n1\nmany\n2\n"),
+        (
+            "example/constructor_flow_effects.wi",
+            "guarded cleanup\n3\n0\ninner recovered\n7\n",
+        ),
         ("example/constructor_lambdas.wi", "8\n402\n"),
         (
             "example/map_float_keys.wi",
