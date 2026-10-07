@@ -78,6 +78,51 @@ impl GcTrace for RuntimeSleepFuture {
     }
 }
 
+// Generated Future<void> values are monotonic millisecond deadlines, not
+// pointers. Zero denotes ready. Copies own no native storage, so aliases,
+// returns, discarded values, panic recovery and cancellation need no cleanup.
+static VALUE_EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+/// Make an allocation-free sleep value. Round the deadline up: millisecond
+/// quantization must never shorten the requested delay. u64 accommodates every
+/// nonnegative i64 duration plus process uptime (saturating at the ABI limit).
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_timer_value_sleep(ms: i64) -> u64 {
+    if ms <= 0 {
+        return 0;
+    }
+    let elapsed = VALUE_EPOCH.elapsed();
+    let now = elapsed.as_millis().min(u64::MAX as u128) as u64;
+    now.saturating_add(u64::from(!elapsed.subsec_nanos().is_multiple_of(1_000_000)))
+        .saturating_add(ms as u64)
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_timer_value_yield() -> u64 {
+    0
+}
+
+/// Await a copied deadline through the same scheduler-aware wait as native
+/// futures. Bounded chunks avoid Instant overflow even for i64::MAX durations.
+/// Native-stack cancellation ends the wait; generated call checks handle exit.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_timer_value_await(deadline: u64) -> u8 {
+    loop {
+        let now = VALUE_EPOCH.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let remaining = deadline.saturating_sub(now);
+        if remaining == 0 {
+            return 0;
+        }
+        let wait = future::WillowFutureVoid::sleep_after_millis(remaining.min(86_400_000) as i64);
+        if !wait.block_until_ready() {
+            return 0;
+        }
+    }
+}
+
 /// Returns a WillowFutureVoid that becomes ready after `ms` milliseconds.
 /// Non-blocking: does not sleep the calling thread.
 /// Use willow_future_is_ready_void to poll, willow_future_await_void to block.
@@ -100,6 +145,41 @@ pub extern "C" fn willow_runtime_yield() -> *mut std::ffi::c_void {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timer_values_allocate_no_native_storage_at_increasing_sizes() {
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+        // Initialize the epoch and TLS counters outside measurement.
+        let _ = willow_timer_value_sleep(1);
+        for count in [1, 16, 256, 4096] {
+            let before = counter::thread_allocations();
+            for _ in 0..count {
+                std::hint::black_box(willow_timer_value_sleep(60_000));
+                let ready = willow_timer_value_yield();
+                assert_eq!(willow_timer_value_await(ready), 0);
+                assert_eq!(willow_timer_value_await(ready), 0);
+            }
+            let allocations = counter::thread_allocations() - before;
+            assert_eq!(allocations, 0);
+            println!("future-values n={count} native_allocations={allocations}");
+        }
+    }
+
+    #[test]
+    fn timer_values_preserve_deadlines_and_copies() {
+        for ms in [i64::MIN, -1, 0] {
+            assert_eq!(willow_timer_value_sleep(ms), 0);
+        }
+        assert_eq!(willow_timer_value_yield(), 0);
+        let before = Instant::now();
+        let value = willow_timer_value_sleep(3);
+        let alias = value;
+        assert_eq!(willow_timer_value_await(alias), 0);
+        assert!(before.elapsed() >= Duration::from_millis(3));
+        assert_eq!(willow_timer_value_await(value), 0);
+        let huge = willow_timer_value_sleep(i64::MAX);
+        assert!(huge >= i64::MAX as u64);
+    }
 
     fn await_and_release(raw: *mut std::ffi::c_void) -> u8 {
         let result = future::willow_future_await_void(raw);

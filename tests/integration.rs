@@ -280,3 +280,6 @@ mod interface_pairs;
 
 #[path = "integration/reference_equality.rs"]
 mod reference_equality;
+
+#[path = "integration/future_values.rs"]
+mod future_values;

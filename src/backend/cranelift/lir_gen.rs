@@ -752,20 +752,11 @@ impl LirTypeCtx<'_> {
                 let (_, elem) = blocking_cell(ty).expect("guarded by the arm");
                 !matches!(elem, Type::Void) && self.supported_type_inner(elem, open)
             }
-            // A runtime future (willow-0g8j.3): one opaque pointer word that,
-            // unlike the blocking cells above (GC-managed since willow-9tls.5),
-            // is NOT GC-managed (`is_opaque_runtime_pointer_type`), so the
-            // walker copies it around without ever rooting or dereferencing
-            // it. Its output type is vetted anyway, because that is what an
-            // `await` of it would produce; `Void` is admitted, since
-            // `Future<void>` is the only instantiation the language can
-            // actually produce -- from `sleep` and `yield`.
-            //
-            // Awaiting a future VALUE is NOT a suspension: lowering refuses
-            // to split it (`lower_root_suspend`) and the walker emits the
-            // blocking `willow_future_await_*` call in place, so a function
-            // that stores a future and awaits it later stays inside the
-            // subset (willow-0g8j.3).
+            // Future<void> from sleep/yield is a copyable deadline word with
+            // no allocation or GC roots. Other Future<T> types retain the
+            // native handle ABI, but have no language-level producers.
+            // Stored-value awaits call the runtime in place; native-stack
+            // waits park through the scheduler without blocking its worker.
             Type::Generic(..) if builtin_types::unary_arg(ty, B::Future).is_some() => {
                 builtin_types::unary_arg(ty, B::Future)
                     .is_some_and(|output| self.supported_type_inner(output, open))

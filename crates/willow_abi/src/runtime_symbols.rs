@@ -222,7 +222,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     PANIC_ALLOC; "willow_map_get_into" => ([Ptr, Word, I64, Ptr] -> Some(I64));
     NONE; "willow_map_len" => ([Ptr] -> Some(I64));
     PANIC_ALLOC; "willow_map_contains" => ([Ptr, Word, I64] -> Some(I64));
-    // --- timer ---
+    // --- allocation-free generated Future<void> deadline values ---
+    NONE; "willow_timer_value_sleep" => ([I64] -> Some(I64));
+    NONE; "willow_timer_value_yield" => ([] -> Some(I64));
+    BLOCK; "willow_timer_value_await" => ([I64] -> Some(I8));
+    // --- legacy native timer handles ---
     NONE; "willow_runtime_sleep" => ([I64] -> Some(Ptr));
     NONE; "willow_runtime_yield" => ([] -> Some(Ptr));
     // --- netpoll ---
@@ -238,8 +242,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_future_ready_bool" => ([I8] -> Some(Ptr));
     NONE; "willow_future_ready_f64" => ([F64] -> Some(Ptr));
     NONE; "willow_future_ready_ptr" => ([Ptr] -> Some(Ptr));
-    // A stored sleep future waits with thread::sleep here. This blocks the
-    // calling OS thread; it neither suspends a task nor reaches the Willow GC.
+    // Park native-stack tasks via the scheduler; sleep only outside a task.
     BLOCK; "willow_future_await_void" => ([Ptr] -> Some(I8));
     NONE; "willow_future_await_i64" => ([Ptr] -> Some(I64));
     NONE; "willow_future_await_bool" => ([Ptr] -> Some(I8));

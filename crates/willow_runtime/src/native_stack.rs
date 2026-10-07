@@ -571,6 +571,25 @@ mod tests {
     }
 
     #[test]
+    fn timer_value_wait_parks_and_cancels_without_sleeping_worker() {
+        use crate::scheduler::*;
+        unsafe extern "C" fn sleeper(_: *mut c_void) -> i32 {
+            let value = crate::timer::willow_timer_value_sleep(i64::MAX);
+            crate::timer::willow_timer_value_await(value);
+            assert_ne!(cancelled(), 0);
+            RUNTIME_POLL_READY
+        }
+        let _guard = crate::gc::runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let task = willow_sched_spawn(sleeper, std::ptr::null_mut());
+        willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
+        assert_eq!(willow_sched_task_state(task), 2);
+        willow_sched_cancel(task);
+        willow_sched_run_until(task);
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
     fn affinity_bound_counts_shared_and_sparse_workers() {
         let registry = WorkerAffinities::default();
         assert_eq!(registry.required_workers(), 0);

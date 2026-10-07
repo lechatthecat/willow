@@ -3041,7 +3041,7 @@ mod tests {
     fn unit_async_codegen_02_sleep_builtin_lowers_to_runtime_sleep() {
         assert_eq!(
             builtin_call_runtime_name("sleep"),
-            Some("willow_runtime_sleep")
+            Some("willow_timer_value_sleep")
         );
     }
 
@@ -3049,7 +3049,7 @@ mod tests {
     fn unit_async_codegen_02c_yield_builtin_lowers_to_runtime_yield() {
         assert_eq!(
             builtin_call_runtime_name("yield"),
-            Some("willow_runtime_yield")
+            Some("willow_timer_value_yield")
         );
     }
 
@@ -3482,7 +3482,7 @@ mod tests {
     fn unit_async_codegen_10_future_await_runtime_selects_by_output_type() {
         assert_eq!(
             future_await_runtime_name(&Type::Void),
-            "willow_future_await_void"
+            "willow_timer_value_await"
         );
         assert_eq!(
             future_await_runtime_name(&Type::I64),

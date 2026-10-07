@@ -4,7 +4,8 @@
 //! The owner must call the matching `willow_future_release_*` exactly once after
 //! all uses and aliases have ended. Handles are not safe for concurrent access.
 //! Pointer results are borrowed payloads: releasing their future does not free
-//! the pointee. Compiler-generated lifetime cleanup is not yet implemented.
+//! the pointee. Generated sleep/yield futures use allocation-free deadline
+//! values in `timer`, not these native handles.
 
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
@@ -160,7 +161,9 @@ impl WillowFutureVoid {
         }
     }
 
-    pub fn block_until_ready(&self) {
+    /// Wait for a timer, returning false when native-stack cancellation
+    /// interrupts it. Ready/pending legacy variants keep their no-wait behavior.
+    pub fn block_until_ready(&self) -> bool {
         if let WillowFutureVoid::Sleep { deadline } = self {
             #[cfg(any(
                 all(
@@ -175,13 +178,13 @@ impl WillowFutureVoid {
                 all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             ))]
             if crate::native_stack::is_active() {
-                // Only generated code reaches this through
-                // `willow_future_await_void`; no runtime frame holds a managed
-                // pointer, so the parked task's root slots may be rewritten.
+                // Both the legacy handle and generated deadline-value await
+                // hold no managed pointer in their runtime frames, so the
+                // parked task's root slots may be rewritten.
                 let _relocation = crate::gc::RelocationSafeScope::enter();
                 while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
                     if crate::native_stack::cancelled() != 0 {
-                        return;
+                        return false;
                     }
                     // Round up so a sub-millisecond tail does not busy-poll.
                     let millis = remaining
@@ -190,13 +193,14 @@ impl WillowFutureVoid {
                     crate::scheduler::willow_sched_sleep(millis.min(i64::MAX as u128) as i64);
                     crate::native_stack::suspend_with_result(crate::task::RUNTIME_POLL_PENDING);
                 }
-                return;
+                return true;
             }
             let remaining = deadline.checked_duration_since(Instant::now());
             if let Some(remaining) = remaining {
                 std::thread::sleep(remaining);
             }
         }
+        true
     }
 }
 

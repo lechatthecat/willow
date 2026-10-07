@@ -83,7 +83,7 @@ pub(crate) fn debug_type_name<N: std::fmt::Display>(ty: &crate::parser::ast::Typ
 
 pub(crate) fn future_await_runtime_name(ty: &Type) -> &'static str {
     match ty {
-        Type::Void => "willow_future_await_void",
+        Type::Void => "willow_timer_value_await",
         Type::I64 => "willow_future_await_i64",
         Type::Bool => "willow_future_await_bool",
         Type::F64 => "willow_future_await_f64",

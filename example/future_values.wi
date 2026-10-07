@@ -1,0 +1,15 @@
+// Copyable, allocation-free timer futures: returning, aliasing and repeated await.
+fn timer() -> Future<void> {
+    return sleep(1);
+}
+
+async fn main() {
+    let original = timer();
+    let alias = original;
+    await alias;
+    await original;
+    for i in 0..1000 {
+        let unused = sleep(60000);
+    }
+    println("future values ok");
+}

@@ -2025,8 +2025,8 @@ pub(crate) fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
         "gc_old_region_reuses" => Some("willow_gc_old_region_reuses"),
         "gc_old_regions_released" => Some("willow_gc_old_regions_released"),
         "gc_major_collections" => Some("willow_gc_major_collections"),
-        "sleep" => Some("willow_runtime_sleep"),
-        "yield" => Some("willow_runtime_yield"),
+        "sleep" => Some("willow_timer_value_sleep"),
+        "yield" => Some("willow_timer_value_yield"),
         _ => None,
     }
 }

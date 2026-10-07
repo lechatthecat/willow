@@ -160,7 +160,7 @@ fn format_segments(args: &[HirExpr]) -> Option<Vec<crate::interpolate::Segment>>
     super::super::format_segments(args)
 }
 
-fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type, is_async: bool) -> bool {
+fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type) -> bool {
     let name = callee.unqualified_name();
     let name = name.as_deref().unwrap_or("");
     if !callee.is_free_named(name) {
@@ -181,14 +181,12 @@ fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type, is_async: 
         return args.is_empty();
     }
     if name == "sleep" {
-        return !is_async
-            && matches!(args, [arg] if arg.ty == Type::I64)
+        return matches!(args, [arg] if arg.ty == Type::I64)
             && (*result == Type::Void
                 || *result == Type::Generic(TypeId::local("Future"), vec![Type::Void]));
     }
     if name == "yield" {
-        return !is_async
-            && args.is_empty()
+        return args.is_empty()
             && (*result == Type::Void
                 || *result == Type::Generic(TypeId::local("Future"), vec![Type::Void]));
     }
@@ -360,7 +358,7 @@ fn scalar(
             || static_field(class, field, callables),
         HirExprKind::StaticCall { class, method, args } => enum_payloads(class, method, &node.ty, callables).is_some_and(|payloads| payloads.len() == args.len() && payloads.iter().zip(args).all(|(target, value)| argument_coercible(target, value, &callables.resolution))) || static_call(class, method, args, &node.ty, callables),
         HirExprKind::Await { inner } => crate::semantic::builtin_types::unary_arg(&inner.ty, crate::semantic::builtin_types::BuiltinTypeId::Future) == Some(&node.ty)
-            || (!is_async && node.ty == Type::Void && matches!(&inner.kind, HirExprKind::Call { callee, args } if (callee.is_free_named("sleep") || callee.is_free_named("yield")) && builtin_call(callee, args, &inner.ty, is_async))),
+            || (!is_async && node.ty == Type::Void && matches!(&inner.kind, HirExprKind::Call { callee, args } if (callee.is_free_named("sleep") || callee.is_free_named("yield")) && builtin_call(callee, args, &inner.ty))),
         HirExprKind::Array { .. } => matches!(node.ty, Type::Array(_)),
         HirExprKind::Index { .. } | HirExprKind::FieldAccess { .. } | HirExprKind::Range { .. } => true,
         HirExprKind::Unary { .. } => matches!(node.ty, Type::I64 | Type::F64 | Type::Bool),
@@ -373,7 +371,7 @@ fn scalar(
             matches!(&locals[local.0 as usize].ty, Type::Fn(params, result) | Type::Closure(params, result) if !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && **result == node.ty && params.len() == args.len() && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution)))
         } else { callables.get(callee).is_some_and(|(params, result)| *result == node.ty
                 && params.len() == args.len() && params.iter().zip(args).all(|(param, arg)| argument_coercible(param, arg, &callables.resolution)))
-                || builtin_call(callee, args, &node.ty, is_async) },
+                || builtin_call(callee, args, &node.ty) },
         HirExprKind::Binary { op, lhs, rhs } => !matches!(op, BinOp::And | BinOp::Or)
             && (matches!(lhs.ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
                 || (matches!(op, BinOp::Eq | BinOp::Ne) && identity_operand_type(lhs, rhs, &callables.resolution).is_some())

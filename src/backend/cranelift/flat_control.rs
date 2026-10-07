@@ -47,8 +47,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn emit_flat_await_future(&mut self, future: Value, result_ty: &Type) -> Value {
-        // Future<T> is an opaque, nonmoving runtime Box, not a GC heap
-        // object. Its runtime implementation owns any result roots.
+        // Future<void> is an allocation-free deadline word. Other output
+        // types retain the native handle ABI; neither is a GC heap pointer.
         self.emit_value_runtime_call(
             super::type_helpers::future_await_runtime_name(result_ty),
             &[future],

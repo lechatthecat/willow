@@ -496,3 +496,33 @@ fn abi_handshake_mismatch_exits_with_diagnostic() {
     assert!(error.contains("rebuild the program and runtime"), "{error}");
     assert!(!error.contains("mismatched ABI returned"));
 }
+
+#[test]
+fn timer_value_abi_is_scalar_and_wait_may_block() {
+    let _: extern "C" fn(i64) -> u64 = crate::timer::willow_timer_value_sleep;
+    let _: extern "C" fn() -> u64 = crate::timer::willow_timer_value_yield;
+    let _: extern "C" fn(u64) -> u8 = crate::timer::willow_timer_value_await;
+    for (name, params, ret, effects) in [
+        (
+            "willow_timer_value_sleep",
+            &[I64][..],
+            Some(I64),
+            willow_abi::RuntimeEffects::NONE,
+        ),
+        (
+            "willow_timer_value_yield",
+            &[][..],
+            Some(I64),
+            willow_abi::RuntimeEffects::NONE,
+        ),
+        (
+            "willow_timer_value_await",
+            &[I64][..],
+            Some(I8),
+            willow_abi::RuntimeEffects::MAY_BLOCK,
+        ),
+    ] {
+        assert_schema(name, params, ret);
+        assert_eq!(runtime_symbol(name).unwrap().effects(), effects);
+    }
+}
