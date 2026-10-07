@@ -34,6 +34,7 @@ use super::typed_ast::{
 
 pub mod async_liveness;
 mod lifetime;
+mod liveness;
 pub mod value;
 pub use value::{LirOperand, LirPlace, LirRvalue};
 
@@ -713,11 +714,11 @@ pub(crate) fn lower_source_program_with(
         super::optimize::eliminate_tail_recursion(function);
         super::optimize::inline_scalar_recursion(function, overflow_checks);
         super::optimize::unroll_scalar_loops(function);
-        lifetime::clear_dead_temporaries(function);
+        let liveness = lifetime::clear_dead_temporaries(function);
         function.async_frame = if function.is_async {
             #[cfg(test)]
             FINAL_ASYNC_ANALYSES.with(|count| count.set(count.get() + 1));
-            async_liveness::analyze(&function.blocks, &function.locals)
+            async_liveness::analyze_with(&function.blocks, &function.locals, &liveness)
         } else {
             LirAsyncFrameLayout::default()
         };
@@ -1040,11 +1041,9 @@ fn lower_function(
         is_async: f.is_async,
         params: f.params.clone(),
         return_type: f.return_type.clone(),
-        async_frame: if f.is_async {
-            async_liveness::analyze(&blocks, &locals)
-        } else {
-            LirAsyncFrameLayout::default()
-        },
+        // Planned once over the final graph after optimization and root
+        // clearing; every earlier layout would be discarded unread.
+        async_frame: LirAsyncFrameLayout::default(),
         blocks,
         locals,
         captures: Vec::new(),
@@ -4987,6 +4986,97 @@ mod tests {
             .find(|local| local.name == "s")
             .unwrap();
         assert!(function.async_frame.slot(captured.id).is_some());
+    }
+
+    #[test]
+    fn async_bodies_solve_liveness_once_per_lowered_body() {
+        // Root clearing and frame planning share one solve per body; earlier
+        // lowering and optimization stages no longer plan discarded frames.
+        for n in [1, 4, 16] {
+            let source = (0..n)
+                .map(|i| format!(
+                    "async fn f{i}(s: String) {{ defer {{ print(s); }} let a = 1; await yield(); print(a); let callback = |y: i64| -> i64 {{ return y; }}; print(callback(a)); }}"
+                ))
+                .collect::<String>();
+            liveness::SOLVES.with(|count| count.set(0));
+            FINAL_ASYNC_ANALYSES.with(|count| count.set(0));
+            let program = lir(&source);
+            let mut bodies = 0;
+            let mut pending: Vec<_> = program
+                .functions
+                .iter()
+                .chain(program.lambdas.iter().map(|lambda| &lambda.function))
+                .collect();
+            while let Some(function) = pending.pop() {
+                bodies += 1;
+                for inst in function.blocks.iter().flat_map(|block| &block.instrs) {
+                    if let SourceInst::Defer { body, .. } = inst {
+                        pending.push(&body.function);
+                    }
+                }
+            }
+            assert_eq!(bodies, 3 * n);
+            assert_eq!(FINAL_ASYNC_ANALYSES.with(|count| count.get()), n);
+            assert_eq!(liveness::SOLVES.with(|count| count.get()), bodies);
+            for i in 0..n {
+                let function = func(&program, &format!("f{i}"));
+                assert_eq!(
+                    function.async_frame,
+                    async_liveness::analyze(&function.blocks, &function.locals)
+                );
+            }
+            println!("async functions={n} lowered bodies={bodies} liveness solves={bodies}");
+        }
+    }
+
+    #[test]
+    fn nested_async_loop_liveness_work_is_linear_in_result_size() {
+        // Each level suspends inside its own loop and a string defined before
+        // the nest is read innermost, so liveness crosses every backedge.
+        // The former reverse-order rescans needed a round per nesting level.
+        let mut previous = None;
+        for depth in [25, 50, 100, 200] {
+            let mut source = String::from("async fn work() { let keep = \"kept\";");
+            for level in 0..depth {
+                source.push_str(&format!(
+                    "let mut k{level} = 0; while k{level} < 1 {{ await yield(); k{level} = k{level} + 1;"
+                ));
+            }
+            source.push_str("print(keep);");
+            source.push_str(&"}".repeat(depth));
+            source.push('}');
+            let program = lir(&source);
+            let work = func(&program, "work");
+            let live = liveness::Liveness::compute(&work.blocks, &work.locals);
+            let edges: usize = work
+                .blocks
+                .iter()
+                .map(|block| {
+                    liveness::normal_successors(&block.terminator).count() + block.recovery.len()
+                })
+                .sum();
+            let entries: usize = (0..work.blocks.len())
+                .map(|block| live.live_in.iter(block).count())
+                .sum();
+            println!(
+                "nested async loops depth={depth} blocks={} edges={edges} locals={} live_in_entries={} edge_visits={} set_bytes={}",
+                work.blocks.len(),
+                work.locals.len(),
+                live.stats.entries,
+                live.stats.edge_visits,
+                live.set_bytes(),
+            );
+            assert_eq!(live.stats.entries, entries);
+            // The result itself grows with depth * blocks (each loop counter
+            // stays live through every deeper loop); the solver performs one
+            // edge visit per carried membership, with no per-level rescans.
+            let per_entry = live.stats.edge_visits as f64 / entries as f64;
+            assert!(per_entry <= 2.0, "{per_entry}");
+            if let Some(previous) = previous {
+                assert!(per_entry <= previous * 1.1, "{per_entry} after {previous}");
+            }
+            previous = Some(per_entry);
+        }
     }
 
     #[test]

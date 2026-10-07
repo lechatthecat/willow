@@ -1590,9 +1590,6 @@ pub(in crate::ir::lowered) fn lower_calls(
         .collect();
     while let Some(f) = pending.pop() {
         lower_blocks_with(&mut f.blocks, &mut f.locals, &callables, f.is_async);
-        if f.is_async {
-            f.async_frame = super::super::async_liveness::analyze(&f.blocks, &f.locals);
-        }
         for block in &mut f.blocks {
             for inst in &mut block.instrs {
                 if let SourceInst::Defer { body, .. } = inst {

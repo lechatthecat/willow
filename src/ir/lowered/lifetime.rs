@@ -1,24 +1,30 @@
 //! End root ownership at last use. Async source bindings must also release
 //! their frame slots before suspending after their final read.
 use super::async_liveness::{instruction_use_def, terminator_uses};
-use super::{BlockId, LirLocalId, SourceBlock, SourceFunction, SourceInst, SourceTerminator};
+use super::liveness::{self, Liveness};
+use super::{BlockId, SourceBlock, SourceFunction, SourceInst, SourceTerminator};
 use std::collections::{HashMap, HashSet};
 
-pub(super) fn clear_dead_temporaries(function: &mut SourceFunction) {
+/// Insert last-use root clears into `function` and its defer bodies. Returns
+/// the root body's liveness, updated for split edges, so async frame planning
+/// reuses it instead of solving the same equations again.
+pub(super) fn clear_dead_temporaries(function: &mut SourceFunction) -> Liveness {
+    let root = clear_function(function);
     let mut functions = vec![function];
     while let Some(function) = functions.pop() {
-        clear_function(function);
         for block in &mut function.blocks {
             for instruction in &mut block.instrs {
                 if let SourceInst::Defer { body, .. } = instruction {
+                    clear_function(body.function.as_mut());
                     functions.push(body.function.as_mut());
                 }
             }
         }
     }
+    root
 }
 
-fn clear_function(function: &mut SourceFunction) {
+fn clear_function(function: &mut SourceFunction) -> Liveness {
     let names: HashMap<_, _> = function
         .locals
         .iter()
@@ -48,77 +54,46 @@ fn clear_function(function: &mut SourceFunction) {
             captured.extend([slots.handle, slots.token, slots.phase, slots.binding]);
         }
     }
-    let clearable = |id: &LirLocalId| {
-        function.locals.get(id.0 as usize).is_some_and(|local| {
-            (local.synthetic || function.is_async)
-                && !local.parameter
-                && !captured.contains(id)
-                && (local.storage_kind == super::LirStorageKind::GcOwner
-                    || matches!(
-                        local.ty,
-                        crate::semantic::ids::SemanticType::String
-                            | crate::semantic::ids::SemanticType::Array(_)
-                            | crate::semantic::ids::SemanticType::Named(_)
-                            | crate::semantic::ids::SemanticType::Generic(..)
-                            | crate::semantic::ids::SemanticType::Closure(..)
-                    ))
-        })
-    };
-    let mut uses = vec![HashSet::new(); function.blocks.len()];
-    let mut defs = uses.clone();
-    let mut successors = vec![Vec::new(); function.blocks.len()];
-    for (index, block) in function.blocks.iter().enumerate() {
-        for instruction in &block.instrs {
-            instruction_use_def(instruction, &names, &mut uses[index], &mut defs[index]);
-        }
-        terminator_uses(&block.terminator, &names, &mut uses[index], &defs[index]);
-        successors[index] = match block.terminator {
-            SourceTerminator::Jump(target) | SourceTerminator::Suspend { resume: target, .. } => {
-                vec![target.0]
-            }
-            SourceTerminator::Branch {
-                then_block,
-                else_block,
-                ..
-            } => vec![then_block.0, else_block.0],
-            _ => Vec::new(),
-        };
-        successors[index].extend(block.recovery.iter().map(|target| target.0));
-    }
-    let mut live_in = uses.clone();
-    let mut live_out = vec![HashSet::new(); function.blocks.len()];
-    loop {
-        let mut changed = false;
-        for index in (0..function.blocks.len()).rev() {
-            let out: HashSet<_> = successors[index]
-                .iter()
-                .flat_map(|&target| live_in[target].iter().copied())
-                .collect();
-            let mut input = uses[index].clone();
-            input.extend(out.difference(&defs[index]).copied());
-            // A panic may transfer before any definition in this block. A
-            // later assignment cannot kill the value that recovery would see.
-            for target in &function.blocks[index].recovery {
-                input.extend(&live_in[target.0]);
-            }
-            changed |= input != live_in[index] || out != live_out[index];
-            live_in[index] = input;
-            live_out[index] = out;
-        }
-        if !changed {
-            break;
+    let mut clearable = vec![0u64; function.locals.len().div_ceil(64)];
+    for local in &function.locals {
+        if (local.synthetic || function.is_async)
+            && !local.parameter
+            && !captured.contains(&local.id)
+            && (local.storage_kind == super::LirStorageKind::GcOwner
+                || matches!(
+                    local.ty,
+                    crate::semantic::ids::SemanticType::String
+                        | crate::semantic::ids::SemanticType::Array(_)
+                        | crate::semantic::ids::SemanticType::Named(_)
+                        | crate::semantic::ids::SemanticType::Generic(..)
+                        | crate::semantic::ids::SemanticType::Closure(..)
+                ))
+        {
+            liveness::insert(&mut clearable, local.id);
         }
     }
+    let mut live_sets = Liveness::compute_named(&function.blocks, function.locals.len(), &names);
     let mut edges = Vec::new();
     let original_blocks = function.blocks.len();
+    let mut read = HashSet::new();
+    let mut written = HashSet::new();
+    let mut recovery_live = vec![0u64; clearable.len()];
     for (index, block) in function.blocks.iter_mut().enumerate() {
-        let mut live = live_out[index].clone();
-        let recovery_live: HashSet<_> = block
-            .recovery
-            .iter()
-            .flat_map(|target| live_in[target.0].iter().copied())
-            .collect();
-        terminator_uses(&block.terminator, &names, &mut live, &HashSet::new());
+        let mut live = live_sets.live_out.row(index).to_vec();
+        // Recovery targets are successors, so `live` already contains their
+        // live-in sets; the instruction walk below never removes them.
+        recovery_live.fill(0);
+        for target in &block.recovery {
+            for (word, bits) in recovery_live
+                .iter_mut()
+                .zip(live_sets.live_in.row(target.0))
+            {
+                *word |= bits;
+            }
+        }
+        read.clear();
+        terminator_uses(&block.terminator, &names, &mut read, &HashSet::new());
+        read.iter().for_each(|&id| liveness::insert(&mut live, id));
         // A value used only on one branch dies on the other edge, even when
         // that edge contains no read at which to insert a last-use clear.
         // Split only edges that need stores; normal and recovery CFG edges
@@ -138,12 +113,13 @@ fn clear_function(function: &mut SourceFunction) {
                 _ => Vec::new(),
             };
             for target in targets {
-                let mut cleared: Vec<_> = live
-                    .difference(&live_in[target.0])
-                    .filter(|id| clearable(id))
-                    .copied()
+                let dead: Vec<u64> = live
+                    .iter()
+                    .zip(live_sets.live_in.row(target.0))
+                    .zip(&clearable)
+                    .map(|((live, next), clearable)| live & !next & clearable)
                     .collect();
-                cleared.sort_by_key(|id| id.0);
+                let cleared: Vec<_> = liveness::ones(&dead).collect();
                 if !cleared.is_empty() {
                     let id = BlockId(original_blocks + edges.len());
                     edges.push(SourceBlock {
@@ -152,33 +128,38 @@ fn clear_function(function: &mut SourceFunction) {
                         terminator: SourceTerminator::Jump(*target),
                         recovery: Vec::new(),
                     });
+                    live_sets.push_forwarding_block(target.0);
                     *target = id;
                 }
             }
         }
         let mut reversed = Vec::with_capacity(block.instrs.len());
         for instruction in std::mem::take(&mut block.instrs).into_iter().rev() {
-            let mut read = HashSet::new();
-            let mut written = HashSet::new();
+            read.clear();
+            written.clear();
             instruction_use_def(&instruction, &names, &mut read, &mut written);
             let mut clear: Vec<_> = read
                 .union(&written)
-                .filter(|id| clearable(id) && !live.contains(id))
+                .filter(|&&id| liveness::contains(&clearable, id) && !liveness::contains(&live, id))
                 .copied()
                 .collect();
             clear.sort_by_key(|id| id.0);
             if !clear.is_empty() {
                 reversed.push(SourceInst::ClearScopeRoots { locals: clear });
             }
-            live.retain(|id| !written.contains(id));
-            live.extend(&recovery_live);
-            live.extend(read);
+            for &id in &written {
+                if !liveness::contains(&recovery_live, id) {
+                    liveness::remove(&mut live, id);
+                }
+            }
+            read.iter().for_each(|&id| liveness::insert(&mut live, id));
             reversed.push(instruction);
         }
         reversed.reverse();
         block.instrs = reversed;
     }
     function.blocks.extend(edges);
+    live_sets
 }
 
 #[cfg(test)]

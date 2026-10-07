@@ -872,10 +872,6 @@ pub(crate) fn inline_scalar_leaves(
             block.instrs = instructions;
         }
         eliminate_dead_values(&mut function.blocks, &function.locals);
-        if function.is_async {
-            function.async_frame =
-                super::lowered::async_liveness::analyze(&function.blocks, &function.locals);
-        }
     }
 }
 

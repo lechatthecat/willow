@@ -8,9 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
 
-use super::{
-    BlockId, LirLocal, LirLocalId, LirSelectOp, SourceBlock, SourceInst, SourceTerminator,
-};
+use super::liveness::{self, Liveness};
+use super::{LirLocal, LirLocalId, LirSelectOp, SourceBlock, SourceInst, SourceTerminator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FrameSlot {
@@ -30,47 +29,27 @@ impl LirAsyncFrameLayout {
 }
 
 /// Compute the exact set of locals live across explicit LIR suspension edges.
+#[cfg(test)]
 pub(crate) fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout {
+    analyze_with(blocks, locals, &Liveness::compute(blocks, locals))
+}
+
+/// Plan the frame from liveness already solved for exactly `blocks`.
+pub(crate) fn analyze_with(
+    blocks: &[SourceBlock],
+    locals: &[LirLocal],
+    liveness: &Liveness,
+) -> LirAsyncFrameLayout {
+    debug_assert_eq!(liveness.live_in.rows(), blocks.len());
     let names: HashMap<&str, LirLocalId> = locals
         .iter()
         .map(|local| (local.name.as_str(), local.id))
         .collect();
-    let mut uses = vec![HashSet::new(); blocks.len()];
-    let mut defs = vec![HashSet::new(); blocks.len()];
-    for block in blocks {
-        block_use_def(block, &names, &mut uses[block.id.0], &mut defs[block.id.0]);
-    }
-
-    let mut live_in = vec![HashSet::new(); blocks.len()];
-    let mut live_out = vec![HashSet::new(); blocks.len()];
-    loop {
-        let mut changed = false;
-        for block in blocks.iter().rev() {
-            let mut out = HashSet::new();
-            for successor in successors(block) {
-                out.extend(live_in[successor.0].iter().copied());
-            }
-            let mut input = uses[block.id.0].clone();
-            input.extend(out.difference(&defs[block.id.0]).copied());
-            // Recovery can leave from any instruction, including before a
-            // later assignment to a local read by the recovery continuation.
-            for target in &block.recovery {
-                input.extend(&live_in[target.0]);
-            }
-            changed |= out != live_out[block.id.0] || input != live_in[block.id.0];
-            live_out[block.id.0] = out;
-            live_in[block.id.0] = input;
-        }
-        if !changed {
-            break;
-        }
-    }
-
     let mut framed = HashSet::new();
     let mut pinned = HashSet::new();
     for block in blocks {
         if let SourceTerminator::Suspend { operation, .. } = &block.terminator {
-            framed.extend(live_out[block.id.0].iter().copied());
+            framed.extend(liveness.live_out.iter(block.id.0));
             operation.collect_locals(&mut pinned);
         }
         for inst in &block.instrs {
@@ -134,29 +113,32 @@ pub(crate) fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFr
             .filter(|local| local.parameter)
             .map(|local| local.id),
     );
-    // A block is an indivisible interference region. Include writes and root
-    // clears even when ordinary liveness does not consider them reads: either
-    // can overwrite another logical local's physical frame slot.
-    let mut regions = vec![HashSet::new(); locals.len()];
+    // A block is an indivisible interference region. Include writes even when
+    // ordinary liveness does not consider them reads: they can overwrite
+    // another logical local's physical frame slot. Only framed scalars that
+    // may share a slot need regions, and root clears never touch them:
+    // primitive locals have no root, so the backend emits no store for a
+    // scalar named in a scope-exit `ClearScopeRoots` list.
+    let candidate = |local: &LirLocal| {
+        framed.contains(&local.id) && !pinned.contains(&local.id) && reusable_scalar(local)
+    };
+    let mut candidates = vec![0u64; locals.len().div_ceil(64)];
+    for local in locals.iter().filter(|local| candidate(local)) {
+        liveness::insert(&mut candidates, local.id);
+    }
+    let mut regions = vec![Vec::new(); locals.len()];
+    let mut touched = vec![0u64; candidates.len()];
     for block in blocks {
-        let mut touched = live_in[block.id.0].clone();
-        touched.extend(&live_out[block.id.0]);
-        touched.extend(&uses[block.id.0]);
-        touched.extend(&defs[block.id.0]);
-        for inst in &block.instrs {
-            if let SourceInst::ClearScopeRoots { locals: cleared } = inst {
-                // Primitive locals have no root to clear; the backend emits
-                // no store for them. Scope-exit lists include all source
-                // locals, including scalars whose lifetimes already ended.
-                touched.extend(
-                    cleared
-                        .iter()
-                        .filter(|id| !reusable_scalar(&locals[id.0 as usize])),
-                );
-            }
+        let index = block.id.0;
+        for (word, touched) in touched.iter_mut().enumerate() {
+            *touched = candidates[word]
+                & (liveness.live_in.row(index)[word]
+                    | liveness.live_out.row(index)[word]
+                    | liveness.uses.row(index)[word]
+                    | liveness.defs.row(index)[word]);
         }
-        for local in touched {
-            regions[local.0 as usize].insert(block.id.0);
+        for local in liveness::ones(&touched) {
+            regions[local.0 as usize].push(index);
         }
     }
     let mut slots = Vec::new();
@@ -173,8 +155,10 @@ pub(crate) fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFr
                         !pinned.contains(&other.id)
                             && reusable_scalar(other)
                             && other.ty == local.ty
-                            && regions[local.id.0 as usize]
-                                .is_disjoint(&regions[other.id.0 as usize])
+                            && disjoint(
+                                &regions[local.id.0 as usize],
+                                &regions[other.id.0 as usize],
+                            )
                     })
                 })
             })
@@ -225,18 +209,6 @@ fn collect_select_locals(operation: &LirSelectOp, out: &mut HashSet<LirLocalId>)
         }
         LirSelectOp::Default => {}
     }
-}
-
-fn block_use_def(
-    block: &SourceBlock,
-    names: &HashMap<&str, LirLocalId>,
-    uses: &mut HashSet<LirLocalId>,
-    defs: &mut HashSet<LirLocalId>,
-) {
-    for inst in &block.instrs {
-        instruction_use_def(inst, names, uses, defs);
-    }
-    terminator_uses(&block.terminator, names, uses, defs);
 }
 
 pub(crate) fn instruction_use_def(
@@ -446,22 +418,17 @@ fn collect_expr_uses(
     }
 }
 
-/// Control-flow successors INCLUDING the panic edges: a value whose only later
-/// use is after a recovered panic is still live here, and the whole point of
-/// this pass is to decide what must survive a poll return.
-fn successors(block: &SourceBlock) -> Vec<BlockId> {
-    let mut out = match &block.terminator {
-        SourceTerminator::Jump(target) => vec![*target],
-        SourceTerminator::Branch {
-            then_block,
-            else_block,
-            ..
-        } => vec![*then_block, *else_block],
-        SourceTerminator::Suspend { resume, .. } => vec![*resume],
-        SourceTerminator::Return(_) | SourceTerminator::CleanupReturn => Vec::new(),
-    };
-    out.extend(block.recovery.iter().copied());
-    out
+/// Whether two ascending block-id lists share no block.
+fn disjoint(left: &[usize], right: &[usize]) -> bool {
+    let (mut l, mut r) = (0, 0);
+    while l < left.len() && r < right.len() {
+        match left[l].cmp(&right[r]) {
+            std::cmp::Ordering::Less => l += 1,
+            std::cmp::Ordering::Greater => r += 1,
+            std::cmp::Ordering::Equal => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
