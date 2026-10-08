@@ -155,20 +155,30 @@ fn main() {
 
 #[test]
 fn panic_recover_07_non_void_outer_scope_is_rejected() {
-    assert_compile_error_contains(
-        r#"
-fn value() -> i64 {
-    defer match recover() { Some(_) => {}, None => {} }
+    for prefix in [
+        "",
+        "let (x,) = (1,);",
+        "let (x,): (i64,) = (1,);",
+        "let (x,) = (1,); let (y,) = (x,);",
+    ] {
+        assert_compile_error_contains(
+            &format!(
+                r#"
+fn value() -> i64 {{
+    {prefix}
+    defer match recover() {{ Some(_) => {{}}, None => {{}} }}
     panic("boom");
-}
-fn main() {}
-"#,
-        &[
-            "E0905",
-            "outermost recovery scope",
-            "without a return value",
-        ],
-    );
+}}
+fn main() {{}}
+"#
+            ),
+            &[
+                "E0905",
+                "outermost recovery scope",
+                "without a return value",
+            ],
+        );
+    }
 }
 
 #[test]

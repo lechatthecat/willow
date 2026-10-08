@@ -808,7 +808,7 @@ struct Binding {
 /// return types used to type `Call` expressions.
 struct LowerCtx<'a> {
     arm_leaves: HashMap<crate::parser::ast::BodyId, bool>,
-    scopes: Vec<HashMap<String, Binding>>,
+    scopes: crate::semantic::scopes::Scopes<Binding>,
     /// Scope depth immediately outside the current function/lambda body.
     /// Used to distinguish a body-wide callable shadow from a nested one.
     namespace_scope_base: usize,
@@ -833,7 +833,7 @@ impl<'a> LowerCtx<'a> {
     ) -> Self {
         Self {
             arm_leaves: HashMap::new(),
-            scopes: vec![HashMap::new()],
+            scopes: crate::semantic::scopes::Scopes::with_frame([]),
             namespace_scope_base: 1,
             binds_seen: HashMap::new(),
             next_defer_id: 0,
@@ -851,7 +851,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push();
     }
 
     fn pop_scope(&mut self) {
@@ -878,7 +878,7 @@ impl<'a> LowerCtx<'a> {
             // can never collide with one the program wrote.
             format!("{name}${seen}")
         };
-        self.scopes.last_mut().expect("at least one scope").insert(
+        self.scopes.insert(
             name,
             Binding {
                 ty,
@@ -889,7 +889,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn lookup(&self, name: &str) -> Option<&Binding> {
-        self.scopes.iter().rev().find_map(|s| s.get(name))
+        self.scopes.get(name)
     }
 
     /// The HIR name of a local binding, or `name` itself when nothing in scope

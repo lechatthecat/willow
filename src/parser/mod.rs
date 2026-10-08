@@ -8,6 +8,7 @@ pub mod iter;
 pub(crate) mod ownership;
 mod pattern;
 mod stmt;
+pub(crate) mod tuples;
 mod types;
 pub mod visit;
 
@@ -16,6 +17,7 @@ use crate::lexer::token::{Token, TokenKind};
 use ast::*;
 
 pub struct Parser {
+    tuple_arities: std::collections::HashSet<usize>,
     type_uses: Vec<TypeUse>,
     tokens: Vec<Token>,
     pos: usize,
@@ -94,6 +96,7 @@ fn ternary_colon_table(tokens: &[Token]) -> Vec<bool> {
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         Self {
+            tuple_arities: Default::default(),
             type_uses: Vec::new(),
             tokens,
             pos: 0,
@@ -173,6 +176,9 @@ impl Parser {
                 .primary_span()
                 .map(|span| (span.file_id.0, span.start))
         });
+        let mut arities: Vec<_> = self.tuple_arities.iter().copied().collect();
+        arities.sort_unstable();
+        items.extend(arities.into_iter().map(tuples::declaration));
         (
             Program {
                 type_uses: std::mem::take(&mut self.type_uses),

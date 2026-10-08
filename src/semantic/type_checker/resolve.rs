@@ -25,7 +25,7 @@ pub(crate) fn qualify_local_type(
     local: &std::collections::HashSet<String>,
 ) -> Type {
     ty.map_names(|name| {
-        if !name.contains("::") && local.contains(name) {
+        if !name.contains("::") && local.contains(name) && !crate::parser::tuples::is_tuple(name) {
             format!("{module}::{name}")
         } else {
             name.clone()
@@ -102,7 +102,9 @@ fn imported_enum_info(
                     // Imported metadata must preserve the same parameter
                     // bindings as the declaring module's normalization.
                     ty.map_names(|name| {
-                        if decl.type_params.contains(name) {
+                        if crate::parser::tuples::is_tuple(&decl.name)
+                            || decl.type_params.contains(name)
+                        {
                             return name.clone();
                         }
                         let Type::Named(ref qualified) = qualify(&Type::Named(name.clone())) else {
@@ -117,7 +119,11 @@ fn imported_enum_info(
         });
     }
     EnumInfo {
-        name: format!("{canonical}::{}", decl.name),
+        name: if crate::parser::tuples::is_tuple(&decl.name) {
+            decl.name.clone()
+        } else {
+            format!("{canonical}::{}", decl.name)
+        },
         public: decl.public,
         type_params: decl.type_params.clone(),
         variants: variant_infos,
@@ -927,7 +933,13 @@ impl TypeChecker {
                 payload_types: variant
                     .payload
                     .iter()
-                    .map(|ty| self.normalize_declared_type(ty, &decl.type_params, variant.span))
+                    .map(|ty| {
+                        if crate::parser::tuples::is_tuple(&decl.name) {
+                            ty.clone()
+                        } else {
+                            self.normalize_declared_type(ty, &decl.type_params, variant.span)
+                        }
+                    })
                     .collect(),
                 tag: tag as i64,
                 declaration_span: variant.span,
@@ -949,8 +961,10 @@ impl TypeChecker {
 
     fn define_declared_enum(&mut self, decl: &EnumDecl, variants: Vec<EnumVariantInfo>) {
         let canonical = match self.module_path.as_deref() {
-            Some(module) => format!("{module}::{}", decl.name),
-            None => decl.name.clone(),
+            Some(module) if !crate::parser::tuples::is_tuple(&decl.name) => {
+                format!("{module}::{}", decl.name)
+            }
+            _ => decl.name.clone(),
         };
         let info = EnumInfo {
             name: canonical.clone(),
@@ -1792,6 +1806,9 @@ impl TypeChecker {
                 let checked_args: Vec<Type> =
                     args.iter().map(|a| self.check_expr(&a.expr)).collect();
 
+                if crate::parser::tuples::is_tuple(&enum_info.name) {
+                    return Type::Generic(enum_info.name.clone(), checked_args);
+                }
                 // Build type argument vector: for each type param, find the
                 // variant payload position that uses it and use the arg type.
                 // Unknown parameters default to Void.
@@ -2568,6 +2585,9 @@ impl TypeChecker {
         variant_name: &str,
         scrutinee_ty: &Type,
     ) -> Option<Vec<Type>> {
+        if !matches!(scrutinee_ty, Type::Named(n) | Type::Generic(n, _) if n == enum_name) {
+            return None;
+        }
         let enum_info = self.symbols.lookup_enum(enum_name)?;
         let type_args: &[Type] = if let Type::Generic(n, args) = scrutinee_ty {
             if n == enum_name { args.as_slice() } else { &[] }

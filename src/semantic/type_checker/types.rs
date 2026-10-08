@@ -90,15 +90,21 @@ pub(crate) fn type_name<N: std::fmt::Display>(ty: &Type<N>) -> String {
                     work.push(Part::Text("Array<"));
                 }
                 Type::Generic(name, args) => {
-                    work.push(Part::Text(">"));
+                    let tuple = crate::parser::tuples::is_tuple(&name.to_string());
+                    work.push(Part::Text(if tuple { ")" } else { ">" }));
+                    if tuple && args.len() == 1 {
+                        work.push(Part::Text(","));
+                    }
                     for (index, arg) in args.iter().enumerate().rev() {
                         work.push(Part::Type(arg));
                         if index > 0 {
                             work.push(Part::Text(", "));
                         }
                     }
-                    work.push(Part::Text("<"));
-                    work.push(Part::Name(name));
+                    work.push(Part::Text(if tuple { "(" } else { "<" }));
+                    if !tuple {
+                        work.push(Part::Name(name));
+                    }
                 }
                 Type::Fn(params, ret) | Type::Closure(params, ret) => {
                     work.push(Part::Type(ret));

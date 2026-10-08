@@ -8,6 +8,7 @@ impl Parser {
     pub(super) fn parse_type(&mut self) -> Result<Type, Diagnostic> {
         enum Frame {
             Generic(String, Vec<Type>),
+            Tuple(Vec<Type>),
             Params(bool, Vec<Type>),
             Return(bool, Vec<Type>),
         }
@@ -58,6 +59,11 @@ impl Parser {
                     self.advance();
                     self.advance();
                     Type::Void
+                }
+                TokenKind::LParen => {
+                    self.advance();
+                    frames.push(Frame::Tuple(Vec::new()));
+                    continue;
                 }
                 TokenKind::Fn => {
                     self.advance();
@@ -128,6 +134,21 @@ impl Parser {
                     None => return Ok(value),
                     Some(Frame::Return(closure, params)) => {
                         value = callable(closure, params, value);
+                    }
+                    Some(Frame::Tuple(mut args)) => {
+                        args.push(value);
+                        let comma = self.eat(TokenKind::Comma);
+                        if comma && !self.check(TokenKind::RParen) && !self.at_eof() {
+                            frames.push(Frame::Tuple(args));
+                            break;
+                        }
+                        self.expect(TokenKind::RParen)?;
+                        if args.len() == 1 && !comma {
+                            value = args.pop().unwrap();
+                        } else {
+                            self.tuple_arities.insert(args.len());
+                            value = Type::Generic(super::tuples::name(args.len()), args);
+                        }
                     }
                     Some(Frame::Generic(name, mut args)) => {
                         args.push(value);
@@ -237,8 +258,8 @@ mod tests {
     }
 
     #[test]
-    fn nonempty_parenthesized_types_stay_unsupported() {
-        for ty in ["(i64)", "(i64, bool)", "(void)", "(,)"] {
+    fn malformed_tuple_type_is_rejected() {
+        for ty in ["(,)", "(i64,, bool)", "(i64, bool,,)"] {
             let errors = check(&format!("fn consume(t: {ty}) {{}} fn main() {{}}"));
             assert!(!errors.is_empty(), "{ty}");
             assert!(

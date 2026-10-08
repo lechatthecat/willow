@@ -14,6 +14,12 @@ impl TypeChecker {
     /// kind of bare name a payload may use without declaring it. Registration
     /// cannot judge this: a payload may name a type declared later in the file.
     pub(super) fn check_enum(&mut self, decl: &EnumDecl) {
+        // The parser creates exactly one bound parameter per tuple position.
+        // Revalidating these generated names against a slice would be quadratic.
+        if crate::parser::tuples::is_tuple(&decl.name) {
+            return;
+        }
+
         // A declaration that failed to register (a reserved name) has nothing
         // to validate; the registration diagnostic already owns it.
         let Some(info) = self.symbols.lookup_enum(&decl.name).cloned() else {

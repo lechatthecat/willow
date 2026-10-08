@@ -1174,6 +1174,8 @@ pub enum MatchSource {
     IfLet,
     /// `while let P = e { .. }` → `while true { match e { P => { .. }, _ => { break; } } }`.
     WhileLet,
+    /// Destructuring let's remainder: a binding scope, not a source block.
+    TupleLet,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

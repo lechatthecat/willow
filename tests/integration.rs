@@ -292,3 +292,6 @@ mod generic_closer_equals;
 
 #[path = "integration/native_stack_slots.rs"]
 mod native_stack_slots;
+
+#[path = "integration/tuples.rs"]
+mod tuples;

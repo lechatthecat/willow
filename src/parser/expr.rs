@@ -635,10 +635,31 @@ impl Parser {
                 }
             }
             TokenKind::LParen => {
+                let span = self.current_span();
                 self.advance();
                 let expr = self.parse_expr()?;
+                if !self.eat(TokenKind::Comma) {
+                    self.expect(TokenKind::RParen)?;
+                    return Ok(expr);
+                }
+                let mut args = vec![CallArg::value(expr)];
+                while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+                    args.push(CallArg::value(self.parse_expr()?));
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
                 self.expect(TokenKind::RParen)?;
-                Ok(expr)
+                self.tuple_arities.insert(args.len());
+                Ok(Expr::StaticCall(Box::new(StaticCallExpr {
+                    class: super::tuples::name(args.len()),
+                    type_args: vec![],
+                    method: super::tuples::VARIANT.into(),
+                    args,
+                    span: span.to(self.previous_span()),
+                    method_span: span,
+                    id: ExprId::fresh(),
+                })))
             }
             // Lambda: `|params| expr` or `|params| { block }`
             TokenKind::Pipe => self.parse_lambda(),

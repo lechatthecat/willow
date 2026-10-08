@@ -12,6 +12,35 @@ impl Parser {
                 self.advance();
                 Ok(Pattern::Wildcard(span, PatternId::fresh()))
             }
+            TokenKind::LParen => {
+                self.advance();
+                let mut bindings = vec![self.expect_ident()?];
+                self.expect(TokenKind::Comma)?;
+                while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+                    bindings.push(self.expect_ident()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RParen)?;
+                let mut seen = std::collections::HashSet::new();
+                for binding in &bindings {
+                    if binding != "_" && !seen.insert(binding) {
+                        return Err(
+                            self.err(ErrorCode::E0102, "duplicate binding in tuple pattern")
+                        );
+                    }
+                }
+                self.tuple_arities.insert(bindings.len());
+                Ok(Pattern::EnumVariantTuple {
+                    enum_name: super::tuples::name(bindings.len()),
+                    variant: super::tuples::VARIANT.into(),
+                    bindings,
+                    variant_span: span,
+                    span: span.to(self.previous_span()),
+                    id: PatternId::fresh(),
+                })
+            }
             TokenKind::True => {
                 self.advance();
                 Ok(Pattern::LiteralBool(true, span, PatternId::fresh()))

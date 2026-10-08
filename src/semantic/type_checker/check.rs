@@ -1070,7 +1070,11 @@ impl TypeChecker {
     }
 
     pub(super) fn check_block(&mut self, block: &Block) {
-        self.local.lexical_block_depth += 1;
+        self.check_block_scope(block, true);
+    }
+
+    pub(super) fn check_block_scope(&mut self, block: &Block, lexical: bool) {
+        self.local.lexical_block_depth += u32::from(lexical);
         self.symbols.push_scope();
         for stmt in &block.stmts {
             self.check_stmt(stmt);
@@ -1089,7 +1093,7 @@ impl TypeChecker {
             }
         }
         self.symbols.pop_scope();
-        self.local.lexical_block_depth -= 1;
+        self.local.lexical_block_depth -= u32::from(lexical);
     }
 
     /// Type-check `lock <target> as [mut] <binding> { .. }` (willow-38w.1.1).

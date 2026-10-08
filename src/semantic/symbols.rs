@@ -325,7 +325,7 @@ impl Default for DeclarationSymbols {
 /// registration uses copy-on-write only when a declaration actually mutates.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct SymbolTable {
-    scopes: Vec<HashMap<String, VarInfo>>,
+    scopes: super::scopes::Scopes<VarInfo>,
     #[serde(skip)]
     method_owners: Rc<std::cell::RefCell<method_owners::MethodOwners>>,
     #[serde(skip)]
@@ -391,7 +391,7 @@ impl SymbolTable {
     /// declarations is O(1), regardless of the number of registered symbols.
     pub(crate) fn fork_body_scope(&self) -> Self {
         Self {
-            scopes: Vec::new(),
+            scopes: Default::default(),
             bare_enum_names: Rc::clone(&self.bare_enum_names),
             method_owners: Rc::clone(&self.method_owners),
             declarations: Rc::clone(&self.declarations),
@@ -402,7 +402,7 @@ impl SymbolTable {
     /// the `shared` modules, which the caller restores from its own copy.
     pub(crate) fn declaration_shell(&self, shared: &[ModuleId]) -> Self {
         Self {
-            scopes: Vec::new(),
+            scopes: Default::default(),
             bare_enum_names: Default::default(),
             method_owners: Default::default(),
             declarations: Rc::new(DeclarationSymbols {
@@ -420,7 +420,7 @@ impl SymbolTable {
     }
 
     pub fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push();
     }
 
     pub fn pop_scope(&mut self) {
@@ -428,30 +428,20 @@ impl SymbolTable {
     }
 
     pub fn define_var(&mut self, name: String, info: VarInfo) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name, info);
-        }
+        self.scopes.insert(name, info);
     }
 
     /// Returns the existing binding in the innermost scope, if any.
     pub fn lookup_var_current_scope(&self, name: &str) -> Option<&VarInfo> {
-        self.scopes.last()?.get(name)
+        self.scopes.current(name)
     }
 
     pub fn lookup_var(&self, name: &str) -> Option<&VarInfo> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(info) = scope.get(name) {
-                return Some(info);
-            }
-        }
-        None
+        self.scopes.get(name)
     }
 
     pub fn lookup_var_mut(&mut self, name: &str) -> Option<&mut VarInfo> {
-        self.scopes
-            .iter_mut()
-            .rev()
-            .find_map(|scope| scope.get_mut(name))
+        self.scopes.get_mut(name)
     }
 
     pub fn define_func(&mut self, name: String, info: FuncInfo) {

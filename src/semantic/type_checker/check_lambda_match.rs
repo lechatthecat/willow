@@ -178,7 +178,9 @@ impl TypeChecker {
     fn collect_lambda_captures(&mut self, l: &LambdaExpr) -> Vec<LambdaCapture> {
         let mut scan = CaptureScan {
             checker: self,
-            scopes: vec![l.params.iter().map(|p| p.name.clone()).collect()],
+            scopes: crate::semantic::scopes::Scopes::with_frame(
+                l.params.iter().map(|p| (p.name.clone(), ())),
+            ),
             captures: Vec::new(),
             writes: Vec::new(),
         };
@@ -727,7 +729,7 @@ impl TypeChecker {
                 if let Some(guard) = &arm.guard {
                     self.check_match_guard(guard);
                 }
-                self.check_match_body(&arm.body, expected.as_ref());
+                self.check_match_body(&arm.body, expected.as_ref(), m.source);
                 self.symbols.pop_scope();
             }
             return Self::error_type();
@@ -756,7 +758,7 @@ impl TypeChecker {
             // Check if arm is unreachable (after a wildcard/binding)
             if has_wildcard && !found_unreachable {
                 let diagnostic = match m.source {
-                    MatchSource::Match => Diagnostic::new(
+                    MatchSource::Match | MatchSource::TupleLet => Diagnostic::new(
                         Severity::Warning,
                         ErrorCode::W1201,
                         "unreachable match arm",
@@ -1181,6 +1183,7 @@ impl TypeChecker {
                 expected.as_ref().or(result_type
                     .as_ref()
                     .filter(|ty| matches!(ty, Type::Array(_)) && !has_array_placeholder(ty))),
+                m.source,
             );
             self.symbols.pop_scope();
 
@@ -1418,11 +1421,21 @@ impl TypeChecker {
         }
     }
 
-    pub(super) fn check_match_body(&mut self, body: &MatchBody, expected: Option<&Type>) -> Type {
-        self.check_match_body_inner(body, expected)
+    pub(super) fn check_match_body(
+        &mut self,
+        body: &MatchBody,
+        expected: Option<&Type>,
+        source: MatchSource,
+    ) -> Type {
+        self.check_match_body_inner(body, expected, source)
     }
 
-    fn check_match_body_inner(&mut self, body: &MatchBody, expected: Option<&Type>) -> Type {
+    fn check_match_body_inner(
+        &mut self,
+        body: &MatchBody,
+        expected: Option<&Type>,
+        source: MatchSource,
+    ) -> Type {
         match body {
             MatchBody::Expr(expr) => {
                 // An arm VALUE is checked against the type the whole `match`
@@ -1440,7 +1453,9 @@ impl TypeChecker {
                 }
             }
             MatchBody::Block(block) => {
-                self.check_block(block);
+                // A tuple-let tail has a binding scope but no new source-level
+                // recovery boundary. Real arm blocks still add lexical depth.
+                self.check_block_scope(block, source != MatchSource::TupleLet);
                 // An arm that always leaves — by `return`, or by `break` /
                 // `continue` of an enclosing loop (willow-jz15.46) — diverges:
                 // type it `Never` so it unifies with value arms
@@ -1480,7 +1495,7 @@ pub struct LambdaCapture {
 
 struct CaptureScan<'a> {
     checker: &'a mut TypeChecker,
-    scopes: Vec<HashSet<String>>,
+    scopes: crate::semantic::scopes::Scopes<()>,
     /// The captures found so far, in first-mention order — which is the order
     /// the closure environment lays its slots out.
     captures: Vec<LambdaCapture>,
@@ -1492,7 +1507,7 @@ struct CaptureScan<'a> {
 
 impl CaptureScan<'_> {
     fn bound_inside(&self, name: &str) -> bool {
-        self.scopes.iter().any(|s| s.contains(name))
+        self.scopes.get(name).is_some()
     }
 
     fn note_use(&mut self, name: &str, span: Span) {
@@ -1554,7 +1569,7 @@ impl CaptureScan<'_> {
     }
 
     fn enter_scope(&mut self) {
-        self.scopes.push(HashSet::new());
+        self.scopes.push();
     }
 
     fn exit_scope(&mut self) {
@@ -1562,10 +1577,7 @@ impl CaptureScan<'_> {
     }
 
     fn bind(&mut self, name: &str) {
-        self.scopes
-            .last_mut()
-            .expect("capture scan scope")
-            .insert(name.to_string());
+        self.scopes.insert(name.to_string(), ());
     }
 
     fn visit_stmt(&mut self, stmt: &Stmt) {
@@ -1674,7 +1686,7 @@ mod lambda_capture_tests {
                 }
                 let mut scan = CaptureScan {
                     checker: &mut checker,
-                    scopes: vec![HashSet::new()],
+                    scopes: crate::semantic::scopes::Scopes::with_frame([]),
                     captures: Vec::new(),
                     writes: Vec::new(),
                 };

@@ -1,0 +1,30 @@
+// Tuples are ordered, GC-managed values. A singleton keeps its trailing comma.
+import std::collections::Array;
+
+fn quote() -> (String, i64) {
+    return ("Willow", 42);
+}
+
+fn main() {
+    let (name, price) = quote();
+    println(name);
+    println(price);
+
+    let entries: Array<(String, i64)> = [("one", 1), ("two", 2)];
+    gc_collect();
+    for entry in entries {
+        match entry {
+            (label, value) => { println(label); println(value); }
+        }
+    }
+
+    let nested = ((true, 2.5), "nested");
+    let (inner, label) = nested;
+    let (flag, fraction) = inner;
+    println(flag);
+    println(fraction);
+    println(label);
+
+    let (only,) = (7,);
+    println(only);
+}

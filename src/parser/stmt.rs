@@ -9,6 +9,7 @@ impl Parser {
         let start = self.current_span();
         self.expect(TokenKind::LBrace)?;
         let mut stmts = Vec::new();
+        let mut tuple_scopes = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
             if matches!(
                 self.peek_kind(),
@@ -21,6 +22,34 @@ impl Parser {
                         self.current_span(),
                     )
                     .with_label(Label::secondary(start, "block opened here")));
+            }
+            // Bind once, then put the remaining lexical scope in the sole
+            // tuple arm. Folding these segments after parsing moves each
+            // statement once instead of repeatedly copying the block tail.
+            if self.check(TokenKind::Let) && self.peek_kind_at(1) == &TokenKind::LParen {
+                let depth = self.brace_depth;
+                let (pattern, ty, mut init, span) = match self.parse_tuple_binding() {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        self.recovered_errors.push(error);
+                        self.recover_to_next_stmt(depth);
+                        continue;
+                    }
+                };
+                if let Some(ty) = ty {
+                    let name = format!("$tuple_binding{}", tuple_scopes.len());
+                    stmts.push(Stmt::Let(LetStmt {
+                        type_span: Some(span),
+                        name: name.clone(),
+                        mutable: false,
+                        ty: Some(ty),
+                        init,
+                        span,
+                    }));
+                    init = Expr::Var(name, span, ExprId::fresh());
+                }
+                tuple_scopes.push((std::mem::take(&mut stmts), pattern, init, span));
+                continue;
             }
             let statement_depth = self.brace_depth;
             match self.parse_stmt() {
@@ -37,11 +66,48 @@ impl Parser {
         let end = self.current_span();
         self.expect(TokenKind::RBrace)
             .map_err(|error| error.with_label(Label::secondary(start, "block opened here")))?;
+        while let Some((mut prefix, pattern, init, span)) = tuple_scopes.pop() {
+            prefix.push(Stmt::Expr(ExprStmt {
+                span: span.to(end),
+                expr: Expr::Match(Box::new(MatchExpr {
+                    id: ExprId::fresh(),
+                    scrutinee: Box::new(init),
+                    span: span.to(end),
+                    source: MatchSource::TupleLet,
+                    arms: vec![MatchArm {
+                        pattern,
+                        guard: None,
+                        span: span.to(end),
+                        body: MatchBody::Block(Block {
+                            id: BodyId::fresh(),
+                            stmts,
+                            span: span.to(end),
+                        }),
+                    }],
+                })),
+            }));
+            stmts = prefix;
+        }
         Ok(Block {
             id: crate::parser::ast::BodyId::fresh(),
             stmts,
             span: start.to(end),
         })
+    }
+
+    fn parse_tuple_binding(&mut self) -> Result<(Pattern, Option<Type>, Expr, Span), Diagnostic> {
+        let span = self.current_span();
+        self.expect(TokenKind::Let)?;
+        let pattern = self.parse_pattern()?;
+        let ty = if self.eat(TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::Eq)?;
+        let init = self.parse_expr()?;
+        self.expect(TokenKind::Semicolon)?;
+        Ok((pattern, ty, init, span.to(self.previous_span())))
     }
 
     /// Skip to the start of the next statement after a statement-level parse

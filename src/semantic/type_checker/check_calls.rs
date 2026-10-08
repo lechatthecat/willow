@@ -581,6 +581,21 @@ impl TypeChecker {
         for (param_ty, arg) in payload_types.iter().zip(call.args.iter()) {
             let arg_ty = self.check_expr_expecting(&arg.expr, param_ty);
             if !self.types_compatible(param_ty, &arg_ty) {
+                if crate::parser::tuples::is_tuple(enum_name) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "tuple element expects `{}`, found `{}`",
+                                type_name(param_ty),
+                                type_name(&arg_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(arg.expr.span(), "wrong tuple element type")),
+                    );
+                    continue;
+                }
                 let actual_result = self.contextual_variant_actual_result(
                     enum_name,
                     &call.method,
