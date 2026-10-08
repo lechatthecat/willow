@@ -447,3 +447,70 @@ fn imported_declaration_details_survive_depth_formats_and_round_trip() {
         }
     }
 }
+
+#[test]
+fn constants_and_tuples_use_source_presentation_across_commands() {
+    let f = Fixture::new(true);
+    f.source("src/main.wi", "import values; const DOCS: String = \"docs\"; fn pair() -> (i64, (bool, String)) { return (values::COUNT, (true, DOCS)); } fn main() { pair(); }");
+    f.source("src/values.wi", "pub const COUNT: i64 = 7;");
+    let v = f.json(&["overview", "--all"], 0);
+    let symbols: Vec<_> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|file| file["symbols"].as_array().unwrap())
+        .collect();
+    for (name, expected) in [
+        ("DOCS", "String"),
+        ("COUNT", "i64"),
+        ("pair", "fn() -> (i64, (bool, String))"),
+    ] {
+        let symbol = symbols.iter().find(|s| s["name"] == name).unwrap();
+        assert_eq!(symbol["type_display"], expected);
+        assert_eq!(
+            symbol["kind"],
+            if name == "pair" { "function" } else { "const" }
+        );
+        let selector = symbol["selector"].as_str().unwrap();
+        for command in ["symbol", "type", "refs"] {
+            let result = f.json(&[command, selector], 0);
+            assert_eq!(result["status"], "ok", "{result}");
+            if command == "symbol" {
+                assert_eq!(
+                    result["result"]["selected"]["kind"], symbol["kind"],
+                    "{result}"
+                );
+                assert_eq!(result["result"]["type_display"], expected, "{result}");
+            }
+            if command == "type" {
+                assert_eq!(result["result"]["type_display"], expected, "{result}");
+            }
+        }
+        let renamed = f.json(&["rename", selector, "renamed", "--dry-run"], 0);
+        assert_eq!(renamed["status"], "ok", "{renamed}");
+        for format in ["human", "json", "ndjson"] {
+            for command in ["symbol", "type"] {
+                let out = f.run(&[command, selector, "--format", format]);
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(text.contains(expected), "{text}");
+                if format == "human" {
+                    assert!(!text.contains("$Tuple"), "{text}");
+                }
+            }
+        }
+    }
+    let constants = f.json(&["overview", "--kind", "const", "--all"], 0);
+    assert_eq!(constants["counts"]["top_level_symbols"], 2);
+    for format in ["human", "json", "ndjson"] {
+        let out = f.run(&["overview", "--all", "--format", format]);
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(!text.contains("$Tuple"), "{text}");
+        assert!(text.contains("fn() -> (i64, (bool, String))"));
+    }
+}

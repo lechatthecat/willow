@@ -10,6 +10,7 @@ use std::{
 pub const HARD_LIMIT: usize = 1024 * 1024;
 pub const KINDS: &[&str] = &[
     "function",
+    "const",
     "class",
     "interface",
     "enum",
@@ -341,7 +342,10 @@ impl Overview {
     }
 }
 fn is_top(s: &Symbol) -> bool {
-    matches!(s.kind.as_str(), "function" | "class" | "enum" | "interface")
+    matches!(
+        s.kind.as_str(),
+        "function" | "const" | "class" | "enum" | "interface"
+    )
 }
 fn entry(session: &DirectSession, symbol: &Symbol) -> Entry {
     Entry {

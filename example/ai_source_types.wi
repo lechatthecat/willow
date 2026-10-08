@@ -1,0 +1,19 @@
+// AI display regression: overview reports const values and source tuple types.
+const DOCS: String = "docs";
+const COUNT: i64 = 7;
+fn pair() -> (i64, (bool, String)) {
+    return (COUNT, (true, DOCS));
+}
+fn main() {
+    match pair() {
+        (count, rest) => {
+            println(count);
+            match rest {
+                (enabled, label) => {
+                    println(enabled);
+                    println(label);
+                }
+            }
+        }
+    }
+}

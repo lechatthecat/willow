@@ -120,6 +120,8 @@ impl TypeNames {
                 }
                 Work::Type(ty) => ty,
             };
+            #[cfg(test)]
+            TYPE_VISITS.with(|count| count.set(count.get() + 1));
             match ty {
                 Type::I64 => out.push_str("i64"),
                 Type::F64 => out.push_str("f64"),
@@ -131,6 +133,11 @@ impl TypeNames {
                 Type::Array(element) => {
                     out.push_str("Array<");
                     work.extend([Work::Text(">"), Work::Type(element)]);
+                }
+                Type::Generic(name, args) if crate::parser::tuples::is_tuple(name) => {
+                    out.push('(');
+                    work.push(Work::Text(if args.len() == 1 { ",)" } else { ")" }));
+                    list(&mut work, args);
                 }
                 Type::Generic(name, args) => {
                     out.push_str(&self.name(name, module));
@@ -160,5 +167,86 @@ impl TypeNames {
             value["type_display"] = self.render(ty, module).into();
         }
         value
+    }
+}
+
+#[cfg(test)]
+thread_local! { static TYPE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names() -> TypeNames {
+        TypeNames {
+            packages: HashMap::new(),
+            local: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn tuple_display_composes_with_every_type_container() {
+        let pair = Type::Generic("$Tuple2".into(), vec![Type::I64, Type::Bool]);
+        let cases = [
+            (pair.clone(), "(i64, bool)"),
+            (Type::Generic("$Tuple1".into(), vec![Type::I64]), "(i64,)"),
+            (Type::Generic("$Tuple0".into(), vec![]), "()"),
+            (Type::Array(Box::new(pair.clone())), "Array<(i64, bool)>"),
+            (
+                Type::Generic("Box".into(), vec![pair.clone()]),
+                "Box<(i64, bool)>",
+            ),
+            (
+                Type::Fn(vec![pair.clone()], Box::new(pair.clone())),
+                "fn((i64, bool)) -> (i64, bool)",
+            ),
+            (
+                Type::Closure(vec![pair.clone()], Box::new(pair)),
+                "closure((i64, bool)) -> (i64, bool)",
+            ),
+            (
+                Type::Generic("$TupleLike".into(), vec![Type::I64]),
+                "$TupleLike<i64>",
+            ),
+            (
+                Type::Generic("m::Tuple2".into(), vec![Type::I64]),
+                "m::Tuple2<i64>",
+            ),
+            (
+                Type::Generic(
+                    "$Tuple4".into(),
+                    vec![Type::F64, Type::String, Type::Void, Type::Never],
+                ),
+                "(f64, String, void, !)",
+            ),
+        ];
+        for (ty, expected) in cases {
+            assert_eq!(names().render(&ty, None), expected);
+        }
+    }
+
+    #[test]
+    fn tuple_display_visits_each_node_once_for_wide_and_deep_types() {
+        for n in [1, 16, 256, 1024] {
+            let wide = Type::Generic(format!("$Tuple{n}"), vec![Type::I64; n]);
+            TYPE_VISITS.with(|count| count.set(0));
+            let output = names().render(&wide, None);
+            assert_eq!(TYPE_VISITS.with(|count| count.get()), n + 1);
+            assert_eq!(output.matches("i64").count(), n);
+            let mut deep = Type::I64;
+            for _ in 0..n {
+                deep = Type::Generic("$Tuple2".into(), vec![Type::Bool, deep]);
+            }
+            TYPE_VISITS.with(|count| count.set(0));
+            let output = names().render(&deep, None);
+            assert_eq!(TYPE_VISITS.with(|count| count.get()), 2 * n + 1);
+            assert_eq!(output.len(), 8 * n + 3);
+            println!(
+                "n={n} wide_visits={} deep_visits={} deep_bytes={}",
+                n + 1,
+                2 * n + 1,
+                output.len()
+            );
+        }
     }
 }

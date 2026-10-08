@@ -24,6 +24,7 @@ pub struct Symbol {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeclarationDetails {
     pub is_async: bool,
+    pub is_const: bool,
     pub type_params: Vec<String>,
 }
 
@@ -31,11 +32,12 @@ pub(super) fn details(program: &Program) -> HashMap<Span, DeclarationDetails> {
     let mut result = HashMap::new();
     for item in &program.items {
         match item {
-            Item::Function(f) if f.is_async => {
+            Item::Function(f) if f.is_async || f.constant.is_some() => {
                 result.insert(
                     f.span,
                     DeclarationDetails {
-                        is_async: true,
+                        is_async: f.is_async,
+                        is_const: f.constant.is_some(),
                         ..Default::default()
                     },
                 );
@@ -486,7 +488,16 @@ pub(super) fn finish(
             id: id.clone(),
             name: d.name.clone(),
             source_name: source_names.get(&declaration_key(d)).cloned(),
-            kind: d.kind.clone(),
+            kind: if d.kind == "function"
+                && captures
+                    .get(&crate::module::ModuleId(d.span.file_id.0))
+                    .and_then(|unit| unit.symbol_details.get(&d.span))
+                    .is_some_and(|details| details.is_const)
+            {
+                "const".into()
+            } else {
+                d.kind.clone()
+            },
             // Type-parameter declarations share their container span. Do not
             // clone the whole generic parameter list onto each parameter.
             details: if matches!(
@@ -606,6 +617,7 @@ mod tests {
                     span,
                     DeclarationDetails {
                         is_async: false,
+                        is_const: false,
                         type_params: params.clone(),
                     },
                 )]),
