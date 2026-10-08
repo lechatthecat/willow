@@ -704,10 +704,12 @@ impl QuerySession {
                     .get(&function)
                     .filter(|_| !self.functions.contains_key(&function))
                 {
-                    let references: Vec<_> = indices
+                    let mut references: Vec<_> = indices
                         .iter()
                         .map(|&i| &self.snapshot.semantic.references[i])
                         .collect();
+                    references
+                        .sort_by_key(|r| (&r.location.path, r.location.start, r.location.end));
                     json!({"status":"ok", "references":references, "coverage":"compiler-resolved"})
                 } else if !self.functions.contains_key(&function) {
                     json!({"status":if self.symbols.contains_key(&function) {"ok"} else {"unknown"},"references":[]})
@@ -723,6 +725,7 @@ impl QuerySession {
                                     serde_json::to_value(&self.snapshot.semantic.expressions[j])
                                         .unwrap();
                                 reference["identity"] = json!(self.snapshot.functions[i].identity);
+                                reference["role"] = json!("call");
                                 reference["certainty"] = json!(if i == root {
                                     "resolved"
                                 } else {
@@ -772,6 +775,18 @@ impl QuerySession {
                             }
                         }
                     }
+                    unique.sort_by(|a, b| {
+                        let key = |v: &Value| {
+                            (
+                                v["location"]["start"].as_u64(),
+                                v["location"]["end"].as_u64(),
+                            )
+                        };
+                        a["location"]["path"]
+                            .as_str()
+                            .cmp(&b["location"]["path"].as_str())
+                            .then_with(|| key(a).cmp(&key(b)))
+                    });
                     let refs = unique;
                     let unresolved: Vec<_> = self
                         .symbols
@@ -782,8 +797,16 @@ impl QuerySession {
                         .flatten()
                         .map(|&i| &self.snapshot.semantic.references[i])
                         .collect();
+                    let mut coverage = String::from("compiler-resolved");
+                    if refs.iter().any(|r| r["certainty"] == "possible-dispatch") {
+                        coverage.push_str(" and possible virtual dispatch");
+                    }
+                    if !unresolved.is_empty() {
+                        coverage
+                            .push_str("; indirect candidates are signature-matched, not resolved");
+                    }
                     json!({"status":if unresolved.is_empty(){"ok"}else{"incomplete"}, "references":refs,
-                        "unresolved_candidates":unresolved,"coverage":"compiler-resolved and possible virtual dispatch; indirect candidates are signature-matched, not resolved"})
+                        "unresolved_candidates":unresolved,"coverage":coverage})
                 }
             }
             QueryRequest::Effects { function, .. } => match self.functions.get(&function) {

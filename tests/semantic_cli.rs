@@ -351,6 +351,12 @@ fn references_distinguish_possible_virtual_dispatch() {
     let f = Fixture::new();
     fs::write(f.0.join("src/main.wi"), "open class Base { pub open fn hook(self) -> i64 { return 1; } }\nclass Child extends Base { pub override fn hook(self) -> i64 { return 2; } }\nfn via_base(x: Base) -> i64 { return x.hook(); }\nfn via_child(x: Child) -> i64 { return x.hook(); }\nfn main() {}\n").unwrap();
     let result = f.json(&["refs", "main::Child::hook"], 0);
+    assert!(
+        result["result"]["coverage"]
+            .as_str()
+            .unwrap()
+            .contains("possible virtual dispatch")
+    );
     let references = result["result"]["references"].as_array().unwrap();
     assert!(
         references
@@ -1839,6 +1845,86 @@ fn main() {}
             function.runtime_effects & E::MAY_BLOCK.bits(),
             0,
             "{function:?}"
+        );
+    }
+}
+
+#[test]
+fn references_sort_source_positions_and_show_roles() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "import order::{submit};\nfn z() { submit(1); submit(2); }\nfn a() { submit(3); }\nfn main() { z(); a(); }\n").unwrap();
+    let result = f.json(&["refs", "order::submit", "--all"], 0);
+    let refs = result["result"]["references"].as_array().unwrap();
+    assert_eq!(refs.len(), 4, "{result}");
+    assert_eq!(refs[0]["role"], "import-target");
+    assert!(refs[1..].iter().all(|r| r["role"] == "call"));
+    let positions: Vec<_> = refs
+        .iter()
+        .map(|r| {
+            (
+                r["location"]["path"].as_str().unwrap(),
+                r["location"]["line"].as_u64().unwrap(),
+                r["location"]["column"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert!(positions.windows(2).all(|w| w[0] < w[1]), "{result}");
+    assert_eq!(result["result"]["coverage"], "compiler-resolved");
+    let out = f.run(&["refs", "order::submit"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        text.lines()
+            .filter(|l| l.ends_with(" import-target"))
+            .count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        text.lines().filter(|l| l.ends_with(" call")).count(),
+        3,
+        "{text}"
+    );
+    assert_eq!(
+        f.json(&["refs", "order::Order::value"], 0)["result"]["coverage"],
+        "compiler-resolved"
+    );
+}
+
+#[test]
+fn method_reference_order_scales_across_files_and_callers() {
+    for n in [16, 64, 256] {
+        let f = Fixture::new();
+        let mut source = String::from("import order;\n");
+        for i in (0..n).rev() {
+            source.push_str(&format!(
+                "fn caller{i}(x: order::Order) {{ x.value(); x.value(); }}\n"
+            ));
+        }
+        source.push_str("fn main() {}\n");
+        fs::write(f.0.join("src/main.wi"), source).unwrap();
+        let mut order = fs::read_to_string(f.0.join("src/order.wi")).unwrap();
+        order.push_str("fn local(x: Order) { x.value(); }\n");
+        fs::write(f.0.join("src/order.wi"), order).unwrap();
+        let result = f.json(&["refs", "order::Order::value", "--all"], 0);
+        let refs = result["result"]["references"].as_array().unwrap();
+        assert_eq!(refs.len(), 2 * n + 1, "{result}");
+        let keys: Vec<_> = refs
+            .iter()
+            .map(|r| {
+                (
+                    r["location"]["path"].as_str().unwrap(),
+                    r["location"]["line"].as_u64().unwrap(),
+                    r["location"]["column"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "{result}");
+        assert_eq!(result["result"]["coverage"], "compiler-resolved");
+        println!(
+            "callers={n} references={} adjacent_checks={}",
+            refs.len(),
+            keys.len() - 1
         );
     }
 }

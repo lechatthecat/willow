@@ -298,12 +298,14 @@ fn human(value: &Value, options: &Options) -> String {
     if let Some(references) = result["references"].as_array() {
         for reference in references {
             lines.push(format!(
-                "  {} {}",
+                "  {} {}{}",
                 location(&reference["location"]),
-                reference["certainty"]
-                    .as_str()
-                    .or_else(|| reference["role"].as_str())
-                    .unwrap_or("resolved")
+                reference["role"].as_str().unwrap_or("reference"),
+                if reference["certainty"] == "possible-dispatch" {
+                    " (possible-dispatch)"
+                } else {
+                    ""
+                }
             ));
         }
         lines.push(format!(
