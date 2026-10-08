@@ -1,0 +1,33 @@
+// Runnable regression input for precise AI CLI effect evidence.
+import std::collections::Array;
+fn float_div(a: f64, b: f64) -> f64 { return a / b; }
+fn float_zero(a: f64) -> f64 { return a / 0.0; }
+fn int_div(a: i64) -> i64 { return a / 2; }
+fn int_rem(a: i64) -> i64 { return a % 2; }
+fn int_one(a: i64) -> i64 { return a / 1; }
+fn rem_one(a: i64) -> i64 { return a % 1; }
+fn int_variable(a: i64, b: i64) -> i64 { return a / b; }
+fn rem_variable(a: i64, b: i64) -> i64 { return a % b; }
+fn int_zero(a: i64) -> i64 { return a / 0; }
+fn rem_zero(a: i64) -> i64 { return a % 0; }
+fn int_negative_one(a: i64) -> i64 { return a / -1; }
+fn concat(a: String, b: String) -> String { return a + b; }
+fn concat_relay(a: String, b: String) -> String { return concat(a, b); }
+fn len_only(xs: Array<i64>) -> i64 { return xs.len(); }
+fn allocate_after_len(xs: Array<i64>) -> Array<i64> { let n = xs.len(); return [n]; }
+fn allocate_before_len(xs: Array<i64>) -> i64 { let ys = [1]; return xs.len(); }
+fn make_array() -> Array<i64> { return [1]; }
+fn allocate_in_callee(xs: Array<i64>) -> Array<i64> { let n = xs.len(); return make_array(); }
+async fn async_select() { select { sleep(0) => {} } }
+fn sync_select() { select { sleep(0) => {} } }
+async fn select_with_io() { select { sleep(0) => { println(1); } } }
+class Selector {
+    pub async fn wait(self) { select { sleep(0) => {} } }
+}
+async fn main() {
+    println(float_div(6.0, 2.0));
+    println(int_rem(5));
+    println(concat("effect", " precision"));
+    println(allocate_after_len([1]).len());
+    await async_select();
+}

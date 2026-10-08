@@ -200,6 +200,7 @@ pub(crate) fn capture(
                 f.span,
                 f.body.id,
                 AstEvent::Block(&f.body),
+                f.is_async,
             )),
             Item::Class(c) => {
                 for field in &c.fields {
@@ -214,6 +215,7 @@ pub(crate) fn capture(
                             field.span,
                             body,
                             AstEvent::Expr(expr),
+                            false,
                         ));
                     }
                 }
@@ -224,6 +226,7 @@ pub(crate) fn capture(
                         m.span,
                         m.body.id,
                         AstEvent::Block(&m.body),
+                        m.is_async,
                     ));
                 }
                 for init in &c.constructors {
@@ -232,6 +235,7 @@ pub(crate) fn capture(
                         init.span,
                         init.body.id,
                         AstEvent::Block(&init.body),
+                        false,
                     ));
                 }
             }
@@ -246,6 +250,7 @@ pub(crate) fn capture(
                             m.span,
                             body.id,
                             AstEvent::Block(body),
+                            false,
                         ));
                     }
                 }
@@ -254,7 +259,7 @@ pub(crate) fn capture(
         }
     }
     let mut lambda_roots = HashMap::new();
-    while let Some((id, span, body_id, body)) = pending.pop() {
+    while let Some((id, span, body_id, body, is_async)) = pending.pop() {
         result.identities.insert(id, body_id);
         let body_span = match body {
             AstEvent::Block(b) => b.span,
@@ -328,6 +333,22 @@ pub(crate) fn capture(
                         | Expr::ArrayLiteral(..)
                         | Expr::ObjectLiteral(_)
                         | Expr::String(..) => RuntimeEffects::MAY_ALLOCATE.bits(),
+                        // Async select parks via SuspendOp::SelectWait. Its case
+                        // expressions/bodies are visited independently below.
+                        Expr::Select(_) if is_async => RuntimeEffects::MAY_ALLOCATE
+                            .union(RuntimeEffects::MAY_SUSPEND)
+                            .union(RuntimeEffects::MAY_PREEMPT)
+                            .union(RuntimeEffects::MAY_PANIC)
+                            .bits(),
+                        Expr::Binary(b)
+                            if b.op == BinOp::Add
+                                && matches!(types.get(&b.id), Some(Type::String)) =>
+                        {
+                            willow_abi::runtime_symbol("willow_string_concat")
+                                .expect("string concat ABI")
+                                .effects()
+                                .bits()
+                        }
                         Expr::Await(_) | Expr::Select(_) | Expr::Print(..) => {
                             RuntimeEffects::ALL.bits()
                         }
@@ -361,6 +382,9 @@ pub(crate) fn capture(
                         Expr::Await(_) => "await",
                         Expr::Select(_) => "select",
                         Expr::Print(..) => "print",
+                        Expr::Binary(b) if matches!(types.get(&b.id), Some(Type::String)) => {
+                            "string-concatenation"
+                        }
                         Expr::Binary(_) => "non-scalar-addition",
                         Expr::MethodCall(_)
                             if calls
@@ -410,7 +434,7 @@ pub(crate) fn capture(
                             child_id,
                             format!("<lambda {root}@{}:{}>", l.span.start, l.span.end),
                         );
-                        pending.push((child_id, l.span, child, event));
+                        pending.push((child_id, l.span, child, event, false));
                     } else {
                         bits |= RuntimeEffects::ALL.bits();
                     }

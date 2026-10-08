@@ -373,6 +373,72 @@ mod tests {
         }
     }
     #[test]
+    fn allocation_witness_selection_visits_each_edge_once() {
+        use serde_json::json;
+        for shape in ["chain", "fanout", "cycle", "duplicate_calls"] {
+            for n in [16, 64, 256, 1024] {
+                let mut functions: Vec<_> = (0..n).map(node).collect();
+                let mut semantic = SemanticFacts::default();
+                for (i, f) in functions.iter_mut().enumerate() {
+                    f.runtime_effects = RuntimeEffects::MAY_ALLOCATE.bits();
+                    f.callees = match shape {
+                        "fanout" if i == 0 => (1..n).map(|j| format!("f{j}")).collect(),
+                        "fanout" => vec![],
+                        "cycle" => vec![format!("f{}", (i + 1) % n)],
+                        "duplicate_calls" if i + 1 < n => vec![format!("f{}", i + 1); 8],
+                        _ if i + 1 < n => vec![format!("f{}", i + 1)],
+                        _ => vec![],
+                    };
+                    semantic.witnesses.insert(f.id.clone(), vec![json!({
+                        "effect": RuntimeEffects::MAY_ALLOCATE.bits(),
+                        "witness": {"kind":"runtime-capability", "cause": {
+                            "operation": if i + 1 == n {"array-allocation"} else {"panic-payload-allocation"},
+                            "location": {"path":"fixture.wi", "start":i, "end":i+1}
+                        }}
+                    })]);
+                }
+                let mut snapshot = Snapshot {
+                    edit_context: None,
+                    semantic,
+                    version: 1,
+                    compiler: storage::compiler_stamp(),
+                    compatibility: String::new(),
+                    workspace: String::new(),
+                    revision: String::new(),
+                    sources: BTreeMap::new(),
+                    functions,
+                };
+                snapshot.revision = snapshot.digest().unwrap();
+                let revision = snapshot.revision.clone();
+                let mut session = QuerySession::new(snapshot).unwrap();
+                // Every supplied edge is visited once, even if a handcrafted
+                // snapshot repeats a callee (normal capture deduplicates it).
+                let edges = match shape {
+                    "cycle" => n,
+                    "duplicate_calls" => 8 * (n - 1),
+                    _ => n - 1,
+                };
+                for _ in 0..3 {
+                    let before = session.effect_edge_visits;
+                    let value = session.query(QueryRequest::Effects {
+                        revision: revision.clone(),
+                        function: "f0".into(),
+                    });
+                    assert_eq!(
+                        value["result"]["effect_evidence"][0]["witness"]["cause"]["operation"],
+                        "array-allocation",
+                        "{shape}/{n}: {value}"
+                    );
+                    assert_eq!(session.effect_edge_visits - before, edges, "{shape}/{n}");
+                }
+                println!(
+                    "allocation-witness shape={shape} nodes={n} edges_per_query={edges} queries=3"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn effects_propagate_through_deep_cycles_and_unknowns() {
         for n in [16, 64, 256, 1024, 4096, 8192] {
             let mut functions: Vec<_> = (0..n).map(node).collect();

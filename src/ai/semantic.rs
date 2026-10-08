@@ -68,6 +68,26 @@ pub(super) struct Captured {
 #[path = "flow.rs"]
 mod flow;
 use flow::Body;
+// Prefer an explicit allocation over an incidental panic path or a propagated
+// capability. Equal-ranked witnesses retain stable traversal order.
+fn explicit_allocation(operation: Option<&str>) -> bool {
+    matches!(
+        operation,
+        Some(
+            "array-allocation"
+                | "object-allocation"
+                | "object-literal-allocation"
+                | "string-allocation"
+                | "string-concatenation"
+                | "lambda-environment"
+        )
+    )
+}
+fn prefer_allocation(effect: u8, candidate: &Value, existing: &Value) -> bool {
+    effect == RuntimeEffects::MAY_ALLOCATE.bits()
+        && explicit_allocation(candidate["cause"]["operation"].as_str())
+        && !explicit_allocation(existing["cause"]["operation"].as_str())
+}
 impl Captured {
     pub fn capability(&mut self, function: FunctionId, bits: u8, span: Span, operation: &str) {
         let witnesses = self.witnesses.entry(function).or_default();
@@ -77,7 +97,14 @@ impl Captured {
                 continue;
             }
             let existing = witnesses.iter().position(|w| w["effect"] == effect);
-            if existing.is_some_and(|i| witnesses[i]["witness"]["kind"] != "unavailable") {
+            if existing.is_some_and(|i| {
+                witnesses[i]["witness"]["kind"] != "unavailable"
+                    && !(effect == RuntimeEffects::MAY_ALLOCATE.bits()
+                        && explicit_allocation(Some(operation))
+                        && !explicit_allocation(
+                            witnesses[i]["witness"]["cause"]["operation"].as_str(),
+                        ))
+            }) {
                 continue;
             }
             let mut value = json!({"effect":effect,"witness":{"kind":"runtime-capability","certainty":"conservative-bound","cause":{"span":span,"operation":operation}}});
@@ -790,11 +817,21 @@ impl QuerySession {
                                 {
                                     continue;
                                 }
-                                evidence.entry(effect).or_insert_with(||json!({"effect":effect,
+                                let entry = evidence.entry(effect).or_insert(Value::Null);
+                                if !entry.is_null()
+                                    && !prefer_allocation(
+                                        effect as u8,
+                                        &fact["witness"],
+                                        &entry["witness"],
+                                    )
+                                {
+                                    continue;
+                                }
+                                *entry = json!({"effect":effect,
                                     "status":if fact["witness"].get("cause").is_some() && !fact["witness"]["cause"]["location"].is_object() {"missing-source"}
                                         else if fact["witness"]["kind"]=="runtime-capability" {"conservative-bound"}
                                         else if fact["witness"]["kind"]=="external-boundary" {"external-boundary"}else{"compiler-fact"},
-                                    "via_function":self.snapshot.functions[j].id,"witness":fact["witness"]}));
+                                    "via_function":self.snapshot.functions[j].id,"witness":fact["witness"]});
                             }
                         }
                         for &k in &self.callees[j] {

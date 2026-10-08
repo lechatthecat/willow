@@ -1683,3 +1683,162 @@ fn stale_parameter_suggestion_beats_similar_spelling_and_respects_scope() {
     assert_eq!(suggestions.len(), 2, "{result}");
     f.json(&["symbol", "main::other::pred"], 0);
 }
+
+#[test]
+fn effect_precision_arithmetic_select_concat_and_allocation() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/effect_precision.wi"),
+    )
+    .unwrap();
+    for name in [
+        "float_div",
+        "float_zero",
+        "int_div",
+        "int_rem",
+        "int_one",
+        "rem_one",
+    ] {
+        let value = f.json(&["effects", &format!("main::{name}")], 0);
+        assert_eq!(
+            value["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_PANIC.bits()),
+            0,
+            "{name}: {value}"
+        );
+    }
+    for name in [
+        "int_variable",
+        "rem_variable",
+        "int_zero",
+        "rem_zero",
+        "int_negative_one",
+    ] {
+        let value = f.json(&["effects", &format!("main::{name}")], 0);
+        assert_ne!(
+            value["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_PANIC.bits()),
+            0,
+            "{name}: {value}"
+        );
+    }
+    for name in ["concat", "concat_relay", "async_select", "Selector::wait"] {
+        let value = f.json(&["effects", &format!("main::{name}")], 0);
+        let bits = value["result"]["runtime_effects"].as_u64().unwrap();
+        assert_eq!(bits & u64::from(E::MAY_BLOCK.bits()), 0, "{name}: {value}");
+        assert_eq!(
+            bits & u64::from(E::NO_PREEMPT_REGION.bits()),
+            0,
+            "{name}: {value}"
+        );
+        if name.contains("concat") {
+            assert_ne!(bits & u64::from(E::MAY_ALLOCATE.bits()), 0, "{value}");
+            assert_ne!(bits & u64::from(E::MAY_PANIC.bits()), 0, "{value}");
+        } else {
+            assert_ne!(bits & u64::from(E::MAY_SUSPEND.bits()), 0, "{value}");
+        }
+    }
+    for name in ["sync_select", "select_with_io"] {
+        let value = f.json(&["effects", &format!("main::{name}")], 0);
+        assert_ne!(
+            value["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
+            0,
+            "{name}: {value}"
+        );
+    }
+    for (name, operation) in [
+        ("len_only", "panic-payload-allocation"),
+        ("allocate_after_len", "array-allocation"),
+        ("allocate_before_len", "array-allocation"),
+        ("allocate_in_callee", "array-allocation"),
+    ] {
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+        let allocation = value["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["effect"] == E::MAY_ALLOCATE.bits())
+            .unwrap();
+        assert_eq!(
+            allocation["witness"]["cause"]["operation"], operation,
+            "{name}: {value}"
+        );
+    }
+}
+
+#[test]
+fn effect_precision_select_callable_contexts() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    use willow_compiler::{CompilerOptions, CompilerSession, diagnostics::HumanEmitter};
+    let f = Fixture::new();
+    let path = f.0.join("src/main.wi");
+    fs::write(
+        &path,
+        r#"
+async fn enclosing() { || { select { sleep(0) => {} } }; }
+async fn recv_case(ch: Channel<i64>) { select { let v = ch.recv() => {} } }
+async fn send_case(ch: Channel<i64>) { select { ch.send(1) => {} } }
+async fn default_case() { select { default => {} } }
+class Selector {
+    pub fn wait(self) { select { sleep(0) => {} } }
+    pub async fn cooperative(self) { select { sleep(0) => {} } }
+}
+interface Waiting { fn wait(self) { select { sleep(0) => {} } } }
+fn main() {}
+"#,
+    )
+    .unwrap();
+    let snapshot =
+        CompilerSession::new(path.to_str().unwrap(), "", &CompilerOptions::debug(), None)
+            .analysis_with_emitter(&mut HumanEmitter)
+            .unwrap();
+    for name in [
+        "enclosing",
+        "recv_case",
+        "send_case",
+        "default_case",
+        "Selector::cooperative",
+    ] {
+        let function = snapshot
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(
+            function.runtime_effects & E::MAY_BLOCK.bits(),
+            0,
+            "{name}: {function:?}"
+        );
+        assert_eq!(
+            function.runtime_effects & E::NO_PREEMPT_REGION.bits(),
+            0,
+            "{name}: {function:?}"
+        );
+    }
+    let sync: Vec<_> = snapshot
+        .functions
+        .iter()
+        .filter(|f| {
+            f.name.contains("<lambda")
+                || f.name == "Selector::wait"
+                || f.name.contains("$default$wait")
+        })
+        .collect();
+    assert_eq!(
+        sync.len(),
+        3,
+        "{:?}",
+        snapshot
+            .functions
+            .iter()
+            .map(|f| &f.name)
+            .collect::<Vec<_>>()
+    );
+    for function in sync {
+        assert_ne!(
+            function.runtime_effects & E::MAY_BLOCK.bits(),
+            0,
+            "{function:?}"
+        );
+    }
+}
