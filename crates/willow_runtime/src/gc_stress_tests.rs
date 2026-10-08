@@ -126,12 +126,6 @@ fn assert_local_region_valid(region: &OldRegion) {
 fn stress_region_01_middle_hole_churn_reuses_one_region() {
     let _guard = stress_guard();
     reset_gc();
-    if skip_under_alloc_stress(
-        "stress_region_01",
-        "reclaims each garbage object before the next allocation, so the reuse count differs",
-    ) {
-        return;
-    }
     let mut left = willow_alloc_object(1, 8);
     willow_push_root(&mut left);
     for _ in 0..1000 {
@@ -143,6 +137,7 @@ fn stress_region_01_middle_hole_churn_reuses_one_region() {
     assert_eq!(willow_gc_old_region_count(), 1);
 
     let initial_reuses = willow_gc_old_region_reuses();
+    let initial_allocations = willow_gc_old_region_allocations();
     for round in 0..200 {
         for value in 0..1000i64 {
             let object = willow_alloc_object(4, 8);
@@ -152,7 +147,21 @@ fn stress_region_01_middle_hole_churn_reuses_one_region() {
         assert_eq!(willow_gc_old_region_count(), 1);
         assert_global_regions_valid();
     }
-    assert!(willow_gc_old_region_reuses() >= initial_reuses + 200_000);
+    assert_eq!(
+        willow_gc_old_region_allocations() - initial_allocations,
+        200_000
+    );
+    if gc_stress_enabled("alloc") {
+        // Collection before every allocation (also in `all`) reclaims the
+        // setup garbage before `right` exists. The two roots are adjacent,
+        // so churn recycles the bump tail, not an interior free span. Sweep
+        // lowers `used` to the last live object; only free-span allocations
+        // increment old_region_reuses. Still exercise every churn allocation,
+        // bounded region retention, metadata validation and final reclamation.
+        assert_eq!(willow_gc_old_region_reuses(), initial_reuses);
+    } else {
+        assert!(willow_gc_old_region_reuses() >= initial_reuses + 200_000);
+    }
 
     willow_pop_roots(2);
     willow_gc_collect();
