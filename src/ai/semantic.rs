@@ -795,7 +795,13 @@ impl QuerySession {
                         .and_then(|ty| self.indirect_references.get(ty))
                         .into_iter()
                         .flatten()
-                        .map(|&i| &self.snapshot.semantic.references[i])
+                        .map(|&i| {
+                            let mut candidate =
+                                serde_json::to_value(&self.snapshot.semantic.references[i]).unwrap();
+                            candidate["certainty"] = json!("signature-matched");
+                            candidate["reason"] = json!("Indirect call through a binding or parameter with the same function type as the selected callable; the target is not resolved.");
+                            candidate
+                        })
                         .collect();
                     let mut coverage = String::from("compiler-resolved");
                     if refs.iter().any(|r| r["certainty"] == "possible-dispatch") {

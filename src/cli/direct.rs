@@ -317,6 +317,15 @@ fn human(value: &Value, options: &Options) -> String {
             result["coverage"].as_str().unwrap_or("compiler-resolved")
         ));
     }
+    if let Some(candidates) = result["unresolved_candidates"].as_array() {
+        for candidate in candidates {
+            lines.push(format!(
+                "  {} indirect candidate: {}",
+                location(&candidate["location"]),
+                candidate["reason"].as_str().unwrap_or("unresolved target")
+            ));
+        }
+    }
     if let Some(ty) = result["type_display"].as_str() {
         lines.push(format!("Type: {ty}"));
     }

@@ -2023,3 +2023,107 @@ fn select_bindings_keep_sibling_outer_and_nested_scopes_separate() {
         )
     );
 }
+
+#[test]
+fn indirect_reference_candidates_explain_each_site_in_json_and_text() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "fn submit(n: i64) -> i64 { return n + 1; }\nfn apply(f: fn(i64) -> i64) -> i64 { return f(1) + f(2); }\nfn main() { let local: fn(i64) -> i64 = submit; println(local(3)); println(apply(submit)); }\n").unwrap();
+    let value = f.json(&["refs", "main::submit"], 1);
+    assert_eq!(value["result"]["status"], "incomplete");
+    let candidates = value["result"]["unresolved_candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 3, "{value}");
+    let output = f.run(&["refs", "main::submit"]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).unwrap();
+    for candidate in candidates {
+        assert_eq!(candidate["certainty"], "signature-matched");
+        let reason = candidate["reason"].as_str().unwrap();
+        assert!(reason.contains("same function type"), "{reason}");
+        assert!(reason.contains("not resolved"), "{reason}");
+        let loc = &candidate["location"];
+        assert_eq!(loc["path"], "src/main.wi");
+        let site = format!("src/main.wi:{}:{}", loc["line"], loc["column"]);
+        assert!(
+            text.contains(&format!("{site} indirect candidate: {reason}")),
+            "{text}"
+        );
+        let source = fs::read_to_string(f.0.join("src/main.wi")).unwrap();
+        let token =
+            &source[loc["start"].as_u64().unwrap() as usize..loc["end"].as_u64().unwrap() as usize];
+        assert!(matches!(token, "f" | "local"), "{token}");
+    }
+    let absolute = f.json(
+        &["references", "main::submit", "--absolute-paths", "--all"],
+        1,
+    );
+    for candidate in absolute["result"]["unresolved_candidates"]
+        .as_array()
+        .unwrap()
+    {
+        assert!(
+            std::path::Path::new(candidate["location"]["path"].as_str().unwrap()).is_absolute()
+        );
+        assert!(candidate["reason"].is_string());
+    }
+    let other = f.json(&["refs", "main::main"], 0);
+    assert_eq!(other["result"]["status"], "ok");
+    assert!(
+        other["result"]["unresolved_candidates"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn indirect_reference_candidate_counts_scale_without_truncation() {
+    let f = Fixture::new();
+    for n in [1, 8, 64] {
+        let calls = "println(f(1));".repeat(n);
+        fs::write(f.0.join("src/main.wi"), format!("fn submit(n: i64) -> i64 {{ return n + 1; }}\nfn apply(f: fn(i64) -> i64) {{ {calls} }}\nfn main() {{ apply(submit); }}\n")).unwrap();
+        let value = f.json(&["refs", "main::submit"], 1);
+        let candidates = value["result"]["unresolved_candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), n);
+        let sites: std::collections::HashSet<_> = candidates
+            .iter()
+            .map(|c| c["location"].to_string())
+            .collect();
+        assert_eq!(sites.len(), n);
+        let output = f.run(&["refs", "main::submit"]);
+        assert_eq!(output.status.code(), Some(1));
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("indirect candidate:"))
+                .count(),
+            n,
+            "{text}"
+        );
+        println!(
+            "indirect calls={n} JSON candidates={} text candidates={n}",
+            candidates.len()
+        );
+    }
+}
+
+#[test]
+fn indirect_reference_candidates_include_imported_static_methods() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/order.wi"), "module order;\npub class Plain { pub static fn normalize(t: String) -> String { return t; } }\npub class Stem { pub static fn normalize(t: String) -> String { return t; } }\n").unwrap();
+    fs::write(f.0.join("src/main.wi"), "import order;\nfn map_terms(f: fn(String) -> String, t: String) -> String { return f(t); }\nfn main() { println(order::Plain::normalize(\"hi\")); }\n").unwrap();
+    for selector in ["order::Plain::normalize", "order::Stem::normalize"] {
+        let value = f.json(&["refs", selector], 1);
+        let candidates = value["result"]["unresolved_candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1, "{value}");
+        assert_eq!(candidates[0]["location"]["path"], "src/main.wi");
+        assert_eq!(candidates[0]["location"]["line"], 2);
+        assert_eq!(candidates[0]["location"]["column"], 69);
+        assert_eq!(candidates[0]["certainty"], "signature-matched");
+        assert!(
+            candidates[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("same function type")
+        );
+    }
+}
