@@ -782,6 +782,14 @@ impl TestProject {
         cli.output().expect("failed to run package compiler")
     }
 
+    pub(super) fn check(&self, entry: &str) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_willow"))
+            .arg("check")
+            .arg(self.root.join(entry))
+            .output()
+            .expect("failed to run compiler check")
+    }
+
     pub(super) fn compile(&self, entry: &str) -> std::process::Output {
         let src_path = self.root.join(entry);
         Command::new(env!("CARGO_BIN_EXE_willow"))

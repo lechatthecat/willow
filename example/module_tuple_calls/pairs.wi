@@ -1,0 +1,51 @@
+module pairs;
+import std::collections::Array;
+
+// Same-module calls must use the same structural tuple identity as callers.
+fn take(p: (i64, i64)) -> i64 { let (a, b) = p; return a; }
+fn pair(x: i64) -> (i64, i64) { return (x, 1); }
+fn echo(p: (i64, i64)) -> (i64, i64) { return p; }
+fn array_take(xs: Array<(i64, i64)>) -> i64 { let (a, b) = xs[0]; return a; }
+fn array_make(x: i64) -> Array<(i64, i64)> { return [(x, 1)]; }
+fn array_echo(xs: Array<(i64, i64)>) -> Array<(i64, i64)> { return xs; }
+fn singleton(p: (i64,)) -> i64 { let (a,) = p; return a; }
+fn triple(p: (i64, i64, i64)) -> i64 { let (a, b, c) = p; return a + b + c; }
+fn nested(p: ((i64, i64), i64)) -> i64 { let (inner, c) = p; return take(inner) + c; }
+fn nested_return() -> ((i64, i64), i64) { return ((2, 1), 3); }
+fn text(p: (String, i64)) -> String { let (s, n) = p; gc_collect(); return s; }
+fn real(p: (i64, f64)) -> f64 { let (n, f) = p; return f; }
+fn flag(p: (bool, i64)) -> bool { let (b, n) = p; return b; }
+fn two(a: (i64, i64), b: (i64, i64)) -> i64 { return take(a) + take(b); }
+fn mixed(x: i64, p: (i64, i64), y: i64) -> i64 { return x + take(p) + y; }
+fn recursive(p: (i64, i64), n: i64) -> i64 { if n == 0 { return take(p); } return recursive(p, n - 1); }
+fn forward(p: (i64, i64)) -> i64 { return later(p); }
+fn later(p: (i64, i64)) -> i64 { return take(p); }
+pub fn public_take(p: (i64, i64)) -> i64 { return take(p); }
+class Cell { pub value: i64; }
+fn object(p: (Cell, i64)) -> i64 { let (c, n) = p; return c.value; }
+enum Choice { Value(i64) }
+fn nominal(p: (Choice, i64)) -> i64 { let (c, n) = p; return match c { Choice::Value(v) => v }; }
+
+pub fn top(x: i64) -> i64 { return take((x, 1)); }
+pub fn run() {
+    println(top(5));                          // 1: original private parameter repro
+    let (a, b) = pair(5); println(a);         // 2: tuple return
+    println(take(echo((5, 1))));              // 3: tuple parameter and return
+    println(array_take([(5, 1)]));            // 4: Array tuple parameter
+    println(array_take(array_make(5)));       // 5: Array tuple return
+    println(array_take(array_echo([(5, 1)])));// 6: Array tuple round trip
+    println(singleton((5,)));                 // 7: singleton
+    println(triple((1, 1, 3)));               // 8: three elements
+    println(nested(((2, 1), 3)));             // 9: nested tuple parameter
+    println(nested(nested_return()));         // 10: nested tuple return
+    println(text(("fi" + "ve", 5)));          // 11: GC-managed String payload
+    println(real((1, 2.5)));                  // 12: floating-point payload
+    println(flag((true, 5)));                 // 13: boolean payload
+    println(two((2, 1), (3, 1)));             // 14: multiple tuple arguments
+    println(mixed(1, (2, 1), 2));             // 15: interleaved scalar arguments
+    println(recursive((5, 1), 3));            // 16: recursive same-module call
+    println(forward((5, 1)));                 // 17: forward declaration and call chain
+    println(public_take((5, 1)));             // 18: public same-module helper
+    println(object((new Cell(5), 1)));        // 19: nominal class inside tuple
+    println(nominal((Choice::Value(5), 1)));   // 20: nominal enum inside tuple
+}

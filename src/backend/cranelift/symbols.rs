@@ -298,7 +298,9 @@ pub(crate) fn qualify_module_local_type(
     local: &std::collections::HashSet<String>,
 ) -> Type {
     let qual = |n: &str| -> String {
-        if !n.contains("::") && local.contains(n) {
+        // Synthetic tuple declarations have a structural, module-independent identity.
+        // Keep this aligned with the type checker's qualify_local_type.
+        if !n.contains("::") && local.contains(n) && !crate::parser::tuples::is_tuple(n) {
             format!("{module_name}::{n}")
         } else {
             n.to_string()
@@ -662,5 +664,41 @@ mod mangling_tests {
             vtable_thunk_symbol("Parcel", "size"),
             vtable_thunk_symbol("Parcel", "label")
         );
+    }
+
+    #[test]
+    fn tuple_qualification_preserves_structural_identity_and_nominal_payloads() {
+        use std::collections::HashSet;
+        let local = HashSet::from(["$Tuple2".into(), "Cell".into(), "$TupleLike".into()]);
+        for width in [16, 32, 64] {
+            // Repeated identical tuple types must remain structural; their nominal
+            // payloads must still qualify. No new tuple declaration is synthesized.
+            let tuple = Type::Generic(
+                "$Tuple2".into(),
+                vec![Type::Named("Cell".into()), Type::I64],
+            );
+            let input = Type::Fn(
+                vec![tuple; width],
+                Box::new(Type::Named("$TupleLike".into())),
+            );
+            let expected_tuple = Type::Generic(
+                "$Tuple2".into(),
+                vec![Type::Named("pairs::Cell".into()), Type::I64],
+            );
+            let expected = Type::Fn(
+                vec![expected_tuple; width],
+                Box::new(Type::Named("pairs::$TupleLike".into())),
+            );
+            let output = qualify_module_local_type(&input, "pairs", &local);
+            assert_eq!(output, expected);
+            let mut visits = 0;
+            let counted = input.map_names(|name| {
+                visits += 1;
+                name.clone()
+            });
+            assert_eq!(counted, input);
+            assert_eq!(visits, 2 * width + 1);
+            eprintln!("tuple qualification width={width}, map_names callbacks={visits}");
+        }
     }
 }

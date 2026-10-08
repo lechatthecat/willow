@@ -200,3 +200,90 @@ async fn main() { println(value()); println(await work()); }
     assert!(ok, "{out}");
     assert_eq!(out, "1\nsync\noldest\n9\nasync\n10\n");
 }
+
+// willow-jz15.57: the example enumerates twenty distinct signature/call
+// perspectives. Check and execute the exact same project in both build modes.
+#[test]
+fn tuple_same_module_signatures_check_debug_release() {
+    let project = TestProject::new(
+        "tuple_module_signatures",
+        &[
+            (
+                "pairs.wi",
+                include_str!("../../example/module_tuple_calls/pairs.wi"),
+            ),
+            (
+                "main.wi",
+                include_str!("../../example/module_tuple_calls/main.wi"),
+            ),
+        ],
+    );
+    let checked = project.check("main.wi");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    for release in [false, true] {
+        let built = if release {
+            project.compile_release("main.wi")
+        } else {
+            project.compile("main.wi")
+        };
+        assert!(
+            built.status.success(),
+            "release={release}: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let output = project.run();
+        assert!(
+            output.status.success(),
+            "release={release}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "5\n5\n5\n5\n5\n5\n5\n5\n5\n5\nfive\n2.5\ntrue\n5\n5\n5\n5\n5\n5\n5\n",
+            "release={release}"
+        );
+    }
+}
+
+#[test]
+fn tuple_same_module_original_repro_check_debug_release() {
+    let project = TestProject::new(
+        "tuple_module_repro",
+        &[
+            (
+                "r.wi",
+                "module r; fn take(p: (i64, i64)) -> i64 { let (a, b) = p; return a; } pub fn top(x: i64) -> i64 { return take((x, 1)); }",
+            ),
+            ("main.wi", "import r::top; fn main() { println(top(5)); }"),
+        ],
+    );
+    let checked = project.check("main.wi");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    for release in [false, true] {
+        let built = if release {
+            project.compile_release("main.wi")
+        } else {
+            project.compile("main.wi")
+        };
+        assert!(
+            built.status.success(),
+            "release={release}: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let output = project.run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "5\n");
+    }
+}

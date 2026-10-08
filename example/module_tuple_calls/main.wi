@@ -1,0 +1,2 @@
+import pairs;
+fn main() { pairs::run(); }
