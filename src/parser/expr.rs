@@ -123,6 +123,50 @@ impl Parser {
         }
     }
 
+    /// Expression-form conditionals share the ternary AST and all its typing,
+    /// short-circuit lowering and contextual conversions. Braces delimit one
+    /// branch expression; statement-form `if` continues to use `parse_if`.
+    /// Collect and fold else-if rungs once, without recursive ladder parsing.
+    pub(super) fn parse_if_expr(&mut self) -> Result<Expr, Diagnostic> {
+        let mut rungs = Vec::new();
+        let mut value = loop {
+            let start = self.current_span();
+            self.expect(TokenKind::If)?;
+            let condition = self.parse_control_head()?;
+            let then_expr = self.parse_if_value()?;
+            rungs.push((start, condition, then_expr));
+            if !self.eat(TokenKind::Else) {
+                return Err(self
+                    .err(
+                        ErrorCode::E0102,
+                        "an `if` expression requires an `else` branch",
+                    )
+                    .with_help("write `if condition { value } else { other_value }`"));
+            }
+            if !self.check(TokenKind::If) {
+                break self.parse_if_value()?;
+            }
+        };
+        let end = self.previous_span();
+        while let Some((start, condition, then_expr)) = rungs.pop() {
+            value = Expr::Ternary(Box::new(TernaryExpr {
+                condition,
+                then_expr,
+                else_expr: value,
+                span: start.to(end),
+                id: ExprId::fresh(),
+            }));
+        }
+        Ok(value)
+    }
+
+    pub(super) fn parse_if_value(&mut self) -> Result<Expr, Diagnostic> {
+        self.expect(TokenKind::LBrace)?;
+        let value = self.parse_expr()?;
+        self.expect(TokenKind::RBrace)?;
+        Ok(value)
+    }
+
     pub(super) fn parse_or(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_and()?;
         while self.check(TokenKind::Or) {
@@ -517,6 +561,7 @@ impl Parser {
             }
             TokenKind::New => self.parse_new(),
             TokenKind::Select => self.parse_select(),
+            TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
             TokenKind::F64 => {
                 let span = self.current_span();

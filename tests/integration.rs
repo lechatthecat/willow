@@ -295,3 +295,6 @@ mod native_stack_slots;
 
 #[path = "integration/tuples.rs"]
 mod tuples;
+
+#[path = "integration/if_expressions.rs"]
+mod if_expressions;
