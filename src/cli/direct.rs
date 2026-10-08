@@ -414,6 +414,34 @@ fn effect_names(bits: &Value) -> String {
 }
 
 fn effect_lines(result: &Value, all: bool, lines: &mut Vec<String>) {
+    if let Some(causes) = result["unknown_causes"].as_array() {
+        for cause in causes.iter().take(if all { usize::MAX } else { 50 }) {
+            lines.push(format!(
+                "Incomplete effect summary: {}",
+                cause["name"].as_str().unwrap_or("unknown")
+            ));
+            if let Some(locations) = cause["locations"].as_array() {
+                for loc in locations {
+                    lines.push(format!("  {}", location(loc)));
+                }
+                if locations.is_empty() {
+                    lines.push("  No declaration source is available.".into());
+                    if cause["caller_location"].is_object() {
+                        lines.push(format!(
+                            "  Referenced from caller at {}",
+                            location(&cause["caller_location"])
+                        ));
+                    }
+                }
+            }
+        }
+        if !all && causes.len() > 50 {
+            lines.push(format!(
+                "  {} unknown causes omitted; use --all",
+                causes.len() - 50
+            ));
+        }
+    }
     lines.push(format!(
         "Runtime effects: {}",
         effect_names(&result["runtime_effects"])
@@ -547,6 +575,49 @@ mod tests {
                 &options,
             );
             assert!(text.contains(reason), "{text}");
+        }
+    }
+    #[test]
+    fn unknown_effect_origins_are_bounded_and_missing_source_is_explicit() {
+        for count in [0, 1, 16, 64, 256] {
+            let causes: Vec<_> = (0..count)
+                .map(|i| {
+                    json!({"name":format!("m::callee{i}"),
+                "locations":[], "caller_location":{"path":"m.wi","line":i+1,"column":1}})
+                })
+                .collect();
+            for all in [false, true] {
+                let mut lines = Vec::new();
+                effect_lines(&json!({"unknown_causes":causes}), all, &mut lines);
+                let shown = if all { count } else { count.min(50) };
+                assert_eq!(
+                    lines
+                        .iter()
+                        .filter(|l| l.starts_with("Incomplete effect summary: m::callee"))
+                        .count(),
+                    shown
+                );
+                assert_eq!(
+                    lines
+                        .iter()
+                        .filter(|l| l.contains("No declaration source"))
+                        .count(),
+                    shown
+                );
+                assert_eq!(
+                    lines
+                        .iter()
+                        .filter(|l| l.contains("Referenced from caller at m.wi:"))
+                        .count(),
+                    shown
+                );
+                assert_eq!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("unknown causes omitted; use --all")),
+                    !all && count > 50
+                );
+            }
         }
     }
     #[test]

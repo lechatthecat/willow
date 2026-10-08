@@ -328,11 +328,16 @@ pub(crate) fn capture(
                     "loop-safepoint",
                 )),
                 AstEvent::Expr(e) => {
+                    if matches!(e, Expr::String(..)) {
+                        // Literal slots can allocate on first use, but a static
+                        // literal is not evidence of a per-evaluation allocation.
+                        // Keep the bound without displacing actual allocation sites.
+                        bits |= RuntimeEffects::MAY_ALLOCATE.bits();
+                    }
                     let effects = match e {
-                        Expr::New(_)
-                        | Expr::ArrayLiteral(..)
-                        | Expr::ObjectLiteral(_)
-                        | Expr::String(..) => RuntimeEffects::MAY_ALLOCATE.bits(),
+                        Expr::New(_) | Expr::ArrayLiteral(..) | Expr::ObjectLiteral(_) => {
+                            RuntimeEffects::MAY_ALLOCATE.bits()
+                        }
                         // Async select parks via SuspendOp::SelectWait. Its case
                         // expressions/bodies are visited independently below.
                         Expr::Select(_) if is_async => RuntimeEffects::MAY_ALLOCATE
@@ -347,6 +352,20 @@ pub(crate) fn capture(
                             willow_abi::runtime_symbol("willow_string_concat")
                                 .expect("string concat ABI")
                                 .effects()
+                                .bits()
+                        }
+                        // Only direct runtime scheduler builtins prove this lowering.
+                        // Stored/custom futures retain their conservative await bound.
+                        Expr::Await(a)
+                            if is_async
+                                && matches!(&a.expr, Expr::Call(c)
+                                    if matches!(c.callee.as_str(), "sleep" | "yield")
+                                        && calls.get(&c.id) == Some(&Some(FunctionId::free(&c.callee)))
+                                        && symbols.lookup_func(&c.callee)
+                                            .is_some_and(|f| f.declaration_span.end == 0)) =>
+                        {
+                            RuntimeEffects::MAY_SUSPEND
+                                .union(RuntimeEffects::MAY_PREEMPT)
                                 .bits()
                         }
                         Expr::Await(_) | Expr::Select(_) | Expr::Print(..) => {
@@ -378,7 +397,6 @@ pub(crate) fn capture(
                         Expr::New(_) => "object-allocation",
                         Expr::ArrayLiteral(..) => "array-allocation",
                         Expr::ObjectLiteral(_) => "object-literal-allocation",
-                        Expr::String(..) => "string-allocation",
                         Expr::Await(_) => "await",
                         Expr::Select(_) => "select",
                         Expr::Print(..) => "print",
@@ -859,6 +877,8 @@ pub(crate) fn snapshot(
             for caller in callers {
                 let node = nodes.get_mut(&caller).unwrap();
                 node.unknown = true;
+                node.unresolved
+                    .push(format!("dispatch {}::{}", key.0, key.1));
                 node.runtime_effects |= RuntimeEffects::ALL.bits();
             }
         }

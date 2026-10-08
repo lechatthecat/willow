@@ -922,6 +922,24 @@ fn await_block_bounds_explain_lowering_without_blaming_locks() {
                 let selector = format!("main::{name}");
                 let result = f.json(&["effects", &selector, "--explain"], 0);
                 let evidence = result["result"]["effect_evidence"].as_array().unwrap();
+                if setup.is_empty() {
+                    assert!(
+                        evidence
+                            .iter()
+                            .all(|e| e["effect"] != RuntimeEffects::MAY_BLOCK.bits()),
+                        "{result}"
+                    );
+                    assert_eq!(
+                        result["result"]["runtime_effects"].as_u64().unwrap()
+                            & u64::from(
+                                RuntimeEffects::MAY_BLOCK.bits()
+                                    | RuntimeEffects::NO_PREEMPT_REGION.bits()
+                            ),
+                        0,
+                        "{result}"
+                    );
+                    continue;
+                }
                 let block = evidence
                     .iter()
                     .find(|e| e["effect"] == RuntimeEffects::MAY_BLOCK.bits())
@@ -2126,4 +2144,118 @@ fn indirect_reference_candidates_include_imported_static_methods() {
                 .contains("same function type")
         );
     }
+}
+
+#[test]
+fn effect_witness_precision_literals_scheduler_and_unknown_origins() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/effect_witness_precision.wi"),
+    )
+    .unwrap();
+    for name in ["literal", "literal_relay"] {
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 1);
+        assert_ne!(
+            value["result"]["runtime_effects"].as_u64().unwrap()
+                & u64::from(E::MAY_ALLOCATE.bits()),
+            0,
+            "{value}"
+        );
+        let allocation = value["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["effect"] == E::MAY_ALLOCATE.bits())
+            .unwrap();
+        assert_eq!(allocation["status"], "missing-witness", "{value}");
+        assert!(allocation.get("witness").is_none(), "{value}");
+    }
+    for name in [
+        "panic_message",
+        "allocate_after_literal",
+        "allocate_before_literal",
+        "allocate_relay",
+        "concat",
+    ] {
+        let value = f.json(
+            &["effects", &format!("main::{name}"), "--explain"],
+            if name == "panic_message" { 1 } else { 0 },
+        );
+        assert!(!value.to_string().contains("string-allocation"), "{value}");
+        if name.starts_with("allocate") || name == "concat" {
+            let allocation = value["result"]["effect_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["effect"] == E::MAY_ALLOCATE.bits())
+                .unwrap();
+            assert_eq!(
+                allocation["witness"]["cause"]["operation"],
+                if name == "concat" {
+                    "string-concatenation"
+                } else {
+                    "object-allocation"
+                },
+                "{value}"
+            );
+            assert!(
+                allocation["witness"]["cause"]["location"]["line"].is_number(),
+                "{value}"
+            );
+        }
+    }
+    for name in [
+        "timer_zero",
+        "timer_positive",
+        "timer_negative",
+        "scheduler_yield",
+        "timer_relay",
+    ] {
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+        let bits = value["result"]["runtime_effects"].as_u64().unwrap();
+        assert_eq!(
+            bits & u64::from(E::MAY_BLOCK.bits() | E::NO_PREEMPT_REGION.bits()),
+            0,
+            "{value}"
+        );
+        assert_ne!(bits & u64::from(E::MAY_SUSPEND.bits()), 0, "{value}");
+    }
+    for name in ["apply", "relay", "dispatch"] {
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 1);
+        let causes = value["result"]["unknown_causes"].as_array().unwrap();
+        let cause = causes.iter().find(|c| c["name"] == "apply").unwrap();
+        assert!(
+            !cause["unresolved"].as_array().unwrap().is_empty(),
+            "{value}"
+        );
+        assert_eq!(cause["locations"][0]["line"], 16, "{value}");
+        let output = f.run(&["effects", &format!("main::{name}")]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains("Incomplete effect summary: main::apply"),
+            "{text}"
+        );
+        assert!(text.contains("src/main.wi:16:"), "{text}");
+    }
+}
+
+#[test]
+fn effect_witness_precision_shadowed_scheduler_names_stay_conservative() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "async fn sleep(n: i64) {}\nasync fn custom() { await sleep(1); }\nasync fn main() {}\n",
+    )
+    .unwrap();
+    let value = f.json(&["effects", "main::custom", "--explain"], 0);
+    let block = value["result"]["effect_evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["effect"] == E::MAY_BLOCK.bits())
+        .unwrap();
+    assert_eq!(block["witness"]["cause"]["operation"], "await", "{value}");
 }

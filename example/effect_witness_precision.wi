@@ -1,0 +1,28 @@
+// Runnable evidence regression: interned strings, scheduler awaits, unknown callee.
+class Response { pub value: i64; pub init(self) { self.value = 1; } }
+fn literal() -> String { return "slowly"; }
+fn literal_relay() -> String { return literal(); }
+fn panic_message() { panic("message"); }
+fn allocate_after_literal() -> Response { let label = "slowly"; return new Response(); }
+fn allocate_before_literal() -> Response { let value = new Response(); let label = "slowly"; return value; }
+fn allocate_relay() -> Response { let label = "slowly"; return allocate_after_literal(); }
+fn concat(a: String) -> String { return a + "suffix"; }
+async fn timer_zero() { await sleep(0); }
+async fn timer_positive() { await sleep(120); }
+async fn timer_negative() { await sleep(-1); }
+async fn scheduler_yield() { await yield(); }
+fn timer_relay() { timer_positive(); }
+async fn stored_timer() { let timer = sleep(0); await timer; }
+fn apply(f: fn(i64) -> i64) -> i64 { return f(1); }
+fn relay(f: fn(i64) -> i64) -> i64 { return apply(f); }
+fn increment(n: i64) -> i64 { return n + 1; }
+open class Base { pub open fn run(self, f: fn(i64) -> i64) -> i64 { return 0; } }
+class Child extends Base { pub override fn run(self, f: fn(i64) -> i64) -> i64 { return apply(f); } }
+fn dispatch(b: Base, f: fn(i64) -> i64) -> i64 { return b.run(f); }
+async fn main() {
+    println(literal_relay());
+    println(allocate_relay().value);
+    println(relay(increment));
+    await timer_zero();
+    await scheduler_yield();
+}

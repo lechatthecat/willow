@@ -273,6 +273,7 @@ mod tests {
             "multiple_seeds",
             "duplicate_calls",
             "synthetic",
+            "missing_source",
         ] {
             for n in [16, 64, 256, 1024, 4096] {
                 let mut functions: Vec<_> = (0..n).map(node).collect();
@@ -280,7 +281,7 @@ mod tests {
                     match shape {
                         "fanout" | "duplicate_calls" if i > 0 => f.callees = vec!["f0".into()],
                         "cycle" => f.callees = vec![format!("f{}", (i + 1) % n)],
-                        "chain" | "multiple_seeds" | "synthetic" if i > 0 => {
+                        "chain" | "multiple_seeds" | "synthetic" | "missing_source" if i > 0 => {
                             f.callees = vec![format!("f{}", i - 1)]
                         }
                         _ => {}
@@ -293,6 +294,15 @@ mod tests {
                 functions[0]
                     .unresolved
                     .push("indirect-or-unresolved".into());
+                if shape == "missing_source" {
+                    functions[0].synthetic = true;
+                    functions[0].unresolved.clear();
+                    functions[1].locations.push(Location {
+                        path: "m".into(),
+                        start: 1,
+                        end: 2,
+                    });
+                }
                 propagate(&mut functions);
                 let snapshot = Snapshot {
                     edit_context: None,
@@ -302,7 +312,7 @@ mod tests {
                     compatibility: String::new(),
                     workspace: String::new(),
                     revision: "r".into(),
-                    sources: BTreeMap::new(),
+                    sources: BTreeMap::from([("m".into(), "source".into())]),
                     functions,
                 };
                 let seeds = if shape == "multiple_seeds" {
@@ -344,6 +354,22 @@ mod tests {
                         revision: revision.clone(),
                         function: format!("f{root}"),
                     });
+                    assert_eq!(
+                        value["result"]["unknown_causes"].as_array().unwrap().len(),
+                        1,
+                        "{shape} {n}: {value}"
+                    );
+                    assert_eq!(value["result"]["unknown_causes"][0]["function"], "f0");
+                    if shape == "missing_source" {
+                        assert_eq!(
+                            value["result"]["unknown_causes"][0]["caller_location"]["start"],
+                            1
+                        );
+                        assert_eq!(
+                            value["result"]["unknown_causes"][0]["locations"],
+                            serde_json::json!([])
+                        );
+                    }
                     assert_eq!(value["result"]["status"], "unknown");
                     assert!(value["result"]["reason"].is_string());
                     assert_eq!(
@@ -359,6 +385,8 @@ mod tests {
                     result.nodes.len(),
                     if shape == "synthetic" {
                         n.div_ceil(2)
+                    } else if shape == "missing_source" {
+                        n - 1
                     } else {
                         n
                     }

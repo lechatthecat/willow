@@ -77,7 +77,6 @@ fn explicit_allocation(operation: Option<&str>) -> bool {
             "array-allocation"
                 | "object-allocation"
                 | "object-literal-allocation"
-                | "string-allocation"
                 | "string-concatenation"
                 | "lambda-environment"
         )
@@ -825,12 +824,24 @@ impl QuerySession {
                 Some(&i) => {
                     let f = &self.snapshot.functions[i];
                     let mut seen = std::collections::HashSet::from([i]);
-                    let mut queue = std::collections::VecDeque::from([i]);
+                    let mut queue = std::collections::VecDeque::from([(i, None)]);
                     let mut witness = vec![
                         json!({"function":f.id,"via":null,"reason":f.unknown_reason(),"unresolved":f.unresolved}),
                     ];
                     let mut evidence = BTreeMap::new();
-                    while let Some(j) = queue.pop_front() {
+                    let mut unknown_causes = Vec::new();
+                    while let Some((j, via)) = queue.pop_front() {
+                        let cause = &self.snapshot.functions[j];
+                        if cause.unknown
+                            && (!cause.unresolved.is_empty()
+                                || (cause.synthetic && self.callees[j].is_empty()))
+                        {
+                            unknown_causes.push(json!({"function":cause.id,
+                                "name":cause.name, "module":cause.module,
+                                "locations":cause.locations, "unresolved":cause.unresolved,
+                                "caller_location":if cause.locations.is_empty() { via.and_then(|v: usize| self.snapshot.functions[v].locations.first()) } else { None },
+                                "reason":cause.unknown_reason()}));
+                        }
                         if let Some(facts) = self
                             .snapshot
                             .semantic
@@ -866,7 +877,7 @@ impl QuerySession {
                         for &k in &self.callees[j] {
                             self.effect_edge_visits += 1;
                             if seen.insert(k) {
-                                queue.push_back(k);
+                                queue.push_back((k, Some(j)));
                                 witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
                             }
                         }
@@ -888,7 +899,7 @@ impl QuerySession {
                         });
                     }
                     json!({"status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
-                        "reason":f.unknown_reason(), "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence.into_values().collect::<Vec<_>>(),
+                        "reason":f.unknown_reason(), "unknown_causes":unknown_causes, "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence.into_values().collect::<Vec<_>>(),
                         "witness":witness, "compiler_witnesses":self.snapshot.semantic.witnesses.get(&f.id),
                         "meaning":"compiler facts and conservative runtime capability bounds; external business effects and predicate feasibility are not implied"})
                 }

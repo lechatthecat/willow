@@ -922,6 +922,13 @@ impl DirectSession {
             }
         }
         let name = |id: &str| labels.get(id).or_else(|| self.function_names.get(id));
+        if let Some(causes) = result["unknown_causes"].as_array_mut() {
+            for cause in causes {
+                if let Some(name) = cause["function"].as_str().and_then(name) {
+                    cause["name"] = json!(name);
+                }
+            }
+        }
         for key in ["effect_evidence", "compiler_witnesses"] {
             if let Some(facts) = result[key].as_array_mut() {
                 for fact in facts {
