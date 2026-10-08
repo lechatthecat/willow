@@ -1,0 +1,24 @@
+// Generic instantiation in `extends` is currently rejected with E0427:
+// interface Filter extends Predicate<i64> { fn describe(self) -> String; }
+// Declare specialized methods on a non-generic contract instead. Generic
+// `implements` remains supported and can coexist with that contract.
+interface Predicate<T> {
+    fn accepts(self, value: T) -> bool;
+}
+interface IntPredicate {
+    fn accepts(self, value: i64) -> bool;
+}
+interface Filter extends IntPredicate {
+    fn describe(self) -> String;
+}
+class Positive implements Filter, Predicate<i64> {
+    pub fn accepts(self, value: i64) -> bool { return value > 0; }
+    pub fn describe(self) -> String { return "positive"; }
+}
+fn main() {
+    let filter: Filter = new Positive();
+    let predicate: Predicate<i64> = new Positive();
+    println(filter.describe());
+    println(filter.accepts(3));
+    println(predicate.accepts(-1));
+}

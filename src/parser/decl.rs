@@ -362,14 +362,7 @@ impl Parser {
         // Optional super-interfaces: `interface B extends A` (willow-1js.2).
         let mut extends = Vec::new();
         if self.eat(TokenKind::Extends) {
-            let start = self.current_span();
-            let name = self.parse_module_path()?;
-            self.type_uses.push(TypeUse {
-                name: name.clone(),
-                span: start.to(self.tokens[self.pos - 1].span),
-            });
-            extends.push(name);
-            while self.eat(TokenKind::Comma) {
+            loop {
                 let start = self.current_span();
                 let name = self.parse_module_path()?;
                 self.type_uses.push(TypeUse {
@@ -377,6 +370,33 @@ impl Parser {
                     span: start.to(self.tokens[self.pos - 1].span),
                 });
                 extends.push(name);
+                if self.check(TokenKind::Lt) {
+                    let span = self.current_span();
+                    // Inheritance currently stores names, not instantiated types.
+                    // Skip the rejected declaration, including nested default bodies,
+                    // so item recovery cannot mistake its methods for free functions.
+                    // Leave the closing brace for recover_to_next_item to consume.
+                    let mut depth = 0usize;
+                    while !self.at_eof() {
+                        match self.peek_kind() {
+                            TokenKind::LBrace => depth += 1,
+                            TokenKind::RBrace if depth <= 1 => break,
+                            TokenKind::RBrace => depth -= 1,
+                            _ => {}
+                        }
+                        self.advance();
+                    }
+                    return Err(Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0427,
+                        "generic interface instantiation in `extends` is not supported yet",
+                    )
+                    .with_label(Label::primary(span, "type arguments in an interface `extends` clause"))
+                    .with_help("use a non-generic super-interface and declare the specialized methods explicitly"));
+                }
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
             }
         }
         self.expect(TokenKind::LBrace)?;

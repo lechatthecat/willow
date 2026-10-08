@@ -3361,3 +3361,6 @@ mod keyword_tests;
 
 #[cfg(test)]
 mod unsupported_postfix_tests;
+
+#[cfg(test)]
+mod generic_interface_extends_tests;

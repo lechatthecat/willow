@@ -1090,3 +1090,22 @@ fn ticket_52_substring_panic_values() {
         assert!(out.contains("UTF-8 boundaries"), "{out}");
     }
 }
+
+#[test]
+fn generic_interface_extends_has_one_dedicated_diagnostic() {
+    let stderr = compile_error_stderr(
+        "interface Predicate<T> { fn accepts(self, value: T) -> bool; }\n\
+         pub interface Filter extends Predicate<i64> {\n\
+             fn describe(self) -> String;\n\
+             fn extra(self) -> i64 { if true { return 1; } return 0; }\n\
+         }\n\
+         fn main() {}",
+    );
+    assert!(stderr.contains("error[E0427]"), "{stderr}");
+    assert!(
+        stderr.contains("generic interface instantiation in `extends` is not supported yet"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("error[E").count(), 1, "{stderr}");
+    assert!(!stderr.contains("reserved keyword"), "{stderr}");
+}
