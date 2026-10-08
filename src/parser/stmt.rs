@@ -345,8 +345,12 @@ impl Parser {
         self.expect(TokenKind::Let)?;
         let mutable = self.eat(TokenKind::Mut);
         let name = self.expect_ident()?;
+        let mut type_span = None;
         let ty = if self.eat(TokenKind::Colon) {
-            Some(self.parse_type()?)
+            let start = self.current_span();
+            let ty = self.parse_type()?;
+            type_span = Some(start.to(self.previous_span()));
+            Some(ty)
         } else {
             None
         };
@@ -357,6 +361,7 @@ impl Parser {
         Ok(Stmt::Let(LetStmt {
             name,
             mutable,
+            type_span,
             ty,
             init,
             span,
@@ -700,6 +705,7 @@ impl Parser {
             Stmt::Let(LetStmt {
                 name: name.to_owned(),
                 mutable: false,
+                type_span: None,
                 ty: None,
                 init,
                 span,

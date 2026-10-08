@@ -496,7 +496,7 @@ clone_shell_struct!(MatchArm {
     syntax: [guard, body]
 });
 clone_shell_struct!(LetStmt {
-    metadata: [name, mutable, ty, span],
+    metadata: [name, mutable, ty, type_span, span],
     syntax: [init]
 });
 clone_shell_struct!(AssignStmt {

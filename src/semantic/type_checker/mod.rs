@@ -1120,6 +1120,21 @@ impl TypeChecker {
                     .join(" or ")
             );
         }
+        // A fixed built-in vocabulary keeps typo recovery independent of the
+        // number of declarations; exact missing-import hints above take priority.
+        let builtins = [
+            "Array",
+            "Map",
+            "FrozenArray",
+            "Channel",
+            "String",
+            "Option",
+            "Result",
+            "Task",
+        ];
+        if let Some(suggestion) = suggest_similar_name(name, builtins.iter()) {
+            return format!("did you mean `{suggestion}`?");
+        }
         "define a class, enum, or interface with this name, or check the spelling".into()
     }
 

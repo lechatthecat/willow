@@ -3409,6 +3409,7 @@ mod tests {
             id: crate::parser::ast::BodyId::fresh(),
             stmts: vec![
                 Stmt::Let(LetStmt {
+                    type_span: None,
                     name: "y".to_string(),
                     mutable: false,
                     ty: Some(crate::parser::ast::Type::String),
@@ -3420,6 +3421,7 @@ mod tests {
                     body: Block {
                         id: crate::parser::ast::BodyId::fresh(),
                         stmts: vec![Stmt::Let(LetStmt {
+                            type_span: None,
                             name: "z".to_string(),
                             mutable: false,
                             ty: Some(crate::parser::ast::Type::I64),
@@ -3450,6 +3452,7 @@ mod tests {
         let body = Block {
             id: crate::parser::ast::BodyId::fresh(),
             stmts: vec![Stmt::Let(LetStmt {
+                type_span: None,
                 name: "inferred".to_string(),
                 mutable: false,
                 ty: None,

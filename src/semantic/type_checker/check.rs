@@ -1241,8 +1241,9 @@ impl TypeChecker {
                 // the mismatches it goes on to cause (willow-rlq9).
                 let annotation = s.ty.as_ref().map(|ty| {
                     let errors_before = self.error_generation;
-                    let annotation = self.normalize_type(ty, s.span);
-                    self.validate_type(&annotation, s.span);
+                    let type_span = s.type_span.unwrap_or(s.span);
+                    let annotation = self.normalize_type(ty, type_span);
+                    self.validate_type(&annotation, type_span);
                     if self.error_generation == errors_before {
                         annotation
                     } else {

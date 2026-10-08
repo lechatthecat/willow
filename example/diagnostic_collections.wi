@@ -1,0 +1,8 @@
+import std::collections::FrozenArray;
+import std::collections::Array;
+fn main() {
+    let values: FrozenArray<i64> = [1, 2].freeze();
+    let channel = Channel<i64>::with_capacity(1);
+    println(values.len());
+    println("abc".substring(1, 2));
+}

@@ -159,7 +159,11 @@ const VOID_IO: StdType = T::Result(&T::Void, &IO_ERROR);
 const LISTENER_IO: StdType = T::Result(&TCP_LISTENER, &IO_ERROR);
 const STREAM_IO: StdType = T::Result(&TCP_STREAM, &IO_ERROR);
 
-const COLLECTIONS: &[StdItemSchema] = &[std_type!("Array", 1, "Array"), std_type!("Map", 2, "Map")];
+const COLLECTIONS: &[StdItemSchema] = &[
+    std_type!("Array", 1, "Array"),
+    std_type!("Map", 2, "Map"),
+    std_type!("FrozenArray", 1, "FrozenArray"),
+];
 const OPTION: &[StdItemSchema] = &[std_type!("Option", 1, "Option")];
 const RESULT: &[StdItemSchema] = &[std_type!("Result", 2, "Result")];
 const IO: &[StdItemSchema] = &[
@@ -726,7 +730,7 @@ mod recursive_schema_tests {
             ]
         );
         for (name, count) in [
-            ("collections", 2),
+            ("collections", 3),
             ("option", 1),
             ("result", 1),
             ("io", 3),

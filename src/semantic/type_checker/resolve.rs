@@ -2014,7 +2014,8 @@ impl TypeChecker {
                             args.len()
                         ),
                     )
-                    .with_label(Label::primary(span, "wrong number of arguments")),
+                    .with_label(Label::primary(span, "wrong number of arguments"))
+                    .with_help("use `Channel::with_capacity(n)` to create a bounded channel"),
                 );
             }
             return match type_args {

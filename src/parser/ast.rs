@@ -630,6 +630,8 @@ impl LockStmt {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LetStmt {
+    #[serde(default)]
+    pub type_span: Option<Span>,
     pub name: String,
     pub mutable: bool,
     pub ty: Option<Type>,

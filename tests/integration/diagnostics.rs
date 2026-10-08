@@ -1049,3 +1049,44 @@ fn main() { let reader: Reader = new Box(1); println(reader.read()); }
 }
 
 // ── Match expression tests ─────────────────────────────────────────────────────
+
+#[test]
+fn ticket_52_frozen_array_import() {
+    let source = include_str!("../../example/diagnostic_collections.wi");
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\nb\n");
+    let error = compile_error_stderr("import std::collections::FrozenArry; fn main() {}");
+    assert!(error.contains("FrozenArray"), "{error}");
+}
+
+#[test]
+fn ticket_52_substring_panic_values() {
+    for (text, start, end, len) in [
+        ("s", 5, 100, 1),
+        ("abc", -1, 1, 3),
+        ("abc", 2, 1, 3),
+        ("日本", 1, 3, 6),
+        ("日本", 0, 4, 6),
+        ("", 0, 1, 0),
+        ("s", 0, i64::MAX, 1),
+        ("s", i64::MIN, 0, 1),
+    ] {
+        // The lexer bounds positive literals before unary negation.
+        let start_expr = if start == i64::MIN {
+            "(-9223372036854775807 - 1)".to_owned()
+        } else {
+            start.to_string()
+        };
+        let source = format!(
+            r#"fn main() {{ defer match recover() {{ Some(info) => println(info.message), None => {{}} }} "{text}".substring({start_expr}, {end}); }}"#
+        );
+        let (out, ok) = compile_and_run(&source);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(&format!("start={start}, end={end}, len={len}")),
+            "{out}"
+        );
+        assert!(out.contains("UTF-8 boundaries"), "{out}");
+    }
+}

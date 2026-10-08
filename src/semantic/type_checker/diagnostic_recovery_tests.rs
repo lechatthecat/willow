@@ -143,3 +143,95 @@ fn diagnostic_recovery_fanout_counts() {
         assert_eq!(checker.expr_types.len(), 2 * n + 3);
     }
 }
+
+#[test]
+fn ticket_52_type_typo_spans_and_hints() {
+    for (ty, expected) in [
+        ("Arry", "Array"),
+        ("FrozenArry<i64>", "FrozenArray"),
+        ("Chanel<i64>", "Channel"),
+        ("Strng", "String"),
+    ] {
+        for binding in ["let y", "let mut y"] {
+            let source = format!("fn main() {{ {binding}: {ty} = 1; }}");
+            let errors = check_source(&source);
+            let error = errors
+                .iter()
+                .find(|d| d.message.starts_with("cannot find type"))
+                .unwrap();
+            assert!(
+                error
+                    .helps
+                    .iter()
+                    .any(|h| h.contains(&format!("did you mean `{expected}`"))),
+                "{error:?}"
+            );
+            let span = error.labels[0].span;
+            assert_eq!(&source[span.start..span.end], ty);
+        }
+    }
+}
+
+#[test]
+fn ticket_52_channel_capacity_hint() {
+    for call in [
+        "Channel::new(1)",
+        "Channel<i64>::new(1)",
+        "Channel::new(1, 2)",
+    ] {
+        let errors = check_source(&format!("fn main() {{ let c = {call}; }}"));
+        let error = errors
+            .iter()
+            .find(|d| d.message.contains("expects 0 arguments"))
+            .unwrap();
+        assert!(
+            error
+                .helps
+                .iter()
+                .any(|h| h.contains("Channel::with_capacity(n)"))
+        );
+    }
+    for call in ["Channel<i64>::new()", "Channel<i64>::with_capacity(1)"] {
+        assert!(check_source(&format!("fn main() {{ let c = {call}; }}")).is_empty());
+    }
+}
+
+#[test]
+fn ticket_52_typo_work_counts() {
+    let checker = TypeChecker::new();
+    // Built-in candidate lengths total 48; no scan over program declarations.
+    for length in [8, 64, 512] {
+        for repetitions in [1, 8, 64] {
+            diagnostics::EDIT_CELLS.with(|cells| cells.set(0));
+            for _ in 0..repetitions {
+                checker.unknown_type_help(&"x".repeat(length));
+            }
+            let cells = diagnostics::EDIT_CELLS.with(|cells| cells.get());
+            assert_eq!(cells, length * repetitions * 48);
+            println!("length={length} repetitions={repetitions} cells={cells}");
+        }
+    }
+}
+
+#[test]
+fn ticket_52_annotation_span_preserves_file_identity() {
+    for ty in ["Arry", "FrozenArry<i64>", "Option<Arry>"] {
+        let source = format!("fn main() {{ let value: {ty}=1; }}");
+        let mut tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+        for token in &mut tokens {
+            token.span.file_id = crate::diagnostics::FileId(7);
+        }
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty());
+        let mut checker = TypeChecker::new();
+        checker.check_program(&program);
+        let error = checker
+            .errors
+            .iter()
+            .find(|d| d.message.starts_with("cannot find type"))
+            .unwrap();
+        let span = error.labels[0].span;
+        assert_eq!(span.file_id, crate::diagnostics::FileId(7));
+        assert_eq!(&source[span.start..span.end], ty);
+    }
+}

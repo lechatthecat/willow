@@ -1,16 +1,17 @@
 //! Diagnostic text helpers for the type checker (extracted from `mod.rs`):
 //! "did you mean" suggestions (edit distance).
 
-pub(super) fn suggest_similar_name<'a>(
+pub(super) fn suggest_similar_name<'a, S: AsRef<str> + 'a>(
     target: &str,
-    candidates: impl Iterator<Item = &'a String>,
+    candidates: impl Iterator<Item = &'a S>,
 ) -> Option<String> {
     let max_distance = if target.len() <= 4 { 1 } else { 2 };
     candidates
+        .map(AsRef::as_ref)
         .map(|candidate| (levenshtein(target, candidate), candidate))
         .filter(|(distance, _)| *distance <= max_distance)
         .min_by_key(|(distance, candidate)| (*distance, candidate.len()))
-        .map(|(_, candidate)| candidate.clone())
+        .map(|(_, candidate)| candidate.to_owned())
 }
 
 pub(super) fn levenshtein(a: &str, b: &str) -> usize {
@@ -21,6 +22,8 @@ pub(super) fn levenshtein(a: &str, b: &str) -> usize {
     for (i, ca) in a.chars().enumerate() {
         curr[0] = i + 1;
         for (j, cb) in b_chars.iter().enumerate() {
+            #[cfg(test)]
+            EDIT_CELLS.with(|cells| cells.set(cells.get() + 1));
             let cost = usize::from(ca != *cb);
             curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
         }
@@ -28,4 +31,9 @@ pub(super) fn levenshtein(a: &str, b: &str) -> usize {
     }
 
     prev[b_chars.len()]
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static EDIT_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

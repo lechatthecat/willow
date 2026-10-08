@@ -57,7 +57,10 @@ pub extern "C" fn willow_string_substring(value: *mut u8, start: i64, end: i64) 
         || !s.is_char_boundary(start as usize)
         || !s.is_char_boundary(end as usize)
     {
-        return fail("String.substring requires an ordered in-bounds range on UTF-8 boundaries");
+        return fail(&format!(
+            "String.substring requires an ordered in-bounds range on UTF-8 boundaries (start={start}, end={end}, len={})",
+            s.len()
+        ));
     }
     copy_range(value, start as usize, end as usize)
 }
