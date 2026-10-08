@@ -102,11 +102,33 @@ impl IdleWaiters {
     }
 
     fn wait(&self, start: u64, timeout: Duration) -> bool {
+        self.wait_with_backoff(start, timeout, || {
+            for _ in 0..2 {
+                std::hint::spin_loop();
+            }
+        })
+    }
+
+    fn wait_with_backoff(&self, start: u64, timeout: Duration, backoff: impl FnOnce()) -> bool {
+        // Two CPU pauses per failed probe, including publication races.
+        // The backoff never waits for a condition or yields to the OS, and
+        // it holds no lock. Then retry known work or register to park.
+        backoff();
+        // A publication after the failed probe requires an immediate retry,
+        // not a yield or a contended waiter-list registration. This read is
+        // only a fast path: registration still rechecks the generation below.
+        if self.generation() != start {
+            #[cfg(test)]
+            super::idle_backoff_tests::record_stale_retry();
+            return true;
+        }
         let index = {
             let mut list = self.list.lock().unwrap_or_else(|p| p.into_inner());
             self.registered.fetch_add(1, Ordering::SeqCst);
             if self.generation() != start {
                 self.registered.fetch_sub(1, Ordering::SeqCst);
+                #[cfg(test)]
+                super::idle_backoff_tests::record_stale_retry();
                 return true;
             }
             list.insert()
@@ -297,6 +319,97 @@ mod tests {
         assert_eq!(list.slots.len(), 1);
         assert_eq!(list.free.len(), 1);
         assert!(list.head.is_none());
+    }
+
+    #[test]
+    fn publication_before_registration_retries_without_retaining_slots() {
+        // Every retry uses an obsolete probe generation. Even a sustained
+        // stream of failed probes must neither sleep through known work nor
+        // consume waiter slots. Exercise many thieves against one publisher.
+        for workers in [1, 2, 8, 32] {
+            for retries in [1, 16, 256] {
+                let waiters = IdleWaiters::default();
+                let generation = waiters.generation();
+                waiters.notify(false);
+                let backoffs = AtomicUsize::new(0);
+                std::thread::scope(|scope| {
+                    for _ in 0..workers {
+                        let waiters = &waiters;
+                        let backoffs = &backoffs;
+                        scope.spawn(move || {
+                            for _ in 0..retries {
+                                assert!(waiters.wait_with_backoff(
+                                    generation,
+                                    Duration::from_secs(5),
+                                    || {
+                                        backoffs.fetch_add(1, Ordering::Relaxed);
+                                    },
+                                ));
+                            }
+                        });
+                    }
+                });
+                assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
+                let list = waiters.list.lock().unwrap();
+                assert!(list.slots.is_empty());
+                assert!(list.free.is_empty());
+                assert!(list.head.is_none());
+                assert_eq!(backoffs.load(Ordering::Relaxed), workers * retries);
+                println!(
+                    "workers={workers} retries={retries} backoffs={} retained_slots=0",
+                    workers * retries
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn known_publication_backs_off_once_without_taking_waiter_lock() {
+        let waiters = IdleWaiters::default();
+        let generation = waiters.generation();
+        waiters.notify(false);
+        // Holding this lock proves the published-work fast path never takes it.
+        let _list = waiters.list.lock().unwrap();
+        let mut backoffs = 0;
+        assert!(
+            waiters.wait_with_backoff(generation, Duration::from_secs(5), || {
+                backoffs += 1;
+            })
+        );
+        assert_eq!(backoffs, 1);
+        assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn publication_during_backoff_is_observed_before_parking() {
+        let waiters = IdleWaiters::default();
+        let generation = waiters.generation();
+        let mut backoffs = 0;
+        assert!(
+            waiters.wait_with_backoff(generation, Duration::from_secs(5), || {
+                backoffs += 1;
+                // Also proves backoff holds no waiter-list lock.
+                assert!(waiters.list.try_lock().is_ok());
+                waiters.notify(false);
+            })
+        );
+        assert_eq!(backoffs, 1);
+        assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
+        assert!(waiters.list.lock().unwrap().slots.is_empty());
+    }
+
+    #[test]
+    fn failed_probe_without_publication_backs_off_once_then_times_out() {
+        let waiters = IdleWaiters::default();
+        let mut backoffs = 0;
+        assert!(
+            !waiters.wait_with_backoff(waiters.generation(), Duration::ZERO, || {
+                backoffs += 1;
+            })
+        );
+        assert_eq!(backoffs, 1);
+        assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
+        assert_eq!(waiters.list.lock().unwrap().free.len(), 1);
     }
 
     #[test]

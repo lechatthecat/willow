@@ -4185,6 +4185,8 @@ fn scheduler_run_loop(
             crate::gc::stress_collect("scheduler");
         }
         let Some((id, work)) = next else {
+            #[cfg(test)]
+            idle_backoff_tests::record_failed_probe();
             // No ready task. If a parked task has a wake-deadline (e.g. it is
             // sleeping), block until the earliest one and wake it, then keep
             // running. If netpoll has parked I/O waiters, wait for readiness
@@ -4686,6 +4688,10 @@ pub extern "C" fn willow_task_stack_leave() {
 #[cfg(test)]
 #[path = "scheduler_idle_stop_tests.rs"]
 mod idle_stop_tests;
+
+#[cfg(test)]
+#[path = "scheduler_idle_backoff_tests.rs"]
+mod idle_backoff_tests;
 
 #[cfg(all(
     test,
