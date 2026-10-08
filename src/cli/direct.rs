@@ -172,8 +172,8 @@ impl Options {
             );
         }
         let mut result = session.query(&self.command, &self.selector, &self.filter, self.all)?;
-        if self.command == "effects" && self.format == "human" {
-            session.display_effect_targets(&mut result);
+        if matches!(self.command.as_str(), "effects" | "impact") && self.format == "human" {
+            session.display_function_targets(&mut result, self.absolute)?;
         }
         session.display_locations(&mut result, self.absolute)?;
         if !(self.explain || self.command == "effects" && self.format == "human") {

@@ -1481,3 +1481,135 @@ fn callee_type_cli_reports_callable_types() {
         assert!(text.contains(&format!("Type: {expected}")), "{text}");
     }
 }
+
+#[test]
+fn lambda_human_anchors_and_legacy_selectors_round_trip() {
+    let f = Fixture::new();
+    let source = "fn leaf(n: i64) -> i64 { println(n); return n; }\nfn main() {\n    let f = |n: i64| leaf(n);\n    println(f(1));\n}\n";
+    fs::write(f.0.join("src/main.wi"), source).unwrap();
+    let impact = f.json(&["impact", "main::leaf"], 0);
+    let node = impact["result"]["impact"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["selector"].as_str().unwrap().contains("<lambda "))
+        .unwrap();
+    let legacy = node["selector"].as_str().unwrap();
+    assert!(
+        legacy.contains(&format!("@{}:", source.find("|n:").unwrap())),
+        "{legacy}"
+    );
+    let unqualified = legacy.strip_prefix("main::").unwrap();
+    let short = f.json(
+        &[
+            "effects",
+            unqualified,
+            "--kind",
+            "function",
+            "--module",
+            "main",
+        ],
+        0,
+    );
+    assert_eq!(short["result"]["selected"]["id"], node["id"]);
+    for command in ["effects", "impact"] {
+        let old = f.json(&[command, legacy], 0);
+        let anchored = f.json(&[command, "src/main.wi:3:13"], 0);
+        let selected = if command == "impact" {
+            "symbol"
+        } else {
+            "selected"
+        };
+        assert_eq!(old["result"][selected]["id"], node["id"]);
+        assert_eq!(anchored["result"][selected]["id"], node["id"]);
+        let output = f.run(&[command, legacy]);
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("Symbol: src/main.wi:3:13"), "{text}");
+        if command == "effects" {
+            assert!(text.contains("via=src/main.wi:3:13"), "{text}");
+        }
+    }
+    for absolute in [false, true] {
+        let mut args = vec!["impact", "main::leaf"];
+        if absolute {
+            args.push("--absolute-paths");
+        }
+        let output = f.run(&args);
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let anchor = if absolute {
+            format!("{}:3:13", f.0.join("src/main.wi").display())
+        } else {
+            "src/main.wi:3:13".into()
+        };
+        assert!(text.lines().any(|line| line.trim() == anchor), "{text}");
+        assert!(!text.contains("<lambda "), "{text}");
+        let resolved = f.json(&["effects", &anchor], 0);
+        assert_eq!(resolved["result"]["selected"]["id"], node["id"]);
+    }
+}
+
+#[test]
+fn lambda_anchors_cover_imports_nested_siblings_and_unicode_crlf() {
+    use willow_compiler::ai::direct::SourceIndex;
+    for (body, newline) in [
+        ("let f = |n: i64| leaf(n); return f(n);", "\n"),
+        (
+            "let a = |n: i64| { return leaf(n); }; let b = |n: i64| leaf(n); return a(n) + b(n);",
+            "\n",
+        ),
+        (
+            "let a = |n: i64| { let b = |v: i64| leaf(v); return b(n); }; return a(n);",
+            "\n",
+        ),
+        (
+            "let label = \"日本😀\"; let f = |n: i64| leaf(n); return f(n);",
+            "\r\n",
+        ),
+    ] {
+        let f = Fixture::new();
+        let source = format!(
+            "module order;{newline}pub fn leaf(n: i64) -> i64 {{ println(n); return n; }}{newline}pub fn run(n: i64) -> i64 {{ {body} }}{newline}"
+        );
+        fs::write(f.0.join("src/order.wi"), &source).unwrap();
+        fs::write(
+            f.0.join("src/main.wi"),
+            "import order; fn main() { println(order::run(1)); }\n",
+        )
+        .unwrap();
+        let impact = f.json(&["impact", "order::leaf"], 0);
+        let nodes = impact["result"]["impact"]["nodes"].as_array().unwrap();
+        let lambdas: Vec<_> = nodes
+            .iter()
+            .filter(|n| n["selector"].as_str().unwrap().contains("<lambda "))
+            .collect();
+        assert!(!lambdas.is_empty(), "{impact}");
+        let human = f.run(&["impact", "order::leaf"]);
+        assert!(human.status.success(), "{human:?}");
+        let text = String::from_utf8(human.stdout).unwrap();
+        let index = SourceIndex::new(source);
+        for node in lambdas {
+            let legacy = node["selector"].as_str().unwrap();
+            let offset: usize = legacy
+                .rsplit_once('@')
+                .unwrap()
+                .1
+                .split(':')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let (line, column) = index.position(offset).unwrap();
+            let anchor = format!("src/order.wi:{line}:{column}");
+            assert!(text.lines().any(|line| line.trim() == anchor), "{text}");
+            for selector in [legacy, anchor.as_str()] {
+                let result = f.json(&["effects", selector], 0);
+                assert_eq!(result["result"]["selected"]["id"], node["id"]);
+            }
+            let filtered = f.json(&["effects", &anchor, "--kind", "method"], 1);
+            assert_eq!(filtered["status"], "unknown");
+        }
+        assert!(!text.contains("<lambda "), "{text}");
+    }
+}

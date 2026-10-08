@@ -135,6 +135,7 @@ pub struct DirectSession {
     pub session: QuerySession,
     sources: HashMap<String, SourceIndex>,
     function_names: HashMap<String, String>,
+    lambda_symbols: HashMap<String, symbols::Symbol>,
     constructor_bodies: HashMap<String, String>,
     contract_bodies: std::collections::HashSet<String>,
 }
@@ -155,8 +156,26 @@ impl DirectSession {
         // compiler analyzes their bodies under one class `init` callable ID.
         let mut callable_by_owner = HashMap::new();
         let mut function_names = HashMap::new();
+        let mut lambda_symbols = HashMap::new();
         let mut contract_bodies = std::collections::HashSet::new();
         for f in &snapshot.functions {
+            if f.name.starts_with("<lambda ")
+                && let Some(location) = f.locations.first()
+            {
+                lambda_symbols.insert(
+                    f.id.clone(),
+                    symbols::Symbol {
+                        identity: f.identity.clone(),
+                        id: f.id.clone(),
+                        name: f.name.clone(),
+                        source_name: None,
+                        details: Default::default(),
+                        kind: "function".into(),
+                        location: Some(location.clone()),
+                        ty: None,
+                    },
+                );
+            }
             if f.name.ends_with("::init") {
                 callable_by_owner.insert((f.module.as_str(), f.name.as_str()), f.id.as_str());
             }
@@ -191,6 +210,7 @@ impl DirectSession {
             session: QuerySession::new(snapshot)?,
             sources: HashMap::new(),
             function_names,
+            lambda_symbols,
             constructor_bodies,
             contract_bodies,
         };
@@ -345,6 +365,10 @@ impl DirectSession {
         Ok(Some((path, byte)))
     }
     pub(super) fn selector(&self, symbol: &symbols::Symbol) -> String {
+        // Lambda names contain ':' as an offset separator, not an identity tag.
+        if self.lambda_symbols.contains_key(&symbol.id) {
+            return self.function_names[&symbol.id].clone();
+        }
         if symbol.kind == "method"
             && let (Some(name), Some(location)) = (&symbol.source_name, &symbol.location)
         {
@@ -457,13 +481,25 @@ impl DirectSession {
                 .map(Value::take)
                 .or_else(|| result.get_mut("symbols").map(Value::take))
                 .unwrap_or_else(|| json!([result["symbol"].take()]));
-            let ids: std::collections::HashSet<String> = symbols
+            let mut ids: std::collections::HashSet<String> = symbols
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter(|s| s["kind"] != "import" || result.get("resolved_symbols").is_none())
                 .filter_map(|s| s["id"].as_str().map(str::to_owned))
                 .collect();
+            // Lambda opening tokens have callable locations but no declaration
+            // symbols. Match only the opening byte, never shadow inner symbols.
+            ids.extend(
+                self.lambda_symbols
+                    .values()
+                    .filter(|s| {
+                        s.location
+                            .as_ref()
+                            .is_some_and(|loc| loc.path == file && loc.start == byte)
+                    })
+                    .map(|s| s.id.clone()),
+            );
             if ids.is_empty() {
                 location_reason = Some(self.missing_symbol_reason(&file, byte)?);
             }
@@ -479,7 +515,14 @@ impl DirectSession {
             .map(|s| (s, s.chars().collect::<Vec<_>>()))
             .collect();
         let selector_scope = selector.rsplit_once("::").map(|(scope, _)| scope);
-        for symbol in &self.session.snapshot.semantic.symbols {
+        for symbol in self
+            .session
+            .snapshot
+            .semantic
+            .symbols
+            .iter()
+            .chain(self.lambda_symbols.values())
+        {
             if located
                 .as_ref()
                 .is_some_and(|ids| !ids.contains(&symbol.id))
@@ -760,26 +803,75 @@ impl DirectSession {
         }
         Ok(result)
     }
-    /// Human-only labels; callers keep the query's structured IDs unchanged.
-    pub fn display_effect_targets(&self, result: &mut Value) {
+    /// Human-only labels. Persisted names (and their IDs, fingerprints and legacy
+    /// selectors) retain byte offsets; displayed lambda anchors are selectors too.
+    pub fn display_function_targets(&mut self, result: &mut Value, absolute: bool) -> Result<()> {
+        // Only index locations needed by this response, once per distinct lambda.
+        let mut ids = std::collections::HashSet::new();
+        for key in ["selected", "symbol"] {
+            if let Some(id) = result[key]["id"].as_str() {
+                ids.insert(id);
+            }
+        }
+        if let Some(nodes) = result["impact"]["nodes"].as_array() {
+            ids.extend(nodes.iter().filter_map(|node| node["id"].as_str()));
+        }
+        for key in ["effect_evidence", "compiler_witnesses"] {
+            if let Some(facts) = result[key].as_array() {
+                for fact in facts {
+                    ids.extend(fact["via_function"].as_str());
+                    ids.extend(fact["witness"]["owner"].as_str());
+                }
+            }
+        }
+        let lambdas: Vec<_> = ids
+            .into_iter()
+            .filter_map(|id| {
+                self.lambda_symbols
+                    .get(id)
+                    .and_then(|s| s.location.clone())
+                    .map(|loc| (id.to_owned(), loc))
+            })
+            .collect();
+        let mut labels = HashMap::with_capacity(lambdas.len());
+        for (id, loc) in lambdas {
+            let (line, column) = self.source(&loc.path)?.position(loc.start)?;
+            let path = if absolute {
+                loc.path.clone()
+            } else {
+                Path::new(&loc.path)
+                    .strip_prefix(self.workspace())
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or(loc.path)
+            };
+            labels.insert(id, format!("{path}:{line}:{column}"));
+        }
+        for key in ["selected", "symbol"] {
+            if let Some(label) = result[key]["id"].as_str().and_then(|id| labels.get(id)) {
+                result[key]["selector"] = json!(label);
+            }
+        }
+        if let Some(nodes) = result["impact"]["nodes"].as_array_mut() {
+            for node in nodes {
+                if let Some(label) = node["id"].as_str().and_then(|id| labels.get(id)) {
+                    node["selector"] = json!(label);
+                }
+            }
+        }
+        let name = |id: &str| labels.get(id).or_else(|| self.function_names.get(id));
         for key in ["effect_evidence", "compiler_witnesses"] {
             if let Some(facts) = result[key].as_array_mut() {
                 for fact in facts {
-                    if let Some(name) = fact["via_function"]
-                        .as_str()
-                        .and_then(|id| self.function_names.get(id))
-                    {
+                    if let Some(name) = fact["via_function"].as_str().and_then(name) {
                         fact["via_function"] = json!(name);
                     }
-                    if let Some(name) = fact["witness"]["owner"]
-                        .as_str()
-                        .and_then(|id| self.function_names.get(id))
-                    {
+                    if let Some(name) = fact["witness"]["owner"].as_str().and_then(name) {
                         fact["witness"]["owner"] = json!(name);
                     }
                 }
             }
         }
+        Ok(())
     }
     pub fn display_locations(&mut self, value: &mut Value, absolute: bool) -> Result<()> {
         match value {
@@ -832,6 +924,94 @@ impl DirectSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lambda_projection_deduplicates_positions_and_preserves_snapshot() {
+        for n in [16usize, 64, 256, 1024] {
+            let path = "/virtual/main.wi";
+            let text = "日|| 1;\r\n".repeat(n);
+            let mut snapshot = Snapshot {
+                edit_context: None,
+                version: 1,
+                compiler: storage::compiler_stamp(),
+                compatibility: String::new(),
+                workspace: "/virtual".into(),
+                revision: String::new(),
+                sources: BTreeMap::from([(path.into(), hash(&text))]),
+                semantic: Default::default(),
+                functions: (0..n)
+                    .map(|i| {
+                        let start = i * "日|| 1;\r\n".len() + "日".len();
+                        Function {
+                            identity: None,
+                            body_id: None,
+                            body_location: None,
+                            rename_calls: vec![],
+                            rename_imports: vec![],
+                            id: format!("f{i}"),
+                            module: path.into(),
+                            name: format!("<lambda main@{start}:{}>", start + 4),
+                            locations: vec![Location {
+                                path: path.into(),
+                                start,
+                                end: start + 4,
+                            }],
+                            synthetic: false,
+                            fingerprint: String::new(),
+                            body_fingerprint: String::new(),
+                            callees: vec![],
+                            runtime_effects: 0,
+                            unknown: false,
+                            unresolved: vec![],
+                        }
+                    })
+                    .collect(),
+            };
+            snapshot.revision = snapshot.digest().unwrap();
+            let before = snapshot.revision.clone();
+            let mut session = DirectSession::new(snapshot).unwrap();
+            session.sources.insert(path.into(), SourceIndex::new(text));
+            let mut once = 0;
+            for repeats in [1, 8] {
+                session.sources[path].search_steps.set(0);
+                let facts: Vec<_> = (0..n * repeats)
+                    .map(|i| {
+                        json!({
+                            "via_function": format!("f{}", i % n),
+                            "witness": {"owner": format!("f{}", i % n)}
+                        })
+                    })
+                    .collect();
+                let mut result = json!({"effect_evidence":facts});
+                session
+                    .display_function_targets(&mut result, false)
+                    .unwrap();
+                for (i, fact) in result["effect_evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                {
+                    let anchor = format!("main.wi:{}:2", i % n + 1);
+                    assert_eq!(fact["via_function"], anchor);
+                    assert_eq!(fact["witness"]["owner"], anchor);
+                }
+                let steps = session.sources[path].search_steps.get();
+                if repeats == 1 {
+                    once = steps;
+                } else {
+                    assert_eq!(steps, once);
+                }
+                let bound = n * 2 * ((n * 10).ilog2() as usize + 2);
+                assert!(steps <= bound);
+                println!(
+                    "lambda-projection lambdas={n} rows={} position_search_steps={steps} bound={bound}",
+                    n * repeats
+                );
+            }
+            assert_eq!(session.snapshot().digest().unwrap(), before);
+            assert_eq!(session.sources.len(), 1);
+        }
+    }
     #[test]
     fn repeated_positions_have_linear_indexes_and_logarithmic_lookup_work() {
         for size in [16usize, 64, 256, 1024] {
