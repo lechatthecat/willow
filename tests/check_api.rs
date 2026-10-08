@@ -202,7 +202,7 @@ fn increasing_diagnostic_batches_emit_each_error_once() {
             .collect::<String>();
         for imported in [false, true] {
             let fixture = if imported {
-                let fixture = Fixture::new("import helper; fn main() {}");
+                let fixture = Fixture::new("import helper; fn main() { helper::bad(); }");
                 fs::write(
                     fixture.0.join("helper.wi"),
                     format!("pub fn bad() {{ {body} }}"),
