@@ -1,5 +1,7 @@
 //! Host object-file, runtime-library, linker, and sidecar artifact handling.
 
+pub mod rust_bridge;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
