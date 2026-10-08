@@ -877,3 +877,23 @@ fn main() {}
         &["error[E0848]", "can only be used inside a constructor"],
     );
 }
+
+#[test]
+fn test_new_ctor_42_subclass_cannot_bypass_base_init() {
+    assert_compile_error_contains(
+        r#"open class Base {
+            pub label: String;
+            pub init(self) { self.label = "base"; }
+        }
+        class Child extends Base {}
+        fn main() { let child = new Child("bypassed"); println(child.label); }"#,
+        &["error[E0848]", "must declare `init`", "super.init"],
+    );
+}
+
+#[test]
+fn test_new_ctor_43_subclass_delegation_example() {
+    let (out, ok) = compile_and_run(include_str!("../../../example/subclass_constructor.wi"));
+    assert!(ok);
+    assert_eq!(out, "base:checked\n");
+}

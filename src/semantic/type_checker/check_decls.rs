@@ -376,12 +376,33 @@ impl TypeChecker {
     }
 
     pub(super) fn check_constructor_inheritance_rules(&mut self, c: &ClassDecl) {
-        if c.constructors.is_empty() {
-            return;
-        }
         let Some(base_name) = c.base_class.as_ref().map(type_path_name) else {
             return;
         };
+        if c.constructors.is_empty() {
+            // Constructors are not inherited. Memberwise construction is only
+            // valid when it cannot bypass a declared base initializer. Check
+            // the immediate base once per declaration, not once per `new`.
+            // An invalid intermediate class is diagnosed at its own declaration.
+            if let Some(base) = self.symbols.lookup_class(&base_name)
+                && let Some(init) = &base.constructor
+            {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0848,
+                        format!(
+                            "class `{}` must declare `init` because base class `{}` declares `init`",
+                            c.name, base_name
+                        ),
+                    )
+                    .with_label(Label::primary(c.span, "missing subclass constructor"))
+                    .with_label(Label::secondary(init.declaration_span, "base constructor declared here"))
+                    .with_help("declare `init(self, ...)` and call `super.init(...)` as its first statement; constructors are not inherited"),
+                );
+            }
+            return;
+        }
         for ctor in &c.constructors {
             let mut super_init_spans = Vec::new();
             collect_super_init_spans(&ctor.body, &mut super_init_spans);

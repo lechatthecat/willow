@@ -20,6 +20,8 @@ mod resolve;
 mod returns;
 mod send_sync;
 #[cfg(test)]
+mod subclass_constructor_tests;
+#[cfg(test)]
 mod super_call_tests;
 #[cfg(test)]
 mod type_arity_tests;

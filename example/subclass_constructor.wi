@@ -1,0 +1,12 @@
+// A subclass explicitly delegates to preserve its base initializer's invariant.
+open class Base {
+    pub label: String;
+    pub init(self, input: String) { self.label = "base:" + input; }
+}
+class Child extends Base {
+    pub init(self, input: String) { super.init(input); }
+}
+fn main() {
+    let child = new Child("checked");
+    println(child.label);
+}
