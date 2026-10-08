@@ -294,9 +294,9 @@ pub struct QuerySession {
 struct Segment {
     start: usize,
     end: usize,
-    /// Innermost declared token: `Some(true)` for a resolved write
+    /// Declared token priority: `Some(true)` for a resolved write
     /// (authoritative), `Some(false)` for a declaration name such as a binding
-    /// or parameter (used when that declaration is typed).
+    /// or parameter, or a callee token (used when that symbol is typed).
     declared: Option<bool>,
     /// Narrowest enclosing expression; `Some(None)` when several tie.
     expression: Option<Option<usize>>,
@@ -314,7 +314,7 @@ impl QuerySession {
             .map(|(i, f)| (f.id.clone(), i))
             .collect();
         let mut references: HashMap<String, Vec<usize>> = HashMap::new();
-        // Expression, declaration and write spans share one sweep, so a
+        // Expression, declaration, call and write spans share one sweep, so a
         // position query is a single binary search over one segment index.
         let mut events: HashMap<String, Vec<(usize, bool, u8, usize)>> = HashMap::new();
         let mut span = |l: &Location, kind: u8, i: usize| {
@@ -338,6 +338,10 @@ impl QuerySession {
         for (i, r) in snapshot.semantic.references.iter().enumerate() {
             if matches!(r.role.as_str(), "write" | "write-element") {
                 span(&r.location, WRITE, i);
+            } else if r.role == "call" {
+                // Only the callee token gets its callable type. Preserve the
+                // call expression and fall back to it for untyped targets.
+                span(&r.location, DECLARATION, i);
             }
         }
         let positions = events
@@ -622,9 +626,9 @@ impl QuerySession {
                 };
                 // Resolved source write tokens are authoritative: compound lowering
                 // can put several synthetic expressions on the same token span.
-                // A declaration name (lambda parameter, pattern binding, let)
-                // lies inside its enclosing expression; report its declared
-                // type unless the declaration itself is untyped.
+                // A callee token or declaration name (parameter, pattern binding,
+                // let) can lie inside an expression; report its declared type
+                // unless the symbol itself is untyped.
                 if let Some(write) = segment.declared {
                     let declared = self.declared_type_at(&file, byte);
                     if write || matches!(declared["status"].as_str(), Some("ok" | "ambiguous")) {

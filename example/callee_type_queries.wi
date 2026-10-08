@@ -1,0 +1,21 @@
+// Callee tokens expose callable types to `willow type`.
+fn increment(value: i64) -> i64 { return value + 1; }
+fn apply_closure(callback: closure(i64) -> f64, value: i64) -> f64 {
+    return callback(value);
+}
+fn apply_function(function: fn(i64) -> i64, value: i64) -> i64 {
+    return function(value);
+}
+fn main() {
+    let local: fn(i64) -> i64 = increment;
+    let offset = 10;
+    let captured: closure(i64) -> i64 = |n| n + offset;
+    let mut mutable: fn(i64) -> i64 = increment;
+    println(increment(3));
+    println(local(4));
+    println(captured(5));
+    println(mutable(6));
+    println(increment(increment(7)));
+    println(apply_closure(|n: i64| -> f64 { return 1.5; }, 8));
+    println(apply_function(local, 9));
+}

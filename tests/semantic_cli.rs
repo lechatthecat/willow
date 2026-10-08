@@ -427,7 +427,7 @@ fn binding_declarations_report_declared_types_and_gaps_have_no_expression() {
         ("src/main.wi:2:9", "Option<f64>"),          // function parameter
         ("src/main.wi:1:60", "i64"),                 // parameter use
         ("src/main.wi:3:18", "Option<f64>"),         // scrutinee use
-        ("src/main.wi:12:13", "i64"),                // call expression
+        ("src/main.wi:12:13", "fn(Option<f64>) -> i64"), // callee token
         ("src/main.wi:12:35", "i64"),                // literal inside parentheses
         ("src/main.wi:11:34", "i64"),                // for binding use
     ] {
@@ -1452,4 +1452,32 @@ fn constants_report_their_value_type_and_references() {
         source.contains("pub const UNUSED: bool = true;"),
         "{source}"
     );
+}
+
+#[test]
+fn callee_type_cli_reports_callable_types() {
+    let f = Fixture::new();
+    let source = include_str!("../example/callee_type_queries.wi");
+    fs::write(f.0.join("src/main.wi"), source).unwrap();
+    for (needle, expected) in [
+        ("callback(value)", "closure(i64) -> f64"),
+        ("function(value)", "fn(i64) -> i64"),
+        ("increment(3)", "fn(i64) -> i64"),
+        ("local(4)", "fn(i64) -> i64"),
+        ("captured(5)", "closure(i64) -> i64"),
+    ] {
+        let byte = source.find(needle).unwrap();
+        let line = source[..byte].bytes().filter(|&b| b == b'\n').count() + 1;
+        let column = byte - source[..byte].rfind('\n').unwrap();
+        let selector = format!("src/main.wi:{line}:{column}");
+        let value = f.json(&["type", &selector], 0);
+        assert_eq!(
+            value["result"]["type_display"], expected,
+            "{selector}: {value}"
+        );
+        let output = f.run(&["type", &selector]);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(&format!("Type: {expected}")), "{text}");
+    }
 }
