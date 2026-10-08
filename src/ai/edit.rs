@@ -68,6 +68,30 @@ pub struct Workspace {
     _lock: File,
 }
 
+#[derive(Serialize, Deserialize)]
+pub(super) struct LocalRenameHint {
+    pub selector: String,
+    pub path: String,
+    pub start: usize,
+    pub digest: String,
+}
+impl LocalRenameHint {
+    pub fn read(snapshot: &Snapshot) -> Option<Self> {
+        // Advisory metadata must never make an otherwise valid query fail.
+        use std::io::Read;
+        let file =
+            File::open(Path::new(&snapshot.workspace).join(".willow-edits/last-local-rename.json"))
+                .ok()?;
+        let mut bytes = Vec::new();
+        file.take(65537).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > 65536 {
+            return None;
+        }
+        let hint: Self = serde_json::from_slice(&bytes).ok()?;
+        (snapshot.sources.get(&hint.path) == Some(&hint.digest)).then_some(hint)
+    }
+}
+
 /// Live analysis inputs, deliberately absent from persisted snapshots. Structured
 /// edits need a current checked frontend, including its original configuration.
 #[derive(Debug, Clone)]
@@ -185,6 +209,34 @@ impl Workspace {
             _lock: lock,
         })
     }
+    /// A bounded advisory record, never an alias used for resolution. Its source
+    /// digest prevents an interrupted/failed edit or later source edit from
+    /// redirecting suggestions to a different declaration.
+    pub(super) fn remember_local_rename(
+        &self,
+        transaction: &str,
+        selector: &str,
+        location: &super::Location,
+    ) -> Result<()> {
+        let plan = self.load(transaction)?;
+        let relative = Path::new(&location.path).strip_prefix(&self.root)?;
+        let change = plan
+            .changes
+            .iter()
+            .find(|change| Path::new(&change.path) == relative)
+            .context("renamed local source is absent from edit")?;
+        let hint = LocalRenameHint {
+            selector: selector.into(),
+            path: location.path.clone(),
+            start: location.start,
+            digest: hash(&change.after),
+        };
+        durable_write(
+            &self.directory.join("last-local-rename.json"),
+            &serde_json::to_vec(&hint)?,
+        )
+    }
+
     fn file(&self, relative: &str) -> Result<PathBuf> {
         checked_file(&self.root, relative)
     }

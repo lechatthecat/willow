@@ -760,7 +760,7 @@ fn local_selectors_accept_unique_names_and_disambiguate_shadowing() {
     let unknown = f.json(&["symbol", "main::serve::runn"], 1);
     let suggestions = unknown["result"]["suggestions"].as_array().unwrap();
     assert_eq!(suggestions.len(), 1, "{unknown}");
-    assert!(suggestions[0].as_str().unwrap().contains("serve::running@"));
+    assert!(suggestions[0].as_str().unwrap().ends_with("serve::running"));
 }
 
 #[test]
@@ -1612,4 +1612,74 @@ fn lambda_anchors_cover_imports_nested_siblings_and_unicode_crlf() {
         }
         assert!(!text.contains("<lambda "), "{text}");
     }
+}
+
+#[test]
+fn stale_local_rename_prefers_same_declaration_and_rejects_collision() {
+    let f = Fixture::new();
+    let path = f.0.join("src/main.wi");
+    let source = "fn main() {\n    let pred = 1;\n    let rejected = 2;\n    let expr = 3;\n    println(pred + rejected + expr);\n}\n";
+    fs::write(&path, source).unwrap();
+    let offset_selector = format!("main::main::pred@{}", source.find("pred").unwrap());
+    f.json(&["rename", "main::main::pred", "matcher", "--dry-run"], 0);
+    assert!(!f.0.join(".willow-edits/last-local-rename.json").exists());
+    f.json(&["rename", "main::main::pred", "matcher"], 0);
+    let after = fs::read_to_string(&path).unwrap();
+    for selector in ["main::main::pred", "main::pred", "pred", &offset_selector] {
+        let result = f.json(&["rename", selector, "rejected"], 1);
+        assert_eq!(result["status"], "unknown", "{result}");
+        assert_eq!(
+            result["result"]["suggestions"][0], "main::main::matcher",
+            "{result}"
+        );
+        let suggestions = result["result"]["suggestions"].as_array().unwrap();
+        assert!(
+            suggestions
+                .iter()
+                .all(|s| !s.as_str().unwrap().contains('@')),
+            "{result}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), after);
+    }
+    let collision = f.run(&["rename", "main::main::matcher", "rejected"]);
+    assert!(!collision.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&collision.stdout),
+        String::from_utf8_lossy(&collision.stderr)
+    );
+    assert!(text.contains("src/main.wi:3:9"), "{text}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), after);
+    let filtered = f.json(&["symbol", "main::main::pred", "--kind", "function"], 1);
+    assert!(
+        !filtered["result"]["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s == "main::main::matcher")
+    );
+    fs::write(&path, after.replace("matcher", "different")).unwrap();
+    let stale = f.json(&["symbol", "main::main::pred"], 1);
+    assert!(
+        stale["result"]["suggestions"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{stale}"
+    );
+    fs::write(f.0.join(".willow-edits/last-local-rename.json"), "invalid").unwrap();
+    f.json(&["symbol", "main::main::different"], 0);
+}
+
+#[test]
+fn stale_parameter_suggestion_beats_similar_spelling_and_respects_scope() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "fn serve(pred: i64) { let preds = 2; println(pred + preds); } fn other() { let pred = 3; println(pred); } fn main() { serve(1); }\n").unwrap();
+    f.json(&["rename", "main::serve::pred", "matcher"], 0);
+    let result = f.json(&["symbol", "main::serve::pred"], 1);
+    let suggestions = result["result"]["suggestions"].as_array().unwrap();
+    assert_eq!(suggestions[0], "main::serve::matcher", "{result}");
+    assert_eq!(suggestions[1], "main::serve::preds", "{result}");
+    assert_eq!(suggestions.len(), 2, "{result}");
+    f.json(&["symbol", "main::other::pred"], 0);
 }

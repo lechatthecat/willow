@@ -305,6 +305,20 @@ impl DirectSession {
                 .extend(summary);
             return Ok(preview);
         }
+        let local_hint = matches!(
+            resolved["symbol"]["kind"].as_str(),
+            Some("binding" | "parameter")
+        )
+        .then(|| -> Result<_> {
+            Ok((
+                resolved["symbol"]["selector"]
+                    .as_str()
+                    .context("local selector")?
+                    .to_owned(),
+                serde_json::from_value::<super::Location>(resolved["symbol"]["location"].clone())?,
+            ))
+        })
+        .transpose()?;
         let workspace = edit::Workspace::open(Path::new(self.workspace()))?;
         let preview = workspace.prepare_analyzed(
             entry,
@@ -316,6 +330,9 @@ impl DirectSession {
         let transaction = preview["transaction"]
             .as_str()
             .context("missing transaction identity")?;
+        if let Some((selector, location)) = local_hint {
+            workspace.remember_local_rename(transaction, &selector, &location)?;
+        }
         let mut emitter = crate::diagnostics::HumanEmitter;
         workspace.validate(transaction, &mut emitter)?;
         workspace.apply_with_rollback(transaction, &mut emitter)?;
@@ -510,6 +527,20 @@ impl DirectSession {
         let mut candidates = Vec::new();
         let mut suggestions = Vec::new();
         let mut scope_fallback = Vec::new();
+        let mut sole_local = None;
+        let mut scoped_locals = 0;
+        let hint = edit::LocalRenameHint::read(&self.session.snapshot).filter(|hint| {
+            let plain = hint
+                .selector
+                .rsplit_once('@')
+                .map_or(hint.selector.as_str(), |(name, _)| name);
+            [hint.selector.as_str(), plain].iter().any(|name| {
+                *name == selector
+                    || name
+                        .strip_suffix(selector)
+                        .is_some_and(|p| p.ends_with("::"))
+            })
+        });
         let segments: Vec<_> = selector
             .split("::")
             .map(|s| (s, s.chars().collect::<Vec<_>>()))
@@ -585,25 +616,57 @@ impl DirectSession {
                     owner == scope || owner.strip_suffix(scope).is_some_and(|p| p.ends_with("::"))
                 });
                 let score = selector_suggestion_score(name, &segments);
-                if same_scope && selector_scope.is_some() {
+                if local_name.is_some() && same_scope && selector_scope.is_some() {
+                    scoped_locals += 1;
+                    sole_local = (scoped_locals == 1).then(|| qualified.clone());
+                }
+                if local_name.is_none() && same_scope && selector_scope.is_some() {
                     scope_fallback.push(qualified.clone());
                     scope_fallback.sort_unstable();
                     scope_fallback.dedup();
                     scope_fallback.truncate(5);
                 }
-                if let Some(score) = score {
-                    suggestions.push((score, qualified));
+                let previous = hint.as_ref().is_some_and(|hint| {
+                    symbol
+                        .location
+                        .as_ref()
+                        .is_some_and(|loc| loc.path == hint.path && loc.start == hint.start)
+                }) && local_name.is_some();
+                if previous || score.is_some() {
+                    // A matching declaration beats spelling similarity. Position
+                    // breaks equal-score ties deterministically within a file.
+                    let position = symbol.location.as_ref().map_or(usize::MAX, |loc| loc.start);
+                    suggestions.push((!previous, score.unwrap_or(usize::MAX), position, qualified));
                     suggestions.sort_unstable();
                     suggestions.dedup();
                     suggestions.truncate(5);
                 }
             }
         }
-        let suggestions: Vec<_> = if suggestions.is_empty() {
+        // Preserve a useful unambiguous same-scope fallback, without choosing
+        // arbitrary locals when several declarations could have been renamed.
+        if let Some(local) = sole_local {
+            scope_fallback.insert(0, local);
+            scope_fallback.truncate(5);
+        }
+        let mut suggestions: Vec<_> = if suggestions.is_empty() {
             scope_fallback
         } else {
-            suggestions.into_iter().map(|(_, name)| name).collect()
+            suggestions
+                .into_iter()
+                .map(|(_, _, _, name)| name)
+                .collect()
         };
+        normalize_local_suggestions(
+            &mut suggestions,
+            self.session
+                .snapshot
+                .semantic
+                .symbols
+                .iter()
+                .filter(|symbol| matches!(symbol.kind.as_str(), "binding" | "parameter"))
+                .map(|symbol| self.selector(symbol)),
+        );
         let mut spellings = HashMap::new();
         for candidate in &candidates {
             *spellings
@@ -1065,6 +1128,30 @@ mod tests {
     }
 }
 
+/// Only the bounded final candidates need ambiguity counts. Keep offsets for
+/// shadowed names; a second streaming pass needs no workspace-sized index.
+fn normalize_local_suggestions(suggestions: &mut [String], locals: impl Iterator<Item = String>) {
+    let mut counts = [0usize; 5];
+    if !suggestions.iter().any(|name| name.contains('@')) {
+        return;
+    }
+    for name in locals {
+        for (i, suggestion) in suggestions.iter().enumerate() {
+            if let (Some((plain, _)), Some((wanted, _))) =
+                (name.rsplit_once('@'), suggestion.rsplit_once('@'))
+                && plain == wanted
+            {
+                counts[i] += 1;
+            }
+        }
+    }
+    for (i, suggestion) in suggestions.iter_mut().enumerate() {
+        if counts[i] == 1 {
+            suggestion.truncate(suggestion.rfind('@').unwrap());
+        }
+    }
+}
+
 /// Compare aligned path segments from the leaf, permitting the same omitted
 /// module prefix as exact resolution. Each segment is visited at most once.
 fn selector_suggestion_score(name: &str, segments: &[(&str, Vec<char>)]) -> Option<usize> {
@@ -1139,6 +1226,40 @@ fn rename_summary(preview: &Value) -> serde_json::Map<String, Value> {
 #[cfg(test)]
 mod typo_tests {
     use super::{selector_suggestion_score, selector_typo_distance};
+
+    #[test]
+    fn local_suggestion_normalization_streams_once_with_bounded_candidates() {
+        for n in [16, 32, 64, 128] {
+            let visits = std::cell::Cell::new(0);
+            let mut suggestions = vec![
+                "m::f::unique@0".into(),
+                "m::f::shadow@1".into(),
+                "m::f::other@2".into(),
+            ];
+            super::normalize_local_suggestions(
+                &mut suggestions,
+                (0..n).map(|i| {
+                    visits.set(visits.get() + 1);
+                    match i {
+                        0 => "m::f::unique@0".into(),
+                        1 => "m::f::other@2".into(),
+                        _ => format!("m::f::shadow@{i}"),
+                    }
+                }),
+            );
+            assert_eq!(visits.get(), n);
+            assert_eq!(
+                suggestions,
+                ["m::f::unique", "m::f::shadow@1", "m::f::other"]
+            );
+            println!(
+                "locals={n} visits={} comparison_bound={}",
+                visits.get(),
+                3 * n
+            );
+        }
+    }
+
     thread_local! { pub(super) static SEGMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
     thread_local! { pub(super) static CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
     fn score(name: &str, selector: &str) -> Option<usize> {
