@@ -1,0 +1,7 @@
+[project]
+name = "rust_bridge_fixture"
+version = "0.1.0"
+[rust-dependencies]
+willow_bridge_native = { path = "native", default-features = false, features = ["answer"] }
+[rust]
+bridge = "bridge.rs"
