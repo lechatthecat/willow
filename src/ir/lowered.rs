@@ -1073,20 +1073,16 @@ struct LirScopeMark {
     /// out from one growing table, so its own bindings — and those of every
     /// scope nested in it — are exactly the entries from here to the end.
     first_local: usize,
-    /// Locals the scope owns that the sweep from `first_local` skips. That sweep
-    /// drops synthetic locals, because lowering declares them for values that
-    /// cross block boundaries and are read after the scope that declared them
-    /// ends; a `for` loop's element binding is flagged synthetic for a different
-    /// reason — lowering synthesizes its `let` from the iteration protocol — and
-    /// it really does end with the body.
-    adopted: Vec<LirLocalId>,
+    /// Start in the active root stack. Popping a child truncates that stack,
+    /// so ordinary exits never revisit locals belonging to closed children.
+    first_root: usize,
 }
 
 impl LirScopeMark {
-    fn opening_at(first_local: usize) -> Self {
+    fn opening_at(first_local: usize, first_root: usize) -> Self {
         Self {
             first_local,
-            adopted: Vec::new(),
+            first_root,
         }
     }
 }
@@ -1116,6 +1112,7 @@ struct Builder {
     locals: Vec<LirLocal>,
     /// The currently open lexical scopes, outermost first (willow-0g8j.3.3).
     scope_starts: Vec<LirScopeMark>,
+    scope_roots: Vec<LirLocalId>,
     /// Flat rather than a scope stack, because HIR names are already unique
     /// within a function: `LowerCtx::bind` alpha-renames every shadowing
     /// binding to `name$n` before lowering runs. That invariant is what lets a
@@ -1387,6 +1384,7 @@ impl Builder {
             suspend_counter: 0,
             locals: Vec::new(),
             scope_starts: Vec::new(),
+            scope_roots: Vec::new(),
             local_by_name: std::collections::HashMap::new(),
         };
         for param in params {
@@ -1512,6 +1510,9 @@ impl Builder {
             synthetic,
             parameter,
         });
+        if !synthetic && !parameter && !self.scope_starts.is_empty() {
+            self.scope_roots.push(id);
+        }
         self.local_by_name.insert(name, id);
         id
     }
@@ -1775,12 +1776,14 @@ impl Builder {
         // scope declared, so — like a `for` loop's hoisted iterable — the
         // construct has to drop its root itself, at the merge every arm reaches.
         let construct = self.scope_starts.len();
-        self.scope_starts
-            .push(LirScopeMark::opening_at(self.locals.len()));
+        self.scope_starts.push(LirScopeMark::opening_at(
+            self.locals.len(),
+            self.scope_roots.len(),
+        ));
         let scrutinee_name = self.synthetic_name("match_scrutinee");
         let scrutinee_local =
             self.declare_local(scrutinee_name, scrutinee.ty.clone(), None, true, false);
-        self.scope_starts[construct].adopted.push(scrutinee_local);
+        self.scope_roots.push(scrutinee_local);
         self.lower_value_into(scrutinee_local, scrutinee);
 
         let merge = self.new_block();
@@ -1821,8 +1824,10 @@ impl Builder {
             // are declared HERE, ahead of the body's own scope, so the body's
             // close does not reach them (willow-0g8j.3.3).
             let arm_scope = self.scope_starts.len();
-            self.scope_starts
-                .push(LirScopeMark::opening_at(self.locals.len()));
+            self.scope_starts.push(LirScopeMark::opening_at(
+                self.locals.len(),
+                self.scope_roots.len(),
+            ));
             let bindings: Vec<_> = pattern_bindings(&arm.pattern)
                 .into_iter()
                 .map(|(name, ty)| {
@@ -1865,7 +1870,7 @@ impl Builder {
             // After the body: an arm that produces a value has already copied it
             // into `destination`, which has a rooted slot of its own.
             self.push_scope_root_clears(arm_scope);
-            self.scope_starts.pop();
+            self.pop_root_scope();
             self.terminate(SourceTerminator::Jump(merge));
 
             if let Some(next) = next {
@@ -1878,7 +1883,7 @@ impl Builder {
 
         self.switch_to(merge);
         self.push_scope_root_clears(construct);
-        self.scope_starts.pop();
+        self.pop_root_scope();
         Some(destination.map(|local| self.local_expr(local, value.span)))
     }
 
@@ -3853,12 +3858,13 @@ impl Builder {
     /// section has to release the lock on its way out even when the section
     /// defers nothing.
     fn lower_scope_inner(&mut self, stmts: &[HirStmt], lock: Option<LirLockSlots>) {
-        // Locals are handed out from one growing table, so everything this
-        // scope declares — its own bindings and those of any scope nested in it
-        // — sits in the range that opens here (willow-0g8j.3.3).
+        // Record direct ownership for ordinary exits and the full local range
+        // for recovery, which can bypass nested scopes' normal closes.
         let lexical_scope = self.scope_starts.len();
-        self.scope_starts
-            .push(LirScopeMark::opening_at(self.locals.len()));
+        self.scope_starts.push(LirScopeMark::opening_at(
+            self.locals.len(),
+            self.scope_roots.len(),
+        ));
         let mut scope = std::collections::HashMap::new();
         let sites: Vec<(LirDeferId, Span)> = stmts
             .iter()
@@ -3880,7 +3886,7 @@ impl Builder {
         if sites.is_empty() && lock.is_none() {
             self.lower_stmts(stmts);
             self.push_scope_root_clears(lexical_scope);
-            self.scope_starts.pop();
+            self.pop_root_scope();
             return;
         }
         let enter_block = self.current;
@@ -3945,36 +3951,51 @@ impl Builder {
             // on the recovery path (willow-0g8j.3.3). Both paths have run the
             // scope's `defer`s by the time they arrive, which is what the clear
             // has to come after — a deferred body may read the bindings.
-            self.push_scope_root_clears(lexical_scope);
+            if recovers {
+                self.push_recovery_root_clears(lexical_scope);
+            } else {
+                self.push_scope_root_clears(lexical_scope);
+            }
         } else {
             // After the scope's own `defer`s have run: they may read the
             // bindings this drops the roots of.
             self.push_scope_root_clears(lexical_scope);
         }
-        self.scope_starts.pop();
+        self.pop_root_scope();
     }
 
-    /// Close the GC roots of the scope at `scope` and of every scope nested
-    /// inside it (willow-0g8j.3.3): name the source locals they declared, so the
-    /// emitter can null the slots that hold one.
-    ///
-    /// One instruction covers the whole nest, because the marks nest too: the
-    /// outermost one's sweep already spans every local an inner scope declared.
-    /// Only their adopted locals have to be gathered scope by scope.
+    fn pop_root_scope(&mut self) {
+        let mark = self.scope_starts.pop().expect("LIR lexical scope stack");
+        self.scope_roots.truncate(mark.first_root);
+    }
+
+    /// Ordinary exits only leave still-open scopes. Closed children have
+    /// already cleared their roots on every ordinary path reaching this point.
+    /// Ownership is recorded once at declaration, avoiding nested range scans.
     fn push_scope_root_clears(&mut self, scope: usize) {
-        let Some(mark) = self.scope_starts.get(scope) else {
-            return;
-        };
+        let locals = self.scope_roots[self.scope_starts[scope].first_root..].to_vec();
+        if !locals.is_empty() {
+            self.push(SourceInst::ClearScopeRoots { locals });
+        }
+    }
+
+    /// Recovery can bypass any child's close, so its continuation must still
+    /// clear descendants. Unlike ordinary exits, none are definitely cleared.
+    fn push_recovery_root_clears(&mut self, scope: usize) {
+        let mark = &self.scope_starts[scope];
         let mut locals: Vec<LirLocalId> = self.locals[mark.first_local..]
             .iter()
             .filter(|local| !local.synthetic && !local.parameter)
             .map(|local| local.id)
             .collect();
-        for mark in &self.scope_starts[scope..] {
-            locals.extend(mark.adopted.iter().copied());
-        }
-        locals.sort_unstable();
-        locals.dedup();
+        // Explicitly adopted synthetic roots (for iterable/element and match
+        // scrutinee) are disjoint from the source-local range above.
+        locals.extend(
+            self.scope_roots[mark.first_root..]
+                .iter()
+                .copied()
+                .filter(|id| self.locals[id.0 as usize].synthetic),
+        );
         if !locals.is_empty() {
             self.push(SourceInst::ClearScopeRoots { locals });
         }
@@ -4480,8 +4501,10 @@ impl Builder {
         // without a close of its own that temp keeps the array — and everything
         // in it — reachable until the function returns.
         let construct = self.scope_starts.len();
-        self.scope_starts
-            .push(LirScopeMark::opening_at(self.locals.len()));
+        self.scope_starts.push(LirScopeMark::opening_at(
+            self.locals.len(),
+            self.scope_roots.len(),
+        ));
         let i64_var = |name: &str| HirExpr {
             kind: HirExprKind::Var(name.to_string()),
             ty: Type::I64,
@@ -4538,7 +4561,7 @@ impl Builder {
                     span,
                 };
                 let arr_local = self.push_synth_let(&arr_name, false, iterable.clone());
-                self.scope_starts[construct].adopted.push(arr_local);
+                self.scope_roots.push(arr_local);
                 self.push_synth_let(
                     &i_name,
                     true,
@@ -4585,7 +4608,7 @@ impl Builder {
                 let range_name = format!("__for{n}_range");
                 let bound_name = format!("__for{n}_end");
                 let range_local = self.push_synth_let(&range_name, false, iterable.clone());
-                self.scope_starts[construct].adopted.push(range_local);
+                self.scope_roots.push(range_local);
                 let bound = |field: &str| HirExpr {
                     kind: HirExprKind::FieldAccess {
                         object: Box::new(HirExpr {
@@ -4635,10 +4658,12 @@ impl Builder {
         // protocol, but the binding is the source loop variable and its root
         // ends with the iteration like any other (willow-0g8j.3.3).
         let iteration = self.scope_starts.len();
-        self.scope_starts
-            .push(LirScopeMark::opening_at(self.locals.len()));
+        self.scope_starts.push(LirScopeMark::opening_at(
+            self.locals.len(),
+            self.scope_roots.len(),
+        ));
         let element = self.push_synth_let(name, false, element_binding);
-        self.scope_starts[iteration].adopted.push(element);
+        self.scope_roots.push(element);
         self.loop_stack.push(LirLoopFrame {
             exit,
             next: inc_block,
@@ -4648,7 +4673,7 @@ impl Builder {
         self.lower_scope(body);
         self.loop_stack.pop();
         self.push_scope_root_clears(iteration);
-        self.scope_starts.pop();
+        self.pop_root_scope();
         self.terminate(SourceTerminator::Jump(inc_block));
 
         self.switch_to(inc_block);
@@ -4672,7 +4697,7 @@ impl Builder {
         // every `break` — so the iterable temp's root is dropped once, on the
         // one path that leaves the construct.
         self.push_scope_root_clears(construct);
-        self.scope_starts.pop();
+        self.pop_root_scope();
     }
 }
 
@@ -5272,6 +5297,80 @@ mod tests {
             .iter()
             .find(|f| f.name.to_string() == name)
             .unwrap_or_else(|| panic!("no function {name}"))
+    }
+
+    fn scope_clear_entries(function: &SourceFunction) -> usize {
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .map(|inst| {
+                if let SourceInst::ClearScopeRoots { locals } = inst {
+                    locals.len()
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn nested_scope_clear_entries_are_linear() {
+        // Source scalars, GC owners, async frames, and sequential fan-out.
+        for shape in ["nested", "owners", "async", "siblings"] {
+            for n in [25, 50, 100, 200] {
+                let mut source = String::from("class Payload { pub value: i64; }\n");
+                if shape == "async" {
+                    source.push_str("async ");
+                }
+                source.push_str("fn f() { let keep = 1;\n");
+                for i in 0..n {
+                    source.push_str(&format!(
+                        "let mut k{i} = 0; while k{i} < 1 {{ k{i} = k{i} + 1;\n"
+                    ));
+                    if shape == "owners" {
+                        source.push_str(&format!(
+                            "let p{i} = new Payload({i}); print(p{i}.value);\n"
+                        ));
+                    }
+                    if shape == "async" {
+                        source.push_str("await yield();\n");
+                    }
+                    if shape == "siblings" {
+                        source.push_str("}\n");
+                    }
+                }
+                source.push_str("print(keep);\n");
+                if shape != "siblings" {
+                    source.push_str(&"}\n".repeat(n));
+                }
+                source.push_str("}\n");
+                let program = lir(&source);
+                let count = scope_clear_entries(func(&program, "f"));
+                // Owners also receive one existing last-use clear per object.
+                let expected = if shape == "owners" { 3 * n + 1 } else { n + 1 };
+                assert_eq!(count, expected, "{shape} N={n}");
+                println!("scope-clear {shape} N={n} entries={count}");
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_still_clears_bypassed_child_scopes() {
+        let program = lir(
+            "fn f() { defer match recover() { Some(info) => {}, None => {} } if true { let child = 42; print(child); } }",
+        );
+        let f = func(&program, "f");
+        let child = f
+            .locals
+            .iter()
+            .find(|local| local.name == "child")
+            .unwrap()
+            .id;
+        let clears = f.blocks.iter().flat_map(|block| &block.instrs).filter(|inst| {
+            matches!(inst, SourceInst::ClearScopeRoots { locals } if locals.contains(&child))
+        }).count();
+        assert_eq!(clears, 2, "ordinary child close plus recovery continuation");
     }
 
     #[test]
