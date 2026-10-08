@@ -148,6 +148,8 @@ pub struct TypeChecker {
     /// reinterpreted as when the scrutinee is an enum. The backend consults this
     /// to lower the arm as a variant match (willow-60o.1).
     pub pattern_resolutions: HashMap<PatternId, Pattern>,
+    /// Syntax-only arm-exit facts; transported with body outputs for HIR reuse.
+    pub arm_leaves: HashMap<BodyId, bool>,
     /// The resolved type of every checked expression, keyed by its node ID. The
     /// authoritative record for consumers (HIR lowering) that must not
     /// re-derive types from the AST (willow-mb5 checker pivot). A node ID is
@@ -320,6 +322,7 @@ impl TypeChecker {
             error_generation: 0,
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
+            arm_leaves: HashMap::new(),
             expr_types: HashMap::new(),
             reference_arg_modes: HashMap::new(),
             normalized_types: HashMap::new(),

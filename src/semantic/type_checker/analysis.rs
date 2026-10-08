@@ -61,11 +61,24 @@ pub(crate) fn reference_place_key(mut expr: &Expr) -> Option<String> {
 /// encloses the `match` (willow-jz15.46). Such an arm hands no value to the
 /// match, so it is typed `Never`. Loops written inside the arm are not entered,
 /// so their own `break`/`continue` never count.
+#[cfg(test)]
 pub(crate) fn block_always_leaves_arm(block: &Block) -> bool {
-    always_leaves(ReturnNode::Block(block))
+    cached_arm_leaves(block, &mut std::collections::HashMap::new())
 }
 
+/// Syntax-only facts, scoped to an immutable AST/body-query result.
+pub(crate) fn cached_arm_leaves(
+    block: &Block,
+    cache: &mut std::collections::HashMap<BodyId, bool>,
+) -> bool {
+    always_leaves(ReturnNode::Block(block), cache)
+}
+
+#[cfg(test)]
+thread_local! { pub(crate) static ARM_BLOCK_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 enum ReturnNode<'a> {
+    Cached(bool),
     Block(&'a Block),
     Stmt(&'a Stmt),
 }
@@ -75,8 +88,12 @@ enum ReturnNode<'a> {
 ///
 /// The evaluator never descends into a nested loop body, so any `break` or
 /// `continue` it reaches targets a loop outside the analysed block.
-fn always_leaves(mut node: ReturnNode<'_>) -> bool {
+fn always_leaves(
+    mut node: ReturnNode<'_>,
+    cache: &mut std::collections::HashMap<BodyId, bool>,
+) -> bool {
     enum Frame<'a> {
+        Save(BodyId),
         Any(std::slice::Iter<'a, Stmt>),
         All(std::slice::Iter<'a, MatchArm>),
         ThenElse(&'a Block),
@@ -84,7 +101,16 @@ fn always_leaves(mut node: ReturnNode<'_>) -> bool {
     let mut frames = Vec::new();
     'evaluate: loop {
         let mut result = match node {
+            ReturnNode::Cached(result) => result,
             ReturnNode::Block(block) => {
+                if let Some(result) = cache.get(&block.id) {
+                    // Feed a cached result through the same continuation frames.
+                    node = ReturnNode::Cached(*result);
+                    continue;
+                }
+                #[cfg(test)]
+                ARM_BLOCK_VISITS.with(|count| count.set(count.get() + 1));
+                frames.push(Frame::Save(block.id));
                 let mut stmts = block.stmts.iter();
                 if let Some(stmt) = stmts.next() {
                     frames.push(Frame::Any(stmts));
@@ -136,6 +162,9 @@ fn always_leaves(mut node: ReturnNode<'_>) -> bool {
         };
         while let Some(frame) = frames.pop() {
             match frame {
+                Frame::Save(id) => {
+                    cache.insert(id, result);
+                }
                 Frame::Any(mut stmts) if !result => {
                     if let Some(stmt) = stmts.next() {
                         frames.push(Frame::Any(stmts));
@@ -179,6 +208,86 @@ mod tests {
     //! `defer` body is skipped.
     use super::*;
     use std::collections::HashSet;
+
+    /// All arm blocks are queried in both traversal orders; repeated queries
+    /// model consumers and short-circuit-skipped siblings being visited later.
+    #[test]
+    fn arm_leave_nested_depth_counts_are_linear() {
+        for depth in [10, 100, 1000] {
+            for leaf in ["return;", "let x = 1;"] {
+                let mut source = String::from("fn f() {");
+                for _ in 0..depth {
+                    source.push_str("match true { true => {");
+                }
+                source.push_str(leaf);
+                for _ in 0..depth {
+                    source.push_str("} false => { return; } }");
+                }
+                source.push('}');
+                let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+                let (program, errors) = crate::parser::Parser::new(tokens).parse();
+                assert!(errors.is_empty(), "{errors:?}");
+                let Item::Function(function) = &program.items[0] else {
+                    panic!()
+                };
+                let blocks: Vec<_> = AstWalk::new(AstEvent::Block(&function.body))
+                    .filter_map(|event| match event {
+                        AstEvent::Block(b) => Some(b),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(blocks.len(), 2 * depth + 1);
+                for reverse in [false, true] {
+                    let mut cache = std::collections::HashMap::new();
+                    ARM_BLOCK_VISITS.set(0);
+                    for index in 0..blocks.len() {
+                        let block = blocks[if reverse {
+                            blocks.len() - 1 - index
+                        } else {
+                            index
+                        }];
+                        cached_arm_leaves(block, &mut cache);
+                    }
+                    assert_eq!(ARM_BLOCK_VISITS.get(), blocks.len());
+                    for block in &blocks {
+                        cached_arm_leaves(block, &mut cache);
+                    }
+                    assert_eq!(ARM_BLOCK_VISITS.get(), blocks.len());
+                    assert_eq!(cache[&function.body.id], leaf == "return;");
+                    println!(
+                        "depth={depth} returning={} reverse={reverse} evaluations={}",
+                        leaf == "return;",
+                        ARM_BLOCK_VISITS.get()
+                    );
+                }
+
+                let mut checker = crate::semantic::TypeChecker::new();
+                ARM_BLOCK_VISITS.set(0);
+                checker.check_program(&program);
+                assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                assert_eq!(ARM_BLOCK_VISITS.get(), 2 * depth);
+                let unit = crate::compiler_db::CheckedUnit::from(checker);
+                let encoded = serde_json::to_vec(&unit).unwrap();
+                let unit: crate::compiler_db::CheckedUnit =
+                    serde_json::from_slice(&encoded).unwrap();
+                ARM_BLOCK_VISITS.set(0);
+                let (_, errors) = crate::ir::lower::lower_program_with(&program, &unit.tables());
+                assert!(errors.is_empty(), "{errors:?}");
+                assert_eq!(
+                    ARM_BLOCK_VISITS.get(),
+                    0,
+                    "lowering must reuse checked facts"
+                );
+                let (_, errors) = crate::ir::lower::lower_program(&program);
+                assert!(errors.is_empty(), "{errors:?}");
+                assert_eq!(
+                    ARM_BLOCK_VISITS.get(),
+                    2 * depth,
+                    "unchecked lowering also memoizes"
+                );
+            }
+        }
+    }
 
     #[test]
     fn return_analysis_handles_fifty_thousand_branches_on_small_stack() {

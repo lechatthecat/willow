@@ -133,6 +133,7 @@ pub(super) struct BodyOutputs {
     reference_arg_modes: HashMap<ExprId, ParamMode>,
     enum_variant_resolutions: HashMap<ExprId, String>,
     pattern_resolutions: HashMap<PatternId, Pattern>,
+    arm_leaves: HashMap<BodyId, bool>,
     normalized_types: HashMap<Type, Type>,
     static_call_classes: HashMap<ExprId, String>,
     lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
@@ -160,6 +161,7 @@ pub(crate) struct TypedBody {
     reference_arg_modes: HashMap<ExprId, ParamMode>,
     enum_variant_resolutions: HashMap<ExprId, String>,
     pattern_resolutions: HashMap<PatternId, Pattern>,
+    arm_leaves: HashMap<BodyId, bool>,
     #[serde(with = "crate::compiler_db::map_entries")]
     normalized_types: HashMap<Type, Type>,
     static_call_classes: HashMap<ExprId, String>,
@@ -202,6 +204,7 @@ impl TypedBody {
             reference_arg_modes: outputs.reference_arg_modes,
             enum_variant_resolutions: outputs.enum_variant_resolutions,
             pattern_resolutions: outputs.pattern_resolutions,
+            arm_leaves: outputs.arm_leaves,
             normalized_types: outputs.normalized_types,
             static_call_classes: outputs.static_call_classes,
             lambda_captures: outputs.lambda_captures,
@@ -235,6 +238,7 @@ impl TypedBody {
         unit.enum_variant_resolutions
             .extend(self.enum_variant_resolutions);
         unit.pattern_resolutions.extend(self.pattern_resolutions);
+        unit.arm_leaves.extend(self.arm_leaves);
         unit.static_call_classes.extend(self.static_call_classes);
         unit.lambda_captures.extend(self.lambda_captures);
         for splice in self.lambdas {
@@ -376,6 +380,7 @@ impl TypeChecker {
         self.enum_variant_resolutions
             .extend(body.enum_variant_resolutions);
         self.pattern_resolutions.extend(body.pattern_resolutions);
+        self.arm_leaves.extend(body.arm_leaves);
         self.normalized_types.extend(body.normalized_types);
         self.static_call_classes.extend(body.static_call_classes);
         self.lambda_captures.extend(body.lambda_captures);
@@ -423,6 +428,7 @@ impl TypeChecker {
         use std::mem::swap;
         swap(&mut self.errors, &mut outputs.errors);
         swap(&mut self.expr_types, &mut outputs.expr_types);
+        swap(&mut self.arm_leaves, &mut outputs.arm_leaves);
         swap(
             &mut self.reference_arg_modes,
             &mut outputs.reference_arg_modes,
@@ -662,6 +668,7 @@ mod tests {
             "ordered diagnostics"
         );
         assert_map_eq(&cached.expr_types, &standalone.expr_types, "expr_types");
+        assert_eq!(cached.arm_leaves, standalone.arm_leaves);
         assert_map_eq(
             &cached.reference_arg_modes,
             &standalone.reference_arg_modes,
@@ -728,6 +735,7 @@ mod tests {
                 .merge_tables(&mut unit, &queries)
                 .unwrap();
         }
+        assert_eq!(unit.arm_leaves, standalone.arm_leaves);
         assert_map_eq(
             &unit.expr_types,
             &standalone.expr_types,
@@ -806,6 +814,32 @@ mod tests {
                 .any(|captures| !captures.is_empty())
         );
         assert!(checker.expr_types.values().any(|ty| matches!(ty, Type::Generic(name, args) if name == "Map" && args == &[Type::I64, Type::I64])));
+    }
+
+    #[test]
+    fn typed_body_preserves_arm_leaves_through_lambda_splices_and_replay() {
+        let (checker, _, program) = compare(
+            r#"
+            fn choose(flag: bool) -> i64 {
+                let f = |x: bool| -> i64 {
+                    match x { true => { return 1; } false => { return 2; } }
+                };
+                match flag {
+                    true => { match flag { true => { return f(flag); } false => { return 3; } } }
+                    false => { return 4; }
+                }
+            }
+        "#,
+        );
+        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        assert_eq!(checker.arm_leaves.len(), 6);
+        super::analysis::ARM_BLOCK_VISITS.set(0);
+        let (_, errors) = crate::ir::lower::lower_program_with(
+            &program,
+            &crate::ir::lower::CheckerTables::from_checker(&checker),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(super::analysis::ARM_BLOCK_VISITS.get(), 0);
     }
 
     #[test]

@@ -1443,7 +1443,10 @@ impl TypeChecker {
                 // type it `Never` so it unifies with value arms
                 // (`Ok(v) => v, Err(_) => { continue; }`) and with
                 // statement-position matches (willow-zvkv).
-                if crate::semantic::type_checker::analysis::block_always_leaves_arm(block) {
+                if crate::semantic::type_checker::analysis::cached_arm_leaves(
+                    block,
+                    &mut self.arm_leaves,
+                ) {
                     Type::Never
                 } else {
                     Type::Void

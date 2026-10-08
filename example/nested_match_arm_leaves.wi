@@ -1,0 +1,25 @@
+// Nested statement matches reuse the checker's arm-exit facts during lowering.
+fn choose(outer: bool, inner: bool) -> i64 {
+    match outer {
+        true => {
+            match inner {
+                true => { return 11; }
+                false => { return 12; }
+            }
+        }
+        false => { return 20; }
+    }
+}
+
+fn main() {
+    println(choose(true, true));
+    println(choose(true, false));
+    println(choose(false, true));
+    for i in 0..3 {
+        let value = match i {
+            0 => { match true { true => { continue; } false => { break; } } }
+            _ => i
+        };
+        println(value);
+    }
+}

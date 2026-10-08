@@ -17,6 +17,7 @@ pub struct CheckedUnit {
     pub reference_arg_modes: HashMap<ExprId, ParamMode>,
     pub enum_variant_resolutions: HashMap<ExprId, String>,
     pub pattern_resolutions: HashMap<PatternId, Pattern>,
+    pub arm_leaves: HashMap<BodyId, bool>,
     #[serde(with = "super::map_entries")]
     pub normalized_types: HashMap<Type, Type>,
     pub static_call_classes: HashMap<ExprId, String>,
@@ -33,6 +34,7 @@ impl From<TypeChecker> for CheckedUnit {
             reference_arg_modes: checker.reference_arg_modes,
             enum_variant_resolutions: checker.enum_variant_resolutions,
             pattern_resolutions: checker.pattern_resolutions,
+            arm_leaves: checker.arm_leaves,
             normalized_types: checker.normalized_types,
             static_call_classes: checker.static_call_classes,
             lambda_captures: checker.lambda_captures,
@@ -48,6 +50,7 @@ impl CheckedUnit {
             enums: Some(&self.symbols.enums),
             enum_variant_resolutions: Some(&self.enum_variant_resolutions),
             pattern_resolutions: Some(&self.pattern_resolutions),
+            arm_leaves: Some(&self.arm_leaves),
             normalized_types: Some(&self.normalized_types),
             static_call_classes: Some(&self.static_call_classes),
             lambda_captures: Some(&self.lambda_captures),
@@ -87,6 +90,7 @@ impl CheckedDeclarations {
             reference_arg_modes: HashMap::new(),
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
+            arm_leaves: HashMap::new(),
             static_call_classes: HashMap::new(),
             lambda_captures: HashMap::new(),
         }

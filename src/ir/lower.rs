@@ -45,6 +45,8 @@ use super::typed_ast::{
 /// the same tables the checker already hands to the backend.
 #[derive(Default)]
 pub struct CheckerTables<'a> {
+    /// Syntax-only block exit facts computed by checking.
+    pub arm_leaves: Option<&'a HashMap<crate::parser::ast::BodyId, bool>>,
     /// Canonical global declarations copied into the owned HIR snapshot.
     pub symbols: Option<&'a symbols::SymbolTable>,
     /// Unqualified enum-variant constructions (`Ok(42)` in an expected-enum
@@ -91,6 +93,7 @@ impl<'a> CheckerTables<'a> {
     pub fn from_checker(checker: &'a crate::semantic::TypeChecker) -> Self {
         Self {
             symbols: Some(&checker.symbols),
+            arm_leaves: Some(&checker.arm_leaves),
             enum_variant_resolutions: Some(&checker.enum_variant_resolutions),
             pattern_resolutions: Some(&checker.pattern_resolutions),
             expr_types: Some(&checker.expr_types),
@@ -804,6 +807,7 @@ struct Binding {
 /// Lowering scope: variables (innermost-last) plus the free-function
 /// return types used to type `Call` expressions.
 struct LowerCtx<'a> {
+    arm_leaves: HashMap<crate::parser::ast::BodyId, bool>,
     scopes: Vec<HashMap<String, Binding>>,
     /// Scope depth immediately outside the current function/lambda body.
     /// Used to distinguish a body-wide callable shadow from a nested one.
@@ -828,6 +832,7 @@ impl<'a> LowerCtx<'a> {
         tables: &'a CheckerTables<'a>,
     ) -> Self {
         Self {
+            arm_leaves: HashMap::new(),
             scopes: vec![HashMap::new()],
             namespace_scope_base: 1,
             binds_seen: HashMap::new(),
@@ -2676,8 +2681,17 @@ fn lower_match(
                 (vec![HirStmt::Expr(value)], ty)
             }
             MatchBody::Block(block) => {
-                let ty = if crate::semantic::type_checker::analysis::block_always_leaves_arm(block)
-                {
+                let ty = if ctx
+                    .tables
+                    .arm_leaves
+                    .and_then(|facts| facts.get(&block.id))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        crate::semantic::type_checker::analysis::cached_arm_leaves(
+                            block,
+                            &mut ctx.arm_leaves,
+                        )
+                    }) {
                     Type::Never
                 } else {
                     Type::Void
