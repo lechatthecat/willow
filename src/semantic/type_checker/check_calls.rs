@@ -643,19 +643,7 @@ impl TypeChecker {
     /// declares `method` — i.e. the body a call resolves to. `None` if no class
     /// in the chain declares it.
     pub(super) fn resolved_method_class(&self, class_name: &str, method: &str) -> Option<String> {
-        let mut current = Some(class_name.to_string());
-        let mut seen = std::collections::HashSet::new();
-        while let Some(name) = current {
-            if !seen.insert(name.clone()) {
-                break;
-            }
-            let class = self.symbols.lookup_class(&name)?;
-            if class.methods.contains_key(method) {
-                return Some(name);
-            }
-            current = class.base_class.clone();
-        }
-        None
+        self.symbols.resolved_method_class(class_name, method)
     }
 
     /// E0810 for a looping method reached through a typed NON-`self` receiver in

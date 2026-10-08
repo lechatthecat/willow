@@ -932,19 +932,13 @@ impl TypeChecker {
         class_name: &str,
         method_name: &str,
     ) -> Option<(String, MethodInfo)> {
-        let mut current = Some(class_name.to_string());
-        let mut seen = HashSet::new();
-        while let Some(name) = current {
-            if !seen.insert(name.clone()) {
-                return None;
-            }
-            let class = self.symbols.lookup_class(&name)?;
-            if let Some(method) = class.methods.get(method_name) {
-                return Some((name, method.clone()));
-            }
-            current = class.base_class.clone();
-        }
-        None
+        let owner = self.resolved_method_class(class_name, method_name)?;
+        let method = self
+            .symbols
+            .lookup_class(&owner)?
+            .methods
+            .get(method_name)?;
+        Some((owner, method.clone()))
     }
 
     fn lookup_method_in_ancestors(

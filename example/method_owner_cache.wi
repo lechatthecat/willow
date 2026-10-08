@@ -1,0 +1,14 @@
+// Inherited methods, repeated call sites, overrides and super share resolution.
+open class Base {
+    pub open fn value(self) -> i64 { return 7; }
+}
+open class Middle extends Base {}
+class Leaf extends Middle {
+    pub override fn value(self) -> i64 { return super.value() + 1; }
+}
+fn inherited(x: Middle) -> i64 { return x.value() + x.value(); }
+fn overridden(x: Leaf) -> i64 { return x.value() + x.value(); }
+fn main() {
+    println(inherited(new Middle()));
+    println(overridden(new Leaf()));
+}

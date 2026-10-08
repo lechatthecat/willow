@@ -1,3 +1,5 @@
+mod method_owners;
+
 use crate::diagnostics::Span;
 use crate::module::ModuleId;
 use crate::parser::ast::{ParamMode, Type};
@@ -10,6 +12,7 @@ use std::{collections::HashMap, rc::Rc};
 pub(crate) enum SymbolRead {
     Function(String),
     Class(String),
+    MethodOwner(String, String),
     Enum(String),
     EnumBare(String),
     Interface(String),
@@ -324,6 +327,8 @@ impl Default for DeclarationSymbols {
 pub struct SymbolTable {
     scopes: Vec<HashMap<String, VarInfo>>,
     #[serde(skip)]
+    method_owners: Rc<std::cell::RefCell<method_owners::MethodOwners>>,
+    #[serde(skip)]
     bare_enum_names: Rc<std::cell::RefCell<Option<std::collections::HashSet<String>>>>,
     #[serde(with = "declaration_rc")]
     declarations: Rc<DeclarationSymbols>,
@@ -339,6 +344,7 @@ impl std::ops::Deref for SymbolTable {
 impl std::ops::DerefMut for SymbolTable {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.bare_enum_names = Default::default();
+        self.method_owners = Default::default();
         Rc::make_mut(&mut self.declarations)
     }
 }
@@ -366,6 +372,9 @@ impl SymbolTable {
             SymbolRead::Dispatch(..) => unreachable!("dispatch is evaluated by BodyQueries"),
             SymbolRead::Function(name) => serde_json::to_value(self.lookup_func(name)),
             SymbolRead::Class(name) => serde_json::to_value(self.lookup_class(name)),
+            SymbolRead::MethodOwner(class, method) => {
+                serde_json::to_value(self.resolved_method_class(class, method))
+            }
             SymbolRead::Enum(name) => serde_json::to_value(self.lookup_enum(name)),
             SymbolRead::EnumBare(name) => serde_json::to_value(self.enum_nameable_bare(name)),
             SymbolRead::Interface(name) => serde_json::to_value(self.lookup_interface(name)),
@@ -384,6 +393,7 @@ impl SymbolTable {
         Self {
             scopes: Vec::new(),
             bare_enum_names: Rc::clone(&self.bare_enum_names),
+            method_owners: Rc::clone(&self.method_owners),
             declarations: Rc::clone(&self.declarations),
         }
     }
@@ -394,6 +404,7 @@ impl SymbolTable {
         Self {
             scopes: Vec::new(),
             bare_enum_names: Default::default(),
+            method_owners: Default::default(),
             declarations: Rc::new(DeclarationSymbols {
                 modules: self
                     .modules

@@ -1133,6 +1133,51 @@ mod tests {
     }
 
     #[test]
+    fn method_owner_body_reuse_tracks_intermediate_override_after_warm_lookup() {
+        let (mut program, previous, _) = prepare(
+            "open class Base { pub open fn m(self) -> i64 { return 1; } } \
+             open class Mid extends Base { pub fn n(self) -> i64 { return 2; } } class Leaf extends Mid {} \
+             fn first(x: Leaf) -> i64 { return x.m(); } \
+             fn second(x: Leaf) -> i64 { return x.m(); } fn unrelated() {}",
+            false,
+        );
+        let Item::Class(mid) = &mut program.items[1] else {
+            panic!()
+        };
+        mid.methods[0].name = "m".into();
+        mid.methods[0].is_override = true;
+        let ids: HashSet<_> = previous.index.entries().map(|(id, _)| id).collect();
+        let artifacts = UnitArtifacts::new().unwrap();
+        let next = Rc::new(BodyQueries::new(
+            Rc::clone(&artifacts.store),
+            Rc::clone(&previous.index),
+        ));
+        next.reuse_body_candidates(&previous, &ids, &Default::default())
+            .unwrap();
+        let mut checker = TypeChecker::new();
+        checker.set_body_queries(Rc::clone(&next));
+        checker.check_program(&program);
+        checker.finish_body_queries().unwrap();
+        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        for item in &program.items {
+            if let Item::Function(f) = item
+                && matches!(f.name.as_str(), "first" | "second")
+            {
+                assert!(
+                    next.dependencies(f.body.id)
+                        .unwrap()
+                        .contains(&SymbolRead::MethodOwner("Leaf".into(), "m".into()))
+                );
+                assert!(
+                    checker.checked_bodies.contains(&f.body.id),
+                    "{} was incorrectly reused",
+                    f.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn body_only_change_reuses_caller_and_unrelated_bodies() {
         let (program, previous, _) = prepare(
             "fn target() -> i64 { return 1; } fn caller() -> i64 { return target(); } fn unrelated() {}",
