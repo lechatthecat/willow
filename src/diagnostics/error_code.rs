@@ -220,6 +220,7 @@ error_codes! {
     W2407, // static mut restricts task execution to a single worker
     // Standard library import warnings W20xx
     W2002, // duplicate import
+    W2003, // unused import
     // Staged language features that parse and type-check but have no code
     // generation yet E25xx (willow-n5yv)
     E2501, // retired exponentiation staging gate (reserved; willow-n5yv)

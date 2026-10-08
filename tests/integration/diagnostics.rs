@@ -1109,3 +1109,48 @@ fn generic_interface_extends_has_one_dedicated_diagnostic() {
     assert_eq!(stderr.matches("error[E").count(), 1, "{stderr}");
     assert!(!stderr.contains("reserved keyword"), "{stderr}");
 }
+
+#[test]
+fn ticket_42_diagnostic_workarounds_run() {
+    let (output, ok) = compile_and_run(include_str!("../../example/diagnostic_workarounds.wi"));
+    assert!(ok, "{output}");
+    assert_eq!(output, "9\n6\n2\n4\n7\n");
+}
+
+#[test]
+fn ticket_42_unused_import_warning_is_successful_check() {
+    let source = temp_path(format!("willow_unused_import_{}.wi", unique_test_id()));
+    fs::write(&source, "import std::collections::Array; fn main() {}\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .args(["check", &source])
+        .output()
+        .unwrap();
+    fs::remove_file(&source).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("warning[W2003]"), "{stderr}");
+    assert!(stderr.contains("unused import `Array`"), "{stderr}");
+}
+
+#[test]
+fn ticket_42_enum_alias_checks_have_no_unused_warning() {
+    for body in [
+        "fn f() -> Result<i64, String> { return res::Result::Ok(1); }",
+        "fn f(r: Result<i64, String>) { match r { res::Result::Ok(n) => println(n), res::Result::Err(e) => println(e) } }",
+    ] {
+        let source = temp_path(format!("willow_enum_alias_{}.wi", unique_test_id()));
+        fs::write(
+            &source,
+            format!("import std::result as res; {body} fn main() {{}}"),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .args(["check", &source])
+            .output()
+            .unwrap();
+        fs::remove_file(&source).unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(!stderr.contains("W2003"), "{stderr}");
+    }
+}

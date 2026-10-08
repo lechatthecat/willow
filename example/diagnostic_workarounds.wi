@@ -1,0 +1,30 @@
+import std::collections::Array;
+import std::result as res;
+
+fn twice(value: i64) -> i64 { return value * 2; }
+fn choose() -> fn(i64) -> i64 { return twice; }
+enum Detail { Bad(i64) }
+enum Outcome { Failure(Detail) }
+
+fn result_value() -> Result<i64, String> { return res::Result::Ok(9); }
+fn show_result(value: Result<i64, String>) {
+    match value {
+        res::Result::Ok(number) => println(number),
+        res::Result::Err(message) => println(message),
+    }
+}
+
+fn main() {
+    show_result(result_value());
+    let operation = choose();
+    println(operation(3));
+    let samples: Array<i64> = [2, 4];
+    let pixels = samples.freeze();
+    for index in 0..pixels.len() { println(pixels[index]); }
+    let outcome = Outcome::Failure(Detail::Bad(7));
+    match outcome {
+        Outcome::Failure(detail) => {
+            match detail { Detail::Bad(code) => println(code) }
+        }
+    }
+}

@@ -3,7 +3,7 @@ use crate::semantic::analysis_symbols::Declaration;
 
 impl TypeChecker {
     pub(super) fn record_annotation_uses(&mut self, program: &Program) {
-        if !self.capture_call_sites {
+        if !self.capture_call_sites && program.imports.is_empty() {
             return;
         }
         let mut owners: Vec<_> = program
@@ -29,6 +29,9 @@ impl TypeChecker {
             .collect();
         owners.sort_by_key(|(span, _)| (span.file_id.0, span.start));
         for import in &program.imports {
+            if !self.capture_call_sites {
+                break;
+            }
             let local = import
                 .alias
                 .as_deref()
@@ -37,7 +40,7 @@ impl TypeChecker {
                 || self.symbols.lookup_enum(local).is_some()
                 || self.symbols.lookup_interface(local).is_some()
             {
-                self.record_type_use(
+                self.record_type_reference(
                     &import.path,
                     &Type::Named(self.canonical_type_name(local)),
                     import.span,
@@ -62,6 +65,9 @@ impl TypeChecker {
                 && usage.span.end <= owner.end
                 && params.contains(usage.name.as_str())
             {
+                if !self.capture_call_sites {
+                    continue;
+                }
                 self.analysis_symbols.reference(
                     usage.span,
                     &usage.name,
@@ -69,6 +75,10 @@ impl TypeChecker {
                     "type",
                     false,
                 );
+                continue;
+            }
+            self.mark_import_used(&usage.name, usage.span);
+            if !self.capture_call_sites {
                 continue;
             }
             let canonical = self.canonical_type_name(&usage.name);
@@ -110,6 +120,53 @@ impl TypeChecker {
             );
         }
     }
+    pub(super) fn mark_import_used(&mut self, written: &str, span: Span) {
+        #[cfg(test)]
+        super::import_diagnostic_tests::IMPORT_PROBES.with(|count| count.set(count.get() + 1));
+        let first = written.split("::").next().unwrap_or(written);
+        if let Some(declaration) = self.imported_names.get(first) {
+            if *declaration != Some(span) && !self.analysis_symbols.used_imports.contains(first) {
+                self.analysis_symbols.used_imports.insert(first.to_string());
+            }
+        } else if matches!(first, "Array" | "Map")
+            && self.imported_std_modules.contains_key("collections")
+            && !self.analysis_symbols.used_imports.contains("collections")
+        {
+            // The unaliased collections module also exposes its bare type names.
+            self.analysis_symbols
+                .used_imports
+                .insert("collections".into());
+        }
+    }
+
+    pub(super) fn warn_unused_imports(&mut self, program: &Program) {
+        // Do not add speculative warnings to a unit that failed type checking.
+        if self.error_generation != 0 {
+            return;
+        }
+        let mut reported = HashSet::new();
+        for import in &program.imports {
+            let local = import
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+            if !self.analysis_symbols.used_imports.contains(local) && reported.insert(local) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        ErrorCode::W2003,
+                        format!("unused import `{local}`"),
+                    )
+                    .with_label(Label::primary(import.span, "not used in this module"))
+                    .with_help(format!(
+                        "remove the import of `{}` if it is unnecessary",
+                        import.path
+                    )),
+                );
+            }
+        }
+    }
+
     fn record_import_use(&mut self, written: &str, span: Span) {
         let first = written.split("::").next().unwrap_or(written);
         if let Some(&Some(declaration)) = self.imported_names.get(first) {
@@ -262,6 +319,14 @@ impl TypeChecker {
         );
     }
     pub(super) fn record_type_use(&mut self, written: &str, normalized: &Type, span: Span) {
+        self.mark_import_used(written, span);
+        self.record_type_reference(written, normalized, span);
+    }
+
+    /// Capture declaration/type reference evidence without counting a source use.
+    /// Import declarations need this evidence for navigation but cannot use themselves
+    /// or another import merely by spelling its module in their declaration path.
+    fn record_type_reference(&mut self, written: &str, normalized: &Type, span: Span) {
         if !self.capture_call_sites {
             return;
         }
@@ -301,6 +366,18 @@ impl TypeChecker {
             .reference(span, written, target, "type", false);
     }
     pub(super) fn record_symbol_use(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Var(name, span, _) if self.symbols.lookup_var(name).is_none() => {
+                self.mark_import_used(name, *span)
+            }
+            Expr::Call(call) if self.symbols.lookup_var(&call.callee).is_none() => {
+                self.mark_import_used(&call.callee, call.span)
+            }
+            Expr::New(call) => self.mark_import_used(&call.class_name, call.span),
+            Expr::StaticCall(call) => self.mark_import_used(&call.class, call.span),
+            Expr::StaticField(field) => self.mark_import_used(&field.class, field.span),
+            _ => {}
+        }
         if !self.capture_call_sites {
             return;
         }

@@ -869,6 +869,167 @@ mod tests {
     }
 
     #[test]
+    fn ticket_42_import_declarations_do_not_count_as_usage_with_capture() {
+        let dependency = parse("pub class Point { pub x: i64; } pub enum Status { Ready }");
+        for (item, body, expected) in [
+            ("Point", "", vec!["helpers", "Point"]),
+            ("Status", "", vec!["helpers", "Status"]),
+            ("Point", "let p = new Point(1);", vec!["helpers"]),
+            ("Point", "let p = new helpers::Point(1);", vec!["Point"]),
+            (
+                "Point",
+                "let build = || new Point(1); let p = build();",
+                vec!["helpers"],
+            ),
+        ] {
+            let source = format!("import helpers; import helpers::{item}; fn main() {{ {body} }}");
+            let mut program = parse(&source);
+            let mut baseline = None;
+            for capture in [false, true] {
+                // Capture modes have separate query stores, like separate compilations.
+                let queries = queries(&mut program);
+                let mut evaluated = None;
+                for cached in [false, true, true] {
+                    let mut checker = TypeChecker::new();
+                    checker.capture_call_sites = capture;
+                    checker.register_module("helpers", "helpers", "helpers.wi", &dependency);
+                    checker.register_item_import(item, "helpers", item, program.imports[1].span);
+                    if cached {
+                        checker.set_body_queries(Rc::clone(&queries));
+                    }
+                    checker.check_program(&program);
+                    checker.finish_body_queries().unwrap();
+                    let names: Vec<_> = checker
+                        .errors
+                        .iter()
+                        .map(|d| {
+                            assert_eq!(d.code, ErrorCode::W2003, "{source}: {d:?}");
+                            d.message.clone()
+                        })
+                        .collect();
+                    assert_eq!(
+                        names,
+                        expected
+                            .iter()
+                            .map(|name| format!("unused import `{name}`"))
+                            .collect::<Vec<_>>(),
+                        "capture={capture}, cached={cached}: {source}"
+                    );
+                    let diagnostics = serde_json::to_value(&checker.errors).unwrap();
+                    if let Some(previous) = &baseline {
+                        assert_eq!(&diagnostics, previous);
+                    } else {
+                        baseline = Some(diagnostics);
+                    }
+                    if capture {
+                        assert!(
+                            checker
+                                .analysis_symbols
+                                .references
+                                .iter()
+                                .any(|r| r.span == program.imports[1].span && r.role == "type"),
+                            "declaration reference lost"
+                        );
+                    }
+                    if cached {
+                        let computations = queries.stats().computations;
+                        assert!(computations > 0);
+                        if let Some(previous) = evaluated {
+                            assert_eq!(computations, previous, "replay recomputed");
+                        }
+                        evaluated = Some(computations);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ticket_42_enum_alias_usage_survives_body_replay() {
+        for source in super::super::import_diagnostic_tests::enum_alias_sources() {
+            let mut program = parse(&source);
+            let queries = queries(&mut program);
+            let mut evaluated = None;
+            for cached in [false, true, true] {
+                let mut checker = TypeChecker::new();
+                crate::register_prelude(&mut checker).unwrap();
+                if cached {
+                    checker.set_body_queries(Rc::clone(&queries));
+                }
+                checker.check_program(&program);
+                checker.finish_body_queries().unwrap();
+                assert!(
+                    checker.errors.is_empty(),
+                    "cached={cached}, {source}: {:?}",
+                    checker.errors
+                );
+                let alias = if source.contains("as outcomes") {
+                    "outcomes"
+                } else {
+                    "res"
+                };
+                assert!(
+                    checker.analysis_symbols.used_imports.contains(alias),
+                    "cached={cached}: {source}"
+                );
+                if cached {
+                    let computations = queries.stats().computations;
+                    if let Some(previous) = evaluated {
+                        assert_eq!(computations, previous, "replay recomputed: {source}");
+                    }
+                    evaluated = Some(computations);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ticket_42_typed_body_retains_import_usage() {
+        for source in [
+            "import std::fs; fn main() { let result = fs::read_to_string(\"x\"); }",
+            "import std::fs; fn main() { let run = || fs::read_to_string(\"x\"); let result = run(); }",
+            "import std::fs; fn main() {}",
+        ] {
+            let mut program = parse(source);
+            let queries = queries(&mut program);
+            let mut checker = TypeChecker::new();
+            checker.set_body_queries(Rc::clone(&queries));
+            checker.check_program(&program);
+            checker.finish_body_queries().unwrap();
+            let mut standalone = TypeChecker::new();
+            standalone.check_program(&program);
+            assert_eq!(
+                standalone.analysis_symbols.used_imports,
+                checker.analysis_symbols.used_imports
+            );
+            assert_eq!(
+                serde_json::to_value(&standalone.errors).unwrap(),
+                serde_json::to_value(&checker.errors).unwrap()
+            );
+            let mut replay = TypeChecker::new();
+            replay.set_body_queries(queries);
+            replay.check_program(&program);
+            replay.finish_body_queries().unwrap();
+            assert_eq!(
+                checker.analysis_symbols.used_imports,
+                replay.analysis_symbols.used_imports
+            );
+            assert_eq!(
+                serde_json::to_value(&checker.errors).unwrap(),
+                serde_json::to_value(&replay.errors).unwrap()
+            );
+            assert_eq!(
+                checker
+                    .errors
+                    .iter()
+                    .filter(|d| d.code == ErrorCode::W2003)
+                    .count(),
+                usize::from(source.ends_with("main() {}"))
+            );
+        }
+    }
+
+    #[test]
     fn typed_body_preserves_missing_collection_import_deduplication() {
         let (checker, _, _) = compare(
             r#"

@@ -849,7 +849,10 @@ mod tests {
                     c.set_enforce_send_sync(true);
                     c.check_program(&program);
                     assert_eq!(
-                        c.errors.len(),
+                        c.errors
+                            .iter()
+                            .filter(|d| d.severity == Severity::Error)
+                            .count(),
                         usize::from(code.is_some()),
                         "{source}: {:?}",
                         c.errors

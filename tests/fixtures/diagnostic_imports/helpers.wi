@@ -1,0 +1,3 @@
+pub fn read_to_string(path: String) -> String { return path; }
+pub class Point { pub x: i64; }
+pub enum Status { Ready, Failed(i64) }

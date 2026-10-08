@@ -86,7 +86,10 @@ fn contextual_arrays_positive_perspectives() {
     ];
     for (name, body) in cases {
         let errors = check_source(&format!("{PREFIX}{body}"));
-        assert!(errors.is_empty(), "{name}: {errors:?}");
+        assert!(
+            !errors.iter().any(|d| d.severity == Severity::Error),
+            "{name}: {errors:?}"
+        );
     }
 }
 
@@ -157,7 +160,10 @@ fn contextual_arrays_element_checks_scale_linearly() {
         ] {
             ARRAY_ELEMENT_CHECKS.with(|count| count.set(0));
             let errors = check_source(&format!("{PREFIX}fn f() -> {ty} {{ return {literal}; }}"));
-            assert!(errors.is_empty(), "{errors:?}");
+            assert!(
+                !errors.iter().any(|d| d.severity == Severity::Error),
+                "{errors:?}"
+            );
             let actual = ARRAY_ELEMENT_CHECKS.with(|count| count.get());
             assert_eq!(actual, expected_visits, "{shape} n={n}");
             eprintln!("array element checks: {shape} n={n}: {actual}");
@@ -176,7 +182,11 @@ fn contextual_arrays_deep_recorded_type_size() {
         assert!(errors.is_empty());
         let mut checker = TypeChecker::new();
         checker.check_program(&program);
-        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        assert!(
+            !checker.errors.iter().any(|d| d.severity == Severity::Error),
+            "{:?}",
+            checker.errors
+        );
         let mut recorded_array_nodes = 0;
         for mut ty in checker.expr_types.values() {
             while let Type::Array(element) = ty {
@@ -210,7 +220,7 @@ fn buildgraph_contextual_match_twenty_perspectives() {
             let mut checker = TypeChecker::new();
             checker.check_program(&program);
             assert!(
-                checker.errors.is_empty(),
+                !checker.errors.iter().any(|d| d.severity == Severity::Error),
                 "{context}/{scalar}: {:?}",
                 checker.errors
             );
@@ -245,7 +255,10 @@ fn buildgraph_match_arm_work_is_linear() {
         ARRAY_ELEMENT_CHECKS.with(|count| count.set(0));
         EMPTY_ARRAY_REFINEMENTS.with(|count| count.set(0));
         let errors = check_source(&source);
-        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            !errors.iter().any(|d| d.severity == Severity::Error),
+            "{errors:?}"
+        );
         assert_eq!(ARRAY_ELEMENT_CHECKS.with(|count| count.get()), 1);
         assert_eq!(EMPTY_ARRAY_REFINEMENTS.with(|count| count.get()), n);
     }
@@ -288,7 +301,10 @@ fn buildgraph_nested_empty_match_work_is_linear() {
         );
         EMPTY_ARRAY_REFINEMENTS.with(|count| count.set(0));
         let errors = check_source(&source);
-        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            !errors.iter().any(|d| d.severity == Severity::Error),
+            "{errors:?}"
+        );
         assert_eq!(EMPTY_ARRAY_REFINEMENTS.with(|count| count.get()), 2 * n + 1);
     }
 }

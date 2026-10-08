@@ -36,6 +36,9 @@ pub(crate) struct MemberReference {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Facts {
+    /// Small, body-local import usage set, retained even outside AI capture.
+    #[serde(default)]
+    pub used_imports: std::collections::HashSet<String>,
     pub declarations: Vec<Declaration>,
     pub members: Vec<(Span, Declaration)>,
     pub member_references: Vec<MemberReference>,
@@ -43,6 +46,7 @@ pub(crate) struct Facts {
 }
 impl Facts {
     pub fn extend(&mut self, other: Self) {
+        self.used_imports.extend(other.used_imports);
         self.declarations.extend(other.declarations);
         self.members.extend(other.members);
         self.member_references.extend(other.member_references);

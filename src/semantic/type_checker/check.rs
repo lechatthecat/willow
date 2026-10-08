@@ -283,6 +283,7 @@ impl TypeChecker {
         }
 
         self.finish_effect_analysis(program);
+        self.warn_unused_imports(program);
     }
 
     /// Standalone backend callers use the same typed edge collector. This
@@ -1637,15 +1638,28 @@ impl TypeChecker {
                     }
                     Type::Void => Type::Void,
                     other => {
+                        let iterable_name = match &s.iterable {
+                            Expr::Var(name, ..) => Some(name.as_str()),
+                            _ => None,
+                        };
                         let help = match builtin_types::resolve(other).map(|ty| ty.id) {
                             Some(B::FrozenArray) => {
-                                "use an index loop: `for i in 0..values.len() { let item = values[i]; ... }`"
+                                if let Some(name) = iterable_name {
+                                    let index = ["i", "index", "index_"].into_iter().find(|index| *index != name && *index != s.name).unwrap();
+                                    format!("use an index loop: `for {index} in 0..{name}.len() {{ let {} = {name}[{index}]; ... }}`", s.name)
+                                } else {
+                                    "bind the collection to a local variable, then loop over its length and index its elements".into()
+                                }
                             }
                             Some(B::FrozenMap) => {
-                                "`FrozenMap` has no iterator; keep keys in an array and use an index loop: `for i in 0..keys.len() { let value = values.get(keys[i]); ... }`"
+                                if let Some(name) = iterable_name {
+                                    format!("`FrozenMap` has no iterator; keep keys in an array and retrieve entries with `{name}.get(key)`")
+                                } else {
+                                    "`FrozenMap` has no iterator; bind the map to a local variable, keep keys in an array and retrieve entries with `.get(key)`".into()
+                                }
                             }
                             _ => {
-                                "use `for item in array { ... }` with `Array<T>` or `for n in start..end { ... }`"
+                                "use `for item in array { ... }` with `Array<T>` or `for n in start..end { ... }`".into()
                             }
                         };
                         self.push(

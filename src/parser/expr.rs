@@ -420,9 +420,15 @@ impl Parser {
                     Expr::Call(_) | Expr::MethodCall(_) | Expr::StaticCall(_)
                 )
             {
+                let callee = match &lhs {
+                    Expr::Call(call) => call.callee.as_str(),
+                    Expr::MethodCall(call) => call.method.as_str(),
+                    Expr::StaticCall(call) => call.method.as_str(),
+                    _ => unreachable!(),
+                };
                 return Err(self
                     .err(ErrorCode::E0102, "calling a call result is not supported")
-                    .with_help("bind the result first: `let f = pick(0); f(5)`"));
+                    .with_help(format!("bind the result of `{callee}` to a local variable first, then call that variable with the second argument list")));
             } else {
                 break;
             }
@@ -743,6 +749,7 @@ impl Parser {
         }
 
         let saved = self.pos;
+        let saved_brace_depth = self.brace_depth;
         let saved_pending_type_eq = self.pending_type_eq;
         let saved_last_span = self.last_span;
         let saved_type_uses = self.type_uses.len();
@@ -753,6 +760,7 @@ impl Parser {
                 Ok(ty) => type_args.push(ty),
                 Err(_) => {
                     self.pos = saved;
+                    self.brace_depth = saved_brace_depth;
                     self.pending_type_eq = saved_pending_type_eq;
                     self.last_span = saved_last_span;
                     self.type_uses.truncate(saved_type_uses);
@@ -766,6 +774,7 @@ impl Parser {
 
         if !self.eat(TokenKind::Gt) || !self.eat(TokenKind::ColonColon) {
             self.pos = saved;
+            self.brace_depth = saved_brace_depth;
             self.pending_type_eq = saved_pending_type_eq;
             self.last_span = saved_last_span;
             self.type_uses.truncate(saved_type_uses);

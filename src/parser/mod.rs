@@ -19,6 +19,8 @@ pub struct Parser {
     type_uses: Vec<TypeUse>,
     tokens: Vec<Token>,
     pos: usize,
+    /// Consumed brace balance, so recovery never rescans a failed prefix.
+    brace_depth: usize,
     /// The current immutable `GtEq` has contributed its `>` to a type.
     /// Only its `=` remains at the cursor; advancing clears this state.
     pending_type_eq: bool,
@@ -95,6 +97,7 @@ impl Parser {
             type_uses: Vec::new(),
             tokens,
             pos: 0,
+            brace_depth: 0,
             pending_type_eq: false,
             last_span: None,
             allow_object_literals: true,
@@ -213,6 +216,11 @@ impl Parser {
 
     fn advance(&mut self) {
         if self.pos + 1 < self.tokens.len() {
+            match self.tokens[self.pos].kind {
+                TokenKind::LBrace => self.brace_depth += 1,
+                TokenKind::RBrace => self.brace_depth = self.brace_depth.saturating_sub(1),
+                _ => {}
+            }
             self.last_span = Some(self.current_span());
             self.pending_type_eq = false;
             self.pos += 1;

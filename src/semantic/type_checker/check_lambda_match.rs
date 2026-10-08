@@ -630,7 +630,9 @@ impl TypeChecker {
                 variant_span,
                 span,
                 ..
-            } if written != enum_name && self.canonical_type_name(written) == info.name => {
+            } if written != enum_name
+                && self.static_call_enum_key(written).as_deref() == Some(info.name.as_str()) =>
+            {
                 Some(Pattern::EnumVariant {
                     enum_name: enum_name.clone(),
                     variant: variant.clone(),
@@ -647,7 +649,9 @@ impl TypeChecker {
                 span,
                 ..
             } if (written.is_empty() && bare)
-                || (written != enum_name && self.canonical_type_name(written) == info.name) =>
+                || (written != enum_name
+                    && self.static_call_enum_key(written).as_deref()
+                        == Some(info.name.as_str())) =>
             {
                 Some(Pattern::EnumVariantTuple {
                     enum_name: enum_name.clone(),
@@ -801,6 +805,8 @@ impl TypeChecker {
                     enum_name, span, ..
                 } => {
                     self.check_source_type_name(enum_name, *span);
+                    // Preserve the source alias before normalization canonicalizes it.
+                    self.record_type_use(enum_name, &scrutinee_ty, *span);
                 }
                 Pattern::ClassDowncast {
                     class_name, span, ..
@@ -819,19 +825,16 @@ impl TypeChecker {
                 enum_name,
                 variant,
                 variant_span,
-                span,
                 ..
             }
             | Pattern::EnumVariantTuple {
                 enum_name,
                 variant,
                 variant_span,
-                span,
                 ..
             } = pattern
             {
                 self.record_variant_use(enum_name, variant, *variant_span);
-                self.record_type_use(enum_name, &scrutinee_ty, *span);
             }
             if let Pattern::ClassDowncast {
                 class_name, span, ..

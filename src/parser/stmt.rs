@@ -22,6 +22,7 @@ impl Parser {
                     )
                     .with_label(Label::secondary(start, "block opened here")));
             }
+            let statement_depth = self.brace_depth;
             match self.parse_stmt() {
                 Ok(stmt) => stmts.push(stmt),
                 Err(e) => {
@@ -29,7 +30,7 @@ impl Parser {
                     // statement cannot swallow the rest of the item
                     // (willow-qzxg).
                     self.recovered_errors.push(e);
-                    self.recover_to_next_stmt();
+                    self.recover_to_next_stmt(statement_depth);
                 }
             }
         }
@@ -47,14 +48,17 @@ impl Parser {
     /// error: past the next `;` (consumed), or stop before `}`/EOF. Nested
     /// braces are skipped wholesale so a malformed statement containing a block
     /// does not desynchronize the enclosing block.
-    fn recover_to_next_stmt(&mut self) {
-        let mut brace_depth = 0usize;
+    fn recover_to_next_stmt(&mut self, statement_depth: usize) {
+        // Include blocks opened before the error without rescanning prefixes
+        // when recovery propagates through nested statements.
+        let mut brace_depth = self.brace_depth.saturating_sub(statement_depth);
         while !self.at_eof() {
             match self.peek_kind() {
                 TokenKind::Semicolon if brace_depth == 0 => {
                     self.advance();
                     return;
                 }
+                TokenKind::Fn | TokenKind::Pub | TokenKind::Async if brace_depth == 0 => return,
                 TokenKind::LBrace => {
                     brace_depth += 1;
                     self.advance();

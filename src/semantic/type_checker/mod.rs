@@ -1942,7 +1942,10 @@ async fn run() {
 
     fn assert_typecheck_ok(source: &str) {
         let errors = check_source(source);
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(
+            !errors.iter().any(|d| d.severity == Severity::Error),
+            "unexpected errors: {errors:?}"
+        );
     }
 
     fn assert_typecheck_error_contains(source: &str, code: ErrorCode, expected_message: &str) {
@@ -8401,3 +8404,6 @@ mod diagnostic_recovery_tests;
 
 #[cfg(test)]
 mod loop_exit_arms_tests;
+
+#[cfg(test)]
+mod import_diagnostic_tests;

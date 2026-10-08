@@ -7,6 +7,8 @@ fn check(source: &str) -> TypeChecker {
     assert!(errors.is_empty(), "{errors:?}\n{source}");
     let mut checker = TypeChecker::new();
     checker.check_program(&program);
+    // These tests count marker-contract errors; unused fixture imports are warnings.
+    checker.errors.retain(|d| d.severity == Severity::Error);
     checker
 }
 

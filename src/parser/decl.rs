@@ -762,6 +762,16 @@ impl Parser {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
         let name = self.expect_ident()?;
+        if self.check(TokenKind::Lt) {
+            return Err(self
+                .err(
+                    ErrorCode::E0102,
+                    "generic functions are not supported yet (willow-b06l)",
+                )
+                .with_help(format!(
+                    "use concrete parameter and return types for `{name}`"
+                )));
+        }
         self.expect(TokenKind::LParen)?;
 
         let mut params = Vec::new();

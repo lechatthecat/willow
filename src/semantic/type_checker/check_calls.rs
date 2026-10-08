@@ -547,6 +547,8 @@ impl TypeChecker {
         result: Type,
     ) -> Type {
         self.record_variant_use(enum_name, &call.method, call.method_span);
+        // This contextual path bypasses check_expr/record_symbol_use.
+        self.record_type_use(&call.class, &result, call.span);
         self.check_source_type_name(&call.class, call.span);
         for ty in &call.type_args {
             self.check_source_type_access(ty, call.span);

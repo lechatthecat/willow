@@ -133,7 +133,11 @@ fn contextual_values_record_expected_type() {
     assert!(parse.is_empty(), "{parse:?}");
     let mut checker = TypeChecker::new();
     checker.check_program(&program);
-    assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+    assert!(
+        !checker.errors.iter().any(|d| d.severity == Severity::Error),
+        "{:?}",
+        checker.errors
+    );
     let mut seen = 0;
     for item in &program.items {
         let Item::Function(f) = item else { continue };

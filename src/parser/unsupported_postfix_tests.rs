@@ -31,7 +31,7 @@ fn unsupported_postfix_call_perspectives() {
             diagnostic
                 .helps
                 .iter()
-                .any(|s| s.contains("let f = pick(0); f(5)"))
+                .any(|s| s.contains("result of `pick`"))
         );
         let span = diagnostic.labels[0].span;
         assert_eq!(&source[span.start as usize..span.end as usize], "(");
@@ -118,5 +118,85 @@ fn unsupported_postfix_token_reads_scale_linearly() {
             assert_eq!(pair[1].1 - pair[0].1, slope * (pair[1].0 - pair[0].0));
         }
         eprintln!("{statement}: {samples:?}");
+    }
+}
+
+#[test]
+fn ticket_42_generic_functions_and_recovery() {
+    for modifiers in ["", "pub ", "async ", "pub async "] {
+        for parameters in ["T", "T, U", "Element", "T: Bound", ""] {
+            let source = format!(
+                "{modifiers}fn take3<{parameters}>(x: i64) {{ println(x); }} async fn main() {{}}"
+            );
+            let (program, diagnostics) =
+                Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+            assert!(
+                diagnostics[0]
+                    .message
+                    .contains("generic functions are not supported yet")
+            );
+            assert!(diagnostics[0].helps[0].contains("take3"));
+            let span = diagnostics[0].primary_span().unwrap();
+            assert_eq!(&source[span.start..span.end], "<");
+            assert!(
+                program.items.iter().any(
+                    |item| matches!(item, Item::Function(f) if f.name == "main" && f.is_async)
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn ticket_42_call_result_help_and_nested_recovery() {
+    for expression in ["choose(1)(2)", "object.choose()(2)", "Factory::choose()(2)"] {
+        for statement in [
+            format!("{expression};"),
+            format!("match v {{ A => {expression}, B => 0 }}"),
+            format!("if true {{ {expression}; }}"),
+        ] {
+            let source = format!("fn broken() {{ {statement} }} pub fn following() {{}}");
+            let (program, diagnostics) =
+                Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+            assert!(diagnostics[0].helps[0].contains("`choose`"));
+            assert!(!diagnostics[0].helps[0].contains("pick"));
+            assert!(program.items.iter().any(
+                |item| matches!(item, Item::Function(f) if f.name == "following" && f.public)
+            ));
+        }
+    }
+}
+
+#[test]
+fn ticket_42_recovery_reads_scale_linearly() {
+    for nested in [false, true] {
+        let mut samples = Vec::new();
+        for count in [8, 16, 32, 64] {
+            let bad = "match value { Wrap::Value(Inner::Bad(n)) => 0 }";
+            let source = if nested {
+                format!(
+                    "fn bad() {{ {} {bad} {} }}",
+                    "if true {".repeat(count),
+                    "}".repeat(count)
+                )
+            } else {
+                format!("fn bad() {{ {bad} }}").repeat(count)
+            };
+            PARSER_TOKEN_READS.with(|v| v.set(0));
+            let diagnostics = errors(&source);
+            assert_eq!(
+                diagnostics.len(),
+                if nested { 1 } else { count },
+                "{diagnostics:?}"
+            );
+            samples.push((count, PARSER_TOKEN_READS.with(|v| v.get())));
+        }
+        let slope = (samples[1].1 - samples[0].1) / 8;
+        for pair in samples.windows(2) {
+            assert_eq!(pair[1].1 - pair[0].1, slope * (pair[1].0 - pair[0].0));
+        }
+        eprintln!("recovery nested={nested}: {samples:?}");
     }
 }

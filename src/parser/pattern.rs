@@ -55,7 +55,7 @@ impl Parser {
                         self.advance(); // consume (
                         let mut bindings = Vec::new();
                         while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
-                            bindings.push(self.parse_payload_binding()?);
+                            bindings.push(self.parse_payload_binding(&name, Some(&variant))?);
                             if matches!(self.peek_kind(), TokenKind::Comma) {
                                 self.advance();
                             }
@@ -89,7 +89,7 @@ impl Parser {
                     let mut bindings = Vec::new();
                     if !matches!(self.peek_kind(), TokenKind::RParen) {
                         loop {
-                            bindings.push(self.parse_payload_binding()?);
+                            bindings.push(self.parse_payload_binding(&name, None)?);
                             if !self.eat(TokenKind::Comma)
                                 || matches!(self.peek_kind(), TokenKind::RParen)
                             {
@@ -128,10 +128,29 @@ impl Parser {
         }
     }
 
-    fn parse_payload_binding(&mut self) -> Result<String, Diagnostic> {
+    fn parse_payload_binding(
+        &mut self,
+        outer: &str,
+        variant: Option<&str>,
+    ) -> Result<String, Diagnostic> {
         let start = self.current_span();
         let name = self.expect_ident()?;
         if matches!(self.peek_kind(), TokenKind::ColonColon | TokenKind::LParen) {
+            let outer = variant.map_or_else(
+                || outer.to_string(),
+                |variant| format!("{outer}::{variant}"),
+            );
+            let mut inner = name.clone();
+            let mut offset = 0;
+            while self.peek_kind_at(offset) == &TokenKind::ColonColon {
+                if let TokenKind::Ident(segment) = self.peek_kind_at(offset + 1) {
+                    inner.push_str("::");
+                    inner.push_str(segment);
+                    offset += 2;
+                } else {
+                    break;
+                }
+            }
             return Err(Diagnostic::new(
                 crate::diagnostics::Severity::Error,
                 ErrorCode::E0102,
@@ -141,7 +160,7 @@ impl Parser {
                 start,
                 "nested constructor pattern",
             ))
-            .with_help("write `Result::Err(error) => { match error { E::Bad(n) => ... } }`"));
+            .with_help(format!("bind the payload of `{outer}` to a local variable, then match that variable against `{inner}` in the arm body")));
         }
         Ok(name)
     }
@@ -174,6 +193,9 @@ mod tests {
                         .contains("nested patterns are not supported; bind and match again"),
                     "{outer}/{inner}: {errors:?}"
                 );
+                assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+                assert!(errors[0].helps[0].contains(outer));
+                assert!(errors[0].helps[0].contains(inner.split('(').next().unwrap()));
                 assert_eq!(errors[0].primary_span().unwrap().line, 2);
                 assert!(
                     errors

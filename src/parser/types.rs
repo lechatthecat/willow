@@ -183,7 +183,11 @@ mod tests {
         let mut checker = TypeChecker::new();
         crate::register_prelude(&mut checker).unwrap();
         checker.check_program(&program);
-        checker.errors
+        checker
+            .errors
+            .into_iter()
+            .filter(|diagnostic| diagnostic.severity == crate::diagnostics::Severity::Error)
+            .collect()
     }
 
     #[test]
@@ -248,7 +252,7 @@ mod tests {
     fn invalid_iteration_keeps_independent_errors() {
         for (ty, help) in [
             ("FrozenArray<i64>", "values[i]"),
-            ("FrozenMap<i64, i64>", "values.get(keys[i])"),
+            ("FrozenMap<i64, i64>", "values.get(key)"),
             ("i64", "Array<T>"),
         ] {
             for use_item in [
