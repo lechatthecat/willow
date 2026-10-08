@@ -254,11 +254,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let result = if let Some(index) = index {
             // The length is not negative, so an unsigned comparison also
             // rejects negative indexes.
-            let out_of_bounds =
-                self.builder
-                    .ins()
-                    .icmp(IntCC::UnsignedGreaterThanOrEqual, index, facts.len);
-            self.emit_array_guard(out_of_bounds, slow, &slow_args);
+            let bounded = self
+                .lir_reuse
+                .as_ref()
+                .is_some_and(|reuse| reuse.bound == Some((index, facts.len)));
+            if !bounded {
+                let out_of_bounds =
+                    self.builder
+                        .ins()
+                        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, facts.len);
+                self.emit_array_guard(out_of_bounds, slow, &slow_args);
+            }
             let ptr_ty = reference_type(self.module.target_config());
             let buffer = match facts.buffer {
                 Some(buffer) => buffer,

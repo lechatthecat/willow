@@ -5049,6 +5049,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f: &LirFunction,
         mut coop: Option<(&mut CoopSuspendPoints, cranelift_codegen::ir::Value)>,
     ) {
+        let proof = if coop.is_none() && self.lir_frame_offsets.is_empty() {
+            super::nonnegative::analyze(f)
+        } else {
+            Default::default()
+        };
+        let outer_nonnegative = std::mem::replace(&mut self.lir_nonnegative, proof);
         let outer_confined_maps = self.lir_confined_maps;
         self.lir_confined_maps = super::local_maps::confined_scalar_maps(f);
         let incoming_frames =
@@ -5236,6 +5242,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Some(pred) if !poll_blocks[i] => reuse_exits[pred].clone(),
                 _ => None,
             };
+            if let Some(reuse) = &mut self.lir_reuse {
+                if let Some((target, index, len)) = reuse.branch_bound.take()
+                    && target == i
+                {
+                    reuse.bound = Some((index, len));
+                }
+                reuse.comparison = None;
+            }
             let recovery_states = self.emit_lir_block(
                 f,
                 block,
@@ -5336,6 +5350,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // (willow-s9ej.4).
         self.terminated = true;
         self.lir_confined_maps = outer_confined_maps;
+        self.lir_nonnegative = outer_nonnegative;
     }
 
     /// Pre-bind the locals selected by LIR liveness to their LIR-owned frame
@@ -5402,7 +5417,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 _ => panic!("opaque GC owner must occupy rooted storage"),
             };
         }
-        self.load_var(&storage)
+        let scalar = matches!(storage, VarStorage::Value { .. })
+            && self
+                .lir_nonnegative
+                .contains(&crate::ir::lowered::LirOperand::Local(local));
+        if scalar && let Some(value) = self.lir_reuse.as_ref().and_then(|r| r.scalars.get(&local)) {
+            return *value;
+        }
+        let value = self.load_var(&storage);
+        if scalar && let Some(reuse) = &mut self.lir_reuse {
+            reuse.scalars.insert(local, value);
+        }
+        value
     }
 
     fn store_lir_local(
@@ -5411,6 +5437,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         local: LirLocalId,
         value: cranelift_codegen::ir::Value,
     ) {
+        if let Some(reuse) = &mut self.lir_reuse {
+            reuse.scalars.remove(&local);
+        }
         let name = &function.locals[local.0 as usize].name;
         let storage = self
             .vars
@@ -6446,6 +6475,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 else_block,
             } => {
                 let c = self.emit_lir_operand(function, cond);
+                if let Some(reuse) = &mut self.lir_reuse {
+                    reuse.branch_bound = reuse.comparison.take().and_then(|(test, index, len)| {
+                        (test == c).then_some((then_block.0, index, len))
+                    });
+                }
                 if then_fallthrough {
                     // Cranelift places a branch's second target next; keep
                     // the loop body after its header (willow-nzsg). The
@@ -7576,6 +7610,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // A literal divisor other than 0 and -1 can trip neither the
                 // zero nor the overflow guard (willow-8hq4.14).
                 let unguarded_divisor = matches!(rhs, crate::ir::lowered::LirOperand::Int(divisor) if *divisor != 0 && *divisor != -1);
+                let nonnegative_lhs =
+                    *operand_ty == Type::I64 && self.lir_nonnegative.contains(lhs);
+                let unsigned_rem = if nonnegative_lhs && matches!(op, BinOp::Rem) {
+                    match rhs {
+                        crate::ir::lowered::LirOperand::Int(n) if *n > 0 => Some(*n as u64),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let checked_shift = self.overflow_checks()
                     && crate::ir::lowered::value::is_overflow_checked_binary(op, rhs, operand_ty)
                     && matches!(op, BinOp::Shl | BinOp::Shr);
@@ -7618,7 +7662,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if !float && !unguarded_divisor && matches!(op, BinOp::Div | BinOp::Rem) {
                     self.emit_int_div_guard(lhs, rhs, matches!(op, BinOp::Rem), span);
                 }
-                if matches!(op, BinOp::Pow) {
+                if let Some(divisor) = unsigned_rem {
+                    if divisor.is_power_of_two() {
+                        self.builder.ins().band_imm_s(lhs, (divisor - 1) as i64)
+                    } else {
+                        let (multiplier, shift) = super::nonnegative::reciprocal(divisor);
+                        let multiplier = self.builder.ins().iconst(types::I64, multiplier as i64);
+                        let high = self.builder.ins().umulhi(lhs, multiplier);
+                        let quotient = self.builder.ins().ushr_imm_s(high, i64::from(shift));
+                        let product = self.builder.ins().imul_imm_s(quotient, divisor as i64);
+                        self.builder.ins().isub(lhs, product)
+                    }
+                } else if nonnegative_lhs && matches!(op, BinOp::Lt) {
+                    let test = self.builder.ins().icmp(IntCC::SignedLessThan, lhs, rhs);
+                    if let Some(reuse) = &mut self.lir_reuse {
+                        reuse.comparison = Some((test, lhs, rhs));
+                    }
+                    test
+                } else if matches!(op, BinOp::Pow) {
                     if float {
                         self.emit_pow_f64(lhs, rhs)
                     } else {
@@ -17072,5 +17133,296 @@ fn f() {
                    async fn main() -> i64 {{ return 1 + side() + await g(); }}"
         );
         assert!(!hoistable_in_main(&no));
+    }
+    // willow-ijui.12: explicit acceptance/rejection perspectives for the shared
+    // scalar fact. Cases with unsafe definitions must retain signed semantics.
+    #[test]
+    fn nonnegative_induction_proof_matrix() {
+        let cases = [
+            (
+                "zero, strict constant",
+                "let mut i = 0; while i < 10 { i = i + 1; }",
+                true,
+            ),
+            (
+                "positive start",
+                "let mut i = 3; while i < 10 { i = i + 1; }",
+                true,
+            ),
+            (
+                "dynamic i64 upper bound",
+                "let mut i = 0; while i < n { i = i + 1; }",
+                true,
+            ),
+            (
+                "two safe loops and reset",
+                "let mut i = 0; while i < 10 { i = i + 1; } i = 0; while i < n { i = i + 1; }",
+                true,
+            ),
+            (
+                "step two, bounded",
+                "let mut i = 0; while i < 10 { i = i + 2; }",
+                true,
+            ),
+            (
+                "MAX endpoint",
+                "let mut i = 9223372036854775806; while i < 9223372036854775807 { i = i + 1; }",
+                true,
+            ),
+            (
+                "step two exact endpoint",
+                "let mut i = 9223372036854775805; while i < 9223372036854775806 { i = i + 2; }",
+                true,
+            ),
+            (
+                "negative initial",
+                "let mut i = -1; while i < 10 { i = i + 1; }",
+                false,
+            ),
+            (
+                "negative reset",
+                "let mut i = 0; while i < 10 { i = i + 1; } i = -1;",
+                false,
+            ),
+            (
+                "unbounded increment",
+                "let mut i = 0; while true { i = i + 1; if i == 10 { break; } }",
+                false,
+            ),
+            (
+                "inclusive MAX can wrap",
+                "let mut i = 0; while i <= n { i = i + 1; }",
+                false,
+            ),
+            (
+                "large step can wrap",
+                "let mut i = 0; while i < n { i = i + 2; }",
+                false,
+            ),
+            (
+                "constant step can wrap",
+                "let mut i = 0; while i < 9223372036854775807 { i = i + 2; }",
+                false,
+            ),
+            (
+                "decrement",
+                "let mut i = 0; while i < n { i = i - 1; }",
+                false,
+            ),
+            (
+                "zero step",
+                "let mut i = 0; while i < n { i = i + 0; }",
+                false,
+            ),
+            (
+                "dynamic step",
+                "let mut i = 0; while i < n { i = i + n; }",
+                false,
+            ),
+            (
+                "two increments per guard",
+                "let mut i = 0; while i < n { i = i + 1; i = i + 1; }",
+                false,
+            ),
+            (
+                "assignment invalidates",
+                "let mut i = 0; while i < n { i = n; i = i + 1; }",
+                false,
+            ),
+            (
+                "wrong guarded variable",
+                "let mut i = 0; while n < 10 { i = i + 1; }",
+                false,
+            ),
+            (
+                "false edge",
+                "let mut i = 0; if i < n {} else { i = i + 1; }",
+                false,
+            ),
+            (
+                "join is conservative",
+                "let mut i = 0; while i < n { if n == 3 { println(n); } i = i + 1; }",
+                false,
+            ),
+            (
+                "mutable reference",
+                "let mut i = 0; while i < n { g(&i); i = i + 1; }",
+                false,
+            ),
+            (
+                "closure capture",
+                "let mut i = 0; while i < n { let f = || i; println(f()); i = i + 1; }",
+                false,
+            ),
+            (
+                "call and poll preserve scalar",
+                "let mut i = 0; while i < n { println(i); i = i + 1; }",
+                true,
+            ),
+        ];
+        for (label, body, expected) in cases {
+            // Keep this matrix about induction, not the pre-existing scalar unroller.
+            let body = body.replace("i = i +", "println(i); i = i +");
+            let source = format!(
+                "fn g(x: &mut i64) {{ x = -1; }} fn f(n: i64) -> i64 {{ {body} return i; }}"
+            );
+            let (f, _) = lir_fn_and_tables(&source, "f", &["f", "g"]);
+            let proof = super::super::nonnegative::analyze(&f);
+            let i = f.locals.iter().find(|l| l.name == "i").unwrap().id;
+            assert_eq!(
+                proof.contains(&crate::ir::lowered::LirOperand::Local(i)),
+                expected,
+                "{label}: {f:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonnegative_induction_scaling() {
+        for n in [8, 32, 128, 512] {
+            let mut source = String::from("fn f(n: i64) -> i64 { let mut sum = 0;");
+            for k in 0..n {
+                source.push_str(&format!("let mut idx{k} = 0; while idx{k} < n {{ sum = sum + idx{k} % 1000; idx{k} = idx{k} + 1; }}"));
+            }
+            source.push_str("return sum; }");
+            let (f, _) = lir_fn_and_tables(&source, "f", &["f"]);
+            let proof = super::super::nonnegative::analyze(&f);
+            let insts: usize = f.blocks.iter().map(|b| b.instrs.len()).sum();
+            let edges: usize = f
+                .blocks
+                .iter()
+                .map(lir_block_successors)
+                .map(|s| s.len())
+                .sum();
+            assert!(proof.work <= 16 * (insts + edges + f.locals.len()));
+            assert_eq!(
+                f.locals
+                    .iter()
+                    .filter(|l| l.name.starts_with('i') && proof.locals[l.id.0 as usize])
+                    .count(),
+                n
+            );
+            println!(
+                "nonnegative_scale sites={n} instructions={insts} edges={edges} locals={} work={}",
+                f.locals.len(),
+                proof.work
+            );
+        }
+    }
+    #[test]
+    fn nonnegative_induction_adverse_shapes() {
+        for shape in ["nested", "exits", "copies", "fanout"] {
+            for n in [8, 32, 128] {
+                let mut source = String::from("fn f(n: i64) -> i64 { let mut sum = 0;");
+                if shape == "nested" {
+                    for k in 0..n {
+                        source.push_str(&format!("let mut idx{k} = 0; while idx{k} < n {{"));
+                    }
+                    source.push_str("println(n);");
+                    for k in (0..n).rev() {
+                        source.push_str(&format!("idx{k} = idx{k} + 1; }}"));
+                    }
+                } else if shape == "exits" {
+                    source.push_str("let mut idx = 0; while idx < n {");
+                    for k in 0..n {
+                        source.push_str(&format!("if idx == {k} {{ return idx; }}"));
+                    }
+                    source.push_str("idx = idx + 1; }");
+                }
+                source.push_str("return sum; }");
+                let (mut f, _) = lir_fn_and_tables(&source, "f", &["f"]);
+                if shape == "copies" || shape == "fanout" {
+                    let base = f.locals.iter().find(|l| l.name == "sum").unwrap().clone();
+                    let mut previous = base.id;
+                    for k in 0..n {
+                        let mut local = base.clone();
+                        local.id = LirLocalId(f.locals.len() as u32);
+                        local.name = format!("__proof_copy_{k}");
+                        local.synthetic = true;
+                        f.blocks[0].instrs.push(LirInst::Compute {
+                            local: local.id,
+                            value: crate::ir::lowered::LirRvalue::Use(
+                                crate::ir::lowered::LirOperand::Local(previous),
+                            ),
+                            span: Span::dummy(),
+                        });
+                        if shape == "copies" {
+                            previous = local.id;
+                        }
+                        f.locals.push(local);
+                    }
+                }
+                let proof = super::super::nonnegative::analyze(&f);
+                let insts: usize = f.blocks.iter().map(|b| b.instrs.len()).sum();
+                let edges: usize = f
+                    .blocks
+                    .iter()
+                    .map(lir_block_successors)
+                    .map(|s| s.len())
+                    .sum();
+                assert!(proof.work <= 16 * (insts + edges + f.locals.len()));
+                if shape == "copies" || shape == "fanout" {
+                    assert_eq!(proof.locals.iter().filter(|&&known| known).count(), n + 1);
+                }
+                println!(
+                    "nonnegative_scale shape={shape} size={n} instructions={insts} edges={edges} locals={} work={}",
+                    f.locals.len(),
+                    proof.work
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nonnegative_induction_rejects_async_capture_and_unrolled_definitions() {
+        let source = "fn f(n: i64) -> i64 { let mut i = 0; while i < n { println(i); i = i + 1; } return i; }";
+        let (mut f, _) = lir_fn_and_tables(source, "f", &["f"]);
+        assert!(
+            super::super::nonnegative::analyze(&f)
+                .locals
+                .iter()
+                .any(|v| *v)
+        );
+        f.is_async = true;
+        assert!(
+            super::super::nonnegative::analyze(&f)
+                .locals
+                .iter()
+                .all(|v| !v)
+        );
+        f.is_async = false;
+        let i = f.locals.iter().find(|l| l.name == "i").unwrap().id;
+        f.async_frame.locals.insert(
+            i,
+            crate::ir::lowered::async_liveness::FrameSlot { index: 0 },
+        );
+        assert!(
+            super::super::nonnegative::analyze(&f)
+                .locals
+                .iter()
+                .all(|v| !v)
+        );
+        f.async_frame.locals.clear();
+        f.captures.push(crate::ir::lowered::LirCapture {
+            name: "i".into(),
+            source: "i".into(),
+            ty: Type::I64,
+        });
+        assert!(
+            super::super::nonnegative::analyze(&f)
+                .locals
+                .iter()
+                .all(|v| !v)
+        );
+        let (f, _) = lir_fn_and_tables(
+            "fn f() -> i64 { let mut i = 0; while i < 10 { i = i + 1; } return i; }",
+            "f",
+            &["f"],
+        );
+        let i = f.locals.iter().find(|l| l.name == "i").unwrap().id;
+        assert!(
+            !super::super::nonnegative::analyze(&f)
+                .contains(&crate::ir::lowered::LirOperand::Local(i))
+        );
     }
 }

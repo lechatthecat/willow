@@ -47,6 +47,16 @@ pub(super) struct LirReuse {
     pub(super) slots: HashMap<StackSlot, Value>,
     /// Header of a non-null array handle.
     pub(super) arrays: HashMap<Value, ArrayFacts>,
+    /// Preserve scalar SSA identity along the run's single-predecessor edges;
+    /// an unsealed successor would otherwise create a distinct alias value.
+    /// A local store invalidates its entry, and a poll drops the entire run.
+    pub(super) scalars: HashMap<LirLocalId, Value>,
+    /// A nonnegative signed comparison, awaiting its actual branch.
+    pub(super) comparison: Option<(Value, Value, Value)>,
+    /// Bound valid only on this true successor, never the false edge.
+    pub(super) branch_bound: Option<(usize, Value, Value)>,
+    /// Exact SSA index/length pair established on entry to this run.
+    pub(super) bound: Option<(Value, Value)>,
 }
 
 impl LirReuse {
@@ -55,7 +65,7 @@ impl LirReuse {
     /// quadratic.
     pub(super) fn carriable(&self) -> bool {
         const CARRY_LIMIT: usize = 16;
-        self.slots.len() + self.arrays.len() <= CARRY_LIMIT
+        self.slots.len() + self.arrays.len() + self.scalars.len() <= CARRY_LIMIT
     }
 }
 
@@ -256,7 +266,7 @@ pub(super) fn gc_free(f: &LirFunction, inst: &LirInst) -> bool {
 
 /// Every local an instruction other than `Compute` names, except the
 /// root clears, which only null a slot.
-fn inst_locals(inst: &LirInst) -> Vec<LirLocalId> {
+pub(super) fn inst_locals(inst: &LirInst) -> Vec<LirLocalId> {
     use crate::ir::lowered::LirSelectOp as Op;
     let select = |op: &Op, out: &mut Vec<LirLocalId>| match op {
         Op::Recv {

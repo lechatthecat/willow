@@ -73,6 +73,7 @@ mod flat_references;
 mod gc_codegen;
 mod lir_gen;
 mod local_maps;
+mod nonnegative;
 mod option_repr;
 mod panic_effect;
 mod root_effect;
@@ -1426,6 +1427,7 @@ struct FuncGen<'a, 'b> {
     /// Array loads the current GC-free run of LIR instructions can reuse;
     /// `None` outside such a run (willow-nzsg).
     lir_reuse: Option<transient_roots::LirReuse>,
+    lir_nonnegative: nonnegative::Proof,
     /// Frame slot the array fault paths share for their operands; see
     /// `emit_array_access` (willow-nzsg).
     array_fault_spill: Option<cranelift_codegen::ir::StackSlot>,

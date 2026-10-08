@@ -236,6 +236,8 @@ mod tests {
         /// Hot branches on a value a call returned, such as a null test of
         /// the poll counter.
         call_result_branches: usize,
+        unsigned_bounds: usize,
+        signed_remainders: usize,
     }
 
     /// Every natural loop's hot blocks, their placement and their calls.
@@ -281,6 +283,19 @@ mod tests {
                 .flat_map(|inst| func.dfg.inst_results(inst).iter().copied())
                 .collect();
             shapes.push(LoopShape {
+                unsigned_bounds: insts
+                    .iter()
+                    .filter(|&&inst| {
+                        func.dfg
+                            .display_inst(inst)
+                            .to_string()
+                            .contains("icmp.i64 uge")
+                    })
+                    .count(),
+                signed_remainders: insts
+                    .iter()
+                    .filter(|&&inst| opcode(inst) == Opcode::Srem)
+                    .count(),
                 hot_blocks: hot.len(),
                 contiguous: positions.windows(2).all(|pair| pair[1] == pair[0] + 1),
                 hot_calls: insts.iter().filter(|&&inst| opcode(inst).is_call()).count(),
@@ -396,5 +411,20 @@ mod tests {
             }",
             2,
         );
+    }
+    #[test]
+    fn nonnegative_loop_shares_proof_for_bounds_and_remainder() {
+        for (initial, checks) in [("0", 0), ("-1", 1)] {
+            let shapes = assert_compact_loops(
+                &format!(
+                    "import std::collections::Array;
+                fn main() {{ let values: Array<i64> = [1,2,3]; let mut i = {initial};
+                    while i < values.len() {{ values[i] = i % 1000; i = i + 1; }} }}"
+                ),
+                1,
+            );
+            assert_eq!(shapes[0].unsigned_bounds, checks, "initial={initial}");
+            assert_eq!(shapes[0].signed_remainders, checks, "initial={initial}");
+        }
     }
 }

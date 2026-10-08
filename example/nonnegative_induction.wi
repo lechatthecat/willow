@@ -1,0 +1,28 @@
+// Bounded nonnegative induction survives polls, while array headers are reloaded.
+import std::collections::Array;
+fn fill(values: Array<i64>) {
+    let mut i: i64 = 0;
+    while i < values.len() { values[i] = (i % 1000) + 1; i = i + 1; }
+}
+fn total(values: Array<i64>) -> i64 {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while i < values.len() { sum = sum + values[i]; i = i + 1; }
+    return sum;
+}
+fn main() {
+    let values: Array<i64> = [];
+    let mut i: i64 = 0;
+    while i < 10000 { values.push(0); i = i + 1; }
+    fill(values);
+    println(total(values));
+    let mut k: i64 = 0;
+    let mut sum: i64 = 0;
+    while k < 10000 { sum = sum + k % 3 + k % 8 + k % 1000; k = k + 2; }
+    println(sum);
+    let mut j: i64 = 9223372036854775790;
+    while j < 9223372036854775807 {
+        println(j % 1000);
+        j = j + 1;
+    }
+}

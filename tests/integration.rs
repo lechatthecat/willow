@@ -283,3 +283,6 @@ mod reference_equality;
 
 #[path = "integration/future_values.rs"]
 mod future_values;
+
+#[path = "integration/nonnegative_induction.rs"]
+mod nonnegative_induction;
