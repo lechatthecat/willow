@@ -2497,7 +2497,7 @@ mod tests {
             let sources = BTreeMap::from([("main.wi".into(), source.clone())]);
             let (changes, work) = structured_changes(
                 &snapshot,
-                &f.0,
+                &w.root,
                 &sources,
                 vec![Operation::Rename {
                     function: id,
