@@ -1,0 +1,28 @@
+// A generic type closer can touch the initializer's '='.
+import std::collections::Array;
+
+class Defaults {
+    pub static one: Option<i64>= Some(7);
+    pub static nested: Option<Option<i64>>= Some(Some(8));
+}
+
+fn single(value: Option<i64>) -> i64 { return value.unwrap(); }
+fn nested(value: Option<Option<i64>>) -> i64 { return value.unwrap().unwrap(); }
+
+fn main() {
+    let before = true ? -1 : 2;
+    let one: Option<i64>= Some(41);
+    let two: Option<Option<i64>>= Some(Some(42));
+    let values: Array<Option<Option<i64>>>= [];
+    values.push(two);
+    let after = false ? -3 : 4;
+    println(single(one));
+    println(nested(values[0]));
+    println(single(Defaults::one));
+    println(nested(Defaults::nested));
+    println(before + after);
+    println(8>=2);
+    let mut bits = 32;
+    bits>>=2;
+    println(bits);
+}

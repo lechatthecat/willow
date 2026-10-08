@@ -2,6 +2,8 @@ pub mod ast;
 mod decl;
 mod expr;
 mod flat_syntax;
+#[cfg(test)]
+mod generic_closer_tests;
 pub mod iter;
 pub(crate) mod ownership;
 mod pattern;
@@ -17,6 +19,10 @@ pub struct Parser {
     type_uses: Vec<TypeUse>,
     tokens: Vec<Token>,
     pos: usize,
+    /// The current immutable `GtEq` has contributed its `>` to a type.
+    /// Only its `=` remains at the cursor; advancing clears this state.
+    pending_type_eq: bool,
+    last_span: Option<Span>,
     allow_object_literals: bool,
     /// Statement-level errors recovered inside blocks (willow-qzxg): the block
     /// keeps parsing after a bad statement, so one error no longer swallows the
@@ -52,6 +58,8 @@ fn ternary_colon_table(tokens: &[Token]) -> Vec<bool> {
     let mut after_group = vec![None; tokens.len()];
     let mut open = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
+        #[cfg(test)]
+        generic_closer_tests::TABLE_VISITS.with(|n| n.set(n.get() + 1));
         match &token.kind {
             TokenKind::LParen | TokenKind::LBracket => open.push(i),
             TokenKind::RParen | TokenKind::RBracket => {
@@ -65,6 +73,8 @@ fn ternary_colon_table(tokens: &[Token]) -> Vec<bool> {
     }
     let mut colon_ahead = vec![false; tokens.len() + 1];
     for i in (0..tokens.len()).rev() {
+        #[cfg(test)]
+        generic_closer_tests::TABLE_VISITS.with(|n| n.set(n.get() + 1));
         colon_ahead[i] = match &tokens[i].kind {
             TokenKind::Colon => true,
             TokenKind::Comma | TokenKind::RParen | TokenKind::RBracket => false,
@@ -85,6 +95,8 @@ impl Parser {
             type_uses: Vec::new(),
             tokens,
             pos: 0,
+            pending_type_eq: false,
+            last_span: None,
             allow_object_literals: true,
             recovered_errors: Vec::new(),
             ternary_colon: std::cell::OnceCell::new(),
@@ -172,31 +184,37 @@ impl Parser {
     fn peek_kind(&self) -> &TokenKind {
         #[cfg(test)]
         PARSER_TOKEN_READS.with(|count| count.set(count.get() + 1));
-        &self.tokens[self.pos].kind
+        self.peek_kind_at(0)
     }
 
     /// The token `offset` places ahead, saturating at the final token — which
     /// is always EOF, so a lookahead past the end reads as EOF rather than
     /// panicking.
     fn peek_kind_at(&self, offset: usize) -> &TokenKind {
+        if offset == 0 && self.pending_type_eq {
+            return &TokenKind::Eq;
+        }
         let idx = (self.pos + offset).min(self.tokens.len() - 1);
         &self.tokens[idx].kind
     }
 
     fn current_span(&self) -> Span {
-        self.tokens[self.pos].span
+        let mut span = self.tokens[self.pos].span;
+        if self.pending_type_eq {
+            span.start += 1;
+            span.col += 1;
+        }
+        span
     }
 
     fn previous_span(&self) -> Span {
-        if self.pos == 0 {
-            self.current_span()
-        } else {
-            self.tokens[self.pos - 1].span
-        }
+        self.last_span.unwrap_or_else(|| self.current_span())
     }
 
     fn advance(&mut self) {
         if self.pos + 1 < self.tokens.len() {
+            self.last_span = Some(self.current_span());
+            self.pending_type_eq = false;
             self.pos += 1;
         }
     }
@@ -206,7 +224,29 @@ impl Parser {
     }
 
     fn check(&self, kind: TokenKind) -> bool {
-        self.tokens[self.pos].kind == kind
+        *self.peek_kind_at(0) == kind
+    }
+
+    fn at_type_gt(&self) -> bool {
+        matches!(self.peek_kind_at(0), TokenKind::Gt | TokenKind::GtEq)
+    }
+
+    /// Consume a type's closing `>` without inserting or mutating tokens.
+    /// Ternary queries start strictly ahead of the current cursor, hence ahead
+    /// of the virtual `=`. Their immutable-token suffix and cached answer stay
+    /// valid. Speculative type parsing restores this cursor state on rollback.
+    fn expect_type_gt(&mut self) -> Result<Span, Diagnostic> {
+        if self.check(TokenKind::GtEq) {
+            #[cfg(test)]
+            generic_closer_tests::SPLITS.with(|n| n.set(n.get() + 1));
+            let mut span = self.current_span();
+            span.end = span.start + 1;
+            self.pending_type_eq = true;
+            self.last_span = Some(span);
+            Ok(span)
+        } else {
+            self.expect(TokenKind::Gt)
+        }
     }
 
     /// Returns true if the current `?` is a TryPropagate postfix operator

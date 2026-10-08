@@ -286,3 +286,6 @@ mod future_values;
 
 #[path = "integration/nonnegative_induction.rs"]
 mod nonnegative_induction;
+
+#[path = "integration/generic_closer_equals.rs"]
+mod generic_closer_equals;

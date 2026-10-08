@@ -743,6 +743,8 @@ impl Parser {
         }
 
         let saved = self.pos;
+        let saved_pending_type_eq = self.pending_type_eq;
+        let saved_last_span = self.last_span;
         let saved_type_uses = self.type_uses.len();
         self.advance();
         let mut type_args = Vec::new();
@@ -751,6 +753,8 @@ impl Parser {
                 Ok(ty) => type_args.push(ty),
                 Err(_) => {
                     self.pos = saved;
+                    self.pending_type_eq = saved_pending_type_eq;
+                    self.last_span = saved_last_span;
                     self.type_uses.truncate(saved_type_uses);
                     return Ok(None);
                 }
@@ -762,6 +766,8 @@ impl Parser {
 
         if !self.eat(TokenKind::Gt) || !self.eat(TokenKind::ColonColon) {
             self.pos = saved;
+            self.pending_type_eq = saved_pending_type_eq;
+            self.last_span = saved_last_span;
             self.type_uses.truncate(saved_type_uses);
             return Ok(None);
         }
@@ -853,13 +859,13 @@ impl Parser {
         // Optional generic type args: `new Box<i64>(...)`.
         let mut type_args = Vec::new();
         if self.eat(TokenKind::Lt) {
-            while !matches!(self.peek_kind(), TokenKind::Gt | TokenKind::Eof) {
+            while !self.at_type_gt() && !self.at_eof() {
                 type_args.push(self.parse_type()?);
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }
             }
-            self.expect(TokenKind::Gt)?;
+            self.expect_type_gt()?;
         }
         self.expect(TokenKind::LParen)?;
         let args = self.parse_call_args_after_lparen()?;

@@ -101,11 +101,11 @@ impl Parser {
                         span: type_start.to(self.tokens[self.pos - 1].span),
                     });
                     if self.eat(TokenKind::Lt) {
-                        if !self.check(TokenKind::Gt) && !self.at_eof() {
+                        if !self.at_type_gt() && !self.at_eof() {
                             frames.push(Frame::Generic(name, Vec::new()));
                             continue;
                         }
-                        self.expect(TokenKind::Gt)?;
+                        self.expect_type_gt()?;
                         generic(name, Vec::new())
                     } else if name == "String" {
                         Type::String
@@ -131,14 +131,11 @@ impl Parser {
                     }
                     Some(Frame::Generic(name, mut args)) => {
                         args.push(value);
-                        if self.eat(TokenKind::Comma)
-                            && !self.check(TokenKind::Gt)
-                            && !self.at_eof()
-                        {
+                        if self.eat(TokenKind::Comma) && !self.at_type_gt() && !self.at_eof() {
                             frames.push(Frame::Generic(name, args));
                             break;
                         }
-                        self.expect(TokenKind::Gt)?;
+                        self.expect_type_gt()?;
                         value = generic(name, args);
                     }
                     Some(Frame::Params(closure, mut params)) => {
@@ -166,6 +163,15 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use crate::{diagnostics::Diagnostic, lexer::Lexer, parser::Parser, semantic::TypeChecker};
+
+    #[test]
+    fn generic_closer_touching_equals_regression() {
+        for ty in ["Option<i64>", "Option<Option<i64>>"] {
+            let source = format!("fn main() {{ let x: {ty}= None; }}");
+            let (_, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            assert!(errors.is_empty(), "{source}: {errors:?}");
+        }
+    }
 
     fn check(source: &str) -> Vec<Diagnostic> {
         let source = format!("import std::collections::Array; {source}");
