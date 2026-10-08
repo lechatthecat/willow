@@ -329,7 +329,7 @@ pub(super) fn inst_locals(inst: &LirInst) -> Vec<LirLocalId> {
     out
 }
 
-fn terminator_locals(terminator: &Terminator) -> Vec<LirLocalId> {
+pub(super) fn terminator_locals(terminator: &Terminator) -> Vec<LirLocalId> {
     match terminator {
         Terminator::Branch { cond, .. } | Terminator::Return(Some(cond)) => cond.locals(),
         Terminator::Suspend { operation, .. } => {

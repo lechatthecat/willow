@@ -289,3 +289,6 @@ mod nonnegative_induction;
 
 #[path = "integration/generic_closer_equals.rs"]
 mod generic_closer_equals;
+
+#[path = "integration/native_stack_slots.rs"]
+mod native_stack_slots;

@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 
-const DIAGNOSTIC: &[u8] = b"Willow runtime error: native stack overflow\n";
+const DIAGNOSTIC: &[u8] = b"Willow runtime error: native stack overflow; reduce recursion depth or use an iterative algorithm\n";
 
 thread_local! {
     // TLS is used only during ordinary initialization and thread teardown.

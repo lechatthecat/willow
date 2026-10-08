@@ -5092,6 +5092,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             (coop.is_none() && !unpolled && loop_polls).then(|| self.emit_sync_poll_spare());
         let sync_poll = (coop.is_none() && !deferred_poll && !unpolled)
             .then(|| self.emit_sync_poll_gates(poll_spare));
+        let unrooted = if coop.is_none() {
+            super::transient_roots::unrooted_array_temps(f)
+        } else {
+            HashSet::new()
+        };
         if coop.is_some() {
             self.bind_coop_lir_locals(f);
             // GC locals that are dead at every suspension deliberately stay
@@ -5099,13 +5104,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // root while the current poll invocation can allocate.
             self.bind_lir_gc_locals(f);
         } else {
+            self.bind_lir_reused_roots(f, &unrooted);
             self.bind_lir_gc_locals(f);
         }
-        let unrooted = if coop.is_none() {
-            super::transient_roots::unrooted_array_temps(f)
-        } else {
-            HashSet::new()
-        };
         self.bind_lir_locals(f, &unrooted);
         let mut blocks = vec![entry];
         for _ in 1..f.blocks.len() {
@@ -5914,6 +5915,41 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
         }
         self.builder.ins().jump(blocks[resume.0], &[]);
+    }
+
+    /// Share entry roots only when all accesses, including clears, fit in a
+    /// single non-overlapping block interval. Other locals keep unique slots.
+    fn bind_lir_reused_roots(&mut self, f: &LirFunction, unrooted: &HashSet<LirLocalId>) {
+        let widths: Vec<_> = f
+            .locals
+            .iter()
+            .map(|local| {
+                (!local.parameter
+                    && !unrooted.contains(&local.id)
+                    && !self.vars.contains_key(local.name.as_str())
+                    && !self.address_taken.contains(local.name.as_str())
+                    && (local.is_gc_owner() || is_gc_managed(&local.ty, self.enum_infos)))
+                .then(|| self.clif_type(&local.ty).bytes().max(8))
+            })
+            .collect();
+        let mut null = None;
+        for group in super::stack_slots::groups(f, &widths) {
+            let first = &f.locals[group[0].0 as usize];
+            self.bind_lir_rooted_slot(&first.name, &first.ty, &mut null);
+            let VarStorage::Stack { slot, .. } = self.vars[&first.name] else {
+                unreachable!("new rooted slot");
+            };
+            for id in &group[1..] {
+                let local = &f.locals[id.0 as usize];
+                self.vars.insert(
+                    local.name.clone(),
+                    VarStorage::Stack {
+                        slot,
+                        ty: local.ty.clone(),
+                    },
+                );
+            }
+        }
     }
 
     /// Give every GC-managed `let` of this function one entry-allocated, rooted

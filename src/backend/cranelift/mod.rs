@@ -77,6 +77,7 @@ mod nonnegative;
 mod option_repr;
 mod panic_effect;
 mod root_effect;
+mod stack_slots;
 mod std_collection;
 mod symbols;
 mod transient_roots;
@@ -1557,6 +1558,8 @@ struct FuncGen<'a, 'b> {
     terminated: bool,
     /// Number of GC roots currently on the root stack for this function invocation.
     gc_root_count: usize,
+    /// Temporary roots indexed by live root depth and spill width.
+    temporary_root_slots: HashMap<(usize, u32), cranelift_codegen::ir::StackSlot>,
     /// Cooperative poll functions may keep a GC local in a native stack slot
     /// when liveness proves that its value does not cross a suspension. Track
     /// those binding roots separately so every poll return can pop them and a

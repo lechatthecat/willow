@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(output.status.code(), Some(101), "{output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr)
-                .contains("Willow runtime error: native stack overflow"),
+                .contains("Willow runtime error: native stack overflow; reduce recursion depth"),
             "{output:?}"
         );
     }

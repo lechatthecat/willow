@@ -58,11 +58,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::StackSlot {
         let spill_bytes = self.builder.func.dfg.value_type(val).bytes();
-        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            spill_bytes,
-            0,
-        ));
+        // Equal root depth means the earlier temporary has been popped (or
+        // belongs to an alternate path). Never share with entry binding roots:
+        // those have their own slots and remain included in gc_root_count.
+        let key = (self.gc_root_count, spill_bytes);
+        let slot = *self.temporary_root_slots.entry(key).or_insert_with(|| {
+            self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                spill_bytes,
+                0,
+            ))
+        });
         self.stack_store(val, slot);
         self.emit_push_root_slot(slot);
         slot

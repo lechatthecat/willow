@@ -1,0 +1,37 @@
+// Disjoint native root slots, match arms, loops and recursive live values.
+// Expected output: 6, 15, 820. Also run with WILLOW_GC_STRESS=relocate.
+class StackNode { pub value: i64; }
+
+fn read_node(node: StackNode) -> i64 {
+    gc_minor_collect();
+    return node.value;
+}
+fn scopes(n: i64) -> i64 {
+    let mut sum = 0;
+    if n >= 0 { let a = new StackNode(1); sum = sum + read_node(a); }
+    if n >= 1 { let b = new StackNode(2); sum = sum + read_node(b); }
+    if n >= 2 { let c = new StackNode(3); sum = sum + read_node(c); }
+    return sum;
+}
+fn arms(n: i64) -> i64 {
+    let mut sum = 0;
+    for i in 0..n {
+        match i % 3 {
+            0 => { let a = new StackNode(1); sum = sum + read_node(a); },
+            1 => { let b = new StackNode(2); sum = sum + read_node(b); },
+            _ => { let c = new StackNode(3); sum = sum + read_node(c); },
+        }
+    }
+    return sum;
+}
+fn recursive(n: i64) -> i64 {
+    let keep = new StackNode(n);
+    if n == 0 { gc_minor_collect(); return keep.value; }
+    let below = recursive(n - 1);
+    return read_node(keep) + below;
+}
+fn main() {
+    println(scopes(2));
+    println(arms(8));
+    println(recursive(40));
+}
