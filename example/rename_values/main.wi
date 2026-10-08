@@ -1,0 +1,14 @@
+import helper;
+import helper::{value as amount};
+
+fn seven() -> i64 { return amount; }
+
+fn main() {
+    println(helper::value + amount);
+    let f = seven;
+    println(f());
+    if true {
+        let value = 9;
+        println(value);
+    }
+}

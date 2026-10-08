@@ -791,6 +791,10 @@ fn durable_write_observed(path: &Path, bytes: &[u8], published: impl FnOnce()) -
 pub(super) struct EditWork {
     pub(super) tokens_indexed: usize,
     pub(super) expressions_indexed: usize,
+    #[serde(default)]
+    pub(super) value_facts_indexed: usize,
+    #[serde(default)]
+    pub(super) value_probes: usize,
     pub(super) references_visited: usize,
     pub(super) patches: usize,
     #[serde(default)]
@@ -973,10 +977,14 @@ fn structured_changes(
     let mut identifiers: BTreeMap<&str, Vec<(&str, &crate::diagnostics::Span)>> = BTreeMap::new();
     let mut call_names = BTreeMap::new();
     let mut qualifiers = std::collections::HashSet::new();
+    let mut alias_tokens = std::collections::HashSet::new();
     for (path, ts) in &tokens {
         for (i, token) in ts.iter().enumerate() {
             work.tokens_indexed += 1;
             if let TokenKind::Ident(name) = &token.kind {
+                if i > 0 && ts[i - 1].kind == TokenKind::As {
+                    alias_tokens.insert((Path::new(path), token.span.start, token.span.end));
+                }
                 if ts
                     .get(i + 1)
                     .is_some_and(|t| t.kind == TokenKind::ColonColon)
@@ -1059,6 +1067,57 @@ fn structured_changes(
                 );
             }
         }
+    }
+    // Exact checker-owned identifier ranges, indexed once for all operations.
+    // Unlike expression ranges these cover values as well as calls.
+    let mut value_targets: std::collections::HashMap<_, std::collections::HashSet<&str>> =
+        std::collections::HashMap::new();
+    let mut explicit_aliases = std::collections::HashSet::new();
+    let mut alias_points = std::collections::HashSet::new();
+    for symbol in &snapshot.semantic.symbols {
+        if symbol.kind == "import"
+            && let Some(l) = &symbol.location
+            && let Ok(path) = Path::new(&l.path).strip_prefix(root)
+            && alias_tokens.contains(&(path, l.start, l.end))
+        {
+            explicit_aliases.insert(symbol.id.as_str());
+            alias_points.insert((path, l.start, l.end));
+        }
+        work.value_facts_indexed += 1;
+        if local_ids.contains(symbol.id.as_str())
+            && let Some(l) = &symbol.location
+            && let Ok(path) = Path::new(&l.path).strip_prefix(root)
+        {
+            value_targets
+                .entry((path, l.start, l.end))
+                .or_default()
+                .insert(symbol.id.as_str());
+        }
+    }
+    for reference in &snapshot.semantic.references {
+        work.value_facts_indexed += 1;
+        let l = &reference.location;
+        let Ok(path) = Path::new(&l.path).strip_prefix(root) else {
+            continue;
+        };
+        // Import provenance accompanies the actual resolved value target. An
+        // explicit alias owns its own spelling and must survive target renames.
+        if reference.role == "import" {
+            if explicit_aliases.contains(reference.target.as_str()) {
+                alias_points.insert((path, l.start, l.end));
+            }
+            continue;
+        }
+        // Import-target facts select a spelling within the whole import and
+        // may point at a repeated module name. The dedicated rename_imports
+        // path below proves the final item token, excluding qualifiers/aliases.
+        if reference.role == "import-target" {
+            continue;
+        }
+        value_targets
+            .entry((path, l.start, l.end))
+            .or_default()
+            .insert(reference.target.as_str());
     }
     let mut semantic_renames = has_member_rename
         .then(|| super::rename::Index::new(snapshot, root, &identifiers, &qualifiers));
@@ -1198,8 +1257,8 @@ fn structured_changes(
                     .into());
                 }
                 // Conservative closed-world rename: every same-spelled token
-                // must be a declaration or a compiler-resolved call to target.
-                // Ambiguous/shadowed/function-value references fail closed.
+                // must be proven to belong to the target or a local binding.
+                // Unknown or conflicting semantic targets still fail closed.
                 let mut family = std::collections::BTreeSet::new();
                 let mut pending = vec![function.id.as_str()];
                 while let Some(id) = pending.pop() {
@@ -1290,7 +1349,32 @@ fn structured_changes(
                     }
                 }
                 for &(p, span) in identifiers.get(old.as_str()).into_iter().flatten() {
-                    if !allowed.get(p).is_some_and(|a| a.contains(&span.start)) {
+                    work.value_probes += 1;
+                    // Functions and constants cannot own a namespace. A
+                    // same-spelled path qualifier is not a use of this target.
+                    if qualifiers.contains(&(p, span.start, span.end)) {
+                        continue;
+                    }
+                    let point = (Path::new(p), span.start, span.end);
+                    if alias_points.contains(&point) {
+                        continue;
+                    }
+                    let mut proven_value = false;
+                    if let Some(targets) = value_targets.get(&point) {
+                        if targets.iter().all(|target| local_ids.contains(target)) {
+                            continue;
+                        }
+                        if targets.iter().all(|target| family.contains(target)) {
+                            proven_value = true;
+                        } else if targets.iter().any(|target| family.contains(target)) {
+                            anyhow::bail!(
+                                "rename occurrence has conflicting semantic targets at {p}:{}:{}",
+                                span.line,
+                                span.col
+                            );
+                        }
+                    }
+                    if !proven_value && !allowed.get(p).is_some_and(|a| a.contains(&span.start)) {
                         if builtin_members
                             .get_or_insert_with(|| builtin_member_points(snapshot, root))
                             .contains(&(Path::new(p), span.start))
@@ -2116,14 +2200,180 @@ mod tests {
     }
 
     #[test]
-    fn rename_rejects_function_value_with_structured_location() {
-        let main = "import helper::{value};\nfn main() {\n  let f = value;\n  println(f());\n}";
-        let error = rename_helper_value(&[HELPER, ("main.wi", main)])
-            .err()
+    fn rename_supports_function_values() {
+        for main in [
+            "import helper::{value}; fn main() { let f = value; println(f()); }",
+            "import helper::value as v; fn main() { let f = v; println(f()); }",
+            "import helper::{value as v}; fn main() { let f = v; println(f()); }",
+        ] {
+            let f = rename_helper_value(&[HELPER, ("main.wi", main)]).unwrap();
+            assert_eq!(
+                fs::read_to_string(f.0.join("main.wi")).unwrap(),
+                main.replace("value", "answer")
+            );
+        }
+    }
+
+    #[test]
+    fn rename_preserves_explicit_alias_equal_to_original_name() {
+        for helper in [HELPER.1, "pub const value: i64 = 7;"] {
+            for import in [
+                "import helper::value as value;",
+                "import helper::{value as value};",
+            ] {
+                let main = format!("{import} fn main() {{ let f = value; }}");
+                let f = rename_helper_value(&[("helper.wi", helper), ("main.wi", &main)]).unwrap();
+                assert_eq!(
+                    fs::read_to_string(f.0.join("main.wi")).unwrap(),
+                    main.replacen("value", "answer", 1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rename_repeated_module_and_item_names() {
+        for (import, usage, expected_import, expected_usage) in [
+            (
+                "import value::value;",
+                "value",
+                "import value::answer;",
+                "answer",
+            ),
+            (
+                "import value::{value};",
+                "value",
+                "import value::{answer};",
+                "answer",
+            ),
+            (
+                "import value::value as v;",
+                "v",
+                "import value::answer as v;",
+                "v",
+            ),
+            (
+                "import value::{value as v};",
+                "v",
+                "import value::{answer as v};",
+                "v",
+            ),
+            (
+                "import value::value as value;",
+                "value",
+                "import value::answer as value;",
+                "value",
+            ),
+            (
+                "import value::{value as value};",
+                "value",
+                "import value::{answer as value};",
+                "value",
+            ),
+        ] {
+            let f = Fixture::new();
+            fs::write(f.0.join("value.wi"), "pub const value: i64 = 7;").unwrap();
+            fs::write(
+                f.0.join("main.wi"),
+                format!("{import} fn main() {{ println({usage}); }}"),
+            )
             .unwrap();
-        let l = &error.downcast_ref::<Rejection>().unwrap().location;
-        assert_eq!((l.path.as_str(), l.line, l.column), ("main.wi", 3, 11));
-        assert_eq!(&main[l.start..l.end], "value");
+            let w = f.workspace();
+            let mut emitter = crate::diagnostics::HumanEmitter;
+            let snapshot = w
+                .analyze(&f.0.join("main.wi"), false, &mut emitter)
+                .unwrap();
+            let id = snapshot
+                .functions
+                .iter()
+                .find(|f| f.name == "value")
+                .unwrap()
+                .id
+                .clone();
+            let result = w
+                .prepare(
+                    &f.0.join("main.wi"),
+                    false,
+                    Request {
+                        revision: snapshot.revision,
+                        operations: vec![Operation::Rename {
+                            function: id,
+                            name: "answer".into(),
+                        }],
+                    },
+                    ChangeFormat::Full,
+                    &mut emitter,
+                )
+                .unwrap();
+            let transaction = result["transaction"].as_str().unwrap();
+            w.validate(transaction, &mut emitter).unwrap();
+            w.apply(transaction, &mut emitter).unwrap();
+            assert_eq!(
+                fs::read_to_string(f.0.join("value.wi")).unwrap(),
+                "pub const answer: i64 = 7;"
+            );
+            assert_eq!(
+                fs::read_to_string(f.0.join("main.wi")).unwrap(),
+                format!("{expected_import} fn main() {{ println({expected_usage}); }}")
+            );
+        }
+    }
+
+    #[test]
+    fn rename_constant_across_consumers() {
+        let f = rename_helper_value(&[
+            ("helper.wi", "pub const value: i64 = 7;"),
+            (
+                "mid.wi",
+                "import helper::{value}; pub fn read() -> i64 { return value; }",
+            ),
+            (
+                "main.wi",
+                "import helper; import mid; fn main() { println(helper::value + mid::read()); }",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(f.0.join("helper.wi")).unwrap(),
+            "pub const answer: i64 = 7;"
+        );
+        assert_eq!(
+            fs::read_to_string(f.0.join("mid.wi")).unwrap(),
+            "import helper::{answer}; pub fn read() -> i64 { return answer; }"
+        );
+        assert_eq!(
+            fs::read_to_string(f.0.join("main.wi")).unwrap(),
+            "import helper; import mid; fn main() { println(helper::answer + mid::read()); }"
+        );
+    }
+
+    #[test]
+    fn rename_constant_spellings_and_local_shadowing() {
+        let helper = "pub const value: i64 = 7; pub fn read() -> i64 { return value; }";
+        for main in [
+            "import helper; fn main() { println(helper::value); }",
+            "import helper as h; fn main() { println(h::value); }",
+            "import helper::value; fn main() { println(value); }",
+            "import helper::{value}; fn main() { println(value); }",
+            "import helper::value as v; fn main() { println(v); }",
+            "import helper::{value as v}; fn main() { println(v); }",
+        ] {
+            let f = rename_helper_value(&[("helper.wi", helper), ("main.wi", main)]).unwrap();
+            assert_eq!(
+                fs::read_to_string(f.0.join("main.wi")).unwrap(),
+                main.replace("value", "answer")
+            );
+            assert_eq!(
+                fs::read_to_string(f.0.join("helper.wi")).unwrap(),
+                helper.replace("value", "answer")
+            );
+        }
+        let main = "import helper::value; fn main() { println(value); if true { let value = 9; println(value); } println(value); } fn shadow(value: i64) -> i64 { return value; }";
+        let f = rename_helper_value(&[("helper.wi", helper), ("main.wi", main)]).unwrap();
+        assert_eq!(
+            fs::read_to_string(f.0.join("main.wi")).unwrap(),
+            "import helper::answer; fn main() { println(answer); if true { let value = 9; println(value); } println(answer); } fn shadow(value: i64) -> i64 { return value; }"
+        );
     }
 
     #[test]
@@ -2171,6 +2421,52 @@ mod tests {
             println!("edit calls={n} work={}", result["work"]);
         }
     }
+    #[test]
+    fn rename_value_scaling_counts_exact_facts_and_probes() {
+        for n in [16, 64, 256] {
+            let f = Fixture::new();
+            let source = format!(
+                "const value: i64 = 7; fn main() {{ {} }}",
+                "println(value); if true { let value = 9; println(value); }".repeat(n)
+            );
+            fs::write(f.0.join("main.wi"), &source).unwrap();
+            let w = f.workspace();
+            let mut emitter = crate::diagnostics::HumanEmitter;
+            let snapshot = w
+                .analyze(&f.0.join("main.wi"), false, &mut emitter)
+                .unwrap();
+            let id = snapshot
+                .functions
+                .iter()
+                .find(|f| f.name == "value")
+                .unwrap()
+                .id
+                .clone();
+            let sources = BTreeMap::from([("main.wi".into(), source.clone())]);
+            let (changes, work) = structured_changes(
+                &snapshot,
+                &f.0,
+                &sources,
+                vec![Operation::Rename {
+                    function: id,
+                    name: "answer".into(),
+                }],
+            )
+            .unwrap();
+            assert_eq!(
+                work.value_facts_indexed,
+                snapshot.semantic.symbols.len() + snapshot.semantic.references.len()
+            );
+            assert_eq!(work.value_probes, 3 * n + 1);
+            assert_eq!(work.patches, n + 1);
+            assert_eq!(changes.len(), 1);
+            println!(
+                "value occurrences={n} work={}",
+                serde_json::to_string(&work).unwrap()
+            );
+        }
+    }
+
     #[test]
     fn rejects_shadowing_and_declarations_outside_replacement() {
         let f = Fixture::new();

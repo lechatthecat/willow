@@ -1011,3 +1011,45 @@ fn nested_builtin_arguments_and_chains_are_proven_non_targets() {
         assert_eq!(main.matches("p.plus(").count(), 2, "{main}");
     }
 }
+
+#[test]
+fn referenced_constant_rename_preserves_aliases_and_shadowed_locals() {
+    let source = "import helper; import helper::{value, value as v}; fn main() { println(value + helper::value + v); if true { let value = 9; println(value); } }";
+    let f = Fixture::new(source);
+    f.write("helper.wi", "pub const value: i64 = 7;");
+    let preview = f.run(&["rename", "helper::value", "answer", "--dry-run"], 0);
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 2);
+    assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+    let applied = f.run(&["rename", "helper::value", "answer"], 0);
+    assert_eq!(applied["result"]["validation"], "passed");
+    assert_eq!(applied["result"]["files_changed"], 2);
+    assert_eq!(
+        fs::read_to_string(f.0.join("helper.wi")).unwrap(),
+        "pub const answer: i64 = 7;"
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join("main.wi")).unwrap(),
+        "import helper; import helper::{answer, answer as v}; fn main() { println(answer + helper::answer + v); if true { let value = 9; println(value); } }"
+    );
+    f.run(&["refs", "helper::answer"], 0);
+}
+
+#[test]
+fn repeated_import_path_and_item_rename_keeps_module_qualifier() {
+    let source =
+        "import value::value; import value::{value as v}; fn main() { println(value + v); }";
+    let f = Fixture::new(source);
+    f.write("value.wi", "pub const value: i64 = 7;");
+    f.run(&["rename", "value::value", "answer", "--dry-run"], 0);
+    assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+    let applied = f.run(&["rename", "value::value", "answer"], 0);
+    assert_eq!(applied["result"]["validation"], "passed");
+    assert_eq!(
+        fs::read_to_string(f.0.join("value.wi")).unwrap(),
+        "pub const answer: i64 = 7;"
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join("main.wi")).unwrap(),
+        "import value::answer; import value::{answer as v}; fn main() { println(answer + v); }"
+    );
+}

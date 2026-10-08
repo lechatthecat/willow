@@ -462,7 +462,9 @@ pub(super) fn finish(
     }
     let mut symbols = BTreeMap::new();
     let mut register = |d: &Declaration| {
-        let location = select(d.span, &d.name, false, names, paths);
+        // An import declares its final alias token, even when it repeats the
+        // target spelling (`import m::value as value`).
+        let location = select(d.span, &d.name, d.kind == "import", names, paths);
         let raw_path = paths.get(&crate::module::ModuleId(d.span.file_id.0));
         // Constructor overloads share a lowered dispatch function but remain distinct
         // source declarations. Keep their compiler owner/ordinal identities.
