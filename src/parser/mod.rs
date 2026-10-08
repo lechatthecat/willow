@@ -2263,6 +2263,37 @@ class ProtectedCtor { prot init(self) {} }
     }
 
     #[test]
+    fn select_binding_spans_scale_with_case_count() {
+        for count in [1, 8, 64, 512] {
+            let mut source = "fn main() { select {".to_string();
+            let mut expected = Vec::new();
+            for _ in 0..count {
+                let start = source.len();
+                source.push_str("let /* comment */ resp = ch.recv() => { println(resp); }");
+                expected.push((start, start + "let /* comment */ resp".len()));
+            }
+            source.push_str("} }");
+            let program = parse_ok(&source);
+            let Stmt::Expr(stmt) = &first_function(&program).body.stmts[0] else {
+                panic!("expected select statement");
+            };
+            let Expr::Select(select) = &stmt.expr else {
+                panic!("expected select");
+            };
+            assert_eq!(select.cases.len(), count);
+            for (case, (start, end)) in select.cases.iter().zip(expected) {
+                assert_eq!((case.span.start, case.span.end), (start, end));
+                assert_eq!(
+                    source[case.span.start..case.span.end]
+                        .matches("resp")
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn select_ref_03_value_arguments_still_parse() {
         let p = parse_ok(
             "fn main() { let ch = Channel<i64>::new(); let v = 1; let ms = 5; select { ch.send(v) => {} sleep(ms) => {} } }",

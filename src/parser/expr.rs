@@ -960,10 +960,13 @@ impl Parser {
 
         let mut cases = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
-            let case_span = self.current_span();
+            let mut case_span = self.current_span();
             let kind = if self.check(TokenKind::Let) {
                 // `let v = ch.recv() => { ... }`
                 self.advance();
+                // Declaration lookup must include the binding token, not just `let`.
+                // Stop before the operand/body so repeated names cannot be selected.
+                case_span = case_span.to(self.current_span());
                 let binding = self.expect_ident()?;
                 self.expect(TokenKind::Eq)?;
                 match &mut self.parse_expr()? {

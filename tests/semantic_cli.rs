@@ -1928,3 +1928,98 @@ fn method_reference_order_scales_across_files_and_callers() {
         );
     }
 }
+
+#[test]
+fn select_bindings_support_direct_queries_and_rename() {
+    for (operation, ty, setup) in [
+        ("ch.recv()", "i64", ""),
+        ("ch.recv_opt()", "Option<i64>", ""),
+        ("await task", "i64", "let task = answer();"),
+    ] {
+        for rename_selector in 0..3 {
+            let f = Fixture::new();
+            let source = format!(
+                "module engine;\nasync fn answer() -> i64 {{ return 7; }}\npub async fn search() {{\n    let ch = Channel<i64>::new();\n    {setup}\n    select {{\n        let resp = {operation} => {{ let first = resp; let second = resp; }}\n        default => {{}}\n    }}\n}}\n"
+            );
+            fs::write(f.0.join("src/engine.wi"), &source).unwrap();
+            fs::write(
+                f.0.join("src/main.wi"),
+                "import engine;\nasync fn main() { await engine::search(); }\n",
+            )
+            .unwrap();
+            let line = source.lines().nth(6).unwrap();
+            let usage = format!("src/engine.wi:7:{}", line.find("= resp;").unwrap() + 3);
+            let selectors = ["engine::search::resp", "src/engine.wi:7:13", &usage];
+            for selector in selectors
+                .into_iter()
+                .take(if rename_selector == 0 { 3 } else { 0 })
+            {
+                let symbol = f.json(&["symbol", selector], 0);
+                assert_eq!(
+                    symbol["result"]["selected"]["selector"]
+                        .as_str()
+                        .unwrap()
+                        .split('@')
+                        .next()
+                        .unwrap(),
+                    "engine::search::resp",
+                    "{symbol}"
+                );
+                let result = f.json(&["type", selector], 0);
+                assert_eq!(result["result"]["type_display"], ty, "{result}");
+                let refs = f.json(&["refs", selector], 0);
+                assert_eq!(refs["result"]["total"], 2, "{refs}");
+            }
+            let preview = f.json(
+                &[
+                    "rename",
+                    selectors[rename_selector],
+                    "response",
+                    "--dry-run",
+                ],
+                0,
+            );
+            assert_eq!(preview["result"]["edits"], 3, "{preview}");
+            assert_eq!(
+                fs::read_to_string(f.0.join("src/engine.wi")).unwrap(),
+                source
+            );
+            let applied = f.json(&["rename", selectors[rename_selector], "response"], 0);
+            assert_eq!(applied["result"]["validation"], "passed");
+            assert_eq!(
+                fs::read_to_string(f.0.join("src/engine.wi")).unwrap(),
+                source.replace("resp", "response")
+            );
+        }
+    }
+}
+
+#[test]
+fn select_bindings_keep_sibling_outer_and_nested_scopes_separate() {
+    let f = Fixture::new();
+    let source = "fn main() {\n let ch = Channel<i64>::new();\n let resp = 1;\n select {\n  let resp = ch.recv() => { println(resp); select { let nested = ch.recv() => { println(nested); } default => {} } }\n  let resp = ch.recv() => { println(resp); }\n  let _ = ch.recv() => {}\n  ch.recv() => {}\n  ch.send(resp) => {}\n  default => {}\n }\n println(resp);\n}\n";
+    fs::write(f.0.join("src/main.wi"), source).unwrap();
+    let ambiguous = f.json(&["symbol", "main::main::resp"], 1);
+    assert_eq!(ambiguous["status"], "ambiguous");
+    assert_eq!(
+        ambiguous["result"]["candidates"].as_array().unwrap().len(),
+        3
+    );
+    for (line, count) in [(3, 2), (5, 1), (6, 1)] {
+        let selector = format!("src/main.wi:{line}:{}", if line == 3 { 6 } else { 7 });
+        let refs = f.json(&["refs", &selector], 0);
+        assert_eq!(refs["result"]["total"], count, "{refs}");
+    }
+    let nested = f.json(&["refs", "main::main::nested"], 0);
+    assert_eq!(nested["result"]["total"], 1);
+    let renamed = f.json(&["rename", "src/main.wi:5:7", "response"], 0);
+    assert_eq!(renamed["result"]["edits"], 2);
+    assert_eq!(
+        fs::read_to_string(f.0.join("src/main.wi")).unwrap(),
+        source.replacen(
+            "let resp = ch.recv() => { println(resp);",
+            "let response = ch.recv() => { println(response);",
+            1
+        )
+    );
+}
