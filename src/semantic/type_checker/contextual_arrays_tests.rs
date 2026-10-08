@@ -308,3 +308,214 @@ fn buildgraph_nested_empty_match_work_is_linear() {
         assert_eq!(EMPTY_ARRAY_REFINEMENTS.with(|count| count.get()), 2 * n + 1);
     }
 }
+
+#[test]
+fn freeze_inference_contexts() {
+    // Two constructors across ten independent expected-type call paths.
+    for (ty, value) in [
+        ("FrozenMap<String, i64>", "Map::new().freeze()"),
+        ("FrozenArray<i64>", "Array::new().freeze()"),
+    ] {
+        let cases = [
+            format!("fn f() {{ let xs: {ty} = {value}; }}"),
+            format!("fn f() -> {ty} {{ return {value}; }}"),
+            format!("fn g(xs: {ty}) {{}} fn f() {{ g({value}); }}"),
+            format!("class H {{ pub xs: {ty}; }} fn f() {{ let h = new H({value}); }}"),
+            format!("class H {{ pub static xs: {ty} = {value}; }}"),
+            format!("class H {{ pub xs: {ty}; pub fn set(self) {{ self.xs = {value}; }} }}"),
+            format!("fn f() {{ let mut xs: {ty} = {value}; xs = {value}; }}"),
+            format!("fn f(b: bool) -> {ty} {{ return b ? {value} : {value}; }}"),
+            format!(
+                "fn f(b: bool) -> {ty} {{ return match b {{ true => {value}, false => {value} }}; }}"
+            ),
+            format!("class H {{ pub fn g(self, xs: {ty}) {{}} }} fn f() {{ new H().g({value}); }}"),
+        ];
+        for (context, body) in cases.iter().enumerate() {
+            let errors = check_source(&format!(
+                "import std::collections::Map; import std::collections::Array; {body}"
+            ));
+            assert!(
+                !errors.iter().any(|d| d.severity == Severity::Error),
+                "{ty}/{context}: {errors:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn freeze_inference_preserves_errors() {
+    for body in [
+        "fn f() -> FrozenMap<String, i64> { return Map<i64, i64>::new().freeze(); }",
+        "fn f() -> FrozenMap<String, i64> { return Map<String, String>::new().freeze(); }",
+        "fn f() -> FrozenArray<String> { return Array<i64>::new().freeze(); }",
+        "fn f(xs: Array<i64>) -> FrozenArray<String> { return xs.freeze(); }",
+        "fn f(xs: Map<i64, i64>) -> FrozenMap<String, i64> { return xs.freeze(); }",
+        "fn f() -> FrozenArray<i64> { return [true].freeze(); }",
+        "fn f() -> FrozenMap<String, i64> { return Map::new().freeze(1); }",
+        "fn f() -> FrozenArray<i64> { return Array::new().freeze(1); }",
+        "fn f() -> FrozenArray<i64> { return Array::new(1).freeze(); }",
+        "fn f() -> FrozenArray<i64> { return Array<i64, bool>::new().freeze(); }",
+        "fn f() -> FrozenMap<String, i64> { return Map::new(1).freeze(); }",
+        "fn f() -> FrozenMap<String, i64> { return Map<i64>::new().freeze(); }",
+        "fn f() -> FrozenArray<i64> { return missing.freeze(); }",
+        "fn f() -> FrozenArray<i64> { return [1].freeze().freeze(); }",
+    ] {
+        let errors = check_source(&format!(
+            "import std::collections::Map; import std::collections::Array; {body}"
+        ));
+        assert!(
+            errors.iter().any(|d| d.severity == Severity::Error),
+            "{body}"
+        );
+        assert!(
+            errors.iter().all(|d| !d.message.contains("FrozenMap<void")
+                && !d.message.contains("FrozenArray<void")),
+            "{body}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn freeze_inference_unresolved_has_one_diagnostic() {
+    for value in [
+        "Map::new().freeze()",
+        "Array::new().freeze()",
+        "[].freeze()",
+    ] {
+        let errors = check_source(&format!(
+            "import std::collections::Map; import std::collections::Array; fn f() {{ let x: i64 = {value}; }}"
+        ));
+        let errors: Vec<_> = errors
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert_eq!(errors.len(), 1, "{value}: {errors:?}");
+        assert!(errors[0].message.contains("known"), "{errors:?}");
+    }
+}
+
+#[test]
+fn freeze_inference_nested_and_receiver_contexts() {
+    for body in [
+        "fn f(b: bool) -> FrozenMap<String, i64> { return (b ? Map::new() : Map::new()).freeze(); }",
+        "fn f(b: bool) -> FrozenArray<i64> { return (b ? Array::new() : []).freeze(); }",
+        "fn f(b: bool) -> FrozenMap<String, i64> { return (match b { true => Map::new(), false => Map::new() }).freeze(); }",
+        "fn f() -> FrozenArray<FrozenMap<String, i64>> { return [Map::new().freeze()].freeze(); }",
+        "fn f() -> FrozenArray<Array<i64>> { return [Array::new()].freeze(); }",
+        "fn f() -> FrozenArray<i64> { return [1, 2].freeze(); }",
+        "fn f() { let m = Map::new(); m.insert(1, true); let frozen = m.freeze(); }",
+        "class C { pub fn freeze(self) -> FrozenArray<i64> { return [1].freeze(); } } fn f() -> FrozenArray<i64> { return new C().freeze(); }",
+        "fn f() -> Array<i64> { return Array::new(); }",
+        "fn f() { let xs = Array<i64>::new(); xs.push(1); }",
+    ] {
+        let errors = check_source(&format!(
+            "import std::collections::Map; import std::collections::Array; {body}"
+        ));
+        assert!(
+            !errors.iter().any(|d| d.severity == Severity::Error),
+            "{body}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn freeze_inference_receiver_work_is_linear() {
+    use super::check_collections::ARRAY_ELEMENT_CHECKS;
+    for n in [8, 32, 128, 512] {
+        for (shape, expression, count) in [
+            ("wide", format!("[{}].freeze()", vec!["1"; n].join(",")), n),
+            (
+                "deep branches",
+                format!(
+                    "{}[1]{} .freeze()",
+                    "(true ? ".repeat(n),
+                    " : [1])".repeat(n)
+                ),
+                n + 1,
+            ),
+        ] {
+            ARRAY_ELEMENT_CHECKS.with(|c| c.set(0));
+            let errors = check_source(&format!(
+                "import std::collections::Array; fn f() -> FrozenArray<i64> {{ return {expression}; }}"
+            ));
+            assert!(
+                !errors.iter().any(|d| d.severity == Severity::Error),
+                "{errors:?}"
+            );
+            let actual = ARRAY_ELEMENT_CHECKS.with(|c| c.get());
+            assert_eq!(actual, count, "{shape}/{n}");
+            eprintln!("freeze receiver elements: {shape} n={n} count={actual}");
+        }
+    }
+}
+
+#[test]
+fn freeze_inference_records_call_targets_and_receiver_types() {
+    use crate::parser::iter::{AstEvent, AstWalk};
+    let source = "import std::collections::Array; import std::collections::Map; class C { pub fn freeze(self) -> FrozenArray<i64> { return [1].freeze(); } } fn f() -> FrozenArray<i64> { return new C().freeze(); } fn g() -> FrozenMap<String, i64> { return Map::new().freeze(); } fn h() -> FrozenArray<i64> { return Array::new().freeze(); }";
+    let (program, errors) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
+    assert!(errors.is_empty());
+    let mut checker = TypeChecker::new();
+    checker.capture_call_sites = true;
+    checker.check_program(&program);
+    assert!(
+        !checker.errors.iter().any(|d| d.severity == Severity::Error),
+        "{:?}",
+        checker.errors
+    );
+    let mut freezes = 0;
+    for item in &program.items {
+        if let Item::Function(f) = item {
+            for event in AstWalk::new(AstEvent::Block(&f.body)) {
+                if let AstEvent::Expr(Expr::MethodCall(call)) = event {
+                    freezes += 1;
+                    assert!(checker.analysis_calls[&call.id].is_some());
+                    let receiver = &checker.expr_types[&call.object.id()];
+                    assert!(!format!("{receiver:?}").contains("Void"));
+                }
+            }
+        }
+    }
+    assert_eq!(freezes, 3);
+    let sites = &checker.resolved_calls[&FunctionId::free_from_source_name("f")];
+    assert!(
+        sites
+            .targets
+            .contains(&FunctionId::method(TypeId::local("C"), "freeze"))
+    );
+}
+
+#[test]
+fn freeze_inference_deep_type_storage_is_explicit() {
+    use super::check_collections::ARRAY_ELEMENT_CHECKS;
+    for depth in [8, 16, 32, 64] {
+        let ty = format!("{}i64{}", "FrozenArray<".repeat(depth), ">".repeat(depth));
+        let value = format!("{}1{}", "[".repeat(depth), "].freeze()".repeat(depth));
+        let source =
+            format!("import std::collections::Array; fn f() -> {ty} {{ return {value}; }}");
+        let (program, parse) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(parse.is_empty());
+        ARRAY_ELEMENT_CHECKS.with(|c| c.set(0));
+        let mut checker = TypeChecker::new();
+        checker.check_program(&program);
+        assert!(
+            !checker.errors.iter().any(|d| d.severity == Severity::Error),
+            "{:?}",
+            checker.errors
+        );
+        assert_eq!(ARRAY_ELEMENT_CHECKS.with(|c| c.get()), depth);
+        let mut nodes = 0;
+        for mut ty in checker.expr_types.values() {
+            loop {
+                match ty {
+                    Type::Array(element) => ty = element,
+                    Type::Generic(name, args) if name == "FrozenArray" => ty = &args[0],
+                    _ => break,
+                }
+                nodes += 1;
+            }
+        }
+        assert_eq!(nodes, depth * (depth + 1));
+        eprintln!("nested freezes depth={depth} element_checks={depth} owned_type_nodes={nodes}");
+    }
+}

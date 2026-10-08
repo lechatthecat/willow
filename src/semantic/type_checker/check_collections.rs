@@ -230,6 +230,18 @@ impl TypeChecker {
                         .with_label(Label::primary(m.span, "unexpected arguments")),
                     );
                 }
+                if **elem == Type::Void {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            "cannot freeze array before its element type is known",
+                        )
+                        .with_label(Label::primary(m.span, "array needs type information"))
+                        .with_help("add an Array<T> or FrozenArray<T> annotation"),
+                    );
+                    return Some(Self::error_type());
+                }
                 Some(Type::Generic(
                     "FrozenArray".to_string(),
                     vec![(**elem).clone()],
@@ -485,6 +497,9 @@ impl TypeChecker {
                         )
                         .with_label(Label::primary(m.span, "unexpected arguments")),
                     );
+                }
+                if key_ty == Type::Void || val_ty == Type::Void {
+                    return Some(Self::error_type());
                 }
                 Some(B::FrozenMap.apply(vec![key_ty, val_ty]))
             }

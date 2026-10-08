@@ -1274,6 +1274,14 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
         Expr::MethodCall(m) => lower_method_call_expr(m, ctx),
         Expr::ObjectLiteral(o) => lower_object_literal_expr(o, ctx),
         Expr::StaticField(s) => lower_static_field_expr(s, ctx),
+        Expr::StaticCall(s)
+            if s.method == "new"
+                && s.args.is_empty()
+                && ctx.tables.static_call_class(&s.id, &s.class) == "Array"
+                && matches!(ctx.tables.expr_type(&s.id), Some(Type::Array(_))) =>
+        {
+            lower_array_literal_expr(expr, &[], s.span, ctx)
+        }
         Expr::StaticCall(s) => lower_static_call_expr(s, ctx),
         Expr::Range(r) => lower_range_expr(r, ctx),
         Expr::Select(select) => lower_select_expr(select, ctx),

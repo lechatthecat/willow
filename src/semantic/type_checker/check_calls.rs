@@ -232,6 +232,26 @@ impl TypeChecker {
         if let (Expr::ArrayLiteral(elements, _, _), Type::Array(elem)) = (expr, expected) {
             return self.check_array_literal_expecting(elements, Some(elem));
         }
+        // Freeze preserves type arguments while changing collection mutability.
+        // Check the receiver once with that context; ordinary values and explicit
+        // constructor arguments retain their actual types in the normal checker.
+        if let Expr::MethodCall(call) = expr
+            && call.method == "freeze"
+        {
+            use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
+            let receiver = if let Some(element) = builtin_types::unary_arg(expected, B::FrozenArray)
+            {
+                Some(Type::Array(Box::new(element.clone())))
+            } else {
+                builtin_types::binary_args(expected, B::FrozenMap)
+                    .map(|(key, value)| B::Map.apply(vec![key.clone(), value.clone()]))
+            };
+            if let Some(receiver) = receiver {
+                let generation = self.error_generation;
+                let ty = self.check_method_call_expecting(call, Some(&receiver));
+                return self.record_checked_expr(expr, ty, generation);
+            }
+        }
         // Contextually-typed lambda.
         if let (Expr::Lambda(lambda), Type::Fn(..) | Type::Closure(..)) = (expr, expected) {
             return self.check_lambda_expecting(lambda, expected);
@@ -283,6 +303,14 @@ impl TypeChecker {
             }
         }
         let actual = self.check_expr(expr);
+        if let Expr::StaticCall(call) = expr
+            && call.type_args.is_empty()
+            && call.method == "new"
+            && matches!(&actual, Type::Array(element) if **element == Type::Void)
+            && matches!(expected, Type::Array(_))
+        {
+            return expected.clone();
+        }
         // Resolve only constructors whose omitted arguments are placeholders.
         // Ordinary values and explicitly typed calls must keep their own type.
         if let Expr::StaticCall(call) = expr

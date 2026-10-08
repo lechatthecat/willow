@@ -1,0 +1,28 @@
+import std::collections::Array;
+import std::collections::Map;
+
+fn map_size(values: FrozenMap<String, i64>) -> i64 { return values.len(); }
+fn array_size(values: FrozenArray<i64>) -> i64 { return values.len(); }
+fn make_map() -> FrozenMap<String, i64> { return Map::new().freeze(); }
+fn make_array() -> FrozenArray<i64> { return Array::new().freeze(); }
+
+fn main() {
+    println(map_size(Map::new().freeze()));
+    println(array_size(Array::new().freeze()));
+    println(map_size(make_map()));
+    println(array_size(make_array()));
+    let values = Array<i64>::new();
+    values.push(7);
+    let frozen = values.freeze();
+    values.push(9);
+    println(frozen.len());
+    println(frozen[0]);
+    let counts = Map::new();
+    counts.insert("answer", 42);
+    let snapshot = counts.freeze();
+    counts.insert("answer", 99);
+    println(snapshot.get("answer").unwrap());
+    println(array_size((true ? Array::new() : []).freeze()));
+    let nested: FrozenArray<FrozenMap<String, i64>> = [Map::new().freeze()].freeze();
+    println(nested[0].len());
+}

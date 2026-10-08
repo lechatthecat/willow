@@ -2012,6 +2012,10 @@ impl TypeChecker {
     pub(super) fn check_expr(&mut self, expr: &Expr) -> Type {
         let generation = self.error_generation;
         let ty = self.check_expr_inner(expr);
+        self.record_checked_expr(expr, ty, generation)
+    }
+
+    pub(super) fn record_checked_expr(&mut self, expr: &Expr, ty: Type, generation: usize) -> Type {
         let ty = if ty == Type::Void && self.error_generation != generation {
             Self::error_type()
         } else {
@@ -2436,45 +2440,7 @@ impl TypeChecker {
                 let obj_ty = self.check_expr(obj);
                 self.resolve_field(&obj_ty, field_name, *span, true, "read")
             }
-            Expr::MethodCall(m) => {
-                // `.` is instance member access; module items use `::`. Using
-                // `math.add(..)` on a module is an error that points at `::`.
-                if let Expr::Var(name, _, _) = &m.object
-                    && self.symbols.lookup_var(name).is_none()
-                    && self.symbols.lookup_module(name).is_some()
-                {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0350,
-                            format!("`{name}` is a module; use `::` to access its items"),
-                        )
-                        .with_label(Label::primary(m.span, "module accessed with `.`"))
-                        .with_help(format!(
-                            "write `{name}::{method}(...)` instead of `{name}.{method}(...)`",
-                            method = m.method
-                        )),
-                    );
-                    return Type::Void;
-                }
-                if let Expr::Var(_, super_span, _) = &m.object
-                    && self.is_super_receiver(&m.object)
-                {
-                    return self.check_super_method_call(m, *super_span);
-                }
-                let obj_ty = self.check_expr(&m.object);
-                if Self::is_error_type(&obj_ty) {
-                    for arg in &m.args {
-                        self.check_expr(&arg.expr);
-                    }
-                    return Self::error_type();
-                }
-                let references = self.analysis_symbols.references.len();
-                let errors = self.error_generation;
-                let result = self.check_receiver_method_call(&obj_ty, m);
-                self.record_builtin_method_use(m, references, errors);
-                result
-            }
+            Expr::MethodCall(m) => self.check_method_call_expecting(m, None),
             Expr::StaticCall(s)
                 if s.is_bare_member()
                     && self
@@ -2795,6 +2761,53 @@ impl TypeChecker {
         }
 
         range_type()
+    }
+
+    pub(super) fn check_method_call_expecting(
+        &mut self,
+        m: &MethodCallExpr,
+        expected_receiver: Option<&Type>,
+    ) -> Type {
+        // `.` is instance member access; module items use `::`. Using
+        // `math.add(..)` on a module is an error that points at `::`.
+        if let Expr::Var(name, _, _) = &m.object
+            && self.symbols.lookup_var(name).is_none()
+            && self.symbols.lookup_module(name).is_some()
+        {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0350,
+                    format!("`{name}` is a module; use `::` to access its items"),
+                )
+                .with_label(Label::primary(m.span, "module accessed with `.`"))
+                .with_help(format!(
+                    "write `{name}::{method}(...)` instead of `{name}.{method}(...)`",
+                    method = m.method
+                )),
+            );
+            return Type::Void;
+        }
+        if let Expr::Var(_, super_span, _) = &m.object
+            && self.is_super_receiver(&m.object)
+        {
+            return self.check_super_method_call(m, *super_span);
+        }
+        let obj_ty = match expected_receiver {
+            Some(expected) => self.check_expr_expecting(&m.object, expected),
+            None => self.check_expr(&m.object),
+        };
+        if Self::is_error_type(&obj_ty) {
+            for arg in &m.args {
+                self.check_expr(&arg.expr);
+            }
+            return Self::error_type();
+        }
+        let references = self.analysis_symbols.references.len();
+        let errors = self.error_generation;
+        let result = self.check_receiver_method_call(&obj_ty, m);
+        self.record_builtin_method_use(m, references, errors);
+        result
     }
 
     /// Member calls on an already-checked, non-error receiver.

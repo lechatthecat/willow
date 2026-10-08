@@ -1659,6 +1659,26 @@ impl TypeChecker {
             .collect::<Vec<_>>();
         let type_args = type_args.as_slice();
 
+        // Array::new is the constructor spelling of the empty array literal.
+        if class_name == "Array" && method_name == "new" {
+            self.check_collection_type_imported("Array", span);
+            if !args.is_empty() || type_args.len() > 1 {
+                for arg in args {
+                    self.check_expr(&arg.expr);
+                }
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        "`Array::new` expects no arguments and at most 1 type argument",
+                    )
+                    .with_label(Label::primary(span, "invalid array constructor")),
+                );
+                return Self::error_type();
+            }
+            return Type::Array(Box::new(type_args.first().cloned().unwrap_or(Type::Void)));
+        }
+
         // Built-in `Map<K, V>` constructor. The type parameters are resolved
         // from the binding's annotation (Map<Void, Void> is a placeholder, like
         // an empty array literal).

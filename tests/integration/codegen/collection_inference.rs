@@ -155,3 +155,40 @@ fn contextual_empty_array_allocation_sites_scale_linearly() {
         println!("sites={sites} literal_allocations={allocations}");
     }
 }
+
+#[test]
+fn freeze_inference_native() {
+    let source = include_str!("../../../example/freeze_inference.wi");
+    for source in [
+        source.to_string(),
+        source.replace("fn main()", "async fn main()"),
+    ] {
+        for run in [compile_and_run, compile_and_run_release] {
+            let (out, ok) = run(&source);
+            assert!(ok, "{out}");
+            assert_eq!(out, "0\n0\n0\n0\n1\n7\n42\n0\n0\n");
+        }
+    }
+}
+
+#[test]
+fn freeze_inference_allocation_sites_scale_linearly() {
+    for n in [1, 8, 32, 128] {
+        let mut source = String::from(
+            "import std::collections::Array; import std::collections::Map; fn a(xs: FrozenArray<i64>) { println(xs.len()); } fn m(xs: FrozenMap<String, i64>) { println(xs.len()); } fn main() {",
+        );
+        source.push_str(&"a(Array::new().freeze()); m(Map::new().freeze());".repeat(n));
+        source.push('}');
+        let names = compile_and_collect_relocation_targets_all(&source, &[]);
+        for symbol in [
+            "willow_array_new",
+            "willow_array_copy",
+            "willow_map_new",
+            "willow_map_copy",
+        ] {
+            let count = names.iter().filter(|name| *name == symbol).count();
+            assert_eq!(count, n, "{symbol}/{n}");
+            println!("freeze sites={n} {symbol}={count}");
+        }
+    }
+}
