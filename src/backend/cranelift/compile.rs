@@ -1181,7 +1181,7 @@ impl UnitCodegenContext<'_> {
             let id = self
                 .output
                 .module
-                .declare_function(symbol.name, Linkage::Import, &sig)?;
+                .declare_runtime_function(symbol.name, &sig)?;
             self.func_ids.insert(symbol.name, id);
         }
         self.output.runtime_declared = true;

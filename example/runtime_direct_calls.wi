@@ -1,0 +1,16 @@
+// Runtime-call-heavy collection/string/allocation fixture.
+import std::collections::Array;
+fn main() {
+    let values: Array<i64> = [];
+    let mut i = 0;
+    let mut checksum = 0;
+    while i < 10000 {
+        values.push(i);
+        checksum = checksum + i.toString().len();
+        i = i + 1;
+    }
+    println(checksum);
+    println(values.len());
+    println(values.pop());
+    println("runtime direct calls");
+}

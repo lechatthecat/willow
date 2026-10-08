@@ -6,7 +6,10 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
-use cranelift_object::{ObjectBuilder, ObjectModule};
+use cranelift_object::ObjectBuilder;
+mod runtime_module;
+use runtime_module::RuntimeObjectModule as ObjectModule;
+pub use runtime_module::supports_direct_runtime_calls;
 use std::collections::{HashMap, HashSet};
 
 use crate::backend::abi;
@@ -370,7 +373,9 @@ impl Codegen {
         }
         let obj_builder =
             ObjectBuilder::new(isa, "willow", cranelift_module::default_libcall_names())?;
-        let mut module = ObjectModule::new(obj_builder);
+        // An explicit runtime path may name a dynamic library/import library.
+        // Only the built-in static-runtime link model promises direct calls.
+        let mut module = ObjectModule::new(obj_builder, opts.target.runtime_lib.is_none());
         let gc_tlab_state =
             module.declare_data("__willow_gc_tlab_state", Linkage::Local, true, true)?;
         let mut tlab_data = DataDescription::new();

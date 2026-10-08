@@ -560,53 +560,187 @@ fn test_link_discards_unused_function_sections() {
     remove_output_artifacts(&binary);
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// Relocation emitted by the unmodified native ObjectModule import policy.
+fn ordinary_import_relocation_flags() -> Vec<object::RelocationFlags> {
+    use cranelift_codegen::{
+        ir::{InstBuilder, UserFuncName},
+        settings::{self, Configurable},
+    };
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use cranelift_module::{Linkage, Module};
+    use cranelift_object::{ObjectBuilder, ObjectModule};
+    use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
+    let mut flags = settings::builder();
+    if cfg!(target_vendor = "apple") {
+        flags.set("is_pic", "true").unwrap();
+    }
+    let isa = cranelift_native::builder()
+        .unwrap()
+        .finish(settings::Flags::new(flags))
+        .unwrap();
+    let mut module = ObjectModule::new(
+        ObjectBuilder::new(
+            isa,
+            "ordinary_import",
+            cranelift_module::default_libcall_names(),
+        )
+        .unwrap(),
+    );
+    let signature = module.make_signature();
+    let import = module
+        .declare_function("fallback_probe", Linkage::Import, &signature)
+        .unwrap();
+    let caller = module
+        .declare_function("caller", Linkage::Export, &signature)
+        .unwrap();
+    let mut context = module.make_context();
+    context.func.signature = signature;
+    context.func.name = UserFuncName::user(0, caller.as_u32());
+    let reference = module.declare_func_in_func(import, &mut context.func);
+    let mut builder_context = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+    let block = builder.create_block();
+    builder.switch_to_block(block);
+    builder.ins().call(reference, &[]);
+    builder.ins().return_(&[]);
+    builder.seal_all_blocks();
+    builder.finalize(module.target_config());
+    module.define_function(caller, &mut context).unwrap();
+    let bytes = module.finish().emit().unwrap();
+    let file = object::File::parse(bytes.as_slice()).unwrap();
+    let relocations: Vec<_> = file
+        .sections()
+        .flat_map(|section| section.relocations())
+        .filter_map(|(_, relocation)| {
+            if let RelocationTarget::Symbol(index) = relocation.target()
+                && file
+                    .symbol_by_index(index)
+                    .unwrap()
+                    .name()
+                    .unwrap()
+                    .trim_start_matches('_')
+                    == "fallback_probe"
+            {
+                Some(relocation.flags())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(!relocations.is_empty());
+    relocations
+}
+
 #[test]
-fn test_runtime_calls_preserve_native_import_relocations() {
+fn test_runtime_calls_follow_native_import_policy() {
     use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
     let id = unique_test_id();
+    let target_direct = willow_compiler::backend::cranelift::supports_direct_runtime_calls(
+        &target_lexicon::Triple::host(),
+    );
+    // Use Cranelift's ordinary import lowering as the fallback oracle instead
+    // of assuming that non-colocated calls have one encoding on every ISA.
+    let fallback_flags = ordinary_import_relocation_flags();
     let source = temp_path(format!("willow_import_runtime_{id}.wi"));
     let binary = temp_path(format!("willow_import_runtime_{id}"));
     fs::write(&source, "fn main() { println(42); }").unwrap();
     for mode in ["--debug", "--release"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
-            .args(["build", &source, "-o", &binary, mode])
-            .env("WILLOW_KEEP_OBJECT", "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let bytes = fs::read(object_path(&binary)).unwrap();
-        let file = object::File::parse(bytes.as_slice()).unwrap();
-        let mut calls = 0;
-        for section in file.sections() {
-            for (_, relocation) in section.relocations() {
-                if let RelocationTarget::Symbol(index) = relocation.target()
-                    && file.symbol_by_index(index).unwrap().name().unwrap() == "willow_println_i64"
-                {
-                    assert!(file.symbol_by_index(index).unwrap().is_undefined());
-                    // Non-PIC x86_64 imports use the standard ObjectModule far
-                    // call policy, without promising a nearby definition.
-                    assert_eq!(
-                        relocation.flags(),
-                        object::RelocationFlags::Elf {
-                            r_type: object::elf::R_X86_64_64,
+        for explicit_runtime in [false, true] {
+            let direct = target_direct && !explicit_runtime;
+            let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
+            command.args(["build", &source, "-o", &binary, mode]);
+            // RuntimeStaticlib holds the build lock. Only retain that guard
+            // when the subprocess bypasses automatic runtime resolution.
+            let runtime = explicit_runtime.then(|| build_runtime_staticlib(mode == "--release"));
+            if let Some(runtime) = &runtime {
+                command.arg("--runtime-lib").arg(&**runtime);
+            }
+            let output = command
+                .env_remove("WILLOW_RUNTIME_LIB")
+                .env("WILLOW_KEEP_OBJECT", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let bytes = fs::read(object_path(&binary)).unwrap();
+            let file = object::File::parse(bytes.as_slice()).unwrap();
+            let mut calls = 0;
+            let mut actual_fallback = Vec::new();
+            for section in file.sections() {
+                for (_, relocation) in section.relocations() {
+                    if let RelocationTarget::Symbol(index) = relocation.target()
+                        && file
+                            .symbol_by_index(index)
+                            .unwrap()
+                            .name()
+                            .unwrap()
+                            .trim_start_matches('_')
+                            == "willow_println_i64"
+                    {
+                        assert!(file.symbol_by_index(index).unwrap().is_undefined());
+                        // Static runtime calls use signed PC-relative relocations,
+                        // while retaining undefined/import symbol linkage.
+                        if !direct {
+                            actual_fallback.push(relocation.flags());
+                            calls += 1;
+                            continue;
                         }
-                    );
-                    calls += 1;
+                        let expected = match (file.format(), file.architecture()) {
+                            (object::BinaryFormat::Elf, object::Architecture::X86_64) => {
+                                object::RelocationFlags::Elf {
+                                    r_type: object::elf::R_X86_64_PLT32,
+                                }
+                            }
+                            (object::BinaryFormat::Elf, object::Architecture::Aarch64) => {
+                                object::RelocationFlags::Elf {
+                                    r_type: object::elf::R_AARCH64_CALL26,
+                                }
+                            }
+                            (object::BinaryFormat::Coff, object::Architecture::X86_64) => {
+                                object::RelocationFlags::Coff {
+                                    typ: object::pe::IMAGE_REL_AMD64_REL32,
+                                }
+                            }
+                            (object::BinaryFormat::Coff, object::Architecture::Aarch64) => {
+                                object::RelocationFlags::Coff {
+                                    typ: object::pe::IMAGE_REL_ARM64_BRANCH26,
+                                }
+                            }
+                            (object::BinaryFormat::MachO, object::Architecture::X86_64) => {
+                                object::RelocationFlags::MachO {
+                                    r_type: object::macho::X86_64_RELOC_BRANCH,
+                                    r_pcrel: true,
+                                    r_length: 2,
+                                }
+                            }
+                            (object::BinaryFormat::MachO, object::Architecture::Aarch64) => {
+                                object::RelocationFlags::MachO {
+                                    r_type: object::macho::ARM64_RELOC_BRANCH26,
+                                    r_pcrel: true,
+                                    r_length: 2,
+                                }
+                            }
+                            target => panic!("unsupported native test target: {target:?}"),
+                        };
+                        assert_eq!(relocation.flags(), expected);
+                        calls += 1;
+                    }
                 }
             }
+            assert!(
+                calls > 0,
+                "expected an imported print runtime helper reference"
+            );
+            if !direct {
+                assert_eq!(actual_fallback, fallback_flags);
+            }
+            let output = Command::new(&binary).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"42\n");
         }
-        assert!(
-            calls > 0,
-            "expected an imported print runtime helper reference"
-        );
-        let output = Command::new(&binary).output().unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"42\n");
     }
     let _ = fs::remove_file(source);
     let _ = fs::remove_file(object_path(&binary));
@@ -1349,4 +1483,18 @@ fn abi_handshake_example_runs() {
     let (output, ok) = compile_file_and_run("example/abi_handshake.wi");
     assert!(ok, "{output}");
     assert_eq!(output, "42\n");
+}
+
+#[test]
+fn test_runtime_direct_call_operations() {
+    let source = include_str!("../../example/runtime_direct_calls.wi").replace("10000", "100");
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (output, success) = run(&source);
+        assert!(success, "{output}");
+        assert_eq!(output, "190\n100\n99\nruntime direct calls\n");
+    }
 }

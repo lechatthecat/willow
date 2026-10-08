@@ -965,10 +965,11 @@ impl FuncGen<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::runtime_module::RuntimeObjectModule as ObjectModule;
     use crate::CompilerOptions;
     use crate::backend::Codegen;
     use cranelift_codegen::settings::{self, Configurable};
-    use cranelift_object::{ObjectBuilder, ObjectModule};
+    use cranelift_object::ObjectBuilder;
 
     #[test]
     fn pow_f64_helpers_compile_for_supported_host_arch_targets() {
@@ -1001,6 +1002,7 @@ mod tests {
                         cranelift_module::default_libcall_names(),
                     )
                     .unwrap(),
+                    true,
                 );
                 let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
                 codegen.output.module = module;
