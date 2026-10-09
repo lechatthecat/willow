@@ -750,6 +750,11 @@ impl Parser {
                 "assignable targets are variables, fields (`obj.field`), indexes (`arr[i]`), and static properties (`Class::prop`)",
             ));
         }
+        if self.match_arm_block_depth == Some(self.brace_depth) && self.check(TokenKind::RBrace) {
+            return Err(self
+                .err_at(ErrorCode::E0101, "block arms cannot yield a value", expr.span())
+                .with_help("use a helper function or an if-expression to produce a value; add `;` if this is only a statement"));
+        }
         self.expect(TokenKind::Semicolon)?;
         Ok(Stmt::Expr(ExprStmt { expr, span }))
     }
@@ -857,7 +862,7 @@ impl Parser {
     }
 }
 
-fn compound_assignment_op(token: &TokenKind) -> Option<BinOp> {
+pub(super) fn compound_assignment_op(token: &TokenKind) -> Option<BinOp> {
     Some(match token {
         TokenKind::PlusEq => BinOp::Add,
         TokenKind::MinusEq => BinOp::Sub,

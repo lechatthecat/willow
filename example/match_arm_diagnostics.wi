@@ -1,0 +1,21 @@
+// Statement arms use blocks; value arms use a helper or an if-expression.
+fn value() -> i64 {
+    let y = 7;
+    return y;
+}
+
+fn main() {
+    let mut n = 0;
+    while true {
+        match n {
+            0 => { n += 1; continue; },
+            1 => { n += 2; },
+            _ => { break; },
+        }
+    }
+    println(n);
+    let from_helper = match true { true => value(), false => 0 };
+    let from_if = match true { true => if n == 3 { 9 } else { 0 }, false => 0 };
+    println(from_helper);
+    println(from_if);
+}

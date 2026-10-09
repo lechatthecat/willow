@@ -1154,3 +1154,43 @@ fn ticket_42_enum_alias_checks_have_no_unused_warning() {
         assert!(!stderr.contains("W2003"), "{stderr}");
     }
 }
+
+#[test]
+fn match_arm_actionable_diagnostics() {
+    for (body, message, help) in [
+        (
+            "break",
+            "`break` in a match arm requires a block",
+            "{ break; }",
+        ),
+        (
+            "continue",
+            "`continue` in a match arm requires a block",
+            "{ continue; }",
+        ),
+        (
+            "n += 1",
+            "assignment in a match arm requires a block",
+            "{ n += v; }",
+        ),
+        (
+            "{ let y = 1; y }",
+            "block arms cannot yield a value",
+            "helper function or an if-expression",
+        ),
+    ] {
+        let source =
+            format!("fn main() {{ let mut n = 0; while true {{ match true {{ _ => {body} }} }} }}");
+        let stderr = compile_error_stderr(&source);
+        assert!(stderr.contains(message), "{stderr}");
+        assert!(stderr.contains(help), "{stderr}");
+        assert!(!stderr.contains("rename it"), "{stderr}");
+    }
+}
+
+#[test]
+fn match_arm_diagnostic_workarounds_run() {
+    let (out, ok) = compile_and_run(include_str!("../../example/match_arm_diagnostics.wi"));
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n7\n9\n");
+}

@@ -1182,8 +1182,10 @@ impl Parser {
             };
             self.expect(TokenKind::FatArrow)?;
             let body = if matches!(self.peek_kind(), TokenKind::LBrace) {
-                let block = self.parse_block()?;
-                MatchBody::Block(block)
+                let saved = self.match_arm_block_depth.replace(self.brace_depth + 1);
+                let result = self.parse_block();
+                self.match_arm_block_depth = saved;
+                MatchBody::Block(result?)
             } else if matches!(self.peek_kind(), TokenKind::Return) {
                 // `Pattern => return [expr]` — sugar for a single-statement
                 // block arm, so match works in statement position with early
@@ -1205,8 +1207,29 @@ impl Parser {
                     })],
                     span: block_span,
                 })
+            } else if matches!(self.peek_kind(), TokenKind::Break | TokenKind::Continue) {
+                let keyword = self.peek_kind().keyword_name().unwrap();
+                return Err(self
+                    .err_at(
+                        ErrorCode::E0102,
+                        format!("`{keyword}` in a match arm requires a block"),
+                        self.current_span(),
+                    )
+                    .with_help(format!("use a block: `{{ {keyword}; }}`")));
             } else {
                 let expr = self.parse_expr()?;
+                if matches!(self.peek_kind(), TokenKind::Eq)
+                    || super::stmt::compound_assignment_op(self.peek_kind()).is_some()
+                    || self.shift_assign_op().is_some()
+                {
+                    return Err(self
+                        .err_at(
+                            ErrorCode::E0102,
+                            "assignment in a match arm requires a block",
+                            self.current_span(),
+                        )
+                        .with_help("use a block, for example `{ n += v; }` or `{ n = v; }`"));
+                }
                 MatchBody::Expr(Box::new(expr))
             };
             let arm_end = self.current_span();

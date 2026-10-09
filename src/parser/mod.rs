@@ -23,6 +23,8 @@ pub struct Parser {
     pos: usize,
     /// Consumed brace balance, so recovery never rescans a failed prefix.
     brace_depth: usize,
+    /// Only direct expression statements in this match-arm block get tail-value help.
+    match_arm_block_depth: Option<usize>,
     /// The current immutable `GtEq` has contributed its `>` to a type.
     /// Only its `=` remains at the cursor; advancing clears this state.
     pending_type_eq: bool,
@@ -101,6 +103,7 @@ impl Parser {
             tokens,
             pos: 0,
             brace_depth: 0,
+            match_arm_block_depth: None,
             pending_type_eq: false,
             last_span: None,
             allow_object_literals: true,
@@ -3414,3 +3417,6 @@ mod generic_interface_extends_tests;
 
 #[cfg(test)]
 mod if_expression_tests;
+
+#[cfg(test)]
+mod match_arm_diagnostic_tests;
