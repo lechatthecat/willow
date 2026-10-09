@@ -220,18 +220,11 @@ mod tests {
     }
 
     #[test]
-    fn frozen_iteration_has_actionable_help_and_no_cascades() {
+    fn frozen_iteration_object_elements_have_no_cascades() {
         let errors = check(
             "class Cell { pub n: i64; pub init(self) { self.n = 1; } } fn main() { let edits = [new Cell()].freeze(); for e in edits { println(e.n); } }",
         );
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(
-            errors[0]
-                .helps
-                .iter()
-                .any(|help| help.contains("0..") && help.contains("[i]")),
-            "{errors:?}"
-        );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
@@ -272,7 +265,6 @@ mod tests {
     #[test]
     fn invalid_iteration_keeps_independent_errors() {
         for (ty, help) in [
-            ("FrozenArray<i64>", "values[i]"),
             ("FrozenMap<i64, i64>", "values.get(key)"),
             ("i64", "Array<T>"),
         ] {
@@ -293,6 +285,34 @@ mod tests {
                 );
                 assert!(errors[1].message.contains("missing"), "{errors:?}");
             }
+        }
+    }
+
+    #[test]
+    fn frozen_iteration_map_policy_and_immutability() {
+        for ty in ["Map<i64, i64>", "FrozenMap<i64, i64>"] {
+            for expr in ["values", "holder.values"] {
+                let source = format!(
+                    "class Holder {{ pub values: {ty}; }} fn visit(values: {ty}, holder: Holder) {{ for item in {expr} {{}} }} fn main() {{}}"
+                );
+                let source = if ty.starts_with("Map<") {
+                    format!("import std::collections::Map; {source}")
+                } else {
+                    source
+                };
+                let errors = check(&source);
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert!(errors[0].message.contains("cannot iterate"));
+                assert!(errors[0].helps[0].contains("keep keys in an array"));
+                assert!(!errors[0].helps[0].contains("bind"));
+            }
+        }
+        for body in ["x = 2;", "values.push(2);", "values[0] = 2;"] {
+            let errors = check(&format!(
+                "fn visit(values: FrozenArray<i64>) {{ for x in values {{ {body} }} }} fn main() {{}}"
+            ));
+            assert!(!errors.is_empty(), "{body}");
+            assert!(!errors.iter().any(|e| e.message.contains("cannot iterate")));
         }
     }
 

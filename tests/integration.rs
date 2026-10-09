@@ -298,3 +298,6 @@ mod tuples;
 
 #[path = "integration/if_expressions.rs"]
 mod if_expressions;
+
+#[path = "integration/frozen_iteration.rs"]
+mod frozen_iteration;

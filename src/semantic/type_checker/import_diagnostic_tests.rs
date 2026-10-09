@@ -158,19 +158,13 @@ fn ticket_42_unused_imports() {
 }
 
 #[test]
-fn ticket_42_frozen_help_uses_source_names() {
+fn ticket_62_frozen_iteration_accepts_source_names() {
     for name in ["samples", "pixels", "entries"] {
         let source = format!(
             "fn visit({name}: FrozenArray<i64>) {{ for pixel in {name} {{}} }} fn main() {{}}"
         );
         let errors = diagnostics(&source);
-        let error = errors
-            .iter()
-            .find(|d| d.message.contains("cannot iterate"))
-            .unwrap();
-        assert!(error.helps[0].contains(&format!("{name}.len()")));
-        assert!(error.helps[0].contains("pixel"));
-        assert!(!error.helps[0].contains("values"));
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }
 

@@ -1,0 +1,38 @@
+// Direct frozen iteration: fields, self, returned temporaries and async roots.
+class Shelf {
+    pub values: FrozenArray<i64>;
+    pub init(self) { self.values = [1, 2, 3].freeze(); }
+    pub fn sum(self) -> i64 {
+        let mut total = 0;
+        for value in self.values { total += value; }
+        return total;
+    }
+}
+fn make() -> FrozenArray<i64> {
+    println("made");
+    return [4, 5].freeze();
+}
+fn first(values: FrozenArray<i64>) -> i64 {
+    for value in values { return value; }
+    return 0;
+}
+async fn total(values: FrozenArray<i64>) -> i64 {
+    let mut sum = 0;
+    for value in values { await sleep(1); sum += value; }
+    return sum;
+}
+async fn main() {
+    let shelf = new Shelf();
+    for value in shelf.values { println(value); }
+    println(shelf.sum());
+    for value in make() { println(value); }
+    println(first(shelf.values));
+    // The temporary frozen array is the sole owner of these objects.
+    for item in [new Shelf(), new Shelf()].freeze() {
+        await sleep(1);
+        println(item.values[1]);
+        break;
+    }
+    for item in [new Shelf()].freeze() { println(item.values[2]); }
+    println(await total(shelf.values));
+}

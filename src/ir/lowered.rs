@@ -4553,7 +4553,14 @@ impl Builder {
                 element_binding = i64_var(&i_name);
             }
             // for x in arr  →  a = arr; i = 0; while i < a.len() { x = a[i]; .. }
-            (_, Type::Array(elem)) => {
+            (_, ty)
+                if matches!(ty, Type::Array(_))
+                    || builtin_types::unary_arg(ty, B::FrozenArray).is_some() =>
+            {
+                let elem = match ty {
+                    Type::Array(elem) => elem.as_ref(),
+                    _ => builtin_types::unary_arg(ty, B::FrozenArray).unwrap(),
+                };
                 let arr_name = format!("__for{n}_arr");
                 let arr_var = HirExpr {
                     kind: HirExprKind::Var(arr_name.clone()),
@@ -4588,7 +4595,7 @@ impl Builder {
                         array: Box::new(arr_var),
                         index: Box::new(i64_var(&i_name)),
                     },
-                    ty: (**elem).clone(),
+                    ty: elem.clone(),
                     span,
                 };
             }
@@ -5297,6 +5304,36 @@ mod tests {
             .iter()
             .find(|f| f.name.to_string() == name)
             .unwrap_or_else(|| panic!("no function {name}"))
+    }
+
+    #[test]
+    fn frozen_iteration_lowering_scales_with_loop_count() {
+        // Compare identical mutable/frozen bodies: no unrolling, copying, or
+        // extra cleanup graph is introduced for an immutable handle.
+        for count in [1, 8, 16, 32] {
+            let body =
+                "for x in values { if x == 1 { continue; } if x == 2 { break; } println(x); }"
+                    .repeat(count);
+            let mut shapes = Vec::new();
+            for ty in ["Array<i64>", "FrozenArray<i64>"] {
+                let program = lir(&format!("fn visit(values: {ty}) {{ {body} }}"));
+                let f = func(&program, "visit");
+                let shape = (
+                    f.blocks.len(),
+                    f.blocks.iter().map(|b| b.instrs.len()).sum::<usize>(),
+                    f.locals.len(),
+                );
+                eprintln!(
+                    "frozen iteration loops={count} type={ty} blocks={} instructions={} locals={}",
+                    shape.0, shape.1, shape.2
+                );
+                shapes.push(shape);
+            }
+            assert_eq!(shapes[0], shapes[1]);
+            // Fixed overhead plus constant work per source loop, including
+            // adverse multiple exits. Counts are deterministic, not timings.
+            assert_eq!(shapes[1], (8 * count + 1, 18 * count, 14 * count + 1));
+        }
     }
 
     fn scope_clear_entries(function: &SourceFunction) -> usize {

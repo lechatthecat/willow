@@ -3613,6 +3613,9 @@ fn supported_body_stmt<'n>(
         } => {
             let element = match &iterable.ty {
                 Type::Array(element) => Some(element.as_ref()),
+                ty if builtin_types::unary_arg(ty, B::FrozenArray).is_some() => {
+                    builtin_types::unary_arg(ty, B::FrozenArray)
+                }
                 ty if range_i64(ty) => Some(&Type::I64),
                 _ => None,
             };

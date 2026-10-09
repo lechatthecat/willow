@@ -1145,6 +1145,11 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             let iterable = lower_expr(&s.iterable, ctx)?;
             let element_ty = match &iterable.ty {
                 Type::Array(inner) => (**inner).clone(),
+                ty if builtin_types::unary_arg(ty, B::FrozenArray).is_some() => {
+                    builtin_types::unary_arg(ty, B::FrozenArray)
+                        .unwrap()
+                        .clone()
+                }
                 // An i64 range yields i64 elements.
                 Type::Generic(name, args)
                     if name.name().as_ref() == "Range" && args.first() == Some(&Type::I64) =>

@@ -1635,6 +1635,11 @@ impl TypeChecker {
                 let elem_ty = match &iterable_ty {
                     ty if Self::is_error_type(ty) => Self::error_type(),
                     Type::Array(elem) => (**elem).clone(),
+                    ty if builtin_types::unary_arg(ty, B::FrozenArray).is_some() => {
+                        builtin_types::unary_arg(ty, B::FrozenArray)
+                            .unwrap()
+                            .clone()
+                    }
                     Type::Generic(name, args)
                         if name == "Range" && args.as_slice() == [Type::I64] =>
                     {
@@ -1647,23 +1652,15 @@ impl TypeChecker {
                             _ => None,
                         };
                         let help = match builtin_types::resolve(other).map(|ty| ty.id) {
-                            Some(B::FrozenArray) => {
+                            Some(B::Map | B::FrozenMap) => {
                                 if let Some(name) = iterable_name {
-                                    let index = ["i", "index", "index_"].into_iter().find(|index| *index != name && *index != s.name).unwrap();
-                                    format!("use an index loop: `for {index} in 0..{name}.len() {{ let {} = {name}[{index}]; ... }}`", s.name)
+                                    format!("`Map` and `FrozenMap` have no iterator; keep keys in an array and retrieve entries with `{name}.get(key)`")
                                 } else {
-                                    "bind the collection to a local variable, then loop over its length and index its elements".into()
-                                }
-                            }
-                            Some(B::FrozenMap) => {
-                                if let Some(name) = iterable_name {
-                                    format!("`FrozenMap` has no iterator; keep keys in an array and retrieve entries with `{name}.get(key)`")
-                                } else {
-                                    "`FrozenMap` has no iterator; bind the map to a local variable, keep keys in an array and retrieve entries with `.get(key)`".into()
+                                    "`Map` and `FrozenMap` have no iterator; keep keys in an array and retrieve entries with `.get(key)`".into()
                                 }
                             }
                             _ => {
-                                "use `for item in array { ... }` with `Array<T>` or `for n in start..end { ... }`".into()
+                                "use `for item in array { ... }` with `Array<T>` / `FrozenArray<T>` or `for n in start..end { ... }`".into()
                             }
                         };
                         self.push(
