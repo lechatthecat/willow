@@ -702,8 +702,11 @@ pub(crate) fn solve_unit<N>(
                     // identity, in the declaring unit. Do not repeat their
                     // source walk; a copy has no typed body of its own.
                     if known.is_none() && !canonical_bodies.contains(&source) {
+                        // Without the declaring unit's facts, assume the
+                        // unscanned body may panic, perform I/O and loop.
                         problem = problem.seed(id, PANIC, None);
                         may_io.insert(id);
+                        loops.insert(id);
                     }
                     copies.push((id, source));
                     continue;
