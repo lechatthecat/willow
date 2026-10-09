@@ -442,7 +442,10 @@ pub(crate) fn replace_manifest(path: &Path, text: &str) -> Result<()> {
 
 /// Inspection preserves pins and does not generate/repair a project.lock.
 pub fn inspect_packages(root: &Path) -> Result<PackageGraph> {
-    let source = PathSource::open(root, false)?;
+    inspect_source(PathSource::open(root, false)?)
+}
+
+pub(super) fn inspect_source(source: PathSource) -> Result<PackageGraph> {
     let (pins, checksums) = super::lock::command_pins(&source.root, None, false)?;
     let graph = super::solve::resolve_prepared(
         source,

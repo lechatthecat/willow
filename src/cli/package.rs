@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use willow_compiler::{
     package::{
         PackageMutation, display_dependencies, inspect_packages, mutate_packages,
-        mutate_packages_report,
+        mutate_packages_report, outdated_packages, tidy_packages,
     },
     project,
 };
@@ -19,6 +19,8 @@ pub(super) struct PackageCommand {
 enum Operation {
     Mutate(PackageMutation),
     Metadata,
+    Tidy,
+    Outdated { offline: bool },
     Tree,
     Why(String),
 }
@@ -34,6 +36,7 @@ impl PackageCommand {
         let mut directory = None;
         let mut dry_run = false;
         let mut breaking = false;
+        let mut offline = false;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             let (option, inline) = arg
@@ -57,6 +60,7 @@ impl PackageCommand {
                 {
                     dry_run = true
                 }
+                "--offline" if command == "outdated" && inline.is_none() => offline = true,
                 "--breaking" if command == "update" && inline.is_none() => breaking = true,
                 "--git" | "--path" | "--version" if command == "add" => {
                     let value = inline
@@ -106,6 +110,17 @@ impl PackageCommand {
                     );
                 }
                 Operation::Metadata
+            }
+            "tidy" | "outdated" => {
+                ensure!(
+                    positional.is_empty(),
+                    "{command} accepts no positional arguments; use --project-dir"
+                );
+                if command == "tidy" {
+                    Operation::Tidy
+                } else {
+                    Operation::Outdated { offline }
+                }
             }
             "add" => {
                 ensure!(positional.len() <= 1, "add accepts one alias or URL");
@@ -189,6 +204,10 @@ impl PackageCommand {
         })?;
         if self.format != "human" {
             let value = match self.operation {
+                Operation::Tidy => serde_json::to_value(tidy_packages(&root)?)?,
+                Operation::Outdated { offline } => {
+                    serde_json::to_value(outdated_packages(&root, offline)?)?
+                }
                 Operation::Mutate(mutation) => serde_json::to_value(mutate_packages_report(
                     &root,
                     mutation,
@@ -211,6 +230,14 @@ impl PackageCommand {
         }
         let mut out = std::io::stdout().lock();
         match self.operation {
+            Operation::Tidy => {
+                use std::io::Write;
+                Ok(out.write_all(tidy_packages(&root)?.human().as_bytes())?)
+            }
+            Operation::Outdated { offline } => {
+                use std::io::Write;
+                Ok(out.write_all(outdated_packages(&root, offline)?.human().as_bytes())?)
+            }
             Operation::Metadata => display_dependencies(&inspect_packages(&root)?, None, &mut out),
             Operation::Mutate(mutation) => mutate_packages(&root, mutation, self.dry_run, &mut out),
             Operation::Tree => display_dependencies(&inspect_packages(&root)?, None, &mut out),

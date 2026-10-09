@@ -27,6 +27,8 @@ pub(super) fn requested(args: &[String]) -> bool {
                 | "update"
                 | "deps"
                 | "metadata"
+                | "tidy"
+                | "outdated"
                 | "rust"
                 | "doctor"
         )

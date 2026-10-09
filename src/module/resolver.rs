@@ -166,7 +166,7 @@ pub(crate) fn resolve_imports_spooled_entry(
     resolve_imports_in_graph(entry_program, src_root, graph, check_modules)
 }
 
-fn resolve_imports_in_graph(
+pub(crate) fn resolve_imports_in_graph(
     entry_program: &Program,
     src_root: &Path,
     mut graph: ModuleGraph,

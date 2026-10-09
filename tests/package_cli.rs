@@ -10,13 +10,18 @@ struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "willow-package-commands-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
+        loop {
+            let path = std::env::temp_dir().join(format!(
+                "willow-package-commands-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("cannot create package fixture: {error}"),
+            }
+        }
     }
     fn write(&self, path: &str, text: &str) {
         let path = self.0.join(path);
@@ -617,4 +622,256 @@ fn machine_dry_run_reports_direct_dependency_removed_from_manifest() {
             );
         }
     }
+}
+
+#[test]
+fn tidy_uses_all_root_modules_and_preserves_alias_identity() {
+    let f = Fixture::new();
+    f.package("lib", "lib", "1.0.0", "");
+    f.write(
+        "lib/src/util.wi",
+        "module util; pub fn value() -> i64 { return 1; }",
+    );
+    f.package(
+        "app",
+        "app",
+        "1.0.0",
+        "[dependencies]\na={path='../lib'}\nb={path='../lib'}\nc={path='../lib'}",
+    );
+    f.write(
+        "app/src/main.wi",
+        "// import c::util;\nfn main() { println(42); }",
+    );
+    // Neither file is reachable from main. Item and module aliases both count.
+    f.write(
+        "app/src/extra.wi",
+        "module extra; import a::util::value as v;",
+    );
+    f.write(
+        "app/src/nested/mod.wi",
+        "module nested; import b::util as renamed;",
+    );
+    let before = snapshot(&f.0.join("app"));
+    let report: serde_json::Value =
+        serde_json::from_str(&success(f.cli(&["tidy", "--format=json"]))).unwrap();
+    assert_eq!(report["used"], serde_json::json!(["a", "b"]));
+    assert_eq!(report["unused"], serde_json::json!(["c"]));
+    assert_eq!(report["modules"], 4);
+    assert_eq!(report["imports"], 2);
+    let ndjson = success(f.cli(&["tidy", "--format=ndjson"]));
+    assert_eq!(ndjson.lines().count(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&ndjson).unwrap(),
+        report
+    );
+    let human = success(f.cli(&["tidy"]));
+    for line in ["a: used", "b: used", "c: unused"] {
+        assert!(human.contains(line), "{human}");
+    }
+    assert_eq!(before, snapshot(&f.0.join("app")));
+}
+
+#[test]
+fn tidy_does_not_count_transitive_aliases_as_root_usage() {
+    let f = Fixture::new();
+    f.package("leaf", "leaf", "1.0.0", "");
+    f.write(
+        "leaf/src/util.wi",
+        "module util; pub fn value() -> i64 { return 1; }",
+    );
+    f.package(
+        "middle",
+        "middle",
+        "1.0.0",
+        "[dependencies]\nleaf={path='../leaf'}",
+    );
+    f.write("middle/src/util.wi", "module util; import leaf::util;");
+    f.package(
+        "app",
+        "app",
+        "1.0.0",
+        "[dependencies]\nleaf={path='../leaf'}\nmiddle={path='../middle'}",
+    );
+    f.write("app/src/main.wi", "import middle::util; fn main() {}");
+    let report: serde_json::Value =
+        serde_json::from_str(&success(f.cli(&["tidy", "--format=json"]))).unwrap();
+    assert_eq!(report["unused"], serde_json::json!(["leaf"]));
+    assert_eq!(report["used"], serde_json::json!(["middle"]));
+}
+
+#[test]
+fn tidy_refuses_incomplete_graphs_and_invalid_source_layout() {
+    let f = Fixture::new();
+    f.package("lib", "lib", "1.0.0", "");
+    f.package("app", "app", "1.0.0", "[dependencies]\ndep={path='../lib'}");
+    for source in [
+        "import dep::missing;",
+        "import missing;",
+        "fn broken( {",
+        "fn main() { @ }",
+        "import std::missing;",
+    ] {
+        f.write("app/src/main.wi", source);
+        machine_failure(f.cli(&["tidy", "--format=json"]), "tidy_analysis_failed");
+    }
+    f.write("app/src/main.wi", "import other; fn main() {}");
+    f.write("app/src/other.wi", "module other; import main;");
+    failure(f.cli(&["tidy"]), "tidy_analysis_failed");
+    f.write("app/src/main.wi", "fn main() {}");
+    f.write("app/src/other.wi", "module wrong;");
+    failure(f.cli(&["tidy"]), "tidy_analysis_failed");
+    f.write("app/src/dep.wi", "module dep;");
+    failure(f.cli(&["tidy"]), "dependency_alias_conflict");
+}
+
+#[test]
+fn maintenance_empty_project_and_option_validation() {
+    let f = Fixture::new();
+    f.package("app", "app", "1.0.0", "");
+    for command in ["tidy", "outdated"] {
+        let value: serde_json::Value =
+            serde_json::from_str(&success(f.cli(&[command, "--format=json"]))).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["kind"], format!("package.{command}"));
+        for option in [
+            "--fix",
+            "--dry-run",
+            "--breaking",
+            "--format=invalid",
+            "unexpected",
+        ] {
+            assert!(
+                !f.cli(&[command, option]).status.success(),
+                "{command} {option}"
+            );
+        }
+        success(f.cli_from("app/src", &[command, "--project-dir=."]));
+    }
+    machine_failure(
+        f.cli(&["outdated", "--offline", "--format=json"]),
+        "network_required",
+    );
+    assert!(!f.0.join("cache").exists());
+}
+
+#[test]
+fn outdated_reports_compatible_and_breaking_file_git_releases_without_mutation() {
+    let f = Fixture::new();
+    let url = f.remote("remote", "lib");
+    f.package("local", "local", "1.0.0", "");
+    f.package("app", "app", "1.0.0", &format!("[dependencies]\ndep={{git='{url}',version='^1'}}\nduplicate={{git='{url}',version='^1'}}\npinned={{git='{url}',tag='v1.0.0'}}\nlocal={{path='../local'}}"));
+    success(f.cli(&["fetch"]));
+    f.release("remote", "lib", "1.6.2");
+    f.release("remote", "lib", "2.0.0");
+    f.release("remote", "lib", "3.0.0-beta.1");
+    let before = snapshot(&f.0.join("app"));
+    let report: serde_json::Value =
+        serde_json::from_str(&success(f.cli(&["outdated", "--format=json"]))).unwrap();
+    let rows = report["dependencies"].as_array().unwrap();
+    for alias in ["dep", "duplicate"] {
+        let row = rows.iter().find(|r| r["alias"] == alias).unwrap();
+        assert_eq!(row["current"], "1.0.0");
+        assert_eq!(row["compatible"], "1.6.2");
+        assert_eq!(row["breaking"], "2.0.0");
+    }
+    assert_eq!(
+        rows.iter().find(|r| r["alias"] == "local").unwrap()["skipped"],
+        "path_dependency"
+    );
+    assert_eq!(
+        rows.iter().find(|r| r["alias"] == "pinned").unwrap()["skipped"],
+        "pinned_selector"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&success(
+            f.cli(&["outdated", "--format=ndjson"])
+        ))
+        .unwrap(),
+        report
+    );
+    let human = success(f.cli(&["outdated"]));
+    assert!(
+        human.contains("dep 1.0.0 (requirement: ^1): compatible 1.6.2; breaking 2.0.0"),
+        "{human}"
+    );
+    assert_eq!(before, snapshot(&f.0.join("app")));
+    let cache_before = snapshot(&f.0.join("cache"));
+    failure(f.cli(&["outdated", "--offline"]), "network_required");
+    assert_eq!(cache_before, snapshot(&f.0.join("cache")));
+}
+
+#[test]
+fn outdated_fails_on_unreachable_remote_and_mismatched_selected_tag() {
+    let f = Fixture::new();
+    let url = f.remote("remote", "lib");
+    f.package(
+        "app",
+        "app",
+        "1.0.0",
+        &format!("[dependencies]\ndep={{git='{url}',version='^1'}}"),
+    );
+    success(f.cli(&["fetch"]));
+    f.git("remote", &["tag", "v1.9.0"]);
+    machine_failure(
+        f.cli(&["outdated", "--format=json"]),
+        "tag_manifest_version_mismatch",
+    );
+    fs::rename(f.0.join("remote"), f.0.join("gone")).unwrap();
+    machine_failure(f.cli(&["outdated", "--format=json"]), "source_unreachable");
+}
+
+fn machine_failure(output: Output, kind: &str) {
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["kind"], kind, "{value}");
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn tidy_ignores_strings_and_counts_repeated_imports_without_duplicate_results() {
+    let f = Fixture::new();
+    f.package("lib", "lib", "1.0.0", "");
+    f.write(
+        "lib/src/util.wi",
+        "module util; pub fn value() -> i64 { return 1; }",
+    );
+    f.package(
+        "app",
+        "app",
+        "1.0.0",
+        "[dependencies]\nused={path='../lib'}\nunused={path='../lib'}",
+    );
+    f.write("app/src/main.wi", "import used::util as a; import used::util as b; fn main() { println(\"import unused::util;\"); }");
+    let report: serde_json::Value =
+        serde_json::from_str(&success(f.cli(&["tidy", "--format=json"]))).unwrap();
+    assert_eq!(report["used"], serde_json::json!(["used"]));
+    assert_eq!(report["unused"], serde_json::json!(["unused"]));
+    assert_eq!(report["imports"], 2);
+    assert_eq!(report["modules"], 2);
+}
+
+#[test]
+fn outdated_without_lock_reports_resolved_baseline_without_creating_lock() {
+    let f = Fixture::new();
+    let url = f.remote("remote", "lib");
+    f.release("remote", "lib", "1.5.0");
+    f.release("remote", "lib", "2.0.0");
+    f.package(
+        "app",
+        "app",
+        "1.0.0",
+        &format!("[dependencies]\ndep={{git='{url}',version='^1'}}"),
+    );
+    let before = snapshot(&f.0.join("app"));
+    let report: serde_json::Value =
+        serde_json::from_str(&success(f.cli(&["outdated", "--format=json"]))).unwrap();
+    let row = &report["dependencies"][0];
+    assert_eq!(row["current"], "1.5.0");
+    assert!(row["compatible"].is_null());
+    assert_eq!(row["breaking"], "2.0.0");
+    assert_eq!(before, snapshot(&f.0.join("app")));
 }

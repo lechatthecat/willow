@@ -1,0 +1,11 @@
+[project]
+name = 'package_maintenance_demo'
+version = '1.0.0'
+
+[willow]
+manifest-version = 1
+
+[dependencies]
+used = { path = '../package_paths/left' }
+unused = { path = '../package_paths/right' }
+second_alias = { path = '../package_paths/left' }

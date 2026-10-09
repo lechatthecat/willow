@@ -42,3 +42,6 @@ mod output;
 pub use output::{Metadata, MetadataDependency, MetadataPackage, PackageDelta};
 mod errors;
 pub use errors::{CommandError, package_error_json};
+
+mod maintenance;
+pub use maintenance::{OutdatedReport, TidyReport, outdated_packages, tidy_packages};

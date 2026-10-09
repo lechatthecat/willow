@@ -1,0 +1,5 @@
+import used::util::value;
+
+fn main() {
+    println(value());
+}
