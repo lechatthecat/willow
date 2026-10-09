@@ -29,6 +29,23 @@ pub(crate) struct RustLock {
     pub dependencies: std::collections::BTreeMap<String, String>,
 }
 
+pub(crate) fn rust_input_hash(
+    project: &crate::project::ProjectManifest,
+    wrapper_schema: &str,
+    abi_revision: &str,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(
+            &project.rust_dependencies,
+            &project.rust,
+            wrapper_schema,
+            abi_revision,
+        ))?)
+    ))
+}
+
 pub(crate) fn read_rust_lock(root: &Path) -> Result<Option<RustLock>> {
     match std::fs::read_to_string(root.join("project.lock")) {
         Ok(text) => Ok(toml::from_str::<Lock>(&text)?.rust),

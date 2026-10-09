@@ -1,0 +1,4 @@
+[package]
+name="regex"
+version="1.2.3"
+edition="2024"

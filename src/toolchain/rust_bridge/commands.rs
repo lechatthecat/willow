@@ -60,18 +60,52 @@ pub fn mutate(root: &Path, options: &BridgeOptions, mutation: Mutation) -> Resul
         !options.locked,
         "Rust dependency edits cannot use --locked or --frozen"
     );
-    fs::create_dir_all(root.join(".willow/rust"))?;
-    let edit_lease = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(root.join(".willow/rust/.edit.lock"))?;
-    edit_lease.lock()?;
+    let _edit_lease = if options.read_only {
+        None
+    } else {
+        fs::create_dir_all(root.join(".willow/rust"))?;
+        let edit_lease = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join(".willow/rust/.edit.lock"))?;
+        edit_lease.lock()?;
+        Some(edit_lease)
+    };
     let path = root.join("project.toml");
     let before = fs::read_to_string(&path)?;
     let mut doc: DocumentMut = before.parse()?;
     let original = ProjectManifest::load(&path)?;
+    let from = if options.read_only {
+        ensure!(
+            matches!(mutation, Mutation::Update { .. }),
+            "read-only mutation requires update"
+        );
+        if let Some(lock) = crate::package::lock::read_rust_lock(root)? {
+            json!(
+                lock.dependencies
+                    .into_iter()
+                    .map(|(name, version)| json!({"alias":name,"name":name,"version":version}))
+                    .collect::<Vec<_>>()
+            )
+        } else {
+            prepare_bridge(
+                &original,
+                root,
+                options,
+                BridgeAction::Edit {
+                    update: None,
+                    lock: EditLock::Persisted,
+                },
+            )?
+            .context("Rust bridge missing")?
+            .direct_dependencies
+            .clone()
+        }
+    } else {
+        Value::Null
+    };
     let (operation, name, update, breaking) = match &mutation {
         Mutation::Add { name, spec } => {
             spec.normalize(name)?;
@@ -218,6 +252,15 @@ pub fn mutate(root: &Path, options: &BridgeOptions, mutation: Mutation) -> Resul
         fs::read_to_string(&path)? == before,
         "project changed while resolving; retry the command"
     );
+    if options.read_only {
+        return Ok(
+            json!({"schema":1,"ok":true,"kind":"rust.update","dry_run":true,
+            "enabled":!build.direct_dependencies.as_array().unwrap().is_empty(),
+            "dependency":name,"from":from,"to":build.direct_dependencies,
+            "direct_dependencies":build.direct_dependencies,"manifest_changed":before != after,
+            "diagnostics":[]}),
+        );
+    }
     let lock_paths = [
         root.join("project.lock"),
         root.join(".willow/rust/Cargo.lock"),

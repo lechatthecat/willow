@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Willow Rust bridge query v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "kind",
+    "status",
+    "bridges",
+    "crate_candidates"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "kind": {
+      "const": "rust-bridge"
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "unknown"
+      ]
+    },
+    "bridges": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/bridge"
+      }
+    },
+    "crate_candidates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/crate"
+      }
+    }
+  },
+  "$defs": {
+    "crate": {
+      "type": "object",
+      "required": [
+        "name",
+        "version",
+        "source"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {}
+      }
+    },
+    "bridge": {
+      "type": "object",
+      "required": [
+        "schema",
+        "kind",
+        "symbol",
+        "function",
+        "identity",
+        "crate",
+        "rust_adapter",
+        "abi_symbol",
+        "signature",
+        "declaration",
+        "declaration_text",
+        "coverage"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": 1
+        },
+        "kind": {
+          "const": "rust-bridge"
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "function": {
+          "type": "string"
+        },
+        "identity": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "crate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/crate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rust_adapter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "abi_symbol": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "inputs",
+            "output"
+          ],
+          "properties": {
+            "inputs": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "I64",
+                  "F64",
+                  "Bool"
+                ]
+              }
+            },
+            "output": {
+              "enum": [
+                "I64",
+                "F64",
+                "Bool",
+                "Void"
+              ]
+            }
+          }
+        },
+        "declaration": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "path",
+              "start",
+              "end"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "start": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "end": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "declaration_text": {
+          "type": "string"
+        },
+        "coverage": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

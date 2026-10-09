@@ -10,6 +10,10 @@ pub(super) const CHECK_COMMAND: &str = "willow check . --format ndjson --protoco
 pub(super) const BUILD_COMMAND: &str = "willow build . --format ndjson --protocol-version 1";
 
 pub(super) fn requested(args: &[String]) -> bool {
+    if args.first().is_some_and(|s| s == "query") && args.get(1).is_some_and(|s| s == "rust-bridge")
+    {
+        return false;
+    }
     // Existing package commands retain their own output contract.
     if matches!(
         args.first().map(String::as_str),

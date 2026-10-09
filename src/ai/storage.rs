@@ -129,6 +129,19 @@ impl Snapshot {
                 ensure!(ids.contains(target), "dangling call edge");
             }
         }
+        let mut bridges = std::collections::HashSet::new();
+        for bridge in &self.semantic.interop.bridges {
+            ensure!(
+                ids.contains(&bridge.function) && bridges.insert(&bridge.function),
+                "invalid bridge function"
+            );
+            for span in &bridge.declaration {
+                ensure!(
+                    span.start <= span.end && self.sources.contains_key(&span.path),
+                    "invalid bridge declaration location"
+                );
+            }
+        }
         let mut symbol_ids = std::collections::HashSet::new();
         for symbol in &self.semantic.symbols {
             ensure!(symbol_ids.insert(&symbol.id), "duplicate symbol identity");

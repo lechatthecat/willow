@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticFacts {
+    #[serde(default)]
+    pub interop: interop::InteropGraph,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rust_bridges: Vec<crate::rust_bridge::RustBridgeSymbol>,
     /// Live-only declaration relationships for atomic semantic rename.
@@ -256,6 +258,10 @@ pub(super) fn finish(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum QueryRequest {
+    RustBridge {
+        revision: String,
+        symbol: Option<String>,
+    },
     Affected {
         revision: String,
         delta: UpdateDelta,
@@ -582,7 +588,8 @@ impl QuerySession {
     pub fn query(&mut self, request: QueryRequest) -> Value {
         self.queries += 1;
         let revision = match &request {
-            QueryRequest::Affected { revision, .. }
+            QueryRequest::RustBridge { revision, .. }
+            | QueryRequest::Affected { revision, .. }
             | QueryRequest::Symbols { revision, .. }
             | QueryRequest::SymbolAt { revision, .. }
             | QueryRequest::SymbolInfo { revision, .. }
@@ -594,6 +601,9 @@ impl QuerySession {
             return json!({"status":"stale", "revision":self.revision()});
         }
         let data = match request {
+            QueryRequest::RustBridge { symbol, .. } => {
+                self.snapshot.semantic.interop.query(symbol.as_deref())
+            }
             QueryRequest::Affected { delta, tests, .. } => {
                 self.packages.affected(&self.snapshot, &delta, &tests)
             }

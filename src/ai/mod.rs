@@ -5,6 +5,7 @@ mod dispatch;
 mod display;
 pub mod edit;
 mod graph;
+pub mod interop;
 pub mod overview;
 mod packages;
 mod rename;
@@ -551,9 +552,40 @@ pub(crate) fn snapshot(
             }
         }
     }
+    let mut bridge_spans: HashMap<UnitId, Vec<(&str, Span)>> = HashMap::new();
+    for (unit, program) in std::iter::once((UnitId::ENTRY, &frontend.program)).chain(
+        frontend
+            .module_graph
+            .files
+            .iter()
+            .map(|m| (m.id, &m.program)),
+    ) {
+        for item in &program.items {
+            if let Item::Function(f) = item
+                && f.rust_bridge.is_some()
+            {
+                bridge_spans
+                    .entry(unit)
+                    .or_default()
+                    .push((&f.name, f.span));
+            }
+        }
+    }
+    let mut bridge_declarations = HashMap::new();
     let mut fingerprints = HashMap::new();
     let mut symbol_names = HashMap::new();
     let mut index_source = |unit: UnitId, path: String, source: &str| -> Result<()> {
+        if let Some(spans) = bridge_spans.remove(&unit) {
+            for (name, span) in spans {
+                bridge_declarations.insert(
+                    (unit.0, name.to_owned()),
+                    source
+                        .get(span.start..span.end)
+                        .context("invalid bridge declaration span")?
+                        .to_owned(),
+                );
+            }
+        }
         sources.insert(path, hash(source));
         let tokens = TokenHashes::new(source)?;
         if let Some(spans) = ranges.remove(&unit) {
@@ -973,6 +1005,16 @@ pub(crate) fn snapshot(
         .iter()
         .map(|(_, symbol)| symbol.clone())
         .collect();
+    interop::attach(
+        frontend,
+        &paths,
+        &functions,
+        bridge_declarations,
+        &mut semantic,
+    )?;
+    if let Some(root) = project {
+        semantic.interop.load_project(root)?;
+    }
     captured.clear();
     let mut snapshot = Snapshot {
         edit_context: None,

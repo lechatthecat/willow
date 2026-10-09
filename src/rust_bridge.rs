@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
+pub(crate) const WRAPPER_SCHEMA: &str = "3";
+
 pub type RustBridgeSymbols = Vec<((u32, String), RustBridgeSymbol)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -11,6 +11,7 @@ use willow_compiler::{BuildMode, CompilerOptions, toolchain::HostToolchain};
 #[derive(Debug)]
 pub(super) struct RustCommand {
     operation: String,
+    selector: Option<String>,
     directory: PathBuf,
     format: String,
     options: BridgeOptions,
@@ -28,7 +29,7 @@ impl RustCommand {
             ensure!(
                 matches!(
                     operation.as_str(),
-                    "check" | "metadata" | "tree" | "add" | "remove" | "update"
+                    "check" | "metadata" | "tree" | "add" | "remove" | "update" | "rust-bridge"
                 ),
                 "unknown rust command `{operation}`"
             );
@@ -47,6 +48,11 @@ impl RustCommand {
                 .split_once('=')
                 .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
             match key {
+                "--dry-run" if operation == "update" && inline.is_none() => {
+                    ensure!(!options.read_only, "duplicate --dry-run");
+                    options.read_only = true;
+                }
+
                 "--breaking" if operation == "update" && inline.is_none() => {
                     ensure!(!breaking, "duplicate --breaking");
                     breaking = true;
@@ -104,7 +110,7 @@ impl RustCommand {
                     options.locked = true;
                 }
                 _ if arg.starts_with('-') => anyhow::bail!("unknown {operation} option `{arg}`"),
-                _ if matches!(operation, "add" | "remove" | "update") => {
+                _ if matches!(operation, "add" | "remove" | "update" | "rust-bridge") => {
                     ensure!(
                         name.replace(arg.clone()).is_none(),
                         "too many dependency names"
@@ -119,6 +125,7 @@ impl RustCommand {
         if let Some(cache) = cache {
             options.cache_root = cache;
         }
+        let selector = name.clone();
         let mutation = match operation {
             "add" => {
                 let mut name = name.context("rust add requires a dependency name")?;
@@ -140,6 +147,7 @@ impl RustCommand {
         };
         Ok(Self {
             operation: operation.into(),
+            selector,
             directory: directory.unwrap_or_else(|| ".".into()),
             format: format.unwrap_or_else(|| "human".into()),
             options,
@@ -153,29 +161,72 @@ impl RustCommand {
             project::find_project_manifest(&directory).context("no project.toml found")?;
         let project = ProjectManifest::load(&root.join("project.toml"))?;
         let mut enabled = !project.rust_dependencies.is_empty();
-        if self.operation == "check" && enabled {
-            let entry = project.entry_point(&root);
-            // Rust-only setup projects may not have Willow sources yet.
-            if entry.try_exists()?
+        let entry = project.entry_point(&root);
+        let mut snapshot = if (self.operation == "check"
+            || self.operation == "rust-bridge"
+            || self.options.read_only)
+            && (entry.try_exists()?
                 || project.project.entry.is_some()
-                || root.join("src").try_exists()?
-            {
-                let mut options = CompilerOptions::debug();
-                options.locked = self.options.locked;
-                options.offline = self.options.offline;
-                self.options.symbols = willow_compiler::CompilerSession::new(
-                    entry.to_str().context("non UTF-8 entry path")?,
-                    "",
-                    &options,
-                    Some(root.clone()),
-                )
-                .rust_bridge_symbols_with_emitter(
-                    &mut willow_compiler::diagnostics::HumanEmitter,
-                )?;
+                || root.join("src").try_exists()?)
+        {
+            std::fs::metadata(&entry)
+                .with_context(|| format!("cannot read {}", entry.display()))?;
+            let mut options = CompilerOptions::debug();
+            options.locked = self.options.locked;
+            options.offline = self.options.offline;
+            let snapshot = willow_compiler::CompilerSession::new(
+                entry.to_str().context("non UTF-8 entry path")?,
+                "",
+                &options,
+                Some(root.clone()),
+            )
+            .analysis_for_edit_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)?;
+            self.options.symbols = snapshot.semantic.rust_bridges.clone();
+            Some(snapshot)
+        } else {
+            None
+        };
+        if self.operation == "rust-bridge" {
+            self.options.read_only = true;
+            let graph = &mut snapshot
+                .as_mut()
+                .context("query rust-bridge requires Willow sources")?
+                .semantic
+                .interop;
+            if enabled {
+                let build = inspect_bridge(&project, &root, &self.options)?
+                    .context("Rust bridge missing")?;
+                graph.resolved_crates(&build.direct_dependencies)?;
             }
+            let value = graph.query(self.selector.as_deref());
+            super::write_machine_output(&value)?;
+            return Ok(());
         }
         let mut value = if let Some(mutation) = self.mutation {
-            commands::mutate(&root, &self.options, *mutation)?
+            let mut value = commands::mutate(&root, &self.options, *mutation)?;
+            if self.options.read_only {
+                if let Some(snapshot) = &mut snapshot {
+                    snapshot.semantic.interop.resolved_crates(&value["from"])?;
+                    let graph = &snapshot.semantic.interop;
+                    let bridges: Vec<_> = graph.bridges.iter().collect();
+                    let index = willow_compiler::ai::interop::CallerIndex::new(snapshot);
+                    let mut impact = index.affected(&bridges);
+                    let mut bridge_query = graph.query(None);
+                    value["bridge_symbols"] = bridge_query["bridges"].take();
+                    value["crate_candidates"] = bridge_query["crate_candidates"].take();
+                    value["affected_willow_callers"] = impact
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("affected_willow_callers")
+                        .unwrap();
+                    value["impact"] = impact;
+                } else {
+                    value["bridge_symbols"] = json!([]);
+                    value["affected_willow_callers"] = json!([]);
+                    value["coverage"] = json!("no Willow sources available");
+                }
+            }
+            value
         } else if self.operation == "doctor" {
             let host = HostToolchain::new(&CompilerOptions::debug().target);
             let runtime = host.runtime_library_status();
@@ -189,7 +240,24 @@ impl RustCommand {
                 "native_linker":linker, "rust_interop":{"enabled":enabled}, "cargo":cargo, "rustc":rustc})
         } else {
             let build = if self.operation == "check" {
-                build_bridge(&project, &root, &self.options, true)?
+                build_bridge(&project, &root, &self.options, true).map_err(|mut error| {
+                    if let Some(details) =
+                        error.downcast_mut::<willow_compiler::package::CommandError>()
+                        && let Some(snapshot) = &snapshot
+                    {
+                        let graph = &snapshot.semantic.interop;
+                        details
+                            .fields
+                            .insert("bridge_declarations".into(), graph.query(None));
+                        let bridges: Vec<_> = graph.bridges.iter().collect();
+                        details.fields.insert(
+                            "willow_callers".into(),
+                            willow_compiler::ai::interop::CallerIndex::new(snapshot)
+                                .affected(&bridges),
+                        );
+                    }
+                    error
+                })?
             } else {
                 inspect_bridge(&project, &root, &self.options)?
             };

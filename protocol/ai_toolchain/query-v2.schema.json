@@ -204,6 +204,28 @@
             }
           }
         }
+      },
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "rust-bridge"
+          },
+          "revision": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bridge FunctionId or full Willow bridge spelling; omit for all declarations."
+          }
+        }
       }
     ]
   }

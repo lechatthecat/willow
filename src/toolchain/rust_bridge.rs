@@ -84,6 +84,8 @@ impl BridgeCacheKey<'_> {
 
 #[derive(Debug, Clone)]
 pub struct BridgeOptions {
+    /// Resolve only in the external cache, without project lock publication.
+    pub read_only: bool,
     pub symbols: Vec<crate::rust_bridge::RustBridgeSymbol>,
     /// Parent of the per-project hidden project; defaults to ~/.willow/build.
     pub cache_root: PathBuf,
@@ -104,6 +106,7 @@ impl BridgeOptions {
             .or_else(|| std::env::var_os("USERPROFILE"))
             .context("cannot locate home directory for Rust bridge cache")?;
         Ok(Self {
+            read_only: false,
             symbols: Vec::new(),
             cache_root: PathBuf::from(home).join(".willow/build"),
             mode,
@@ -112,7 +115,7 @@ impl BridgeOptions {
             locked: false,
             cargo: "cargo".into(),
             rustc: "rustc".into(),
-            wrapper_schema: "3".into(),
+            wrapper_schema: crate::rust_bridge::WRAPPER_SCHEMA.into(),
             abi_revision: willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION.to_string(),
         })
     }
@@ -181,7 +184,7 @@ pub struct BridgeBuild {
     // Hold until caller finishes consuming/linking the artifact. Another Willow
     // process must not replace the stable Cargo staticlib alias during linking.
     _lease: File,
-    _project_lease: File,
+    _project_lease: Option<File>,
     resolution: crate::package::lock::RustLock,
 }
 
@@ -283,6 +286,10 @@ fn prepare_bridge(
     options: &BridgeOptions,
     action: BridgeAction<'_>,
 ) -> Result<Option<BridgeBuild>> {
+    anyhow::ensure!(
+        !options.read_only || matches!(action, BridgeAction::Metadata | BridgeAction::Edit { .. }),
+        "read-only Rust resolution cannot compile adapters"
+    );
     if project.rust_dependencies.is_empty() && !matches!(action, BridgeAction::Edit { .. }) {
         return Ok(None);
     }
@@ -328,16 +335,21 @@ fn prepare_bridge(
         .open(directory.join(".willow.lock"))?;
     lease.lock().context("cannot lock Rust bridge cache")?;
     let rust_directory = root.join(".willow/rust");
-    fs::create_dir_all(&rust_directory)?;
-    let project_lease = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(rust_directory.join(".lock"))?;
-    project_lease
-        .lock()
-        .context("cannot lock project Rust resolution")?;
+    let project_lease = if options.read_only {
+        None
+    } else {
+        fs::create_dir_all(&rust_directory)?;
+        let lease = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(rust_directory.join(".lock"))?;
+        lease
+            .lock()
+            .context("cannot lock project Rust resolution")?;
+        Some(lease)
+    };
     fs::create_dir_all(directory.join("src"))?;
     let manifest = generated_manifest(project, &root)?;
     let manifest_path = directory.join("Cargo.toml");
@@ -346,12 +358,11 @@ fn prepare_bridge(
         &directory.join("willow-symbols.json"),
         &serde_json::to_vec_pretty(&options.symbols)?,
     )?;
-    let input_hash = hash(&serde_json::to_vec(&(
-        &project.rust_dependencies,
-        &project.rust,
+    let input_hash = crate::package::lock::rust_input_hash(
+        project,
         &options.wrapper_schema,
         &options.abi_revision,
-    ))?);
+    )?;
     let persisted = root.join(".willow/rust/Cargo.lock");
     let previous = crate::package::lock::read_rust_lock(&root)
         .context("rust_lockfile_stale: invalid project.lock")?;
@@ -506,12 +517,12 @@ fn prepare_bridge(
             _project_lease: project_lease,
             resolution: rust_lock,
         };
-        if action == BridgeAction::Metadata && !options.locked {
+        if action == BridgeAction::Metadata && !options.locked && !options.read_only {
             build.persist_resolution(&root, options)?;
         }
         return Ok(Some(build));
     }
-    if !options.locked {
+    if !options.locked && !options.read_only {
         persist_resolution(&root, &directory, options, &rust_lock)?;
     }
     let check = action == BridgeAction::Check;

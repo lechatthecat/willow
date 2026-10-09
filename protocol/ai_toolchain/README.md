@@ -187,3 +187,9 @@ sets return empty results. Invalid report schema/kind/success state returns
 `invalid-delta`; stale revisions retain the existing top-level `stale` response.
 `module_visits` and `edge_visits` expose closure work per request, excluding the
 one-time session index construction and JSON output serialization.
+
+## Rust bridge queries and repair
+
+See [Rust bridge query, update impact, and repair](RUST_BRIDGE.md) for standalone
+and batch queries, external dependency boundaries, read-only update previews,
+and the combined Cargo/declaration/caller diagnostic workflow.

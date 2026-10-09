@@ -32,6 +32,8 @@ pub struct ImpactNode {
 }
 #[derive(Debug, Serialize)]
 pub struct Impact {
+    pub rust_dependencies: Vec<interop::RustCrateIdentity>,
+    pub dependency_boundary: Vec<serde_json::Value>,
     pub external_dependencies: Vec<serde_json::Value>,
     pub revision: String,
     pub nodes: Vec<ImpactNode>,
@@ -225,7 +227,18 @@ impl Snapshot {
         }
         nodes.sort_by(|a, b| (a.distance, &a.id).cmp(&(b.distance, &b.id)));
         let external_dependencies = self.external_dependencies(&index, &distance);
+        let dependency_boundary = self
+            .semantic
+            .interop
+            .boundaries(nodes.iter().map(|n| &n.id));
+        let rust_dependencies = if dependency_boundary.is_empty() {
+            vec![]
+        } else {
+            self.semantic.interop.crates.clone()
+        };
         Ok(Impact {
+            rust_dependencies,
+            dependency_boundary,
             external_dependencies,
             revision: self.revision.clone(),
             nodes,

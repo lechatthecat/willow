@@ -1,0 +1,9 @@
+[project]
+name="rust_interop_queries"
+version="0.1.0"
+[willow]
+manifest-version=1
+[rust-dependencies]
+regex={path="native"}
+[rust]
+bridge="bridge.rs"
