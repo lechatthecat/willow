@@ -26,6 +26,8 @@ pub struct DeclarationDetails {
     pub is_async: bool,
     pub is_const: bool,
     pub type_params: Vec<String>,
+    pub extends: Vec<Type>,
+    pub implements: Vec<Type>,
 }
 
 pub(super) fn details(program: &Program) -> HashMap<Span, DeclarationDetails> {
@@ -43,6 +45,30 @@ pub(super) fn details(program: &Program) -> HashMap<Span, DeclarationDetails> {
                 );
             }
             Item::Class(c) => {
+                result.insert(
+                    c.span,
+                    DeclarationDetails {
+                        extends: c
+                            .base_class
+                            .iter()
+                            .map(|base| {
+                                Type::Named(match base {
+                                    crate::parser::ast::TypePath::Local(name) => name.clone(),
+                                    crate::parser::ast::TypePath::Qualified(parts) => {
+                                        parts.join("::")
+                                    }
+                                })
+                            })
+                            .collect(),
+                        implements: c
+                            .implements
+                            .iter()
+                            .take(c.source_implements_len)
+                            .cloned()
+                            .collect(),
+                        ..Default::default()
+                    },
+                );
                 for m in &c.methods {
                     if m.is_async && c.span.contains(m.span) {
                         result.insert(
@@ -55,11 +81,12 @@ pub(super) fn details(program: &Program) -> HashMap<Span, DeclarationDetails> {
                     }
                 }
             }
-            Item::Interface(i) if !i.type_params.is_empty() => {
+            Item::Interface(i) => {
                 result.insert(
                     i.span,
                     DeclarationDetails {
                         type_params: i.type_params.clone(),
+                        extends: i.extends.iter().cloned().map(Type::Named).collect(),
                         ..Default::default()
                     },
                 );
@@ -502,7 +529,7 @@ pub(super) fn finish(
             // clone the whole generic parameter list onto each parameter.
             details: if matches!(
                 d.kind.as_str(),
-                "function" | "method" | "interface" | "enum"
+                "function" | "method" | "class" | "interface" | "enum"
             ) {
                 captures
                     .get(&crate::module::ModuleId(d.span.file_id.0))
@@ -619,6 +646,8 @@ mod tests {
                         is_async: false,
                         is_const: false,
                         type_params: params.clone(),
+                        extends: params.iter().cloned().map(Type::Named).collect(),
+                        ..Default::default()
                     },
                 )]),
                 declarations: HashMap::new(),
@@ -660,7 +689,14 @@ mod tests {
                     .type_params,
                 params
             );
-            println!("generic_parameters={n} stored_parameter_names={n}");
+            assert_eq!(
+                symbols
+                    .iter()
+                    .map(|s| s.details.extends.len())
+                    .sum::<usize>(),
+                n
+            );
+            println!("generic_parameters={n} stored_parameter_names={n} stored_supertypes={n}");
         }
     }
 

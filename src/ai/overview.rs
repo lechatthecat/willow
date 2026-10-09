@@ -29,6 +29,10 @@ pub struct Entry {
     pub is_async: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub type_params: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extends: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub implements: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_display: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -348,6 +352,12 @@ fn is_top(s: &Symbol) -> bool {
     )
 }
 fn entry(session: &DirectSession, symbol: &Symbol) -> Entry {
+    let render = |ty: &crate::parser::ast::Type| {
+        session
+            .session
+            .names
+            .render(ty, symbol.identity.as_ref().map(|i| i.module.as_str()))
+    };
     Entry {
         name: symbol
             .name
@@ -359,6 +369,8 @@ fn entry(session: &DirectSession, symbol: &Symbol) -> Entry {
         selector: session.selector(symbol),
         is_async: symbol.details.is_async,
         type_params: symbol.details.type_params.clone(),
+        extends: symbol.details.extends.iter().map(render).collect(),
+        implements: symbol.details.implements.iter().map(render).collect(),
         type_display: symbol.ty.as_ref().map(|ty| {
             session
                 .session
@@ -377,6 +389,11 @@ fn human_entry(out: &mut impl Write, s: &Entry, indent: &str) -> io::Result<()> 
     write!(out, "{} {}", s.kind, s.name)?;
     if !s.type_params.is_empty() {
         write!(out, "<{}>", s.type_params.join(", "))?;
+    }
+    for (keyword, types) in [("extends", &s.extends), ("implements", &s.implements)] {
+        if !types.is_empty() {
+            write!(out, " {keyword} {}", types.join(", "))?;
+        }
     }
     write!(out, " [{}]", s.selector)?;
     if let Some(ty) = &s.type_display {

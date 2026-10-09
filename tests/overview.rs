@@ -514,3 +514,72 @@ fn constants_and_tuples_use_source_presentation_across_commands() {
         assert!(text.contains("fn() -> (i64, (bool, String))"));
     }
 }
+
+#[test]
+fn overview_preserves_declared_inheritance() {
+    for project in [false, true] {
+        let f = Fixture::new(project);
+        let source = "pub interface Shape {} pub interface Marker {} pub interface Accel extends Send, Shape {} pub interface Generic<T> {} pub open class Primitive implements Marker {} pub class Sphere extends Primitive implements Shape, Generic<i64> {} pub class Plain {} fn main() {}";
+        let path = if project {
+            "src/model.wi"
+        } else {
+            "src/main.wi"
+        };
+        f.source(path, source);
+        if project {
+            f.source("src/main.wi", "import model; fn main() {}");
+        }
+        let prefix = if project { "model::" } else { "" };
+        for depth in ["0", "1"] {
+            for format in ["human", "json", "ndjson"] {
+                let out = f.run(&[
+                    "overview", path, "--depth", depth, "--format", format, "--all",
+                ]);
+                assert!(
+                    out.status.success(),
+                    "{} {}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                if format == "human" {
+                    let text = String::from_utf8(out.stdout).unwrap();
+                    assert!(
+                        text.contains(&format!("interface Accel extends Send, {prefix}Shape")),
+                        "{text}"
+                    );
+                    assert!(
+                        text.contains(&format!("class Sphere extends {prefix}Primitive implements {prefix}Shape, {prefix}Generic<i64>")),
+                        "{text}"
+                    );
+                } else {
+                    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+                    let symbols = v["files"][0]["symbols"].as_array().unwrap();
+                    let find = |name| symbols.iter().find(|s| s["name"] == name).unwrap();
+                    assert_eq!(
+                        find("Accel")["extends"],
+                        serde_json::json!(["Send", format!("{prefix}Shape")])
+                    );
+                    assert_eq!(
+                        find("Sphere")["extends"],
+                        serde_json::json!([format!("{prefix}Primitive")])
+                    );
+                    assert_eq!(
+                        find("Sphere")["implements"],
+                        serde_json::json!([
+                            format!("{prefix}Shape"),
+                            format!("{prefix}Generic<i64>")
+                        ])
+                    );
+                    assert!(find("Plain").get("extends").is_none());
+                    assert!(find("Plain").get("implements").is_none());
+                    assert!(find("Shape").get("extends").is_none());
+                    let selector = find("Sphere")["selector"].as_str().unwrap();
+                    assert_eq!(
+                        f.json(&["symbol", selector, "--source", path], 0)["status"],
+                        "ok"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -3,10 +3,11 @@ interface Source<T> {
     fn get(self) -> T;
 }
 async fn background() -> i64 { return 1; }
-interface Described {
+interface Described extends Send {
     fn describe(self) -> String;
 }
-class Counter implements Described {
+open class Primitive {}
+class Counter extends Primitive implements Described {
     pub value: i64;
     pub init(self, value: i64) { self.value = value; }
     pub fn describe(self) -> String { return "counter"; }
