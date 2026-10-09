@@ -1285,16 +1285,29 @@ impl TypeChecker {
             c.span,
             "class cannot transitively extend itself",
         ));
+        // Members are canonical (`m::Circle` inside module `m`); spell the
+        // ones declared in this module the way its source does.
+        let module_prefix = self.module_path.as_ref().map(|path| format!("{path}::"));
+        let display = |member: &str| -> String {
+            module_prefix
+                .as_deref()
+                .and_then(|prefix| member.strip_prefix(prefix))
+                .unwrap_or(member)
+                .to_string()
+        };
         for member in cycle.iter().skip(1) {
             if let Some(info) = self.symbols.lookup_class(member) {
                 diagnostic = diagnostic.with_label(Label::secondary(
                     info.declaration_span,
-                    format!("`{member}` is part of the cycle"),
+                    format!("`{}` is part of the cycle", display(member)),
                 ));
             }
         }
-        let mut path = cycle.iter().map(String::as_str).collect::<Vec<_>>();
-        path.push(first.as_str());
+        let mut path = cycle
+            .iter()
+            .map(|member| display(member))
+            .collect::<Vec<_>>();
+        path.push(display(first));
         self.push(
             diagnostic
                 .with_note(format!("inheritance cycle: {}", path.join(" extends ")))

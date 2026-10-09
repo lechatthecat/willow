@@ -559,6 +559,9 @@ pub(crate) fn solve_unit<N>(
     let mut pending = Vec::new();
     let mut helpers = HashMap::new();
     let mut foreign = Vec::new();
+    // Injected default copies the checker skipped: they have no typed body in
+    // this unit and reuse their declaring interface's check (willow-rvpp).
+    let mut reused = HashSet::new();
     for item in &program.items {
         match item {
             Item::Function(f) => {
@@ -576,6 +579,9 @@ pub(crate) fn solve_unit<N>(
                 let owner = TypeId::local(&c.name);
                 for m in &c.methods {
                     let id = FunctionId::method(owner, &m.name);
+                    if m.is_default_injected {
+                        reused.insert(m.body.id);
+                    }
                     pending.push((id, m.body.id, &m.body));
                     if !m.is_async {
                         helpers.insert(id, m.span);
@@ -691,9 +697,14 @@ pub(crate) fn solve_unit<N>(
                         loop_bodies.insert(body_id);
                     }
                 }
-                if canonical_bodies.contains(&source) {
-                    // Same-unit defaults are checked only under the canonical
-                    // interface identity. Do not repeat their source walk.
+                if canonical_bodies.contains(&source) || reused.contains(&body_id) {
+                    // Defaults are checked only under the canonical interface
+                    // identity, in the declaring unit. Do not repeat their
+                    // source walk; a copy has no typed body of its own.
+                    if known.is_none() && !canonical_bodies.contains(&source) {
+                        problem = problem.seed(id, PANIC, None);
+                        may_io.insert(id);
+                    }
                     copies.push((id, source));
                     continue;
                 }
