@@ -17,7 +17,36 @@ struct Lock {
     root: Root,
     #[serde(rename = "package")]
     packages: Vec<Package>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rust: Option<RustLock>,
 }
+/// Cargo remains authoritative; only fingerprints and direct versions live here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct RustLock {
+    pub cargo_lock_hash: String,
+    pub bridge_input_hash: String,
+    pub dependencies: std::collections::BTreeMap<String, String>,
+}
+
+pub(crate) fn read_rust_lock(root: &Path) -> Result<Option<RustLock>> {
+    match std::fs::read_to_string(root.join("project.lock")) {
+        Ok(text) => Ok(toml::from_str::<Lock>(&text)?.rust),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub(crate) fn write_rust_lock(root: &Path, rust: RustLock) -> Result<()> {
+    let path = root.join("project.lock");
+    let mut lock: Lock = toml::from_str(&std::fs::read_to_string(&path)?)?;
+    if lock.rust.as_ref() != Some(&rust) {
+        lock.rust = Some(rust);
+        atomic_write(&path, lock.canonical_text()?.as_bytes(), || Ok(()))?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Root {
@@ -233,6 +262,7 @@ impl Lock {
                 package: ids[graph.root.0 as usize].clone(),
             },
             packages,
+            rust: None,
         })
     }
 }
@@ -273,11 +303,7 @@ pub(crate) fn resolve_project_analysis(
 pub(super) fn update(root: &Path) -> Result<PackageGraph> {
     let graph = super::resolve_packages(root)?;
     let path = graph.get(graph.root).unwrap().root.join("project.lock");
-    atomic_write(
-        &path,
-        Lock::from_graph(&graph)?.canonical_text()?.as_bytes(),
-        || Ok(()),
-    )?;
+    atomic_write(&path, command_lock(&graph)?.as_bytes(), || Ok(()))?;
     Ok(graph)
 }
 
@@ -287,6 +313,7 @@ fn resolve_source(
     offline: bool,
     publish_lock: bool,
 ) -> Result<PackageGraph> {
+    let has_rust_dependencies = !source.manifest.rust_dependencies.is_empty();
     let path = source.root.join("project.lock");
     let previous = match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
@@ -333,10 +360,18 @@ fn resolve_source(
         }
         Err(error) => return Err(error.into()),
     };
-    let expected = Lock::from_graph(&graph)?;
+    let mut expected = Lock::from_graph(&graph)?;
+    expected.rust = current.as_ref().and_then(|lock| lock.rust.clone());
+    if !has_rust_dependencies && current.as_ref().is_some_and(|lock| lock.rust.is_some()) {
+        anyhow::ensure!(
+            !locked,
+            "rust_lockfile_stale: Rust dependencies were removed"
+        );
+        expected.rust = None;
+    }
     if !current
         .as_ref()
-        .is_some_and(|current| current.matches(&expected))
+        .is_some_and(|current| current.matches(&expected) && current.rust == expected.rust)
     {
         if locked {
             return Err(
@@ -368,6 +403,18 @@ fn atomic_write(
     bytes: &[u8],
     before_rename: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    atomic_write_validated(path, bytes, || {
+        let lock: Lock = toml::from_str(std::str::from_utf8(bytes)?)?;
+        anyhow::ensure!(lock.version == 1, "unsupported_lock_version");
+        before_rename()
+    })
+}
+
+pub(crate) fn atomic_write_validated(
+    path: &Path,
+    bytes: &[u8],
+    validate: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let (guard, mut file) = loop {
         let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -385,10 +432,7 @@ fn atomic_write(
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    let text = std::fs::read_to_string(&guard.0)?;
-    let lock: Lock = toml::from_str(&text)?;
-    anyhow::ensure!(lock.version == 1, "unsupported_lock_version");
-    before_rename()?;
+    validate()?;
     std::fs::rename(&guard.0, path)?;
     Ok(())
 }
@@ -479,7 +523,9 @@ pub(super) fn command_pins(
 }
 
 pub(super) fn command_lock(graph: &PackageGraph) -> Result<String> {
-    Lock::from_graph(graph)?.canonical_text()
+    let mut lock = Lock::from_graph(graph)?;
+    lock.rust = read_rust_lock(&graph.get(graph.root).context("invalid root package")?.root)?;
+    lock.canonical_text()
 }
 
 pub(super) fn write_command_lock(path: &Path, text: &str) -> Result<()> {

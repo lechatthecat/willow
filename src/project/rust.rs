@@ -15,7 +15,7 @@ use super::{CanonicalGitUrl, ManifestError};
 
 /// Raw `[rust-dependencies]` entry, accepted as either the crates.io short form
 /// (`regex = "1.12"`) or the expanded table form.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct RustDependencySpec {
     pub version: Option<String>,
     pub git: Option<String>,
@@ -209,7 +209,7 @@ fn validate_rust_alias(alias: &str) -> Result<(), ManifestError> {
 }
 
 /// `[rust]` section: the single user-authored bridge module (spec §13).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RustSection {
     pub bridge: String,

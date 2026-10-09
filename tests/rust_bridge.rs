@@ -459,3 +459,208 @@ fn four_target_artifacts_and_target_key_invalidation() {
         assert!(fresh(&fixture.build(false)));
     }
 }
+
+#[test]
+fn persistent_locks_warm_frozen_and_regeneration() {
+    let mut f = Fixture::new("path");
+    let first = f.build(true);
+    let directory = first.directory.clone();
+    drop(first);
+    let cargo = f.root.join(".willow/rust/Cargo.lock");
+    let project = f.root.join("project.lock");
+    let bytes = fs::read(&cargo).unwrap();
+    let project_bytes = fs::read(&project).unwrap();
+    let lock: toml::Value = toml::from_str(std::str::from_utf8(&project_bytes).unwrap()).unwrap();
+    assert_eq!(
+        lock["rust"]["dependencies"]["willow_bridge_native"].as_str(),
+        Some("1.2.3")
+    );
+    let modified = fs::metadata(&cargo).unwrap().modified().unwrap();
+    let project_modified = fs::metadata(&project).unwrap().modified().unwrap();
+    f.options.locked = true; // offline already enabled: frozen
+    assert!(fresh(&f.build(true)));
+    assert_eq!(bytes, fs::read(&cargo).unwrap());
+    assert_eq!(project_bytes, fs::read(&project).unwrap());
+    assert_eq!(modified, fs::metadata(&cargo).unwrap().modified().unwrap());
+    assert_eq!(
+        project_modified,
+        fs::metadata(&project).unwrap().modified().unwrap()
+    );
+    // A discarded build cache is restored from the authoritative project lock.
+    fs::remove_file(directory.join("Cargo.lock")).unwrap();
+    drop(f.build(true));
+    assert_eq!(bytes, fs::read(directory.join("Cargo.lock")).unwrap());
+    // Removing the authoritative copy is forbidden under --locked.
+    fs::remove_file(&cargo).unwrap();
+    let error = build_bridge(&f.manifest(), &f.root, &f.options, true).unwrap_err();
+    assert!(error.to_string().contains("rust_lockfile_stale"));
+    assert!(!cargo.exists());
+    f.options.locked = false;
+    drop(f.build(true));
+    assert_eq!(bytes, fs::read(&cargo).unwrap());
+    assert_eq!(project_bytes, fs::read(&project).unwrap());
+    // Network-free path resolution is reproducible even with both copies removed.
+    fs::remove_file(&cargo).unwrap();
+    fs::remove_file(directory.join("Cargo.lock")).unwrap();
+    drop(f.build(true));
+    assert_eq!(bytes, fs::read(&cargo).unwrap());
+}
+
+#[test]
+fn locked_rejects_changed_direct_spec_and_live_path_version_without_writes() {
+    for change in ["features", "version", "summary", "cargo", "missing-rust"] {
+        let mut f = Fixture::new("path");
+        drop(f.build(true));
+        let cargo = f.root.join(".willow/rust/Cargo.lock");
+        let project = f.root.join("project.lock");
+        match change {
+            "features" => {
+                let path = f.root.join("project.toml");
+                let text = fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("default-features = false", "default-features = true");
+                fs::write(path, text).unwrap();
+            }
+            "version" => {
+                let path = f.root.join("native/Cargo.toml");
+                let text = fs::read_to_string(&path).unwrap().replace("1.2.3", "1.2.4");
+                fs::write(path, text).unwrap();
+            }
+            "summary" => {
+                let text = fs::read_to_string(&project)
+                    .unwrap()
+                    .replace("1.2.3", "9.9.9");
+                fs::write(&project, text).unwrap();
+            }
+            "cargo" => {
+                fs::write(&cargo, "corrupt").unwrap();
+            }
+            _ => {
+                let mut lock: toml::Table =
+                    toml::from_str(&fs::read_to_string(&project).unwrap()).unwrap();
+                lock.remove("rust");
+                fs::write(&project, toml::to_string(&lock).unwrap()).unwrap();
+            }
+        }
+        let a = fs::read(&cargo).unwrap();
+        let b = fs::read(&project).unwrap();
+        f.options.locked = true;
+        let error = build_bridge(&f.manifest(), &f.root, &f.options, true).unwrap_err();
+        assert!(
+            error.to_string().contains("rust_lockfile_stale"),
+            "{change}: {error:#}"
+        );
+        assert_eq!(a, fs::read(&cargo).unwrap());
+        assert_eq!(b, fs::read(&project).unwrap());
+    }
+}
+
+#[test]
+fn offline_missing_registry_dependency_fails_without_publishing_rust_lock() {
+    let f = Fixture::new("path");
+    let mut manifest = f.manifest();
+    manifest.rust_dependencies.insert(
+        "willow_nonexistent_offline_fixture_987654321".into(),
+        willow_compiler::project::RustDependencySpec {
+            version: Some("=0.0.987654321".into()),
+            ..Default::default()
+        },
+    );
+    let error = build_bridge(&manifest, &f.root, &f.options, true).unwrap_err();
+    assert!(format!("{error:#}").contains("offline"));
+    assert!(!f.root.join(".willow/rust/Cargo.lock").exists());
+}
+
+#[test]
+fn willow_lock_refresh_preserves_rust_summary() {
+    let f = Fixture::new("path");
+    drop(f.build(true));
+    let project = f.root.join("project.lock");
+    let before: toml::Value = toml::from_str(&fs::read_to_string(&project).unwrap()).unwrap();
+    let manifest = f.root.join("project.toml");
+    let text = fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("version = \"0.1.0\"", "version = \"0.2.0\"");
+    fs::write(&manifest, text).unwrap();
+    willow_compiler::package::fetch_packages(&f.root, false, true).unwrap();
+    let after: toml::Value = toml::from_str(&fs::read_to_string(&project).unwrap()).unwrap();
+    assert_eq!(before["rust"], after["rust"]);
+}
+
+#[test]
+fn cli_build_run_frozen_and_stale_rust_graph() {
+    let f = Fixture::new("path");
+    fs::create_dir_all(f.root.join("src")).unwrap();
+    fs::write(f.root.join("src/main.wi"), "fn main() { println(42); }\n").unwrap();
+    let home = f.temp.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let original_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .unwrap();
+    let command = |args: &[&str]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_willow"));
+        command
+            .current_dir(&f.root)
+            .args(args)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env(
+                "RUSTUP_HOME",
+                std::env::var_os("RUSTUP_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(&original_home).join(".rustup")),
+            )
+            .env(
+                "CARGO_HOME",
+                std::env::var_os("CARGO_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(&original_home).join(".cargo")),
+            );
+        command.output().unwrap()
+    };
+    let first = command(&["build", "--offline", "-o", "app"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let cargo = fs::read(f.root.join(".willow/rust/Cargo.lock")).unwrap();
+    let project = fs::read(f.root.join("project.lock")).unwrap();
+    let frozen = command(&["run", "--frozen"]);
+    assert!(
+        frozen.status.success(),
+        "{}",
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&frozen.stdout), "42\n");
+    assert_eq!(
+        cargo,
+        fs::read(f.root.join(".willow/rust/Cargo.lock")).unwrap()
+    );
+    assert_eq!(project, fs::read(f.root.join("project.lock")).unwrap());
+    let manifest_path = f.root.join("project.toml");
+    let original = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(&manifest_path, original.replace("0.1.0", "0.2.0")).unwrap();
+    let stale_willow = command(&["build", "--frozen", "-o", "app"]);
+    assert!(!stale_willow.status.success());
+    assert!(String::from_utf8_lossy(&stale_willow.stderr).contains("lockfile_stale"));
+    assert_eq!(
+        cargo,
+        fs::read(f.root.join(".willow/rust/Cargo.lock")).unwrap()
+    );
+    assert_eq!(project, fs::read(f.root.join("project.lock")).unwrap());
+    fs::write(&manifest_path, &original).unwrap();
+    let path = f.root.join("project.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("default-features = false", "default-features = true");
+    fs::write(&path, text).unwrap();
+    let stale = command(&["build", "--locked", "-o", "app"]);
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("rust_lockfile_stale"));
+    assert_eq!(
+        cargo,
+        fs::read(f.root.join(".willow/rust/Cargo.lock")).unwrap()
+    );
+    assert_eq!(project, fs::read(f.root.join("project.lock")).unwrap());
+}

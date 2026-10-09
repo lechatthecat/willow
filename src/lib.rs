@@ -460,6 +460,20 @@ impl<'a> CompilerSession<'a> {
                 .unwrap_or_else(|| root.clone());
             inputs.check_modules = package::discover_sources(project, &source_root)?;
         }
+        let _rust_bridge = if let Some(project_root) = &self.project_root {
+            let manifest = project::ProjectManifest::load(&project_root.join("project.toml"))?;
+            if manifest.rust_dependencies.is_empty() {
+                None
+            } else {
+                let mut options =
+                    toolchain::rust_bridge::BridgeOptions::new(self.opts.target.build_mode)?;
+                options.locked = self.opts.locked;
+                options.offline = self.opts.offline;
+                toolchain::rust_bridge::build_bridge(&manifest, project_root, &options, !build)?
+            }
+        } else {
+            None
+        };
         let frontend = run_frontend_with_inputs(&source, &root, &map, inputs, emitter)?;
         if build {
             run_backend(

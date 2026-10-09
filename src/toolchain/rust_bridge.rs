@@ -88,6 +88,7 @@ pub struct BridgeOptions {
     /// None means rustc's host. Future target-aware callers supply a triple.
     pub target: Option<String>,
     pub offline: bool,
+    pub locked: bool,
     pub cargo: PathBuf,
     pub rustc: PathBuf,
     pub wrapper_schema: String,
@@ -104,6 +105,7 @@ impl BridgeOptions {
             mode,
             target: None,
             offline: false,
+            locked: false,
             cargo: "cargo".into(),
             rustc: "rustc".into(),
             wrapper_schema: "1".into(),
@@ -237,10 +239,48 @@ pub fn build_bridge(
         .write(true)
         .open(directory.join(".willow.lock"))?;
     lease.lock().context("cannot lock Rust bridge cache")?;
+    let rust_directory = root.join(".willow/rust");
+    fs::create_dir_all(&rust_directory)?;
+    let project_lease = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(rust_directory.join(".lock"))?;
+    project_lease
+        .lock()
+        .context("cannot lock project Rust resolution")?;
     fs::create_dir_all(directory.join("src"))?;
     let manifest = generated_manifest(project, &root)?;
     let manifest_path = directory.join("Cargo.toml");
     let lib_path = directory.join("src/lib.rs");
+    let input_hash = hash(&serde_json::to_vec(&(
+        &project.rust_dependencies,
+        &project.rust,
+        &options.wrapper_schema,
+        &options.abi_revision,
+    ))?);
+    let persisted = root.join(".willow/rust/Cargo.lock");
+    let previous = crate::package::lock::read_rust_lock(&root)
+        .context("rust_lockfile_stale: invalid project.lock")?;
+    if options.locked {
+        let valid = previous.as_ref().is_some_and(|lock| {
+            lock.bridge_input_hash == input_hash
+                && hash_file(&persisted).ok().as_ref() == Some(&lock.cargo_lock_hash)
+        });
+        if !valid {
+            bail!("rust_lockfile_stale: missing or inconsistent Rust lock fingerprints");
+        }
+    }
+    if !root.join("project.lock").exists() {
+        crate::package::fetch_packages(&root, options.locked, options.offline)?;
+    }
+    let cached_lock = directory.join("Cargo.lock");
+    match fs::read(&persisted) {
+        Ok(bytes) => write_changed(&cached_lock, &bytes)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     write_changed(&manifest_path, manifest.as_bytes())?;
     let source = format!(
         "#[path = {:?}]\npub mod bridge;\n",
@@ -268,8 +308,38 @@ pub fn build_bridge(
     if options.offline {
         metadata_command.arg("--offline");
     }
-    let metadata: Value = serde_json::from_slice(&run(&mut metadata_command)?.stdout)?;
+    if options.locked {
+        metadata_command.arg("--locked");
+    }
+    let metadata_output = run(&mut metadata_command).with_context(|| {
+        if options.locked {
+            "rust_lockfile_stale: Cargo rejected locked resolution"
+        } else {
+            "Rust dependency resolution failed"
+        }
+    })?;
+    let metadata: Value = serde_json::from_slice(&metadata_output.stdout)?;
     let lock_hash = hash_file(&directory.join("Cargo.lock"))?;
+    let rust_lock = crate::package::lock::RustLock {
+        cargo_lock_hash: lock_hash.clone(),
+        bridge_input_hash: input_hash,
+        dependencies: direct_versions(&metadata)?,
+    };
+    if options.locked {
+        if previous.as_ref() != Some(&rust_lock) {
+            bail!("rust_lockfile_stale: Cargo resolution or direct version summary changed");
+        }
+    } else {
+        let bytes = fs::read(&cached_lock)?;
+        fs::create_dir_all(persisted.parent().unwrap())?;
+        if fs::read(&persisted).ok().as_deref() != Some(bytes.as_slice()) {
+            crate::package::lock::atomic_write_validated(&persisted, &bytes, || {
+                let _: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
+                Ok(())
+            })?;
+        }
+        crate::package::lock::write_rust_lock(&root, rust_lock)?;
+    }
     let source_hash = hash_file(&bridge)?;
     let manifest_hash = hash(manifest.as_bytes());
     let cache_key = BridgeCacheKey {
@@ -302,6 +372,7 @@ pub fn build_bridge(
     if options.offline {
         cargo.arg("--offline");
     }
+    cargo.arg("--locked");
     if !check {
         cargo.args(["--", "--print=native-static-libs"]);
     }
@@ -358,6 +429,68 @@ pub fn build_bridge(
         metadata,
         _lease: lease,
     }))
+}
+
+#[cfg(test)]
+thread_local! { static SUMMARY_VISITS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) }; }
+#[cfg(test)]
+fn summary_visit(index: usize) {
+    SUMMARY_VISITS.with(|counts| {
+        let mut values = counts.get();
+        values[index] += 1;
+        counts.set(values);
+    });
+}
+
+// Index package IDs once; never scan the full graph for each direct edge.
+fn direct_versions(metadata: &Value) -> Result<std::collections::BTreeMap<String, String>> {
+    let packages = metadata["packages"]
+        .as_array()
+        .context("Cargo packages missing")?;
+    let versions: std::collections::HashMap<_, _> = packages
+        .iter()
+        .map(|p| {
+            #[cfg(test)]
+            summary_visit(0);
+            Ok((
+                p["id"].as_str().context("Cargo package id missing")?,
+                p["version"].as_str().context("Cargo version missing")?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let root = metadata["resolve"]["root"]
+        .as_str()
+        .context("Cargo root missing")?;
+    let node = metadata["resolve"]["nodes"]
+        .as_array()
+        .context("Cargo nodes missing")?
+        .iter()
+        .find(|n| {
+            #[cfg(test)]
+            summary_visit(1);
+            n["id"].as_str() == Some(root)
+        })
+        .context("Cargo root node missing")?;
+    node["deps"]
+        .as_array()
+        .context("Cargo direct dependencies missing")?
+        .iter()
+        .map(|d| {
+            #[cfg(test)]
+            summary_visit(2);
+            let id = d["pkg"].as_str().context("Cargo dependency id missing")?;
+            Ok((
+                d["name"]
+                    .as_str()
+                    .context("Cargo dependency name missing")?
+                    .to_owned(),
+                versions
+                    .get(id)
+                    .context("Cargo dependency version missing")?
+                    .to_string(),
+            ))
+        })
+        .collect()
 }
 
 fn generated_manifest(project: &ProjectManifest, root: &Path) -> Result<String> {
@@ -491,6 +624,30 @@ mod tests {
                 "bridge_manifest dependencies={count} bytes={}",
                 manifest.len()
             );
+        }
+    }
+
+    #[test]
+    fn summary_indexes_packages_once_for_wide_graphs_and_root_last() {
+        for count in [16, 64, 256, 1024] {
+            let packages: Vec<_> = (0..count)
+                .map(|i| serde_json::json!({"id":format!("id{i}"), "version":"1.2.3"}))
+                .collect();
+            let mut nodes: Vec<_> = (0..count)
+                .map(|i| serde_json::json!({"id":format!("id{i}"), "deps":[]}))
+                .collect();
+            let deps: Vec<_> = (0..count)
+                .map(|i| serde_json::json!({"name":format!("dep{i}"), "pkg":format!("id{i}")}))
+                .collect();
+            nodes.push(serde_json::json!({"id":"root", "deps":deps}));
+            let metadata =
+                serde_json::json!({"packages":packages, "resolve":{"root":"root", "nodes":nodes}});
+            SUMMARY_VISITS.with(|v| v.set([0; 3]));
+            let summary = direct_versions(&metadata).unwrap();
+            let visits = SUMMARY_VISITS.with(|v| v.get());
+            assert_eq!(summary.len(), count);
+            assert_eq!(visits, [count, count + 1, count]);
+            eprintln!("rust_summary dependencies={count} visits={visits:?}");
         }
     }
 

@@ -295,6 +295,7 @@ fn selective_command_pins_visit_shared_descendants_once() {
             packages[i].dependencies.push(edge("shared".into(), n + 2));
         }
         let lock = Lock {
+            rust: None,
             version: 1,
             root: Root {
                 package: "p0".into(),
