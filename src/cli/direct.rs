@@ -146,13 +146,28 @@ impl Options {
             )
         };
         let project = root.is_some();
-        let compiler =
-            willow_compiler::CompilerSession::new(&entry, "", &CompilerOptions::debug(), root);
+        let compiler = willow_compiler::CompilerSession::new(
+            &entry,
+            "",
+            &CompilerOptions::debug(),
+            root.clone(),
+        );
+        let mut human_emitter = willow_compiler::diagnostics::HumanEmitter;
+        let mut project_emitter;
+        let emitter: &mut dyn willow_compiler::diagnostics::DiagnosticEmitter =
+            if let Some(root) = root.as_deref() {
+                project_emitter = willow_compiler::diagnostics::ProjectEmitter {
+                    root,
+                    inner: &mut human_emitter,
+                };
+                &mut project_emitter
+            } else {
+                &mut human_emitter
+            };
         let snapshot = if self.command == "rename" {
-            compiler
-                .analysis_for_edit_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)?
+            compiler.analysis_for_edit_with_emitter(emitter)?
         } else {
-            compiler.overview_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)?
+            compiler.overview_with_emitter(emitter)?
         };
         let mut session = DirectSession::new(snapshot)?;
         if self.command == "rename" {

@@ -48,6 +48,56 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn direct_checker_warnings_use_check_project_paths() {
+    let f = Fixture::new();
+    for file in ["src/main.wi", "src/order.wi"] {
+        let path = f.0.join(file);
+        let source = fs::read_to_string(&path).unwrap();
+        let (first, rest) = source.split_once('\n').unwrap();
+        fs::write(
+            path,
+            format!("{first}\nimport std::collections::Array;\n{rest}"),
+        )
+        .unwrap();
+    }
+    let check = f.run(&["check"]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let check_stderr = String::from_utf8(check.stderr).unwrap();
+    let expected = &check_stderr[check_stderr.find("warning[W2003]").unwrap()..];
+    assert!(expected.contains("warning[W2003]"), "{expected}");
+    for file in ["main.wi", "order.wi"] {
+        assert!(expected.contains(file), "{expected}");
+    }
+    assert!(!expected.contains(f.0.to_str().unwrap()), "{expected}");
+    for args in [
+        vec!["symbol", "order::submit"],
+        vec!["refs", "order::submit"],
+        vec!["references", "order::submit"],
+        vec!["type", "order::submit"],
+        vec!["effects", "order::submit"],
+        vec!["impact", "order::submit"],
+        vec!["rename", "main::main::item", "product", "--dry-run"],
+    ] {
+        for format in ["human", "json", "ndjson"] {
+            let mut args = args.clone();
+            args.extend(["--format", format]);
+            let output = f.run(&args);
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {stderr}\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(stderr, expected, "{args:?}");
+        }
+    }
+}
+
+#[test]
 fn impact_prints_definition_location_once() {
     let f = Fixture::new();
     let value = f.json(&["impact", "order::submit"], 0);
