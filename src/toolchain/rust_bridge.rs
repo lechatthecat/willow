@@ -84,6 +84,7 @@ impl BridgeCacheKey<'_> {
 
 #[derive(Debug, Clone)]
 pub struct BridgeOptions {
+    pub symbols: Vec<crate::rust_bridge::RustBridgeSymbol>,
     /// Parent of the per-project hidden project; defaults to ~/.willow/build.
     pub cache_root: PathBuf,
     pub mode: BuildMode,
@@ -103,6 +104,7 @@ impl BridgeOptions {
             .or_else(|| std::env::var_os("USERPROFILE"))
             .context("cannot locate home directory for Rust bridge cache")?;
         Ok(Self {
+            symbols: Vec::new(),
             cache_root: PathBuf::from(home).join(".willow/build"),
             mode,
             target: None,
@@ -110,8 +112,8 @@ impl BridgeOptions {
             locked: false,
             cargo: "cargo".into(),
             rustc: "rustc".into(),
-            wrapper_schema: "1".into(),
-            abi_revision: "1".into(),
+            wrapper_schema: "3".into(),
+            abi_revision: willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION.to_string(),
         })
     }
 }
@@ -284,6 +286,11 @@ fn prepare_bridge(
     if project.rust_dependencies.is_empty() && !matches!(action, BridgeAction::Edit { .. }) {
         return Ok(None);
     }
+    if !options.symbols.is_empty()
+        && options.abi_revision != willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION.to_string()
+    {
+        bail!("rust_bridge_abi_mismatch: incompatible adapter revision");
+    }
     let root = fs::canonicalize(root)?;
     let bridge = project
         .rust
@@ -335,6 +342,10 @@ fn prepare_bridge(
     let manifest = generated_manifest(project, &root)?;
     let manifest_path = directory.join("Cargo.toml");
     let lib_path = directory.join("src/lib.rs");
+    write_changed(
+        &directory.join("willow-symbols.json"),
+        &serde_json::to_vec_pretty(&options.symbols)?,
+    )?;
     let input_hash = hash(&serde_json::to_vec(&(
         &project.rust_dependencies,
         &project.rust,
@@ -382,10 +393,21 @@ fn prepare_bridge(
         }
     }
     write_changed(&manifest_path, manifest.as_bytes())?;
-    let source = format!(
+    let mut source = format!(
         "#[path = {:?}]\npub mod bridge;\n",
         bridge.to_str().context("non-UTF8 bridge path")?
     );
+    if !options.symbols.is_empty() {
+        write_changed(
+            &directory.join("src/willow_bridge_abi.rs"),
+            include_bytes!("../../crates/willow_abi/src/ffi.rs"),
+        )?;
+        source.push_str(&crate::rust_bridge::wrappers(
+            &options.symbols,
+            &directory.join("src/willow_bridge_abi.rs"),
+            willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
+        ));
+    }
     // Cargo metadata needs a lib target, but never rewrite a previous fingerprint
     // before determining the new key: that would invalidate every warm build.
     if !lib_path.exists() {
@@ -449,7 +471,10 @@ fn prepare_bridge(
     if options.locked && previous.as_ref() != Some(&rust_lock) {
         bail!("rust_lockfile_stale: Cargo resolution or direct version summary changed");
     }
-    let source_hash = hash_file(&bridge)?;
+    let source_hash = hash(&serde_json::to_vec(&(
+        hash_file(&bridge)?,
+        &options.symbols,
+    ))?);
     let manifest_hash = hash(manifest.as_bytes());
     let cache_key = BridgeCacheKey {
         target,
@@ -513,8 +538,32 @@ fn prepare_bridge(
         .context("cargo_missing: cannot execute Cargo")?;
     let messages = parse_cargo_messages(&output.stdout, &manifest_path)?;
     if !output.status.success() || !messages.success {
+        let adapter_error = |codes: &[&str]| {
+            !options.symbols.is_empty()
+                && messages.diagnostics.iter().any(|diagnostic| {
+                    let message = &diagnostic["message"];
+                    message["code"]["code"]
+                        .as_str()
+                        .is_some_and(|code| codes.contains(&code))
+                        && message["spans"].as_array().is_some_and(|spans| {
+                            spans.iter().any(|span| {
+                                span["is_primary"] == true
+                                    && span["file_name"].as_str().is_some_and(|name| {
+                                        let path = Path::new(name);
+                                        path == lib_path || path == Path::new("src/lib.rs")
+                                    })
+                            })
+                        })
+                })
+        };
         let mut error = crate::package::CommandError::new(
-            "rust_bridge_compile_error",
+            if adapter_error(&["E0425", "E0603"]) {
+                "rust_bridge_symbol_missing"
+            } else if adapter_error(&["E0308", "E0277", "E0283"]) {
+                "rust_bridge_signature_mismatch"
+            } else {
+                "rust_bridge_compile_error"
+            },
             "Rust bridge compilation failed",
         );
         error.fields.insert(

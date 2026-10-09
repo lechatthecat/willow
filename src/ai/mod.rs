@@ -967,6 +967,12 @@ pub(crate) fn snapshot(
         .collect();
     semantic.references = frontend.db.references.capture(symbol_references, &ranges)?;
     packages::attach(frontend, &paths, &captured, &mut functions, &mut semantic)?;
+    semantic.rust_bridges = frontend
+        .db
+        .rust_bridge_symbols
+        .iter()
+        .map(|(_, symbol)| symbol.clone())
+        .collect();
     captured.clear();
     let mut snapshot = Snapshot {
         edit_context: None,

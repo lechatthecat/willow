@@ -627,7 +627,12 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
     }
     if let Err(error) = &result
         && let Some(error) = error.downcast_ref::<willow_compiler::package::CommandError>()
-        && error.kind == "rust_bridge_compile_error"
+        && matches!(
+            error.kind,
+            "rust_bridge_compile_error"
+                | "rust_bridge_symbol_missing"
+                | "rust_bridge_signature_mismatch"
+        )
     {
         if let Some(diagnostics) = error.fields.get("diagnostics").and_then(|v| v.as_array()) {
             for diagnostic in diagnostics {

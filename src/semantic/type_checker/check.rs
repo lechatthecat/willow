@@ -244,6 +244,7 @@ impl TypeChecker {
                 self.symbols.define_func(
                     f.name.clone(),
                     FuncInfo {
+                        foreign: f.rust_bridge.is_some(),
                         param_infos,
                         params,
                         return_type,
@@ -318,9 +319,10 @@ impl TypeChecker {
         for item in &program.items {
             match item {
                 Item::Function(function) => {
-                    self.effect_index
-                        .callables
-                        .insert(FunctionId::free(function.name.as_str()), function.is_async);
+                    self.effect_index.callables.insert(
+                        FunctionId::free_from_source_name(function.name.as_str()),
+                        function.is_async,
+                    );
                 }
                 Item::Class(class) => {
                     let owner = TypeId::local(class.name.as_str());
@@ -2388,6 +2390,13 @@ impl TypeChecker {
                                 ),
                             )
                             .with_label(Label::primary(c.span, "wrong number of arguments")),
+                        );
+                    }
+                    if info.foreign {
+                        self.record_direct_lock_effect(
+                            c.span,
+                            "extern rust",
+                            LockEffectKind::Block,
                         );
                     }
                     self.check_call_args_against_param_infos(&info.param_infos, &c.args);

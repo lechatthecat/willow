@@ -148,6 +148,9 @@ impl LirQueries {
                 for item in &program.items {
                     match item {
                         Item::Function(f) => {
+                            if f.rust_bridge.is_some() {
+                                continue;
+                            }
                             names.insert(FunctionId::free(&f.name), f.body.id);
                             roots.push((f.body.id, AstEvent::Block(&f.body)));
                         }

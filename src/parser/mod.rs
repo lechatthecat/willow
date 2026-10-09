@@ -7,6 +7,7 @@ mod generic_closer_tests;
 pub mod iter;
 pub(crate) mod ownership;
 mod pattern;
+mod rust_bridge;
 mod stmt;
 pub(crate) mod tuples;
 mod types;
@@ -17,6 +18,7 @@ use crate::lexer::token::{Token, TokenKind};
 use ast::*;
 
 pub struct Parser {
+    rust_namespaces: std::collections::HashSet<String>,
     tuple_arities: std::collections::HashSet<usize>,
     type_uses: Vec<TypeUse>,
     tokens: Vec<Token>,
@@ -97,7 +99,27 @@ fn ternary_colon_table(tokens: &[Token]) -> Vec<bool> {
 #[willow_continuations::parser]
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
+        let rust_namespaces = tokens
+            .windows(4)
+            .filter_map(|window| {
+                match (
+                    &window[0].kind,
+                    &window[1].kind,
+                    &window[2].kind,
+                    &window[3].kind,
+                ) {
+                    (
+                        TokenKind::Ident(extern_),
+                        TokenKind::Ident(rust),
+                        TokenKind::Ident(namespace),
+                        TokenKind::LBrace,
+                    ) if extern_ == "extern" && rust == "rust" => Some(namespace.clone()),
+                    _ => None,
+                }
+            })
+            .collect();
         Self {
+            rust_namespaces,
             tuple_arities: Default::default(),
             type_uses: Vec::new(),
             tokens,
@@ -164,6 +186,16 @@ impl Parser {
                 self.recover_to_next_item();
                 continue;
             }
+            if matches!(self.peek_kind(), TokenKind::Ident(name) if name == "extern") {
+                match self.parse_rust_bridge() {
+                    Ok(declarations) => items.extend(declarations),
+                    Err(error) => {
+                        errors.push(error);
+                        self.recover_to_next_item();
+                    }
+                }
+                continue;
+            }
             match self.parse_item() {
                 Ok(item) => items.push(item),
                 Err(e) => {
@@ -173,6 +205,29 @@ impl Parser {
             }
         }
 
+        let bridge_names: std::collections::HashSet<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Function(f) if f.rust_bridge.is_some() => Some(f.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut seen_bridges = std::collections::HashSet::new();
+        for item in &items {
+            if let Item::Function(f) = item
+                && bridge_names.contains(f.name.as_str())
+                && !seen_bridges.insert(f.name.as_str())
+            {
+                errors.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0102,
+                        "rust_bridge_symbol_collision: duplicate Willow declaration",
+                    )
+                    .with_label(Label::primary(f.span, "duplicate bridge function")),
+                );
+            }
+        }
         errors.append(&mut self.recovered_errors);
         errors.sort_by_key(|error| {
             error

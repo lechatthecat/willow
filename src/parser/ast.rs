@@ -370,6 +370,8 @@ pub struct MethodDecl {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionDecl {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_bridge: Option<crate::rust_bridge::RustBridgeSymbol>,
     pub name: String,
     pub public: bool,
     pub is_async: bool,

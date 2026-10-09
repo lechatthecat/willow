@@ -558,10 +558,15 @@ pub(crate) fn solve_unit<N>(
     let overflow_checks = origins.is_none_or(|(_, queries)| queries.overflow_checks);
     let mut pending = Vec::new();
     let mut helpers = HashMap::new();
+    let mut foreign = Vec::new();
     for item in &program.items {
         match item {
             Item::Function(f) => {
                 let id = FunctionId::free(&f.name);
+                if f.rust_bridge.is_some() {
+                    foreign.push((FunctionId::free_from_source_name(&f.name), f.span));
+                    continue;
+                }
                 pending.push((id, f.body.id, &f.body));
                 if !f.is_async {
                     helpers.insert(id, f.span);
@@ -624,7 +629,11 @@ pub(crate) fn solve_unit<N>(
         .external_callee(PANIC)
         .unknown_callee(PANIC)
         .missing_body(PANIC)
-        .default_transmit(ANY_PANIC.union(LOCK_EFFECT_WAIT));
+        .default_transmit(
+            ANY_PANIC
+                .union(LOCK_EFFECT_WAIT)
+                .union(RuntimeEffects::MAY_ALLOCATE),
+        );
     let mut own = HashSet::new();
     let mut loops = HashSet::new();
     let mut loop_spans = HashMap::new();
@@ -632,6 +641,26 @@ pub(crate) fn solve_unit<N>(
     let mut loop_bodies = HashSet::new();
     let mut copies = Vec::new();
     let mut may_io = HashSet::new();
+    for (id, span) in foreign {
+        problem = problem.seed(
+            id,
+            PANIC.union(RuntimeEffects::MAY_ALLOCATE),
+            Some(EffectWitness::External(id)),
+        );
+        problem = problem.seed(
+            id,
+            RuntimeEffects::MAY_BLOCK,
+            Some(EffectWitness::Lock(LockEffectWitness {
+                owner: id,
+                cause: LockEffectCause {
+                    span,
+                    operation: "extern rust".into(),
+                    kind: LockEffectKind::Block,
+                },
+            })),
+        );
+        may_io.insert(id);
+    }
     let mut visits = 0;
     while let Some((id, body_id, body)) = pending.pop() {
         visits += 1;
@@ -818,9 +847,11 @@ pub(crate) fn solve_unit<N>(
         );
     }
     for id in graph.ids().chain(callables.keys()).chain(helpers.keys()) {
-        let mut mask = ANY_PANIC.union(LOCK_EFFECT_WAIT);
+        let mut mask = ANY_PANIC
+            .union(LOCK_EFFECT_WAIT)
+            .union(RuntimeEffects::MAY_ALLOCATE);
         if callables.get(id) == Some(&true) {
-            mask = ANY_PANIC;
+            mask = ANY_PANIC.union(RuntimeEffects::MAY_ALLOCATE);
         } else if helpers.contains_key(id) {
             mask = mask.union(NO_PREEMPT);
         }

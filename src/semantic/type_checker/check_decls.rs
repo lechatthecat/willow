@@ -1645,6 +1645,9 @@ impl TypeChecker {
     }
 
     fn check_function_body(&mut self, f: &FunctionDecl) {
+        if f.rust_bridge.is_some() {
+            return;
+        }
         let return_type = self.normalize_type(&f.return_type, f.span);
         let param_types = self.normalize_param_types(&f.params);
         self.validate_type(&return_type, f.span);

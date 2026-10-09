@@ -444,6 +444,7 @@ pub fn lower_program_with(
     let mut diagnostics = Vec::new();
     for item in &program.items {
         match item {
+            Item::Function(f) if f.rust_bridge.is_some() => {}
             Item::Function(f) => match lower_function(f, &fn_returns, &classes, &enums, tables) {
                 Ok(func) => functions.push(func),
                 Err(d) => diagnostics.push(d),
@@ -3515,6 +3516,7 @@ mod tests {
                                 span,
                             },
                             span,
+                            rust_bridge: None,
                             constant: None,
                         })],
                     };

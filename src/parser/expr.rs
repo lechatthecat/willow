@@ -642,6 +642,13 @@ impl Parser {
                             method_span: member_span,
                         })))
                     } else if !matches!(self.peek_kind(), TokenKind::LParen) {
+                        if self.rust_namespaces.contains(&name) {
+                            return Ok(Expr::Var(
+                                format!("{name}::{member}"),
+                                span.to(self.previous_span()),
+                                ExprId::fresh(),
+                            ));
+                        }
                         // `Class::property` — static property read (no parens).
                         Ok(Expr::StaticField(StaticFieldExpr {
                             class: name,
@@ -652,6 +659,14 @@ impl Parser {
                     } else {
                         self.expect(TokenKind::LParen)?;
                         let args = self.parse_call_args_after_lparen()?;
+                        if self.rust_namespaces.contains(&name) {
+                            return Ok(Expr::Call(Box::new(CallExpr {
+                                callee: format!("{name}::{member}"),
+                                args,
+                                span: span.to(self.previous_span()),
+                                id: ExprId::fresh(),
+                            })));
+                        }
                         Ok(Expr::StaticCall(Box::new(StaticCallExpr {
                             class: name,
                             type_args: vec![],

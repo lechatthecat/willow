@@ -154,6 +154,7 @@ pub struct BuildCodegenDb {
 
 /// Mutable object output, independent of unit resolution and frozen metadata.
 struct EmissionState {
+    rust_bridge_symbols: HashMap<(u32, String), String>,
     enum_payload_layouts: HashMap<Type, HashMap<String, std::sync::Arc<EnumPayloadLayout>>>,
     module: ObjectModule,
     string_literals: HashMap<String, StringLiteralData>,
@@ -424,6 +425,7 @@ impl Codegen {
                 module_init_plan: ModuleInitPlan::default(),
             },
             output: EmissionState {
+                rust_bridge_symbols: HashMap::new(),
                 enum_payload_layouts: HashMap::new(),
                 module,
                 string_literals: HashMap::new(),
@@ -541,13 +543,34 @@ impl UnitCodegenContext<'_> {
         item: impl Into<String>,
         span: crate::diagnostics::Span,
     ) -> Result<()> {
+        self.claim_symbol_inner(symbol, item, span, false)
+    }
+
+    // Only compiler-generated bridge imports and ABI shims may claim the
+    // reserved namespace. Duplicate ownership is still checked.
+    pub(super) fn claim_bridge_symbol(
+        &mut self,
+        symbol: &str,
+        item: impl Into<String>,
+        span: crate::diagnostics::Span,
+    ) -> Result<()> {
+        self.claim_symbol_inner(symbol, item, span, true)
+    }
+
+    fn claim_symbol_inner(
+        &mut self,
+        symbol: &str,
+        item: impl Into<String>,
+        span: crate::diagnostics::Span,
+        compiler_generated: bool,
+    ) -> Result<()> {
         let owner = SymbolOwner {
             item: item.into(),
             source_file: self.source_file.clone(),
             span,
         };
 
-        let kind = if is_reserved_symbol(symbol) {
+        let kind = if !compiler_generated && is_reserved_symbol(symbol) {
             Some(SymbolConflictKind::Reserved)
         } else {
             self.output
@@ -3482,6 +3505,7 @@ mod tests {
                 span: crate::diagnostics::Span::dummy(),
             },
             span: crate::diagnostics::Span::dummy(),
+            rust_bridge: None,
             constant: None,
         };
 
@@ -3563,3 +3587,12 @@ pub(super) fn lir_address_taken_locals(
 
 #[cfg(test)]
 mod class_layout_tests;
+
+impl Codegen {
+    pub fn set_rust_bridge_symbols(&mut self, symbols: &crate::rust_bridge::RustBridgeSymbols) {
+        self.output.rust_bridge_symbols = symbols
+            .iter()
+            .map(|(key, symbol)| (key.clone(), symbol.abi_symbol.clone()))
+            .collect();
+    }
+}

@@ -822,6 +822,7 @@ impl Parser {
             return_type,
             body,
             span,
+            rust_bridge: None,
             constant: None,
         })
     }
@@ -897,6 +898,7 @@ impl Parser {
             return_type,
             body,
             span,
+            rust_bridge: None,
             constant: Some(constant),
         })
     }

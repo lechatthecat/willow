@@ -175,76 +175,7 @@ impl Toolchain for HostToolchain {
     }
 
     fn link(&self, object: &Path, runtime: &Path, output: &str) -> Result<ExitStatus> {
-        #[cfg(all(windows, target_env = "msvc"))]
-        {
-            let target = if cfg!(target_arch = "x86_64") {
-                "x86_64-pc-windows-msvc"
-            } else if cfg!(target_arch = "aarch64") {
-                "aarch64-pc-windows-msvc"
-            } else if cfg!(target_arch = "x86") {
-                "i686-pc-windows-msvc"
-            } else {
-                anyhow::bail!("unsupported Windows MSVC target architecture");
-            };
-            let mut command = cc::windows_registry::find_tool(target, "cl.exe")
-                .ok_or_else(|| anyhow::anyhow!("failed to find MSVC cl.exe"))?
-                .to_command();
-            command
-                .arg("/nologo")
-                .arg(object)
-                .arg(runtime)
-                .arg("/link")
-                .args(dead_strip_args("windows", "msvc"))
-                .arg(format!("/OUT:{output}"))
-                .arg("/SUBSYSTEM:CONSOLE")
-                .arg("legacy_stdio_definitions.lib")
-                .arg("kernel32.lib")
-                .arg("ntdll.lib")
-                .arg("userenv.lib")
-                .arg("ws2_32.lib")
-                .arg("dbghelp.lib")
-                .arg("psapi.lib")
-                .arg("/defaultlib:msvcrt");
-            if self.target.emit_debug_info {
-                command.args(retain_debug_metadata_args("windows", "msvc"));
-            }
-            command
-                .stdout(std::process::Stdio::from(std::io::stderr()))
-                .status()
-                .with_context(|| "failed to run MSVC compiler driver")
-        }
-
-        #[cfg(not(all(windows, target_env = "msvc")))]
-        {
-            let mut command = Command::new("cc");
-            command.arg(object).arg(runtime).arg("-o").arg(output);
-            command.args(dead_strip_args(std::env::consts::OS, ""));
-            if self.target.emit_debug_info {
-                command.args(retain_debug_metadata_args(std::env::consts::OS, ""));
-            }
-            // Apple targets emit PIC and use the platform default PIE link.
-            if !cfg!(target_vendor = "apple") {
-                command.arg("-no-pie");
-            }
-            command.arg("-lm").arg("-lpthread");
-            // Rust's Apple staticlib reports libiconv as a native dependency.
-            // libSystem/libc are supplied automatically by the clang driver.
-            if cfg!(any(target_os = "macos", target_os = "ios")) {
-                command.arg("-liconv");
-            }
-            // dlopen/dlsym live in libSystem on Apple platforms, which do not
-            // ship a separate libdl.
-            if !cfg!(any(target_os = "macos", target_os = "ios")) {
-                command.arg("-ldl");
-            }
-            if self.target.strip_symbols {
-                command.arg("-s");
-            }
-            command
-                .stdout(std::process::Stdio::from(std::io::stderr()))
-                .status()
-                .with_context(|| "failed to run linker")
-        }
+        self.link_with_bridge(object, runtime, output, None)
     }
 
     fn update_source_map(&self, output: &str, contents: Option<&str>) -> Result<()> {
@@ -292,8 +223,182 @@ fn source_map_path(output: &str) -> PathBuf {
     PathBuf::from(format!("{output}.wsmap"))
 }
 
+impl HostToolchain {
+    pub fn link_rust_bridge(
+        &self,
+        object: &Path,
+        runtime: &Path,
+        output: &str,
+        bridge: &rust_bridge::BridgeBuild,
+    ) -> Result<ExitStatus> {
+        bridge.ensure_target(&target_lexicon::Triple::host().to_string())?;
+        self.link_with_bridge(object, runtime, output, Some(bridge))
+            .context("rust_bridge_link_error")
+    }
+    fn link_with_bridge(
+        &self,
+        object: &Path,
+        runtime: &Path,
+        output: &str,
+        bridge: Option<&rust_bridge::BridgeBuild>,
+    ) -> Result<ExitStatus> {
+        #[cfg(all(windows, target_env = "msvc"))]
+        {
+            let target = if cfg!(target_arch = "x86_64") {
+                "x86_64-pc-windows-msvc"
+            } else if cfg!(target_arch = "aarch64") {
+                "aarch64-pc-windows-msvc"
+            } else if cfg!(target_arch = "x86") {
+                "i686-pc-windows-msvc"
+            } else {
+                anyhow::bail!("unsupported Windows MSVC target architecture");
+            };
+            let mut command = cc::windows_registry::find_tool(target, "cl.exe")
+                .ok_or_else(|| anyhow::anyhow!("failed to find MSVC cl.exe"))?
+                .to_command();
+            command.arg("/nologo").arg(object);
+            if let Some(bridge) = bridge {
+                command.arg(
+                    bridge
+                        .staticlib
+                        .as_ref()
+                        .context("rust_bridge_link_error: missing archive")?,
+                );
+            }
+            command
+                .arg(runtime)
+                .arg("/link")
+                .args(dead_strip_args("windows", "msvc"))
+                .arg(format!("/OUT:{output}"))
+                .arg("/SUBSYSTEM:CONSOLE")
+                .arg("legacy_stdio_definitions.lib")
+                .arg("kernel32.lib")
+                .arg("ntdll.lib")
+                .arg("userenv.lib")
+                .arg("ws2_32.lib")
+                .arg("dbghelp.lib")
+                .arg("psapi.lib")
+                .arg("/defaultlib:msvcrt");
+            if let Some(bridge) = bridge {
+                command.args(split_native_libs(
+                    bridge
+                        .messages
+                        .native_static_libs
+                        .as_deref()
+                        .context("rust_bridge_link_error: missing system libraries")?,
+                )?);
+            }
+            if self.target.emit_debug_info {
+                command.args(retain_debug_metadata_args("windows", "msvc"));
+            }
+            command
+                .stdout(std::process::Stdio::from(std::io::stderr()))
+                .status()
+                .with_context(|| "failed to run MSVC compiler driver")
+        }
+
+        #[cfg(not(all(windows, target_env = "msvc")))]
+        {
+            let mut command = Command::new("cc");
+            command.arg(object);
+            if let Some(bridge) = bridge {
+                command.arg(
+                    bridge
+                        .staticlib
+                        .as_ref()
+                        .context("rust_bridge_link_error: missing archive")?,
+                );
+            }
+            command.arg(runtime).arg("-o").arg(output);
+            command.args(dead_strip_args(std::env::consts::OS, ""));
+            if let Some(bridge) = bridge {
+                command.args(split_native_libs(
+                    bridge
+                        .messages
+                        .native_static_libs
+                        .as_deref()
+                        .context("rust_bridge_link_error: missing system libraries")?,
+                )?);
+            }
+            if self.target.emit_debug_info {
+                command.args(retain_debug_metadata_args(std::env::consts::OS, ""));
+            }
+            // Apple targets emit PIC and use the platform default PIE link.
+            if !cfg!(target_vendor = "apple") {
+                command.arg("-no-pie");
+            }
+            command.arg("-lm").arg("-lpthread");
+            // Rust's Apple staticlib reports libiconv as a native dependency.
+            // libSystem/libc are supplied automatically by the clang driver.
+            if cfg!(any(target_os = "macos", target_os = "ios")) {
+                command.arg("-liconv");
+            }
+            // dlopen/dlsym live in libSystem on Apple platforms, which do not
+            // ship a separate libdl.
+            if !cfg!(any(target_os = "macos", target_os = "ios")) {
+                command.arg("-ldl");
+            }
+            if self.target.strip_symbols {
+                command.arg("-s");
+            }
+            command
+                .stdout(std::process::Stdio::from(std::io::stderr()))
+                .status()
+                .with_context(|| "failed to run linker")
+        }
+    }
+}
+
+fn split_native_libs(text: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    for ch in text.chars() {
+        if Some(ch) == quote {
+            quote = None;
+        } else if quote.is_some() {
+            word.push(ch);
+        } else if ch == '\"' || ch == '\'' {
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(ch);
+        }
+    }
+    anyhow::ensure!(
+        quote.is_none(),
+        "rust_bridge_link_error: unmatched native library quote"
+    );
+    if !word.is_empty() {
+        words.push(word);
+    }
+    Ok(words)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_libraries_keep_order_duplicates_and_quoted_arguments() {
+        for text in [
+            "-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc",
+            "-lSystem -liconv -lSystem",
+            "kernel32.lib ws2_32.lib kernel32.lib",
+        ] {
+            assert_eq!(
+                super::split_native_libs(text).unwrap(),
+                text.split_whitespace().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            super::split_native_libs("\"C:\\Program Files\\native.lib\" -framework 'Some Kit'")
+                .unwrap(),
+            ["C:\\Program Files\\native.lib", "-framework", "Some Kit"]
+        );
+        assert!(super::split_native_libs("'broken").is_err());
+    }
     use super::*;
 
     #[test]

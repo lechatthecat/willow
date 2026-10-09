@@ -6,6 +6,7 @@
 pub mod ai;
 pub mod backend;
 pub mod compiler_db;
+pub mod rust_bridge;
 use compiler_db::dependencies::ModuleDependencies;
 pub(crate) mod compiler_stack;
 pub mod desugar;
@@ -432,10 +433,29 @@ impl<'a> CompilerSession<'a> {
         Ok(snapshot)
     }
 
-    fn execute(self, emitter: &mut dyn diagnostics::DiagnosticEmitter, build: bool) -> Result<()> {
+    /// Reuse the checked frontend IR for Cargo-only adapter validation. This
+    /// performs no Rust build, code generation, snapshot construction, or link.
+    pub fn rust_bridge_symbols_with_emitter(
+        self,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    ) -> Result<Vec<rust_bridge::RustBridgeSymbol>> {
         let _symbols = self.symbols.enter();
         let _query_stats = query_stats::Session::enter();
         let _node_ids = parser::ast::NodeIdSession::enter();
+        let (frontend, _, _) = self.checked_frontend(emitter, true)?;
+        Ok(frontend
+            .db
+            .rust_bridge_symbols
+            .into_iter()
+            .map(|(_, symbol)| symbol)
+            .collect())
+    }
+
+    fn checked_frontend(
+        &self,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+        discover: bool,
+    ) -> Result<(Frontend, String, diagnostics::SourceMap)> {
         let src_path = PathBuf::from(self.src);
         let source = std::fs::read_to_string(&src_path)
             .with_context(|| format!("cannot read {}", src_path.display()))?;
@@ -451,7 +471,7 @@ impl<'a> CompilerSession<'a> {
         let mut inputs =
             compiler_db::inputs::CompilerInputs::native(self.opts.clone(), root.clone())
                 .resolve_project(self.project_root.as_deref())?;
-        if !build && let Some(project) = &self.project_root {
+        if discover && let Some(project) = &self.project_root {
             let source_root = inputs
                 .package_graph
                 .as_ref()
@@ -460,24 +480,57 @@ impl<'a> CompilerSession<'a> {
                 .unwrap_or_else(|| root.clone());
             inputs.check_modules = package::discover_sources(project, &source_root)?;
         }
-        let _rust_bridge = if let Some(project_root) = &self.project_root {
+        let frontend = run_frontend_with_inputs(&source, &root, &map, inputs, emitter)?;
+        Ok((frontend, source, map))
+    }
+
+    fn execute(self, emitter: &mut dyn diagnostics::DiagnosticEmitter, build: bool) -> Result<()> {
+        let _symbols = self.symbols.enter();
+        let _query_stats = query_stats::Session::enter();
+        let _node_ids = parser::ast::NodeIdSession::enter();
+        let (frontend, source, map) = self.checked_frontend(emitter, !build)?;
+        let bound = frontend.db.rust_bridge_symbols.clone();
+        let rust_bridge = if let Some(project_root) = &self.project_root {
             let manifest = project::ProjectManifest::load(&project_root.join("project.toml"))?;
             if manifest.rust_dependencies.is_empty() {
+                anyhow::ensure!(
+                    bound.is_empty(),
+                    "rust_bridge_missing: extern rust requires Rust dependencies and [rust] bridge"
+                );
                 None
             } else {
                 let mut options =
                     toolchain::rust_bridge::BridgeOptions::new(self.opts.target.build_mode)?;
                 options.locked = self.opts.locked;
                 options.offline = self.opts.offline;
+                options.symbols = bound.iter().map(|(_, symbol)| symbol.clone()).collect();
+                if build && !bound.is_empty() {
+                    drop(toolchain::rust_bridge::build_bridge(
+                        &manifest,
+                        project_root,
+                        &options,
+                        true,
+                    )?);
+                }
                 toolchain::rust_bridge::build_bridge(&manifest, project_root, &options, !build)?
             }
         } else {
+            anyhow::ensure!(
+                bound.is_empty(),
+                "rust_bridge_missing: extern rust requires a project"
+            );
             None
         };
-        let frontend = run_frontend_with_inputs(&source, &root, &map, inputs, emitter)?;
         if build {
             run_backend(
-                frontend, self.src, self.out, source, &self.opts, &map, emitter,
+                frontend,
+                self.src,
+                self.out,
+                source,
+                &self.opts,
+                &map,
+                emitter,
+                rust_bridge.as_ref().map(|bridge| (bridge, &bound)),
             )
         } else {
             Ok(())
@@ -721,13 +774,42 @@ fn run_frontend_revision(
     artifacts.body_index_mut().finish_revision();
     artifacts.previous_parsed = None;
     let syntax_queries = artifacts.syntax_queries.take();
-    let db = compiler_db::CompilerDb::with_dependencies(
+    let mut db = compiler_db::CompilerDb::with_dependencies(
         inputs,
         &graph.files,
         std::rc::Rc::clone(&artifacts.bodies),
         std::rc::Rc::clone(&artifacts.store),
         desugar_dependencies,
     );
+    let mut bridge_identity = None;
+    for (namespace, program) in std::iter::once((String::new(), &program)).chain(
+        graph
+            .files
+            .iter()
+            .map(|module| (module.identity_path().to_string(), &module.program)),
+    ) {
+        for item in &program.items {
+            if let parser::ast::Item::Function(f) = item
+                && let Some(symbol) = &f.rust_bridge
+            {
+                let identity = bridge_identity.get_or_insert_with(|| {
+                    let bridge_root = project::find_project_manifest(root)
+                        .map(|(_, root)| root)
+                        .unwrap_or_else(|| root.to_path_buf());
+                    std::fs::canonicalize(&bridge_root)
+                        .unwrap_or(bridge_root)
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                let mut symbol = symbol.clone();
+                if !namespace.is_empty() {
+                    symbol.willow_function = format!("{namespace}::{}", symbol.willow_function);
+                }
+                db.rust_bridge_symbols
+                    .push(((f.span.file_id.0, f.name.clone()), symbol.bind(identity)));
+            }
+        }
+    }
     if let Some(queries) = syntax_queries {
         db.references.set_tracking(&queries);
         let mut paths: std::collections::HashMap<_, _> = graph
@@ -1698,6 +1780,7 @@ fn log_hir_gaps(gaps: &[diagnostics::Diagnostic]) {
 /// Back-end phases: drive Cranelift codegen over the modules and entry program,
 /// emit the object file, resolve the runtime library, link the native
 /// executable, and write debug/source-map artifacts.
+#[allow(clippy::too_many_arguments)]
 fn run_backend(
     frontend: Frontend,
     src: &str,
@@ -1706,6 +1789,10 @@ fn run_backend(
     opts: &CompilerOptions,
     map: &diagnostics::SourceMap,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    rust_bridge: Option<(
+        &toolchain::rust_bridge::BridgeBuild,
+        &crate::rust_bridge::RustBridgeSymbols,
+    )>,
 ) -> Result<()> {
     use diagnostics::{Diagnostic, ErrorCode, Severity};
     use toolchain::{HostToolchain, Toolchain};
@@ -1736,6 +1823,9 @@ fn run_backend(
                 &diagnostic_packages,
             )
         })?;
+    if let Some((_, symbols)) = rust_bridge {
+        codegen.set_rust_bridge_symbols(symbols);
+    }
     codegen.configure_queries(
         std::rc::Rc::clone(&db.typed_bodies),
         std::rc::Rc::clone(&db.lir),
@@ -2021,7 +2111,11 @@ fn run_backend(
         }
     })?;
 
-    let link_result = toolchain.link(&obj_path, &runtime_lib, out);
+    let link_result = if let Some((bridge, _)) = rust_bridge {
+        toolchain.link_rust_bridge(&obj_path, &runtime_lib, out, bridge)
+    } else {
+        toolchain.link(&obj_path, &runtime_lib, out)
+    };
     discard_object(&obj_path);
     let status = link_result?;
 
@@ -2036,7 +2130,11 @@ fn run_backend(
             runtime_lib.display()
         ));
         emitter.emit(&d, map)?;
-        anyhow::bail!("linking failed");
+        anyhow::bail!(if rust_bridge.is_some() {
+            "rust_bridge_link_error: linking failed"
+        } else {
+            "linking failed"
+        });
     }
 
     toolchain.update_source_map(

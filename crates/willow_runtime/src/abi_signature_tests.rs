@@ -526,3 +526,15 @@ fn timer_value_abi_is_scalar_and_wait_may_block() {
         assert_eq!(runtime_symbol(name).unwrap().effects(), effects);
     }
 }
+
+#[test]
+fn scalar_bridge_runtime_abi_matches_schema() {
+    let _: extern "C" fn(u32) = crate::rust_bridge::willow_rust_bridge_enter;
+    let _: extern "C" fn() -> ! = crate::rust_bridge::willow_rust_bridge_panic;
+    let enter = willow_abi::runtime_symbol("willow_rust_bridge_enter").unwrap();
+    assert_eq!(enter.params, &[willow_abi::AbiTy::I32]);
+    assert_eq!(enter.ret, None);
+    let panic = willow_abi::runtime_symbol("willow_rust_bridge_panic").unwrap();
+    assert!(panic.params.is_empty());
+    assert_eq!(panic.ret, None);
+}

@@ -28,7 +28,7 @@ fn clif_abi_ty(ty: AbiTy, ptr_ty: Type) -> Type {
 /// Rust's extern-C `u8` boolean exports require zero extension at the ABI
 /// boundary. Without it an optimized callee may inspect the full argument
 /// register and see stale high bits even when the low boolean byte is zero.
-fn clif_abi_param(ty: AbiTy, ptr_ty: Type) -> AbiParam {
+pub(crate) fn clif_abi_param(ty: AbiTy, ptr_ty: Type) -> AbiParam {
     let param = AbiParam::new(clif_abi_ty(ty, ptr_ty));
     if ty == AbiTy::I8 { param.uext() } else { param }
 }

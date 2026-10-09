@@ -147,12 +147,33 @@ impl RustCommand {
         })
     }
 
-    pub(super) fn execute(self) -> Result<()> {
+    pub(super) fn execute(mut self) -> Result<()> {
         let directory = std::fs::canonicalize(&self.directory)?;
         let (_, root) =
             project::find_project_manifest(&directory).context("no project.toml found")?;
         let project = ProjectManifest::load(&root.join("project.toml"))?;
         let mut enabled = !project.rust_dependencies.is_empty();
+        if self.operation == "check" && enabled {
+            let entry = project.entry_point(&root);
+            // Rust-only setup projects may not have Willow sources yet.
+            if entry.try_exists()?
+                || project.project.entry.is_some()
+                || root.join("src").try_exists()?
+            {
+                let mut options = CompilerOptions::debug();
+                options.locked = self.options.locked;
+                options.offline = self.options.offline;
+                self.options.symbols = willow_compiler::CompilerSession::new(
+                    entry.to_str().context("non UTF-8 entry path")?,
+                    "",
+                    &options,
+                    Some(root.clone()),
+                )
+                .rust_bridge_symbols_with_emitter(
+                    &mut willow_compiler::diagnostics::HumanEmitter,
+                )?;
+            }
+        }
         let mut value = if let Some(mutation) = self.mutation {
             commands::mutate(&root, &self.options, *mutation)?
         } else if self.operation == "doctor" {

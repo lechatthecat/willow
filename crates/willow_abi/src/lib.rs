@@ -5,6 +5,7 @@
 //! when converting a descriptor to byte offsets or allocation sizes. This
 //! keeps cross-compilation independent of the host Rust process layout.
 
+pub mod ffi;
 pub mod fingerprint;
 pub mod runtime_type_ids;
 pub mod schema;

@@ -137,6 +137,8 @@ pub struct VarInfo {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FuncInfo {
+    #[serde(default)]
+    pub foreign: bool,
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
     pub return_type: Type,
@@ -655,6 +657,7 @@ mod tests {
     }
     fn function_info(ty: Type) -> FuncInfo {
         FuncInfo {
+            foreign: false,
             params: vec![],
             param_infos: vec![],
             return_type: ty,

@@ -40,6 +40,7 @@ struct CheckedUnitRecord {
 }
 
 pub struct CompilerDb {
+    pub rust_bridge_symbols: crate::rust_bridge::RustBridgeSymbols,
     _symbols: crate::semantic::ids::SymbolInterner,
     inputs: inputs::CompilerInputs,
     scopes: scope::ScopeQueries,
@@ -69,6 +70,7 @@ impl CompilerDb {
         let dependencies = std::rc::Rc::new(dependencies);
         let overflow_checks = inputs.options.target.build_mode == crate::BuildMode::Debug;
         Self {
+            rust_bridge_symbols: Default::default(),
             _symbols: crate::semantic::ids::SymbolInterner::current(),
             references: Default::default(),
             scopes: scope::ScopeQueries::new(std::rc::Rc::clone(&store)),

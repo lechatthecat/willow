@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticFacts {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_bridges: Vec<crate::rust_bridge::RustBridgeSymbol>,
     /// Live-only declaration relationships for atomic semantic rename.
     #[serde(skip)]
     pub(crate) rename_links: Vec<(String, String)>,

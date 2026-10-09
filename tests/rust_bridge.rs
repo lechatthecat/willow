@@ -158,7 +158,7 @@ fn source_schema_abi_manifest_lock_and_profile_invalidate_compilation() {
                 )
                 .unwrap();
             }
-            1 => fixture.options.wrapper_schema = "2".into(),
+            1 => fixture.options.wrapper_schema = "test-future-schema".into(),
             2 => fixture.options.abi_revision = "2".into(),
             3 => {
                 let manifest = fixture.root.join("project.toml");

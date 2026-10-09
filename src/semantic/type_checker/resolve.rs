@@ -172,6 +172,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "recover".to_string(),
             FuncInfo {
+                foreign: false,
                 params: Vec::new(),
                 param_infos: Vec::new(),
                 return_type: Type::Generic(
@@ -193,6 +194,7 @@ impl TypeChecker {
             self.symbols.define_func(
                 name.to_string(),
                 FuncInfo {
+                    foreign: false,
                     param_infos: value_param_infos(&params),
                     params,
                     return_type: Type::F64,
@@ -207,6 +209,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "gc_collect".to_string(),
             FuncInfo {
+                foreign: false,
                 param_infos: vec![],
                 params: vec![],
                 return_type: Type::Void,
@@ -220,6 +223,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "gc_minor_collect".to_string(),
             FuncInfo {
+                foreign: false,
                 param_infos: vec![],
                 params: vec![],
                 return_type: Type::Void,
@@ -273,6 +277,7 @@ impl TypeChecker {
             self.symbols.define_func(
                 name.to_string(),
                 FuncInfo {
+                    foreign: false,
                     param_infos: vec![],
                     params: vec![],
                     return_type: Type::I64,
@@ -289,6 +294,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "panic".to_string(),
             FuncInfo {
+                foreign: false,
                 param_infos: value_param_infos(&panic_params),
                 params: panic_params,
                 return_type: Type::Never,
@@ -303,6 +309,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "sleep".to_string(),
             FuncInfo {
+                foreign: false,
                 param_infos: value_param_infos(&sleep_params),
                 params: sleep_params,
                 return_type: Type::Generic("Future".to_string(), vec![Type::Void]),
@@ -316,6 +323,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "yield".to_string(),
             FuncInfo {
+                foreign: false,
                 param_infos: vec![],
                 params: vec![],
                 return_type: Type::Generic("Future".to_string(), vec![Type::Void]),
@@ -359,6 +367,7 @@ impl TypeChecker {
                 Some((
                     item.name.to_string(),
                     FuncInfo {
+                        foreign: false,
                         param_infos: value_param_infos(&params),
                         params,
                         return_type: std_schema_type(return_type),
@@ -660,6 +669,7 @@ impl TypeChecker {
                     functions.insert(
                         f.name.clone(),
                         FuncInfo {
+                            foreign: f.rust_bridge.is_some(),
                             param_infos,
                             params,
                             return_type: qualify(&f.return_type),
@@ -2142,6 +2152,9 @@ impl TypeChecker {
                     self.reject_constant_call(&qualified, &fi, args, span)
                 }
                 Some(fi) => {
+                    if fi.foreign {
+                        self.record_direct_lock_effect(span, "extern rust", LockEffectKind::Block);
+                    }
                     self.record_method_use(
                         method_name,
                         "function",

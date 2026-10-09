@@ -9,6 +9,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{Linkage, Module};
 
 use super::*;
+use anyhow::Context;
 
 /// The name of a lifted closure's hidden leading parameter — the environment
 /// object it was called through (willow-0g8j.2.12).
@@ -325,6 +326,9 @@ impl BodyPlanner {
         self.push_lambda_targets(&unit.lambdas, &unit.lambda_bodies, &mut plan);
         for item in &unit.program.items {
             if let Item::Function(f) = item {
+                if f.rust_bridge.is_some() {
+                    continue;
+                }
                 plan.push(UnitBody {
                     body: self.semantic_body(f.body.id),
                     target: BodyTarget::Function {
@@ -348,6 +352,7 @@ impl BodyPlanner {
         self.push_lambda_targets(&unit.lambdas, &unit.lambda_bodies, &mut plan);
         for item in &unit.program.items {
             match item {
+                Item::Function(f) if f.rust_bridge.is_some() => {}
                 Item::Function(f) => plan.push(UnitBody {
                     body: self.semantic_body(f.body.id),
                     target: BodyTarget::Function {
@@ -1161,6 +1166,7 @@ impl UnitCodegenContext<'_> {
             return_type: return_type.to_source(),
             body,
             span: l.span,
+            rust_bridge: None,
             constant: None,
         };
         self.compile_function_named(name, &f, semantic_body)
@@ -1252,6 +1258,11 @@ impl UnitCodegenContext<'_> {
     }
 
     pub(super) fn declare_user_function(&mut self, f: &FunctionDecl) -> Result<()> {
+        if f.rust_bridge.is_some() {
+            self.func_ids
+                .scope()
+                .declare(&f.name, FunctionId::free_from_source_name(&f.name));
+        }
         let symbol_name = user_function_symbol(&f.name);
         self.declare_function_symbol(&f.name, &symbol_name, f, f.name == "main")
     }
@@ -1272,7 +1283,14 @@ impl UnitCodegenContext<'_> {
         let ptr_ty = reference_type(self.output.module.target_config());
         // `willow_user_main` is parameterless even when `fn main(args:
         // Array<String>)` is declared (see compile_function_named).
-        if symbol_name != USER_MAIN_SYMBOL {
+        if let Some(bridge) = &f.rust_bridge {
+            for ty in &bridge.input_types {
+                sig.params.push(crate::backend::abi::clif_abi_param(
+                    ty.abi_type().context("void Rust bridge parameter")?,
+                    ptr_ty,
+                ));
+            }
+        } else if symbol_name != USER_MAIN_SYMBOL {
             for param in &f.params {
                 sig.params
                     .push(AbiParam::new(param_abi_type(param, ptr_ty, self.classes())));
@@ -1283,11 +1301,29 @@ impl UnitCodegenContext<'_> {
         // inspects its result and exits in the body; willow-exg). Keep this in
         // sync with compile_function_named.
         let force_void_main = symbol_name == USER_MAIN_SYMBOL && main_result_err_type(f).is_some();
-        if call_return_type != Type::Void && !force_void_main {
+        if let Some(bridge) = &f.rust_bridge {
+            if let Some(ty) = bridge.output_type.abi_type() {
+                sig.returns
+                    .push(crate::backend::abi::clif_abi_param(ty, ptr_ty));
+            }
+        } else if call_return_type != Type::Void && !force_void_main {
             sig.returns
                 .push(AbiParam::new(self.clif_type(&call_return_type)));
         }
-        let linkage = if export {
+        let symbol_name = if let Some(bridge) = &f.rust_bridge {
+            self.output
+                .rust_bridge_symbols
+                .get(&(f.span.file_id.0, bridge.willow_function.clone()))
+                .context("rust_bridge_missing: declaration has no configured bridge")?
+                .as_str()
+        } else {
+            symbol_name
+        };
+        let symbol_name = symbol_name.to_owned();
+        let symbol_name = symbol_name.as_str();
+        let linkage = if f.rust_bridge.is_some() {
+            Linkage::Import
+        } else if export {
             Linkage::Export
         } else {
             Linkage::Local
@@ -1297,11 +1333,61 @@ impl UnitCodegenContext<'_> {
         } else {
             "function"
         };
-        self.claim_symbol(symbol_name, format!("{kind} `{}`", f.name), f.span)?;
+        if f.rust_bridge.is_some() {
+            self.claim_bridge_symbol(symbol_name, format!("{kind} `{}`", f.name), f.span)?;
+        } else {
+            self.claim_symbol(symbol_name, format!("{kind} `{}`", f.name), f.span)?;
+        }
         let id = self
             .output
             .module
             .declare_function(symbol_name, linkage, &sig)?;
+        // Willow function values use the internal scalar ABI (no bool
+        // extension attributes). A single per-declaration shim preserves that
+        // ABI while the Rust boundary uses C zero extension, including indirect
+        // calls. Non-bool signatures already agree and need no shim.
+        let id = if f.rust_bridge.as_ref().is_some_and(|bridge| {
+            bridge
+                .input_types
+                .contains(&crate::rust_bridge::Scalar::Bool)
+                || bridge.output_type == crate::rust_bridge::Scalar::Bool
+        }) {
+            let mut internal = sig.clone();
+            for param in internal.params.iter_mut().chain(&mut internal.returns) {
+                *param = AbiParam::new(param.value_type);
+            }
+            let shim_name = format!("{symbol_name}_willow");
+            self.claim_bridge_symbol(
+                &shim_name,
+                format!("Rust bool ABI shim `{}`", f.name),
+                f.span,
+            )?;
+            let shim =
+                self.output
+                    .module
+                    .declare_function(&shim_name, Linkage::Local, &internal)?;
+            let mut context = self.output.module.make_context();
+            context.func.signature = internal;
+            context.func.name = UserFuncName::user(0, shim.as_u32());
+            let mut builder_context = FunctionBuilderContext::new();
+            {
+                let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+                let entry = builder.create_block();
+                builder.append_block_params_for_function_params(entry);
+                builder.switch_to_block(entry);
+                builder.seal_block(entry);
+                let arguments = builder.block_params(entry).to_vec();
+                let target = self.output.module.declare_func_in_func(id, builder.func);
+                let call = builder.ins().call(target, &arguments);
+                let results = builder.inst_results(call).to_vec();
+                builder.ins().return_(&results);
+                builder.finalize(self.output.module.target_config());
+            }
+            self.output.module.define_function(shim, &mut context)?;
+            shim
+        } else {
+            id
+        };
         self.func_ids.insert(lookup_name, id);
         // Task constructors are global declarations. Unit aliases resolve to
         // these canonical identities, including calls within another module.
@@ -1756,6 +1842,7 @@ impl UnitCodegenContext<'_> {
                     span: init.span(),
                 },
                 span: init.span(),
+                rust_bridge: None,
                 constant: None,
             };
             let static_body = self.static_initializer_body(init)?;
