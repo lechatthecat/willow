@@ -584,6 +584,11 @@ impl Parser {
                 } else if self.eat(TokenKind::ColonColon) {
                     let member_span = self.current_span();
                     let member = self.expect_ident()?;
+                    if let Some(expr) =
+                        self.try_parse_generic_static_call(format!("{name}::{member}"), span)?
+                    {
+                        return Ok(expr);
+                    }
                     if self.eat(TokenKind::ColonColon) {
                         let method_span = self.current_span();
                         let method = self.expect_ident()?;
@@ -661,6 +666,7 @@ impl Parser {
                         let args = self.parse_call_args_after_lparen()?;
                         if self.rust_namespaces.contains(&name) {
                             return Ok(Expr::Call(Box::new(CallExpr {
+                                type_args: Vec::new(),
                                 callee: format!("{name}::{member}"),
                                 args,
                                 span: span.to(self.previous_span()),
@@ -680,6 +686,7 @@ impl Parser {
                 } else if self.eat(TokenKind::LParen) {
                     let args = self.parse_call_args_after_lparen()?;
                     Ok(Expr::Call(Box::new(CallExpr {
+                        type_args: Vec::new(),
                         callee: name,
                         args,
                         span,
@@ -853,7 +860,28 @@ impl Parser {
             }
         }
 
-        if !self.eat(TokenKind::Gt) || !self.eat(TokenKind::ColonColon) {
+        let closed = self.eat(TokenKind::Gt);
+        if closed && type_args.is_empty() {
+            return Err(self.err(ErrorCode::E0102, "type argument list must not be empty"));
+        }
+        if closed && self.eat(TokenKind::LParen) {
+            let args = self.parse_call_args_after_lparen()?;
+            return Ok(Some(Expr::Call(Box::new(CallExpr {
+                callee: class,
+                type_args,
+                args,
+                span: span.to(self.previous_span()),
+                id: ExprId::fresh(),
+            }))));
+        }
+        if closed && self.allow_object_literals && self.eat(TokenKind::LBrace) {
+            let mut expr = self.parse_object_literal_fields(class, span)?;
+            if let Expr::ObjectLiteral(object) = &mut expr {
+                object.type_args = type_args;
+            }
+            return Ok(Some(expr));
+        }
+        if !closed || !self.eat(TokenKind::ColonColon) {
             self.pos = saved;
             self.brace_depth = saved_brace_depth;
             self.pending_type_eq = saved_pending_type_eq;
@@ -930,6 +958,7 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace)?;
         Ok(Expr::ObjectLiteral(Box::new(ObjectLiteralExpr {
+            type_args: Vec::new(),
             class,
             fields,
             span,

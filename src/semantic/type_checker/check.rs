@@ -142,6 +142,61 @@ impl TypeChecker {
     }
 
     fn check_program_items(&mut self, program: &Program) {
+        self.register_instantiation_types(&program.instantiation_types);
+        // Generic declarations are templates and never enter the ordinary
+        // signature-registration pass. Index all declarations first so a
+        // template cannot silently replace another template or share a name
+        // with a concrete declaration that survives specialization.
+        let mut declarations = HashMap::new();
+        for item in &program.items {
+            let (name, span, kind, generic) = match item {
+                Item::Function(f) => (
+                    &f.name,
+                    f.span,
+                    if f.constant.is_some() {
+                        "constant"
+                    } else {
+                        "function"
+                    },
+                    !f.type_params.is_empty(),
+                ),
+                Item::Class(c) => (&c.name, c.span, "class", !c.type_params.is_empty()),
+                Item::Enum(e) => (&e.name, e.span, "enum", !e.type_params.is_empty()),
+                Item::Interface(i) => (&i.name, i.span, "interface", !i.type_params.is_empty()),
+            };
+            if let Some(&(first_span, first_kind, first_generic)) = declarations.get(name) {
+                if generic || first_generic {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0706,
+                            format!("{kind} `{name}` is already declared as a {first_kind}"),
+                        )
+                        .with_label(Label::primary(span, "second declaration"))
+                        .with_label(Label::secondary(first_span, "first declared here"))
+                        .with_help("rename one of them"),
+                    );
+                }
+            } else {
+                declarations.insert(name, (span, kind, generic));
+            }
+            match item {
+                Item::Function(f) if !f.type_params.is_empty() => {
+                    self.generics.functions.insert(
+                        f.name.clone(),
+                        self.generics.registry.borrow_mut().intern_function(f),
+                    );
+                }
+                Item::Class(c) if !c.type_params.is_empty() => {
+                    self.generics.classes.insert(
+                        c.name.clone(),
+                        self.generics.registry.borrow_mut().intern_class(c),
+                    );
+                }
+                _ => {}
+            }
+        }
+
         self.marker_contracts.clear();
         self.marker_contract_proven.clear();
         self.register_std_imports(&program.imports);
@@ -182,6 +237,9 @@ impl TypeChecker {
                             )
                             .with_label(Label::primary(c.span, "cannot redeclare `PanicInfo`")),
                         );
+                        continue;
+                    }
+                    if !c.type_params.is_empty() {
                         continue;
                     }
                     self.register_class(c);
@@ -238,6 +296,9 @@ impl TypeChecker {
                 if self.reject_constant_redeclaration(f) {
                     continue;
                 }
+                if !f.type_params.is_empty() {
+                    continue;
+                }
                 let params = self.normalize_param_types(&f.params);
                 let param_infos = self.normalize_param_infos(&f.params);
                 let return_type = self.normalize_type(&f.return_type, f.span);
@@ -276,13 +337,22 @@ impl TypeChecker {
         // Pass 3: check bodies
         for item in &program.items {
             match item {
-                Item::Function(f) => self.check_function(f),
-                Item::Class(c) => self.check_class(c),
+                Item::Function(f) if f.type_params.is_empty() => self.check_function(f),
+                Item::Function(_) => {}
+                Item::Class(c) if c.type_params.is_empty() => self.check_class(c),
+                Item::Class(_) => {}
                 Item::Enum(e) => self.check_enum(e), // validate payload types
                 Item::Interface(i) => self.check_interface(i), // validate `extends` + signatures
             }
         }
 
+        if let Some(file) = program.items.iter().find_map(|item| match item {
+            Item::Function(f) if !f.type_params.is_empty() => Some(f.span.file_id),
+            Item::Class(c) if !c.type_params.is_empty() => Some(c.span.file_id),
+            _ => None,
+        }) {
+            self.validate_generic_templates(file);
+        }
         self.finish_effect_analysis(program);
         self.warn_unused_imports(program);
     }
@@ -2209,6 +2279,61 @@ impl TypeChecker {
     }
 
     fn check_expr_inner(&mut self, expr: &Expr) -> Type {
+        if let Expr::Var(name, span, _) = expr
+            && self.symbols.lookup_var(name).is_none()
+            && (self.generics.functions.contains_key(name)
+                || self.generics.classes.contains_key(name))
+        {
+            self.generic_error(
+                *span,
+                format!(
+                    "generic declaration `{name}` cannot be used as a value without instantiation"
+                ),
+            );
+            return Self::error_type();
+        }
+
+        let generic_class = match expr {
+            Expr::ObjectLiteral(o) => Some((&o.class, &o.type_args)),
+            Expr::New(n) => Some((&n.class_name, &n.type_args)),
+            Expr::StaticCall(c) => Some((&c.class, &c.type_args)),
+            _ => None,
+        };
+        if let Some((name, args)) = generic_class
+            && let Some(ty) = self.instantiate_class(name, args, expr.span())
+        {
+            let Type::Named(name) = &ty else {
+                return ty;
+            };
+            self.generics.objects.insert(expr.id(), name.clone());
+            let mut concrete = expr.clone();
+            match &mut concrete {
+                Expr::ObjectLiteral(o) => {
+                    o.class = name.clone();
+                    o.type_args.clear();
+                }
+                Expr::New(n) => {
+                    n.class_name = name.clone();
+                    n.type_args.clear();
+                }
+                Expr::StaticCall(c) => {
+                    c.class = name.clone();
+                    c.type_args.clear();
+                }
+                _ => unreachable!(),
+            }
+            return self.check_expr_inner(&concrete);
+        }
+        if let Some((name, args)) = generic_class
+            && !args.is_empty()
+            && matches!(expr, Expr::New(_) | Expr::ObjectLiteral(_))
+        {
+            self.generic_error(
+                expr.span(),
+                format!("class `{name}` is not generic and does not accept type arguments"),
+            );
+        }
+
         match expr {
             Expr::Integer(_, _, _) => Type::I64,
             Expr::Float(_, _, _) => Type::F64,
@@ -2313,6 +2438,15 @@ impl TypeChecker {
                 // `let f = |...| ...; f(...)` as a direct call when a top-level
                 // `fn f` also existed (willow-bv9.1).
                 if let Some(var_info) = self.symbols.lookup_var(&c.callee).cloned() {
+                    if !c.type_args.is_empty() {
+                        self.generic_error(
+                            c.span,
+                            format!(
+                                "function value `{}` does not accept type arguments",
+                                c.callee
+                            ),
+                        );
+                    }
                     match &var_info.ty {
                         // Both callable types are called the same way in source
                         // (willow-0g8j.2.12); they differ only in what codegen
@@ -2363,6 +2497,15 @@ impl TypeChecker {
                     }
                 }
 
+                if let Some(ty) = self.check_generic_call(c) {
+                    return ty;
+                }
+                if !c.type_args.is_empty() {
+                    self.generic_error(
+                        c.span,
+                        format!("function `{}` does not accept type arguments", c.callee),
+                    );
+                }
                 if c.callee == "format" {
                     return self.check_format_call(c);
                 }
@@ -2457,6 +2600,18 @@ impl TypeChecker {
                 self.resolve_static_field_read(&s.class, &s.method, s.span)
             }
             Expr::StaticCall(s) => {
+                let generic_name = format!("{}::{}", s.class, s.method);
+                if self.generics.functions.contains_key(&generic_name)
+                    && let Some(ty) = self.check_generic_call_parts(
+                        &generic_name,
+                        &s.type_args,
+                        &s.args,
+                        s.span,
+                        s.id,
+                    )
+                {
+                    return ty;
+                }
                 self.record_static_builtin_lock_effect(s);
                 let callee = self.static_method_effect_id(&s.class, &s.method);
                 let result = self.resolve_static_call(

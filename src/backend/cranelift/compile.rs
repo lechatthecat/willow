@@ -557,10 +557,23 @@ impl UnitCodegenContext<'_> {
         // (`resolve_class_key`), but an interface has no such scan: left bare in
         // an exported signature, it made every box site in a consumer that did
         // not itself import the interface fall out of the walker's subset.
+        let instantiation_types: HashMap<_, _> = program
+            .instantiation_types
+            .iter()
+            .map(|(alias, info)| (alias.as_str(), info.name()))
+            .collect();
+        let resolve_instantiation = |ty: &crate::parser::ast::Type| {
+            ty.map_names(|name| {
+                instantiation_types
+                    .get(name.as_str())
+                    .map_or_else(|| name.clone(), |name| (*name).to_string())
+            })
+        };
         let qualify_class_type = |ty: &crate::parser::ast::Type| -> crate::parser::ast::Type {
             let ty = qualify_module_local_type(ty, mod_name, &local_signature_type_names);
             let ty = qualify_module_local_type(&ty, canonical_path, &local_enum_names);
-            self.canonical_declared_type(&ty).to_source()
+            self.canonical_declared_type(&resolve_instantiation(&ty))
+                .to_source()
         };
         let module_classes: Vec<(String, ClassDecl)> = program
             .items
@@ -636,10 +649,13 @@ impl UnitCodegenContext<'_> {
                     // identity the tables hold, not the bare local spelling
                     // (willow-sxcp).
                     for param in &mut qualified.params {
-                        param.ty = (self.canonical_declared_type(&param.ty)).to_source();
+                        param.ty = self
+                            .canonical_declared_type(&resolve_instantiation(&param.ty))
+                            .to_source();
                     }
-                    qualified.return_type =
-                        (self.canonical_declared_type(&qualified.return_type)).to_source();
+                    qualified.return_type = self
+                        .canonical_declared_type(&resolve_instantiation(&qualified.return_type))
+                        .to_source();
                     self.func_ids.scope().declare(
                         &mangled,
                         FunctionId::free(&f.name).in_namespace(canonical_path),
@@ -1159,6 +1175,7 @@ impl UnitCodegenContext<'_> {
             },
         };
         let f = FunctionDecl {
+            type_params: Vec::new(),
             name: name.to_string(),
             public: false,
             is_async: false,
@@ -1945,6 +1962,7 @@ impl UnitCodegenContext<'_> {
             let initializer_name =
                 crate::ir::typed_ast::static_initializer_name(class_key, &field.name);
             let initializer = FunctionDecl {
+                type_params: Vec::new(),
                 name: initializer_name.clone(),
                 public: false,
                 is_async: false,

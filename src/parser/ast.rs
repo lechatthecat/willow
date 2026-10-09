@@ -193,6 +193,10 @@ mod type_tree;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Program {
+    /// Compiler-owned nominal identities carried across generic instantiation
+    /// scopes. Synthetic aliases cannot be spelled by source programs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instantiation_types: Vec<(String, crate::semantic::symbols::InstantiationType)>,
     /// Source spelling/position of each explicit type head, recorded once by the parser.
     pub type_uses: Vec<TypeUse>,
     /// Optional `module path;` declaration at the top of the file. The path is
@@ -288,6 +292,8 @@ impl TypePath {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClassDecl {
+    #[serde(default)]
+    pub type_params: Vec<String>,
     pub name: String,
     pub public: bool,
     pub is_open: bool,
@@ -370,6 +376,8 @@ pub struct MethodDecl {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionDecl {
+    #[serde(default)]
+    pub type_params: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rust_bridge: Option<crate::rust_bridge::RustBridgeSymbol>,
     pub name: String,
@@ -956,6 +964,8 @@ pub struct UnaryExpr {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CallExpr {
+    #[serde(default)]
+    pub type_args: Vec<Type>,
     pub id: ExprId,
     pub callee: String,
     pub args: Vec<CallArg>,
@@ -995,6 +1005,8 @@ impl StaticCallExpr {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ObjectLiteralExpr {
+    #[serde(default)]
+    pub type_args: Vec<Type>,
     pub id: ExprId,
     pub class: String,
     pub fields: Vec<ObjectLiteralField>,

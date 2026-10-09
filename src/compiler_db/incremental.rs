@@ -983,6 +983,7 @@ impl QueryProvider for SyntaxProvider<'_> {
                         }
                         Err(diagnostics) => (
                             Program {
+                                instantiation_types: Vec::new(),
                                 type_uses: vec![],
                                 module: None,
                                 imports: vec![],

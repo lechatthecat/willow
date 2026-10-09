@@ -738,6 +738,129 @@ fn run_frontend_revision(
         &diagnostic_modules,
         emitter,
     )?;
+    let has_generics = |p: &parser::ast::Program| {
+        p.items.iter().any(|i| match i {
+            parser::ast::Item::Function(f) => !f.type_params.is_empty(),
+            parser::ast::Item::Class(c) => !c.type_params.is_empty(),
+            _ => false,
+        })
+    };
+    if has_generics(&program) || graph.files.iter().any(|m| has_generics(&m.program)) {
+        let storage = graph.artifacts.take().expect("spooled imports");
+        let registry = std::rc::Rc::new(std::cell::RefCell::new(
+            semantic::type_checker::generics::TemplateRegistry::default(),
+        ));
+        for module in &graph.files {
+            std::rc::Rc::make_mut(&mut registry.borrow_mut().module_paths)
+                .insert(module.id.file_id(), module.identity_path().to_string());
+        }
+        // Retain only generic templates. Ordinary executable trees stay in
+        // their body artifacts and are hydrated one source unit at a time.
+        for (shell, file) in graph
+            .files
+            .iter()
+            .map(|m| (&m.program, m.id.file_id()))
+            .chain(std::iter::once((&program, diagnostics::FileId::ENTRY)))
+        {
+            if !has_generics(shell) {
+                continue;
+            }
+            let source = storage.hydrate(shell, file)?;
+            for item in &source.items {
+                match item {
+                    parser::ast::Item::Function(f) if !f.type_params.is_empty() => {
+                        registry.borrow_mut().intern_function(f);
+                    }
+                    parser::ast::Item::Class(c) if !c.type_params.is_empty() => {
+                        registry.borrow_mut().intern_class(c);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let dependencies =
+            ModuleDependencies::with_packages(&graph.files, inputs.package_graph.as_deref());
+        let mut checkers = Vec::new();
+        let mut owners = std::collections::HashMap::new();
+        for module in &graph.files {
+            let mut checker = semantic::TypeChecker::new();
+            checker.generics.registry = std::rc::Rc::clone(&registry);
+            checker.capture_generic_call_targets();
+            checker.set_enforce_send_sync(inputs.options.enforce_send_sync);
+            register_prelude(&mut checker)?;
+            register_module_imports_with_closure(
+                &mut checker,
+                &module.program,
+                &graph.files,
+                &dependencies,
+                None,
+            );
+            checker.set_module_path(module.identity_path());
+            checker.set_class_module_path(module.registration_name());
+            let source = storage.hydrate(&module.program, module.id.file_id())?;
+            checker.check_module_program(&source);
+            owners.insert(module.id.file_id(), checkers.len());
+            checkers.push(storage.track(UnitKind::Checker, checker));
+        }
+        let entry = checkers.len();
+        owners.insert(diagnostics::FileId::ENTRY, entry);
+        {
+            let body = storage.hydrate(&program, diagnostics::FileId::ENTRY)?;
+            checkers.push(
+                typecheck_phase_with_generics(
+                    &body,
+                    &graph.files,
+                    &storage,
+                    &inputs.options,
+                    None,
+                    Some(std::rc::Rc::clone(&registry)),
+                )?
+                .checker,
+            );
+        }
+        let mut pending = std::collections::VecDeque::new();
+        for checker in &mut checkers {
+            pending.append(&mut checker.generics.pending);
+        }
+        let mut seen = std::collections::HashSet::new();
+        while let Some(item) = pending.pop_front() {
+            let (file, name, kind) = match &item.item {
+                parser::ast::Item::Function(f) => (f.span.file_id, f.name.clone(), 0u8),
+                parser::ast::Item::Class(c) => (c.span.file_id, c.name.clone(), 1u8),
+                _ => unreachable!(),
+            };
+            if !seen.insert((file, name, kind)) {
+                continue;
+            }
+            anyhow::ensure!(
+                seen.len() <= 4096,
+                "generic instantiation limit exceeded (possible polymorphic recursion)"
+            );
+            let checker = &mut checkers[owners[&file]];
+            checker.check_generic_instance(item);
+            pending.append(&mut checker.generics.pending);
+        }
+        graph.artifacts = Some(storage);
+        let mut errors = 0;
+        for checker in &checkers {
+            emit_frontend_diagnostics(&checker.errors, map, &graph, &diagnostic_modules, emitter)?;
+            errors += diagnostic_error_count(&checker.errors);
+        }
+        anyhow::ensure!(errors == 0, "generic checking failed ({errors} errors)");
+        let mut storage = graph.artifacts.take().expect("generic source artifacts");
+        let mut fresh_ids = semantic::type_checker::generics::FreshIds::default();
+        for (index, module) in graph.files.iter_mut().enumerate() {
+            let mut source = storage.hydrate(&module.program, module.id.file_id())?;
+            checkers[index].expand_generics(&mut source, &mut fresh_ids);
+            storage.offload(&mut source)?;
+            module.program = source.into_inner();
+        }
+        let mut body = storage.hydrate(&program, diagnostics::FileId::ENTRY)?;
+        checkers[entry].expand_generics(&mut body, &mut fresh_ids);
+        storage.offload(&mut body)?;
+        program = body.into_inner();
+        graph.artifacts = Some(storage);
+    }
     let mut artifacts = graph.artifacts.take().expect("spooled import graph");
     if let Some(packages) = &inputs.package_graph {
         let package = packages.get(packages.root).expect("root package");
@@ -986,8 +1109,25 @@ fn typecheck_phase(
     options: &CompilerOptions,
     queries: Option<&compiler_db::CompilerDb>,
 ) -> Result<TypecheckPhase> {
+    typecheck_phase_with_generics(program, modules, artifacts, options, queries, None)
+}
+
+fn typecheck_phase_with_generics(
+    program: &parser::ast::Program,
+    modules: &[module::ResolvedModule],
+    artifacts: &UnitArtifacts,
+    options: &CompilerOptions,
+    queries: Option<&compiler_db::CompilerDb>,
+    registry: Option<
+        std::rc::Rc<std::cell::RefCell<semantic::type_checker::generics::TemplateRegistry>>,
+    >,
+) -> Result<TypecheckPhase> {
     let db = queries;
     let mut checker = semantic::TypeChecker::new();
+    if let Some(registry) = registry {
+        checker.generics.registry = registry;
+        checker.capture_generic_call_targets();
+    }
     if let Some(db) = queries {
         checker = checker.with_sync_stack_preemption(db.inputs().target.sync_stack_preemption);
         checker.set_effect_queries(std::rc::Rc::clone(&db.effects), module::UnitId::ENTRY);
@@ -1082,6 +1222,7 @@ fn check_module(
     let needed = dependencies.unit_closure(module.id, artifacts)?;
     register_module_imports_with_closure(&mut checker, body, modules, dependencies, Some(&needed));
     checker.set_module_path(module.identity_path());
+    checker.set_class_module_path(module.registration_name());
     checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
         body,
         modules,
@@ -1423,6 +1564,7 @@ mod diagnostic_emission_tests {
                     path: format!("m{i}.wi").into(),
                     source: "é".into(),
                     program: parser::ast::Program {
+                        instantiation_types: Vec::new(),
                         type_uses: Vec::new(),
                         module: None,
                         imports: vec![],
@@ -1502,6 +1644,7 @@ mod diagnostic_emission_tests {
             path: "helper.wi".into(),
             source: "é".into(),
             program: parser::ast::Program {
+                instantiation_types: Vec::new(),
                 type_uses: Vec::new(),
                 module: None,
                 imports: vec![],

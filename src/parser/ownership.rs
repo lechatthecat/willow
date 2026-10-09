@@ -440,7 +440,7 @@ clone_shell_struct!(UnaryExpr {
     syntax: [expr]
 });
 clone_shell_struct!(CallExpr {
-    metadata: [id, callee, span],
+    metadata: [id, callee, type_args, span],
     syntax: [args]
 });
 clone_shell_struct!(MethodCallExpr {
@@ -456,7 +456,7 @@ clone_shell_struct!(NewExpr {
     syntax: [args]
 });
 clone_shell_struct!(ObjectLiteralExpr {
-    metadata: [id, class, span],
+    metadata: [id, class, type_args, span],
     syntax: [fields]
 });
 clone_shell_struct!(ObjectLiteralField {

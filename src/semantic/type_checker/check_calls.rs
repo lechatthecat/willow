@@ -788,7 +788,18 @@ impl TypeChecker {
         let Some(place) = self.reference_place_info(&arg.expr, arg.span) else {
             return;
         };
+        self.check_reference_argument_place(param, arg, require_mutable, place);
+    }
 
+    /// Validate a place already checked during generic argument inference.
+    /// Reusing it avoids rechecking index expressions and their nested calls.
+    pub(super) fn check_reference_argument_place(
+        &mut self,
+        param: &ParamInfo,
+        arg: &CallArg,
+        require_mutable: bool,
+        place: ReferencePlaceInfo,
+    ) {
         if require_mutable && let Some(reason) = place.immutable_reason {
             self.push(
                 Diagnostic::new(Severity::Error, ErrorCode::E1701, reason)

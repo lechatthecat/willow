@@ -49,6 +49,11 @@ impl<T> std::ops::Deref for LiveUnit<T> {
         &self.value
     }
 }
+impl<T> std::ops::DerefMut for LiveUnit<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
 pub(crate) struct UnitLease {
     metrics: Rc<RefCell<UnitMetrics>>,
     kind: UnitKind,

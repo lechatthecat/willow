@@ -15,3 +15,5 @@ pub use type_checker::TypeChecker;
 pub(crate) mod analysis_symbols;
 
 pub(crate) mod scopes;
+
+pub(crate) mod generic_inference;

@@ -405,6 +405,13 @@ impl LirEnumDef {
     }
 }
 
+#[derive(Default)]
+struct SupportedTypes {
+    seen_types: HashSet<Type>,
+    /// Generic definitions currently traversed, with their validated arity.
+    active_enums: HashMap<TypeId, usize>,
+}
+
 /// The program facts eligibility needs beyond the lowered IR itself: which
 /// named types are classes the walker can lay out, which symbols exist, and
 /// what those symbols' signatures are. Built from the compiler's registration
@@ -712,11 +719,11 @@ impl LirTypeCtx<'_> {
     /// interface's DATA: `class_layout_of` answers `None` for an interface, so
     /// every field access and every `new` whose type is one is still rejected.
     pub(super) fn supported_type(&self, ty: &Type) -> bool {
-        let mut open = HashSet::new();
+        let mut open = SupportedTypes::default();
         self.supported_type_inner(ty, &mut open)
     }
 
-    fn supported_type_inner(&self, ty: &Type, open: &mut HashSet<Type>) -> bool {
+    fn supported_type_inner(&self, ty: &Type, open: &mut SupportedTypes) -> bool {
         match ty {
             Type::Array(elem) => {
                 !matches!(**elem, Type::Void) && self.supported_type_inner(elem, open)
@@ -884,29 +891,56 @@ impl LirTypeCtx<'_> {
     /// emission, from the same instantiated type vetted here, so validation and
     /// emission always pick the same representation.
     pub(super) fn supported_enum_type(&self, ty: &Type) -> bool {
-        let mut open = HashSet::new();
+        let mut open = SupportedTypes::default();
         self.supported_enum_inner(ty, &mut open)
     }
 
-    fn supported_enum_inner(&self, ty: &Type, open: &mut HashSet<Type>) -> bool {
+    fn supported_enum_inner(&self, ty: &Type, open: &mut SupportedTypes) -> bool {
+        // Validate the concrete arguments even when this definition is already
+        // active. In particular Option<Option<unsupported>> cannot use the
+        // outer Option's marker to hide its unsupported inner argument.
+        let active_definition = if let Type::Generic(name, args) = ty {
+            if !args.iter().all(|arg| self.supported_type_inner(arg, open)) {
+                return false;
+            }
+            if let Some(arity) = open.active_enums.get(name) {
+                // Check arity without substituting the recursive definition's
+                // payloads again. Their concrete arguments were vetted above.
+                return args.len() == *arity;
+            }
+            if open.seen_types.contains(ty) {
+                return true;
+            }
+            Some((*name, args.len()))
+        } else {
+            None
+        };
         let Some((_, def)) = self.enum_instance(ty) else {
             return false;
         };
-        // A self- or mutually-referential payload (`enum List { Cons(i64,
-        // List), Nil }`) is fine — the payload slot is one word either way —
-        // but must not recurse forever. The key is the INSTANTIATED type, so
-        // `enum List<T> { Cons(T, List<T>), Nil }` at `List<i64>` closes the
-        // cycle on itself while `Option<Option<i64>>` still walks its inner
-        // type. Same guard, and the same shared `open` set, as the class walk
-        // below.
-        if !open.insert(ty.clone()) {
+        // Enum references occupy one payload word. Changing recursive type
+        // arguments (`Grow<T> -> Grow<Array<T>>`) therefore need not expand
+        // the same definition forever. The definition entry is active only
+        // along this path; sibling instantiations still vet their own payloads.
+        // Keep exact successful types as memo entries for repeated siblings.
+        if !open.seen_types.insert(ty.clone()) {
             return true;
         }
-        def.variants.iter().all(|v| {
+        if let Some((name, arity)) = active_definition {
+            open.active_enums.insert(name, arity);
+        }
+        let supported = def.variants.iter().all(|v| {
             v.payloads
                 .iter()
                 .all(|t| self.supported_type_inner(t, open))
-        })
+        });
+        if let Some((name, _)) = active_definition {
+            open.active_enums.remove(&name);
+        }
+        if !supported {
+            open.seen_types.remove(ty);
+        }
+        supported
     }
 
     /// A class the walker can emit: it has a registered field layout, is not an
@@ -930,7 +964,7 @@ impl LirTypeCtx<'_> {
         &self,
         name: &Q,
     ) -> bool {
-        let mut open = HashSet::new();
+        let mut open = SupportedTypes::default();
         self.supported_class_inner(&name.type_id(), &mut open)
     }
 
@@ -942,7 +976,7 @@ impl LirTypeCtx<'_> {
         resolve_class_key(self.classes, self.known_modules, self.visible_modules, name)
     }
 
-    fn supported_class_inner(&self, name: &TypeId, open: &mut HashSet<Type>) -> bool {
+    fn supported_class_inner(&self, name: &TypeId, open: &mut SupportedTypes) -> bool {
         if (self.is_interface)(name) || self.is_enum(name) {
             return false;
         }
@@ -956,7 +990,7 @@ impl LirTypeCtx<'_> {
         // is fine — it is the same layout — but must not recurse forever. Keyed
         // on the resolved name, so the bare and qualified spellings of one
         // class close the same cycle.
-        if !open.insert(Type::Named(key)) {
+        if !open.seen_types.insert(Type::Named(key)) {
             return true;
         }
         layout
@@ -10931,6 +10965,7 @@ mod tests {
     #[test]
     fn eligibility_operator_positions_preserve_leaf_validation() {
         let program = crate::parser::ast::Program {
+            instantiation_types: Vec::new(),
             type_uses: Vec::new(),
             module: None,
             imports: vec![],
@@ -11023,6 +11058,7 @@ mod tests {
     #[test]
     fn operator_rejection_preserves_first_child_and_parent_fallback() {
         let program = crate::parser::ast::Program {
+            instantiation_types: Vec::new(),
             type_uses: Vec::new(),
             module: None,
             imports: vec![],
@@ -11072,6 +11108,7 @@ mod tests {
             .stack_size(1024 * 1024)
             .spawn(|| {
                 let program = crate::parser::ast::Program {
+                    instantiation_types: Vec::new(),
                     type_uses: Vec::new(),
                     module: None,
                     imports: vec![],
@@ -13894,6 +13931,99 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
                 };
             }";
         assert!(eligible_checked(generic_interface, "f", &[]));
+    }
+
+    #[test]
+    fn generic_enum_changing_recursive_arguments_are_opaque_references() {
+        let source =
+            "import std::collections::Array; enum Grow<T> { End, Next(Grow<Array<T>>) } fn f() {}";
+        let (_, tables) = checked_lowering(source, &[]);
+        tables.with_ctx(|ctx| {
+            assert!(ctx.supported_enum_type(&Type::Generic("Grow".into(), vec![Type::I64])));
+            assert!(!ctx.supported_enum_type(&Type::Named("Grow".into())));
+            assert!(!ctx.supported_enum_type(&Type::Generic("Grow".into(), vec![])));
+        });
+    }
+
+    #[test]
+    fn generic_enum_active_definition_does_not_hide_unsupported_arguments() {
+        let (_, tables) = checked_lowering("fn f() {}", &[]);
+        tables.with_ctx(|ctx| {
+            let bad = Type::Generic(
+                "Option".into(),
+                vec![Type::Generic(
+                    "Option".into(),
+                    vec![Type::Named("Missing".into())],
+                )],
+            );
+            let mut open = SupportedTypes {
+                active_enums: HashMap::from([("Option".into(), 1)]),
+                ..SupportedTypes::default()
+            };
+            assert!(!ctx.supported_enum_inner(&bad, &mut open));
+            assert!(!ctx.supported_enum_inner(&Type::Generic("Option".into(), vec![]), &mut open));
+        });
+    }
+
+    #[test]
+    fn generic_enum_sibling_instantiations_validate_each_payload() {
+        let (_, tables) = checked_lowering(
+            "import std::collections::Array; enum Items<T> { Values(Array<T>) } fn f() {}",
+            &[],
+        );
+        tables.with_ctx(|ctx| {
+            let mut open = SupportedTypes::default();
+            assert!(
+                ctx.supported_enum_inner(
+                    &Type::Generic("Items".into(), vec![Type::I64]),
+                    &mut open
+                )
+            );
+            assert!(!open.active_enums.contains_key(&TypeId::from("Items")));
+            // Void itself is supported, but Array<void> is not: this checks
+            // payload validation rather than only validation of arguments.
+            assert!(
+                !ctx.supported_enum_inner(
+                    &Type::Generic("Items".into(), vec![Type::Void]),
+                    &mut open
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn generic_enum_recursive_fanout_looks_up_definition_once() {
+        for count in [1, 16, 256] {
+            let variants: String = (0..count)
+                .map(|index| format!(", Next{index}(Grow<Array<T>> )"))
+                .collect();
+            let source = format!(
+                "import std::collections::Array; enum Grow<T> {{ End{variants} }} fn f() {{}}"
+            );
+            let (_, tables) = checked_lowering(&source, &[]);
+            tables.with_ctx(|base| {
+                let lookups = std::cell::Cell::new(0usize);
+                let enum_def = |name: &TypeId| {
+                    lookups.set(lookups.get() + 1);
+                    (base.enum_def)(name)
+                };
+                let ctx = LirTypeCtx {
+                    enum_def: &enum_def,
+                    ..*base
+                };
+                assert!(ctx.supported_enum_type(&Type::Generic("Grow".into(), vec![Type::I64])));
+                assert_eq!(lookups.get(), 1, "recursive payloads={count}");
+                eprintln!(
+                    "WILLOW_GENERIC_AUDIT {}",
+                    serde_json::json!({
+                        "case": "enum_recursion",
+                        "variants": count + 1,
+                        "recursive_payloads": count,
+                        "lookups": lookups.get(),
+                    })
+                );
+            });
+        }
     }
 
     // m04. `Option<T>` over a scalar is the ordinary `[tag | payload]` heap

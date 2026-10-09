@@ -353,7 +353,10 @@ fn scalar(
         HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) | HirExprKind::Str(_) | HirExprKind::FnRef(_) => true,
         HirExprKind::ReferenceArg { place } => matches!(place.kind, HirExprKind::Var(_) | HirExprKind::FieldAccess { .. } | HirExprKind::Index { .. }),
         HirExprKind::New { class, args } => constructor_supported(class, args, callables),
-        HirExprKind::ObjectLiteral { class, fields } => class_fields(class, callables).is_some_and(|declared| declared.len() == fields.len() && declared.iter().all(|(name, _)| fields.iter().filter(|(field, _)| field == name).count() == 1)),
+        HirExprKind::ObjectLiteral { class, fields } => class_fields(class, callables).is_some_and(|declared| {
+            let names: std::collections::HashSet<_> = fields.iter().map(|(name, _)| name).collect();
+            declared.len() == fields.len() && names.len() == fields.len() && declared.iter().all(|(name, _)| names.contains(name))
+        }),
         HirExprKind::StaticField { class, field } => enum_payloads(class, field, &node.ty, callables).is_some_and(|payloads| payloads.is_empty())
             || static_field(class, field, callables),
         HirExprKind::StaticCall { class, method, args } => enum_payloads(class, method, &node.ty, callables).is_some_and(|payloads| payloads.len() == args.len() && payloads.iter().zip(args).all(|(target, value)| argument_coercible(target, value, &callables.resolution))) || static_call(class, method, args, &node.ty, callables),

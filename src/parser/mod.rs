@@ -241,6 +241,7 @@ impl Parser {
         items.extend(arities.into_iter().map(tuples::declaration));
         (
             Program {
+                instantiation_types: Vec::new(),
                 type_uses: std::mem::take(&mut self.type_uses),
                 module,
                 imports,

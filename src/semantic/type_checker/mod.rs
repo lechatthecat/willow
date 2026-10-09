@@ -6,6 +6,7 @@ mod check_collections;
 mod check_concurrency;
 mod check_decls;
 mod check_lambda_match;
+pub(crate) mod generics;
 pub use check_lambda_match::LambdaCapture;
 mod check_ops;
 #[cfg(test)]
@@ -64,6 +65,8 @@ pub struct ResolutionContext {
     /// so one enum has ONE name in every unit that can see it. `None` for the
     /// entry program, whose declarations are already unique build-wide.
     pub(crate) module_path: Option<String>,
+    /// Build registration spelling used by class layouts and methods.
+    pub(crate) class_module_path: Option<String>,
     task_sync_preemption: bool,
     /// Names introduced by imports (module access names and item-import locals),
     /// used to reject local declarations that collide with an import. The span
@@ -112,6 +115,7 @@ pub struct ResolutionContext {
 }
 
 pub struct TypeChecker {
+    pub(crate) generics: generics::Generics,
     // Declaration-epoch caches: cleared before registering each program.
     marker_contracts: HashMap<String, Option<send_sync::Marker>>,
     marker_contract_proven: HashSet<(Type, send_sync::Marker)>,
@@ -284,6 +288,7 @@ impl TypeChecker {
         let resolution = std::rc::Rc::new(ResolutionContext {
             entry_program: false,
             module_path: None,
+            class_module_path: None,
             task_sync_preemption: crate::compiler_db::inputs::TargetCapabilities::native()
                 .sync_stack_preemption,
             imported_names: HashMap::new(),
@@ -307,6 +312,7 @@ impl TypeChecker {
 
     fn empty(resolution: std::rc::Rc<ResolutionContext>, symbols: SymbolTable) -> Self {
         Self {
+            generics: generics::Generics::default(),
             marker_contracts: HashMap::new(),
             marker_contract_proven: HashSet::new(),
             resolution,
@@ -351,8 +357,16 @@ impl TypeChecker {
     /// Name the module whose items this checker is about to check
     /// (willow-itcw), so its own declarations get a canonical identity. Call
     /// before `check_module_program`; the entry program leaves it unset.
+    pub(crate) fn capture_generic_call_targets(&mut self) {
+        self.capture_call_sites = true;
+    }
+
     pub fn set_module_path(&mut self, path: &str) {
         self.module_path = Some(path.to_string());
+    }
+
+    pub(crate) fn set_class_module_path(&mut self, path: &str) {
+        self.class_module_path = Some(path.to_string());
     }
 
     /// Enable the Send/Sync async checks. Turned on when targeting multi-worker
@@ -446,6 +460,22 @@ impl TypeChecker {
     }
 
     fn normalize_type(&mut self, ty: &Type, span: Span) -> Type {
+        if let Type::Generic(name, args) = ty
+            && let Some(concrete) = self.instantiate_class(name, args, span)
+        {
+            self.normalized_types.insert(ty.clone(), concrete.clone());
+            return concrete;
+        }
+        if let Type::Named(name) = ty
+            && self.generics.classes.contains_key(name)
+        {
+            self.generic_error(
+                span,
+                format!("generic class `{name}` requires explicit type arguments"),
+            );
+            return Self::error_type();
+        }
+
         // Declaration parameters shadow module types, including enum names
         // predeclared before registration. Preserve them for substitution.
         if let Type::Named(name) = ty
@@ -469,6 +499,13 @@ impl TypeChecker {
     }
 
     fn normalize_type_inner(&mut self, ty: &Type, span: Span) -> Type {
+        // Instantiation aliases preserve the caller's scope until checked HIR
+        // and backend signatures resolve the carried nominal declaration.
+        if let Type::Named(name) = ty
+            && name.starts_with("$type$mono$")
+        {
+            return ty.clone();
+        }
         match ty {
             Type::Array(element) => {
                 Type::Array(Box::new(self.normalize_type(element.as_ref(), span)))
@@ -490,7 +527,14 @@ impl TypeChecker {
                 if let Some((module, item)) = self.resolve_imported_std_module_item(name, span) {
                     return self.normalize_std_type_item(name, &module, &item, args, span);
                 }
-                Type::Generic(self.canonical_type_name(name), args)
+                Type::Generic(
+                    if name.starts_with("$type$mono$") {
+                        name.clone()
+                    } else {
+                        self.canonical_type_name(name)
+                    },
+                    args,
+                )
             }
             Type::Named(name) => {
                 if self.imported_collection_aliases.contains_key(name) {
@@ -8273,6 +8317,7 @@ mod continuation_depth_tests {
                 for index in 0..50_000 {
                     expression = if index % 2 == 0 {
                         Expr::Call(Box::new(CallExpr {
+                            type_args: Vec::new(),
                             id: ExprId::fresh(),
                             callee: "id".into(),
                             args: vec![CallArg::value(expression)],

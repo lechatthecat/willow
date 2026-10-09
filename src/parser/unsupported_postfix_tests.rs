@@ -122,7 +122,7 @@ fn unsupported_postfix_token_reads_scale_linearly() {
 }
 
 #[test]
-fn ticket_42_generic_functions_and_recovery() {
+fn generic_functions_accept_parameters_and_recover_malformed_lists() {
     for modifiers in ["", "pub ", "async ", "pub async "] {
         for parameters in ["T", "T, U", "Element", "T: Bound", ""] {
             let source = format!(
@@ -130,15 +130,22 @@ fn ticket_42_generic_functions_and_recovery() {
             );
             let (program, diagnostics) =
                 Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
-            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
-            assert!(
-                diagnostics[0]
-                    .message
-                    .contains("generic functions are not supported yet")
-            );
-            assert!(diagnostics[0].helps[0].contains("take3"));
-            let span = diagnostics[0].primary_span().unwrap();
-            assert_eq!(&source[span.start..span.end], "<");
+            if matches!(parameters, "T: Bound" | "") {
+                assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+                assert_eq!(program.items.len(), 1, "{source}");
+            } else {
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+                assert_eq!(program.items.len(), 2);
+                let Item::Function(function) = &program.items[0] else {
+                    panic!("expected generic function: {source}");
+                };
+                assert_eq!(
+                    function.type_params,
+                    parameters.split(", ").collect::<Vec<_>>()
+                );
+                assert_eq!(function.public, modifiers.contains("pub"));
+                assert_eq!(function.is_async, modifiers.contains("async"));
+            }
             assert!(
                 program.items.iter().any(
                     |item| matches!(item, Item::Function(f) if f.name == "main" && f.is_async)
@@ -202,7 +209,7 @@ fn ticket_42_recovery_reads_scale_linearly() {
 }
 
 #[test]
-fn ticket_60_generic_classes_and_recovery() {
+fn generic_classes_accept_parameters_and_recover_malformed_lists() {
     for modifiers in ["", "pub ", "open ", "pub open "] {
         for header in [
             "<T>",
@@ -216,17 +223,33 @@ fn ticket_60_generic_classes_and_recovery() {
             );
             let (program, diagnostics) =
                 Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
-            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
-            assert_eq!(
-                diagnostics[0].message,
-                "generic classes are not supported yet (willow-b06l)"
-            );
-            assert_eq!(diagnostics[0].code, ErrorCode::E0102);
-            let span = diagnostics[0].primary_span().unwrap();
-            assert_eq!(&source[span.start..span.end], "<");
-            assert_eq!(program.items.len(), 1);
+            if matches!(header, "<>" | "<T: Bound>") {
+                assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+                assert_eq!(program.items.len(), 1);
+            } else {
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+                assert_eq!(program.items.len(), 2);
+                let Item::Class(class) = &program.items[0] else {
+                    panic!("expected generic class: {source}");
+                };
+                assert_eq!(
+                    class.type_params,
+                    if header == "<T, U>" {
+                        vec!["T", "U"]
+                    } else {
+                        vec!["T"]
+                    }
+                );
+                assert_eq!(class.public, modifiers.contains("pub"));
+                assert_eq!(class.is_open, modifiers.contains("open"));
+                assert_eq!(class.base_class.is_some(), header.contains("extends"));
+                assert_eq!(
+                    class.implements.len(),
+                    usize::from(header.contains("implements"))
+                );
+            }
             assert!(
-                matches!(&program.items[0], Item::Function(f) if f.name == "following" && f.public)
+                matches!(program.items.last(), Some(Item::Function(f)) if f.name == "following" && f.public)
             );
         }
     }
@@ -245,7 +268,7 @@ fn ticket_60_supported_interfaces_and_classes() {
 }
 
 #[test]
-fn ticket_60_truncated_generic_class() {
+fn truncated_generic_class_remains_a_syntax_error() {
     for source in [
         "class Box<T>",
         "class Box<",
@@ -253,15 +276,12 @@ fn ticket_60_truncated_generic_class() {
     ] {
         let diagnostics = errors(source);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(
-            diagnostics[0].message,
-            "generic classes are not supported yet (willow-b06l)"
-        );
+        assert_eq!(diagnostics[0].severity, Severity::Error);
     }
 }
 
 #[test]
-fn ticket_60_recovery_reads_scale_linearly() {
+fn generic_class_token_reads_scale_linearly() {
     for shape in ["declarations", "depth", "members"] {
         let mut samples = Vec::new();
         for count in [8, 16, 32, 64] {
@@ -275,10 +295,7 @@ fn ticket_60_recovery_reads_scale_linearly() {
                 _ => format!("class Box<T> {{ {} }}", "pub fn get(self) {}".repeat(count)),
             };
             PARSER_TOKEN_READS.with(|v| v.set(0));
-            assert_eq!(
-                errors(&source).len(),
-                if shape == "declarations" { count } else { 1 }
-            );
+            assert!(errors(&source).is_empty());
             samples.push((count, PARSER_TOKEN_READS.with(|v| v.get())));
         }
         let slope = (samples[1].1 - samples[0].1) / 8;
@@ -303,16 +320,28 @@ fn ticket_60_following_item_boundaries() {
         let tokens = Lexer::new(following).tokenize().unwrap();
         let (expected, errors) = Parser::new(tokens).parse();
         assert!(errors.is_empty());
-        let source = format!("class Box<T> {{}} {following}");
-        let (actual, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
-        assert_eq!(errors.len(), 1);
-        assert_eq!(actual.items.len(), expected.items.len());
-        if let Item::Class(class) = &actual.items[0] {
-            assert_eq!(class.is_open, following.contains("open"));
+        for malformed in [false, true] {
+            let header = if malformed { "<T: Bound>" } else { "<T>" };
+            let source = format!("class Box{header} {{}} {following}");
+            let (actual, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            assert_eq!(errors.len(), usize::from(malformed), "{source}: {errors:?}");
+            let offset = usize::from(!malformed);
+            assert_eq!(actual.items.len(), expected.items.len() + offset);
+            match (&actual.items[offset], &expected.items[0]) {
+                (Item::Class(class), Item::Class(expected)) => {
+                    assert_eq!(class.is_open, expected.is_open);
+                    assert_eq!(class.public, expected.public);
+                }
+                (Item::Function(function), Item::Function(expected)) => {
+                    assert_eq!(function.is_async, expected.is_async);
+                    assert_eq!(function.public, expected.public);
+                }
+                _ => {}
+            }
+            assert_eq!(
+                std::mem::discriminant(&actual.items[offset]),
+                std::mem::discriminant(&expected.items[0])
+            );
         }
-        assert_eq!(
-            std::mem::discriminant(&actual.items[0]),
-            std::mem::discriminant(&expected.items[0])
-        );
     }
 }

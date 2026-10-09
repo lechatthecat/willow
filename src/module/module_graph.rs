@@ -280,6 +280,7 @@ mod tests {
 
     fn empty_program() -> crate::parser::ast::Program {
         crate::parser::ast::Program {
+            instantiation_types: Vec::new(),
             type_uses: Vec::new(),
             module: None,
             imports: vec![],

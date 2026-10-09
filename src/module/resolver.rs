@@ -570,6 +570,7 @@ fn resolve_one(
                             module_path,
                             source,
                             Program {
+                                instantiation_types: Vec::new(),
                                 type_uses: Vec::new(),
                                 module: None,
                                 imports: vec![],

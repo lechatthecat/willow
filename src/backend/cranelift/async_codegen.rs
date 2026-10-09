@@ -905,6 +905,7 @@ impl UnitCodegenContext<'_> {
         self.output.module.clear_context(&mut ctx);
 
         let poll_decl = FunctionDecl {
+            type_params: Vec::new(),
             name: format!("{class_name}::{}", m.name),
             public: m.public,
             is_async: true,

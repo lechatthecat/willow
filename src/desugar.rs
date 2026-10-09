@@ -1028,7 +1028,9 @@ fn inject_default_interface_methods(
     // type-checked once at the interface level (check_interface), so the injected
     // class copy is marked to be skipped there. A default inherited from another
     // module's interface is NOT checked at the interface level here, so its class
-    // copy stays checkable (willow-1js.7).
+    // copy stays checkable except in a generic class, whose preserved template
+    // body reuses the defining interface checker (willow-1js.7).
+
     let own_iface_names: HashSet<String> = program
         .items
         .iter()
@@ -1204,11 +1206,6 @@ fn inject_default_interface_methods(
                         return_type: subst_iface_type(&dm.return_type, &subst),
                         body: body.clone(),
                         span: dm.span,
-                        // Non-generic default bodies of an interface declared
-                        // in THIS program are checked once at the interface
-                        // level (skipped on the class to avoid duplicate
-                        // diagnostics); generic ones and cross-module ones need
-                        // the (substituted) copy checked here (willow-1js.7).
                         is_default_injected: type_params.is_empty()
                             && own_iface_names.contains(iface_name),
                         is_interface_default: true,

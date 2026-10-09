@@ -30,6 +30,48 @@ impl TypeChecker {
     }
 
     pub(super) fn check_object_literal(&mut self, literal: &ObjectLiteralExpr) -> Type {
+        if literal.class.contains("$mono$")
+            && let Some(info) = self.symbols.lookup_class(&literal.class).cloned()
+        {
+            if info.constructor.is_some() || info.base_class.is_some() {
+                self.generic_error(
+                    literal.span,
+                    "object literal requires a class with an implicit memberwise constructor",
+                );
+            }
+            let mut seen = std::collections::HashSet::new();
+            for field in &literal.fields {
+                if !seen.insert(&field.name) {
+                    self.generic_error(field.span, format!("duplicate field `{}`", field.name));
+                }
+                if let Some(expected) = info.fields.get(&field.name) {
+                    let actual = self.check_expr_expecting(&field.value, &expected.ty);
+                    if !self.types_compatible(&expected.ty, &actual) {
+                        self.generic_error(
+                            field.span,
+                            format!("field `{}` has incompatible type", field.name),
+                        );
+                    }
+                    if !expected.public
+                        && self.local.current_class.as_deref() != Some(literal.class.as_str())
+                    {
+                        self.generic_error(
+                            field.span,
+                            format!("field `{}` is private", field.name),
+                        );
+                    }
+                } else {
+                    self.check_expr(&field.value);
+                    self.generic_error(field.span, format!("unknown field `{}`", field.name));
+                }
+            }
+            for name in info.fields.keys() {
+                if !seen.contains(name) {
+                    self.generic_error(literal.span, format!("missing field `{name}`"));
+                }
+            }
+            return Type::Named(literal.class.clone());
+        }
         for field in &literal.fields {
             self.check_expr(&field.value);
         }

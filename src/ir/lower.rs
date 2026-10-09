@@ -3498,10 +3498,12 @@ mod tests {
                         }));
                     }
                     let program = Program {
+                        instantiation_types: Vec::new(),
                         type_uses: Vec::new(),
                         module: None,
                         imports: vec![],
                         items: vec![Item::Function(FunctionDecl {
+                            type_params: Vec::new(),
                             name: "main".into(),
                             public: false,
                             is_async: false,

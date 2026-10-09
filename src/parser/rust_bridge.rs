@@ -63,6 +63,7 @@ impl Parser {
                 );
                 symbol.close_handle = true;
                 items.push(Item::Function(FunctionDecl {
+                    type_params: Vec::new(),
                     name: close_name,
                     public: true,
                     is_async: false,
@@ -124,6 +125,7 @@ impl Parser {
             self.expect(TokenKind::Semicolon)?;
             let span = span.to(self.previous_span());
             items.push(Item::Function(FunctionDecl {
+                type_params: Vec::new(),
                 rust_bridge: Some(RustBridgeSymbol::new(name.clone(), inputs, output)),
                 name,
                 public: true,

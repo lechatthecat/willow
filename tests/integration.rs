@@ -301,3 +301,6 @@ mod if_expressions;
 
 #[path = "integration/frozen_iteration.rs"]
 mod frozen_iteration;
+
+#[path = "integration/user_generics.rs"]
+mod user_generics;

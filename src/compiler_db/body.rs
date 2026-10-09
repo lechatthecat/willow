@@ -970,6 +970,7 @@ impl BodyQueries {
             });
         }
         Ok(Program {
+            instantiation_types: program.instantiation_types.clone(),
             type_uses: program.type_uses.clone(),
             module: program.module.clone(),
             imports: program.imports.clone(),

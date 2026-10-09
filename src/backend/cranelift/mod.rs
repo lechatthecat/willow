@@ -3494,6 +3494,7 @@ mod tests {
     #[test]
     fn unit_async_codegen_08_async_function_call_returns_task_type() {
         let function = FunctionDecl {
+            type_params: Vec::new(),
             name: "work".to_string(),
             public: false,
             is_async: true,

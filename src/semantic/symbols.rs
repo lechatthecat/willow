@@ -236,6 +236,23 @@ pub struct ClassInfo {
     pub constructor: Option<ConstructorInfo>,
 }
 
+/// Nominal declarations carried with cross-module generic instantiations.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum InstantiationType {
+    Class(ClassInfo),
+    Enum(EnumInfo),
+    Interface(InterfaceInfo),
+}
+impl InstantiationType {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Class(i) => &i.name,
+            Self::Enum(i) => &i.name,
+            Self::Interface(i) => &i.name,
+        }
+    }
+}
+
 /// A required method signature declared inside an `interface`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InterfaceMethodInfo<N = String> {

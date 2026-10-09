@@ -97,6 +97,7 @@ mod tests {
                         path: Default::default(),
                         source: String::new(),
                         program: Program {
+                            instantiation_types: Vec::new(),
                             type_uses: Vec::new(),
                             module: None,
                             imports: vec![],

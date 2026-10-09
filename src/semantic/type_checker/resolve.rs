@@ -486,6 +486,37 @@ impl TypeChecker {
                 self.symbols.define_enum(to, info);
             }
         }
+        for item in &program.items {
+            match item {
+                Item::Function(f) if !f.type_params.is_empty() => {
+                    if let Some(t) = self
+                        .generics
+                        .functions
+                        .get(&format!("{registered}::{}", f.name))
+                        .cloned()
+                    {
+                        let key = format!("{spelling}::{}", f.name);
+                        self.generics.functions.insert(key.clone(), t);
+                        self.generics
+                            .function_paths
+                            .insert(key, spelling.to_string());
+                    }
+                }
+                Item::Class(c) if !c.type_params.is_empty() => {
+                    if let Some(t) = self
+                        .generics
+                        .classes
+                        .get(&format!("{registered}::{}", c.name))
+                        .cloned()
+                    {
+                        let key = format!("{spelling}::{}", c.name);
+                        self.generics.classes.insert(key.clone(), t);
+                        self.generics.class_paths.insert(key, spelling.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(info) = self.symbols.lookup_module(registered).cloned() {
             self.symbols
                 .define_module_with_id(spelling.to_string(), id, info);
@@ -514,6 +545,7 @@ impl TypeChecker {
         program: &Program,
         scope: ModuleScope,
     ) {
+        self.register_instantiation_types(&program.instantiation_types);
         match scope {
             ModuleScope::Types => {
                 self.signature_only_modules.insert(canonical.to_string());
@@ -657,6 +689,12 @@ impl TypeChecker {
 
             match item {
                 Item::Function(f) => {
+                    if !f.type_params.is_empty() {
+                        let key = format!("{name}::{}", f.name);
+                        let template = self.generics.registry.borrow_mut().intern_function(f);
+                        self.generics.functions.insert(key.clone(), template);
+                        self.generics.function_paths.insert(key, name.to_string());
+                    }
                     let params = f.params.iter().map(|p| qualify(&p.ty)).collect::<Vec<_>>();
                     let mut param_infos = param_infos_from_decl(&f.params, None);
                     for pi in &mut param_infos {
@@ -682,6 +720,12 @@ impl TypeChecker {
                     );
                 }
                 Item::Class(c) => {
+                    if !c.type_params.is_empty() {
+                        let key = format!("{name}::{}", c.name);
+                        let template = self.generics.registry.borrow_mut().intern_class(c);
+                        self.generics.classes.insert(key.clone(), template);
+                        self.generics.class_paths.insert(key, name.to_string());
+                    }
                     let class_name = format!("{name}::{}", c.name);
                     let info = imported_class_info_from_decl(c, &class_name, &qualify);
                     self.symbols.define_class(class_name, info);
@@ -747,6 +791,19 @@ impl TypeChecker {
     /// `local` resolves to the public function `item` of module `module`.
     pub fn register_item_import(&mut self, local: &str, module: &str, item: &str, span: Span) {
         self.imported_names.insert(local.to_string(), Some(span));
+        let key = format!("{module}::{item}");
+        if let Some(template) = self.generics.functions.get(&key).cloned() {
+            self.generics.functions.insert(local.to_string(), template);
+            self.generics
+                .function_paths
+                .insert(local.to_string(), module.to_string());
+        }
+        if let Some(template) = self.generics.classes.get(&key).cloned() {
+            self.generics.classes.insert(local.to_string(), template);
+            self.generics
+                .class_paths
+                .insert(local.to_string(), module.to_string());
+        }
 
         // Functions are registered per-module in the ModuleInfo table.
         let func = self.symbols.lookup_module_func(module, item).cloned();
@@ -990,7 +1047,18 @@ impl TypeChecker {
     }
 
     pub(super) fn register_class(&mut self, c: &ClassDecl) {
-        let info = self.class_info_from_decl(c, &c.name, None);
+        let identity = if c.name.contains("::") {
+            c.name.clone()
+        } else {
+            self.class_module_path
+                .as_ref()
+                .or(self.module_path.as_ref())
+                .map_or_else(|| c.name.clone(), |module| format!("{module}::{}", c.name))
+        };
+        let info = self.class_info_from_decl(c, &identity, None);
+        if identity != c.name {
+            self.symbols.define_class(identity, info.clone());
+        }
         self.symbols.define_class(c.name.clone(), info);
     }
 
@@ -1832,33 +1900,51 @@ impl TypeChecker {
                     let void_args = vec![Type::Void; enum_info.type_params.len()];
                     return Type::Generic(enum_info.name.clone(), void_args);
                 }
-                // Type-check args and infer type parameters.
-                let checked_args: Vec<Type> =
-                    args.iter().map(|a| self.check_expr(&a.expr)).collect();
+                let explicit: Vec<_> = type_args
+                    .iter()
+                    .map(|t| self.normalize_type(t, span))
+                    .collect();
+                for ty in &explicit {
+                    self.validate_type(ty, span);
+                }
+                let bindings: HashMap<_, _> = enum_info
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(explicit.iter().cloned())
+                    .collect();
+                let checked_args: Vec<Type> = args
+                    .iter()
+                    .zip(&variant.payload_types)
+                    .map(|(arg, param)| {
+                        if explicit.is_empty() {
+                            self.check_expr(&arg.expr)
+                        } else {
+                            let expected = param.substitute_names(|n| bindings.get(n).cloned());
+                            self.check_expr_expecting(&arg.expr, &expected)
+                        }
+                    })
+                    .collect();
 
                 if crate::parser::tuples::is_tuple(&enum_info.name) {
                     return Type::Generic(enum_info.name.clone(), checked_args);
                 }
-                // Build type argument vector: for each type param, find the
-                // variant payload position that uses it and use the arg type.
-                // Unknown parameters default to Void.
-                let type_args: Vec<Type> = enum_info
+                let bindings = match crate::semantic::generic_inference::infer_partial(
+                    &enum_info.type_params,
+                    &variant.payload_types,
+                    &checked_args,
+                    &explicit,
+                ) {
+                    Ok(bindings) => bindings,
+                    Err(message) => {
+                        self.generic_error(span, message);
+                        return Self::error_type();
+                    }
+                };
+                let type_args = enum_info
                     .type_params
                     .iter()
-                    .map(|param| {
-                        variant
-                            .payload_types
-                            .iter()
-                            .zip(checked_args.iter())
-                            .find_map(|(payload_ty, arg_ty)| {
-                                if matches!(payload_ty, Type::Named(n) if n == param) {
-                                    Some(arg_ty.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(Type::Void)
-                    })
+                    .map(|p| bindings[p].clone())
                     .collect();
                 return Type::Generic(enum_info.name.clone(), type_args);
             } else {

@@ -1,0 +1,27 @@
+// User functions and classes specialize at concrete call sites.
+import std::collections::Array;
+
+fn identity<T>(value: T) -> T { return value; }
+
+class Box<T> {
+    pub value: T;
+    pub fn get(self) -> T { return self.value; }
+}
+
+fn unbox<T>(box: Box<T>) -> T { return box.get(); }
+
+enum Parcel<T> { Values(Array<T>), Empty }
+
+fn main() {
+    println(identity(42));
+    println(identity<String>("hello"));
+    let number = new Box<i64>(7);
+    let text = Box<String> { value: "willow" };
+    println(number.get());
+    println(unbox(text));
+    let parcel = Parcel::Values([10, 20]);
+    match parcel {
+        Parcel::Values(values) => println(values[1]),
+        Parcel::Empty => println(0),
+    }
+}

@@ -168,21 +168,42 @@ impl Parser {
         }
     }
 
+    fn parse_type_parameters(&mut self) -> Result<Vec<String>, Diagnostic> {
+        let mut params = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        if !self.eat(TokenKind::Lt) {
+            return Ok(params);
+        }
+        loop {
+            let span = self.current_span();
+            let name = self.expect_ident()?;
+            #[cfg(test)]
+            GENERIC_PARAMETER_LOOKUPS.with(|count| count.set(count.get() + 1));
+            if !seen.insert(name.clone()) {
+                return Err(Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0102,
+                    format!("duplicate type parameter `{name}`"),
+                )
+                .with_label(Label::primary(
+                    span,
+                    "already declared in this parameter list",
+                )));
+            }
+            params.push(name);
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::Gt)?;
+        Ok(params)
+    }
+
     pub(super) fn parse_enum_decl(&mut self, public: bool) -> Result<EnumDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Enum)?;
         let name = self.expect_ident()?;
-        // Optional generic type parameters: `<T>` or `<T, E>`
-        let mut type_params = Vec::new();
-        if self.eat(TokenKind::Lt) {
-            while !matches!(self.peek_kind(), TokenKind::Gt | TokenKind::Eof) {
-                type_params.push(self.expect_ident()?);
-                if matches!(self.peek_kind(), TokenKind::Comma) {
-                    self.advance();
-                }
-            }
-            self.expect(TokenKind::Gt)?;
-        }
+        let type_params = self.parse_type_parameters()?;
         self.expect(TokenKind::LBrace)?;
         let mut variants = Vec::new();
         while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
@@ -231,28 +252,25 @@ impl Parser {
         self.expect(TokenKind::Class)?;
         let name = self.expect_ident()?;
 
-        if self.check(TokenKind::Lt) {
-            let diagnostic = self
-                .err(
-                    ErrorCode::E0102,
-                    "generic classes are not supported yet (willow-b06l)",
-                )
-                .with_help(format!("use concrete field and method types for `{name}`"));
-            // Skip the rejected declaration without interpreting members as
-            // top-level items. Leave its closing brace for item recovery's
-            // initial advance, preserving the following declaration's modifiers.
-            let mut depth = 0usize;
-            while !self.at_eof() {
-                match self.peek_kind() {
-                    TokenKind::LBrace => depth += 1,
-                    TokenKind::RBrace if depth <= 1 => break,
-                    TokenKind::RBrace => depth -= 1,
-                    _ => {}
+        let type_params = match self.parse_type_parameters() {
+            Ok(params) => params,
+            Err(diagnostic) => {
+                // Recover the entire malformed class, without interpreting its
+                // fields/constructors as top-level declarations. Item recovery
+                // consumes the closing brace and preserves following modifiers.
+                let mut depth = 0usize;
+                while !self.at_eof() {
+                    match self.peek_kind() {
+                        TokenKind::LBrace => depth += 1,
+                        TokenKind::RBrace if depth <= 1 => break,
+                        TokenKind::RBrace => depth -= 1,
+                        _ => {}
+                    }
+                    self.advance();
                 }
-                self.advance();
+                return Err(diagnostic);
             }
-            return Err(diagnostic);
-        }
+        };
 
         let base_class = if self.eat(TokenKind::Extends) {
             Some(self.parse_type_path()?)
@@ -354,6 +372,7 @@ impl Parser {
         let span = start.to(end);
 
         Ok(ClassDecl {
+            type_params,
             name,
             public,
             is_open,
@@ -785,16 +804,7 @@ impl Parser {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
         let name = self.expect_ident()?;
-        if self.check(TokenKind::Lt) {
-            return Err(self
-                .err(
-                    ErrorCode::E0102,
-                    "generic functions are not supported yet (willow-b06l)",
-                )
-                .with_help(format!(
-                    "use concrete parameter and return types for `{name}`"
-                )));
-        }
+        let type_params = self.parse_type_parameters()?;
         self.expect(TokenKind::LParen)?;
 
         let mut params = Vec::new();
@@ -815,6 +825,7 @@ impl Parser {
         let body = self.parse_block()?;
         let span = start.to(body.span);
         Ok(FunctionDecl {
+            type_params,
             name,
             public,
             is_async,
@@ -891,6 +902,7 @@ impl Parser {
             span,
         };
         Ok(FunctionDecl {
+            type_params: Vec::new(),
             name,
             public,
             is_async: false,
@@ -952,5 +964,47 @@ fn const_literal(expr: &Expr) -> Option<ConstValue> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static GENERIC_PARAMETER_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod generic_parameter_tests {
+    use super::*;
+    #[test]
+    fn duplicate_detection_has_one_lookup_per_parameter() {
+        for count in [1, 16, 256] {
+            let parameters = (0..count)
+                .map(|i| format!("T{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            for duplicate in [false, true] {
+                let source = format!(
+                    "fn identity<{parameters}{}>(x: i64) -> i64 {{ return x; }}",
+                    if duplicate { ",T0" } else { "" }
+                );
+                GENERIC_PARAMETER_LOOKUPS.with(|visits| visits.set(0));
+                let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+                let (_, errors) = Parser::new(tokens).parse();
+                assert_eq!(errors.is_empty(), !duplicate);
+                if duplicate {
+                    assert!(
+                        errors
+                            .iter()
+                            .any(|error| error.message.contains("duplicate type parameter"))
+                    );
+                }
+                let lookups = GENERIC_PARAMETER_LOOKUPS.with(|visits| visits.get());
+                assert_eq!(lookups, count + usize::from(duplicate));
+                println!(
+                    "WILLOW_GENERIC_AUDIT {}",
+                    serde_json::json!({"case":"parameter_list", "parameters":count, "duplicate":duplicate, "lookups":lookups})
+                );
+            }
+        }
     }
 }
