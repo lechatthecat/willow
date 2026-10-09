@@ -200,3 +200,119 @@ fn ticket_42_recovery_reads_scale_linearly() {
         eprintln!("recovery nested={nested}: {samples:?}");
     }
 }
+
+#[test]
+fn ticket_60_generic_classes_and_recovery() {
+    for modifiers in ["", "pub ", "open ", "pub open "] {
+        for header in [
+            "<T>",
+            "<T, U>",
+            "<>",
+            "<T: Bound>",
+            "<T> extends Base implements Get<T>",
+        ] {
+            let source = format!(
+                "{modifiers}class Box{header} {{ pub v: T; pub init(self, v: T) {{ self.v = v; }} pub fn get(self) -> T {{ if true {{ return self.v; }} return self.v; }} }} pub fn following() {{}}"
+            );
+            let (program, diagnostics) =
+                Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+            assert_eq!(
+                diagnostics[0].message,
+                "generic classes are not supported yet (willow-b06l)"
+            );
+            assert_eq!(diagnostics[0].code, ErrorCode::E0102);
+            let span = diagnostics[0].primary_span().unwrap();
+            assert_eq!(&source[span.start..span.end], "<");
+            assert_eq!(program.items.len(), 1);
+            assert!(
+                matches!(&program.items[0], Item::Function(f) if f.name == "following" && f.public)
+            );
+        }
+    }
+}
+
+#[test]
+fn ticket_60_supported_interfaces_and_classes() {
+    for source in [
+        "interface Get<T> { fn get(self) -> T; }",
+        "pub interface Pair<T, U> { fn get(self) -> T; fn other(self) -> U; }",
+        "class Box { pub v: i64; }",
+        "class Box implements Get<i64> { pub fn get(self) -> i64 { return 1; } }",
+    ] {
+        assert!(errors(source).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn ticket_60_truncated_generic_class() {
+    for source in [
+        "class Box<T>",
+        "class Box<",
+        "class Box<T> { pub fn get(self) { if true {} }",
+    ] {
+        let diagnostics = errors(source);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "generic classes are not supported yet (willow-b06l)"
+        );
+    }
+}
+
+#[test]
+fn ticket_60_recovery_reads_scale_linearly() {
+    for shape in ["declarations", "depth", "members"] {
+        let mut samples = Vec::new();
+        for count in [8, 16, 32, 64] {
+            let source = match shape {
+                "declarations" => "class Box<T> { pub fn get(self) { } }".repeat(count),
+                "depth" => format!(
+                    "class Box<T> {{ fn get(self) {{ {} {} }} }}",
+                    "if true {".repeat(count),
+                    "}".repeat(count)
+                ),
+                _ => format!("class Box<T> {{ {} }}", "pub fn get(self) {}".repeat(count)),
+            };
+            PARSER_TOKEN_READS.with(|v| v.set(0));
+            assert_eq!(
+                errors(&source).len(),
+                if shape == "declarations" { count } else { 1 }
+            );
+            samples.push((count, PARSER_TOKEN_READS.with(|v| v.get())));
+        }
+        let slope = (samples[1].1 - samples[0].1) / 8;
+        for pair in samples.windows(2) {
+            assert_eq!(pair[1].1 - pair[0].1, slope * (pair[1].0 - pair[0].0));
+        }
+        eprintln!("generic class {shape}: {samples:?}");
+    }
+}
+
+#[test]
+fn ticket_60_following_item_boundaries() {
+    for following in [
+        "open class Following {}",
+        "pub open class Following {}",
+        "const VALUE: i64 = 1;",
+        "class Following {}",
+        "interface Following<T> {}",
+        "enum Following { Value }",
+        "async fn following() {}",
+    ] {
+        let tokens = Lexer::new(following).tokenize().unwrap();
+        let (expected, errors) = Parser::new(tokens).parse();
+        assert!(errors.is_empty());
+        let source = format!("class Box<T> {{}} {following}");
+        let (actual, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(actual.items.len(), expected.items.len());
+        if let Item::Class(class) = &actual.items[0] {
+            assert_eq!(class.is_open, following.contains("open"));
+        }
+        assert_eq!(
+            std::mem::discriminant(&actual.items[0]),
+            std::mem::discriminant(&expected.items[0])
+        );
+    }
+}

@@ -431,6 +431,8 @@ impl Parser {
                 TokenKind::Fn
                     | TokenKind::Async
                     | TokenKind::Class
+                    | TokenKind::Open
+                    | TokenKind::Const
                     | TokenKind::Interface
                     | TokenKind::Pub
                     | TokenKind::Prot

@@ -231,6 +231,29 @@ impl Parser {
         self.expect(TokenKind::Class)?;
         let name = self.expect_ident()?;
 
+        if self.check(TokenKind::Lt) {
+            let diagnostic = self
+                .err(
+                    ErrorCode::E0102,
+                    "generic classes are not supported yet (willow-b06l)",
+                )
+                .with_help(format!("use concrete field and method types for `{name}`"));
+            // Skip the rejected declaration without interpreting members as
+            // top-level items. Leave its closing brace for item recovery's
+            // initial advance, preserving the following declaration's modifiers.
+            let mut depth = 0usize;
+            while !self.at_eof() {
+                match self.peek_kind() {
+                    TokenKind::LBrace => depth += 1,
+                    TokenKind::RBrace if depth <= 1 => break,
+                    TokenKind::RBrace => depth -= 1,
+                    _ => {}
+                }
+                self.advance();
+            }
+            return Err(diagnostic);
+        }
+
         let base_class = if self.eat(TokenKind::Extends) {
             Some(self.parse_type_path()?)
         } else {
