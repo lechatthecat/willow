@@ -927,6 +927,75 @@ fn runnable_project_example_cases() -> &'static [(&'static str, &'static str, &'
     )]
 }
 
+// Registry-backed examples are kept separate so focused offline bridge tests
+// can use their existing path dependencies without pretending to test crates.io.
+fn runnable_rust_project_example_cases() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[(
+        "example/rust_regex",
+        "example/rust_regex/src/main.wi",
+        "true\nErr\ntrue\n",
+    )]
+}
+
+fn run_rust_project_examples() {
+    for &(project, _, expected) in runnable_rust_project_example_cases() {
+        let copy = PathBuf::from(temp_path(format!(
+            "willow_rust_example_{}",
+            unique_test_id()
+        )));
+        let project_copy = copy.join("project");
+        for file in ["project.toml", "rust/bridge.rs", "src/main.wi"] {
+            let destination = project_copy.join(file);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(Path::new(project).join(file), destination).unwrap();
+        }
+        // Capture diagnostics: missing cargo/rustc and unavailable registry
+        // access must fail explicitly, never silently skip the example.
+        let original_home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .expect("Rust example audit requires a home directory");
+        let home = copy.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("WILLOW_HOME", home.join(".willow"))
+            .env(
+                "RUSTUP_HOME",
+                std::env::var_os("RUSTUP_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(&original_home).join(".rustup")),
+            )
+            .env(
+                "CARGO_HOME",
+                std::env::var_os("CARGO_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(&original_home).join(".cargo")),
+            )
+            .arg("run")
+            .arg(&project_copy)
+            .output();
+        let _ = fs::remove_dir_all(&copy);
+        let output = output.expect("failed to launch Willow for Rust example audit");
+        assert!(
+            output.status.success(),
+            "{project}: Rust example audit FAILED (requires cargo, rustc, native linker, and crates.io access or a populated Cargo cache):\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{project}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_regex_project_example() {
+    run_rust_project_examples();
+}
+
 #[test]
 fn test_package_paths_project_example() {
     for &(project, _, expected) in runnable_project_example_cases() {
@@ -968,6 +1037,7 @@ fn test_runnable_example_catalog_is_complete() {
         .chain(
             runnable_project_example_cases()
                 .iter()
+                .chain(runnable_rust_project_example_cases())
                 .map(|(_, entry, _)| entry.to_string()),
         )
         .collect::<Vec<_>>();
@@ -1046,6 +1116,7 @@ fn test_constructor_flow_example() {
 
 #[test]
 fn test_runnable_example_files_compile_and_run() {
+    run_rust_project_examples();
     for &(path, expected) in runnable_example_cases() {
         let (out, ok) = if path == "example/lir_self_statics.wi" {
             // `static mut` state with task execution requires one worker.

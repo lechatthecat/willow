@@ -1,0 +1,17 @@
+extern rust {
+    fn regex_is_match(pattern: String, text: String) -> Result<bool, String>;
+}
+
+fn main() {
+    match regex_is_match("^hello [a-z]+$", "hello willow") {
+        Result::Ok(matched) => println(matched),
+        Result::Err(error) => println(error),
+    };
+    match regex_is_match("[", "hello willow") {
+        Result::Ok(matched) => println(matched),
+        Result::Err(error) => {
+            println("Err");
+            println(error.len() > 0);
+        },
+    };
+}

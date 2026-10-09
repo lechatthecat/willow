@@ -256,3 +256,27 @@ Fractional values retain their round-tripping decimal representation;
 placeholders such as `{:.6f}` retain their requested decimal places.
 Collections use the same default formatting for floating-point elements.
 See [f64_integral_display.wi](f64_integral_display.wi) for all four entry points.
+
+## Rust regex bridge
+
+`cargo run --bin willow -- run example/rust_regex` resolves the crates.io
+`regex = "1"` dependency, builds the Rust static bridge, links it into Willow,
+and prints `true`, `Err`, `true` on separate lines. The last two lines confirm
+that an invalid pattern returns a nonempty error through `Result<bool, String>`.
+The example uses `match` for both success and error handling.
+
+This example requires Cargo, rustc, a native linker, and crates.io network access
+on the first build. A populated Cargo registry cache permits an offline run:
+`cargo run --bin willow -- run example/rust_regex --offline`.
+For an offline focused audit, set `CARGO_NET_OFFLINE=true` (the actual regex
+crate and its transitive dependencies must already be cached).
+Missing tools or unavailable dependencies produce a failed audit with captured
+compiler diagnostics; the audit does not skip this example. CI installs Rust and
+runs the example audit on Linux, Windows, and both macOS architectures, with
+registry access required. The focused check is
+`cargo test --test integration runtime::examples::test_rust_regex_project_example -- --exact --nocapture`.
+
+We do not vendor regex or substitute a path crate here: exercising a real registry
+dependency is the purpose of this example. Existing `rust_value_bridge` and
+`tests/fixtures/rust_bridge/path` cover bridge behavior with offline path crates;
+they do not establish that regex resolves from crates.io.

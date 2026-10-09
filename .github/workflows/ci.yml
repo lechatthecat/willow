@@ -68,5 +68,7 @@ jobs:
       - name: GC concurrency stress (macOS and Windows)
         if: runner.os != 'Linux'
         run: cargo test --locked -p willow_runtime stress_region_08 -- --ignored --nocapture
+      # Includes rust_regex: Cargo/rustc above and crates.io access are required.
+      # Dependency/toolchain failures fail the audit; no platform skips.
       - name: Runnable example audit
         run: cargo test --locked --test integration runtime::examples::test_runnable_example_files_compile_and_run -- --exact --nocapture
