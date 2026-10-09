@@ -21,20 +21,26 @@ use std::{
     sync::Arc,
 };
 
+/// A lowered lambda: its expression, source span and the body it was stored under.
+pub(crate) type LambdaSite = (ExprId, Span, BodyId);
+
+/// Diagnostics and lambda sites produced by [`LirQueries::lower_foreign`].
+pub(crate) type ForeignLowering = (Vec<Diagnostic>, Vec<LambdaSite>);
+
 /// One unit's body inventory: which semantic body each lowered function was
 /// stored under. The bodies themselves live in the artifact store; nothing
 /// here retains IR.
 #[derive(Default)]
 struct LirUnit {
     functions: Vec<(FunctionId, BodyId)>,
-    lambdas: Vec<(ExprId, Span, BodyId)>,
+    lambdas: Vec<LambdaSite>,
     diagnostics: Arc<[Diagnostic]>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LirInventory {
     functions: Vec<(FunctionId, BodyId)>,
-    lambdas: Vec<(ExprId, Span, BodyId)>,
+    lambdas: Vec<LambdaSite>,
     diagnostics: Vec<Diagnostic>,
     bodies: Vec<(BodyId, FlatLir)>,
 }
@@ -286,7 +292,7 @@ impl LirQueries {
         receivers: &[lower::ForeignClass<'_>],
         classes: &HashMap<TypeId, crate::ir::typed_ast::HirClassInfo>,
         index: &BodyIndex,
-    ) -> Result<(Vec<Diagnostic>, Vec<(ExprId, Span, BodyId)>)> {
+    ) -> Result<ForeignLowering> {
         let (hir, diagnostics) =
             lower::lower_foreign_methods(scope, scope_tables, receivers, classes);
         let mut names = HashMap::new();

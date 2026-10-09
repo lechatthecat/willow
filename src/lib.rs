@@ -2143,10 +2143,7 @@ impl ForeignBatch {
         scope: &parser::ast::Program,
         scope_tables: &ir::lower::CheckerTables<'_>,
         defaults: &std::collections::HashMap<parser::ast::BodyId, parser::ast::MethodDecl>,
-    ) -> Result<(
-        Vec<diagnostics::Diagnostic>,
-        Vec<(parser::ast::ExprId, diagnostics::Span, parser::ast::BodyId)>,
-    )> {
+    ) -> Result<compiler_db::lir::ForeignLowering> {
         let receivers = self.classes(db.bodies(), defaults)?;
         db.lir
             .lower_foreign(scope, scope_tables, &receivers, &self.classes, db.bodies())
@@ -2852,7 +2849,7 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
             .classes
             .iter()
             .enumerate()
-            .map(|(at, class)| (class.name.clone(), at))
+            .map(|(at, class)| (class.name, at))
             .collect();
         for (&provider, batch) in &foreign {
             let program = files
@@ -2873,7 +2870,7 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
                 match receivers.get(&class.name) {
                     Some(&at) => hir.classes[at].methods.extend(class.methods),
                     None => {
-                        receivers.insert(class.name.clone(), hir.classes.len());
+                        receivers.insert(class.name, hir.classes.len());
                         hir.classes.push(class);
                     }
                 }
