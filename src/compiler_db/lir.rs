@@ -160,7 +160,11 @@ impl LirQueries {
                                 names.insert(FunctionId::method(owner, "init"), ctor.body.id);
                                 methods.push((ctor.body.id, AstEvent::Block(&ctor.body)));
                             }
-                            for m in &c.methods {
+                            for m in c
+                                .methods
+                                .iter()
+                                .filter(|m| index.foreign_default(unit, m).is_none())
+                            {
                                 names.insert(FunctionId::method(owner, &m.name), m.body.id);
                                 methods.push((m.body.id, AstEvent::Block(&m.body)));
                             }
@@ -214,7 +218,9 @@ impl LirQueries {
                         }
                     }
                 }
-                let (hir, diagnostics) = lower::lower_program_with(program, tables);
+                let (hir, diagnostics) = lower::lower_program_except(program, tables, &|m| {
+                    index.foreign_default(unit, m).is_some()
+                });
                 let source = lowered::lower_source_program_with(&hir, self.overflow_checks);
                 let mut result = LirInventory {
                     diagnostics,
@@ -267,6 +273,59 @@ impl LirQueries {
         })
     }
 
+    /// Lower and store the interface defaults that classes of other units
+    /// copied from `scope`'s interfaces (willow-rvpp), in that declaring unit's
+    /// scope: `scope` and `scope_tables` are its program and checked tables,
+    /// and `classes` holds each receiver's class chain from its own unit. These
+    /// bodies are left out of [`Self::lower_unit`], so each is lowered exactly
+    /// once, by this call.
+    pub(crate) fn lower_foreign(
+        &self,
+        scope: &Program,
+        scope_tables: &CheckerTables,
+        receivers: &[lower::ForeignClass<'_>],
+        classes: &HashMap<TypeId, crate::ir::typed_ast::HirClassInfo>,
+        index: &BodyIndex,
+    ) -> Result<(Vec<Diagnostic>, Vec<(ExprId, Span, BodyId)>)> {
+        let (hir, diagnostics) =
+            lower::lower_foreign_methods(scope, scope_tables, receivers, classes);
+        let mut names = HashMap::new();
+        let mut lambdas: HashMap<ExprId, VecDeque<BodyId>> = HashMap::new();
+        for receiver in receivers {
+            let owner = TypeId::from_source_name(receiver.key);
+            for &(body, method) in &receiver.methods {
+                names.insert(FunctionId::method(owner, &method.name), body);
+                for (lambda, expr) in copied_lambdas(index, body, &method.body)? {
+                    lambdas.entry(expr.id).or_default().push_back(lambda);
+                }
+            }
+        }
+        let source = lowered::lower_source_program_with(&hir, self.overflow_checks);
+        let functions = source.functions.into_iter().map(|function| {
+            let body = names
+                .get(&function.name)
+                .copied()
+                .with_context(|| format!("missing body identity for {}", function.name));
+            (body, function)
+        });
+        let mut lifted = Vec::with_capacity(source.lambdas.len());
+        let lifted_bodies = source.lambdas.into_iter().map(|lambda| {
+            let body = lambdas
+                .get_mut(&lambda.id)
+                .and_then(VecDeque::pop_front)
+                .context("missing lifted lambda body identity");
+            if let Ok(body) = body {
+                lifted.push((lambda.id, lambda.span, body));
+            }
+            (body, lambda.function)
+        });
+        for (body, function) in functions.chain(lifted_bodies) {
+            let function = FlatLir::from_function(lowered::finish_body(function));
+            self.bodies.query(body?, || self.store.write(&function))?;
+        }
+        Ok((diagnostics, lifted))
+    }
+
     /// Materialize a unit only for consumers that need a whole-program view,
     /// such as the textual dump. Native emission reads individual bodies.
     pub(crate) fn unit_program(&self, unit: UnitId) -> Result<lowered::LirProgram> {
@@ -299,6 +358,33 @@ impl LirQueries {
         })?;
         self.store.read::<FlatLir>(*artifact)?.into_function()
     }
+}
+
+/// The lambdas nested in `block`, the body of the copy `copy`, with the
+/// contextual body identity each has in that copy, innermost first: the
+/// order lowering lifts them in (willow-rvpp).
+pub(crate) fn copied_lambdas<'b>(
+    index: &BodyIndex,
+    copy: BodyId,
+    block: &'b crate::parser::ast::Block,
+) -> Result<Vec<(BodyId, &'b crate::parser::ast::LambdaExpr)>> {
+    let mut parents = vec![copy];
+    let mut lambdas = Vec::new();
+    for event in AstWalk::new(AstEvent::Block(block)) {
+        match event {
+            AstEvent::Expr(Expr::Lambda(lambda)) => {
+                let body = index
+                    .lambda_in(*parents.last().unwrap(), lambda.id)
+                    .context("missing contextual lambda body identity")?;
+                parents.push(body);
+            }
+            AstEvent::ExitExpr(Expr::Lambda(lambda)) => {
+                lambdas.push((parents.pop().unwrap(), &**lambda));
+            }
+            _ => {}
+        }
+    }
+    Ok(lambdas)
 }
 
 #[cfg(test)]

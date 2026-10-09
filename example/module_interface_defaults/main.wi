@@ -1,0 +1,35 @@
+// Classes here receive `greeting::Greeter` defaults. This module declares its
+// own `decorate`, which the provider's default body must not pick up.
+import greeting;
+
+fn decorate(text: String) -> String {
+    return "[" + text + "]";
+}
+
+class Person implements greeting::Greeter {
+    pub label: String;
+
+    pub fn name(self) -> String {
+        return self.label;
+    }
+}
+
+class Robot<T> implements greeting::Greeter {
+    pub id: T;
+
+    pub fn name(self) -> String {
+        return "robot";
+    }
+}
+
+fn introduce(who: greeting::Greeter) -> String {
+    return who.greet();
+}
+
+fn main() {
+    let ada = new Person("ada");
+    println(ada.greet());
+    println(introduce(new Robot<i64>(7)));
+    println(ada.score());
+    println(decorate("local"));
+}

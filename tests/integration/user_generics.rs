@@ -525,7 +525,6 @@ fn p76_generic_classes_preserve_local_interface_default_body_identity() {
 }
 
 #[test]
-#[ignore = "willow-rvpp: cross-module default bodies cannot reach provider items"]
 fn p77_generic_classes_preserve_imported_default_private_helper_scope() {
     custom_module_runs(
         "module util; fn helper() -> i64 { return 77; } pub interface Answer { fn answer(self) -> i64 { return helper(); } }",
@@ -535,7 +534,6 @@ fn p77_generic_classes_preserve_imported_default_private_helper_scope() {
 }
 
 #[test]
-#[ignore = "willow-rvpp: cross-module default bodies cannot reach provider items"]
 fn p78_generic_classes_preserve_imported_default_generic_helper_calls() {
     custom_module_runs(
         "module util; fn identity<T>(x: T) -> T { return x; } pub interface Answer { fn answer(self) -> i64 { return identity(78); } }",
@@ -1043,7 +1041,6 @@ fn main() {
 }
 
 #[test]
-#[ignore = "willow-rvpp: cross-module default bodies cannot reach provider items"]
 fn p83_generic_class_default_preserves_provider_generic_allocation() {
     custom_module_runs(
         "module util; class Payload<T> { pub value: T; pub fn get(self) -> T { return self.value; } } pub interface Answer { fn answer(self) -> i64 { return new Payload<i64>(83).get(); } }",
@@ -1062,10 +1059,16 @@ fn p84_generic_classes_receive_imported_interface_defaults() {
 }
 
 #[test]
-fn p85_generic_class_imported_default_reports_provider_scope_like_nongeneric() {
-    for class in [
-        "class Box<T> implements util::Answer { pub value: T; }",
-        "class Box implements util::Answer { pub value: i64; }",
+fn p85_generic_class_imported_default_resolves_provider_scope_like_nongeneric() {
+    for (class, ctor) in [
+        (
+            "class Box<T> implements util::Answer { pub value: T; }",
+            "new Box<i64>(1)",
+        ),
+        (
+            "class Box implements util::Answer { pub value: i64; }",
+            "new Box(1)",
+        ),
     ] {
         let project = TestProject::new(
             "generic_module_scope",
@@ -1074,15 +1077,20 @@ fn p85_generic_class_imported_default_reports_provider_scope_like_nongeneric() {
                     "util.wi",
                     "module util; fn helper() -> i64 { return 77; } pub interface Answer { fn answer(self) -> i64 { return helper(); } }",
                 ),
-                ("main.wi", &format!("import util; {class} fn main() {{ }}")),
+                (
+                    "main.wi",
+                    &format!("import util; {class} fn main() {{ println({ctor}.answer()); }}"),
+                ),
             ],
         );
         let compiled = project.compile("main.wi");
-        let stderr = String::from_utf8_lossy(&compiled.stderr);
-        assert!(!compiled.status.success(), "{class}");
         assert!(
-            stderr.contains("E0350") && !stderr.contains("internal compiler error"),
-            "{class}: {stderr}"
+            compiled.status.success(),
+            "{class}: {}",
+            String::from_utf8_lossy(&compiled.stderr)
         );
+        let output = project.run();
+        assert!(output.status.success(), "{class}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "77\n", "{class}");
     }
 }

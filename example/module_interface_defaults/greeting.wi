@@ -1,0 +1,26 @@
+// Provider module: the default bodies below use items that are private to
+// this module. Classes in other modules that implement `Greeter` run these
+// bodies in this module's scope (willow-rvpp).
+module greeting;
+
+fn decorate(text: String) -> String {
+    return "<" + text + ">";
+}
+
+fn twice(x: i64) -> i64 {
+    return x * 2;
+}
+
+pub interface Greeter {
+    fn name(self) -> String;
+
+    fn greet(self) -> String {
+        return decorate("hello " + self.name());
+    }
+
+    fn score(self) -> i64 {
+        let bonus = 1;
+        let scale = |x: i64| -> i64 { return twice(x) + bonus; };
+        return scale(20);
+    }
+}

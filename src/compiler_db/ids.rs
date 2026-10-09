@@ -342,8 +342,29 @@ impl BodyIndex {
         Ok(result)
     }
 
+    /// The declaration body a (possibly nested) lambda body belongs to.
+    pub fn root_body(&self, mut body: BodyId) -> BodyId {
+        while let Some((_, BodyOwner::Lambda { parent, .. })) = self.owner(body) {
+            body = parent;
+        }
+        body
+    }
     pub fn source_body(&self, body: BodyId) -> BodyId {
         self.origins.get(&body).copied().unwrap_or(body)
+    }
+    /// The unit that declared the interface default `method` was injected
+    /// from, when that is not `unit` itself (willow-rvpp). Such a copy reuses
+    /// the declaring unit's check and is lowered and emitted in its scope.
+    pub fn foreign_default(
+        &self,
+        unit: UnitId,
+        method: &crate::parser::ast::MethodDecl,
+    ) -> Option<UnitId> {
+        if !method.is_default_injected {
+            return None;
+        }
+        let (source, _) = self.owner(self.source_body(method.body.id))?;
+        (source != unit).then_some(source)
     }
     pub fn static_id(&self, expr: ExprId) -> Option<StaticId> {
         let id = *self.static_ids.get(&expr)?;

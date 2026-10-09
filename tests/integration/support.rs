@@ -790,6 +790,20 @@ impl TestProject {
             .expect("failed to run compiler check")
     }
 
+    pub(super) fn emit_lir(&self, entry: &str) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_willow"))
+            .args(["build", path_str(&self.root.join(entry)), "--emit-lir"])
+            .output()
+            .unwrap()
+    }
+
+    pub(super) fn emit_hir(&self, entry: &str) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_willow"))
+            .args(["build", path_str(&self.root.join(entry)), "--emit-hir"])
+            .output()
+            .unwrap()
+    }
+
     pub(super) fn compile(&self, entry: &str) -> std::process::Output {
         let src_path = self.root.join(entry);
         Command::new(env!("CARGO_BIN_EXE_willow"))

@@ -69,6 +69,37 @@ enum BodyTarget<'a> {
     },
 }
 
+impl<'a> UnitBody<'a> {
+    /// A lifted lambda declared as `name`, with semantic body `body`: one
+    /// nested in an interface default another unit copied (willow-rvpp).
+    pub(crate) fn lambda(
+        body: crate::parser::ast::BodyId,
+        name: &'a str,
+        lambda: &'a LambdaExpr,
+    ) -> Self {
+        Self {
+            body: Some(body),
+            target: BodyTarget::Lambda { name, lambda },
+        }
+    }
+
+    /// The method this target emits, if it is one.
+    pub(crate) fn method(&self) -> Option<&MethodDecl> {
+        match &self.target {
+            BodyTarget::Method { method, .. } => Some(method.as_ref()),
+            BodyTarget::Lambda { .. } | BodyTarget::Function { .. } => None,
+        }
+    }
+
+    /// The semantic body and declared name of a lifted-lambda target.
+    pub(crate) fn lambda_target(&self) -> Option<(crate::parser::ast::BodyId, &str)> {
+        match self.target {
+            BodyTarget::Lambda { name, .. } => self.body.map(|body| (body, name)),
+            BodyTarget::Function { .. } | BodyTarget::Method { .. } => None,
+        }
+    }
+}
+
 impl BodyTarget<'_> {
     fn kind(&self) -> &'static str {
         match self {
@@ -177,6 +208,14 @@ pub struct DeclaredProgram {
 impl DeclaredModule {
     pub fn normalized_program(&self) -> &Program {
         &self.program
+    }
+    /// Each class this module spells locally, to its qualified name; built
+    /// once per unit for lookups by every receiving class.
+    pub(crate) fn module_class_names(&self) -> HashMap<&str, &str> {
+        self.module_classes
+            .iter()
+            .map(|(local, class)| (local.as_str(), class.name.as_str()))
+            .collect()
     }
     pub fn normalized_expr_types(&self) -> &HashMap<ExprId, crate::parser::ast::Type> {
         &self.normalized_expr_types
@@ -802,6 +841,26 @@ impl UnitCodegenContext<'_> {
         unit: &DeclaredModule,
         emit: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
+        self.install_module_scope(unit);
+        emit(self)?;
+        // Inside the alias scope, for the reason the bodies are.
+        self.compile_unit_static_init(unit)
+    }
+
+    /// Emit bodies another unit received from `unit`'s interfaces under
+    /// `unit`'s alias scope (willow-rvpp): a default body names the items of
+    /// the module that declared the interface, whichever class it was copied
+    /// into. The static initializers stay with [`Self::emit_module`].
+    pub(super) fn emit_foreign_bodies(
+        &mut self,
+        unit: &DeclaredModule,
+        emit: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        self.install_module_scope(unit);
+        emit(self)
+    }
+
+    fn install_module_scope(&mut self, unit: &DeclaredModule) {
         for (name, lambda) in &unit.lambdas {
             self.lambda_names
                 .insert(lambda.id, self.func_ids.scope().lookup_id(name));
@@ -842,10 +901,6 @@ impl UnitCodegenContext<'_> {
                 self.alias_function_symbol(&local_mangled, &qualified_mangled);
             }
         }
-
-        emit(self)?;
-        // Inside the alias scope, for the reason the bodies are.
-        self.compile_unit_static_init(unit)
     }
 
     pub(crate) fn declare_program_with_types(
@@ -2589,23 +2644,36 @@ impl UnitCodegenContext<'_> {
         m: &MethodDecl,
         body: Option<crate::parser::ast::BodyId>,
     ) -> Result<()> {
-        self.compile_class_method_inner(c, m, body)
+        self.compile_class_method_inner(&c.name, m, body)
+    }
+
+    /// Emit an interface default that `class_name` received from another
+    /// unit's interface (willow-rvpp). The caller installs the declaring
+    /// unit's alias scope, so `class_name` is the class identity rather than
+    /// a spelling of the unit that declared the class.
+    pub(crate) fn compile_foreign_method(
+        &mut self,
+        class_name: &str,
+        m: &MethodDecl,
+        body: crate::parser::ast::BodyId,
+    ) -> Result<()> {
+        self.compile_class_method_inner(class_name, m, Some(body))
     }
 
     fn compile_class_method_inner(
         &mut self,
-        c: &ClassDecl,
+        class_name: &str,
         m: &MethodDecl,
         body: Option<crate::parser::ast::BodyId>,
     ) -> Result<()> {
-        let mangled = self.class_method_symbol(&c.name, &m.name);
+        let mangled = self.class_method_symbol(class_name, &m.name);
         // LIR-walking path for a method body (willow-0g8j.2.18). `lower_program`
         // lowers every method under `Class::method` -- the key
         // `register_lir_functions` stored it under, which is not the mangled
         // symbol -- and puts the `self` receiver first in the lowered parameter
         // list, exactly where the method ABI passes it. So the receiver and
         // parameter bindings below are what the walker's body reads.
-        let lir_name = FunctionId::method(TypeId::from_source_name(&c.name), &m.name);
+        let lir_name = FunctionId::method(TypeId::from_source_name(class_name), &m.name);
         let lir_fn = self.take_lir_body(body, lir_name)?;
         let ctx = lir_type_ctx!(
             self,
@@ -2622,7 +2690,7 @@ impl UnitCodegenContext<'_> {
             if std::env::var("WILLOW_LIR_LOG").is_ok() {
                 eprintln!("[lir] compiling async `{lir_name}` from lowered IR");
             }
-            return self.compile_cooperative_method(&c.name, &mangled, m, lir_fn);
+            return self.compile_cooperative_method(class_name, &mangled, m, lir_fn);
         }
         let func_id = self.func_ids[&mangled];
 
@@ -2717,7 +2785,7 @@ impl UnitCodegenContext<'_> {
             lir_send_offsets: HashMap::new(),
             main_result_err_ty: None,
             vars: HashMap::new(),
-            current_class: Some(c.name.as_str()),
+            current_class: Some(class_name),
             // An async method returned above through `compile_cooperative_method`.
             is_async: false,
             terminated: false,
@@ -2755,7 +2823,7 @@ impl UnitCodegenContext<'_> {
         // cannot cause the receiver to be collected.
         if !m.is_static && unrooted {
             let self_val = fg.builder.block_params(entry_block)[0];
-            fg.bind_unrooted_param("self", &Type::Named(c.name.clone().into()), self_val);
+            fg.bind_unrooted_param("self", &Type::Named(class_name.to_owned().into()), self_val);
         } else if !m.is_static {
             let self_val = fg.builder.block_params(entry_block)[0];
             let self_slot = fg.builder.create_sized_stack_slot(StackSlotData::new(
@@ -2772,7 +2840,7 @@ impl UnitCodegenContext<'_> {
                 fg.builder.ins().call(push_ref, &[addr]);
                 fg.gc_root_count += 1;
             }
-            let receiver_ty = Type::Named(c.name.clone().into());
+            let receiver_ty = Type::Named(class_name.to_owned().into());
             let receiver_storage = VarStorage::Stack {
                 slot: self_slot,
                 ty: receiver_ty,

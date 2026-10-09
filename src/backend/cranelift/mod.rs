@@ -55,6 +55,7 @@ mod block_layout;
 mod class_view;
 use class_view::ClassView;
 mod compile;
+pub(crate) use compile::UnitBody;
 pub use compile::{DeclaredModule, DeclaredProgram, ItemBinding, ModuleSpelling, UnitImports};
 mod emit;
 mod emit_collections;

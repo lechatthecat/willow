@@ -1920,6 +1920,266 @@ fn log_hir_gaps(gaps: &[diagnostics::Diagnostic]) {
     }
 }
 
+/// The interface defaults one unit's classes received from other units'
+/// interfaces (willow-rvpp). Each is checked once, with its interface, in the
+/// scope of the module that declares the interface; it is lowered with that
+/// module's tables and emitted under that module's alias scope, so its private
+/// helpers and types resolve as they do inside the interface. The receiving
+/// class supplies only the receiver identity, recorded in a [`ForeignBatch`].
+struct ForeignDefaults<'p> {
+    /// Per declaring unit, in a deterministic order: each receiving class and
+    /// the defaults it took from that unit.
+    providers: std::collections::BTreeMap<
+        module::UnitId,
+        Vec<(&'p parser::ast::ClassDecl, Vec<&'p parser::ast::MethodDecl>)>,
+    >,
+    /// Each copied default body, to the unit whose scope it is emitted in.
+    roots: std::collections::HashMap<parser::ast::BodyId, module::UnitId>,
+}
+
+impl<'p> ForeignDefaults<'p> {
+    fn collect(
+        index: &compiler_db::ids::BodyIndex,
+        unit: module::UnitId,
+        program: &'p parser::ast::Program,
+    ) -> Self {
+        let mut providers: std::collections::BTreeMap<_, Vec<_>> = Default::default();
+        let mut roots = std::collections::HashMap::new();
+        for item in &program.items {
+            let parser::ast::Item::Class(class) = item else {
+                continue;
+            };
+            let mut by_provider: std::collections::BTreeMap<_, Vec<_>> = Default::default();
+            for method in &class.methods {
+                if let Some(provider) = index.foreign_default(unit, method) {
+                    roots.insert(method.body.id, provider);
+                    by_provider.entry(provider).or_default().push(method);
+                }
+            }
+            for (provider, methods) in by_provider {
+                providers
+                    .entry(provider)
+                    .or_default()
+                    .push((class, methods));
+            }
+        }
+        Self { providers, roots }
+    }
+
+    /// Record these defaults in `batches`, by declaring unit, and remove them
+    /// and the lambdas nested in them from this unit's emission `plan`.
+    /// `program` and `tables` are this unit's, for the receivers' identities
+    /// and class chains; `class_name` maps a class this unit declares to the
+    /// name the back end compiles its other methods under.
+    fn defer(
+        &self,
+        index: &compiler_db::ids::BodyIndex,
+        plan: Option<&mut Vec<backend::cranelift::UnitBody<'_>>>,
+        program: &parser::ast::Program,
+        tables: &ir::lower::CheckerTables<'_>,
+        class_name: &dyn Fn(&parser::ast::ClassDecl) -> String,
+        batches: &mut ForeignBatches,
+    ) {
+        use parser::ast::Type;
+        if self.providers.is_empty() {
+            return;
+        }
+        if let Some(plan) = plan {
+            plan.retain(|target| {
+                if let Some(method) = target.method() {
+                    return !self.roots.contains_key(&method.body.id);
+                }
+                let Some((body, name)) = target.lambda_target() else {
+                    return true;
+                };
+                let Some(&provider) = self.roots.get(&index.root_body(body)) else {
+                    return true;
+                };
+                let batch = batches.entry(provider).or_default();
+                batch.lambdas.insert(body, name.to_owned());
+                false
+            });
+        }
+        let resolution = ir::lower::lower_resolution(program, tables);
+        for (&provider, classes) in &self.providers {
+            let batch = batches.entry(provider).or_default();
+            for (class, methods) in classes {
+                let key = match tables.normalize(&Type::Named(class.name.clone())) {
+                    Type::Named(ref name) => name.clone(),
+                    _ => class.name.clone(),
+                };
+                // Stop at an ancestor an earlier receiver already recorded, so
+                // shared chains are copied once.
+                let mut current = Some(semantic::ids::TypeId::from_source_name(&key));
+                while let Some(id) = current {
+                    let Some(info) = resolution.classes.get(&id) else {
+                        break;
+                    };
+                    if batch.classes.insert(id, info.clone()).is_some() {
+                        break;
+                    }
+                    current = info.base;
+                }
+                batch.receivers.push(ForeignReceiver {
+                    key,
+                    span: class.span,
+                    name: class_name(class),
+                    copies: methods.iter().map(|method| method.body.id).collect(),
+                });
+            }
+        }
+    }
+}
+
+/// A class that copied defaults from one declaring unit, as its own unit
+/// identifies it.
+struct ForeignReceiver {
+    /// The class identity in lowered IR.
+    key: String,
+    span: diagnostics::Span,
+    /// The name the back end compiles the class's methods under.
+    name: String,
+    copies: Vec<parser::ast::BodyId>,
+}
+
+/// Every default copied from one declaring unit's interfaces, gathered from
+/// all receiving units so the declaring unit's program and tables are loaded,
+/// and its scope's signatures built, once for all of them (willow-rvpp).
+#[derive(Default)]
+struct ForeignBatch {
+    receivers: Vec<ForeignReceiver>,
+    /// The receivers' class chains, from their own units' resolutions.
+    classes: std::collections::HashMap<semantic::ids::TypeId, ir::typed_ast::HirClassInfo>,
+    /// The lambdas nested in the copies, under the names their receiving
+    /// units declared them by.
+    lambdas: std::collections::HashMap<parser::ast::BodyId, String>,
+}
+
+type ForeignBatches = std::collections::BTreeMap<module::UnitId, ForeignBatch>;
+
+impl ForeignBatch {
+    /// The method each copy instantiates, keyed by the interface default's own
+    /// body: built once from `scope`'s interface declaration, which the copies
+    /// of a non-generic default share but for their body identity.
+    fn defaults(
+        &self,
+        index: &compiler_db::ids::BodyIndex,
+        scope: &parser::ast::Program,
+    ) -> std::collections::HashMap<parser::ast::BodyId, parser::ast::MethodDecl> {
+        let mut wanted: std::collections::HashSet<_> = self
+            .receivers
+            .iter()
+            .flat_map(|receiver| &receiver.copies)
+            .map(|&copy| index.source_body(copy))
+            .collect();
+        let mut defaults = std::collections::HashMap::with_capacity(wanted.len());
+        for item in &scope.items {
+            let parser::ast::Item::Interface(interface) = item else {
+                continue;
+            };
+            for method in &interface.methods {
+                let Some(body) = method
+                    .default_body
+                    .as_ref()
+                    .filter(|body| wanted.remove(&body.id))
+                else {
+                    continue;
+                };
+                defaults.insert(
+                    body.id,
+                    parser::ast::MethodDecl {
+                        name: method.name.clone(),
+                        public: true,
+                        protected: false,
+                        is_async: false,
+                        is_open: false,
+                        is_override: false,
+                        is_static: false,
+                        params: method.params.clone(),
+                        return_type: method.return_type.clone(),
+                        body: body.clone(),
+                        span: method.span,
+                        is_default_injected: true,
+                        is_interface_default: true,
+                    },
+                );
+            }
+        }
+        defaults
+    }
+
+    /// Each receiver with its copies and the declarations they instantiate.
+    fn classes<'b>(
+        &'b self,
+        index: &compiler_db::ids::BodyIndex,
+        defaults: &'b std::collections::HashMap<parser::ast::BodyId, parser::ast::MethodDecl>,
+    ) -> Result<Vec<ir::lower::ForeignClass<'b>>> {
+        self.receivers
+            .iter()
+            .map(|receiver| {
+                Ok(ir::lower::ForeignClass {
+                    key: &receiver.key,
+                    span: receiver.span,
+                    methods: receiver
+                        .copies
+                        .iter()
+                        .map(|&copy| {
+                            let source = index.source_body(copy);
+                            let method = defaults.get(&source).with_context(|| {
+                                format!("copied default {copy:?} has no declaration {source:?}")
+                            })?;
+                            Ok((copy, method))
+                        })
+                        .collect::<Result<_>>()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Lower every copy in this batch with the declaring unit's `scope`.
+    fn lower(
+        &self,
+        db: &compiler_db::CompilerDb,
+        scope: &parser::ast::Program,
+        scope_tables: &ir::lower::CheckerTables<'_>,
+        defaults: &std::collections::HashMap<parser::ast::BodyId, parser::ast::MethodDecl>,
+    ) -> Result<(
+        Vec<diagnostics::Diagnostic>,
+        Vec<(parser::ast::ExprId, diagnostics::Span, parser::ast::BodyId)>,
+    )> {
+        let receivers = self.classes(db.bodies(), defaults)?;
+        db.lir
+            .lower_foreign(scope, scope_tables, &receivers, &self.classes, db.bodies())
+    }
+
+    /// Emit every copy and its lambdas; the caller installs the declaring
+    /// unit's alias scope. `current` names the receiver being emitted, for
+    /// failure reports.
+    fn emit<'b>(
+        &'b self,
+        index: &compiler_db::ids::BodyIndex,
+        defaults: &std::collections::HashMap<parser::ast::BodyId, parser::ast::MethodDecl>,
+        backend: &mut backend::cranelift::UnitCodegenContext<'_>,
+        current: &mut &'b str,
+    ) -> Result<()> {
+        for (receiver, class) in self.receivers.iter().zip(self.classes(index, defaults)?) {
+            *current = &receiver.name;
+            for (copy, method) in class.methods {
+                for (body, lambda) in compiler_db::lir::copied_lambdas(index, copy, &method.body)? {
+                    let declared = self.lambdas.get(&body).with_context(|| {
+                        format!("lambda {body:?} in copied default {copy:?} was not declared")
+                    })?;
+                    backend.compile_body(&backend::cranelift::UnitBody::lambda(
+                        body, declared, lambda,
+                    ))?;
+                }
+                backend.compile_foreign_method(&receiver.name, method, copy)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Back-end phases: drive Cranelift codegen over the modules and entry program,
 /// emit the object file, resolve the runtime library, link the native
 /// executable, and write debug/source-map artifacts.
@@ -2077,6 +2337,12 @@ fn run_backend(
         let unit = artifacts.track(UnitKind::Declared, unit);
         artifacts.write(&*unit)?
     };
+    let declared_units: std::collections::HashMap<_, _> = modules
+        .iter()
+        .zip(declared_modules.iter().copied())
+        .map(|(module, artifact)| (module.id, (artifact, module.name.as_str())))
+        .collect();
+    let mut foreign = ForeignBatches::new();
     for (module, artifact) in modules.iter().zip(declared_modules) {
         let unit: backend::cranelift::DeclaredModule = artifacts.read(artifact)?;
         let unit = artifacts.track(UnitKind::Declared, unit);
@@ -2098,7 +2364,30 @@ fn run_backend(
         // Emission is addressed one body at a time: each target names the
         // semantic body whose lowered IR the artifact store holds, so no
         // whole-unit IR is materialized here (willow-afb5.18).
-        let plan = codegen.module_body_plan(&unit);
+        let mut plan = codegen.module_body_plan(&unit);
+        {
+            let mut tables = checker.tables();
+            tables.expr_types = Some(unit.normalized_expr_types());
+            let defaults =
+                ForeignDefaults::collect(db.bodies(), module.id, unit.normalized_program());
+            let names = if defaults.providers.is_empty() {
+                Default::default()
+            } else {
+                unit.module_class_names()
+            };
+            defaults.defer(
+                db.bodies(),
+                Some(&mut plan),
+                unit.normalized_program(),
+                &tables,
+                &|class| {
+                    names
+                        .get(class.name.as_str())
+                        .map_or_else(|| class.name.clone(), |&name| name.to_owned())
+                },
+                &mut foreign,
+            );
+        }
         let compiled = codegen.with_module_bodies(&unit, &checker, |backend| {
             for target in &plan {
                 backend.compile_body(target)?;
@@ -2130,7 +2419,24 @@ fn run_backend(
             &tables,
         )?);
     }
-    let plan = codegen.program_body_plan(&entry_unit);
+    let mut plan = codegen.program_body_plan(&entry_unit);
+    {
+        let mut tables = checked.tables();
+        tables.expr_types = Some(entry_unit.normalized_expr_types());
+        ForeignDefaults::collect(
+            db.bodies(),
+            module::UnitId::ENTRY,
+            entry_unit.normalized_program(),
+        )
+        .defer(
+            db.bodies(),
+            Some(&mut plan),
+            entry_unit.normalized_program(),
+            &tables,
+            &|class| class.name.clone(),
+            &mut foreign,
+        );
+    }
     let compiled = codegen.with_program_bodies(&entry_unit, &checked, |backend| {
         for target in &plan {
             backend.compile_body(target)?;
@@ -2149,6 +2455,44 @@ fn run_backend(
     })?;
     drop(checked);
     drop(entry_unit);
+    // Defaults copied from other units' interfaces, once per declaring unit:
+    // its program, tables and scope signatures serve every receiver
+    // (willow-rvpp).
+    for (provider, batch) in &foreign {
+        query_stats::query_call("foreign_default_unit");
+        let &(artifact, name) = declared_units
+            .get(provider)
+            .with_context(|| format!("interface unit {provider:?} was not declared"))?;
+        let scope: backend::cranelift::DeclaredModule = artifacts.read(artifact)?;
+        let scope = artifacts.track(UnitKind::Declared, scope);
+        let _lir = artifacts.live(UnitKind::Lir);
+        let checked = db.checked_unit(*provider, &artifacts)?;
+        let defaults = batch.defaults(db.bodies(), scope.normalized_program());
+        {
+            let mut tables = checked.tables();
+            tables.expr_types = Some(scope.normalized_expr_types());
+            let (gaps, _) = batch.lower(&db, scope.normalized_program(), &tables, &defaults)?;
+            log_hir_gaps(&gaps);
+        }
+        let mut receiver = "";
+        let compiled = codegen.with_foreign_bodies(&scope, &checked, |backend| {
+            batch.emit(db.bodies(), &defaults, backend, &mut receiver)
+        });
+        compiled.map_err(|error| {
+            let stage = errors::CodegenStage::ForeignDefault {
+                provider: name.to_owned(),
+                receiver: receiver.to_owned(),
+            };
+            report_backend_failure(
+                &mut codegen,
+                errors::CodegenError::new(stage, error),
+                map,
+                emitter,
+                &artifacts,
+                &diagnostic_packages,
+            )
+        })?;
+    }
 
     let warnings = codegen.take_async_frame_size_warnings();
     // Index once and load each warned file once, even with many large frames.
@@ -2479,7 +2823,63 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
         frontend.module_graph.artifacts.as_ref().unwrap(),
     )?;
     let tables = checked.tables();
-    let (hir, lowering_diagnostics) = ir::lower::lower_program_with(&body, &tables);
+    let bodies = frontend.db.bodies();
+    let (mut hir, mut lowering_diagnostics) =
+        ir::lower::lower_program_except(&body, &tables, &|m| {
+            bodies.foreign_default(module::UnitId::ENTRY, m).is_some()
+        });
+    // Defaults copied from imported interfaces are lowered in the scope of the
+    // module that declares each interface (willow-rvpp), then shown with the
+    // receiving class's own methods.
+    let mut foreign = ForeignBatches::new();
+    ForeignDefaults::collect(bodies, module::UnitId::ENTRY, &body).defer(
+        bodies,
+        None,
+        &body,
+        &tables,
+        &|class| class.name.clone(),
+        &mut foreign,
+    );
+    if !foreign.is_empty() {
+        let artifacts = frontend.module_graph.artifacts.as_ref().unwrap();
+        let files: std::collections::HashMap<_, _> = frontend
+            .module_graph
+            .files
+            .iter()
+            .map(|module| (module.id, &module.program))
+            .collect();
+        let mut receivers: std::collections::HashMap<_, _> = hir
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(at, class)| (class.name.clone(), at))
+            .collect();
+        for (&provider, batch) in &foreign {
+            let program = files
+                .get(&provider)
+                .with_context(|| format!("interface unit {provider:?} is not in the graph"))?;
+            let scope = artifacts.hydrate(program, provider.file_id())?;
+            let checked = frontend.db.checked_unit(provider, artifacts)?;
+            let defaults = batch.defaults(bodies, &scope);
+            let classes = batch.classes(bodies, &defaults)?;
+            let (lowered, gaps) = ir::lower::lower_foreign_methods(
+                &scope,
+                &checked.tables(),
+                &classes,
+                &batch.classes,
+            );
+            lowering_diagnostics.extend(gaps);
+            for class in lowered.classes {
+                match receivers.get(&class.name) {
+                    Some(&at) => hir.classes[at].methods.extend(class.methods),
+                    None => {
+                        receivers.insert(class.name.clone(), hir.classes.len());
+                        hir.classes.push(class);
+                    }
+                }
+            }
+        }
+    }
     let mut text = ir::dump::format_program(&hir);
     if !lowering_diagnostics.is_empty() {
         text.push_str("\n// constructs not yet lowered to HIR (willow-mb5):\n");
@@ -2527,7 +2927,51 @@ pub fn emit_lir_text(src: &str) -> Result<String> {
             .db
             .lir
             .lower_unit(module::UnitId::ENTRY, &body, frontend.db.bodies(), &tables)?;
-    let lir = frontend.db.lir.unit_program(module::UnitId::ENTRY)?;
+    let mut lir = frontend.db.lir.unit_program(module::UnitId::ENTRY)?;
+    // Defaults copied from imported interfaces are lowered in the scope of the
+    // module that declares each interface (willow-rvpp).
+    let mut foreign = ForeignBatches::new();
+    ForeignDefaults::collect(frontend.db.bodies(), module::UnitId::ENTRY, &body).defer(
+        frontend.db.bodies(),
+        None,
+        &body,
+        &tables,
+        &|class| class.name.clone(),
+        &mut foreign,
+    );
+    let mut gaps = gaps.to_vec();
+    if !foreign.is_empty() {
+        let artifacts = frontend.module_graph.artifacts.as_ref().unwrap();
+        let files: std::collections::HashMap<_, _> = frontend
+            .module_graph
+            .files
+            .iter()
+            .map(|module| (module.id, &module.program))
+            .collect();
+        for (&provider, batch) in &foreign {
+            let program = files
+                .get(&provider)
+                .with_context(|| format!("interface unit {provider:?} is not in the graph"))?;
+            let scope = artifacts.hydrate(program, provider.file_id())?;
+            let checked = frontend.db.checked_unit(provider, artifacts)?;
+            let defaults = batch.defaults(frontend.db.bodies(), &scope);
+            let (lowered_gaps, lifted) =
+                batch.lower(&frontend.db, &scope, &checked.tables(), &defaults)?;
+            gaps.extend(lowered_gaps);
+            for receiver in &batch.receivers {
+                for &copy in &receiver.copies {
+                    lir.functions.push(frontend.db.lir.body(copy)?);
+                }
+            }
+            for (id, span, body) in lifted {
+                lir.lambdas.push(ir::lowered::LirLambda {
+                    id,
+                    span,
+                    function: frontend.db.lir.body(body)?,
+                });
+            }
+        }
+    }
     let mut text = ir::lowered::format_program(&lir);
     if !gaps.is_empty() {
         text.push_str("\n// constructs not yet lowered to HIR (willow-mb5):\n");

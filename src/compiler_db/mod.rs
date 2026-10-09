@@ -36,6 +36,12 @@ use std::sync::Arc;
 struct CheckedUnitRecord {
     artifact: usize,
     bodies: Vec<crate::parser::ast::BodyId>,
+    /// Default copies injected from another unit's interface (willow-rvpp):
+    /// their interface-level records join this unit's tables because this
+    /// unit still declares the copies' symbols (methods and lifted lambdas,
+    /// whose callable types come from these records). Their bodies are
+    /// lowered and emitted later with the declaring unit's tables.
+    foreign: Vec<crate::parser::ast::BodyId>,
     diagnostics: Arc<[crate::diagnostics::Diagnostic]>,
 }
 
@@ -154,14 +160,24 @@ impl CompilerDb {
             let checked = compute(artifacts)?;
             let CheckedUnit {
                 bodies,
+                reused_bodies,
                 diagnostics,
                 normalized_types,
                 ..
             } = checked;
             let artifact = artifacts.write(&checked::CheckedTypes { normalized_types })?;
+            let index = self.bodies();
+            let foreign = reused_bodies
+                .into_iter()
+                .map(|copy| index.source_body(copy))
+                .filter(|source| index.owner(*source).is_some_and(|(owner, _)| owner != unit))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
             Ok(CheckedUnitRecord {
                 artifact,
                 bodies,
+                foreign,
                 diagnostics: diagnostics.into(),
             })
         })?;
@@ -190,6 +206,11 @@ impl CompilerDb {
         let declarations = self.unit_declarations(unit, artifacts)?;
         let mut unit = declarations.into_unit();
         for &body in &record.bodies {
+            self.typed_bodies
+                .read(body)?
+                .merge_tables(&mut unit, &self.typed_bodies)?;
+        }
+        for &body in &record.foreign {
             self.typed_bodies
                 .read(body)?
                 .merge_tables(&mut unit, &self.typed_bodies)?;

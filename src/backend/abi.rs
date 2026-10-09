@@ -455,6 +455,8 @@ mod alloc_effects_tests {
         "willow_runtime_arg",
         "willow_runtime_program_name",
         "willow_runtime_args_array",
+        "willow_rust_bridge_buffer",
+        "willow_rust_bridge_enum",
         "willow_alloc",
         "willow_alloc_typed",
         "willow_gc_alloc_layout",

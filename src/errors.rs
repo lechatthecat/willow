@@ -67,6 +67,12 @@ impl ResolveError {
 pub enum CodegenStage {
     Initialize,
     Module(String),
+    /// Interface defaults one module declares, emitted for a class another
+    /// unit declares (willow-rvpp).
+    ForeignDefault {
+        provider: String,
+        receiver: String,
+    },
     Entry,
     Metadata,
     Finish,
@@ -91,6 +97,11 @@ impl CodegenError {
     pub fn diagnostic(&self) -> Diagnostic {
         let context = match &self.stage {
             CodegenStage::Module(module) => format!(" in module `{module}`"),
+            CodegenStage::ForeignDefault { provider, receiver } => {
+                format!(
+                    " in interface defaults from module `{provider}` copied into class `{receiver}`"
+                )
+            }
             _ => String::new(),
         };
         Diagnostic::new(

@@ -132,6 +132,9 @@ pub struct TypeChecker {
         crate::module::UnitId,
     )>,
     pub(crate) checked_bodies: Vec<BodyId>,
+    /// Injected interface-default copies whose interface-level check this
+    /// unit reuses instead of checking them itself (willow-rvpp).
+    pub(crate) reused_bodies: Vec<BodyId>,
     /// Lambdas checked as their own `typed_body` inside the current body.
     lambdas: body::LambdaChildren,
     /// Lambdas that were checked inline because their body query had already
@@ -321,6 +324,7 @@ impl TypeChecker {
             effect_queries: None,
             declaration_queries: None,
             checked_bodies: Vec::new(),
+            reused_bodies: Vec::new(),
             lambdas: Default::default(),
             #[cfg(test)]
             inline_lambda_rechecks: 0,

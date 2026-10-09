@@ -157,6 +157,7 @@ impl DesugarPass {
             default_diagnostics.extend(inject_default_interface_methods(
                 &mut module.program,
                 &module_defaults,
+                &module_ifaces,
                 &module_class_shapes,
             ));
         }
@@ -164,6 +165,7 @@ impl DesugarPass {
         diagnostics.extend(inject_default_interface_methods(
             program,
             &entry_defaults,
+            &entry_ifaces,
             &entry_class_shapes,
         ));
         diagnostics.extend(default_diagnostics);
@@ -997,6 +999,7 @@ fn build_module_class_shapes_with_imports(
 fn inject_default_interface_methods(
     program: &mut parser::ast::Program,
     external: &DefaultMethodIndex,
+    external_ifaces: &IfaceIndex,
     external_class_shapes: &std::collections::HashMap<String, ClassShape>,
 ) -> Vec<diagnostics::Diagnostic> {
     use diagnostics::{Diagnostic, ErrorCode, Label, Severity};
@@ -1024,25 +1027,21 @@ fn inject_default_interface_methods(
         return Vec::new();
     }
 
-    // Interfaces declared in THIS program: their non-generic default bodies are
-    // type-checked once at the interface level (check_interface), so the injected
-    // class copy is marked to be skipped there. A default inherited from another
-    // module's interface is NOT checked at the interface level here, so its class
-    // copy stays checkable except in a generic class, whose preserved template
-    // body reuses the defining interface checker (willow-1js.7).
-
-    let own_iface_names: HashSet<String> = program
-        .items
-        .iter()
-        .filter_map(|it| match it {
-            Item::Interface(i) => Some(i.name.clone()),
-            _ => None,
-        })
-        .collect();
+    // Every non-generic default body is type-checked once, at the interface
+    // level, in the scope of the unit that declares the interface
+    // (check_interface), so each injected class copy is marked to reuse that
+    // record instead of being checked here. A copy from another unit's
+    // interface is also lowered and emitted in that unit's scope (willow-rvpp),
+    // so the provider's private helpers and types resolve as they do in the
+    // interface. A generic interface's copy stays checkable: its substituted
+    // signature is this class's own (willow-1js.7).
 
     // Inheritance graph (own bare + imported qualified) for super/sub checks so
     // an inherited default does not count as "ambiguous" with its own super.
-    let mut supers_index: IfaceIndex = IfaceIndex::new();
+    let mut supers_index: IfaceIndex = external_ifaces
+        .iter()
+        .map(|(name, (supers, _))| (name.clone(), (supers.clone(), Vec::new())))
+        .collect();
     for item in &program.items {
         if let Item::Interface(i) = item {
             supers_index.insert(i.name.clone(), (i.extends.clone(), Vec::new()));
@@ -1206,8 +1205,7 @@ fn inject_default_interface_methods(
                         return_type: subst_iface_type(&dm.return_type, &subst),
                         body: body.clone(),
                         span: dm.span,
-                        is_default_injected: type_params.is_empty()
-                            && own_iface_names.contains(iface_name),
+                        is_default_injected: type_params.is_empty(),
                         is_interface_default: true,
                     },
                 ));

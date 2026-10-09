@@ -302,6 +302,170 @@ pub fn lower_program_with(
     program: &Program,
     tables: &CheckerTables,
 ) -> (HirProgram, Vec<Diagnostic>) {
+    lower_program_except(program, tables, &|_| false)
+}
+
+/// [`lower_program_with`], leaving out the class methods `foreign` selects:
+/// interface defaults another unit declared, which [`lower_foreign_methods`]
+/// lowers in that unit's scope instead (willow-rvpp).
+pub fn lower_program_except(
+    program: &Program,
+    tables: &CheckerTables,
+    foreign: &dyn Fn(&MethodDecl) -> bool,
+) -> (HirProgram, Vec<Diagnostic>) {
+    let LowerEnv {
+        fn_returns,
+        classes,
+        enums,
+    } = lower_env(program, tables);
+    let mut functions = Vec::new();
+    let mut hir_classes = Vec::new();
+    let mut diagnostics = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Function(f) if f.rust_bridge.is_some() => {}
+            Item::Function(f) => match lower_function(f, &fn_returns, &classes, &enums, tables) {
+                Ok(func) => functions.push(func),
+                Err(d) => diagnostics.push(d),
+            },
+            Item::Class(c) => {
+                let mut methods = Vec::new();
+                for ctor in &c.constructors {
+                    match lower_constructor(ctor, &c.name, &fn_returns, &classes, &enums, tables) {
+                        Ok(func) => methods.push(func),
+                        Err(d) => diagnostics.push(d),
+                    }
+                }
+                for m in c.methods.iter().filter(|m| !foreign(m)) {
+                    match lower_method(m, &c.name, None, &fn_returns, &classes, &enums, tables) {
+                        Ok(func) => methods.push(func),
+                        Err(d) => diagnostics.push(d),
+                    }
+                }
+                for field in c.fields.iter().filter(|field| field.is_static) {
+                    if let Some(init) = &field.initializer {
+                        let mut ctx = LowerCtx::new(&fn_returns, &classes, &enums, tables);
+                        ctx.current_class = Some(c.name.clone());
+                        match lower_expr(init, &mut ctx) {
+                            Ok(mut value) => {
+                                let return_type = ctx.normalize(&field.ty);
+                                retype_array_literal(&mut value, &return_type);
+                                functions.push(HirFunction {
+                                    name: crate::semantic::ids::FunctionId::method(
+                                        crate::semantic::ids::TypeId::from_source_name(&c.name),
+                                        format!("$static_init.{}", field.name),
+                                    ),
+                                    is_async: false,
+                                    params: Vec::new(),
+                                    return_type: return_type.into(),
+                                    body: vec![HirStmt::Return {
+                                        value: Some(value),
+                                        span: init.span(),
+                                    }],
+                                    span: init.span(),
+                                });
+                            }
+                            Err(diagnostic) => diagnostics.push(diagnostic),
+                        }
+                    }
+                }
+                hir_classes.push(HirClass {
+                    name: c.name.clone().into(),
+                    methods,
+                    span: c.span,
+                });
+            }
+            _ => {}
+        }
+    }
+    (
+        HirProgram {
+            functions,
+            classes: hir_classes,
+            resolution: lower_resolution(program, tables),
+        },
+        diagnostics,
+    )
+}
+
+/// Lower the interface defaults that classes of other units received from
+/// `scope`'s interfaces (willow-rvpp) in that unit's scope: `scope` and
+/// `scope_tables` are the declaring unit's program and checked tables, whose
+/// typed record of each default is what the copies reuse. The scope's
+/// signatures and resolution are built once for all `receivers`; `classes`
+/// holds their class chains, taken from the implementing units.
+pub fn lower_foreign_methods(
+    scope: &Program,
+    scope_tables: &CheckerTables,
+    receivers: &[ForeignClass<'_>],
+    classes: &HashMap<crate::semantic::ids::TypeId, super::typed_ast::HirClassInfo>,
+) -> (HirProgram, Vec<Diagnostic>) {
+    let LowerEnv {
+        fn_returns,
+        classes: env_classes,
+        enums,
+    } = lower_env(scope, scope_tables);
+    let mut hir_classes = Vec::with_capacity(receivers.len());
+    let mut diagnostics = Vec::new();
+    for receiver in receivers {
+        let self_ty = Type::Named(receiver.key.to_owned());
+        let mut lowered = Vec::with_capacity(receiver.methods.len());
+        for &(_, m) in &receiver.methods {
+            match lower_method(
+                m,
+                receiver.key,
+                Some(&self_ty),
+                &fn_returns,
+                &env_classes,
+                &enums,
+                scope_tables,
+            ) {
+                Ok(func) => lowered.push(func),
+                Err(d) => diagnostics.push(d),
+            }
+        }
+        hir_classes.push(HirClass {
+            name: receiver.key.to_owned().into(),
+            methods: lowered,
+            span: receiver.span,
+        });
+    }
+    let mut resolution = lower_resolution(scope, scope_tables);
+    // The receivers' class chains are their implementing units' declarations;
+    // module class identities are qualified, so none collides with the scope's.
+    for (id, info) in classes {
+        resolution
+            .classes
+            .entry(*id)
+            .or_insert_with(|| info.clone());
+    }
+    (
+        HirProgram {
+            functions: Vec::new(),
+            classes: hir_classes,
+            resolution,
+        },
+        diagnostics,
+    )
+}
+
+/// A class that copied interface defaults from another unit, with each copy's
+/// body identity and the declaration it instantiates (willow-rvpp).
+pub struct ForeignClass<'a> {
+    /// The receiver's class identity, as its own unit's tables normalize it.
+    pub key: &'a str,
+    pub span: Span,
+    pub methods: Vec<(crate::parser::ast::BodyId, &'a MethodDecl)>,
+}
+
+/// The signatures one unit's own declarations give its bodies.
+struct LowerEnv {
+    fn_returns: HashMap<String, Type>,
+    classes: Classes,
+    enums: Enums,
+}
+
+fn lower_env(program: &Program, tables: &CheckerTables) -> LowerEnv {
     // Builtin functions the checker registers (register_builtin_functions):
     // their call-site types, so calls to them lower like any other call.
     let mut fn_returns: HashMap<String, Type> = HashMap::from([
@@ -439,74 +603,11 @@ pub fn lower_program_with(
         }
     }
 
-    let mut functions = Vec::new();
-    let mut hir_classes = Vec::new();
-    let mut diagnostics = Vec::new();
-    for item in &program.items {
-        match item {
-            Item::Function(f) if f.rust_bridge.is_some() => {}
-            Item::Function(f) => match lower_function(f, &fn_returns, &classes, &enums, tables) {
-                Ok(func) => functions.push(func),
-                Err(d) => diagnostics.push(d),
-            },
-            Item::Class(c) => {
-                let mut methods = Vec::new();
-                for ctor in &c.constructors {
-                    match lower_constructor(ctor, &c.name, &fn_returns, &classes, &enums, tables) {
-                        Ok(func) => methods.push(func),
-                        Err(d) => diagnostics.push(d),
-                    }
-                }
-                for m in &c.methods {
-                    match lower_method(m, &c.name, &fn_returns, &classes, &enums, tables) {
-                        Ok(func) => methods.push(func),
-                        Err(d) => diagnostics.push(d),
-                    }
-                }
-                for field in c.fields.iter().filter(|field| field.is_static) {
-                    if let Some(init) = &field.initializer {
-                        let mut ctx = LowerCtx::new(&fn_returns, &classes, &enums, tables);
-                        ctx.current_class = Some(c.name.clone());
-                        match lower_expr(init, &mut ctx) {
-                            Ok(mut value) => {
-                                let return_type = ctx.normalize(&field.ty);
-                                retype_array_literal(&mut value, &return_type);
-                                functions.push(HirFunction {
-                                    name: crate::semantic::ids::FunctionId::method(
-                                        crate::semantic::ids::TypeId::from_source_name(&c.name),
-                                        format!("$static_init.{}", field.name),
-                                    ),
-                                    is_async: false,
-                                    params: Vec::new(),
-                                    return_type: return_type.into(),
-                                    body: vec![HirStmt::Return {
-                                        value: Some(value),
-                                        span: init.span(),
-                                    }],
-                                    span: init.span(),
-                                });
-                            }
-                            Err(diagnostic) => diagnostics.push(diagnostic),
-                        }
-                    }
-                }
-                hir_classes.push(HirClass {
-                    name: c.name.clone().into(),
-                    methods,
-                    span: c.span,
-                });
-            }
-            _ => {}
-        }
+    LowerEnv {
+        fn_returns,
+        classes,
+        enums,
     }
-    (
-        HirProgram {
-            functions,
-            classes: hir_classes,
-            resolution: lower_resolution(program, tables),
-        },
-        diagnostics,
-    )
 }
 
 /// The type a CALL to a function/method produces at the call site: an async
@@ -708,6 +809,7 @@ fn lower_function(
 fn lower_method(
     m: &MethodDecl,
     class_name: &str,
+    self_ty: Option<&Type>,
     fn_returns: &HashMap<String, Type>,
     classes: &Classes,
     enums: &Enums,
@@ -717,8 +819,12 @@ fn lower_method(
     ctx.current_class = Some(class_name.to_owned());
     let mut params = Vec::with_capacity(m.params.len() + 1);
     // Explicit and implicit `self` spellings normalize to the same receiver.
+    // A foreign default's receiver is already the class identity: this
+    // unit's tables would read its local spelling as another class.
     if !m.is_static {
-        let self_ty = ctx.normalize(&Type::Named(class_name.to_string()));
+        let self_ty = self_ty
+            .cloned()
+            .unwrap_or_else(|| ctx.normalize(&Type::Named(class_name.to_string())));
         ctx.bind("self".to_string(), self_ty.clone());
         params.push(HirParam {
             name: "self".to_string(),
@@ -2939,7 +3045,7 @@ fn internal(span: Span, msg: String) -> Diagnostic {
 /// Freeze declaration facts before control-flow lowering. Source declarations
 /// provide a complete fallback for checkerless tools/tests; checker entries
 /// then replace them with the canonical, globally resolved definitions.
-fn lower_resolution(
+pub(crate) fn lower_resolution(
     program: &Program,
     tables: &CheckerTables<'_>,
 ) -> super::typed_ast::HirResolution {

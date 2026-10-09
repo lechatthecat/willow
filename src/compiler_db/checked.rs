@@ -11,6 +11,8 @@ use std::collections::HashMap;
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CheckedUnit {
     pub(crate) bodies: Vec<BodyId>,
+    /// Injected default copies checked with their interface, not here.
+    pub(crate) reused_bodies: Vec<BodyId>,
     pub diagnostics: Vec<Diagnostic>,
     pub symbols: SymbolTable,
     pub expr_types: HashMap<ExprId, Type>,
@@ -28,6 +30,7 @@ impl From<TypeChecker> for CheckedUnit {
     fn from(checker: TypeChecker) -> Self {
         Self {
             bodies: checker.checked_bodies,
+            reused_bodies: checker.reused_bodies,
             diagnostics: checker.errors,
             symbols: checker.symbols,
             expr_types: checker.expr_types,
@@ -83,6 +86,7 @@ impl CheckedDeclarations {
     pub fn into_unit(self) -> CheckedUnit {
         CheckedUnit {
             bodies: Vec::new(),
+            reused_bodies: Vec::new(),
             diagnostics: Vec::new(),
             symbols: self.symbols,
             normalized_types: self.normalized_types,

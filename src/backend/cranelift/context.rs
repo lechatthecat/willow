@@ -200,6 +200,18 @@ impl Codegen {
         context.checked = Some(checked);
         context.emit_module(unit, emit)
     }
+    /// Emit the interface defaults another unit received from `unit`
+    /// (willow-rvpp), checked and scoped as `unit`'s own bodies are.
+    pub fn with_foreign_bodies<'a>(
+        &'a mut self,
+        unit: &DeclaredModule,
+        checked: &'a crate::compiler_db::CheckedUnit,
+        emit: impl FnOnce(&mut UnitCodegenContext<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let mut context = self.emission_context();
+        context.checked = Some(checked);
+        context.emit_foreign_bodies(unit, emit)
+    }
     pub fn with_program_bodies<'a>(
         &'a mut self,
         unit: &DeclaredProgram,

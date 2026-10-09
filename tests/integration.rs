@@ -31,6 +31,8 @@ mod codegen;
 mod codegen_invariants;
 #[path = "integration/codegen_scaling.rs"]
 mod codegen_scaling;
+#[path = "integration/cross_module_interface_defaults.rs"]
+mod cross_module_interface_defaults;
 #[path = "integration/defer_panic_termination.rs"]
 mod defer_panic_termination;
 #[path = "integration/enum_identity_aliases.rs"]

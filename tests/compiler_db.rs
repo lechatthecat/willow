@@ -422,8 +422,9 @@ fn write_permutable_project(project: &Project, imports: &[&str], with_errors: bo
         "main",
         format!(
             "{}\nfn main() {{ {errors} let l = new leaf::Leaf(); let o = new other::Other(); \
+             let b: base::Base = l; \
              println(l.name() + o.name() + l.describe() + o.describe()); \
-             println(leaf::value() + other::value() + l.base_value()); }}",
+             println(leaf::value() + other::value() + b.base_value()); }}",
             imports.join(" ")
         ),
     );

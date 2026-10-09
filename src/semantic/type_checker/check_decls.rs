@@ -232,6 +232,7 @@ impl TypeChecker {
             // interface level; skip the injected class copy to avoid duplicate
             // diagnostics (willow-1js.7).
             if m.is_default_injected {
+                self.reused_bodies.push(m.body.id);
                 continue;
             }
             self.check_method(m, &c.name);
