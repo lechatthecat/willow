@@ -19,6 +19,7 @@ use ast::*;
 
 pub struct Parser {
     rust_namespaces: std::collections::HashSet<String>,
+    rust_opaque_names: std::collections::HashSet<String>,
     tuple_arities: std::collections::HashSet<usize>,
     type_uses: Vec<TypeUse>,
     tokens: Vec<Token>,
@@ -119,6 +120,7 @@ impl Parser {
             })
             .collect();
         Self {
+            rust_opaque_names: rust_bridge::opaque_names(&tokens),
             rust_namespaces,
             tuple_arities: Default::default(),
             type_uses: Vec::new(),

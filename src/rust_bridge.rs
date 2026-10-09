@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
-pub(crate) const WRAPPER_SCHEMA: &str = "4";
+pub(crate) const WRAPPER_SCHEMA: &str = "5";
 
 pub type RustBridgeSymbols = Vec<((u32, String), RustBridgeSymbol)>;
 
@@ -17,6 +17,7 @@ pub enum Scalar {
     Void,
     String,
     Bytes,
+    Opaque(String),
     Option(Box<Scalar>),
     Result(Box<Scalar>, Box<Scalar>),
 }
@@ -32,7 +33,14 @@ impl Scalar {
     }
 
     pub fn from_type(ty: &Type) -> Option<Self> {
+        Self::from_type_with_opaque(ty, &Default::default())
+    }
+    pub fn from_type_with_opaque(
+        ty: &Type,
+        names: &std::collections::HashSet<String>,
+    ) -> Option<Self> {
         Some(match ty {
+            Type::Named(name) if names.contains(name) => Self::Opaque(name.clone()),
             Type::I64 => Self::I64,
             Type::F64 => Self::F64,
             Type::Bool => Self::Bool,
@@ -40,11 +48,11 @@ impl Scalar {
             Type::String => Self::String,
             Type::Array(inner) if **inner == Type::I64 => Self::Bytes,
             Type::Generic(name, args) if name == "Option" && args.len() == 1 => {
-                Self::Option(Box::new(Self::from_type(&args[0])?))
+                Self::Option(Box::new(Self::from_type_with_opaque(&args[0], names)?))
             }
             Type::Generic(name, args) if name == "Result" && args.len() == 2 => Self::Result(
-                Box::new(Self::from_type(&args[0])?),
-                Box::new(Self::from_type(&args[1])?),
+                Box::new(Self::from_type_with_opaque(&args[0], names)?),
+                Box::new(Self::from_type_with_opaque(&args[1], names)?),
             ),
             _ => return None,
         })
@@ -67,6 +75,8 @@ pub struct RustBridgeSymbol {
     pub input_types: Vec<Scalar>,
     pub output_type: Scalar,
     pub effects: u8,
+    #[serde(default)]
+    pub close_handle: bool,
 }
 impl RustBridgeSymbol {
     pub fn aggregate(&self) -> bool {
@@ -82,6 +92,7 @@ impl RustBridgeSymbol {
             .union(willow_abi::RuntimeEffects::MAY_ALLOCATE);
         Self {
             rust_crate: String::new(),
+            close_handle: false,
             abi_symbol: name.clone(),
             willow_function: name,
             input_types: inputs,
@@ -117,6 +128,30 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
         "#[cfg(panic = \"abort\")] compile_error!(\"Rust bridge requires panic=unwind\");\n",
     );
     source.push_str(include_str!("rust_bridge/panic.rs"));
+    source.push_str("#[allow(dead_code)] mod handles {\n");
+    source.push_str(include_str!(
+        "../crates/willow_runtime/src/rust_bridge/handles.rs"
+    ));
+    source.push_str("\n}\nmod opaque_tags {\n");
+    let mut names = std::collections::HashSet::new();
+    let mut pending: Vec<_> = symbols
+        .iter()
+        .flat_map(|symbol| symbol.input_types.iter().chain([&symbol.output_type]))
+        .collect();
+    while let Some(ty) = pending.pop() {
+        match ty {
+            Scalar::Opaque(name) if names.insert(name) => {
+                writeln!(source, "pub struct r#{name};").unwrap();
+            }
+            Scalar::Option(child) => pending.push(child),
+            Scalar::Result(a, b) => {
+                pending.push(a);
+                pending.push(b);
+            }
+            _ => {}
+        }
+    }
+    source.push_str("}\n");
     if symbols.iter().any(RustBridgeSymbol::aggregate) {
         source.push_str(include_str!("rust_bridge/support.rs"));
     }

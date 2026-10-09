@@ -20,6 +20,7 @@ unsafe extern "C" {
 }
 struct BridgeFrame {
     raw: *mut u8,
+    handles: std::cell::RefCell<Vec<handles::Lease>>,
     // Each inner allocation remains stable when the outer vector grows.
     bytes: std::cell::RefCell<Vec<Vec<u8>>>,
 }
@@ -28,7 +29,22 @@ impl BridgeFrame {
         Self {
             raw: unsafe { willow_rust_bridge_frame_new() },
             bytes: Default::default(),
+            handles: Default::default(),
         }
+    }
+    fn handle<T: std::any::Any + Send + Sync>(&self, id: u64, name: std::any::TypeId) -> &T {
+        let lease = handles::get(id, name).unwrap_or_else(|error| std::panic::panic_any((error, id)));
+        let value = lease.downcast_ref::<T>().expect("opaque adapter type invariant") as *const T;
+        self.handles.borrow_mut().push(lease);
+        // The Arc keeps the boxed object stable until this frame is dropped,
+        // even if another call closes the ID. No mutable references escape.
+        unsafe { &*value }
+    }
+    fn release_handles(&mut self) {
+        // Release native borrows before allocating Willow output objects. A
+        // user destructor may itself call into the collector.
+        let leases = std::mem::take(self.handles.get_mut());
+        drop(leases);
     }
     fn root(&self, object: u64) {
         unsafe { willow_rust_bridge_root(self.raw, object) }
@@ -91,6 +107,9 @@ impl BridgeFrame {
 }
 impl Drop for BridgeFrame {
     fn drop(&mut self) {
+        // User destructors run while outputs remain rooted and inside the
+        // generated catch_unwind boundary.
+        self.handles.get_mut().clear();
         unsafe { willow_rust_bridge_frame_drop(self.raw) }
     }
 }

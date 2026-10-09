@@ -205,6 +205,18 @@
               }
             }
           }
+        },
+        {
+          "type": "object",
+          "required": [
+            "Opaque"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "Opaque": {
+              "type": "string"
+            }
+          }
         }
       ]
     }

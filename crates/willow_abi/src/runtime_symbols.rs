@@ -413,6 +413,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // Scalar Rust bridge entry gate and contained-panic termination.
     NONE; "willow_rust_bridge_enter" => ([I32] -> None);
     NONE; "willow_rust_bridge_panic" => ([] -> None);
+    NONE; "willow_rust_bridge_handle_error" => ([I32, I64] -> None);
     NONE; "willow_rust_bridge_panic_message" => ([Ptr, I64] -> None);
     NONE; "willow_rust_bridge_frame_new" => ([] -> Some(Ptr));
     NONE; "willow_rust_bridge_frame_drop" => ([Ptr] -> None);

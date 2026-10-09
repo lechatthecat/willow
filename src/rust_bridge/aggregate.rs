@@ -31,6 +31,17 @@ impl Scalar {
         #[cfg(test)]
         TYPE_NODE_VISITS.set(TYPE_NODE_VISITS.get() + 1);
         match self {
+            Self::Opaque(name) => {
+                if input {
+                    output.push_str("&bridge::r#");
+                } else {
+                    output.push_str("Box<bridge::r#");
+                }
+                output.push_str(name);
+                if !input {
+                    output.push('>');
+                }
+            }
             Self::String => output.push_str(if input { "&str" } else { "String" }),
             Self::Bytes => output.push_str(if input { "&[u8]" } else { "Vec<u8>" }),
             Self::Option(t) => {
@@ -53,6 +64,7 @@ impl Scalar {
         *serial += 1;
         let out = format!("v{n}");
         match self {
+            Self::Opaque(name) => writeln!(source, "let {out} = frame.handle::<bridge::r#{name}>(frame.payload({value}, false).low, std::any::TypeId::of::<opaque_tags::r#{name}>());").unwrap(),
             Self::I64 => writeln!(source, "let {out} = {value}.low as i64;").unwrap(),
             Self::F64 => writeln!(source, "let {out} = f64::from_bits({value}.low);").unwrap(),
             Self::Bool => writeln!(source, "let {out} = {value}.low != 0;").unwrap(),
@@ -126,6 +138,9 @@ impl Scalar {
             .unwrap();
         } else {
             match self {
+                Self::Opaque(name) => {
+                    writeln!(source, "let id{n} = handles::insert({value}, std::any::TypeId::of::<opaque_tags::r#{name}>());\nlet {out} = frame.enum_value(0, BridgeValue {{ low: id{n}, high: 0 }}, false, false);").unwrap();
+                }
                 Self::String | Self::Bytes => {
                     let method = if *self == Self::String {
                         "output_string"
@@ -178,12 +193,20 @@ impl Scalar {
 
 pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, revision: u32) {
     let target = symbol.willow_function.rsplit("::").next().unwrap();
-    writeln!(source, "#[unsafe(no_mangle)] pub unsafe extern \"C\" fn {}(input: *const BridgeValue, output: *mut BridgeValue) {{\nunsafe {{ willow_rust_bridge_enter({revision}); }}\nlet frame = BridgeFrame::new();\nlet outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{",symbol.abi_symbol).unwrap();
+    let mutable = if symbol.close_handle { "" } else { "mut " };
+    writeln!(source, "#[unsafe(no_mangle)] pub unsafe extern \"C\" fn {}(input: *const BridgeValue, output: *mut BridgeValue) {{\nunsafe {{ willow_rust_bridge_enter({revision}); }}\nlet outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\nlet {mutable}frame = BridgeFrame::new();",symbol.abi_symbol).unwrap();
     for (i, ty) in symbol.input_types.iter().enumerate() {
         writeln!(source, "let a{i} = unsafe {{ *input.add({i}) }};").unwrap();
         if ty.reference() {
             writeln!(source, "frame.root(a{i}.low);").unwrap();
         }
+    }
+    if symbol.close_handle {
+        let Scalar::Opaque(name) = &symbol.input_types[0] else {
+            unreachable!()
+        };
+        writeln!(source, "let id = frame.payload(a0, false).low;\nhandles::close(id, std::any::TypeId::of::<opaque_tags::r#{name}>()).unwrap_or_else(|error| std::panic::panic_any((error, id)));\nunsafe {{ *output = BridgeValue::default(); }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}}").unwrap();
+        return;
     }
     let mut serial = 0;
     let mut arguments = Vec::new();
@@ -196,7 +219,7 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
     }
     writeln!(
         source,
-        ") -> {} = bridge::r#{target};\nlet result = adapter({});",
+        ") -> {} = bridge::r#{target};\nlet result = adapter({});\nframe.release_handles();",
         symbol.output_type.rust_type(false),
         arguments.join(",")
     )

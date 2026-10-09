@@ -583,6 +583,8 @@ fn independent_project_archives_keep_same_named_rust_functions_distinct() {
         #[unsafe(no_mangle)]
         pub extern "C" fn willow_rust_bridge_panic() -> ! {{ std::process::abort() }}
         #[unsafe(no_mangle)]
+        pub extern "C" fn willow_rust_bridge_handle_error(_: u32, _: u64) -> ! {{ std::process::abort() }}
+        #[unsafe(no_mangle)]
         pub extern "C" fn willow_rust_bridge_panic_message(_: *const u8, _: usize) -> ! {{ std::process::abort() }}
         fn main() {{
             let (a, b) = unsafe {{ (first(20, 22), second(20, 22)) }};
@@ -1068,4 +1070,240 @@ fn aggregate_abi_shims_are_shared_across_repeated_calls() {
         assert_eq!(shims, count);
         eprintln!("aggregate declarations={count} calls={count} shims={shims}");
     }
+}
+
+const OPAQUE_DECL: &str = "extern rust { opaque Handle; fn handle_new(value: i64) -> Handle; fn read(handle: Handle) -> i64; }";
+const OPAQUE_RUST: &str = "pub struct Handle(i64); pub fn handle_new(value: i64) -> Box<Handle> { Box::new(Handle(value)) } pub fn read(handle: &Handle) -> i64 { handle.0 }";
+
+#[test]
+fn opaque_handles_roundtrip_aliases_defer_collections_and_indirect_calls() {
+    for (name, body, expected) in [
+        (
+            "roundtrip",
+            "let h = handle_new(42); println(read(h)); Handle_close(h);",
+            "42\n",
+        ),
+        (
+            "alias",
+            "let h = handle_new(7); let copy = h; println(read(copy)); Handle_close(h);",
+            "7\n",
+        ),
+        (
+            "defer",
+            "let h = handle_new(8); defer Handle_close(h); println(read(h));",
+            "8\n",
+        ),
+        (
+            "indirect",
+            "let make = handle_new; let get = read; let close = Handle_close; let h = make(9); println(get(h)); close(h);",
+            "9\n",
+        ),
+        (
+            "array",
+            "let a = [handle_new(10), handle_new(11)]; println(read(a[1])); Handle_close(a[0]); Handle_close(a[1]);",
+            "11\n",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.sources(
+            &format!("{OPAQUE_DECL} fn main() {{ {body} }}"),
+            OPAQUE_RUST,
+        );
+        let output = f.successful(&["run", "--offline"]);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{name}");
+    }
+}
+
+#[test]
+fn opaque_handles_closed_diagnostics_and_nominal_type_rejection() {
+    for body in [
+        "let h = handle_new(1); Handle_close(h); Handle_close(h);",
+        "let h = handle_new(1); let copy = h; Handle_close(h); println(read(copy));",
+        "let h = handle_new(1); Handle_close(h); let next = handle_new(2); println(read(h)); Handle_close(next);",
+    ] {
+        let f = Fixture::new();
+        f.sources(
+            &format!("{OPAQUE_DECL} fn main() {{ {body} }}"),
+            OPAQUE_RUST,
+        );
+        let output = f.command(&["run", "--offline"]);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("rust_handle_closed"), "{error}");
+    }
+    for source in [
+        "extern rust { opaque A; opaque B; fn make() -> A; fn use_b(b: B); } fn main() { use_b(make()); }",
+        "extern rust { opaque A; fn use_a(a: A); } fn main() { use_a(1); }",
+        "extern rust { opaque A; opaque A; } fn main() {}",
+        "extern rust { opaque String; } fn main() {}",
+        "extern rust { opaque A; fn A_close(a: A); } fn main() {}",
+        "extern rust { fn bad(a: Missing); } fn main() {}",
+    ] {
+        let f = Fixture::new();
+        f.sources(source, "");
+        assert!(
+            !f.command(&["check", "--offline"]).status.success(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn opaque_nested_option_result_and_rust_type_contract() {
+    let f = Fixture::new();
+    f.sources(
+        "extern rust { opaque Handle; fn make() -> Option<Handle>; fn read(h: Option<Handle>) -> i64; } fn main() { let h = make(); println(read(h)); match h { Some(value) => { Handle_close(value); } None => {} } }",
+        "pub struct Handle(i64); pub fn make() -> Option<Box<Handle>> { Some(Box::new(Handle(42))) } pub fn read(h: Option<&Handle>) -> i64 { h.map_or(0, |v| v.0) }",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
+        "42\n"
+    );
+    let f = Fixture::new();
+    f.sources(&format!("{OPAQUE_DECL} fn main() {{}}"), "pub struct Handle(i64); pub fn handle_new(value: i64) -> Handle { Handle(value) } pub fn read(h: &Handle) -> i64 {h.0}");
+    let output = f.command(&["check", "--offline"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rust_bridge_signature_mismatch"));
+}
+
+#[test]
+fn opaque_regex_example_runs() {
+    let f = Fixture::new();
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/rust_opaque_bridge");
+    for file in ["project.toml", "bridge.rs", "src/main.wi"] {
+        fs::copy(example.join(file), f.root.join(file)).unwrap();
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
+        "true\nfalse\n"
+    );
+    for name in ["regex_new", "Regex_close"] {
+        let output = f.successful(&[
+            "query",
+            "rust-bridge",
+            name,
+            "--offline",
+            "--format",
+            "json",
+        ]);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["status"], "ok");
+        assert!(
+            value["bridges"][0]["signature"]
+                .to_string()
+                .contains("Opaque"),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn opaque_forward_cross_block_namespace_and_drop_contract() {
+    for source in [
+        "extern rust { fn handle_new(value: i64) -> Handle; opaque Handle; fn read(handle: Handle) -> i64; } fn main() { let h = handle_new(42); println(read(h)); Handle_close(h); }",
+        "extern rust { opaque Handle; } extern rust { fn handle_new(value: i64) -> Handle; fn read(handle: Handle) -> i64; } fn main() { let h = handle_new(42); println(read(h)); Handle_close(h); }",
+        "extern rust native { opaque Handle; fn handle_new(value: i64) -> Handle; fn read(handle: Handle) -> i64; } fn main() { let h = native::handle_new(42); println(native::read(h)); native::Handle_close(h); }",
+    ] {
+        let f = Fixture::new();
+        f.sources(source, OPAQUE_RUST);
+        assert_eq!(
+            String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
+            "42\n"
+        );
+    }
+    let f = Fixture::new();
+    f.sources("extern rust { opaque Handle; fn handle_new(value: i64) -> Handle; fn drops() -> i64; } fn main() { let h = handle_new(1); println(drops()); Handle_close(h); println(drops()); }",
+        "use std::sync::atomic::{AtomicI64, Ordering}; static DROPS: AtomicI64 = AtomicI64::new(0); pub struct Handle; impl Drop for Handle { fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); } } pub fn handle_new(_: i64) -> Box<Handle> {Box::new(Handle)} pub fn drops() -> i64 {DROPS.load(Ordering::SeqCst)}");
+    assert_eq!(
+        String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
+        "0\n1\n"
+    );
+}
+
+#[test]
+fn opaque_handle_survives_gc_and_destructor_panic_is_structured() {
+    let f = Fixture::new();
+    f.sources("extern rust { opaque Handle; fn handle_new(value: i64) -> Handle; fn read(h: Handle) -> i64; fn collect(); } fn main() { let h = handle_new(42); collect(); println(read(h)); Handle_close(h); }",
+        &format!("{OPAQUE_RUST} pub fn collect() {{ unsafe extern \"C\" {{ fn willow_gc_collect(); }} unsafe {{ willow_gc_collect(); }} }}"));
+    assert_eq!(
+        String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
+        "42\n"
+    );
+    let f = Fixture::new();
+    f.sources("extern rust { opaque Handle; fn make() -> Handle; } fn main() { let h = make(); Handle_close(h); }",
+        "pub struct Handle; impl Drop for Handle { fn drop(&mut self) {panic!(\"handle destructor\");} } pub fn make() -> Box<Handle> {Box::new(Handle)}");
+    let output = f.command(&["run", "--offline"]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("RustPanic: rust_bridge_panic: handle destructor"),
+        "{error}"
+    );
+}
+
+#[test]
+fn opaque_wrapper_counts_share_table_and_nominal_tags() {
+    let abi = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/willow_abi/src/ffi.rs");
+    let mut previous = None;
+    let mut slope = None;
+    for count in [16, 64, 256, 1024] {
+        let symbols: Vec<_> = (0..count)
+            .map(|_| {
+                RustBridgeSymbol::new(
+                    "read".into(),
+                    vec![Scalar::Opaque("Handle".into())],
+                    Scalar::I64,
+                )
+            })
+            .collect();
+        let source = wrappers(
+            &symbols,
+            &abi,
+            willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
+        );
+        assert_eq!(source.matches("pub struct r#Handle;").count(), 1);
+        assert_eq!(source.matches("pub struct Table {").count(), 1);
+        assert_eq!(source.matches("let adapter:").count(), count);
+        assert_eq!(
+            source.matches("frame.handle::<bridge::r#Handle>").count(),
+            count
+        );
+        let base = wrappers(&[], &abi, willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION).len();
+        if let Some((old_count, old_len)) = previous {
+            assert_eq!((source.len() - old_len) % (count - old_count), 0);
+            let step = (source.len() - old_len) / (count - old_count);
+            assert_eq!(*slope.get_or_insert(step), step);
+        }
+        eprintln!(
+            "opaque_wrappers declarations={count} tables=1 tags=1 calls={count} bytes={} base={base}",
+            source.len()
+        );
+        previous = Some((count, source.len()));
+    }
+}
+
+#[test]
+fn opaque_last_lease_destructor_precedes_output_conversion() {
+    let f = Fixture::new();
+    f.sources("extern rust { opaque Input; opaque Output; fn make() -> Input; fn convert(h: Input) -> Output; fn value(h: Output) -> i64; } fn main() { let h = make(); let output = convert(h); println(value(output)); Output_close(output); }",
+        r#"use std::sync::atomic::{AtomicBool, Ordering};
+        static DROPPED: AtomicBool = AtomicBool::new(false);
+        pub struct Input; pub struct Output(i64);
+        impl Drop for Input { fn drop(&mut self) {
+            unsafe extern "C" { fn willow_gc_collect(); }
+            unsafe { willow_gc_collect(); }
+            DROPPED.store(true, Ordering::SeqCst);
+        } }
+        pub fn make() -> Box<Input> { Box::new(Input) }
+        pub fn convert(_: &Input) -> Box<Output> {
+            crate::handles::close((1u64 << 32) | 1, std::any::TypeId::of::<crate::opaque_tags::Input>()).unwrap();
+            assert!(!DROPPED.load(Ordering::SeqCst));
+            Box::new(Output(42))
+        }
+        pub fn value(h: &Output) -> i64 { assert!(DROPPED.load(Ordering::SeqCst)); h.0 }
+        "#);
+    assert_eq!(
+        String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
+        "42\n"
+    );
 }

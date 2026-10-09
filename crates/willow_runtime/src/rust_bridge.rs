@@ -1,5 +1,7 @@
 //! R2 permits synchronous foreign calls only, outside scheduler task execution.
 pub(crate) mod aggregate;
+#[cfg(test)]
+mod handles;
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_rust_bridge_enter(revision: u32) {
@@ -48,4 +50,19 @@ mod tests {
             willow_rust_bridge_enter(willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION);
         }
     }
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_rust_bridge_handle_error(closed: u32, id: u64) -> ! {
+    let kind = if closed != 0 {
+        "rust_handle_closed"
+    } else {
+        "rust_handle_invalid"
+    };
+    crate::failure::fatal_invariant(&format!(
+        "{kind}: id={id:#018x} slot={} generation={}",
+        id as u32,
+        id >> 32
+    ));
 }

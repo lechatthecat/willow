@@ -1,0 +1,15 @@
+extern rust {
+    opaque Regex;
+    fn regex_new(pattern: String) -> Result<Regex, String>;
+    fn regex_is_match(regex: Regex, text: String) -> bool;
+}
+fn main() {
+    match regex_new("^hello [a-z]+$") {
+        Ok(regex) => {
+            defer Regex_close(regex);
+            println(regex_is_match(regex, "hello willow"));
+            println(regex_is_match(regex, "goodbye"));
+        }
+        Err(message) => { println(message); }
+    }
+}
