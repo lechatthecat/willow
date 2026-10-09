@@ -187,7 +187,6 @@ impl PackageCommand {
                 "no project.toml found",
             )
         })?;
-        let mut out = std::io::stdout().lock();
         if self.format != "human" {
             let value = match self.operation {
                 Operation::Mutate(mutation) => serde_json::to_value(mutate_packages_report(
@@ -208,11 +207,9 @@ impl PackageCommand {
                     }
                 }
             };
-            use std::io::Write;
-            serde_json::to_writer(&mut out, &value)?;
-            writeln!(out)?;
-            return Ok(());
+            return super::write_machine_output(&value);
         }
+        let mut out = std::io::stdout().lock();
         match self.operation {
             Operation::Metadata => display_dependencies(&inspect_packages(&root)?, None, &mut out),
             Operation::Mutate(mutation) => mutate_packages(&root, mutation, self.dry_run, &mut out),

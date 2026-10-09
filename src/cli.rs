@@ -11,6 +11,7 @@ mod init;
 mod overview;
 mod package;
 mod protocol;
+mod rust;
 
 #[derive(Debug)]
 enum CliCommand {
@@ -25,6 +26,7 @@ enum CliCommand {
     Fetch(FetchCommand),
     Verify(FetchCommand),
     Package(package::PackageCommand),
+    Rust(rust::RustCommand),
 }
 
 #[derive(Debug)]
@@ -129,6 +131,7 @@ impl CliCommand {
         };
 
         match command.as_str() {
+            "rust" | "doctor" => Ok(Self::Rust(rust::RustCommand::parse(command, &args[1..])?)),
             "agent" => Ok(Self::Agent(agent::AgentCommand::parse(&args[1..])?)),
             "init" => Ok(Self::Init(init::InitCommand::parse(&args[1..])?)),
             "edit" => Ok(Self::Edit(edit::EditCommand::parse(&args[1..])?)),
@@ -183,6 +186,7 @@ impl CliCommand {
                 );
                 Ok(())
             }
+            Self::Rust(command) => command.execute(),
             Self::Package(command) => command.execute(),
             Self::Build(command) => command.execute(),
             Self::Check(command) => {
@@ -592,7 +596,15 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
     let machine_package = args.first().is_some_and(|s| {
         matches!(
             s.as_str(),
-            "add" | "remove" | "update" | "deps" | "metadata" | "fetch" | "package"
+            "add"
+                | "remove"
+                | "update"
+                | "deps"
+                | "metadata"
+                | "fetch"
+                | "package"
+                | "rust"
+                | "doctor"
         )
     }) && args.iter().enumerate().any(|(i, arg)| {
         matches!(arg.as_str(), "--format=json" | "--format=ndjson")
@@ -603,10 +615,40 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
     });
     let result = CliCommand::parse(&args).and_then(CliCommand::execute);
     if machine_package && let Err(error) = &result {
-        println!("{}", willow_compiler::package::package_error_json(error));
+        let mut value = willow_compiler::package::package_error_json(error);
+        if let Some(command @ ("rust" | "doctor")) = args.first().map(String::as_str) {
+            value["kind"] = serde_json::json!(format!("{command}.error"));
+            if value["error"]["kind"] == "package_command_failed" {
+                value["error"]["kind"] = serde_json::json!(format!("{command}_command_failed"));
+            }
+        }
+        write_machine_output(&value)?;
         std::process::exit(1);
     }
+    if let Err(error) = &result
+        && let Some(error) = error.downcast_ref::<willow_compiler::package::CommandError>()
+        && error.kind == "rust_bridge_compile_error"
+    {
+        if let Some(diagnostics) = error.fields.get("diagnostics").and_then(|v| v.as_array()) {
+            for diagnostic in diagnostics {
+                if let Some(rendered) = diagnostic["message"]["rendered"].as_str() {
+                    eprint!("{rendered}");
+                }
+            }
+        }
+        if let Some(stderr) = error.fields.get("cargo_stderr").and_then(|v| v.as_str()) {
+            eprint!("{stderr}");
+        }
+    }
     result
+}
+
+pub(super) fn write_machine_output(value: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    serde_json::to_writer(&mut out, value)?;
+    writeln!(out)?;
+    Ok(())
 }
 
 /// `willow --help`, `willow help [command]` and `willow <command> ... --help`
@@ -666,7 +708,7 @@ fn is_advanced_usage(line: &str) -> bool {
 }
 
 fn detailed_usage() -> &'static str {
-    "Usage:\n  willow overview [PATH] [--depth 0|1] [--format human|json|ndjson] [--max-chars N] [--all] [--kind KIND] [--absolute-paths]\n  willow agent instructions <codex|claude> [--format human|json]\n  willow agent sync [--yes]\n  willow init [DIR] [--name NAME]\n  init preserves existing Git repositories and .gitignore files; outside a repository, run git init in DIR to activate ignore rules. Parent repositories need no nested git init.\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi [--project] --requests edits.json [--changes full|diff]\n  willow edit preview --root DIR --transaction ID [--changes full|diff]\n  willow edit <validate|apply|recover> --root DIR --transaction ID\n  willow rename SELECTOR NEW_NAME [--dry-run] [--source FILE | --project-dir DIR] [--format human|json|ndjson] [--verbose]\n  willow impact <source.wi|project-dir> (--file PATH --byte N | --function ID --revision REV) [--direction callers|callees] [--max-nodes N] [--max-depth N]\n  willow query <source.wi|project-dir> --requests queries.json\n  willow refs SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow references SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow symbol SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow type SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow effects SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow impact SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
+    "Usage:\n  willow overview [PATH] [--depth 0|1] [--format human|json|ndjson] [--max-chars N] [--all] [--kind KIND] [--absolute-paths]\n  willow agent instructions <codex|claude> [--format human|json]\n  willow agent sync [--yes]\n  willow init [DIR] [--name NAME]\n  init preserves existing Git repositories and .gitignore files; outside a repository, run git init in DIR to activate ignore rules. Parent repositories need no nested git init.\n  willow doctor [project-dir] [--format human|json|ndjson]\n  willow rust <check|metadata> [project-dir] [--format human|json|ndjson] [--offline|--locked|--frozen] [--cache-dir DIR]\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi [--project] --requests edits.json [--changes full|diff]\n  willow edit preview --root DIR --transaction ID [--changes full|diff]\n  willow edit <validate|apply|recover> --root DIR --transaction ID\n  willow rename SELECTOR NEW_NAME [--dry-run] [--source FILE | --project-dir DIR] [--format human|json|ndjson] [--verbose]\n  willow impact <source.wi|project-dir> (--file PATH --byte N | --function ID --revision REV) [--direction callers|callees] [--max-nodes N] [--max-depth N]\n  willow query <source.wi|project-dir> --requests queries.json\n  willow refs SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow references SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow symbol SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow type SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow effects SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow impact SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
 }
 
 fn stem(path: &str) -> String {

@@ -263,13 +263,11 @@ fn compile_failure_retains_structured_diagnostic() {
         "pub fn bad() { missing_function(); }\n",
     )
     .unwrap();
-    let error = build_bridge(&fixture.manifest(), &fixture.root, &fixture.options, false)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("rust_bridge_build_failed") && error.contains("E0425"),
-        "{error}"
-    );
+    let error =
+        build_bridge(&fixture.manifest(), &fixture.root, &fixture.options, false).unwrap_err();
+    let value = willow_compiler::package::package_error_json(&error);
+    assert_eq!(value["error"]["kind"], "rust_bridge_compile_error");
+    assert!(value["error"]["diagnostics"].to_string().contains("E0425"));
 }
 
 #[test]

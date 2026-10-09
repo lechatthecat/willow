@@ -165,6 +165,7 @@ pub fn parse_cargo_messages(bytes: &[u8], bridge_manifest: &Path) -> Result<Carg
 
 #[derive(Debug)]
 pub struct BridgeBuild {
+    pub toolchain: RustToolchain,
     pub directory: PathBuf,
     pub cache_key: String,
     pub target: String,
@@ -172,6 +173,7 @@ pub struct BridgeBuild {
     pub messages: CargoMessages,
     /// Cargo metadata includes exact package versions and resolved graph.
     pub metadata: Value,
+    pub direct_dependencies: Value,
     // Hold until caller finishes consuming/linking the artifact. Another Willow
     // process must not replace the stable Cargo staticlib alias during linking.
     _lease: File,
@@ -199,6 +201,40 @@ pub fn build_bridge(
     root: &Path,
     options: &BridgeOptions,
     check: bool,
+) -> Result<Option<BridgeBuild>> {
+    prepare_bridge(
+        project,
+        root,
+        options,
+        if check {
+            BridgeAction::Check
+        } else {
+            BridgeAction::Build
+        },
+    )
+}
+
+/// Resolve dependencies and generate the wrapper without compiling it.
+pub fn inspect_bridge(
+    project: &ProjectManifest,
+    root: &Path,
+    options: &BridgeOptions,
+) -> Result<Option<BridgeBuild>> {
+    prepare_bridge(project, root, options, BridgeAction::Metadata)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BridgeAction {
+    Metadata,
+    Check,
+    Build,
+}
+
+fn prepare_bridge(
+    project: &ProjectManifest,
+    root: &Path,
+    options: &BridgeOptions,
+    action: BridgeAction,
 ) -> Result<Option<BridgeBuild>> {
     if project.rust_dependencies.is_empty() {
         return Ok(None);
@@ -320,10 +356,14 @@ pub fn build_bridge(
     })?;
     let metadata: Value = serde_json::from_slice(&metadata_output.stdout)?;
     let lock_hash = hash_file(&directory.join("Cargo.lock"))?;
+    let direct_dependencies = direct_dependency_metadata(
+        &metadata,
+        project.rust_dependencies.keys().map(String::as_str),
+    )?;
     let rust_lock = crate::package::lock::RustLock {
         cargo_lock_hash: lock_hash.clone(),
         bridge_input_hash: input_hash,
-        dependencies: direct_versions(&metadata)?,
+        dependencies: direct_versions(&direct_dependencies)?,
     };
     if options.locked {
         if previous.as_ref() != Some(&rust_lock) {
@@ -358,6 +398,20 @@ pub fn build_bridge(
         &lib_path,
         format!("// Willow bridge key: {cache_key}\n{source}").as_bytes(),
     )?;
+    if action == BridgeAction::Metadata {
+        return Ok(Some(BridgeBuild {
+            directory,
+            cache_key,
+            target: target.to_owned(),
+            staticlib: None,
+            messages: CargoMessages::default(),
+            metadata,
+            direct_dependencies,
+            toolchain,
+            _lease: lease,
+        }));
+    }
+    let check = action == BridgeAction::Check;
     let mut cargo = command();
     cargo
         .arg(if check { "check" } else { "rustc" })
@@ -381,11 +435,19 @@ pub fn build_bridge(
         .context("cargo_missing: cannot execute Cargo")?;
     let messages = parse_cargo_messages(&output.stdout, &manifest_path)?;
     if !output.status.success() || !messages.success {
-        bail!(
-            "rust_bridge_build_failed: {}\n{}",
-            serde_json::to_string(&messages.diagnostics)?,
-            String::from_utf8_lossy(&output.stderr)
+        let mut error = crate::package::CommandError::new(
+            "rust_bridge_compile_error",
+            "Rust bridge compilation failed",
         );
+        error.fields.insert(
+            "diagnostics".into(),
+            serde_json::to_value(&messages.diagnostics)?,
+        );
+        error.fields.insert(
+            "cargo_stderr".into(),
+            String::from_utf8_lossy(&output.stderr).into_owned().into(),
+        );
+        return Err(error.into());
     }
     let staticlib = if check {
         None
@@ -427,12 +489,14 @@ pub fn build_bridge(
         staticlib,
         messages,
         metadata,
+        direct_dependencies,
+        toolchain,
         _lease: lease,
     }))
 }
 
 #[cfg(test)]
-thread_local! { static SUMMARY_VISITS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) }; }
+thread_local! { static SUMMARY_VISITS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) }; }
 #[cfg(test)]
 fn summary_visit(index: usize) {
     SUMMARY_VISITS.with(|counts| {
@@ -442,20 +506,41 @@ fn summary_visit(index: usize) {
     });
 }
 
-// Index package IDs once; never scan the full graph for each direct edge.
-fn direct_versions(metadata: &Value) -> Result<std::collections::BTreeMap<String, String>> {
-    let packages = metadata["packages"]
+// Reuse the already projected edges for the persisted version summary.
+fn direct_versions(dependencies: &Value) -> Result<std::collections::BTreeMap<String, String>> {
+    dependencies
         .as_array()
-        .context("Cargo packages missing")?;
-    let versions: std::collections::HashMap<_, _> = packages
+        .context("Cargo direct dependencies missing")?
+        .iter()
+        .map(|d| {
+            Ok((
+                d["alias"]
+                    .as_str()
+                    .context("Cargo dependency name missing")?
+                    .to_owned(),
+                d["version"]
+                    .as_str()
+                    .context("Cargo dependency version missing")?
+                    .to_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// Project manifest aliases via indexed direct packages (expected O(P + N + D)).
+/// Cargo owns resolved versions and registry/git source identities.
+pub fn direct_dependency_metadata<'a>(
+    metadata: &Value,
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> Result<Value> {
+    let packages: std::collections::HashMap<_, _> = metadata["packages"]
+        .as_array()
+        .context("Cargo packages missing")?
         .iter()
         .map(|p| {
             #[cfg(test)]
             summary_visit(0);
-            Ok((
-                p["id"].as_str().context("Cargo package id missing")?,
-                p["version"].as_str().context("Cargo version missing")?,
-            ))
+            Ok((p["id"].as_str().context("Cargo package id missing")?, p))
         })
         .collect::<Result<_>>()?;
     let root = metadata["resolve"]["root"]
@@ -471,26 +556,43 @@ fn direct_versions(metadata: &Value) -> Result<std::collections::BTreeMap<String
             n["id"].as_str() == Some(root)
         })
         .context("Cargo root node missing")?;
-    node["deps"]
+    // Generated manifests currently have no `package` rename: each original
+    // alias is the exact Cargo package name, not the normalized/custom lib name
+    // in resolve.nodes[].deps[].name. Index only resolved direct packages so a
+    // transitive package with the same name cannot replace the direct version.
+    let direct: std::collections::HashMap<_, _> = node["deps"]
         .as_array()
         .context("Cargo direct dependencies missing")?
         .iter()
         .map(|d| {
             #[cfg(test)]
             summary_visit(2);
-            let id = d["pkg"].as_str().context("Cargo dependency id missing")?;
+            let package = packages
+                .get(d["pkg"].as_str().context("Cargo dependency id missing")?)
+                .context("Cargo dependency package missing")?;
             Ok((
-                d["name"]
+                package["name"]
                     .as_str()
-                    .context("Cargo dependency name missing")?
-                    .to_owned(),
-                versions
-                    .get(id)
-                    .context("Cargo dependency version missing")?
-                    .to_string(),
+                    .context("Cargo package name missing")?,
+                *package,
             ))
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    let dependencies = aliases
+        .into_iter()
+        .map(|alias| {
+            #[cfg(test)]
+            summary_visit(3);
+            let package = direct
+                .get(alias)
+                .context("Cargo manifest dependency missing from resolution")?;
+            Ok(serde_json::json!({"alias":alias, "name":package["name"],
+            "version":package["version"], "source": if package["source"].is_null() {
+                serde_json::json!({"path":package["manifest_path"]})
+            } else { package["source"].clone() }}))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Value::Array(dependencies))
 }
 
 fn generated_manifest(project: &ProjectManifest, root: &Path) -> Result<String> {
@@ -604,6 +706,33 @@ mod tests {
     use crate::project::RustDependencySpec;
 
     #[test]
+    fn direct_projection_preserves_aliases_and_sources_without_transitives() {
+        let metadata = serde_json::json!({
+            "packages":[
+                {"id":"unused", "name":"actual-name", "version":"9.0.0"},
+                {"id":"git", "name":"actual-name", "version":"2.3.4", "source":"git+https://example.invalid/repo#abc"},
+                {"id":"registry", "name":"regex", "version":"1.12.0", "source":"registry+https://example.invalid/index"}
+            ],
+            "resolve":{"root":"root", "nodes":[{"id":"unused","deps":[]},
+                {"id":"root","deps":[{"name":"renamed", "pkg":"git"},{"name":"regex", "pkg":"registry"}]}]}
+        });
+        let dependencies = direct_dependency_metadata(&metadata, ["actual-name", "regex"]).unwrap();
+        assert_eq!(dependencies.as_array().unwrap().len(), 2);
+        assert_eq!(dependencies[0]["alias"], "actual-name");
+        assert_eq!(dependencies[0]["name"], "actual-name");
+        assert_eq!(
+            dependencies[0]["source"],
+            "git+https://example.invalid/repo#abc"
+        );
+        assert_eq!(dependencies[1]["version"], "1.12.0");
+        assert_eq!(
+            direct_versions(&dependencies).unwrap()["actual-name"],
+            "2.3.4"
+        );
+        assert!(direct_dependency_metadata(&metadata, ["missing-alias"]).is_err());
+    }
+
+    #[test]
     fn manifest_cardinality_scales_without_duplicate_dependencies() {
         for count in [16, 64, 256, 1024] {
             let mut project: ProjectManifest =
@@ -631,7 +760,7 @@ mod tests {
     fn summary_indexes_packages_once_for_wide_graphs_and_root_last() {
         for count in [16, 64, 256, 1024] {
             let packages: Vec<_> = (0..count)
-                .map(|i| serde_json::json!({"id":format!("id{i}"), "version":"1.2.3"}))
+                .map(|i| serde_json::json!({"id":format!("id{i}"), "name":format!("dep-{i}"), "version":"1.2.3"}))
                 .collect();
             let mut nodes: Vec<_> = (0..count)
                 .map(|i| serde_json::json!({"id":format!("id{i}"), "deps":[]}))
@@ -642,11 +771,14 @@ mod tests {
             nodes.push(serde_json::json!({"id":"root", "deps":deps}));
             let metadata =
                 serde_json::json!({"packages":packages, "resolve":{"root":"root", "nodes":nodes}});
-            SUMMARY_VISITS.with(|v| v.set([0; 3]));
-            let summary = direct_versions(&metadata).unwrap();
+            SUMMARY_VISITS.with(|v| v.set([0; 4]));
+            let aliases: Vec<_> = (0..count).map(|i| format!("dep-{i}")).collect();
+            let projection =
+                direct_dependency_metadata(&metadata, aliases.iter().map(String::as_str)).unwrap();
+            let summary = direct_versions(&projection).unwrap();
             let visits = SUMMARY_VISITS.with(|v| v.get());
             assert_eq!(summary.len(), count);
-            assert_eq!(visits, [count, count + 1, count]);
+            assert_eq!(visits, [count, count + 1, count, count]);
             eprintln!("rust_summary dependencies={count} visits={visits:?}");
         }
     }

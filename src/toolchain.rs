@@ -58,6 +58,44 @@ impl HostToolchain {
         })
     }
 
+    /// Read-only availability probe: doctor must not build or link anything.
+    pub fn runtime_library_status(&self) -> serde_json::Value {
+        let bundled = std::env::current_exe().ok().and_then(|exe| {
+            exe.parent()?.parent().map(|root| {
+                root.join("lib").join(if cfg!(target_env = "msvc") {
+                    "willow_runtime.lib"
+                } else {
+                    "libwillow_runtime.a"
+                })
+            })
+        });
+        let path = self
+            .target
+            .runtime_lib
+            .clone()
+            .or_else(|| bundled.filter(|p| p.is_file()))
+            .unwrap_or_else(|| self.default_runtime_library_path());
+        serde_json::json!({"required":true, "available":path.is_file(), "path":path})
+    }
+
+    pub fn native_linker_status(&self) -> serde_json::Value {
+        #[cfg(all(windows, target_env = "msvc"))]
+        {
+            let target = target_lexicon::Triple::host().to_string();
+            let tool = cc::windows_registry::find_tool(&target, "cl.exe");
+            serde_json::json!({"required":true, "available":tool.is_some(),
+                "program":tool.map(|t| t.path().to_owned())})
+        }
+        #[cfg(not(all(windows, target_env = "msvc")))]
+        {
+            let available = Command::new("cc")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success());
+            serde_json::json!({"required":true, "available":available, "program":"cc"})
+        }
+    }
+
     fn build_default_runtime_library(&self) -> Result<()> {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut args = vec!["build", "-p", "willow_runtime"];
