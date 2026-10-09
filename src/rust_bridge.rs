@@ -1,27 +1,33 @@
-//! Scalar bridge IR shared by declarations, adapters, and metadata.
+//! Bridge type IR shared by declarations, adapters, and metadata.
+//! `Scalar` retains its R2 public name for API compatibility.
 use crate::parser::ast::Type;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
-pub(crate) const WRAPPER_SCHEMA: &str = "3";
+pub(crate) const WRAPPER_SCHEMA: &str = "4";
 
 pub type RustBridgeSymbols = Vec<((u32, String), RustBridgeSymbol)>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scalar {
     I64,
     F64,
     Bool,
     Void,
+    String,
+    Bytes,
+    Option(Box<Scalar>),
+    Result(Box<Scalar>, Box<Scalar>),
 }
 impl Scalar {
-    pub fn abi_type(self) -> Option<willow_abi::AbiTy> {
+    pub fn abi_type(&self) -> Option<willow_abi::AbiTy> {
         Some(match self {
             Self::I64 => willow_abi::AbiTy::I64,
             Self::F64 => willow_abi::AbiTy::F64,
             Self::Bool => willow_abi::AbiTy::I8,
             Self::Void => return None,
+            _ => willow_abi::AbiTy::Ptr,
         })
     }
 
@@ -31,15 +37,25 @@ impl Scalar {
             Type::F64 => Self::F64,
             Type::Bool => Self::Bool,
             Type::Void => Self::Void,
+            Type::String => Self::String,
+            Type::Array(inner) if **inner == Type::I64 => Self::Bytes,
+            Type::Generic(name, args) if name == "Option" && args.len() == 1 => {
+                Self::Option(Box::new(Self::from_type(&args[0])?))
+            }
+            Type::Generic(name, args) if name == "Result" && args.len() == 2 => Self::Result(
+                Box::new(Self::from_type(&args[0])?),
+                Box::new(Self::from_type(&args[1])?),
+            ),
             _ => return None,
         })
     }
-    fn rust(self) -> &'static str {
+    fn rust(&self) -> &'static str {
         match self {
             Self::I64 => "i64",
             Self::F64 => "f64",
             Self::Bool => "bool",
             Self::Void => "()",
+            _ => unreachable!("aggregate Rust type"),
         }
     }
 }
@@ -53,6 +69,13 @@ pub struct RustBridgeSymbol {
     pub effects: u8,
 }
 impl RustBridgeSymbol {
+    pub fn aggregate(&self) -> bool {
+        self.input_types
+            .iter()
+            .chain([&self.output_type])
+            .any(Scalar::aggregate)
+    }
+
     pub fn new(name: String, inputs: Vec<Scalar>, output: Scalar) -> Self {
         let effects = willow_abi::RuntimeEffects::MAY_PANIC
             .union(willow_abi::RuntimeEffects::MAY_BLOCK)
@@ -70,7 +93,7 @@ impl RustBridgeSymbol {
         let mut bound = self.clone();
         bound.rust_crate = identity.into();
         let bytes =
-            serde_json::to_vec(&(&self.willow_function, &self.input_types, self.output_type))
+            serde_json::to_vec(&(&self.willow_function, &self.input_types, &self.output_type))
                 .unwrap();
         // Package identity is a separate component, shared by this bridge's
         // exports. The symbol component keeps its readable leaf name plus a
@@ -93,7 +116,15 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
     source.push_str(
         "#[cfg(panic = \"abort\")] compile_error!(\"Rust bridge requires panic=unwind\");\n",
     );
+    source.push_str(include_str!("rust_bridge/panic.rs"));
+    if symbols.iter().any(RustBridgeSymbol::aggregate) {
+        source.push_str(include_str!("rust_bridge/support.rs"));
+    }
     for symbol in symbols {
+        if symbol.aggregate() {
+            aggregate_wrapper(&mut source, symbol, revision);
+            continue;
+        }
         let target = symbol.willow_function.rsplit("::").next().unwrap();
         write!(
             source,
@@ -117,7 +148,11 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
         for i in 0..symbol.input_types.len() {
             write!(source, "a{i},").unwrap();
         }
-        source.push_str(")\n})) { Ok(value) => value, Err(payload) => { std::mem::forget(payload); unsafe { willow_rust_bridge_panic() } } }\n}\n");
+        source
+            .push_str(")\n})) { Ok(value) => value, Err(payload) => bridge_panic(payload) }\n}\n");
     }
     source
 }
+
+mod aggregate;
+use aggregate::aggregate_wrapper;

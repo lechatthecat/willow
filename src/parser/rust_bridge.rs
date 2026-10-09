@@ -37,7 +37,7 @@ impl Parser {
                 let param = self.parse_param()?;
                 let ty = Scalar::from_type(&param.ty).filter(|ty| *ty != Scalar::Void);
                 if ty.is_none() || !matches!(param.mode, ParamMode::Value) {
-                    return Err(self.err(ErrorCode::E0102, "rust_bridge_signature_mismatch: only scalar value parameters i64/f64/bool are supported"));
+                    return Err(self.err(ErrorCode::E0102, "rust_bridge_signature_mismatch: unsupported value parameter (expected scalar, String, Array<i64>, Option or Result)"));
                 }
                 inputs.push(ty.unwrap());
                 params.push(param);
@@ -54,7 +54,7 @@ impl Parser {
             let output = Scalar::from_type(&return_type).ok_or_else(|| {
                 self.err(
                     ErrorCode::E0102,
-                    "rust_bridge_signature_mismatch: only i64/f64/bool/void returns are supported",
+                    "rust_bridge_signature_mismatch: unsupported return type (expected scalar, String, Array<i64>, Option or Result)",
                 )
             })?;
             self.expect(TokenKind::Semicolon)?;

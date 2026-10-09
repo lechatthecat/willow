@@ -40,12 +40,16 @@ impl Fixture {
         fs::write(self.root.join("bridge.rs"), rust).unwrap();
     }
     fn command(&self, args: &[&str]) -> Output {
+        self.command_env(args, &[])
+    }
+    fn command_env(&self, args: &[&str], environment: &[(&str, &str)]) -> Output {
         let original_home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .unwrap();
         Command::new(env!("CARGO_BIN_EXE_willow"))
             .current_dir(&self.root)
             .args(args)
+            .envs(environment.iter().copied())
             .env("WILLOW_KEEP_OBJECT", "1")
             .env("HOME", self.temp.join("home"))
             .env("USERPROFILE", self.temp.join("home"))
@@ -169,11 +173,14 @@ fn unsupported_signatures_duplicate_and_malformed_declarations_fail() {
             "extern rust native::module { fn bad(); }",
         ),
         ("reserved_namespace", "extern rust std { fn bad(); }"),
-        ("string_parameter", "extern rust { fn bad(x: String); }"),
-        ("array_parameter", "extern rust { fn bad(x: Array<i64>); }"),
+        ("object_parameter", "extern rust { fn bad(x: Object); }"),
+        (
+            "array_parameter",
+            "extern rust { fn bad(x: Array<String>); }",
+        ),
         ("void_parameter", "extern rust { fn bad(x: void); }"),
         ("reference_parameter", "extern rust { fn bad(x: &i64); }"),
-        ("string_return", "extern rust { fn bad() -> String; }"),
+        ("object_return", "extern rust { fn bad() -> Object; }"),
         ("duplicate", "extern rust { fn bad(); fn bad(); }"),
         ("local_collision", "extern rust { fn bad(); } fn bad() {}"),
         ("body_forbidden", "extern rust { fn bad() {} }"),
@@ -575,6 +582,8 @@ fn independent_project_archives_keep_same_named_rust_functions_distinct() {
         pub extern "C" fn willow_rust_bridge_enter(revision: u32) {{ assert_eq!(revision, {}); }}
         #[unsafe(no_mangle)]
         pub extern "C" fn willow_rust_bridge_panic() -> ! {{ std::process::abort() }}
+        #[unsafe(no_mangle)]
+        pub extern "C" fn willow_rust_bridge_panic_message(_: *const u8, _: usize) -> ! {{ std::process::abort() }}
         fn main() {{
             let (a, b) = unsafe {{ (first(20, 22), second(20, 22)) }};
             assert_eq!(a, 42);
@@ -817,4 +826,246 @@ fn rust_check_does_not_skip_a_missing_willow_entry() {
     assert!(!output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(value.to_string().contains("cannot read"), "{value}");
+}
+
+#[test]
+fn aggregate_bridge_roundtrips_and_indirect_calls() {
+    let f = Fixture::new();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/rust_value_bridge");
+    for file in [
+        "project.toml",
+        "bridge.rs",
+        "native/Cargo.toml",
+        "native/src/lib.rs",
+        "src/main.wi",
+    ] {
+        fs::copy(source.join(file), f.root.join(file)).unwrap();
+    }
+    for (args, environment) in [
+        (&["run", "--offline"][..], &[][..]),
+        (&["run", "--offline", "--release"][..], &[][..]),
+        (
+            &["run", "--offline"][..],
+            &[("WILLOW_GC_STRESS", "alloc,relocate")][..],
+        ),
+    ] {
+        let output = f.command_env(args, environment);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n".repeat(25));
+    }
+}
+
+#[test]
+fn aggregate_bridge_large_buffers_forced_collection_and_properties() {
+    let f = Fixture::new();
+    f.sources(
+        r#"
+        import std::collections::Array;
+        extern rust {
+            fn text(value: String) -> String;
+            fn bytes(value: Array<i64>) -> Array<i64>;
+            fn collect(value: String) -> String;
+            fn collect_nested(value: Option<Option<String>>) -> Option<Option<String>>;
+        }
+        fn main() {
+            for n in [0, 1, 16, 256, 4096, 65536] {
+                let input = "🙂é".repeat(n);
+                println(text(input) == input);
+                println(collect(text(input)) == input);
+                println(collect_nested(Some(Some(text(input)))).unwrap().unwrap() == input);
+                let data: Array<i64> = [];
+                for i in 0..n { data.push(i % 256); }
+                let output = bytes(data);
+                let mut same = output.len() == n;
+                for i in 0..n { if output[i] != i % 256 { same = false; } }
+                println(same);
+            }
+        }
+    "#,
+        r#"
+        pub fn text(v: &str) -> String { v.to_owned() }
+        pub fn bytes(v: &[u8]) -> Vec<u8> { v.to_owned() }
+        unsafe extern "C" {
+            fn willow_gc_collect();
+            fn willow_gc_minor_collect();
+            fn willow_gc_major_collections() -> i64;
+        }
+        pub fn collect_nested(v: Option<Option<&str>>) -> Option<Option<String>> {
+            unsafe { willow_gc_minor_collect(); willow_gc_collect(); }
+            v.map(|inner| inner.map(str::to_owned))
+        }
+        pub fn collect(v: &str) -> String {
+            let before = unsafe { willow_gc_major_collections() };
+            unsafe { willow_gc_minor_collect(); willow_gc_collect(); }
+            assert!(unsafe { willow_gc_major_collections() } > before);
+            v.to_owned()
+        }
+    "#,
+    );
+    let output = f.successful(&["run", "--offline"]);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n".repeat(24));
+}
+
+#[test]
+fn aggregate_bridge_panics_and_invalid_bytes_are_diagnostics() {
+    for (declaration, call, rust, expected) in [
+        (
+            "fn fail() -> String;",
+            "fail()",
+            "pub fn fail() -> String { panic!(\"panic text 日本語\") }",
+            "RustPanic: rust_bridge_panic: panic text 日本語",
+        ),
+        (
+            "fn fail() -> Result<bool,String>;",
+            "fail()",
+            "pub fn fail() -> Result<bool,String> { panic!(\"result panic\") }",
+            "RustPanic: rust_bridge_panic: result panic",
+        ),
+        (
+            "fn fail() -> Option<i64>;",
+            "fail()",
+            "struct Bad; impl Drop for Bad { fn drop(&mut self) { panic!(\"BAD_DROP\") } } pub fn fail() -> Option<i64> { std::panic::panic_any(Bad) }",
+            "RustPanic: rust_bridge_panic: non-string panic payload",
+        ),
+        (
+            "fn fail(a: Array<i64>);",
+            "fail([-1])",
+            "pub fn fail(_: &[u8]) {}",
+            "rust_bridge_byte_out_of_range",
+        ),
+        (
+            "fn fail(a: Array<i64>);",
+            "fail([256])",
+            "pub fn fail(_: &[u8]) {}",
+            "rust_bridge_byte_out_of_range",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.sources(&format!("import std::collections::Array; extern rust {{ {declaration} }} fn main() {{ {call}; println(987654321); }}"),rust);
+        let output = f.command(&["run", "--offline"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!stderr.contains("BAD_DROP"), "{stderr}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("987654321"));
+    }
+}
+
+#[test]
+fn aggregate_wrapper_emission_is_linear_and_shared_per_declaration() {
+    let abi = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/willow_abi/src/ffi.rs");
+    let mut previous = None;
+    for count in [8, 32, 128] {
+        let symbols: Vec<_> = (0..count)
+            .map(|i| {
+                RustBridgeSymbol::new(
+                    format!("v{i:04}"),
+                    vec![Scalar::String, Scalar::Bytes],
+                    Scalar::Result(Box::new(Scalar::Bytes), Box::new(Scalar::String)),
+                )
+            })
+            .collect();
+        let source = wrappers(
+            &symbols,
+            &abi,
+            willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
+        );
+        let baseline = wrappers(
+            &symbols[..1],
+            &abi,
+            willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
+        );
+        let per = (source.len() - baseline.len()) / (count - 1);
+        assert_eq!(source.matches("let adapter:").count(), count);
+        assert_eq!(source.matches("struct BridgeFrame").count(), 1);
+        assert_eq!(source.matches("catch_unwind(").count(), count);
+        if let Some(prior) = previous {
+            assert_eq!(per, prior);
+        }
+        previous = Some(per);
+        eprintln!(
+            "aggregate declarations={count} adapters={count} shared_frames=1 bytes_per_adapter={per}"
+        );
+    }
+}
+
+#[test]
+fn aggregate_bridge_simultaneous_scalar_option_calls_keep_frames_isolated() {
+    let f = Fixture::new();
+    let option = Scalar::Option(Box::new(Scalar::I64));
+    let symbol = RustBridgeSymbol::new("echo".into(), vec![option.clone()], option)
+        .bind(f.root.canonicalize().unwrap().to_str().unwrap())
+        .abi_symbol;
+    let rust = r#"
+        static BARRIER: std::sync::OnceLock<std::sync::Barrier> = std::sync::OnceLock::new();
+        pub fn echo(value: Option<i64>) -> Option<i64> {
+            BARRIER.get().unwrap().wait();
+            value
+        }
+        pub fn drive() -> i64 {
+            BARRIER.set(std::sync::Barrier::new(8)).unwrap();
+            let threads: Vec<_> = (0..8).map(|i| std::thread::spawn(move || {
+                // This test invokes generated wrappers with scalar-only data.
+                // No Willow GC pointer or object is given to a Rust worker.
+                use super::willow_bridge_abi::WillowBridgeValue;
+                for round in 0..32 {
+                    let input = WillowBridgeValue { low: (round % 2) as u64, high: i };
+                    let mut output = WillowBridgeValue::default();
+                    unsafe { super::WRAPPER(&input, &mut output) };
+                    assert_eq!(output.low, input.low);
+                    assert_eq!(output.high, if input.low == 0 { i } else { 0 });
+                }
+                1
+            })).collect();
+            threads.into_iter().map(|thread| thread.join().unwrap()).sum()
+        }
+    "#
+    .replace("WRAPPER", &symbol);
+    f.sources("extern rust { fn echo(value: Option<i64>) -> Option<i64>; fn drive() -> i64; } fn main() { println(drive()); }", &rust);
+    let output = f.successful(&["run", "--offline"]);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "8\n");
+}
+
+#[test]
+fn aggregate_abi_shims_are_shared_across_repeated_calls() {
+    use object::{Object, ObjectSymbol};
+    for count in [8, 32, 128] {
+        let f = Fixture::new();
+        let declarations: String = (0..count)
+            .map(|i| format!("fn o{i:04}(value: Option<i64>) -> Option<i64>;\n"))
+            .collect();
+        let rust: String = (0..count)
+            .map(|i| format!("pub fn o{i:04}(value: Option<i64>) -> Option<i64> {{ value }}\n"))
+            .collect();
+        let calls: String = (0..count)
+            .map(|_| "println(o0000(Some(7)).unwrap());")
+            .collect();
+        f.sources(
+            &format!("extern rust {{ {declarations} }} fn main() {{ {calls} }}"),
+            &rust,
+        );
+        f.successful(&["build", "--offline", "-o", "app"]);
+        let extension = if cfg!(all(windows, target_env = "msvc")) {
+            "obj"
+        } else {
+            "o"
+        };
+        let bytes = fs::read(f.root.join(format!("app.{extension}"))).unwrap();
+        let object = object::File::parse(&*bytes).unwrap();
+        let shims = object
+            .symbols()
+            .filter(|symbol| {
+                symbol.is_definition()
+                    && symbol.name().is_ok_and(|name| {
+                        name.contains("_willow_rust_") && name.ends_with("_willow")
+                    })
+            })
+            .count();
+        assert_eq!(shims, count);
+        eprintln!("aggregate declarations={count} calls={count} shims={shims}");
+    }
 }

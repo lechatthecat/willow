@@ -413,6 +413,17 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // Scalar Rust bridge entry gate and contained-panic termination.
     NONE; "willow_rust_bridge_enter" => ([I32] -> None);
     NONE; "willow_rust_bridge_panic" => ([] -> None);
+    NONE; "willow_rust_bridge_panic_message" => ([Ptr, I64] -> None);
+    NONE; "willow_rust_bridge_frame_new" => ([] -> Some(Ptr));
+    NONE; "willow_rust_bridge_frame_drop" => ([Ptr] -> None);
+    NONE; "willow_rust_bridge_root" => ([Ptr, I64] -> None);
+    NONE; "willow_rust_bridge_string_data" => ([I64, Ptr] -> None);
+    NONE; "willow_rust_bridge_bytes_len" => ([I64] -> Some(I64));
+    NONE; "willow_rust_bridge_bytes_copy" => ([I64, Ptr, I64] -> None);
+    ALLOC; "willow_rust_bridge_buffer" => ([Ptr, Ptr, I64, I32] -> Some(I64));
+    NONE; "willow_rust_bridge_tag" => ([I64] -> Some(I64));
+    NONE; "willow_rust_bridge_payload" => ([I64, I32, Ptr] -> None);
+    ALLOC; "willow_rust_bridge_enum" => ([Ptr, I64, Ptr, I32, I32] -> Some(I64));
     NONE; "willow_sched_current_task" => ([] -> Some(I64));
     // Tag the running task with its async fn name for async stack traces
     // (willow-9lw): (name_ptr, name_len).

@@ -538,3 +538,47 @@ fn scalar_bridge_runtime_abi_matches_schema() {
     assert!(panic.params.is_empty());
     assert_eq!(panic.ret, None);
 }
+
+#[test]
+fn aggregate_bridge_runtime_abi_matches_schema() {
+    use crate::rust_bridge::aggregate::*;
+    use willow_abi::{
+        AbiTy::*,
+        ffi::{WillowBridgeValue, WillowSliceU8},
+    };
+    let _: extern "C" fn() -> *mut u8 = willow_rust_bridge_frame_new;
+    let _: extern "C" fn(*mut u8) = willow_rust_bridge_frame_drop;
+    let _: extern "C" fn(*mut u8, u64) = willow_rust_bridge_root;
+    let _: extern "C" fn(u64, *mut WillowSliceU8) = willow_rust_bridge_string_data;
+    let _: extern "C" fn(u64) -> usize = willow_rust_bridge_bytes_len;
+    let _: extern "C" fn(u64, *mut u8, usize) = willow_rust_bridge_bytes_copy;
+    let _: extern "C" fn(*mut u8, *const u8, usize, u32) -> u64 = willow_rust_bridge_buffer;
+    let _: extern "C" fn(u64) -> u64 = willow_rust_bridge_tag;
+    let _: extern "C" fn(u64, u32, *mut WillowBridgeValue) = willow_rust_bridge_payload;
+    let _: extern "C" fn(*mut u8, u64, *const WillowBridgeValue, u32, u32) -> u64 =
+        willow_rust_bridge_enum;
+    let _: extern "C" fn(*const u8, usize) -> ! = willow_rust_bridge_panic_message;
+    for (name, params, result) in [
+        ("willow_rust_bridge_frame_new", &[][..], Some(Ptr)),
+        ("willow_rust_bridge_frame_drop", &[Ptr][..], None),
+        ("willow_rust_bridge_root", &[Ptr, I64][..], None),
+        ("willow_rust_bridge_string_data", &[I64, Ptr][..], None),
+        ("willow_rust_bridge_bytes_len", &[I64][..], Some(I64)),
+        ("willow_rust_bridge_bytes_copy", &[I64, Ptr, I64][..], None),
+        (
+            "willow_rust_bridge_buffer",
+            &[Ptr, Ptr, I64, I32][..],
+            Some(I64),
+        ),
+        ("willow_rust_bridge_tag", &[I64][..], Some(I64)),
+        ("willow_rust_bridge_payload", &[I64, I32, Ptr][..], None),
+        (
+            "willow_rust_bridge_enum",
+            &[Ptr, I64, Ptr, I32, I32][..],
+            Some(I64),
+        ),
+        ("willow_rust_bridge_panic_message", &[Ptr, I64][..], None),
+    ] {
+        assert_schema(name, params, result);
+    }
+}

@@ -1,4 +1,5 @@
 //! R2 permits synchronous foreign calls only, outside scheduler task execution.
+pub(crate) mod aggregate;
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_rust_bridge_enter(revision: u32) {

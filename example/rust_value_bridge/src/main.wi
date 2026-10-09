@@ -1,0 +1,46 @@
+import std::collections::Array;
+extern rust {
+    fn text(value: String) -> String;
+    fn bytes(value: Array<i64>) -> Array<i64>;
+    fn maybe(value: Option<i64>) -> Option<i64>;
+    fn maybe_text(value: Option<String>) -> Option<String>;
+    fn maybe_bytes(value: Option<Array<i64>>) -> Option<Array<i64>>;
+    fn checked(value: bool) -> Result<bool, String>;
+    fn checked_bytes(value: Array<i64>) -> Result<Array<i64>, String>;
+    fn nested(value: Option<Option<i64>>) -> Option<Option<i64>>;
+    fn nested_text(value: Option<Option<String>>) -> Option<Option<String>>;
+    fn scalar_result(value: Result<f64, bool>) -> Result<f64, bool>;
+    fn result_input(value: Result<Array<i64>, String>) -> Result<Array<i64>, String>;
+    fn concurrent(value: String) -> String;
+}
+fn main() {
+    println(text("") == "");
+    println(text("日本語🙂") == "日本語🙂");
+    let indirect = text;
+    println(indirect("indirect") == "indirect");
+    let empty: Array<i64> = [];
+    println(bytes(empty).len() == 0);
+    let input = [0, 127, 128, 255];
+    let output = bytes(input);
+    println(output.len() == 4 && output[0] == 0 && output[3] == 255);
+    println(maybe(Some(-42)).unwrap() == -42);
+    println(maybe(None).is_none());
+    println(maybe_text(Some("🙂")).unwrap() == "🙂");
+    println(maybe_text(None).is_none());
+    println(maybe_bytes(Some(input)).unwrap()[2] == 128);
+    println(maybe_bytes(None).is_none());
+    println(checked(true).unwrap());
+    println(checked(false).unwrap_err() == "失敗");
+    println(checked_bytes(input).unwrap()[3] == 255);
+    println(checked_bytes(empty).unwrap_err() == "empty");
+    println(nested(Some(Some(7))).unwrap().unwrap() == 7);
+    println(nested(Some(None)).unwrap().is_none());
+    println(nested(None).is_none());
+    println(nested_text(Some(Some("nested"))).unwrap().unwrap() == "nested");
+    println(nested_text(Some(None)).unwrap().is_none());
+    println(scalar_result(Ok(2.5)).unwrap() == 2.5);
+    println(scalar_result(Err(false)).unwrap_err() == false);
+    println(result_input(Ok(input)).unwrap()[3] == 255);
+    println(result_input(Err("error")).unwrap_err() == "error");
+    println(concurrent("threads") == "threads");
+}

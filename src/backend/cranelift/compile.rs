@@ -1283,7 +1283,13 @@ impl UnitCodegenContext<'_> {
         let ptr_ty = reference_type(self.output.module.target_config());
         // `willow_user_main` is parameterless even when `fn main(args:
         // Array<String>)` is declared (see compile_function_named).
-        if let Some(bridge) = &f.rust_bridge {
+        if f.rust_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.aggregate())
+        {
+            sig.params
+                .extend([AbiParam::new(ptr_ty), AbiParam::new(ptr_ty)]);
+        } else if let Some(bridge) = &f.rust_bridge {
             for ty in &bridge.input_types {
                 sig.params.push(crate::backend::abi::clif_abi_param(
                     ty.abi_type().context("void Rust bridge parameter")?,
@@ -1302,7 +1308,9 @@ impl UnitCodegenContext<'_> {
         // sync with compile_function_named.
         let force_void_main = symbol_name == USER_MAIN_SYMBOL && main_result_err_type(f).is_some();
         if let Some(bridge) = &f.rust_bridge {
-            if let Some(ty) = bridge.output_type.abi_type() {
+            if !bridge.aggregate()
+                && let Some(ty) = bridge.output_type.abi_type()
+            {
                 sig.returns
                     .push(crate::backend::abi::clif_abi_param(ty, ptr_ty));
             }
@@ -1346,7 +1354,13 @@ impl UnitCodegenContext<'_> {
         // extension attributes). A single per-declaration shim preserves that
         // ABI while the Rust boundary uses C zero extension, including indirect
         // calls. Non-bool signatures already agree and need no shim.
-        let id = if f.rust_bridge.as_ref().is_some_and(|bridge| {
+        let id = if f
+            .rust_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.aggregate())
+        {
+            self.declare_aggregate_bridge_shim(f, symbol_name, id)?
+        } else if f.rust_bridge.as_ref().is_some_and(|bridge| {
             bridge
                 .input_types
                 .contains(&crate::rust_bridge::Scalar::Bool)
@@ -1414,6 +1428,106 @@ impl UnitCodegenContext<'_> {
             Type::Fn(param_types, Box::new(call_return_type)),
         );
         Ok(())
+    }
+
+    /// One pointer-transport adapter per declaration, shared by direct and
+    /// indirect calls. Explicit packing keeps I128/internal bool ABI private.
+    fn declare_aggregate_bridge_shim(
+        &mut self,
+        f: &FunctionDecl,
+        symbol: &str,
+        target: cranelift_module::FuncId,
+    ) -> Result<cranelift_module::FuncId> {
+        let ptr = reference_type(self.output.module.target_config());
+        let mut signature = self.output.module.make_signature();
+        for parameter in &f.params {
+            signature.params.push(AbiParam::new(param_abi_type(
+                parameter,
+                ptr,
+                self.classes(),
+            )));
+        }
+        let return_type = self.canonical_enum_type(&function_call_return_type(f));
+        if return_type != Type::Void {
+            signature
+                .returns
+                .push(AbiParam::new(self.clif_type(&return_type)));
+        }
+        let name = format!("{symbol}_willow");
+        self.claim_bridge_symbol(
+            &name,
+            format!("Rust aggregate ABI shim `{}`", f.name),
+            f.span,
+        )?;
+        let shim = self
+            .output
+            .module
+            .declare_function(&name, Linkage::Local, &signature)?;
+        let mut context = self.output.module.make_context();
+        context.func.signature = signature;
+        context.func.name = UserFuncName::user(0, shim.as_u32());
+        let mut builder_context = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut context.func, &mut builder_context);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            b.switch_to_block(entry);
+            b.seal_block(entry);
+            let size = u32::try_from(
+                f.params
+                    .len()
+                    .max(1)
+                    .checked_mul(16)
+                    .context("bridge argument size")?,
+            )?;
+            let inputs =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 3));
+            let output =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 3));
+            let arguments = b.block_params(entry).to_vec();
+            for (i, value) in arguments.into_iter().enumerate() {
+                let offset = i32::try_from(i * 16)?;
+                let ty = b.func.dfg.value_type(value);
+                let (low, high) = if ty == types::I128 {
+                    b.ins().isplit(value)
+                } else {
+                    let low = if ty == types::F64 {
+                        b.ins().bitcast(types::I64, MemFlagsData::new(), value)
+                    } else if ty == types::I8 {
+                        b.ins().uextend(types::I64, value)
+                    } else {
+                        value
+                    };
+                    (low, b.ins().iconst(types::I64, 0))
+                };
+                b.ins().stack_store(ptr, low, inputs, offset);
+                b.ins().stack_store(ptr, high, inputs, offset + 8);
+            }
+            let input_address = b.ins().stack_addr(ptr, inputs, 0);
+            let output_address = b.ins().stack_addr(ptr, output, 0);
+            let callee = self.output.module.declare_func_in_func(target, b.func);
+            b.ins().call(callee, &[input_address, output_address]);
+            if return_type == Type::Void {
+                b.ins().return_(&[]);
+            } else {
+                let ty = b.func.signature.returns[0].value_type;
+                let low = b.ins().stack_load(ptr, types::I64, output, 0);
+                let result = if ty == types::I128 {
+                    let high = b.ins().stack_load(ptr, types::I64, output, 8);
+                    b.ins().iconcat(low, high)
+                } else if ty == types::F64 {
+                    b.ins().bitcast(types::F64, MemFlagsData::new(), low)
+                } else if ty == types::I8 {
+                    b.ins().ireduce(types::I8, low)
+                } else {
+                    low
+                };
+                b.ins().return_(&[result]);
+            }
+            b.finalize(self.output.module.target_config());
+        }
+        self.output.module.define_function(shim, &mut context)?;
+        Ok(shim)
     }
 
     pub(super) fn compile_function_named(

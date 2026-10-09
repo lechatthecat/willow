@@ -10,6 +10,11 @@
 // String literals are allocated once and kept alive permanently via
 // willow_gc_add_runtime_root so that gc_collect() never frees them.
 
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static ALLOCATION_COPY_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 mod methods;
 pub use methods::*;
 
@@ -74,6 +79,8 @@ unsafe fn alloc_validated_bytes(bytes: *const u8, len_usize: usize, payload_size
         *(ptr as *mut i64) = len_usize as i64;
         if len_usize > 0 {
             std::ptr::copy_nonoverlapping(bytes, ptr.add(8), len_usize);
+            #[cfg(test)]
+            ALLOCATION_COPY_BYTES.set(ALLOCATION_COPY_BYTES.get() + len_usize);
         }
         *ptr.add(8 + len_usize) = 0; // NUL terminator
     }

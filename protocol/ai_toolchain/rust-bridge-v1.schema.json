@@ -124,20 +124,11 @@
             "inputs": {
               "type": "array",
               "items": {
-                "enum": [
-                  "I64",
-                  "F64",
-                  "Bool"
-                ]
+                "$ref": "#/$defs/value_type"
               }
             },
             "output": {
-              "enum": [
-                "I64",
-                "F64",
-                "Bool",
-                "Void"
-              ]
+              "$ref": "#/$defs/value_type"
             }
           }
         },
@@ -173,6 +164,49 @@
           "type": "string"
         }
       }
+    },
+    "value_type": {
+      "oneOf": [
+        {
+          "enum": [
+            "I64",
+            "F64",
+            "Bool",
+            "Void",
+            "String",
+            "Bytes"
+          ]
+        },
+        {
+          "type": "object",
+          "required": [
+            "Option"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "Option": {
+              "$ref": "#/$defs/value_type"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "Result"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "Result": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "$ref": "#/$defs/value_type"
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }
