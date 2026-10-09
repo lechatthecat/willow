@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::BuildMode;
 use crate::project::{ProjectManifest, RustDependencySource, RustGitSelector};
 
+pub mod commands;
+
 const BRIDGE_NAME: &str = "willow_generated_bridge";
 
 #[derive(Debug, Clone)]
@@ -177,9 +179,15 @@ pub struct BridgeBuild {
     // Hold until caller finishes consuming/linking the artifact. Another Willow
     // process must not replace the stable Cargo staticlib alias during linking.
     _lease: File,
+    _project_lease: File,
+    resolution: crate::package::lock::RustLock,
 }
 
 impl BridgeBuild {
+    fn persist_resolution(&self, root: &Path, options: &BridgeOptions) -> Result<()> {
+        persist_resolution(root, &self.directory, options, &self.resolution)
+    }
+
     pub fn ensure_target(&self, linker_target: &str) -> Result<()> {
         if self.target != linker_target {
             bail!(
@@ -189,6 +197,29 @@ impl BridgeBuild {
         }
         Ok(())
     }
+}
+
+fn persist_resolution(
+    root: &Path,
+    directory: &Path,
+    options: &BridgeOptions,
+    resolution: &crate::package::lock::RustLock,
+) -> Result<()> {
+    if !root.join("project.lock").exists() {
+        crate::package::fetch_packages(root, options.locked, options.offline)?;
+    }
+    let bytes = fs::read(directory.join("Cargo.lock"))?;
+    let persisted = root.join(".willow/rust/Cargo.lock");
+    if fs::read(&persisted).ok().as_deref() != Some(bytes.as_slice()) {
+        crate::package::lock::atomic_write_validated(&persisted, &bytes, || {
+            let _: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
+            Ok(())
+        })?;
+    }
+    // An empty generated bridge still has a Cargo.lock, but Willow's locked
+    // project validation requires no Rust summary when no Rust dependencies remain.
+    let summary = (!resolution.dependencies.is_empty()).then(|| resolution.clone());
+    crate::package::lock::write_rust_lock(root, summary)
 }
 
 /// R1 toolchain API. `check` selects Cargo check instead of staticlib production.
@@ -224,19 +255,33 @@ pub fn inspect_bridge(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BridgeAction {
+enum EditLock<'a> {
+    Persisted,
+    Candidate(&'a [u8]),
+    /// Resolve preferred versions without the old graph's reuse preferences.
+    Fresh,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BridgeAction<'a> {
     Metadata,
     Check,
     Build,
+    Edit {
+        /// Cargo package ID, already projected from the original direct graph.
+        update: Option<Option<&'a str>>,
+        /// Owned by the edit caller across prepare passes; never published early.
+        lock: EditLock<'a>,
+    },
 }
 
 fn prepare_bridge(
     project: &ProjectManifest,
     root: &Path,
     options: &BridgeOptions,
-    action: BridgeAction,
+    action: BridgeAction<'_>,
 ) -> Result<Option<BridgeBuild>> {
-    if project.rust_dependencies.is_empty() {
+    if project.rust_dependencies.is_empty() && !matches!(action, BridgeAction::Edit { .. }) {
         return Ok(None);
     }
     let root = fs::canonicalize(root)?;
@@ -308,14 +353,33 @@ fn prepare_bridge(
             bail!("rust_lockfile_stale: missing or inconsistent Rust lock fingerprints");
         }
     }
-    if !root.join("project.lock").exists() {
-        crate::package::fetch_packages(&root, options.locked, options.offline)?;
-    }
     let cached_lock = directory.join("Cargo.lock");
-    match fs::read(&persisted) {
-        Ok(bytes) => write_changed(&cached_lock, &bytes)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+    if let BridgeAction::Edit {
+        lock: EditLock::Candidate(bytes),
+        ..
+    } = action
+    {
+        write_changed(&cached_lock, bytes)?;
+    } else if matches!(
+        action,
+        BridgeAction::Edit {
+            lock: EditLock::Fresh,
+            ..
+        }
+    ) {
+        if cached_lock.exists() {
+            fs::remove_file(&cached_lock)?;
+        }
+    } else {
+        match fs::read(&persisted) {
+            Ok(bytes) => write_changed(&cached_lock, &bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if cached_lock.exists() {
+                    fs::remove_file(&cached_lock)?;
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
     write_changed(&manifest_path, manifest.as_bytes())?;
     let source = format!(
@@ -335,6 +399,23 @@ fn prepare_bridge(
         }
         cmd
     };
+    if let BridgeAction::Edit {
+        update: Some(package),
+        ..
+    } = action
+    {
+        let mut update = command();
+        update
+            .args(["update", "--manifest-path"])
+            .arg(&manifest_path);
+        if let Some(package) = package {
+            update.args(["--package", package]);
+        }
+        if options.offline {
+            update.arg("--offline");
+        }
+        run(&mut update)?;
+    }
     let mut metadata_command = command();
     metadata_command
         .args(["metadata", "--format-version=1", "--manifest-path"])
@@ -365,20 +446,8 @@ fn prepare_bridge(
         bridge_input_hash: input_hash,
         dependencies: direct_versions(&direct_dependencies)?,
     };
-    if options.locked {
-        if previous.as_ref() != Some(&rust_lock) {
-            bail!("rust_lockfile_stale: Cargo resolution or direct version summary changed");
-        }
-    } else {
-        let bytes = fs::read(&cached_lock)?;
-        fs::create_dir_all(persisted.parent().unwrap())?;
-        if fs::read(&persisted).ok().as_deref() != Some(bytes.as_slice()) {
-            crate::package::lock::atomic_write_validated(&persisted, &bytes, || {
-                let _: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
-                Ok(())
-            })?;
-        }
-        crate::package::lock::write_rust_lock(&root, rust_lock)?;
+    if options.locked && previous.as_ref() != Some(&rust_lock) {
+        bail!("rust_lockfile_stale: Cargo resolution or direct version summary changed");
     }
     let source_hash = hash_file(&bridge)?;
     let manifest_hash = hash(manifest.as_bytes());
@@ -398,8 +467,8 @@ fn prepare_bridge(
         &lib_path,
         format!("// Willow bridge key: {cache_key}\n{source}").as_bytes(),
     )?;
-    if action == BridgeAction::Metadata {
-        return Ok(Some(BridgeBuild {
+    if matches!(action, BridgeAction::Metadata | BridgeAction::Edit { .. }) {
+        let build = BridgeBuild {
             directory,
             cache_key,
             target: target.to_owned(),
@@ -409,7 +478,16 @@ fn prepare_bridge(
             direct_dependencies,
             toolchain,
             _lease: lease,
-        }));
+            _project_lease: project_lease,
+            resolution: rust_lock,
+        };
+        if action == BridgeAction::Metadata && !options.locked {
+            build.persist_resolution(&root, options)?;
+        }
+        return Ok(Some(build));
+    }
+    if !options.locked {
+        persist_resolution(&root, &directory, options, &rust_lock)?;
     }
     let check = action == BridgeAction::Check;
     let mut cargo = command();
@@ -492,6 +570,8 @@ fn prepare_bridge(
         direct_dependencies,
         toolchain,
         _lease: lease,
+        _project_lease: project_lease,
+        resolution: rust_lock,
     }))
 }
 
@@ -586,10 +666,12 @@ pub fn direct_dependency_metadata<'a>(
             let package = direct
                 .get(alias)
                 .context("Cargo manifest dependency missing from resolution")?;
-            Ok(serde_json::json!({"alias":alias, "name":package["name"],
+            Ok(
+                serde_json::json!({"alias":alias, "id":package["id"], "name":package["name"],
             "version":package["version"], "source": if package["source"].is_null() {
                 serde_json::json!({"path":package["manifest_path"]})
-            } else { package["source"].clone() }}))
+            } else { package["source"].clone() }}),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Value::Array(dependencies))
@@ -720,6 +802,7 @@ mod tests {
         assert_eq!(dependencies.as_array().unwrap().len(), 2);
         assert_eq!(dependencies[0]["alias"], "actual-name");
         assert_eq!(dependencies[0]["name"], "actual-name");
+        assert_eq!(dependencies[0]["id"], "git");
         assert_eq!(
             dependencies[0]["source"],
             "git+https://example.invalid/repo#abc"

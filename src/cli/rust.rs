@@ -3,7 +3,8 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use willow_compiler::project::{self, ProjectManifest};
+use willow_compiler::project::{self, ProjectManifest, RustDependencySpec};
+use willow_compiler::toolchain::rust_bridge::commands::{self, Mutation};
 use willow_compiler::toolchain::rust_bridge::{BridgeOptions, build_bridge, inspect_bridge};
 use willow_compiler::{BuildMode, CompilerOptions, toolchain::HostToolchain};
 
@@ -13,6 +14,7 @@ pub(super) struct RustCommand {
     directory: PathBuf,
     format: String,
     options: BridgeOptions,
+    mutation: Option<Box<Mutation>>,
 }
 
 impl RustCommand {
@@ -22,9 +24,12 @@ impl RustCommand {
         } else {
             let operation = args
                 .first()
-                .context("expected rust check or rust metadata")?;
+                .context("expected rust add, remove, update, tree, check or metadata")?;
             ensure!(
-                matches!(operation.as_str(), "check" | "metadata"),
+                matches!(
+                    operation.as_str(),
+                    "check" | "metadata" | "tree" | "add" | "remove" | "update"
+                ),
                 "unknown rust command `{operation}`"
             );
             (operation.as_str(), &args[1..])
@@ -33,12 +38,36 @@ impl RustCommand {
         let mut directory = None;
         let mut format = None;
         let mut cache = None;
+        let mut name = None;
+        let mut spec = RustDependencySpec::default();
+        let mut breaking = false;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             let (key, inline) = arg
                 .split_once('=')
                 .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
             match key {
+                "--breaking" if operation == "update" && inline.is_none() => {
+                    ensure!(!breaking, "duplicate --breaking");
+                    breaking = true;
+                }
+                "--version" | "--git" | "--rev" | "--tag" | "--path" if operation == "add" => {
+                    let value = inline
+                        .or_else(|| args.next().map(String::as_str))
+                        .context("missing dependency option value")?;
+                    ensure!(
+                        !value.is_empty() && !value.starts_with('-'),
+                        "missing {key} value"
+                    );
+                    let slot = match key {
+                        "--version" => &mut spec.version,
+                        "--git" => &mut spec.git,
+                        "--rev" => &mut spec.rev,
+                        "--tag" => &mut spec.tag,
+                        _ => &mut spec.path,
+                    };
+                    ensure!(slot.replace(value.to_owned()).is_none(), "duplicate {key}");
+                }
                 "--format" | "--project-dir" | "--cache-dir" => {
                     let value = inline
                         .or_else(|| args.next().map(String::as_str))
@@ -75,6 +104,12 @@ impl RustCommand {
                     options.locked = true;
                 }
                 _ if arg.starts_with('-') => anyhow::bail!("unknown {operation} option `{arg}`"),
+                _ if matches!(operation, "add" | "remove" | "update") => {
+                    ensure!(
+                        name.replace(arg.clone()).is_none(),
+                        "too many dependency names"
+                    );
+                }
                 _ => ensure!(
                     directory.replace(PathBuf::from(arg)).is_none(),
                     "duplicate project directory"
@@ -84,11 +119,31 @@ impl RustCommand {
         if let Some(cache) = cache {
             options.cache_root = cache;
         }
+        let mutation = match operation {
+            "add" => {
+                let mut name = name.context("rust add requires a dependency name")?;
+                if let Some((package, version)) = name.split_once('@') {
+                    ensure!(
+                        spec.version.replace(version.to_owned()).is_none(),
+                        "duplicate version requirement"
+                    );
+                    name = package.to_owned();
+                }
+                spec.normalize(&name)?;
+                Some(Mutation::Add { name, spec })
+            }
+            "remove" => Some(Mutation::Remove {
+                name: name.context("rust remove requires a dependency name")?,
+            }),
+            "update" => Some(Mutation::Update { name, breaking }),
+            _ => None,
+        };
         Ok(Self {
             operation: operation.into(),
             directory: directory.unwrap_or_else(|| ".".into()),
             format: format.unwrap_or_else(|| "human".into()),
             options,
+            mutation: mutation.map(Box::new),
         })
     }
 
@@ -97,8 +152,10 @@ impl RustCommand {
         let (_, root) =
             project::find_project_manifest(&directory).context("no project.toml found")?;
         let project = ProjectManifest::load(&root.join("project.toml"))?;
-        let enabled = !project.rust_dependencies.is_empty();
-        let value = if self.operation == "doctor" {
+        let mut enabled = !project.rust_dependencies.is_empty();
+        let mut value = if let Some(mutation) = self.mutation {
+            commands::mutate(&root, &self.options, *mutation)?
+        } else if self.operation == "doctor" {
             let host = HostToolchain::new(&CompilerOptions::debug().target);
             let runtime = host.runtime_library_status();
             let linker = host.native_linker_status();
@@ -123,10 +180,26 @@ impl RustCommand {
                 value["bridge"] = json!({"source":project.rust.as_ref().unwrap().resolve_bridge(&root)?, "artifact":build.staticlib,
                     "manifest":build.directory.join("Cargo.toml")});
                 value["diagnostics"] = json!(build.messages.diagnostics);
+                if self.operation == "tree" {
+                    value["tree"] = commands::tree(&build.metadata);
+                }
             }
             value
         };
+        enabled = value["enabled"].as_bool().unwrap_or(enabled);
+        // Explicit inspection surfaces carry the notice on every invocation;
+        // build/run retain their streaming diagnostic protocol unchanged.
+        let notice = enabled && matches!(self.operation.as_str(), "doctor" | "metadata");
+        if notice {
+            value["rust_dependency_build_execution_notice"] = json!({"build_time_code_execution_possible":true,
+                "message":"Cargo builds may execute dependency build.rs scripts and procedural macros."});
+        }
         if self.format == "human" {
+            if notice {
+                println!(
+                    "note: Cargo builds may execute dependency build.rs scripts and procedural macros."
+                );
+            }
             if self.operation == "doctor" {
                 println!("Rust interop enabled: {enabled}");
                 for name in ["runtime", "native_linker", "cargo", "rustc"] {
@@ -154,6 +227,18 @@ impl RustCommand {
                         "disabled (no Rust dependencies)"
                     }
                 );
+                if self.operation == "tree" && !value["tree"].is_null() {
+                    print!("{}", commands::display_tree(&value["tree"])?);
+                }
+                for diagnostic in value["diagnostics"].as_array().into_iter().flatten() {
+                    if diagnostic["kind"] == "rust_bridge_unused_declaration_candidate" {
+                        println!(
+                            "note: {} ({})",
+                            diagnostic["message"].as_str().unwrap(),
+                            diagnostic["dependency"].as_str().unwrap()
+                        );
+                    }
+                }
                 for dependency in value["direct_dependencies"].as_array().unwrap() {
                     println!(
                         "{} {} ({})",

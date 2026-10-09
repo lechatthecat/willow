@@ -37,11 +37,11 @@ pub(crate) fn read_rust_lock(root: &Path) -> Result<Option<RustLock>> {
     }
 }
 
-pub(crate) fn write_rust_lock(root: &Path, rust: RustLock) -> Result<()> {
+pub(crate) fn write_rust_lock(root: &Path, rust: Option<RustLock>) -> Result<()> {
     let path = root.join("project.lock");
     let mut lock: Lock = toml::from_str(&std::fs::read_to_string(&path)?)?;
-    if lock.rust.as_ref() != Some(&rust) {
-        lock.rust = Some(rust);
+    if lock.rust != rust {
+        lock.rust = rust;
         atomic_write(&path, lock.canonical_text()?.as_bytes(), || Ok(()))?;
     }
     Ok(())

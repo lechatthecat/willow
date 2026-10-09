@@ -32,7 +32,7 @@ mod verify;
 pub use verify::{Verification, verify_package};
 pub(crate) use verify::{discover_sources, discover_sources_for_overview};
 
-mod commands;
+pub(crate) mod commands;
 pub use commands::{
     MutationReport, PackageMutation, display_dependencies, inspect_packages, mutate_packages,
     mutate_packages_report,

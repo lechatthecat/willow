@@ -386,7 +386,7 @@ pub fn mutate_packages_report(
     Ok(report)
 }
 
-fn render_manifest(doc: &DocumentMut, original: &str) -> String {
+pub(crate) fn render_manifest(doc: &DocumentMut, original: &str) -> String {
     let mut text = doc.to_string();
     // toml_edit emits LF and a final newline; retain the source file's style.
     let crlf = original.contains("\r\n")
@@ -412,7 +412,7 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn replace_manifest(path: &Path, text: &str) -> Result<()> {
+pub(crate) fn replace_manifest(path: &Path, text: &str) -> Result<()> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let (temporary, mut file) = loop {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
