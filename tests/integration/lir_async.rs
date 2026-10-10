@@ -161,9 +161,12 @@ async fn answer(x: i64) -> i64 {
     return x * 2;
 }
 async fn main() {
-    answer(21);
+    let task = answer(21);
     let mut i = 0;
     while i < 10000 { i = i + 1; }
+    // Awaiting makes the leaf's output deterministic: main's exit does not
+    // wait for an unawaited task, and the spin alone races it on slow hosts.
+    await task;
 }
 "#,
         "42\n",

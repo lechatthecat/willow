@@ -322,7 +322,7 @@ fn semantic_member_rename_covers_declarations_references_and_dispatch() {
         ),
         (
             "inherited field",
-            "open class A { pub old: i64; pub init(self) { self.old = 1; } } class B extends A {} fn read(b: B) -> i64 { return b.old; } fn main() {}",
+            "open class A { pub old: i64; pub init(self) { self.old = 1; } } class B extends A { pub init(self) { super.init(); } } fn read(b: B) -> i64 { return b.old; } fn main() {}",
             "main::A::old",
         ),
         (

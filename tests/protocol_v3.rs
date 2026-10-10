@@ -94,7 +94,9 @@ fn structured_edit_cli_end_to_end() {
 #[test]
 fn structured_edit_rejection_reports_source_location() {
     let f = Fixture::new();
-    let main = "fn value() -> i64 { return 1; }\nfn main() {\n  let f = value;\n  println(f());\n}";
+    // Function values are renamed (0501edc); a same-spelled field is outside
+    // the proven reference set, so the rename is rejected at that field.
+    let main = "class Box { pub value: i64; }\nfn value() -> i64 { return 1; }\nfn main() {\n  let b = new Box(2);\n  println(b.value + value());\n}";
     fs::write(f.0.join("main.wi"), main).unwrap();
     let snapshot = f.symbols("main.wi");
     let function = snapshot["functions"]
@@ -132,7 +134,7 @@ fn structured_edit_rejection_reports_source_location() {
     assert_eq!(location["path"], "main.wi");
     assert_eq!(
         (location["line"].as_u64(), location["column"].as_u64()),
-        (Some(3), Some(11))
+        (Some(1), Some(17))
     );
     let start = location["start"].as_u64().unwrap() as usize;
     assert_eq!(

@@ -144,6 +144,8 @@ fn verify(path: &Path, report: &mut Verification) -> Result<(), VerificationErro
         writeln!(entry, "import {module} as verify_module_{index};").unwrap();
     }
     entry.push_str("fn main() {}\n");
+    let symbols = crate::semantic::ids::SymbolInterner::new();
+    let _symbols = symbols.enter();
     let _nodes = crate::parser::ast::NodeIdSession::enter();
     let _queries = crate::query_stats::Session::enter();
     let inputs = crate::compiler_db::inputs::CompilerInputs::native(
