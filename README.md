@@ -10,7 +10,20 @@ Willow is an experimental programming language that compiles to native code thro
 
 ## How to start
 
-A Rust toolchain is currently required to build Willow from source.
+### Download a prebuilt release
+
+Prebuilt archives for Linux (x86_64), macOS (arm64, x86_64) and Windows (x86_64) are on the [latest release](https://github.com/lechatthecat/willow/releases/latest) page.
+
+```bash
+tar xzf willow-v0.0.1-linux-x86_64.tar.gz
+./willow-v0.0.1-linux-x86_64/bin/willow
+```
+
+For convenience, add the archive's `bin` directory to your `PATH`. Keep `bin/` and `lib/` together: `willow` finds its runtime library in `../lib`. No Rust toolchain is needed, but Willow links programs with the system C toolchain: `cc` on Linux and macOS, or the MSVC Build Tools on Windows.
+
+### Build from source
+
+A Rust toolchain is required to build Willow from source.
 
 ```bash
 git clone https://github.com/lechatthecat/willow.git
