@@ -189,9 +189,10 @@ async fn sum(limit: i64) -> i64 {
     return total;
 }
 async fn main() {
-    sum(10);
+    let task = sum(10);
     let mut i = 0;
     while i < 10000 { i = i + 1; }
+    await task;
 }
 "#,
         "20\n",
@@ -211,9 +212,10 @@ async fn keep() -> String {
     return value;
 }
 async fn main() {
-    keep();
+    let task = keep();
     let mut i = 0;
     while i < 10000 { i = i + 1; }
+    await task;
 }
 "#,
         "still alive\n",

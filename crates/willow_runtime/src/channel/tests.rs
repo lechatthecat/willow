@@ -392,6 +392,9 @@ fn poison_channel(channel: &WillowAbiChannel) {
 
 #[test]
 fn poisoned_channel_gc_hooks_visit_each_queued_reference() {
+    // Channel storage is charged to the global external-byte counter that the
+    // exact accounting tests compare; serialize with them.
+    let _guard = crate::gc::runtime_test_guard();
     for count in [0, 1, 16, 256, 4096] {
         let mut channel = WillowAbiChannel::new(true);
         let mut values = vec![0u8; count];
