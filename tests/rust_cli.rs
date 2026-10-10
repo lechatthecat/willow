@@ -454,9 +454,7 @@ fn build_mutation(f: &Fixture) {
     command.arg(f.temp.join("app"));
     let output = command.output().unwrap();
     assert!(output.status.success(), "{output:?}");
-    let output = Command::new(f.temp.join(if cfg!(windows) { "app.exe" } else { "app" }))
-        .output()
-        .unwrap();
+    let output = Command::new(f.temp.join("app")).output().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"42\n");
 }

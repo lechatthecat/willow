@@ -365,3 +365,24 @@ fn batch_query_does_not_label_stale_or_missing_lock_versions_as_resolved() {
         );
     }
 }
+
+/// A project root reached through a symlink (macOS temp dirs live under
+/// `/var` -> `/private/var`) must not make its own sources look escaped.
+#[cfg(unix)]
+#[test]
+fn snapshot_accepts_a_symlinked_project_root() {
+    let f = Fixture::new();
+    let (ok, v) = f.run(&["rust", "metadata"]);
+    assert!(ok, "{v}");
+    let linked = f.temp.join("linked");
+    std::os::unix::fs::symlink(&f.root, &linked).unwrap();
+    let snapshot = CompilerSession::new(
+        linked.join("src/main.wi").to_str().unwrap(),
+        "",
+        &CompilerOptions::debug(),
+        Some(linked.clone()),
+    )
+    .analysis_for_edit_with_emitter(&mut HumanEmitter)
+    .unwrap();
+    assert!(snapshot.functions.iter().any(|f| f.name == "App::validate"));
+}

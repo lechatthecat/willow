@@ -411,16 +411,11 @@ impl<'a> CompilerSession<'a> {
             context.verify_files()?;
         }
         if discover && let Some(project) = &self.project_root {
-            let source_root = inputs
-                .package_graph
-                .as_ref()
-                .and_then(|g| g.get(g.root))
-                .map(|p| p.source_root())
-                .unwrap_or_else(|| root.to_path_buf());
+            let (project, source_root) = discovery_roots(&inputs, project, root);
             inputs.check_modules = if overview_aliases {
-                package::discover_sources_for_overview(project, &source_root)?
+                package::discover_sources_for_overview(&project, &source_root)?
             } else {
-                package::discover_sources(project, &source_root)?
+                package::discover_sources(&project, &source_root)?
             };
         }
         inputs.capture_analysis = true;
@@ -472,13 +467,8 @@ impl<'a> CompilerSession<'a> {
             compiler_db::inputs::CompilerInputs::native(self.opts.clone(), root.clone())
                 .resolve_project(self.project_root.as_deref())?;
         if discover && let Some(project) = &self.project_root {
-            let source_root = inputs
-                .package_graph
-                .as_ref()
-                .and_then(|g| g.get(g.root))
-                .map(|p| p.source_root())
-                .unwrap_or_else(|| root.clone());
-            inputs.check_modules = package::discover_sources(project, &source_root)?;
+            let (project, source_root) = discovery_roots(&inputs, project, &root);
+            inputs.check_modules = package::discover_sources(&project, &source_root)?;
         }
         let frontend = run_frontend_with_inputs(&source, &root, &map, inputs, emitter)?;
         Ok((frontend, source, map))
@@ -574,6 +564,21 @@ struct TypecheckPhase {
     checker: LiveUnit<semantic::TypeChecker>,
     #[cfg(test)]
     error_count: usize,
+}
+
+/// Roots for project source discovery. A resolved package graph holds the
+/// canonical package root and `src/`; the user-spelled project root may differ
+/// (macOS `/var` vs `/private/var`), and mixing spellings makes every source
+/// look escaped. Without a graph, both fall back to the caller's spellings.
+fn discovery_roots(
+    inputs: &compiler_db::inputs::CompilerInputs,
+    project: &std::path::Path,
+    root: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    match inputs.package_graph.as_ref().and_then(|g| g.get(g.root)) {
+        Some(package) => (package.root.clone(), package.source_root()),
+        None => (project.to_path_buf(), root.to_path_buf()),
+    }
 }
 
 fn run_frontend(
