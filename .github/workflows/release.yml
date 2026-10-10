@@ -1,0 +1,110 @@
+name: Release
+
+# Tag pushes (v*) build every platform and publish a GitHub Release.
+# Manual runs only build and upload the archives as workflow artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on the oldest supported Ubuntu runner so the binary runs on
+          # distributions with an older glibc.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            name: macos-arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            name: macos-x86_64
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            name: windows-x86_64
+    env:
+      CARGO_TERM_COLOR: always
+      PACKAGE: willow-${{ github.ref_name }}-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Select native toolchain
+        run: rustup override set 1.95.0-${{ matrix.target }}
+      - name: Build
+        run: cargo build --locked --release -p willow -p willow_runtime
+      # Relocatable layout: bin/willow finds ../lib/<runtime> without Cargo.
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p "$PACKAGE/bin" "$PACKAGE/lib"
+          cp target/release/willow "$PACKAGE/bin/"
+          cp target/release/libwillow_runtime.a "$PACKAGE/lib/"
+          cp README.md LICENSE "$PACKAGE/"
+          tar czf "$PACKAGE.tar.gz" "$PACKAGE"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory "$env:PACKAGE/bin", "$env:PACKAGE/lib" | Out-Null
+          Copy-Item target/release/willow.exe "$env:PACKAGE/bin/"
+          Copy-Item target/release/willow_runtime.lib "$env:PACKAGE/lib/"
+          Copy-Item README.md, LICENSE "$env:PACKAGE/"
+          Compress-Archive -Path $env:PACKAGE -DestinationPath "$env:PACKAGE.zip"
+      # Compile and run a program with the packaged runtime library only.
+      # Without the bundled library, willow falls back to `cargo build -p
+      # willow_runtime` in the checkout, so hide cargo to make that fail.
+      - name: Smoke test bundled layout (Unix)
+        if: runner.os != 'Windows'
+        # Explicit bash runs with -eo pipefail, so a failing willow is not
+        # masked by tee.
+        shell: bash
+        run: |
+          PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '/\.cargo/bin$' | paste -sd: -)
+          if command -v cargo; then echo "cargo still on PATH"; exit 1; fi
+          printf 'fn main() {\n    print("hello");\n}\n' > "$RUNNER_TEMP/hello.wi"
+          "$PACKAGE/bin/willow" run "$RUNNER_TEMP/hello.wi" | tee "$RUNNER_TEMP/hello.out"
+          grep -qx hello "$RUNNER_TEMP/hello.out"
+      - name: Smoke test bundled layout (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:Path = ($env:Path -split ';' | Where-Object { $_ -notmatch '\\\.cargo\\bin\\?$' }) -join ';'
+          if (Get-Command cargo -ErrorAction SilentlyContinue) { throw "cargo still on PATH" }
+          Set-Content "$env:RUNNER_TEMP/hello.wi" "fn main() {`n    print(`"hello`");`n}"
+          $out = & "$env:PACKAGE/bin/willow.exe" run "$env:RUNNER_TEMP/hello.wi"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $out
+          if (@($out) -notcontains "hello") { throw "smoke test output mismatch" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ env.PACKAGE }}.tar.gz
+            ${{ env.PACKAGE }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" willow-* --repo "${{ github.repository }}" --verify-tag --generate-notes
