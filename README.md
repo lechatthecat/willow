@@ -89,6 +89,46 @@ tar xzf willow-v0.0.1-linux-x86_64.tar.gz
 
 For convenience, add the archive's `bin` directory to your `PATH`. Keep `bin/` and `lib/` together: `willow` finds its runtime library in `../lib`. No Rust toolchain is needed, but Willow links programs with the system C toolchain: `cc` on Linux and macOS, or the MSVC Build Tools on Windows.
 
+Each release also includes a `SHA256SUMS` file containing the SHA-256 digest of every platform archive. Download it alongside your archive and verify the checksum before extracting.
+
+On Linux, when only the downloaded platform archive is in the directory:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+On macOS, for example:
+
+```bash
+grep 'willow-v0.0.1-macos-arm64.tar.gz
+
+### Build from source
+
+A Rust toolchain is required to build Willow from source.
+
+```bash
+git clone https://github.com/lechatthecat/willow.git
+cd willow
+cargo build --release
+```
+
+The user-facing tool is:
+
+```bash
+./target/release/willow
+```
+
+For convenience, add `target/release` to your `PATH`.
+
+
+# License
+
+[MIT License](LICENSE)
+ SHA256SUMS | shasum -a 256 --check
+```
+
+On Windows, run `Get-FileHash .\\willow-v0.0.1-windows-x86_64.zip -Algorithm SHA256` in PowerShell and compare the digest to the matching `SHA256SUMS` entry.
+
 ### Build from source
 
 A Rust toolchain is required to build Willow from source.
