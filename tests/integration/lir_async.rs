@@ -315,8 +315,10 @@ async fn worker(message: String) -> i64 {
     return 42;
 }
 async fn main() {
-    worker("leaf");
-    await sleep(10);
+    let task = worker("leaf");
+    // Waiting for the task, rather than sleeping for a fixed duration,
+    // guarantees that its output is observed even on busy CI hosts.
+    await task;
 }
 "#,
         "leaf\n",
