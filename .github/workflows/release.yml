@@ -1,10 +1,15 @@
 name: Release
 
-# Tag pushes (v*) build every platform and publish a GitHub Release.
-# Manual runs only build and upload the archives as workflow artifacts.
+# Version tags (v*) publish archives and checksums. A release-workflow update
+# on main backfills SHA256SUMS for the latest release if it is missing.
+# Manual runs only build and upload archives as workflow artifacts.
 on:
   push:
     tags: ["v*"]
+    branches: [main]
+    # Path filters do not apply to tag pushes.
+    paths:
+      - .github/workflows/release.yml
   workflow_dispatch:
 
 permissions:
@@ -12,6 +17,7 @@ permissions:
 
 jobs:
   build:
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -104,6 +110,17 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          shopt -s nullglob
+          archives=(willow-*.tar.gz willow-*.zip)
+          if [ "${#archives[@]}" -ne 4 ]; then
+            echo "Expected four platform archives; found ${#archives[@]}" >&2
+            exit 1
+          fi
+          sha256sum "${archives[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -111,7 +128,41 @@ jobs:
         # instead of failing the publish.
         run: |
           if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" > /dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" willow-* --repo "${{ github.repository }}" --clobber
+            gh release upload "${{ github.ref_name }}" willow-* SHA256SUMS --repo "${{ github.repository }}" --clobber
           else
-            gh release create "${{ github.ref_name }}" willow-* --repo "${{ github.repository }}" --verify-tag --generate-notes
+            gh release create "${{ github.ref_name }}" willow-* SHA256SUMS --repo "${{ github.repository }}" --verify-tag --generate-notes
           fi
+
+  backfill-checksums:
+    # Run once on the workflow update to cover v0.0.1 without rebuilding or
+    # replacing any released binaries; safely skip when checksums already exist.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Add SHA256SUMS to latest release if missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -Fxq SHA256SUMS; then
+            echo "$tag already has SHA256SUMS"
+            exit 0
+          fi
+          mkdir -p release-assets
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'willow-*.tar.gz' --pattern 'willow-*.zip' \
+            --dir release-assets
+          cd release-assets
+          shopt -s nullglob
+          archives=(willow-*.tar.gz willow-*.zip)
+          if [ "${#archives[@]}" -ne 4 ]; then
+            echo "Expected four released archives; found ${#archives[@]}" >&2
+            exit 1
+          fi
+          sha256sum "${archives[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          gh release upload "$tag" SHA256SUMS --repo "$GITHUB_REPOSITORY"
