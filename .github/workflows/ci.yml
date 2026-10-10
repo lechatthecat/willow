@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # Branch pushes only: a tag on an already-tested commit would rerun the
+  # full suite.
   push:
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
