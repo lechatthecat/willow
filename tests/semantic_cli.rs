@@ -1722,7 +1722,9 @@ fn stale_local_rename_prefers_same_declaration_and_rejects_collision() {
         String::from_utf8_lossy(&collision.stdout),
         String::from_utf8_lossy(&collision.stderr)
     );
-    assert!(text.contains("src/main.wi:3:9"), "{text}");
+    // Windows diagnostics use backslashes in relative paths.
+    let normalized = text.replace('\\', "/");
+    assert!(normalized.contains("src/main.wi:3:9"), "{text}");
     assert_eq!(fs::read_to_string(&path).unwrap(), after);
     let filtered = f.json(&["symbol", "main::main::pred", "--kind", "function"], 1);
     assert!(
