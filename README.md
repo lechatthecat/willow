@@ -82,7 +82,6 @@ Willow used 8 workers. Comparison runtimes were Go 1.27.0 and OpenJDK 26.0.2 usi
 | map_lookup_insert | 132.431 | **88.026** | 208.081 |
 | virtual_dispatch | 55.577 | **34.684** | 58.267 |
 
-The `leibniz_pow` case is intentionally excluded from this comparison.
 Scheduler cases time marked phases; `*_only` synchronous cases also time marked phases. Other synchronous cases time the whole process, including JVM startup and JIT warm-up.
 The Java `channel_select_fan_in` case uses one shared queue. CPU affinity/frequency were not pinned and background services were active.
 The nominal `leibniz_reduced` lead over Go is within observed session-to-session variation and should not be treated as a confirmed speed advantage.
