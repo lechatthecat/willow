@@ -2781,6 +2781,13 @@ use parking::{
     wait_for_wake_since,
 };
 
+/// Wake every idle-parked scheduler thread so it reaches its safepoint now.
+/// Idle threads remain GC mutators; without this each stop or handshake round
+/// waits out their bounded park.
+pub(crate) fn wake_idle_mutators_for_gc() {
+    notify_all_idle_waiters();
+}
+
 /// Render the active async chain for panic diagnostics (willow-9lw).
 pub fn async_chain_text() -> String {
     with_global(|sched| {
@@ -3549,43 +3556,36 @@ fn willow_sched_run_parallel(
     state.completed.load(Ordering::Acquire)
 }
 
-/// One completion counter per drive, independent of worker count. The mutex
-/// couples the completion predicate to the wait so the final wake cannot be lost.
+/// One completion counter per drive, independent of worker count. The waiter
+/// samples the wake generation before the counter, so the final wake (a
+/// generation bump) cannot be lost between the check and the park.
 struct ParallelCompletion {
-    remaining: Mutex<usize>,
-    ready: std::sync::Condvar,
+    remaining: AtomicUsize,
 }
 
 impl ParallelCompletion {
     fn new(workers: usize) -> Self {
         Self {
-            remaining: Mutex::new(workers),
-            ready: std::sync::Condvar::new(),
+            remaining: AtomicUsize::new(workers),
         }
     }
 
     fn finish(&self) {
-        let mut remaining = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
-        *remaining -= 1;
-        if *remaining == 0 {
-            self.ready.notify_one();
+        if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+            notify_all_idle_waiters();
         }
     }
 
     fn wait(&self) {
         loop {
-            // The driver remains a registered mutator. Never hold the completion
-            // mutex across a safepoint, and bound every wait so GC can stop it.
+            // The driver remains a registered mutator. Wait on the idle-waiter
+            // list so both completion and a GC request cut the park short.
             crate::gc::relocatable_safepoint();
-            let remaining = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
-            if *remaining == 0 {
+            let generation = current_wake_generation();
+            if self.remaining.load(Ordering::SeqCst) == 0 {
                 return;
             }
-            drop(
-                self.ready
-                    .wait_timeout(remaining, Duration::from_millis(1))
-                    .unwrap_or_else(|e| e.into_inner()),
-            );
+            wait_for_wake_since(generation, Duration::from_millis(1));
         }
     }
 }

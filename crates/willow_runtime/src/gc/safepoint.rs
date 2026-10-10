@@ -369,6 +369,7 @@ pub(super) fn with_stw<R>(
     runtime().poll_requested.store(true, Ordering::Release);
     let mut coord = lock.lock().unwrap_or_else(|poison| poison.into_inner());
     coord.stop_requested = true;
+    crate::scheduler::wake_idle_mutators_for_gc();
     coord = wait_for_mutators(
         cv,
         coord,

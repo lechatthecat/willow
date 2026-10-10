@@ -545,6 +545,8 @@ fn leaf_method_and_call_counts_scale_without_runtime_overhead() {
         let names = relocations(&source, &[], true);
         let counts = [ROOT, POLL, PANIC_DEPTH]
             .map(|symbol| names.iter().filter(|name| name.as_str() == symbol).count());
-        assert_eq!(counts, [2 * n + 2, 1, 0], "methods/calls={n}");
+        // Call-site roots share reused entry slots (willow-jz15.50), so the
+        // root count does not grow with the number of calls.
+        assert_eq!(counts, [3, 1, 0], "methods/calls={n}");
     }
 }

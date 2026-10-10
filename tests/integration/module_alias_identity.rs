@@ -405,6 +405,8 @@ fn mai_10_extends_the_aliased_modules_class() {
                 "import sales as biz;
 
 pub class Bonus extends biz::Amount {
+    pub init(self, value: i64) { super.init(value); }
+
     pub override fn doubled(self) -> i64 { return self.value * 3; }
 }
 
@@ -627,6 +629,8 @@ fn mai_17_an_entry_subclass_over_the_aliased_base() {
                 "import sales as biz;
 
 pub open class Bonus extends biz::Amount {
+    pub init(self, value: i64) { super.init(value); }
+
     pub open override fn doubled(self) -> i64 { return self.value * 3; }
 }
 ",
@@ -638,6 +642,8 @@ import ledger;
 import ledger::Bonus;
 
 class Big extends Bonus {
+    pub init(self, value: i64) { super.init(value); }
+
     pub override fn doubled(self) -> i64 { return self.value * 10; }
 }
 
@@ -1163,6 +1169,8 @@ fn mai_31_new_through_the_entrys_alias_over_an_item_imported_base() {
                 "import sales::Amount;
 
 pub class Bonus extends Amount {
+    pub init(self, value: i64) { super.init(value); }
+
     pub override fn doubled(self) -> i64 { return self.value * 3; }
 }
 

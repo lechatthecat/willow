@@ -298,7 +298,7 @@ fn prepare_bridge(
     {
         bail!("rust_bridge_abi_mismatch: incompatible adapter revision");
     }
-    let root = fs::canonicalize(root)?;
+    let root = canonicalize(root)?;
     let bridge = project
         .rust
         .as_ref()
@@ -323,7 +323,7 @@ fn prepare_bridge(
         .join(hash(root.as_os_str().as_encoded_bytes()))
         .join("rust-bridge");
     fs::create_dir_all(&directory)?;
-    let directory = fs::canonicalize(directory)?;
+    let directory = canonicalize(&directory)?;
     if directory.starts_with(&root) {
         bail!("Rust bridge cache must be outside the project source tree");
     }
@@ -747,7 +747,7 @@ fn generated_manifest(project: &ProjectManifest, root: &Path) -> Result<String> 
                 fields.insert("version".into(), version.into());
             }
             RustDependencySource::Path { path } => {
-                let path = fs::canonicalize(root.join(path))?;
+                let path = canonicalize(&root.join(path))?;
                 fields.insert(
                     "path".into(),
                     path.to_str().context("non-UTF8 dependency path")?.into(),
@@ -805,6 +805,36 @@ fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// `fs::canonicalize` without the Windows `\\?\` verbatim prefix. MSVC's
+/// `cl.exe` cannot open a verbatim archive path (LNK1104), and Cargo echoes
+/// the `--target-dir` spelling into its artifact paths.
+fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    let path = fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = path.components();
+        let plain = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => Some(format!("{}:", drive as char)),
+                Prefix::VerbatimUNC(server, share) => Some(format!(
+                    r"\\{}\{}",
+                    server.to_string_lossy(),
+                    share.to_string_lossy()
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(prefix) = plain {
+            let mut plain = PathBuf::from(prefix + r"\");
+            plain.extend(components.filter(|c| !matches!(c, Component::RootDir)));
+            return Ok(plain);
+        }
+    }
+    Ok(path)
+}
+
 // Resolve symlinks in the existing prefix before creating any output. This also
 // rejects a cache configured inside the source tree without polluting that tree.
 fn canonical_output_path(path: &Path) -> Result<PathBuf> {
@@ -821,7 +851,7 @@ fn canonical_output_path(path: &Path) -> Result<PathBuf> {
             .parent()
             .context("cache path has no existing ancestor")?;
     }
-    let mut resolved = fs::canonicalize(existing)?;
+    let mut resolved = canonicalize(existing)?;
     for component in suffix.into_iter().rev() {
         resolved.push(component);
     }
@@ -924,6 +954,24 @@ mod tests {
             assert_eq!(visits, [count, count + 1, count, count]);
             eprintln!("rust_summary dependencies={count} visits={visits:?}");
         }
+    }
+
+    #[test]
+    fn canonical_paths_drop_the_verbatim_prefix_and_stay_absolute() {
+        let directory = std::env::temp_dir();
+        let path = canonicalize(&directory).unwrap();
+        assert!(path.is_absolute(), "{}", path.display());
+        assert!(
+            !path.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            path.display()
+        );
+        assert_eq!(
+            fs::canonicalize(&path).unwrap(),
+            fs::canonicalize(&directory).unwrap()
+        );
+        let output = canonical_output_path(&directory.join("missing").join("cache")).unwrap();
+        assert!(output.starts_with(&path), "{}", output.display());
     }
 
     #[test]

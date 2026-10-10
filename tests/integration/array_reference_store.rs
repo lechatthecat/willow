@@ -225,9 +225,10 @@ async fn main() {
 fn array_reference_store_sites_match_scalar_store_runtime_calls() {
     // Count relocation targets for 1/8/32 store sites of `Array<i64>` and
     // `Array<Node>`. The reference store must add exactly the per-site calls
-    // of the i64 store (its cold `willow_array_set` slow path) plus the frame
-    // slot of its loaded array temporary, one cold barrier call and one
-    // mark-phase load: no extra root pair and no hot panic-depth bracket.
+    // of the i64 store (its cold `willow_array_set` slow path) plus one cold
+    // barrier call and one mark-phase load: no extra root pair and no hot
+    // panic-depth bracket. The loaded array temporaries of successive sites
+    // share one reused entry root slot (willow-jz15.50), so roots stay flat.
     // Scalar stores form one GC-free run, so their array temporaries need no
     // root at all (willow-ijui.10).
     const TRACKED: [&str; 6] = [
@@ -267,7 +268,11 @@ fn array_reference_store_sites_match_scalar_store_runtime_calls() {
         );
         let added = [1, 8, 32][sites] - 1;
         assert_eq!(per_site(&scalar, 0), 0, "scalar store roots: {scalar:?}");
-        assert_eq!(per_site(&reference, 0), added, "{reference:?}");
+        assert_eq!(
+            per_site(&reference, 0),
+            0,
+            "reused store roots: {reference:?}"
+        );
         assert_eq!(per_site(&reference, 4), added, "{reference:?}");
         assert_eq!(per_site(&reference, 5), added, "{reference:?}");
     }

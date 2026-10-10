@@ -156,7 +156,8 @@ fn repeated_stack_calls_add_only_entry_roots() {
                 .count()
         };
         // Lowering keeps both the operand and prepared receiver snapshots in
-        // entry-rooted slots. Dispatch must not add a third root per call.
-        assert_eq!(roots(8) - roots(1), 14, "release={release}");
+        // entry-rooted slots, and successive calls reuse those slots
+        // (willow-jz15.50). Dispatch must not add a root per call.
+        assert_eq!(roots(8) - roots(1), 0, "release={release}");
     }
 }

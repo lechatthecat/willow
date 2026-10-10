@@ -27,7 +27,7 @@ fn persistent_worker_completes_each_drive_once_and_exits_on_disconnect() {
         drop(sender);
         worker.join().unwrap();
         assert_eq!(ENTERED.load(Ordering::Relaxed), drives);
-        assert_eq!(*finished.remaining.lock().unwrap(), 0);
+        assert_eq!(finished.remaining.load(Ordering::SeqCst), 0);
     }
     reset_global_scheduler_for_test();
 }

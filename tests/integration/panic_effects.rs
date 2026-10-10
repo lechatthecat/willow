@@ -1050,8 +1050,11 @@ fn main() { println(new A().value() + new B().value()); }
     assert_eq!(run.stdout, b"2\n");
 }
 
+// An injected default copy is checked and lowered in its provider's scope
+// (willow-rvpp), so its free call binds to the provider's `pure`, not to the
+// destination's panicking function of the same name.
 #[test]
-fn pe_33_cross_unit_default_copy_keeps_its_resolved_free_call_effects() {
+fn pe_33_cross_unit_default_copy_binds_free_calls_in_the_provider_scope() {
     let project = TestProject::new(
         "panic_effect_default_copy_binding",
         &[
@@ -1071,7 +1074,7 @@ pub interface Value {
 import values::Value;
 fn pure(n: i64) -> i64 { panic("copy binding"); return n; }
 class A implements Value {}
-fn main() { let a = new A(); }
+fn main() { let a = new A(); println(a.value()); }
 "#,
             ),
         ],
@@ -1080,9 +1083,16 @@ fn main() { let a = new A(); }
     let stderr = String::from_utf8_lossy(&compile.stderr);
     assert!(compile.status.success(), "{stderr}");
     assert!(
-        stderr.contains("[panic-effects] $lambda.0: may-panic"),
+        stderr.contains("[panic-effects] $lambda.0: no-panic"),
         "{stderr}"
     );
+    let run = project.run();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"1\n");
 }
 
 #[test]

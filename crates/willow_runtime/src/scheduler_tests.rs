@@ -918,7 +918,10 @@ fn parallel_completion_retains_early_notifications() {
         let completion = ParallelCompletion::new(workers);
         for completed in 1..=workers {
             completion.finish();
-            assert_eq!(*completion.remaining.lock().unwrap(), workers - completed);
+            assert_eq!(
+                completion.remaining.load(Ordering::SeqCst),
+                workers - completed
+            );
         }
         completion.wait();
     }

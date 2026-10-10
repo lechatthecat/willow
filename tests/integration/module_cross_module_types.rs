@@ -109,6 +109,8 @@ fn cmt_01_a_module_class_extends_an_item_imported_base() {
                 "import base::Parcel;
 
 pub class Crate extends Parcel {
+    pub init(self, side: i64) { super.init(side); }
+
     pub override fn area(self) -> i64 { return self.side * 3; }
 }
 
@@ -144,6 +146,8 @@ fn cmt_02_the_entry_constructs_the_module_subclass() {
                 "import base::Parcel;
 
 pub class Crate extends Parcel {
+    pub init(self, side: i64) { super.init(side); }
+
     pub override fn area(self) -> i64 { return self.side * 3; }
 }
 ",
@@ -176,7 +180,9 @@ fn cmt_03_a_subclass_inherits_the_imported_bases_method() {
                 "mid.wi",
                 "import base::Parcel;
 
-pub class Plain extends Parcel {}
+pub class Plain extends Parcel {
+    pub init(self, side: i64) { super.init(side); }
+}
 
 pub fn make(n: i64) -> Plain { return new Plain(n); }
 ",
@@ -244,6 +250,8 @@ fn cmt_05_a_three_module_chain() {
                 "import base::Parcel;
 
 pub open class Crate extends Parcel {
+    pub init(self, side: i64) { super.init(side); }
+
     pub open override fn area(self) -> i64 { return self.side * 3; }
 }
 ",
@@ -253,6 +261,8 @@ pub open class Crate extends Parcel {
                 "import mid::Crate;
 
 pub class Pallet extends Crate {
+    pub init(self, side: i64) { super.init(side); }
+
     pub override fn area(self) -> i64 { return self.side * 10; }
 }
 
@@ -689,7 +699,9 @@ fn cmt_18_the_entry_aliases_the_module() {
                 "mid.wi",
                 "import base::Parcel;
 
-pub class Crate extends Parcel {}
+pub class Crate extends Parcel {
+    pub init(self, side: i64) { super.init(side); }
+}
 
 pub fn make(n: i64) -> Crate { return new Crate(n); }
 ",
@@ -718,7 +730,9 @@ fn cmt_19_two_modules_subclass_one_base() {
                 "one.wi",
                 "import base::Parcel;
 
-pub class A extends Parcel {}
+pub class A extends Parcel {
+    pub init(self, side: i64) { super.init(side); }
+}
 
 pub fn make(n: i64) -> A { return new A(n); }
 ",
@@ -727,7 +741,9 @@ pub fn make(n: i64) -> A { return new A(n); }
                 "two.wi",
                 "import base::Parcel;
 
-pub class B extends Parcel {}
+pub class B extends Parcel {
+    pub init(self, side: i64) { super.init(side); }
+}
 
 pub fn make(n: i64) -> B { return new B(n); }
 ",
@@ -750,12 +766,18 @@ fn main() {
 
 // 20. No declared constructor: the implicit memberwise one takes the inherited
 //     field first and the imported-enum field second, so both qualifications
-//     have to agree on the order and the types.
+//     have to agree on the order and the types. Memberwise construction is
+//     only valid over a base without `init`, so the base drops its own.
 #[test]
 fn cmt_20_the_implicit_memberwise_constructor() {
+    let base = BASE.replace(
+        "    pub init(self, side: i64) { self.side = side; }\n\n",
+        "",
+    );
+    assert!(!base.contains("init"));
     assert_project(
         &[
-            ("base.wi", BASE),
+            ("base.wi", &base),
             (
                 "mid.wi",
                 "import base::Parcel;
@@ -839,6 +861,8 @@ fn cmt_22_extends_and_implements_are_both_imported() {
 import base::Sized;
 
 pub class Crate extends Parcel implements Sized {
+    pub init(self, side: i64) { super.init(side); }
+
     pub fn size(self) -> i64 { return self.side; }
 }
 
@@ -906,6 +930,8 @@ fn cmt_24_an_entry_subclass_of_the_module_subclass() {
                 "import base::Parcel;
 
 pub open class Crate extends Parcel {
+    pub init(self, side: i64) { super.init(side); }
+
     pub open override fn area(self) -> i64 { return self.side * 3; }
 }
 ",
@@ -916,6 +942,8 @@ pub open class Crate extends Parcel {
 import mid::Crate;
 
 class Big extends Crate {
+    pub init(self, side: i64) { super.init(side); }
+
     pub override fn area(self) -> i64 { return self.side * 100; }
 }
 
@@ -1102,6 +1130,8 @@ fn cmt_30_the_chain_compiles_in_release() {
 import base::Sized;
 
 pub class Crate extends Parcel implements Sized {
+    pub init(self, side: i64) { super.init(side); }
+
     pub fn size(self) -> i64 { return self.side; }
 }
 

@@ -920,25 +920,120 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
                 "false\nscope complete\n30\ntrue\nscope task cancelled\n",
             ),
         ),
+        ("example/ai_source_types.wi", "7\ntrue\ndocs\n"),
+        (
+            "example/callee_type_queries.wi",
+            "4\n5\n15\n7\n9\n1.5\n10\n",
+        ),
+        ("example/diagnostic_collections.wi", "2\nb\n"),
+        ("example/diagnostic_workarounds.wi", "9\n6\n2\n4\n7\n"),
+        ("example/effect_precision.wi", "3\n1\neffect precision\n1\n"),
+        ("example/effect_witness_precision.wi", "slowly\n1\n2\n"),
+        (
+            "example/freeze_inference.wi",
+            "0\n0\n0\n0\n1\n7\n42\n0\n0\n",
+        ),
+        (
+            "example/frozen_iteration.wi",
+            "1\n2\n3\n6\nmade\n4\n5\n1\n2\n3\n6\n",
+        ),
+        ("example/future_values.wi", "future values ok\n"),
+        (
+            "example/generic_closer_equals.wi",
+            "41\n42\n7\n8\n3\ntrue\n8\n",
+        ),
+        (
+            "example/if_expressions.wi",
+            "negative\nzero\npositive\n42\n",
+        ),
+        (
+            "example/interface_extends_specialization.wi",
+            "positive\ntrue\nfalse\n",
+        ),
+        ("example/match_arm_diagnostics.wi", "3\n7\n9\n"),
+        ("example/method_owner_cache.wi", "14\n16\n"),
+        ("example/native_stack_slots.wi", "6\n15\n820\n"),
+        ("example/nested_match_arm_leaves.wi", "11\n12\n20\n1\n2\n"),
+        (
+            "example/nonnegative_induction.wi",
+            "5005000\n2515000\n790\n791\n792\n793\n794\n795\n796\n797\n798\n799\n800\n801\n802\n803\n804\n805\n806\n",
+        ),
+        (
+            "example/runtime_direct_calls.wi",
+            "38890\n10000\n9999\nruntime direct calls\n",
+        ),
+        ("example/subclass_constructor.wi", "base:checked\n"),
+        (
+            "example/tuples.wi",
+            "Willow\n42\none\n1\ntwo\n2\ntrue\n2.5\nnested\n7\n",
+        ),
+        ("example/user_generics.wi", "42\nhello\n7\nwillow\n20\n"),
+        (
+            "example/module_tuple_calls/main.wi",
+            "5\n5\n5\n5\n5\n5\n5\n5\n5\n5\nfive\n2.5\ntrue\n5\n5\n5\n5\n5\n5\n5\n",
+        ),
+        ("example/rename_values/main.wi", "14\n7\n9\n"),
     ]
 }
 
-fn runnable_project_example_cases() -> &'static [(&'static str, &'static str, &'static str)] {
-    &[(
-        "example/package_paths/app",
-        "example/package_paths/app/src/main.wi",
-        "11\n22\n11\n1\n13\n",
-    )]
+// Each project example lists the directories its run needs (the project and
+// any path dependencies), copied with their layout under `example/` intact.
+type ProjectExampleCase = (
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+fn runnable_project_example_cases() -> &'static [ProjectExampleCase] {
+    &[
+        (
+            &["example/package_paths"],
+            "example/package_paths/app",
+            "example/package_paths/app/src/main.wi",
+            "11\n22\n11\n1\n13\n",
+        ),
+        (
+            &["example/package_maintenance", "example/package_paths"],
+            "example/package_maintenance",
+            "example/package_maintenance/src/main.wi",
+            "11\n",
+        ),
+    ]
 }
 
-// Registry-backed examples are kept separate so focused offline bridge tests
-// can use their existing path dependencies without pretending to test crates.io.
+// Rust bridge examples are kept separate so focused offline bridge tests can
+// use their existing path dependencies without pretending to test crates.io.
 fn runnable_rust_project_example_cases() -> &'static [(&'static str, &'static str, &'static str)] {
-    &[(
-        "example/rust_regex",
-        "example/rust_regex/src/main.wi",
-        "true\nErr\ntrue\n",
-    )]
+    &[
+        (
+            "example/rust_interop_queries",
+            "example/rust_interop_queries/src/main.wi",
+            "true\n",
+        ),
+        ("example/rust_lock", "example/rust_lock/src/main.wi", "42\n"),
+        (
+            "example/rust_opaque_bridge",
+            "example/rust_opaque_bridge/src/main.wi",
+            "true\nfalse\n",
+        ),
+        (
+            "example/rust_regex",
+            "example/rust_regex/src/main.wi",
+            "true\nErr\ntrue\n",
+        ),
+        (
+            "example/rust_scalar_bridge",
+            "example/rust_scalar_bridge/src/main.wi",
+            "42\n",
+        ),
+        (
+            "example/rust_value_bridge",
+            "example/rust_value_bridge/src/main.wi",
+            // 25 bridge round-trip checks.
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        ),
+    ]
 }
 
 fn run_rust_project_examples() {
@@ -948,11 +1043,7 @@ fn run_rust_project_examples() {
             unique_test_id()
         )));
         let project_copy = copy.join("project");
-        for file in ["project.toml", "rust/bridge.rs", "src/main.wi"] {
-            let destination = project_copy.join(file);
-            fs::create_dir_all(destination.parent().unwrap()).unwrap();
-            fs::copy(Path::new(project).join(file), destination).unwrap();
-        }
+        copy_dir(Path::new(project), &project_copy);
         // Capture diagnostics: missing cargo/rustc and unavailable registry
         // access must fail explicitly, never silently skip the example.
         let original_home = std::env::var_os("HOME")
@@ -1002,17 +1093,18 @@ fn test_rust_regex_project_example() {
 
 #[test]
 fn test_package_paths_project_example() {
-    for &(project, _, expected) in runnable_project_example_cases() {
-        // Run from a copy of the enclosing directory (which holds the path
-        // dependencies) so the generated project.lock never lands in the tree.
-        let project = Path::new(project);
-        let workspace = project.parent().unwrap();
+    for &(dirs, project, _, expected) in runnable_project_example_cases() {
+        // Run from a copy of the project and its path dependencies so the
+        // generated project.lock never lands in the tree.
         let copy = PathBuf::from(temp_path(format!(
             "willow_project_example_{}",
             unique_test_id()
         )));
-        copy_dir(workspace, &copy);
-        let copied_project = copy.join(project.file_name().unwrap());
+        for dir in dirs {
+            copy_dir(Path::new(dir), &copy.join(dir));
+        }
+        let copied_project = copy.join(project);
+        let project = Path::new(project);
         let (out, ok) = compile_file_and_run(copied_project.to_str().unwrap());
         let _ = fs::remove_dir_all(&copy);
         assert!(ok, "{} failed", project.display());
@@ -1024,6 +1116,13 @@ fn copy_dir(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     for entry in fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
+        // Skip build state a local run may have left in an example.
+        if matches!(
+            entry.file_name().to_str(),
+            Some(".willow" | "target" | "project.lock")
+        ) {
+            continue;
+        }
         let target = to.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             copy_dir(&entry.path(), &target);
@@ -1041,7 +1140,11 @@ fn test_runnable_example_catalog_is_complete() {
         .chain(
             runnable_project_example_cases()
                 .iter()
-                .chain(runnable_rust_project_example_cases())
+                .map(|(_, _, entry, _)| entry.to_string()),
+        )
+        .chain(
+            runnable_rust_project_example_cases()
+                .iter()
                 .map(|(_, entry, _)| entry.to_string()),
         )
         .collect::<Vec<_>>();
