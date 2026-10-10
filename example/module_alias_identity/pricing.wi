@@ -3,6 +3,8 @@
 import catalog as cat;
 
 pub class Bundle extends cat::Item implements cat::Priced {
+    pub init(self, sku: i64, cost: i64) { super.init(sku, cost); }
+
     pub override fn price(self) -> i64 { return self.cost * 2; }
 }
 

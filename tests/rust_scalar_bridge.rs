@@ -763,7 +763,8 @@ fn rust_check_validates_declared_adapters_with_json_and_human_diagnostics() {
                 stderr.contains(kind)
                     && stderr.contains(code)
                     && stderr.contains("add")
-                    && stderr.contains("src/lib.rs:"),
+                    // rustc renders the span path with the host separator.
+                    && (stderr.contains("src/lib.rs:") || stderr.contains("src\\lib.rs:")),
                 "{stderr}"
             );
             if code == "E0308" {
