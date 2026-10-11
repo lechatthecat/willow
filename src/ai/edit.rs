@@ -1,7 +1,9 @@
 //! Durable structured edits. The workspace lock defines the observation boundary:
-//! cooperating readers/writers see all old or all new files. Ordinary filesystem
-//! readers can observe intermediate files; an interrupted apply is rolled back
-//! before the next edit operation. Recovery never overwrites a third-party edit.
+//! cooperating operations exclude one another while the lease is held. Ordinary
+//! filesystem readers can observe intermediate files. After interruption, edit
+//! operations refuse to proceed until explicit recovery; committed journals retain
+//! the new state, otherwise recovery restores old bytes unless a conflict is found.
+//! Non-cooperating writers have a check/replacement race; see STRUCTURED_EDITS.md.
 use super::{Snapshot, hash};
 use crate::{
     CompilerOptions, CompilerSession,
@@ -61,6 +63,9 @@ pub enum ChangeFormat {
     Diff,
 }
 
+/// Exclusive cooperating-client lease for structured edits. Opening does not
+/// recover an interrupted AI edit: call `recover` explicitly before other edit
+/// operations. This is not a multi-file filesystem snapshot or mandatory lock.
 pub struct Workspace {
     root: PathBuf,
     directory: PathBuf,
@@ -182,11 +187,8 @@ impl Workspace {
     pub fn open(root: &Path) -> Result<Self> {
         let root = fs::canonicalize(root)?;
         let directory = root.join(".willow-edits");
-        fs::create_dir_all(&directory)?;
-        ensure!(
-            !fs::symlink_metadata(&directory)?.file_type().is_symlink(),
-            "edit directory is a symlink"
-        );
+        // The shared transaction owns metadata creation, symlink validation,
+        // and parent-directory synchronization before publication.
         let transaction = crate::workspace_transaction::WorkspaceFileTransaction::try_open(&root)?;
         Ok(Self {
             root,
@@ -640,8 +642,12 @@ impl Workspace {
         // Persist all undo data before the first workspace write. The applying
         // state is also the recovery marker if this process dies mid-operation.
         durable_write(&self.directory.join("active"), id.as_bytes())?;
+        #[cfg(test)]
+        visibility_tests::checkpoint("intent");
         plan.state = "applying".into();
         self.store(id, &plan)?;
+        #[cfg(test)]
+        visibility_tests::checkpoint("applying");
         for (i, change) in plan.changes.iter().enumerate() {
             if let Some(hook) = observe {
                 hook(Some(i))?;
@@ -657,6 +663,8 @@ impl Workspace {
             );
             durable_write_observed(&path, change.after.as_bytes(), || *written += 1)?;
         }
+        #[cfg(test)]
+        visibility_tests::checkpoint("written");
         let snapshot = self.analyze(&self.root.join(&plan.entry), plan.project, emitter)?;
         let replacements: BTreeMap<_, _> = plan
             .changes
@@ -692,6 +700,8 @@ impl Workspace {
         }
         plan.state = "applied".into();
         self.store(id, &plan)?;
+        #[cfg(test)]
+        visibility_tests::checkpoint("committed");
         self.clear_active()?;
         if let Some(hook) = observe {
             hook(None)?;
@@ -741,7 +751,7 @@ impl Workspace {
                 change.path
             );
         }
-        for change in &plan.changes {
+        for (index, change) in plan.changes.iter().enumerate() {
             let path = self.file(&change.path)?;
             let current = fs::read_to_string(&path)?;
             ensure!(
@@ -751,6 +761,10 @@ impl Workspace {
             if current != change.before {
                 durable_write(&path, change.before.as_bytes())?;
             }
+            #[cfg(test)]
+            visibility_tests::checkpoint(&format!("recovered-{index}"));
+            #[cfg(not(test))]
+            let _ = index;
         }
         plan.state = "aborted".into();
         self.store(id, &plan)?;
@@ -2546,3 +2560,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "edit_visibility_tests.rs"]
+mod visibility_tests;

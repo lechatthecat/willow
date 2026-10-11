@@ -646,3 +646,73 @@ fn relative_manifest_loading_recovers_pending_journal() {
             .exists()
     );
 }
+
+// Opt-in, thread-local trace: parallel tests and child workers do not share it.
+// Record successful operations only, so ordering assertions reflect actual syncs.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DurabilityEvent {
+    DirectorySynced(PathBuf),
+    Published(PathBuf),
+}
+#[cfg(unix)]
+thread_local! {
+    static DURABILITY_TRACE: RefCell<Option<Vec<DurabilityEvent>>> = const { RefCell::new(None) };
+}
+#[cfg(unix)]
+pub(super) fn record_durability(event: impl FnOnce() -> DurabilityEvent) {
+    DURABILITY_TRACE.with(|trace| {
+        if let Some(events) = trace.borrow_mut().as_mut() {
+            events.push(event());
+        }
+    });
+}
+#[cfg(unix)]
+pub(crate) struct DurabilityTrace;
+#[cfg(unix)]
+impl DurabilityTrace {
+    pub(crate) fn start() -> Self {
+        DURABILITY_TRACE.with(|trace| {
+            let mut trace = trace.borrow_mut();
+            assert!(trace.is_none(), "durability trace already active");
+            *trace = Some(Vec::new());
+        });
+        Self
+    }
+    pub(crate) fn finish(self) -> Vec<DurabilityEvent> {
+        DURABILITY_TRACE.with(|trace| trace.borrow_mut().take().unwrap())
+    }
+}
+#[cfg(unix)]
+impl Drop for DurabilityTrace {
+    fn drop(&mut self) {
+        DURABILITY_TRACE.with(|trace| *trace.borrow_mut() = None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_sync_count_tracks_independent_acquisitions_not_nested_leases() {
+    for count in [1, 16, 64] {
+        let f = Fixture::new();
+        let root = fs::canonicalize(f.root()).unwrap();
+        let trace = DurabilityTrace::start();
+        for _ in 0..count {
+            let independent = WorkspaceFileTransaction::open(&root).unwrap();
+            let nested = WorkspaceFileTransaction::open(&root).unwrap();
+            drop(nested);
+            drop(independent);
+        }
+        let events = trace.finish();
+        assert_eq!(events.len(), count);
+        assert!(
+            events.iter().all(
+                |event| matches!(event, DurabilityEvent::DirectorySynced(path) if path == &root)
+            )
+        );
+        println!(
+            "lease_sync_count independent={count} nested={count} root_syncs={}",
+            events.len()
+        );
+    }
+}

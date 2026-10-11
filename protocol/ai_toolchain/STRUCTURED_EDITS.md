@@ -55,19 +55,70 @@ stops before modifying any file in its preflight pass. Restore/resolve the
 reported conflicting file explicitly before retrying recovery; no automatic
 conflict resolution is attempted.
 
-Atomic visibility is scoped to operations holding `Workspace`'s exclusive OS
-file lock, including edit operations. The journal blocks
-those observers after an interrupted apply until recovery. Ordinary editors,
-filesystem readers and standalone builds do not take this lock: they can observe
-intermediate files. Non-cooperating writers are detected at the input checks,
-before each replacement and during recovery, but an uncooperative write racing
-the final check/rename cannot be protected by a portable advisory lock. Power-loss
-durability requires filesystem support for file and directory synchronization;
-Unix synchronizes parent directories after replacement and marker removal.
+## Visibility, concurrency, and recovery contract
+
+`Workspace` holds the exclusive advisory OS lock at `.willow-edits/lock`
+for its entire lifetime. Cooperating edit clients must acquire this lease before
+reading or changing the workspace and retain it until their operation ends.
+A second edit process fails to acquire it while the first holds it. Package and
+Rust-bridge transactions share the lease. A lock alone does not resolve an
+interrupted AI edit: subsequent edit operations reject the active marker until
+explicit `edit recover`. Raw readers, ordinary editors, query commands, and
+standalone builds do not universally participate in this lease; callers must
+not infer snapshot consistency from a query/build command alone.
+
+The observable states are:
+
+| Durable boundary | Source files visible to raw readers | Next cooperating edit |
+| --- | --- | --- |
+| Prepared / validated | Original files; candidate lives separately | May preview, validate, or apply if inputs are unchanged |
+| Active marker saved, before applying state | Original files | Refuses normal operations; recover restores originals |
+| Applying, after any replacement prefix | Candidate bytes in replaced files, original bytes in the rest | Refuses normal operations; recover restores originals |
+| Applied state saved, active marker still present | All candidate files | Recover clears the marker and keeps the committed candidate |
+| Active marker removed | All candidate files | Normal operations resume; replay of this apply is rejected |
+| Recovery interrupted | A mixture of original and candidate files | Recover may be retried; normal operations remain blocked |
+| Recovery conflict | Conflicting external bytes and any existing prefix | Reports an error, preserves the conflict and active marker |
+
+Replacement is per file; a multi-file edit has **no atomic filesystem visibility**.
+An individual successful replacement exposes complete old or new file bytes.
+Cooperating clients exclude live concurrent edits and reject interrupted states;
+that is different from a cross-process snapshot for arbitrary tools. Recovery
+preflights all changed files before its first replacement. It accepts only original
+or candidate bytes, rechecks each file, restores original bytes for uncommitted
+plans, and marks the plan aborted. A durable applied/aborted state needs only
+marker cleanup. Thus a crash after commit preserves the candidate rather than
+undoing a completed transaction. Direct `willow rename` additionally attempts
+immediate rollback on errors; advanced `edit apply` leaves recovery explicit.
+
+Changes from another cooperating process cannot interleave under the lease.
+Non-cooperating changes are checked against all captured inputs before applying,
+before each file replacement, after analysis, and during recovery. Observed
+conflicts cause failure instead of silent overwrite. A source moved or deleted
+since preparation invalidates the plan; apply does not recreate its old path.
+A move, deletion, or modification encountered in recovery is a conflict and is
+preserved. Symbol rename changes text at existing paths; it does not itself move
+or delete source files. Re-query and prepare a new request after external path
+changes; restoring/resolving a recovery conflict requires explicit user action.
+
+These are advisory guarantees: an uncooperative writer racing between the last
+check and replacement (or writing identical candidate bytes) cannot be distinguished
+or protected by this protocol. Such writers must cooperate with the same lease
+for guaranteed exclusion. Stronger arbitrary-reader visibility would require a
+separate versioned snapshot layer with a single pointer switch and readers that
+use that pointer; it is not implemented by this journal.
+
+Power-loss durability requires filesystem support for file and directory
+synchronization. Undo data and active intent are persisted before source writes.
+Unix synchronizes the workspace root when acquiring the shared lease, so the
+metadata directory entry is durable before journal or source publication, even
+if a previous opener created it without completing initialization. It also
+synchronizes parent directories after replacement and marker removal.
 Windows synchronizes file contents before replacement, but does not synchronize
-directory entries, so power-loss durability is not promised there. Process-crash
-recovery uses the same journal on both platforms. Native recovery validation has
-been run locally on Linux. No Git operation is performed.
+directory entries, so power-loss durability is not promised there. Process-kill
+recovery uses the same journal on both platforms. Deterministic process-kill tests
+cover journal boundaries, every prefix of a multi-file apply, commit, and repeated
+recovery on Linux; these simulate interruption, not physical power loss. Foreign
+native execution is unverified. No Git operation is performed.
 
 The initial edit surface uses debug/default compiler options and workspace-local,
 regular, non-symlink source files. `--project` selects project mode. External

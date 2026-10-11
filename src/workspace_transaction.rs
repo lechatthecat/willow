@@ -92,15 +92,15 @@ impl WorkspaceFileTransaction {
         // Never wait for a second workspace while owning another: opposing
         // path-dependency traversals would otherwise form an OS-lock cycle.
         let nested_other = LEASES.with(|leases| !leases.borrow().is_empty());
-        let existed = directory.exists();
         fs::create_dir_all(&directory)?;
         ensure!(
             !fs::symlink_metadata(&directory)?.file_type().is_symlink(),
             "workspace transaction directory is a symlink"
         );
-        if !existed {
-            sync_directory(&root)?;
-        }
+        // Persist the metadata directory's entry even if another opener created
+        // it, or a prior initialization stopped before syncing its parent.
+        // Existence alone is not evidence that the directory entry is durable.
+        sync_directory(&root)?;
         let lease = LEASES.with(|leases| -> Result<Arc<File>> {
             let mut leases = leases.borrow_mut();
             let path = directory.join("lock");
@@ -317,6 +317,8 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     #[cfg(not(unix))]
     let _ = path;
+    #[cfg(all(test, unix))]
+    tests::record_durability(|| tests::DurabilityEvent::DirectorySynced(path.to_owned()));
     Ok(())
 }
 pub(crate) fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -349,6 +351,8 @@ pub(crate) fn durable_write_observed(
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;
+        #[cfg(all(test, unix))]
+        tests::record_durability(|| tests::DurabilityEvent::Published(path.to_owned()));
         published();
         sync_directory(parent)
     })();
@@ -360,3 +364,6 @@ pub(crate) fn durable_write_observed(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+pub(crate) use tests::{DurabilityEvent, DurabilityTrace};
