@@ -1,6 +1,38 @@
 //! Deterministic tracing-work checks for the minor-collector extraction.
 
 use super::{MinorCollector, MinorRoots, PinSource, verify_no_pin_enabled};
+
+#[test]
+fn scoped_lease_policy_visits_scale_with_roots_plus_loans() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    reset_internal();
+    for leases in [1, 16, 256, 4096] {
+        for fanout in [1, 8] {
+            let mut roots = MinorRoots::default();
+            for index in 1..=leases {
+                // Policy never dereferences these opaque addresses: every
+                // unsafe alias is covered by an explicit loan before the
+                // young-generation query. Large spacing models fragmentation.
+                let value = (index * 32768) as *mut u8;
+                roots.values.extend(std::iter::repeat_n(
+                    (value, PinSource::RuntimeCodeStack),
+                    fanout,
+                ));
+                roots.values.push((value, PinSource::ScopedLoan));
+            }
+            let mut state = runtime().heap.lock().unwrap();
+            assert!(!super::should_defer_minor(&mut state, &roots));
+            let visits = super::LEASE_POLICY_VISITS.get();
+            assert_eq!(visits, 2 * roots.values.len());
+            eprintln!(
+                "leases={leases} aliases={} policy_visits={visits}",
+                leases * fanout
+            );
+        }
+    }
+    reset_internal();
+}
 use crate::gc::{
     GC_HEADER_SIZE, drop_registry, reset_internal, retire_all_tlabs_unindexed, runtime,
     runtime_test_guard, tlab_state_for_test, type_registry, verify_old_region_metadata,

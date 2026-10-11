@@ -684,13 +684,13 @@ fn channel_recv_or_closed(raw: *mut c_void) -> Option<WillowChannelValue> {
                 drop(state);
                 // Waking can explicitly collect under scheduler GC stress.
                 // The popped reference no longer has the queue as its root.
-                if channel.is_ref {
-                    crate::gc::willow_push_root(std::ptr::addr_of_mut!(value.ptr_value).cast());
-                }
+                let root = channel
+                    .is_ref
+                    .then(|| crate::gc::GcRootHandle::new(unsafe { value.ptr_value.cast() }));
                 wake_send_waiters(channel);
                 wake_recv_waiters(channel);
-                if channel.is_ref {
-                    crate::gc::willow_pop_roots(1);
+                if let Some(root) = root {
+                    value.ptr_value = root.load().cast();
                 }
                 return Some(value);
             }

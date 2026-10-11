@@ -1,6 +1,6 @@
 //! Core String operations. All positions are UTF-8 byte offsets.
 use super::{string_payload_size, ws_as_bytes};
-use crate::gc::{GcObjectKind, willow_alloc_with_layout, willow_pop_roots, willow_push_root};
+use crate::gc::{GcObjectKind, GcRootHandle, willow_alloc_with_layout};
 
 // String creation validates UTF-8. These operations preserve that invariant;
 // rescanning the entire receiver for each substring would make splitting quadratic.
@@ -28,21 +28,20 @@ unsafe fn copy_bytes(source: *const u8, destination: *mut u8, len: usize) {
 }
 
 // The caller supplies a checked range on UTF-8 boundaries.
-fn copy_range(mut value: *mut u8, start: usize, end: usize) -> *mut u8 {
+fn copy_range(value: *mut u8, start: usize, end: usize) -> *mut u8 {
     let len = end - start;
     let size = string_payload_size(len).expect("range fits an existing String");
-    willow_push_root(&mut value);
+    let value = GcRootHandle::new(value);
     let result = willow_alloc_with_layout(GcObjectKind::String, 0, size, 0);
     if !result.is_null() {
         unsafe {
             *(result as *mut i64) = len as i64;
             if len != 0 {
-                copy_bytes(value.add(8 + start), result.add(8), len);
+                copy_bytes(value.load().add(8 + start), result.add(8), len);
             }
             *result.add(8 + len) = 0;
         }
     }
-    willow_pop_roots(1);
     result
 }
 
@@ -101,7 +100,7 @@ pub extern "C" fn willow_string_trim(value: *mut u8) -> *mut u8 {
 /// Repeat whole strings; negative counts or payload-size overflow raise a panic.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_string_repeat(mut value: *mut u8, count: i64) -> *mut u8 {
+pub extern "C" fn willow_string_repeat(value: *mut u8, count: i64) -> *mut u8 {
     if count < 0 {
         return fail("String.repeat requires a nonnegative count");
     }
@@ -112,7 +111,7 @@ pub extern "C" fn willow_string_repeat(mut value: *mut u8, count: i64) -> *mut u
     else {
         return fail("String.repeat size overflow");
     };
-    willow_push_root(&mut value);
+    let value = GcRootHandle::new(value);
     let result = willow_alloc_with_layout(GcObjectKind::String, 0, size, 0);
     if !result.is_null() {
         unsafe {
@@ -120,7 +119,7 @@ pub extern "C" fn willow_string_repeat(mut value: *mut u8, count: i64) -> *mut u
             // Doubling copies avoid count-dependent work for empty inputs and
             // use O(log(count)) copy operations for nonempty inputs, O(total) bytes.
             if total != 0 {
-                copy_bytes(value.add(8), result.add(8), len);
+                copy_bytes(value.load().add(8), result.add(8), len);
                 let mut filled = len;
                 while filled < total {
                     let copied = filled.min(total - filled);
@@ -131,7 +130,6 @@ pub extern "C" fn willow_string_repeat(mut value: *mut u8, count: i64) -> *mut u
             *result.add(8 + total) = 0;
         }
     }
-    willow_pop_roots(1);
     result
 }
 
@@ -139,7 +137,7 @@ pub extern "C" fn willow_string_repeat(mut value: *mut u8, count: i64) -> *mut u
 /// yields leading/trailing empty fields with Unicode scalar values between them.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_string_split(mut value: *mut u8, separator: *const u8) -> *mut u8 {
+pub extern "C" fn willow_string_split(value: *mut u8, separator: *const u8) -> *mut u8 {
     // One search pass. Only integer ranges survive GC; the separator is no
     // longer needed after this pass. No per-field rescanning or array growth.
     let ranges: Vec<(usize, usize)> = {
@@ -152,25 +150,22 @@ pub extern "C" fn willow_string_split(mut value: *mut u8, separator: *const u8) 
             })
             .collect()
     };
-    willow_push_root(&mut value);
-    let mut result = crate::array::willow_array_new(ranges.len() as i64, 1);
+    let value = GcRootHandle::new(value);
+    let result = crate::array::willow_array_new(ranges.len() as i64, 1);
     if result.is_null() {
-        willow_pop_roots(1);
         return result;
     }
-    willow_push_root(&mut result);
+    let result = GcRootHandle::new(result);
     for (index, (start, end)) in ranges.into_iter().enumerate() {
-        let part = copy_range(value, start, end);
+        let part = copy_range(value.load(), start, end);
         if part.is_null() {
-            willow_pop_roots(2);
             return part;
         }
         // A valid in-bounds store has no allocation/safepoint; array_set applies
         // the GC write barrier, and the rooted array retains every earlier part.
-        crate::array::willow_array_set(result, index as i64, part as i64);
+        crate::array::willow_array_set(result.load(), index as i64, part as i64);
     }
-    willow_pop_roots(2);
-    result
+    result.load()
 }
 
 #[cfg(test)]
@@ -181,6 +176,7 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::{willow_pop_roots, willow_push_root};
     use crate::string::{willow_string_as_str, willow_string_from_str};
 
     #[test]

@@ -142,15 +142,11 @@ pub(crate) fn willow_alloc_enum_variant(
         "enum payload does not match its instantiated ABI layout"
     );
     let mut words = payload_words.to_vec();
-    let mut rooted = 0usize;
+    let mut roots = Vec::new();
     let mut offset = 0;
     for kind in layout.payload.slots {
         if kind.traces_first_word() {
-            // SAFETY: `words` is not resized while the root is registered and
-            // each i64 word is one pointer-sized Willow slot on supported
-            // targets.
-            willow_push_root(unsafe { words.as_mut_ptr().add(offset).cast::<*mut u8>() });
-            rooted += 1;
+            roots.push((offset, GcRootHandle::new(words[offset] as *mut u8)));
         }
         offset += kind.word_count() as usize;
     }
@@ -163,7 +159,9 @@ pub(crate) fn willow_alloc_enum_variant(
         payload_bytes,
         layout.gc_ref_mask(),
     );
-    willow_pop_roots(rooted as i32);
+    for (offset, root) in &roots {
+        words[*offset] = root.load() as i64;
+    }
     if value.is_null() {
         return value;
     }
@@ -780,6 +778,8 @@ struct GcRuntime {
     runtime_roots: RuntimeRootSet,
     /// Runtime-owned slots a moving collection rewrites (counted per slot).
     runtime_root_slots: RuntimeRootSet,
+    /// Subset of runtime slots whose owners lend a fixed address.
+    pin_lease_slots: RuntimeRootSet,
     parked_stack_roots: Mutex<HashMap<u64, PublishedRoots>>,
     next_parked_stack: AtomicU64,
     coord: (Mutex<GcCoord>, Condvar),
@@ -810,6 +810,7 @@ impl Default for GcRuntime {
             skipped_foreign_owner_collections: std::sync::atomic::AtomicU64::new(0),
             runtime_roots: RuntimeRootSet::default(),
             runtime_root_slots: RuntimeRootSet::default(),
+            pin_lease_slots: RuntimeRootSet::default(),
             parked_stack_roots: Mutex::new(HashMap::new()),
             next_parked_stack: AtomicU64::new(1),
             coord: (Mutex::new(GcCoord::default()), Condvar::new()),
@@ -2134,6 +2135,7 @@ fn reset_internal() {
     state.major_collections = 0;
     runtime().runtime_roots.clear();
     runtime().runtime_root_slots.clear();
+    runtime().pin_lease_slots.clear();
     runtime().parked_stack_roots.lock().unwrap().clear();
     *runtime().root_stack_owner.lock().unwrap() = None;
     {

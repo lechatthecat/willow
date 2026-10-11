@@ -84,6 +84,28 @@ impl RuntimeRootSet {
         roots
     }
 
+    /// Snapshot referents while registration still protects native slot storage.
+    /// Returning slot addresses and then dereferencing them after unlocking is
+    /// invalid for short-lived native handles during concurrent marking.
+    ///
+    /// # Safety
+    /// Every registered address must name a live, aligned pointer slot. Native
+    /// writers use atomic stores; generated/foreign slots have no concurrent
+    /// non-atomic writer while registered. Removal precedes freeing storage.
+    pub(super) unsafe fn snapshot_slot_values(&self) -> Vec<*mut u8> {
+        let shards = self.lock_all();
+        let mut values = Vec::with_capacity(shards.iter().map(|shard| shard.len()).sum());
+        for shard in &shards {
+            for address in shard.addresses() {
+                let value = unsafe { crate::gc::load_gc_reference(address as *mut *mut u8) };
+                if !value.is_null() {
+                    values.push(value);
+                }
+            }
+        }
+        values
+    }
+
     pub(super) fn len(&self) -> usize {
         self.lock_all().iter().map(|shard| shard.len()).sum()
     }

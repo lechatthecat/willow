@@ -4099,3 +4099,6 @@ fn runtime_policy_budget_is_per_thread() {
     assert!(!runtime_policy_check_due(1));
     reset_gc();
 }
+
+#[path = "root_handle_tests.rs"]
+mod root_handle_tests;

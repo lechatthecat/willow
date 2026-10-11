@@ -8,7 +8,7 @@ use std::hash::BuildHasherDefault;
 
 use super::{
     DropFn, GC_GENERATION_OLD, GC_GENERATION_YOUNG, GC_HEADER_SIZE, GC_REGION_MARK_GRANULE,
-    GcHeader, GcPayload, GcState, HeapObject, RegionKind, TraceFn,
+    GcHeader, GcPayload, GcState, HeapObject, RegionKind, RootSlot, TraceFn,
     allocate_old_region_object_locked, append_parked_roots, drop_registry,
     foreign_root_stack_owner_active, foreign_root_stack_owner_active_locked, index_retired_chunk,
     minor_stack_roots, object_reference_slots, retire_all_tlabs_unindexed, runtime,
@@ -651,6 +651,8 @@ pub(super) enum PinSource {
     OldOrForeign,
     /// A hard memory budget left no evacuation space.
     MemoryBudget,
+    /// An explicitly scoped interior/foreign address loan.
+    ScopedLoan,
 }
 
 impl PinSource {
@@ -661,6 +663,7 @@ impl PinSource {
             Self::RememberedOwner => "remembered-set owner",
             Self::OldOrForeign => "root slot outside the young source chunks",
             Self::MemoryBudget => "memory budget left no evacuation space",
+            Self::ScopedLoan => "scoped fixed-address loan",
         }
     }
 }
@@ -696,6 +699,17 @@ fn minor_collect_with_roots(
 ) -> Option<(u64, u64, crate::gc_telemetry::MarkWork)> {
     append_parked_roots(&mut roots);
     roots.slots.extend(runtime_root_slots());
+    roots.values.extend(
+        runtime()
+            .pin_lease_slots
+            .snapshot()
+            .into_iter()
+            .filter_map(|slot| {
+                RootSlot::from_raw(slot.cast())
+                    .and_then(RootSlot::load)
+                    .map(|value| (value.as_ptr(), PinSource::ScopedLoan))
+            }),
+    );
     // Address roots are never young (checked at registration), so retaining
     // them moves nothing; scanning them still finds young children stored by
     // runtime code, as before this ticket.
@@ -759,10 +773,28 @@ fn minor_collect_with_roots(
 /// first consecutive deferral), so a park that never ends costs at most one
 /// extra nursery's worth of memory before the in-place fallback.
 fn should_defer_minor(state: &mut super::GcState, roots: &MinorRoots) -> bool {
+    #[cfg(test)]
+    LEASE_POLICY_VISITS.set(0);
+    // A scoped loan already requires in-place promotion. Its unsafe-stack
+    // aliases cannot become movable by waiting, so do not accrue deferral debt
+    // for them. Build the membership index once, rather than scanning leases
+    // for every stack root (O(roots + loans), expected).
+    let leased: AddressSet = roots
+        .values
+        .iter()
+        .filter_map(|&(value, source)| {
+            #[cfg(test)]
+            LEASE_POLICY_VISITS.set(LEASE_POLICY_VISITS.get() + 1);
+            (source == PinSource::ScopedLoan).then_some(value as usize)
+        })
+        .collect();
     if state.memory_limit_bytes.is_some()
         || force_pin_fallback()
         || !roots.values.iter().any(|&(value, source)| {
+            #[cfg(test)]
+            LEASE_POLICY_VISITS.set(LEASE_POLICY_VISITS.get() + 1);
             source == PinSource::RuntimeCodeStack
+                && !leased.contains(&(value as usize))
                 && tlab_payload_generation(state, value as usize) == Some(GC_GENERATION_YOUNG)
         })
     {
@@ -776,6 +808,7 @@ fn should_defer_minor(state: &mut super::GcState, roots: &MinorRoots) -> bool {
 #[cfg(test)]
 thread_local! {
     static FORCE_PIN_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LEASE_POLICY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

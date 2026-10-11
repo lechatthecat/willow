@@ -9,7 +9,6 @@
 
 use std::ffi::c_void;
 
-use crate::gc::{willow_pop_roots, willow_push_root};
 use crate::native_frame::{NativeFrameSpec, NativeTaskFrame};
 
 const CHUNK_RESULT_SLOT: usize = 0;
@@ -257,6 +256,7 @@ pub extern "C" fn willow_parallel_map_i64(
     if crate::panic_context::willow_panic_active() != 0 {
         return std::ptr::null_mut();
     }
+    let input = crate::gc::GcRootHandle::new(input);
     let output = crate::array::willow_array_new(len, 0);
     if output.is_null() {
         return std::ptr::null_mut();
@@ -264,30 +264,26 @@ pub extern "C" fn willow_parallel_map_i64(
 
     // `input` remains rooted by generated argument-rooting, but the newly
     // allocated output has no owner until it is stored in the coordinator.
-    let mut rooted_output = output;
-    willow_push_root(&mut rooted_output as *mut *mut u8);
+    let rooted_output = crate::gc::GcRootHandle::new(output);
 
     let Some(frame) = NativeTaskFrame::<CoordinatorFrame>::allocate() else {
-        willow_pop_roots(1);
         return std::ptr::null_mut();
     };
-    frame.store_gc(COORD_INPUT_SLOT, input);
-    frame.store_gc(COORD_OUTPUT_SLOT, output);
+    frame.store_gc(COORD_INPUT_SLOT, input.load());
+    frame.store_gc(COORD_OUTPUT_SLOT, rooted_output.load());
 
     // The coordinator is not scheduler-rooted until all children are published.
     // Root it explicitly while child-frame allocations may collect.
-    let mut rooted_frame = frame.as_raw().cast::<u8>();
-    willow_push_root(&mut rooted_frame as *mut *mut u8);
+    let _rooted_frame = crate::gc::GcRootHandle::new(frame.as_raw().cast::<u8>());
     let worker_count = crate::scheduler::willow_sched_active_workers().max(1) as usize;
     let ranges = chunk_ranges(len, worker_count);
     let mut children = Vec::with_capacity(ranges.len());
     for (start, end) in ranges {
-        let child = spawn_chunk(input, output, mapper, start, end);
+        let child = spawn_chunk(input.load(), rooted_output.load(), mapper, start, end);
         if child == 0 {
             for spawned in children {
                 crate::scheduler::willow_sched_cancel(spawned);
             }
-            willow_pop_roots(2);
             if crate::panic_context::willow_panic_active() == 0 {
                 crate::panic_context::raise_language_message(
                     "parallel::map could not allocate a worker Task",
@@ -311,7 +307,6 @@ pub extern "C" fn willow_parallel_map_i64(
         Some(cancel_coordinator),
         |task_id| frame.store_word(COORD_TASK_ID_SLOT, task_id as i64),
     );
-    willow_pop_roots(2);
     raw
 }
 

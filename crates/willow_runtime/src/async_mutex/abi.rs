@@ -106,6 +106,7 @@ fn current_task() -> Option<RuntimeTaskId> {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_new(value: i64, is_ref: i64) -> *mut c_void {
     ensure_async_mutex_registered();
+    let root = (is_ref != 0).then(|| crate::gc::GcRootHandle::new(value as *mut u8));
     let payload = crate::gc::willow_alloc_with_layout(
         crate::gc::GcObjectKind::LockHandle,
         ASYNC_MUTEX_TYPE_ID,
@@ -115,6 +116,7 @@ pub extern "C" fn willow_async_mutex_new(value: i64, is_ref: i64) -> *mut c_void
     if payload.is_null() {
         return std::ptr::null_mut();
     }
+    let value = root.as_ref().map_or(value, |root| root.load() as i64);
     unsafe {
         (payload as *mut AsyncMutex).write(AsyncMutex::new_payload(value, is_ref != 0));
     }

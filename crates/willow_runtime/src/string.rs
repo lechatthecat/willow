@@ -71,6 +71,11 @@ pub extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
 
 // Caller guarantees valid UTF-8 bytes and a checked payload size.
 unsafe fn alloc_validated_bytes(bytes: *const u8, len_usize: usize, payload_size: i64) -> *mut u8 {
+    // Native buffers need no root. A borrowed managed buffer needs an explicit
+    // address loan across the allocation, even when no generated root exists.
+    let _loan = (len_usize != 0)
+        .then(|| crate::gc::PinLease::<crate::gc::InteriorPointer>::for_address(bytes))
+        .flatten();
     let ptr = willow_alloc_with_layout(GcObjectKind::String, 0, payload_size, 0);
     if ptr.is_null() {
         return ptr;
@@ -197,18 +202,15 @@ pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u
         crate::panic_context::raise_language_message("string concatenation size overflow");
         return std::ptr::null_mut();
     };
-    let mut lhs = lhs.cast_mut();
-    let mut rhs = rhs.cast_mut();
-    crate::gc::willow_push_root(&mut lhs);
-    crate::gc::willow_push_root(&mut rhs);
+    let lhs = crate::gc::GcRootHandle::new(lhs.cast_mut());
+    let rhs = crate::gc::GcRootHandle::new(rhs.cast_mut());
     let ptr = willow_alloc_with_layout(GcObjectKind::String, 0, payload_size, 0);
     if ptr.is_null() {
-        crate::gc::willow_pop_roots(2);
         return ptr;
     }
     // Derive interior addresses from the root slots after the allocation.
-    let (lhs_bytes, _) = unsafe { ws_as_bytes(lhs) };
-    let (rhs_bytes, _) = unsafe { ws_as_bytes(rhs) };
+    let (lhs_bytes, _) = unsafe { ws_as_bytes(lhs.load()) };
+    let (rhs_bytes, _) = unsafe { ws_as_bytes(rhs.load()) };
     unsafe {
         *(ptr as *mut i64) = total_len as i64;
         if lhs_len > 0 {
@@ -219,7 +221,6 @@ pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u
         }
         *ptr.add(8 + total_len) = 0;
     }
-    crate::gc::willow_pop_roots(2);
     ptr
 }
 

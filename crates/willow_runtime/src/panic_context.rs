@@ -10,10 +10,9 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::gc::{
-    willow_alloc_typed, willow_gc_add_runtime_root, willow_gc_remove_runtime_root,
-    willow_pop_roots, willow_push_root,
-};
+use crate::gc::{willow_alloc_typed, willow_gc_add_runtime_root, willow_gc_remove_runtime_root};
+#[cfg(test)]
+use crate::gc::{willow_pop_roots, willow_push_root};
 use crate::string::{willow_string_alloc, willow_string_as_str};
 
 /// `PanicInfo` has the ordinary Willow class-object prefix followed by its four
@@ -238,13 +237,15 @@ fn alloc_string_or_empty(input: *const u8, fallback: &str) -> *mut u8 {
 }
 
 fn alloc_panic_info(message: *const u8, file: *const u8, line: i64, column: i64) -> *mut u8 {
-    let mut message = message.cast_mut();
-    let mut file = file.cast_mut();
-    willow_push_root(&mut message);
-    willow_push_root(&mut file);
+    let message = crate::gc::GcRootHandle::new(message.cast_mut());
+    let file = crate::gc::GcRootHandle::new(file.cast_mut());
     // Either fallback can allocate; protect both supplied inputs first.
-    message = alloc_string_or_empty(message, "explicit panic");
-    file = alloc_string_or_empty(file, "");
+    if message.load().is_null() {
+        message.store(alloc_string_or_empty(std::ptr::null(), "explicit panic"));
+    }
+    if file.load().is_null() {
+        file.store(alloc_string_or_empty(std::ptr::null(), ""));
+    }
 
     let info = willow_alloc_typed(PANIC_INFO_PAYLOAD_SIZE, PANIC_INFO_REF_MASK);
     if info.is_null() {
@@ -252,12 +253,18 @@ fn alloc_panic_info(message: *const u8, file: *const u8, line: i64, column: i64)
     }
     unsafe {
         *(info as *mut i64) = 0;
-        *(info.add(8) as *mut *mut u8) = message;
-        *(info.add(16) as *mut *mut u8) = file;
+        for (offset, value) in [(8, message.load()), (16, file.load())] {
+            crate::gc::willow_gc_write_barrier(
+                info,
+                std::ptr::null_mut(),
+                value,
+                crate::gc::GcStoreDestination::ObjectField as i64,
+            );
+            crate::gc::store_gc_reference(info.add(offset).cast(), value);
+        }
         *(info.add(24) as *mut i64) = line.max(0);
         *(info.add(32) as *mut i64) = column.max(0);
     }
-    willow_pop_roots(2);
     willow_gc_add_runtime_root(info);
     info
 }
@@ -266,16 +273,9 @@ fn alloc_panic_info(message: *const u8, file: *const u8, line: i64, column: i64)
 /// The helper must return an ABI-neutral value immediately afterwards; it must
 /// never continue the failed operation. `file` is an optional Willow String.
 pub(crate) fn raise_language_message_at(message: &str, file: *const u8, line: i64, column: i64) {
-    let mut rooted_file = file as *mut u8;
-    let root_file = !rooted_file.is_null();
-    if root_file {
-        willow_push_root(&mut rooted_file);
-    }
+    let rooted_file = crate::gc::GcRootHandle::new(file as *mut u8);
     let message = crate::string::willow_string_from_str(message);
-    willow_panic_raise(message, rooted_file, line, column);
-    if root_file {
-        willow_pop_roots(1);
-    }
+    willow_panic_raise(message, rooted_file.load(), line, column);
 }
 
 /// Raise a runtime fault that has no location of its own (array bounds, a
@@ -289,10 +289,9 @@ pub(crate) fn raise_language_message(message: &str) {
         raise_language_message_at(message, std::ptr::null(), line, column);
         return;
     }
-    let mut file_string = willow_string_alloc(file.as_ptr(), file.len() as i64);
-    willow_push_root(&mut file_string);
-    raise_language_message_at(message, file_string, line, column);
-    willow_pop_roots(1);
+    let file_string =
+        crate::gc::GcRootHandle::new(willow_string_alloc(file.as_ptr(), file.len() as i64));
+    raise_language_message_at(message, file_string.load(), line, column);
 }
 
 thread_local! {

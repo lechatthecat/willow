@@ -10,24 +10,122 @@ pub(super) struct GcRootCell(std::sync::atomic::AtomicPtr<u8>);
 // Atomic publication permits concurrent marking; the Arc allocation keeps
 // slot addresses stable until owner finalization. Relocation writes stay STW.
 
-/// Handle for one slot in a [`GcRootArena`]. Dropping the handle does not free
-/// the slot because the arena retains its own Arc until the owning runtime
-/// object is finalized.
+/// One stable mutable reference slot. A scoped handle unregisters and frees
+/// its cell on Drop. An arena handle nulls its cell on Drop; the arena retains
+/// the physical slot until owner finalization, preserving trace-slot lifetimes.
 pub(crate) struct GcRootHandle {
     cell: Arc<GcRootCell>,
+    registered: bool,
 }
 
 impl GcRootHandle {
+    /// A scoped native root, using the same stable cell as arena-owned roots.
+    /// This operation does not safepoint. Reload after every GC point.
+    pub(crate) fn new(value: *mut u8) -> Self {
+        let cell = Arc::new(GcRootCell(std::sync::atomic::AtomicPtr::new(value)));
+        willow_gc_add_runtime_root_slot(cell.0.as_ptr());
+        Self {
+            cell,
+            registered: true,
+        }
+    }
+
     pub(crate) fn load(&self) -> *mut u8 {
         // SAFETY: see `GcRootCell`'s synchronization contract.
         self.cell.0.load(Ordering::Acquire)
     }
 
+    pub(crate) fn store(&self, value: *mut u8) {
+        let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+        publish_native_reference(value);
+        satb_delete(self.cell.0.swap(value, Ordering::AcqRel));
+    }
+
     pub(crate) fn release(&self) {
+        let _no_preempt = crate::preempt::NoPreemptGuard::enter();
         // SAFETY: see `GcRootCell`'s synchronization contract. Null is the GC
         // root protocol's explicit inactive-slot value.
-        satb_delete(self.cell.0.load(Ordering::Acquire));
-        self.cell.0.store(std::ptr::null_mut(), Ordering::Release);
+        satb_delete(self.cell.0.swap(std::ptr::null_mut(), Ordering::AcqRel));
+    }
+}
+
+impl Drop for GcRootHandle {
+    fn drop(&mut self) {
+        self.release();
+        if self.registered {
+            willow_gc_remove_runtime_root_slot(self.cell.0.as_ptr());
+        }
+    }
+}
+
+/// A scoped address loan. Unlike a relocatable handle, the leased object must
+/// remain at its current address until Drop, including through park or unwind.
+/// T records the kind of loan; the lease owns its root and cannot be cloned.
+pub(crate) struct PinLease<T> {
+    root: GcRootHandle,
+    kind: std::marker::PhantomData<T>,
+}
+
+pub(crate) enum ForeignReference {}
+pub(crate) enum InteriorPointer {}
+
+impl PinLease<InteriorPointer> {
+    /// Retain the containing allocation when a native byte slice borrows GC
+    /// storage. Native addresses need no lease. Uses the existing region index;
+    /// only an unindexed TLAB header prefix needs a bounded bitmap scan.
+    pub(crate) fn for_address(address: *const u8) -> Option<Self> {
+        let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+        let owner = {
+            let state = runtime().heap.lock().unwrap();
+            find_old_region_object(&state, address as usize, true)
+                .or_else(|| {
+                    find_tlab_chunk(&state, address as usize).and_then(|chunk| {
+                        if chunk.owner_state.is_none() {
+                            return object_in_retired_chunk(chunk, address as usize, true);
+                        }
+                        let relative =
+                            (address as usize).checked_sub(chunk.base as usize + GC_HEADER_SIZE)?;
+                        let offset = chunk.mark_bitmap.last_start_in(0, relative)?;
+                        // The caller borrows an already published allocation;
+                        // start bits only select headers at/before that address.
+                        let object =
+                            HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())?;
+                        (object.allocated()
+                            && address as usize >= object.payload().as_ptr() as usize
+                            && (address as usize) < object.as_ptr() as usize + object.size())
+                        .then_some(object)
+                    })
+                })
+                .map(|object| object.payload().as_ptr())
+        };
+        owner.map(Self::new)
+    }
+}
+
+impl<T> PinLease<T> {
+    pub(crate) fn new(value: *mut u8) -> Self {
+        let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+        let root = GcRootHandle::new(value);
+        runtime().pin_lease_slots.add(root.cell.0.as_ptr().cast());
+        Self {
+            root,
+            kind: std::marker::PhantomData,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load(&self) -> *mut u8 {
+        self.root.load()
+    }
+}
+
+impl<T> Drop for PinLease<T> {
+    fn drop(&mut self) {
+        let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+        runtime()
+            .pin_lease_slots
+            .remove(self.root.cell.0.as_ptr().cast());
+        // The handle's Drop performs the deletion barrier and unregisters.
     }
 }
 
@@ -65,7 +163,10 @@ impl GcRootArena {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(Arc::clone(&cell));
-        GcRootHandle { cell }
+        GcRootHandle {
+            cell,
+            registered: false,
+        }
     }
 
     pub(crate) fn trace_slots(&self, slots: &mut Vec<*mut *mut u8>) {

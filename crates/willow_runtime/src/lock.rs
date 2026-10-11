@@ -160,29 +160,19 @@ fn ensure_blocking_cells_registered() {
     }
 }
 
-/// Allocate one cell payload with `value` kept alive across the allocation.
-///
-/// The initial word arrives by value. When it is a GC reference the caller may
-/// hold it nowhere else, and the allocation below can collect: a minor
-/// collection would free (or, if it is reachable only through a heap slot,
-/// move) the object. Rooting the local copy makes it a direct root; runtime
-/// code allocates outside a relocation-safe scope, so the collector pins it in
-/// place and the word written into the payload afterwards is still the
-/// object's address. Returns null when the allocation fails.
+/// Allocate one cell payload with a possibly moving initial reference held in
+/// a stable handle. Reload into the caller's word after the allocation.
 fn alloc_cell_payload(type_id: u32, payload_size: usize, value: &mut i64, is_ref: bool) -> *mut u8 {
     ensure_blocking_cells_registered();
-    let rooted = is_ref && *value != 0;
-    if rooted {
-        crate::gc::willow_push_root((value as *mut i64).cast::<*mut u8>());
-    }
+    let root = is_ref.then(|| crate::gc::GcRootHandle::new(*value as *mut u8));
     let payload = crate::gc::willow_alloc_with_layout(
         GcObjectKind::LockHandle,
         type_id,
         payload_size as i64,
         0,
     );
-    if rooted {
-        crate::gc::willow_pop_roots(1);
+    if let Some(root) = root {
+        *value = root.load() as i64;
     }
     payload
 }

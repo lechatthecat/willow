@@ -296,12 +296,10 @@ pub fn runtime_root_count() -> usize {
 /// Marking consumers only need values.
 pub(super) fn runtime_roots_snapshot() -> Vec<*mut u8> {
     let mut roots = runtime().runtime_roots.snapshot();
-    roots.extend(
-        runtime_root_slots()
-            .into_iter()
-            .filter_map(|slot| RootSlot::from_raw(slot).and_then(RootSlot::load))
-            .map(GcPayload::as_ptr),
-    );
+    // SAFETY: runtime slot registration keeps each aligned slot alive until
+    // removal; snapshot_slot_values holds the registry locks through atomic
+    // reads so a concurrent handle Drop cannot free an enumerated cell.
+    roots.extend(unsafe { runtime().runtime_root_slots.snapshot_slot_values() });
     let parked = runtime().parked_stack_roots.lock().unwrap();
     roots.extend(
         parked

@@ -11,17 +11,10 @@ std::thread_local! {
 
 #[derive(Default)]
 struct Frame {
-    // Box storage must remain stable when the vector grows.
-    #[allow(clippy::vec_box)]
-    roots: Vec<Box<*mut u8>>,
-}
-
-impl Drop for Frame {
-    fn drop(&mut self) {
-        for slot in &mut self.roots {
-            gc::willow_gc_remove_runtime_root_slot(&mut **slot);
-        }
-    }
+    // The synchronous bridge returns raw values and borrowed String data to
+    // foreign code. Keep their addresses fixed until the bridge frame ends.
+    roots: Vec<gc::PinLease<gc::ForeignReference>>,
+    addresses: crate::id_hash::IdSet<u64>,
 }
 
 #[unsafe(no_mangle)]
@@ -43,9 +36,9 @@ pub extern "C" fn willow_rust_bridge_root(frame: *mut u8, object: u64) {
         return;
     }
     let frame = unsafe { &mut *frame.cast::<Frame>() };
-    let mut slot = Box::new(object as *mut u8);
-    gc::willow_gc_add_runtime_root_slot(&mut *slot);
-    frame.roots.push(slot);
+    if frame.addresses.insert(object) {
+        frame.roots.push(gc::PinLease::new(object as *mut u8));
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -157,19 +150,16 @@ pub extern "C" fn willow_rust_bridge_enum(
     };
     let slots = [kind];
     let layout = EnumVariantLayout::new(tag as u32, &slots);
-    let mut referent = value.low as *mut u8;
-    if reference != 0 {
-        gc::willow_gc_add_runtime_root_slot(&mut referent);
-    }
+    let referent = (reference != 0).then(|| gc::GcRootHandle::new(value.low as *mut u8));
     let object = gc::willow_alloc_with_layout(
         gc::GcObjectKind::Enum,
         0,
         layout.payload_bytes(8) as i64,
         layout.gc_ref_mask(),
     );
-    if reference != 0 {
-        gc::willow_gc_remove_runtime_root_slot(&mut referent);
-    }
+    let referent = referent
+        .as_ref()
+        .map_or(std::ptr::null_mut(), gc::GcRootHandle::load);
     willow_rust_bridge_root(frame, object as u64);
     unsafe {
         *object.cast::<u64>() = tag;

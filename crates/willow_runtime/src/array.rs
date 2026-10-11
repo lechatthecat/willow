@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::gc::{
     GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
-    willow_pop_roots, willow_push_root, write_barrier_object_owner,
+    write_barrier_object_owner,
 };
 
 use willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID;
@@ -185,7 +185,7 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
     // Allocate the handle first (zero-filled, buffer slot null), root it, then
     // allocate the buffer — so a collection during the buffer allocation cannot
     // free the handle, and the still-null buffer slot traces safely.
-    let mut handle = willow_alloc_with_layout(
+    let handle = willow_alloc_with_layout(
         GcObjectKind::ArrayHandle,
         0,
         HANDLE_WORDS * WORD,
@@ -194,12 +194,12 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
     if handle.is_null() {
         return std::ptr::null_mut();
     }
-    willow_push_root(&mut handle as *mut *mut u8);
+    let handle_root = crate::gc::GcRootHandle::new(handle);
     let buffer = alloc_buffer(len, is_ref);
     if buffer.is_null() {
-        willow_pop_roots(1);
         return std::ptr::null_mut();
     }
+    let handle = handle_root.load();
     unsafe {
         set_buffer_len(buffer, len);
         set_handle_word(handle, H_LEN, len);
@@ -213,7 +213,6 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
         );
         set_handle_word(handle, H_BUF, buffer as i64);
     }
-    willow_pop_roots(1);
     handle
 }
 
@@ -224,59 +223,54 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
 /// their — Sync — referents).
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_copy(mut arr: *mut u8) -> *mut u8 {
+pub extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
     if arr.is_null() {
         raise_with("cannot freeze a null array");
         return std::ptr::null_mut();
     }
     let len = willow_array_len(arr);
     let is_ref = unsafe { handle_word(arr, H_IS_REF) };
-    willow_push_root(&mut arr);
-    let mut copy = willow_array_new(len, is_ref);
+    let arr = crate::gc::GcRootHandle::new(arr);
+    let copy = willow_array_new(len, is_ref);
     if copy.is_null() {
-        willow_pop_roots(1);
         return copy;
     }
-    willow_push_root(&mut copy as *mut *mut u8);
+    let copy = crate::gc::GcRootHandle::new(copy);
     let mut i = 0;
     while i < len {
-        willow_array_set(copy, i, willow_array_get(arr, i));
+        willow_array_set(copy.load(), i, willow_array_get(arr.load(), i));
         i += 1;
     }
-    willow_pop_roots(2);
-    copy
+    copy.load()
 }
 
 /// Freeze an array whose element words point to scalar or interface pair boxes. Copy the boxes too: mutable element references must not
 /// change the frozen snapshot. Both arrays remain rooted across every allocation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_copy_scalar_pairs(mut arr: *mut u8) -> *mut u8 {
+pub extern "C" fn willow_array_copy_scalar_pairs(arr: *mut u8) -> *mut u8 {
     if arr.is_null() {
         raise_with("cannot freeze a null array");
         return std::ptr::null_mut();
     }
     let len = willow_array_len(arr);
-    willow_push_root(&mut arr);
-    let mut copy = willow_array_new(len, 1);
+    let arr = crate::gc::GcRootHandle::new(arr);
+    let copy = willow_array_new(len, 1);
     if copy.is_null() {
-        willow_pop_roots(1);
         return copy;
     }
-    willow_push_root(&mut copy);
+    let copy = crate::gc::GcRootHandle::new(copy);
     for index in 0..len {
-        if willow_array_get(arr, index) == 0 {
+        if willow_array_get(arr.load(), index) == 0 {
             continue;
         }
-        let pair = unsafe { copy_scalar_pair(willow_array_get(arr, index) as *const i64) };
+        let pair = unsafe { copy_scalar_pair(willow_array_get(arr.load(), index) as *const i64) };
         if pair.is_null() {
-            willow_pop_roots(2);
             return std::ptr::null_mut();
         }
-        willow_array_set(copy, index, pair as i64);
+        willow_array_set(copy.load(), index, pair as i64);
     }
-    willow_pop_roots(2);
-    copy
+    copy.load()
 }
 
 /// Read immutable tracing metadata without borrowing mutable header bytes.
@@ -312,16 +306,17 @@ unsafe fn store_pair(pair: *mut i64, first: i64, second: i64, mask: u64) {
 unsafe fn copy_scalar_pair(source: *const i64) -> *mut u8 {
     let mask = unsafe { pair_ref_mask(source) };
     let (first, second) = unsafe { (source.read(), source.add(1).read()) };
-    let mut object = first as *mut u8;
-    if mask & 1 != 0 {
-        willow_push_root(&mut object);
-    }
+    let object = (mask & 1 != 0).then(|| crate::gc::GcRootHandle::new(first as *mut u8));
     let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, mask);
     if !pair.is_null() {
-        unsafe { store_pair(pair.cast(), object as i64, second, mask) };
-    }
-    if mask & 1 != 0 {
-        willow_pop_roots(1);
+        unsafe {
+            store_pair(
+                pair.cast(),
+                object.as_ref().map_or(first, |root| root.load() as i64),
+                second,
+                mask,
+            )
+        };
     }
     pair
 }
@@ -427,19 +422,15 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
         // it is a GC pointer — rooting a scalar word (e.g. an i64 like 42) would
         // make the collector treat it as an object pointer and crash. Use the
         // updated root slots after allocation in case the collector moves them.
-        willow_push_root(&mut arr);
-        let mut val = value as *mut u8;
-        let root_val = is_ref && !val.is_null();
-        if root_val {
-            willow_push_root(&mut val as *mut *mut u8);
-        }
+        let arr_root = crate::gc::GcRootHandle::new(arr);
+        let value_root = is_ref.then(|| crate::gc::GcRootHandle::new(value as *mut u8));
         let mut new_buf = alloc_buffer(new_cap, is_ref);
         if new_buf.is_null() {
-            willow_pop_roots(1 + i32::from(root_val));
             return;
         }
+        arr = arr_root.load();
         if copy_pairs {
-            willow_push_root(&mut new_buf);
+            let buffer_root = crate::gc::GcRootHandle::new(new_buf);
             for index in 0..len {
                 // Reload through the rooted handle on every iteration: cloning
                 // can move both buffers and all still-live boxes.
@@ -449,11 +440,12 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
                 } else {
                     let pair = unsafe { copy_scalar_pair(source as *const i64) };
                     if pair.is_null() {
-                        willow_pop_roots(2 + i32::from(root_val));
                         return;
                     }
                     pair
                 };
+                arr = arr_root.load();
+                new_buf = buffer_root.load();
                 unsafe {
                     store_buffer_slot(new_buf, index, pair as i64, true);
                     // Keep each initialized pair visible to GC during the next
@@ -461,10 +453,9 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
                     set_buffer_len(new_buf, index + 1);
                 }
             }
-            willow_pop_roots(1);
         }
-        if root_val {
-            value = val as i64;
+        if let Some(root) = value_root {
+            value = root.load() as i64;
         }
         unsafe {
             let old_buf = handle_buffer(arr);
@@ -491,10 +482,6 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
             set_handle_word(arr, H_BUF, new_buf as i64);
             set_handle_word(arr, H_CAP, new_cap);
         }
-        if root_val {
-            willow_pop_roots(1);
-        }
-        willow_pop_roots(1);
     }
     unsafe {
         let buffer = handle_buffer(arr);

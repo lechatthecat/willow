@@ -50,6 +50,9 @@ impl BridgeFrame {
         unsafe { willow_rust_bridge_root(self.raw, object) }
     }
     fn string(&self, object: u64) -> &str {
+        // A nested enum's String child has its own loan lifetime. Pinning the
+        // outer enum does not prevent its traced children from moving.
+        self.root(object);
         let mut slice = WillowSliceU8 {
             ptr: std::ptr::null(),
             len: 0,
