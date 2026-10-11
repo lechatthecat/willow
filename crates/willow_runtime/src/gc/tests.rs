@@ -1304,7 +1304,7 @@ fn test_gc_minor_deferral_backs_off_and_is_bounded_by_an_indefinite_park() {
         let mut state = runtime().heap.lock().unwrap();
         state.pacer.disable_for_test();
         state.threshold_bytes = 64 * 1024 * 1024;
-        state.pacer_trigger = state.threshold_bytes;
+        state.pacer_trigger = state.threshold_bytes as u64;
     }
     invalidate_runtime_policy_budgets();
     let mut tls = new_tlab_state();
