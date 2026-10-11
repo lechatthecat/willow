@@ -1296,6 +1296,17 @@ fn test_gc_minor_collection_defers_roots_parked_from_runtime_code() {
 fn test_gc_minor_deferral_backs_off_and_is_bounded_by_an_indefinite_park() {
     let _guard = gc_test_guard();
     reset_gc();
+    // The test measures young-heap growth across deferred minor attempts.
+    // Concurrent major sweeping can independently reclaim young allocations,
+    // resetting that growth and leaving the indefinite park unexercised.
+    // Disable major-GC pacing for this isolated minor-policy regression.
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        state.pacer.disable_for_test();
+        state.threshold_bytes = 64 * 1024 * 1024;
+        state.pacer_trigger = state.threshold_bytes;
+    }
+    invalidate_runtime_policy_budgets();
     let mut tls = new_tlab_state();
     let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
     unsafe { *(original as *mut i64) = 81 };
@@ -1312,7 +1323,18 @@ fn test_gc_minor_deferral_backs_off_and_is_bounded_by_an_indefinite_park() {
         assert!(!willow_gc_alloc_slow(&mut tls, 22, 0, 64, 0).is_null());
         slow_paths += 1;
         max_young = max_young.max(runtime().heap.lock().unwrap().young_allocated_bytes);
-        assert!(slow_paths < 1 << 20, "deferral never escalated");
+        if slow_paths >= 1 << 16 {
+            let state = runtime().heap.lock().unwrap();
+            panic!(
+                "deferral never escalated: young={} threshold={} retry={} start={:?} deferred={} majors={}",
+                state.young_allocated_bytes,
+                state.nursery_threshold_bytes,
+                state.minor_retry_bytes,
+                state.minor_deferral_start_bytes,
+                state.survivor_stats.deferred_minor_collections,
+                state.major_collections,
+            );
+        }
     }
 
     // Each deferral waits one TLAB chunk before the next stop-the-world
