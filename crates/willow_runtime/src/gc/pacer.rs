@@ -85,6 +85,12 @@ impl Sampler {
         self.enabled
     }
 
+    /// Isolate a minor-GC policy test from concurrent major-GC pacing.
+    #[cfg(test)]
+    pub(super) fn disable_for_test(&mut self) {
+        self.enabled = false;
+    }
+
     pub(super) fn sample_due(&self, bytes: u64) -> bool {
         self.enabled
             && self

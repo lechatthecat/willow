@@ -6,11 +6,30 @@ use super::*;
 // Runtime-level perspectives live in willow_runtime's `frame_reclaim` and
 // `scheduler_tests` (vjaf_*); these cover the generated-code paths.
 
-const LONG_AWAIT_LOOP: &str = "async fn make(i: i64) -> i64 { return i; }\nasync fn label(i: i64) -> String { return format(\"v{}\", i); }\nasync fn main() { let mut n = 0; let mut i = 0; while i < 20000 { n = n + await make(i) + (await label(i)).len(); make(i); i = i + 1; } await sleep(10); gc_collect(); println(n); println(gc_allocated_bytes() < 200000); }";
+// A TaskScope serves as the completion barrier for 20,000 concurrently
+// scheduled extra tasks. A fixed sleep is not enough on loaded CI runners.
+const LONG_AWAIT_LOOP: &str = r#"
+async fn make(i: i64) -> i64 { return i; }
+async fn label(i: i64) -> String { return format("v{}", i); }
+async fn main() {
+    let scope = TaskScope::new();
+    let mut n = 0;
+    let mut i = 0;
+    while i < 20000 {
+        n = n + await make(i) + (await label(i)).len();
+        scope.add(make(i));
+        i = i + 1;
+    }
+    await scope.finish();
+    gc_collect();
+    println(n);
+    println(gc_allocated_bytes() < 200000);
+}
+"#;
 
 #[test]
 fn vjaf_int_01_parallel_workers_keep_heap_bounded() {
-    // 40,000 awaited + 20,000 detached tasks would retain >3 MB of frames
+    // 40,000 directly awaited + 20,000 scope-owned tasks would retain >3 MB of frames
     // under the old outermost-drive rule.
     let (out, ok) = compile_and_run_with_env(LONG_AWAIT_LOOP, &[("WILLOW_WORKERS", "4")]);
     assert!(ok, "{out}");
