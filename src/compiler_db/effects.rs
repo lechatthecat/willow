@@ -109,6 +109,7 @@ pub(crate) struct UnitEffects {
     pub(crate) facts: EffectFacts<EffectWitness>,
     pub(crate) helpers: Arc<super::HelperSummary>,
     loop_bodies: HashSet<BodyId>,
+    callables: HashMap<FunctionId, bool>,
     may_io: HashSet<FunctionId>,
 }
 
@@ -388,7 +389,7 @@ impl EffectQueries {
         unit: UnitId,
         body: BodyId,
         id: FunctionId,
-    ) -> Option<(RuntimeEffects, bool, bool)> {
+    ) -> Option<(Arc<EffectSummary<EffectWitness>>, bool, bool)> {
         let effects = self.units.ready(&unit)?;
         if consumer != unit && self.tracking.borrow().upgrade().is_some() {
             self.source_reads
@@ -398,9 +399,7 @@ impl EffectQueries {
                 .insert(unit);
         }
         Some((
-            self.effect_capabilities(unit, id)?
-                .runtime
-                .intersection(ANY_PANIC),
+            self.effect_evidence(unit, id)?,
             effects.loop_bodies.contains(&body),
             self.effect_capabilities(unit, id)?.may_io,
         ))
@@ -483,6 +482,30 @@ impl EffectQueries {
         };
         let unit = self.resolve_module(consumer, path)?;
         Some((unit, id))
+    }
+
+    /// Resolve a declared callable before reading its asyncness or evidence.
+    /// Source dependencies also invalidate asyncness and witness-only edits.
+    pub(crate) fn external_lock_callable(
+        &self,
+        consumer: UnitId,
+        target: &FunctionId,
+        imports: &HashMap<String, String>,
+    ) -> Option<(UnitId, FunctionId, bool)> {
+        let (unit, id) = self.external_target(consumer, target, imports)?;
+        if consumer != unit && self.tracking.borrow().upgrade().is_some() {
+            self.source_reads
+                .borrow_mut()
+                .entry(consumer)
+                .or_default()
+                .insert(unit);
+        }
+        let is_async = self
+            .units
+            .ready(&unit)
+            .and_then(|effects| effects.callables.get(&id).copied())
+            .unwrap_or(false);
+        Some((unit, id, is_async))
     }
 
     fn lookup_external_capabilities(
@@ -687,12 +710,18 @@ pub(crate) fn solve_unit<N>(
                         )
                     })
                 });
-                if let Some((panic, has_loop, source_io)) = known {
-                    if source_io {
+                if let Some((summary, has_loop, source_io)) = &known {
+                    if *source_io {
                         may_io.insert(id);
                     }
-                    problem = problem.seed(id, panic, None);
-                    if has_loop {
+                    problem = problem.seed(id, summary.effects().intersection(ANY_PANIC), None);
+                    // Reused defaults execute the declaring body's waits too.
+                    problem = problem.seed(
+                        id,
+                        summary.effects().intersection(LOCK_EFFECT_WAIT),
+                        summary.witness(LOCK_EFFECT_WAIT).cloned(),
+                    );
+                    if *has_loop {
                         loops.insert(id);
                         loop_bodies.insert(body_id);
                     }
@@ -704,7 +733,7 @@ pub(crate) fn solve_unit<N>(
                     if known.is_none() && !canonical_bodies.contains(&source) {
                         // Without the declaring unit's facts, assume the
                         // unscanned body may panic, perform I/O and loop.
-                        problem = problem.seed(id, PANIC, None);
+                        problem = problem.seed(id, PANIC.union(LOCK_EFFECT_WAIT), None);
                         may_io.insert(id);
                         loops.insert(id);
                     }
@@ -873,10 +902,23 @@ pub(crate) fn solve_unit<N>(
     }
     let mut classified = HashSet::new();
     let incremental = origins.is_some() && consumer.is_some();
+    let mut lock_graph = std::borrow::Cow::Borrowed(graph);
     let mut io_graph = std::borrow::Cow::Borrowed(graph);
     let mut io_callers: HashMap<FunctionId, Vec<FunctionId>> = HashMap::new();
     if let Some(index) = index {
         for (id, source) in copies {
+            if index.owner(source).map(|(unit, _)| unit) == consumer {
+                edge_visits += 1;
+                lock_graph.to_mut().merge(
+                    id,
+                    crate::semantic::call_graph::CallSites {
+                        unsupported_initialization: Default::default(),
+                        virtual_calls: Default::default(),
+                        targets: std::iter::once(source_callable(index, source)).collect(),
+                        has_unknown: false,
+                    },
+                );
+            }
             let source = source_callable(index, source);
             if incremental {
                 io_graph.to_mut().merge(
@@ -915,6 +957,24 @@ pub(crate) fn solve_unit<N>(
                 };
                 if external_io {
                     may_io.insert(*target);
+                }
+                if let (Some((_, queries)), Some(unit)) = (origins, consumer)
+                    && let Some((declaring, id, is_async)) =
+                        queries.external_lock_callable(unit, target, &imports)
+                    && !is_async
+                {
+                    let evidence = queries.effect_evidence(declaring, id);
+                    let waiting = evidence.as_ref().map_or(LOCK_EFFECT_WAIT, |summary| {
+                        summary.effects().intersection(LOCK_EFFECT_WAIT)
+                    });
+                    problem = problem.seed(
+                        *target,
+                        waiting,
+                        evidence
+                            .as_ref()
+                            .and_then(|summary| summary.witness(LOCK_EFFECT_WAIT))
+                            .cloned(),
+                    );
                 }
                 problem = problem.seed(
                     *target,
@@ -972,7 +1032,7 @@ pub(crate) fn solve_unit<N>(
         (Some((_, queries)), Some(unit)) => {
             let mut solutions = queries.solutions.borrow_mut();
             let solution = problem.solve_incremental_by(
-                graph,
+                &lock_graph,
                 solutions.get(&unit).map(Arc::as_ref),
                 same_seed,
             );
@@ -983,7 +1043,7 @@ pub(crate) fn solve_unit<N>(
             solutions.insert(unit, Arc::new(solution));
             facts
         }
-        _ => problem.solve(graph),
+        _ => problem.solve(&lock_graph),
     };
     let helpers = helpers
         .into_iter()
@@ -1002,6 +1062,7 @@ pub(crate) fn solve_unit<N>(
         facts,
         helpers: Arc::new(helpers),
         loop_bodies,
+        callables: callables.clone(),
         may_io,
     }
 }
@@ -1979,6 +2040,79 @@ mod tests {
     }
 
     #[test]
+    fn imported_lock_unavailable_evidence_fails_closed() {
+        let mut queries = EffectQueries::default();
+        queries
+            .names
+            .insert("dependency".to_owned(), crate::module::ModuleId(7));
+        let worker = program("pub fn run() {}");
+        let main = program(
+            "import dependency as alias; async fn main() { let m = Mutex::new(0); lock m as value { alias::run(); } }",
+        );
+        let mut checker = crate::semantic::TypeChecker::new();
+        checker.register_module("alias", "dependency", "dependency", &worker);
+        checker.set_effect_queries(std::rc::Rc::new(queries), UnitId::ENTRY);
+        checker.check_program(&main);
+        assert!(
+            checker
+                .errors
+                .iter()
+                .any(|error| error.code == crate::diagnostics::ErrorCode::E2604)
+        );
+    }
+
+    #[test]
+    fn imported_lock_callable_asyncness_unknown_and_dependency_deduplication() {
+        use std::{cell::RefCell, rc::Rc};
+        let mut queries = EffectQueries::default();
+        let dependency = crate::module::ModuleId(7);
+        queries.names.insert("dependency".to_owned(), dependency);
+        let imports = HashMap::from([("alias".to_owned(), "dependency".to_owned())]);
+        let target = FunctionId::method(TypeId::local("alias"), "run");
+        // A resolvable but unavailable declaring unit is synchronous/unknown,
+        // so the consumer must record a site and fail closed on absent evidence.
+        assert_eq!(
+            queries.external_lock_callable(UnitId::ENTRY, &target, &imports),
+            Some((dependency, FunctionId::free("run"), false))
+        );
+        assert!(
+            queries
+                .effect_evidence(dependency, FunctionId::free("run"))
+                .is_none()
+        );
+        let source = program("pub async fn run() {}");
+        let graph = crate::semantic::TypeChecker::resolved_effect_graph(&source);
+        queries
+            .complete(dependency, || {
+                solve_unit(
+                    &source,
+                    &graph,
+                    &HashMap::<ExprId, Type>::new(),
+                    None,
+                    &HashMap::from([(FunctionId::free("run"), true)]),
+                    &HashMap::new(),
+                    |_| PANIC,
+                )
+            })
+            .unwrap();
+        let tracking = Rc::new(RefCell::new(
+            super::super::incremental::SyntaxQueries::default(),
+        ));
+        *queries.tracking.borrow_mut() = Rc::downgrade(&tracking);
+        for count in [32, 128, 512] {
+            queries.source_reads.borrow_mut().clear();
+            for _ in 0..count {
+                assert_eq!(
+                    queries.external_lock_callable(UnitId::ENTRY, &target, &imports),
+                    Some((dependency, FunctionId::free("run"), true))
+                );
+            }
+            assert_eq!(queries.source_reads.borrow()[&UnitId::ENTRY].len(), 1);
+            println!("imported lock: resolutions={count} distinct source dependencies=1");
+        }
+    }
+
+    #[test]
     fn imported_capabilities_resolve_aliases_and_keep_unknown_units_conservative() {
         let mut queries = EffectQueries::default();
         let dependency = crate::module::ModuleId(7);
@@ -2125,6 +2259,7 @@ mod tests {
 pub(crate) struct CallableIndex {
     pub(crate) callables: HashMap<FunctionId, bool>,
     pub(crate) hierarchy: Arc<ClassHierarchy>,
+    pub(crate) imports: Arc<HashMap<String, String>>,
 }
 
 /// Typed effect contributions and lock-held diagnostic sites for one unit/body.

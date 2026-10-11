@@ -1636,6 +1636,50 @@ mod tests {
     }
 
     #[test]
+    fn revision_imported_lock_default_edits_match_cold() {
+        let f = Fixture::new();
+        f.write("main.wi", "import impls; async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); let runner = new impls::Runner(); lock m as value { runner.run(ch); } }");
+        f.write(
+            "impls.wi",
+            "import proto; pub class Runner implements proto::Receiver {}",
+        );
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        for (prefix, body, allowed) in [
+            ("", "", true),
+            ("", "ch.recv();", false),
+            ("\n\n", "ch.recv();", false),
+            ("", "", true),
+        ] {
+            f.write("proto.wi", &format!("{prefix}pub interface Receiver extends Send {{ fn run(self, ch: Channel<i64>) {{ {body} }} }}"));
+            assert_eq!(f.compare(&mut warm), allowed);
+            assert_eq!(f.compare(&mut warm), allowed);
+        }
+    }
+
+    #[test]
+    fn revision_imported_lock_wait_async_and_witness_edits_match_cold() {
+        let f = Fixture::new();
+        f.write("main.wi", "import worker; async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); lock m as value { worker::run(ch); } }");
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        for (body, allowed) in [
+            ("pub fn run(ch: Channel<i64>) {}", true),
+            ("pub fn run(ch: Channel<i64>) { ch.recv(); }", false),
+            ("\n\n pub fn run(ch: Channel<i64>) { ch.recv(); }", false),
+            // Keep body offsets identical across sync/async signature edits.
+            ("pub       fn run(ch: Channel<i64>) { ch.recv(); }", false),
+            ("pub async fn run(ch: Channel<i64>) { ch.recv(); }", true),
+            ("pub       fn run(ch: Channel<i64>) { ch.recv(); }", false),
+            ("pub fn run(ch: Channel<i64>) {}", true),
+        ] {
+            f.write("worker.wi", body);
+            assert_eq!(f.compare(&mut warm), allowed);
+            assert_eq!(f.compare(&mut warm), allowed);
+        }
+    }
+
+    #[test]
     fn revision_effect_changes_recheck_lock_effects() {
         let f = Fixture::new();
         f.write("main.wi", "import value; import independent; async fn main() { let mutex = Mutex::new(0); let ch: Channel<i64> = Channel::new(); lock mutex as n { let v = value::get(ch); } }");
@@ -1653,8 +1697,8 @@ mod tests {
             "value.wi",
             "pub fn get(ch: Channel<i64>) -> i64 { return ch.recv(); }",
         );
-        assert!(f.compare(&mut warm));
-        assert_eq!((warm.typechecks, warm.reused_bodies), (1, 2));
+        assert!(!f.compare(&mut warm));
+        // Rejected analyses do not publish successful-revision statistics.
         f.write(
             "value.wi",
             "pub fn get(ch: Channel<i64>) -> i64 { return 2; }",

@@ -1122,3 +1122,246 @@ fn imported_asynchronous_reference_call_still_rejects_escape() {
     let diagnostics = String::from_utf8_lossy(&output.stderr);
     assert!(diagnostics.contains("error[E1708]"), "{diagnostics}");
 }
+
+/// Cross-unit lock effects: direct, transitive, method/default and eager async.
+#[test]
+fn lock_imported_callable_effects() {
+    let cases = [
+        (
+            "free wait",
+            "pub fn run(ch: Channel<i64>) { ch.recv(); }",
+            "import worker;",
+            "worker::run(ch);",
+            true,
+        ),
+        (
+            "free pure",
+            "pub fn run(ch: Channel<i64>) {}",
+            "import worker;",
+            "worker::run(ch);",
+            false,
+        ),
+        (
+            "free async",
+            "pub async fn run(ch: Channel<i64>) { ch.recv(); }",
+            "import worker;",
+            "let task = worker::run(ch);",
+            false,
+        ),
+        (
+            "async awaited",
+            "pub async fn run(ch: Channel<i64>) { ch.recv(); }",
+            "import worker;",
+            "await worker::run(ch);",
+            true,
+        ),
+        (
+            "alias wait",
+            "pub fn run(ch: Channel<i64>) { ch.recv(); }",
+            "import worker as renamed;",
+            "renamed::run(ch);",
+            true,
+        ),
+        (
+            "item wait",
+            "pub fn run(ch: Channel<i64>) { ch.recv(); }",
+            "import worker::run;",
+            "run(ch);",
+            true,
+        ),
+        (
+            "item async",
+            "pub async fn run(ch: Channel<i64>) { ch.recv(); }",
+            "import worker::run;",
+            "let task = run(ch);",
+            false,
+        ),
+        (
+            "item pure",
+            "pub fn run(ch: Channel<i64>) {}",
+            "import worker::run;",
+            "run(ch);",
+            false,
+        ),
+        (
+            "method wait",
+            "pub class Runner { pub fn run(self, ch: Channel<i64>) { ch.recv(); } }",
+            "import worker;",
+            "let runner = new worker::Runner(); runner.run(ch);",
+            true,
+        ),
+        (
+            "method pure",
+            "pub class Runner { pub fn run(self, ch: Channel<i64>) {} }",
+            "import worker;",
+            "let runner = new worker::Runner(); runner.run(ch);",
+            false,
+        ),
+        (
+            "method async",
+            "pub class Runner { pub async fn run(self, ch: Channel<i64>) { ch.recv(); } }",
+            "import worker;",
+            "let runner = new worker::Runner(); let task = runner.run(ch);",
+            false,
+        ),
+        (
+            "transitive",
+            "fn wait(ch: Channel<i64>) { ch.recv(); } pub fn run(ch: Channel<i64>) { wait(ch); }",
+            "import worker;",
+            "worker::run(ch);",
+            true,
+        ),
+        (
+            "sync spawn",
+            "async fn wait(ch: Channel<i64>) { ch.recv(); } pub fn run(ch: Channel<i64>) { let task = wait(ch); }",
+            "import worker;",
+            "worker::run(ch);",
+            false,
+        ),
+        (
+            "local wrapper",
+            "pub fn run(ch: Channel<i64>) { ch.recv(); }",
+            "import worker; fn wrapper(ch: Channel<i64>) { worker::run(ch); }",
+            "wrapper(ch);",
+            true,
+        ),
+        (
+            "local spawn wrapper",
+            "pub async fn run(ch: Channel<i64>) { ch.recv(); }",
+            "import worker; fn wrapper(ch: Channel<i64>) { let task = worker::run(ch); }",
+            "wrapper(ch);",
+            false,
+        ),
+        (
+            "default local impl",
+            "pub interface Receiver extends Send { fn run(self, ch: Channel<i64>) { ch.recv(); } }",
+            "import worker; class Runner implements worker::Receiver {}",
+            "let runner = new Runner(); runner.run(ch);",
+            true,
+        ),
+        (
+            "default imported impl",
+            "pub interface Receiver extends Send { fn run(self, ch: Channel<i64>) { ch.recv(); } } pub class Runner implements Receiver {}",
+            "import worker;",
+            "let runner = new worker::Runner(); runner.run(ch);",
+            true,
+        ),
+        (
+            "pure default",
+            "pub interface Receiver extends Send { fn run(self, ch: Channel<i64>) {} } pub class Runner implements Receiver {}",
+            "import worker;",
+            "let runner = new worker::Runner(); runner.run(ch);",
+            false,
+        ),
+        (
+            "override pure",
+            "pub interface Receiver extends Send { fn run(self, ch: Channel<i64>) { ch.recv(); } } pub class Runner implements Receiver { pub fn run(self, ch: Channel<i64>) {} }",
+            "import worker;",
+            "let runner = new worker::Runner(); runner.run(ch);",
+            false,
+        ),
+        (
+            "send wait",
+            "pub fn run(ch: Channel<i64>) { ch.send(1); }",
+            "import worker;",
+            "worker::run(ch);",
+            true,
+        ),
+        (
+            "read lock",
+            "pub fn run(ch: Channel<i64>) { ch.recv(); }",
+            "import worker;",
+            "worker::run(ch);",
+            true,
+        ),
+        (
+            "write lock",
+            "pub fn run(ch: Channel<i64>) { ch.recv(); }",
+            "import worker;",
+            "worker::run(ch);",
+            true,
+        ),
+        (
+            "static wait",
+            "pub class Runner { pub static fn run(ch: Channel<i64>) { ch.recv(); } }",
+            "import worker;",
+            "worker::Runner::run(ch);",
+            true,
+        ),
+        (
+            "static pure",
+            "pub class Runner { pub static fn run(ch: Channel<i64>) {} }",
+            "import worker;",
+            "worker::Runner::run(ch);",
+            false,
+        ),
+        (
+            "constructor wait",
+            "pub class Runner { pub init(self, ch: Channel<i64>) { ch.recv(); } }",
+            "import worker;",
+            "let runner = new worker::Runner(ch);",
+            true,
+        ),
+        (
+            "constructor pure",
+            "pub class Runner { pub init(self) {} }",
+            "import worker;",
+            "let runner = new worker::Runner();",
+            false,
+        ),
+    ];
+    for (name, worker, imports, call, rejected) in cases {
+        let (mutex, lock) = match name {
+            "read lock" => ("RwLock", "lock read"),
+            "write lock" => ("RwLock", "lock write"),
+            _ => ("Mutex", "lock"),
+        };
+        let main = format!(
+            "{imports} async fn main() {{ let m = {mutex}::new(0); let ch: Channel<i64> = Channel::new(); {lock} m as value {{ {call} }} }}"
+        );
+        let project = TestProject::new(
+            "lock_imported_effect",
+            &[("worker.wi", worker), ("main.wi", &main)],
+        );
+        let output = project.compile("main.wi");
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            diagnostics.contains("error[E2604]"),
+            rejected,
+            "{name}: {diagnostics}"
+        );
+        if !rejected {
+            assert!(output.status.success(), "{name}: {diagnostics}");
+        }
+        if name == "free wait" {
+            assert!(
+                diagnostics.contains("worker.wi") && diagnostics.contains("recv"),
+                "missing declaring-unit witness: {diagnostics}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lock_imported_default_from_third_module() {
+    let project = TestProject::new(
+        "lock_imported_default_three_units",
+        &[
+            (
+                "proto.wi",
+                "pub interface Receiver extends Send { fn run(self, ch: Channel<i64>) { ch.recv(); } }",
+            ),
+            (
+                "impls.wi",
+                "import proto; pub class Runner implements proto::Receiver {}",
+            ),
+            (
+                "main.wi",
+                "import impls; async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); let runner = new impls::Runner(); lock m as value { runner.run(ch); } }",
+            ),
+        ],
+    );
+    let output = project.compile("main.wi");
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostics.contains("error[E2604]"), "{diagnostics}");
+}

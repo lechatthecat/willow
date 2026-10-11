@@ -290,6 +290,7 @@ impl TypeChecker {
             self.symbols.fork_body_scope(),
         );
         body.capture_call_sites = self.capture_call_sites;
+        body.effect_queries = self.effect_queries.clone();
         body.invalid_type_names = self.invalid_type_names.clone();
         body.import_type_hints = self.import_type_hints.clone();
         body.fully_qualified_collection_types = self.fully_qualified_collection_types.clone();

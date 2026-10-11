@@ -1,0 +1,2 @@
+pub fn increment(value: i64) -> i64 { return value + 1; }
+pub async fn receive(ch: Channel<i64>) -> i64 { return ch.recv(); }

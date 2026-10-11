@@ -1,0 +1,12 @@
+import worker;
+
+async fn main() {
+    let m = Mutex::new(6);
+    let ch: Channel<i64> = Channel::new();
+    ch.send(42);
+    lock m as mut value {
+        value = worker::increment(value);
+        let pending = worker::receive(ch);
+        println(value);
+    }
+}

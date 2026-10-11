@@ -376,6 +376,24 @@ impl TypeChecker {
     fn prepare_lock_effect_analysis(&mut self, program: &Program) {
         self.local.current_effect_callable = None;
         self.effect_index.callables.clear();
+        self.effect_index.imports = program
+            .imports
+            .iter()
+            .map(|import| {
+                (
+                    import.alias.clone().unwrap_or_else(|| {
+                        import
+                            .path
+                            .rsplit("::")
+                            .next()
+                            .unwrap_or(&import.path)
+                            .to_string()
+                    }),
+                    import.path.clone(),
+                )
+            })
+            .collect::<HashMap<_, _>>()
+            .into();
         self.effect_index.hierarchy = std::sync::Arc::new(self.build_lock_effect_hierarchy());
         self.effect_inputs.edges.clear();
         self.resolved_calls.clear();
@@ -702,7 +720,7 @@ impl TypeChecker {
         result
     }
 
-    /// Record a typed call to a same-program callable.
+    /// Record a typed call to a local or imported callable.
     ///
     /// An `async` callee is still an edge, but a masked one: calling an
     /// `async fn` eagerly creates a Task, which allocates in the caller, while
@@ -712,8 +730,19 @@ impl TypeChecker {
     /// graph stays complete without the wait leaking into the caller. For the
     /// same reason a bare async call is never itself a lock-held wait site.
     pub(super) fn record_lock_effect_call(&mut self, callee: FunctionId, span: Span) {
-        let Some(callee_is_async) = self.effect_index.callables.get(&callee).copied() else {
-            return;
+        let callee_is_async = match self.effect_index.callables.get(&callee).copied() {
+            Some(is_async) => is_async,
+            None => {
+                let Some((queries, unit)) = &self.effect_queries else {
+                    return;
+                };
+                let Some((_, _, is_async)) =
+                    queries.external_lock_callable(*unit, &callee, &self.effect_index.imports)
+                else {
+                    return;
+                };
+                is_async
+            }
         };
         // A lock-held call site does not depend on the caller having a graph
         // node: non-callable contexts have none, and their direct waits are
@@ -803,7 +832,7 @@ impl TypeChecker {
             .dispatch_targets(&info.name, method)
     }
 
-    /// Resolve a local static method call to its declaring body without
+    /// Resolve a module function or static method to its declaring body without
     /// emitting diagnostics a second time.
     pub(super) fn static_method_effect_id(&self, class: &str, method: &str) -> Option<FunctionId> {
         let class = if class == "Self" {
@@ -811,6 +840,9 @@ impl TypeChecker {
         } else {
             class
         };
+        if self.symbols.lookup_module_func(class, method).is_some() {
+            return Some(FunctionId::method(TypeId::from_source_name(class), method));
+        }
         self.symbols.lookup_class(class)?;
         let declaring = self.resolved_method_class(class, method)?;
         let method_info = self.symbols.lookup_class(&declaring)?.methods.get(method)?;
@@ -870,23 +902,7 @@ impl TypeChecker {
             self.effect_graph_only = Some(graph);
             return;
         }
-        let imports = program
-            .imports
-            .iter()
-            .map(|import| {
-                (
-                    import.alias.clone().unwrap_or_else(|| {
-                        import
-                            .path
-                            .rsplit("::")
-                            .next()
-                            .unwrap_or(&import.path)
-                            .to_string()
-                    }),
-                    import.path.clone(),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let imports = std::sync::Arc::clone(&self.effect_index.imports);
         if let Some((queries, unit)) = &self.effect_queries {
             queries.static_initializers.record(
                 *unit,
@@ -1095,22 +1111,50 @@ impl TypeChecker {
             // A callable that waits on its own is explained by its own
             // operation; only a purely transitive effect needs the propagated
             // witness.
-            let Some(cause) =
-                self.effect_inputs
-                    .direct
-                    .get(&site.callee)
-                    .cloned()
-                    .or_else(|| {
-                        let evidence = self.effect_queries.as_ref().and_then(|(queries, unit)| {
+            let Some(cause) = self
+                .effect_inputs
+                .direct
+                .get(&site.callee)
+                .cloned()
+                .or_else(|| {
+                    let evidence = self.effect_queries.as_ref().and_then(|(queries, unit)| {
+                        if self.effect_index.callables.contains_key(&site.callee) {
                             queries.effect_evidence(*unit, site.callee)
-                        });
-                        evidence
-                            .as_deref()
-                            .or_else(|| facts.get(&site.callee))
-                            .filter(|summary| summary.intersects(LOCK_EFFECT_WAIT))
-                            .and_then(|summary| summary.witness(LOCK_EFFECT_WAIT))
-                            .and_then(|witness| witness.lock().cloned())
-                    })
+                        } else {
+                            let (declaring, id) = queries.external_target(
+                                *unit,
+                                &site.callee,
+                                &self.effect_index.imports,
+                            )?;
+                            queries.effect_evidence(declaring, id)
+                        }
+                    });
+                    evidence
+                        .as_deref()
+                        .or_else(|| facts.get(&site.callee))
+                        .filter(|summary| summary.intersects(LOCK_EFFECT_WAIT))
+                        .and_then(|summary| {
+                            summary
+                                .witness(LOCK_EFFECT_WAIT)
+                                .and_then(|witness| witness.lock().cloned())
+                                .or_else(|| {
+                                    Some(LockEffectCause {
+                                        span: site.span,
+                                        operation: "unavailable waiting evidence".into(),
+                                        kind: LockEffectKind::SuspendOrBlock,
+                                    })
+                                })
+                        })
+                        .or_else(|| {
+                            (!self.effect_index.callables.contains_key(&site.callee)
+                                && evidence.is_none())
+                            .then(|| LockEffectCause {
+                                span: site.span,
+                                operation: "unavailable imported effect evidence".into(),
+                                kind: LockEffectKind::SuspendOrBlock,
+                            })
+                        })
+                })
             else {
                 continue;
             };
@@ -2640,10 +2684,16 @@ impl TypeChecker {
             Expr::StaticField(s) => self.resolve_static_field_read(&s.class, &s.field, s.span),
             Expr::New(n) => {
                 let result = self.check_new(n);
-                self.record_lock_effect_call(
-                    FunctionId::method(TypeId::from_source_name(&n.class_name), "init"),
-                    n.span,
-                );
+                if self
+                    .symbols
+                    .lookup_class(&n.class_name)
+                    .is_some_and(|info| info.constructor.is_some())
+                {
+                    self.record_lock_effect_call(
+                        FunctionId::method(TypeId::from_source_name(&n.class_name), "init"),
+                        n.span,
+                    );
+                }
                 result
             }
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
