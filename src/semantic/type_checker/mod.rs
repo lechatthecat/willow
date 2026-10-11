@@ -880,6 +880,10 @@ impl TypeChecker {
             Expr::FieldAccess(obj, field_name, span, _) => {
                 let obj_ty = self.check_expr(obj);
                 let field_ty = self.resolve_field(&obj_ty, field_name, *span, true, "read");
+                // Reference arguments check places directly, bypassing
+                // check_expr's type recording. Lowering still needs the
+                // resolved field type, including imported specializations.
+                self.expr_types.insert(expr.id(), field_ty.clone());
                 if matches!(field_ty, Type::Void) {
                     return None;
                 }

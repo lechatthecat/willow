@@ -1,0 +1,17 @@
+module boxes;
+
+pub class Box<T> {
+    pub value: T;
+    pub fn get(self) -> T { return self.value; }
+}
+
+pub class Holder {
+    pub b: Box<i64>;
+    pub nested: Box<Box<i64>>;
+    pub text: Box<String>;
+    pub init(self) {
+        self.b = new Box<i64>(5);
+        self.nested = new Box<Box<i64>>(new Box<i64>(7));
+        self.text = new Box<String>("kept");
+    }
+}

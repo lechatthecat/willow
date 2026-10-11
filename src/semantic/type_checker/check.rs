@@ -2081,6 +2081,16 @@ impl TypeChecker {
     pub(super) fn check_expr(&mut self, expr: &Expr) -> Type {
         let generation = self.error_generation;
         let ty = self.check_expr_inner(expr);
+        // Imported signatures retain generic class applications until a value
+        // reaches this checker. Materialize the class before recording its type
+        // or letting a parent expression resolve fields/methods on the value.
+        let ty = if let Type::Generic(name, _) = &ty
+            && self.generics.classes.contains_key(name)
+        {
+            self.normalize_type(&ty, expr.span())
+        } else {
+            ty
+        };
         self.record_checked_expr(expr, ty, generation)
     }
 

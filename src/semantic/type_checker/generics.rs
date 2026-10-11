@@ -29,6 +29,8 @@ pub(crate) struct TemplateRegistry {
     #[cfg(test)]
     class_specializations: usize,
     #[cfg(test)]
+    class_requests: usize,
+    #[cfg(test)]
     function_copies: usize,
     #[cfg(test)]
     class_copies: usize,
@@ -221,6 +223,48 @@ mod template_registry_tests {
     }
 
     #[test]
+    fn imported_member_access_scaling_reuses_specialization() {
+        for width in [1, 16, 64] {
+            let template = parse(&format!(
+                "pub class Box<T> {{ pub value: T; pub fn get(self) -> T {{ {} return self.value; }} }} pub fn make() -> Box<i64> {{ return new Box<i64>(1); }}",
+                "println(1);".repeat(width)
+            ));
+            for consumers in [1, 8, 32] {
+                for uses in [1, 16, 64] {
+                    let registry = Rc::new(RefCell::new(TemplateRegistry::default()));
+                    let mut pending = 0;
+                    for _ in 0..consumers {
+                        let mut checker = TypeChecker::new();
+                        checker.generics.registry = registry.clone();
+                        checker.register_module("boxes", "boxes", "boxes.wi", &template);
+                        let entry = parse(&format!(
+                            "fn main() {{ {} }}",
+                            "println(boxes::make().value);".repeat(uses)
+                        ));
+                        checker.check_program(&entry);
+                        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                        pending += checker.generics.pending.len();
+                    }
+                    let registry = registry.borrow();
+                    assert_eq!(registry.class_requests, consumers * uses);
+                    assert_eq!(registry.class_specializations, 1);
+                    assert_eq!(registry.class_copies, 1);
+                    assert_eq!(pending, 1);
+                    println!(
+                        "WILLOW_GENERIC_MEMBER_AUDIT {}",
+                        serde_json::json!({
+                            "body_width": width, "consumers": consumers, "uses_per_consumer": uses,
+                            "class_requests": registry.class_requests,
+                            "specializations": registry.class_specializations,
+                            "template_copies": registry.class_copies, "queued_bodies": pending
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn consumer_fanout_specializes_each_body_once() {
         for width in [1, 16, 256] {
             let templates = parse(&format!(
@@ -360,12 +404,12 @@ mod template_registry_tests {
                     .collect();
                 INSTANTIATION_METADATA_COPIES.with(|copies| copies.set(0));
                 let (substituted, metadata) =
-                    checker.instantiation_bindings(FileId(1), Span::dummy(), &bindings);
+                    checker.instantiation_bindings(Span::dummy(), &bindings);
                 assert_eq!(substituted.len(), count);
                 assert_eq!(metadata.len(), 1);
                 let one = HashMap::from([("T".to_string(), Type::Named("Payload".into()))]);
                 for _ in 0..count {
-                    let (_, next) = checker.instantiation_bindings(FileId(1), Span::dummy(), &one);
+                    let (_, next) = checker.instantiation_bindings(Span::dummy(), &one);
                     assert!(Rc::ptr_eq(&metadata[0].1, &next[0].1));
                 }
                 assert_eq!(
@@ -574,7 +618,6 @@ impl TypeChecker {
 
     fn instantiation_bindings(
         &mut self,
-        owner: crate::diagnostics::FileId,
         span: Span,
         bindings: &HashMap<String, Type>,
     ) -> (HashMap<String, Type>, ImportedTypes) {
@@ -602,9 +645,9 @@ impl TypeChecker {
                         return name.clone();
                     };
                     let (identity, declaration_span) = info.identity();
-                    if declaration_span.file_id == owner && !name.contains("::") {
-                        return name.clone();
-                    }
+                    // Cached signatures can be consumed outside their owner.
+                    // Carry every nominal argument through the shared type
+                    // table instead of leaving an owner-local bare name.
                     let canonical = self.generic_nominal_identity(identity, declaration_span);
                     let alias = symbol("$type", &[Type::Named(canonical)]);
                     classes.entry(alias.clone()).or_insert_with(|| {
@@ -897,8 +940,7 @@ impl TypeChecker {
                 let mut f = (*template).clone();
                 f.name = name.clone();
                 f.type_params.clear();
-                let (bindings, classes) =
-                    self.instantiation_bindings(template.span.file_id, span, &bindings);
+                let (bindings, classes) = self.instantiation_bindings(span, &bindings);
                 let mut item = Item::Function(f);
                 substitute_item(&mut item, &bindings);
                 self.generics
@@ -931,6 +973,10 @@ impl TypeChecker {
         span: Span,
     ) -> Option<Type> {
         let template = self.generics.classes.get(name)?.clone();
+        #[cfg(test)]
+        {
+            self.generics.registry.borrow_mut().class_requests += 1;
+        }
         if !template.public && template.span.file_id != span.file_id {
             self.generic_error(span, format!("generic class `{name}` is private"));
             return Some(Self::error_type());
@@ -1037,8 +1083,7 @@ impl TypeChecker {
         };
         class.name = name.clone();
         class.type_params.clear();
-        let (bindings, classes) =
-            self.instantiation_bindings(template.span.file_id, span, &bindings);
+        let (bindings, classes) = self.instantiation_bindings(span, &bindings);
         self.register_shared_instantiation_types(&classes);
         let mut item = Item::Class(class);
         substitute_item(&mut item, &bindings);

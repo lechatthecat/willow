@@ -309,3 +309,6 @@ mod user_generics;
 
 #[path = "integration/assignable_representations.rs"]
 mod assignable_representations;
+
+#[path = "integration/module_generic_members.rs"]
+mod module_generic_members;

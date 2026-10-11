@@ -1403,7 +1403,15 @@ impl TypeChecker {
                         );
                     }
                 }
-                fi.ty.clone()
+                // Writes need the same concrete expected type as reads and
+                // call parameters during generic discovery.
+                if let Type::Generic(name, _) = &fi.ty
+                    && self.generics.classes.contains_key(name)
+                {
+                    self.normalize_type(&fi.ty, span)
+                } else {
+                    fi.ty.clone()
+                }
             }
         }
     }

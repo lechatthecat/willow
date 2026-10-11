@@ -105,6 +105,20 @@ impl TypeChecker {
     }
 
     pub(super) fn check_call_arg_against_param(&mut self, param: &ParamInfo, arg: &CallArg) {
+        // Imported parameter signatures, like expression results, may still
+        // contain a generic class application during the discovery pass.
+        let normalized;
+        let param = if let Type::Generic(name, _) = &param.ty
+            && self.generics.classes.contains_key(name)
+        {
+            normalized = ParamInfo {
+                ty: self.normalize_type(&param.ty, arg.span),
+                ..param.clone()
+            };
+            &normalized
+        } else {
+            param
+        };
         match (&param.mode, &arg.mode) {
             (ParamMode::Value, CallArgMode::Value) => {
                 self.check_value_arg_type(&param.ty, arg);

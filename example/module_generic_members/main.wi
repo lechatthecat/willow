@@ -1,0 +1,11 @@
+import boxes::Holder;
+
+fn main() {
+    let h = new Holder();
+    println(h.b.value);
+    let b = h.b;
+    println(b.get());
+    println(h.nested.value.value);
+    println(h.nested.get().get());
+    println(h.text.get());
+}
