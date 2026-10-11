@@ -22,6 +22,7 @@
 // outside a `RelocationSafeScope` defers the minor collection while it
 // publishes a young referent; only a hard memory budget pins instead.
 
+mod cycle_wait;
 mod safepoint;
 pub use safepoint::*;
 mod marking;
@@ -586,52 +587,7 @@ static ELECTION_BUDGET_WAITING: std::sync::atomic::AtomicBool =
 /// Give reclamation one opportunity before treating reservation pressure as
 /// exhaustion. Waiting mutators cooperate with remark and wait through sweep.
 fn collect_for_budget() {
-    let mut observed_or_requested_cycle = false;
-    loop {
-        let (collector, _sweeping) = {
-            let state = runtime().heap.lock().unwrap();
-            let collector = state
-                .concurrent_cycle
-                .as_ref()
-                .map(|cycle| cycle.collector)
-                .or(state.sweeping);
-            (collector, state.sweeping.is_some())
-        };
-        match collector {
-            Some(collector) if collector == std::thread::current().id() => return,
-            Some(_) => {
-                #[cfg(test)]
-                if _sweeping {
-                    SWEEP_BUDGET_WAITING.store(true, Ordering::Release);
-                }
-                observed_or_requested_cycle = true;
-                willow_gc_safepoint();
-                std::thread::yield_now();
-            }
-            None if observed_or_requested_cycle => {
-                // An elected collector can own serialization before publishing
-                // its initial mark state. Likewise it may be finishing accounting
-                // after clearing sweep state. Neither gap is an idle heap.
-                let busy = match runtime().collect_lock.try_lock() {
-                    Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => false,
-                    Err(std::sync::TryLockError::WouldBlock) => true,
-                };
-                if !busy {
-                    return;
-                }
-                #[cfg(test)]
-                ELECTION_BUDGET_WAITING.store(true, Ordering::Release);
-                willow_gc_safepoint();
-                std::thread::yield_now();
-            }
-            None => {
-                observed_or_requested_cycle = true;
-                collect_internal();
-                // Election may only have joined an initial safepoint. Recheck
-                // the published cycle and wait through its sweep before retry.
-            }
-        }
-    }
+    cycle_wait::collect_for_budget();
 }
 
 fn allocation_failure(state: &GcState) -> *mut u8 {
@@ -802,6 +758,8 @@ struct GcCoord {
     /// Mutators currently parked at a safepoint.
     parked: HashSet<ThreadId>,
     handshake: Option<root_handshake::Handshake>,
+    cycle_collector: Option<ThreadId>,
+    cycle_generation: u64,
 }
 
 /// Process-wide GC services. Keeping the heap, roots, registries, and STW
@@ -825,6 +783,9 @@ struct GcRuntime {
     parked_stack_roots: Mutex<HashMap<u64, PublishedRoots>>,
     next_parked_stack: AtomicU64,
     coord: (Mutex<GcCoord>, Condvar),
+    /// Only cycle/participation transitions wake budget waiters. Mutator
+    /// acknowledgements use coord.1, avoiding quadratic wakeup fan-out.
+    budget_cv: Condvar,
     /// Lock-free fast-path mirror of `GcCoord::stop_requested`.
     stop_requested: std::sync::atomic::AtomicBool,
     poll_requested: std::sync::atomic::AtomicBool,
@@ -852,6 +813,7 @@ impl Default for GcRuntime {
             parked_stack_roots: Mutex::new(HashMap::new()),
             next_parked_stack: AtomicU64::new(1),
             coord: (Mutex::new(GcCoord::default()), Condvar::new()),
+            budget_cv: Condvar::new(),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
             poll_requested: std::sync::atomic::AtomicBool::new(false),
             trace_registry: Mutex::new(HashMap::new()),
@@ -1714,14 +1676,9 @@ fn collect_internal() {
         willow_gc_safepoint();
         return;
     }
-    let _serialize = match runtime().collect_lock.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            // Another collector is active; cooperate by reaching a safepoint.
-            willow_gc_safepoint();
-            return;
-        }
+    let Some(_serialize) = cycle_wait::CollectorGuard::try_acquire() else {
+        willow_gc_safepoint();
+        return;
     };
     // A legacy root owner outside the registry cannot publish a snapshot.
     // Other registered workers do not make that foreign stack safe to scan.

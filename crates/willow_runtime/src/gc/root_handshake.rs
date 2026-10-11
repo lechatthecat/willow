@@ -178,6 +178,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
         activating: true,
     });
     runtime().poll_requested.store(true, Ordering::Release);
+    runtime().budget_cv.notify_all();
     crate::scheduler::wake_idle_mutators_for_gc();
     publish_current(&mut coord);
     coord = wait_pending(cv, coord, "root handshake activation round");
@@ -194,6 +195,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
     cycle.tracing_enabled.store(true, Ordering::Release);
     // Leaving mutators wait for this transition, not just round completion.
     cv.notify_all();
+    runtime().budget_cv.notify_all();
     crate::scheduler::wake_idle_mutators_for_gc();
     publish_current(&mut coord);
     coord = wait_pending(cv, coord, "root handshake publication round");

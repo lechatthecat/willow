@@ -1553,7 +1553,7 @@ fn reservation_retry_waits_for_election_before_phase_publication() {
     let _guard = runtime_test_guard();
     reset_internal_for_test();
     ELECTION_BUDGET_WAITING.store(false, Ordering::Relaxed);
-    let elected = runtime().collect_lock.lock().unwrap();
+    let elected = cycle_wait::CollectorGuard::try_acquire().unwrap();
     let done = Arc::new(AtomicBool::new(false));
     let worker = {
         let done = done.clone();

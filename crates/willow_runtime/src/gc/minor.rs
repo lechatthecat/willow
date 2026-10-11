@@ -819,13 +819,9 @@ pub(crate) fn minor_collect_internal() {
         willow_gc_safepoint();
         return;
     }
-    let _serialize = match runtime().collect_lock.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            willow_gc_safepoint();
-            return;
-        }
+    let Some(_serialize) = super::cycle_wait::CollectorGuard::try_acquire() else {
+        willow_gc_safepoint();
+        return;
     };
     if foreign_root_stack_owner_active() {
         runtime()
