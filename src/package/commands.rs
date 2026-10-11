@@ -70,7 +70,8 @@ fn git_metadata<'a>(
     Ok(&sources[url.as_str()])
 }
 
-/// Dry-run is strictly read-only, including the global cache and its lock files.
+/// Dry-run creates no candidates or cache/lock files. A pending workspace
+/// journal is recovered first, just as for ordinary commands.
 /// Git previews use available cached metadata; a cold cache produces an error.
 pub fn mutate_packages(
     root: &Path,
@@ -103,6 +104,14 @@ pub fn mutate_packages_report(
     dry_run: bool,
     out: &mut impl Write,
 ) -> Result<MutationReport> {
+    let transaction = if dry_run {
+        crate::workspace_transaction::WorkspaceFileTransaction::existing(root)?
+    } else {
+        Some(crate::workspace_transaction::WorkspaceFileTransaction::open(root)?)
+    };
+    if let Some(transaction) = &transaction {
+        transaction.ensure_no_ai_edit()?;
+    }
     let (operation, mut dependency) = match &mutation {
         PackageMutation::Add { alias, .. } => ("add", alias.clone()),
         PackageMutation::Remove { alias } => ("remove", Some(alias.clone())),
@@ -366,23 +375,19 @@ pub fn mutate_packages_report(
     if dry_run {
         return Ok(report);
     }
-    ensure!(
-        std::fs::read_to_string(&manifest_path)? == before
-            && read_optional(&lock_path)? == lock_before,
-        "project changed while resolving; retry the command"
-    );
-    if before != after {
-        replace_manifest(&manifest_path, &after)?;
-    }
-    if lock_before.as_deref() != Some(&lock_after)
-        && let Err(error) = super::lock::write_command_lock(&lock_path, &lock_after)
-    {
-        if before != after {
-            replace_manifest(&manifest_path, &before)
-                .context("lock write failed and manifest rollback failed")?;
-        }
-        return Err(error);
-    }
+    use crate::workspace_transaction::FileChange;
+    transaction.unwrap().publish(vec![
+        FileChange::new(
+            "project.toml",
+            Some(before.into_bytes()),
+            Some(after.into_bytes()),
+        ),
+        FileChange::new(
+            "project.lock",
+            lock_before.map(String::into_bytes),
+            Some(lock_after.into_bytes()),
+        ),
+    ])?;
     Ok(report)
 }
 
@@ -412,36 +417,12 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
     }
 }
 
-pub(crate) fn replace_manifest(path: &Path, text: &str) -> Result<()> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let (temporary, mut file) = loop {
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temporary =
-            path.with_file_name(format!(".project.toml.{}.{n}.tmp", std::process::id()));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => break (temporary, file),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
-        }
-    };
-    let result = (|| {
-        file.set_permissions(std::fs::metadata(path)?.permissions())?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-    let _ = std::fs::remove_file(temporary);
-    result
-}
-
 /// Inspection preserves pins and does not generate/repair a project.lock.
 pub fn inspect_packages(root: &Path) -> Result<PackageGraph> {
+    let transaction = crate::workspace_transaction::WorkspaceFileTransaction::existing(root)?;
+    if let Some(transaction) = &transaction {
+        transaction.ensure_no_ai_edit()?;
+    }
     inspect_source(PathSource::open(root, false)?)
 }
 

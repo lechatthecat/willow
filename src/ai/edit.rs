@@ -11,8 +11,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs::{self, File},
     path::{Path, PathBuf},
 };
 
@@ -65,7 +64,7 @@ pub enum ChangeFormat {
 pub struct Workspace {
     root: PathBuf,
     directory: PathBuf,
-    _lock: File,
+    _transaction: crate::workspace_transaction::WorkspaceFileTransaction,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -188,25 +187,11 @@ impl Workspace {
             !fs::symlink_metadata(&directory)?.file_type().is_symlink(),
             "edit directory is a symlink"
         );
-        let lock_path = directory.join("lock");
-        if lock_path.exists() {
-            ensure!(
-                !fs::symlink_metadata(&lock_path)?.file_type().is_symlink(),
-                "edit lock is a symlink"
-            );
-        }
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)?;
-        lock.try_lock()
-            .context("workspace edit operation already running")?;
+        let transaction = crate::workspace_transaction::WorkspaceFileTransaction::try_open(&root)?;
         Ok(Self {
             root,
             directory,
-            _lock: lock,
+            _transaction: transaction,
         })
     }
     /// A bounded advisory record, never an alias used for resolution. Its source
@@ -793,51 +778,7 @@ fn candidate(plan: &Plan) -> Result<String> {
         &plan.absent,
     ))?))
 }
-// Unix supports syncing directory entries after rename/unlink. Windows cannot
-// open a directory through File::open; file contents are still synced before
-// replacement there. Process-crash recovery is supported on both platforms;
-// power-loss durability of directory entries is not promised on Windows.
-fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    File::open(path)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
-fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    durable_write_observed(path, bytes, || {})
-}
-fn durable_write_observed(path: &Path, bytes: &[u8], published: impl FnOnce()) -> Result<()> {
-    let parent = path.parent().context("missing parent")?;
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let temporary = parent.join(format!(
-        ".willow-write-{}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)?;
-    let result = (|| -> Result<()> {
-        if path.exists() {
-            file.set_permissions(fs::metadata(path)?.permissions())?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        published();
-        sync_directory(parent)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    result
-}
+use crate::workspace_transaction::{durable_write, durable_write_observed, sync_directory};
 
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct EditWork {

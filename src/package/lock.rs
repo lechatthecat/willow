@@ -54,14 +54,41 @@ pub(crate) fn read_rust_lock(root: &Path) -> Result<Option<RustLock>> {
     }
 }
 
-pub(crate) fn write_rust_lock(root: &Path, rust: Option<RustLock>) -> Result<()> {
-    let path = root.join("project.lock");
-    let mut lock: Lock = toml::from_str(&std::fs::read_to_string(&path)?)?;
-    if lock.rust != rust {
+/// Rust edits leave Willow dependencies unchanged: retain the existing Willow
+/// lock graph and attach Cargo's candidate summary without resolving it again.
+/// A missing lock requires one candidate Willow resolution before publication.
+pub(crate) fn candidate_rust_lock(
+    root: &Path,
+    project: crate::project::ProjectManifest,
+    rust: Option<RustLock>,
+    offline: bool,
+) -> Result<String> {
+    if let Some(bytes) = crate::workspace_transaction::read_optional(&root.join("project.lock"))? {
+        let text = std::str::from_utf8(&bytes)?;
+        let mut lock: Lock = toml::from_str(text)?;
+        anyhow::ensure!(lock.version == 1, "unsupported_lock_version");
+        if lock.rust == rust {
+            return Ok(text.to_owned());
+        }
         lock.rust = rust;
-        atomic_write(&path, lock.canonical_text()?.as_bytes(), || Ok(()))?;
+        return lock.canonical_text();
     }
-    Ok(())
+    let mut source = PathSource::open(root, false)?;
+    source.replace_manifest(project)?;
+    let (pins, checksums) = command_pins(root, None, false)?;
+    let graph = super::solve::resolve_prepared(
+        source,
+        pins,
+        checksums,
+        offline,
+        false,
+        Default::default(),
+        false,
+    )?;
+    super::PackageImports::new(&graph)?;
+    let mut lock = Lock::from_graph(&graph)?;
+    lock.rust = rust;
+    lock.canonical_text()
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,11 +315,15 @@ impl Lock {
 /// compiler, so lock validation does not cause a second dependency traversal.
 /// Only the selected root lock is read. A matching lock is never rewritten.
 pub fn resolve_locked_path_packages(root: &Path, locked: bool) -> Result<PackageGraph> {
+    let transaction = crate::workspace_transaction::WorkspaceFileTransaction::open(root)?;
+    transaction.ensure_no_ai_edit()?;
     resolve_source(PathSource::open(root, false)?, locked, false, true)
 }
 
 /// Resolve and cache dependencies without invoking the compiler or runtime builder.
 pub fn fetch_packages(root: &Path, locked: bool, offline: bool) -> Result<PackageGraph> {
+    let transaction = crate::workspace_transaction::WorkspaceFileTransaction::open(root)?;
+    transaction.ensure_no_ai_edit()?;
     resolve_source(PathSource::open(root, false)?, locked, offline, true)
 }
 
@@ -311,6 +342,14 @@ pub(crate) fn resolve_project_analysis(
     offline: bool,
     publish_lock: bool,
 ) -> Result<Option<PackageGraph>> {
+    let transaction = if publish_lock {
+        Some(crate::workspace_transaction::WorkspaceFileTransaction::open(root)?)
+    } else {
+        crate::workspace_transaction::WorkspaceFileTransaction::existing(root)?
+    };
+    if publish_lock && let Some(transaction) = &transaction {
+        transaction.ensure_no_ai_edit()?;
+    }
     let source = PathSource::open(root, false)?;
     let package_mode = source.manifest.willow.is_some() || !source.manifest.dependencies.is_empty();
     let graph = resolve_source(source, locked, offline, publish_lock)?;
@@ -318,6 +357,8 @@ pub(crate) fn resolve_project_analysis(
 }
 
 pub(super) fn update(root: &Path) -> Result<PackageGraph> {
+    let transaction = crate::workspace_transaction::WorkspaceFileTransaction::open(root)?;
+    transaction.ensure_no_ai_edit()?;
     let graph = super::resolve_packages(root)?;
     let path = graph.get(graph.root).unwrap().root.join("project.lock");
     atomic_write(&path, command_lock(&graph)?.as_bytes(), || Ok(()))?;
@@ -543,10 +584,6 @@ pub(super) fn command_lock(graph: &PackageGraph) -> Result<String> {
     let mut lock = Lock::from_graph(graph)?;
     lock.rust = read_rust_lock(&graph.get(graph.root).context("invalid root package")?.root)?;
     lock.canonical_text()
-}
-
-pub(super) fn write_command_lock(path: &Path, text: &str) -> Result<()> {
-    atomic_write(path, text.as_bytes(), || Ok(()))
 }
 
 #[cfg(test)]

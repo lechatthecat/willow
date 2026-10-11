@@ -7,6 +7,7 @@ pub mod ai;
 pub mod backend;
 pub mod compiler_db;
 pub mod rust_bridge;
+mod workspace_transaction;
 use compiler_db::dependencies::ModuleDependencies;
 pub(crate) mod compiler_stack;
 pub mod desugar;

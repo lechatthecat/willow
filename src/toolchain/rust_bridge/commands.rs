@@ -60,19 +60,14 @@ pub fn mutate(root: &Path, options: &BridgeOptions, mutation: Mutation) -> Resul
         !options.locked,
         "Rust dependency edits cannot use --locked or --frozen"
     );
-    let _edit_lease = if options.read_only {
-        None
+    let transaction = if options.read_only {
+        crate::workspace_transaction::WorkspaceFileTransaction::existing(root)?
     } else {
-        fs::create_dir_all(root.join(".willow/rust"))?;
-        let edit_lease = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(root.join(".willow/rust/.edit.lock"))?;
-        edit_lease.lock()?;
-        Some(edit_lease)
+        Some(crate::workspace_transaction::WorkspaceFileTransaction::open(root)?)
     };
+    if let Some(transaction) = &transaction {
+        transaction.ensure_no_ai_edit()?;
+    }
     let path = root.join("project.toml");
     let before = fs::read_to_string(&path)?;
     let mut doc: DocumentMut = before.parse()?;
@@ -261,33 +256,18 @@ pub fn mutate(root: &Path, options: &BridgeOptions, mutation: Mutation) -> Resul
             "diagnostics":[]}),
         );
     }
-    let lock_paths = [
-        root.join("project.lock"),
-        root.join(".willow/rust/Cargo.lock"),
-    ];
-    let saved = lock_paths
-        .iter()
-        .map(|p| match fs::read(p) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        })
-        .collect::<std::io::Result<Vec<_>>>()?;
-    if before != after {
-        crate::package::commands::replace_manifest(&path, &after)?;
-    }
-    if let Err(error) = build.persist_resolution(root, options) {
-        crate::package::commands::replace_manifest(&path, &before)
-            .context("manifest rollback failed")?;
-        for (path, bytes) in lock_paths.iter().zip(&saved) {
-            if let Some(bytes) = bytes {
-                crate::package::lock::atomic_write_validated(path, bytes, || Ok(()))?;
-            } else if path.exists() {
-                fs::remove_file(path)?;
-            }
-        }
-        return Err(error);
-    }
+    let (project, _) = parsed(&doc, &before)?;
+    let mut changes =
+        resolution_changes(root, &build.directory, options, &build.resolution, project)?;
+    changes.insert(
+        0,
+        crate::workspace_transaction::FileChange::new(
+            "project.toml",
+            Some(before.as_bytes().to_vec()),
+            Some(after.as_bytes().to_vec()),
+        ),
+    );
+    transaction.unwrap().publish(changes)?;
     // A candidate, deliberately not an assertion of semantic liveness: Rust
     // macros and generated code preclude proving unused declarations textually.
     let diagnostics = if operation == "remove" {

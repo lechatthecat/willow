@@ -184,7 +184,7 @@ pub struct BridgeBuild {
     // Hold until caller finishes consuming/linking the artifact. Another Willow
     // process must not replace the stable Cargo staticlib alias during linking.
     _lease: File,
-    _project_lease: Option<File>,
+    _project_lease: Option<crate::workspace_transaction::WorkspaceFileTransaction>,
     resolution: crate::package::lock::RustLock,
 }
 
@@ -210,21 +210,50 @@ fn persist_resolution(
     options: &BridgeOptions,
     resolution: &crate::package::lock::RustLock,
 ) -> Result<()> {
-    if !root.join("project.lock").exists() {
-        crate::package::fetch_packages(root, options.locked, options.offline)?;
-    }
+    let transaction = crate::workspace_transaction::WorkspaceFileTransaction::open(root)?;
+    transaction.ensure_no_ai_edit()?;
+    let project = ProjectManifest::load(&root.join("project.toml"))?;
+    anyhow::ensure!(
+        crate::package::lock::rust_input_hash(
+            &project,
+            &options.wrapper_schema,
+            &options.abi_revision
+        )? == resolution.bridge_input_hash,
+        "project changed before Rust publication; retry the command"
+    );
+    transaction.publish(resolution_changes(
+        root, directory, options, resolution, project,
+    )?)
+}
+
+fn resolution_changes(
+    root: &Path,
+    directory: &Path,
+    options: &BridgeOptions,
+    resolution: &crate::package::lock::RustLock,
+    project: ProjectManifest,
+) -> Result<Vec<crate::workspace_transaction::FileChange>> {
+    use crate::workspace_transaction::{FileChange, read_optional};
     let bytes = fs::read(directory.join("Cargo.lock"))?;
-    let persisted = root.join(".willow/rust/Cargo.lock");
-    if fs::read(&persisted).ok().as_deref() != Some(bytes.as_slice()) {
-        crate::package::lock::atomic_write_validated(&persisted, &bytes, || {
-            let _: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
-            Ok(())
-        })?;
-    }
-    // An empty generated bridge still has a Cargo.lock, but Willow's locked
-    // project validation requires no Rust summary when no Rust dependencies remain.
+    let _: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)?;
+    anyhow::ensure!(
+        hash(&bytes) == resolution.cargo_lock_hash,
+        "Cargo candidate lock changed"
+    );
     let summary = (!resolution.dependencies.is_empty()).then(|| resolution.clone());
-    crate::package::lock::write_rust_lock(root, summary)
+    let lock = crate::package::lock::candidate_rust_lock(root, project, summary, options.offline)?;
+    Ok(vec![
+        FileChange::new(
+            "project.lock",
+            read_optional(&root.join("project.lock"))?,
+            Some(lock.into_bytes()),
+        ),
+        FileChange::new(
+            ".willow/rust/Cargo.lock",
+            read_optional(&root.join(".willow/rust/Cargo.lock"))?,
+            Some(bytes),
+        ),
+    ])
 }
 
 /// R1 toolchain API. `check` selects Cargo check instead of staticlib production.
@@ -299,6 +328,14 @@ fn prepare_bridge(
         bail!("rust_bridge_abi_mismatch: incompatible adapter revision");
     }
     let root = canonicalize(root)?;
+    let project_lease = if options.read_only {
+        crate::workspace_transaction::WorkspaceFileTransaction::existing(&root)?
+    } else {
+        Some(crate::workspace_transaction::WorkspaceFileTransaction::open(&root)?)
+    };
+    if let Some(lease) = &project_lease {
+        lease.ensure_no_ai_edit()?;
+    }
     let bridge = project
         .rust
         .as_ref()
@@ -335,21 +372,11 @@ fn prepare_bridge(
         .open(directory.join(".willow.lock"))?;
     lease.lock().context("cannot lock Rust bridge cache")?;
     let rust_directory = root.join(".willow/rust");
-    let project_lease = if options.read_only {
-        None
-    } else {
+    if !options.read_only {
         fs::create_dir_all(&rust_directory)?;
-        let lease = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(rust_directory.join(".lock"))?;
-        lease
-            .lock()
-            .context("cannot lock project Rust resolution")?;
-        Some(lease)
-    };
+        crate::workspace_transaction::sync_directory(&root.join(".willow"))?;
+        crate::workspace_transaction::sync_directory(&root)?;
+    }
     fs::create_dir_all(directory.join("src"))?;
     let manifest = generated_manifest(project, &root)?;
     let manifest_path = directory.join("Cargo.toml");

@@ -65,6 +65,11 @@ pub struct ProjectSection {
 
 impl ProjectManifest {
     pub fn load(manifest_path: &Path) -> Result<Self> {
+        let root = manifest_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let _transaction = crate::workspace_transaction::WorkspaceFileTransaction::existing(root)?;
         let text = std::fs::read_to_string(manifest_path).map_err(|e| {
             ManifestError::Invalid(format!("cannot read {}: {e}", manifest_path.display()))
         })?;
@@ -73,7 +78,7 @@ impl ProjectManifest {
         manifest.validate()?;
         // Bridge existence is the only rule that needs the project root.
         if let Some(rust) = &manifest.rust {
-            rust.resolve_bridge(manifest_path.parent().unwrap_or(Path::new(".")))?;
+            rust.resolve_bridge(root)?;
         }
         Ok(manifest)
     }
