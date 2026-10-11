@@ -72,14 +72,11 @@ pub struct ResolutionContext {
     /// used to reject local declarations that collide with an import. The span
     /// is the item-import's location, or `None` for module access names.
     imported_names: HashMap<String, Option<Span>>,
-    /// Access spelling each registered module answers to here, keyed by the
-    /// module's canonical path. A module's own item import names its dependency
-    /// canonically (`import base::Parcel;`), but the dependency's types are
-    /// registered under whatever spelling THIS checker reached it by, so
-    /// exporting a signature that mentions `Parcel` needs the translation
-    /// (willow-sxcp). Modules register in dependency order, so the entry is
-    /// always present by the time an importer is registered.
+    /// Canonical declaration routes retained for direct registration APIs.
+    /// Driver registrations additionally borrow package-aware per-unit paths.
     module_access_names: HashMap<String, String>,
+    /// Shared source-import routes built once with the dependency index.
+    registration_import_paths: std::rc::Rc<HashMap<String, String>>,
     /// Dependency metadata needed by imported signatures, without a source
     /// import in this unit. Lookups on inferred types still use the metadata;
     /// explicitly written type names must pass `check_source_type_name` first.
@@ -296,6 +293,7 @@ impl TypeChecker {
                 .sync_stack_preemption,
             imported_names: HashMap::new(),
             module_access_names: HashMap::new(),
+            registration_import_paths: std::rc::Rc::new(HashMap::new()),
             signature_only_modules: HashSet::new(),
             imported_collection_types: HashSet::new(),
             imported_collection_aliases: HashMap::new(),

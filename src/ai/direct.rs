@@ -296,6 +296,12 @@ impl DirectSession {
                 name: name.to_owned(),
             }],
         };
+        // Keep the selected declaration's pre-edit canonical identity in both
+        // results, matching refs. Display conversion must not alter the raw
+        // source location used by local rename hints below.
+        let mut displayed = resolved.clone();
+        self.display_locations(&mut displayed, false)?;
+        let selected = displayed["symbol"].take();
         if dry_run {
             let mut preview = edit::preview_analyzed(&self.session.snapshot, request)?;
             let summary = rename_summary(&preview);
@@ -303,6 +309,7 @@ impl DirectSession {
                 .as_object_mut()
                 .context("rename preview is not an object")?
                 .extend(summary);
+            preview["selected"] = selected;
             return Ok(preview);
         }
         let local_hint = matches!(
@@ -336,7 +343,7 @@ impl DirectSession {
         let mut emitter = crate::diagnostics::HumanEmitter;
         workspace.validate(transaction, &mut emitter)?;
         workspace.apply_with_rollback(transaction, &mut emitter)?;
-        let mut result = json!({"status":"ok","old":selector,"new":name,"validation":"passed","transaction":transaction});
+        let mut result = json!({"status":"ok","old":selector,"new":name,"validation":"passed","transaction":transaction,"selected":selected});
         result
             .as_object_mut()
             .unwrap()

@@ -1158,8 +1158,9 @@ fn typecheck_phase_with_generics(
         }
     };
     let bindings = ModuleImportBindings::new(program, dependencies);
+    let mut aliases = Vec::new();
     for (index, m) in modules.iter().enumerate() {
-        prepare_module_registration(&mut checker, m, modules, dependencies);
+        prepare_module_registration(&mut checker, m, dependencies);
         checker.register_module_with_id(
             m.id,
             m.registration_name(),
@@ -1171,10 +1172,11 @@ fn typecheck_phase_with_generics(
         // Resolve against package/module identity, never the graph's first alias.
         if let Some(spellings) = bindings.imported.get(&index) {
             for spelling in spellings {
-                checker.alias_module_spelling(m.id, spelling, m.registration_name(), &m.program);
+                aliases.push((m.id, *spelling, m.registration_name(), &m.program));
             }
         }
     }
+    checker.alias_module_spellings(&aliases);
     for &(local, module, item, span) in &bindings.items {
         checker.register_item_import(local, module, item, span);
     }
@@ -1334,28 +1336,13 @@ fn register_module_imports(
 fn prepare_module_registration(
     checker: &mut semantic::TypeChecker,
     module: &module::ResolvedModule,
-    modules: &[module::ResolvedModule],
     dependencies: &ModuleDependencies,
 ) {
-    if module.symbol_module.is_none() {
+    // Translate source paths into the unspellable canonical namespace.
+    if module.symbol_namespace.is_none() {
         return;
     }
-    let paths = dependencies.paths_for(&module.program);
-    let mut names = std::collections::HashMap::new();
-    for import in &module.program.imports {
-        let path = import.path.as_str();
-        let target = paths.get(path).map(|&id| (path, id)).or_else(|| {
-            let (parent, _) = path.rsplit_once("::")?;
-            paths.get(parent).map(|&id| (parent, id))
-        });
-        if let Some((path, id)) = target {
-            names.insert(
-                path.to_string(),
-                modules[id].registration_name().to_string(),
-            );
-        }
-    }
-    checker.set_registration_import_paths(names);
+    checker.set_registration_import_paths(dependencies.registration_paths(module.id));
 }
 
 fn register_module_imports_with_closure(
@@ -1377,23 +1364,20 @@ fn register_module_imports_with_closure(
             &computed
         }
     };
+    let mut aliases = Vec::new();
     for &id in needed {
         let dep = &modules[id];
-        prepare_module_registration(checker, dep, modules, dependencies);
+        prepare_module_registration(checker, dep, dependencies);
         let canonical = dep.identity_path();
         let dep_path = dep.path.to_string_lossy();
         let Some(spellings) = imported.get(&id) else {
             checker.register_module_type_signatures(canonical, &dep_path, &dep.program);
             continue;
         };
-        // Keep source spelling order and bind aliases to the first registration.
+        // Keep source spelling order, but register declarations canonically.
         let mut spellings = spellings.iter().copied();
         let first = spellings.next().expect("import has a spelling");
-        let registered = if dep.symbol_module.is_some() {
-            dep.registration_name()
-        } else {
-            first
-        };
+        let registered = dep.registration_name();
         checker.register_module_with_id(
             dep.id,
             registered,
@@ -1402,10 +1386,11 @@ fn register_module_imports_with_closure(
             &dep.program,
         );
         for access in std::iter::once(first).chain(spellings) {
-            checker.alias_module_spelling(dep.id, access, registered, &dep.program);
+            aliases.push((dep.id, access, registered, &dep.program));
         }
     }
 
+    checker.alias_module_spellings(&aliases);
     for (local, module_path, item, span) in items {
         checker.register_item_import(local, module_path, item, span);
     }
@@ -1833,11 +1818,8 @@ fn backend_unit_imports(
     let mut visible_modules = std::collections::HashSet::new();
     let mut module_spellings = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    // Visibility alone was not enough: the tables are keyed by ONE of the two
-    // spellings, so the other has to be bound to it for this unit's phase
-    // (willow-kd1v). The types worth binding are the ones the module itself
-    // declares, which is why this is built here rather than in the back end —
-    // only the driver holds the imported module's program.
+    // Bind source spellings to canonical declaration identities for this unit.
+    // Only the driver holds the imported program and can enumerate its types.
     let mut bind_spelling = |access: &str, dependency: &module::ResolvedModule| {
         let graph_name = dependency.registration_name();
         if access == graph_name {
@@ -1867,9 +1849,7 @@ fn backend_unit_imports(
         let dependency = &modules[dependencies
             .index_for_unit(binding.unit)
             .expect("resolved module")];
-        // Both spellings: this file writes `access`, while the back end's
-        // module tables are keyed by the name the graph registered, which is
-        // the first importer's alias when that was another file.
+        // Source visibility is separate from the canonical registration name.
         visible_modules.insert(binding.access.clone());
         visible_modules.insert(dependency.registration_name().to_string());
         bind_spelling(&binding.access, dependency);
@@ -3032,6 +3012,50 @@ mod frontend_phase_tests {
     }
 
     #[test]
+    fn module_registration_ids_ignore_first_consumer_spelling() {
+        use semantic::ids::{FunctionId, TypeId};
+        for first_access in ["proto", "base", "again"] {
+            let modules = vec![module::ResolvedModule {
+                id: module::ModuleId(1),
+                package: package::PackageId(0),
+                symbol_module: None,
+                symbol_namespace: Some(std::sync::Arc::from("$local::base")),
+                name: first_access.into(),
+                canonical_path: "base".into(),
+                path: "base.wi".into(),
+                source: String::new(),
+                program: parse_source(
+                    "pub class Parcel { pub fn read(self) -> i64 { return 42; } } pub fn id<T>(x: T) -> T { return x; } pub class Cell<T> { pub value: T; }",
+                ),
+            }];
+            let entry = parse_source(
+                "import base as proto; import base as again; import base::Parcel; import base::id as item; import base::Cell as Imported;",
+            );
+            let dependencies = ModuleDependencies::with_packages(&modules, None);
+            let mut checker = semantic::TypeChecker::new();
+            register_module_imports(&mut checker, &entry, &modules, &dependencies);
+            for spelling in ["proto::Parcel", "again::Parcel", "Parcel"] {
+                let info = checker.symbols.lookup_class(spelling).unwrap();
+                assert_eq!(info.name, "$local::base::Parcel");
+                assert_eq!(
+                    FunctionId::method(TypeId::from_source_name(&info.name), "read"),
+                    FunctionId::method(TypeId::from_source_name("$local::base::Parcel"), "read")
+                );
+            }
+            assert!(std::ptr::eq(
+                checker.symbols.lookup_module("proto").unwrap(),
+                checker.symbols.lookup_module("again").unwrap()
+            ));
+            assert_eq!(checker.generics.function_paths["proto::id"], "$local::base");
+            assert_eq!(checker.generics.function_paths["again::id"], "$local::base");
+            assert_eq!(checker.generics.function_paths["item"], "$local::base");
+            assert_eq!(checker.generics.class_paths["proto::Cell"], "$local::base");
+            assert_eq!(checker.generics.class_paths["again::Cell"], "$local::base");
+            assert_eq!(checker.generics.class_paths["Imported"], "$local::base");
+        }
+    }
+
+    #[test]
     fn module_dependency_index_work_is_numeric_and_output_sensitive() {
         for size in [8usize, 16, 32, 64] {
             for shape in ["chain", "fanout", "diamond"] {
@@ -3077,6 +3101,18 @@ mod frontend_phase_tests {
                     n - 1
                 };
                 assert_eq!(DEPENDENCY_WORK.with(|work| work.get()), (expected_edges, 0));
+                for module in &modules {
+                    let routes = index.registration_paths(module.id);
+                    for _ in 0..16 {
+                        assert!(std::rc::Rc::ptr_eq(
+                            &routes,
+                            &index.registration_paths(module.id)
+                        ));
+                    }
+                }
+                // Shared route reads do not repeat import-path resolution.
+                assert_eq!(DEPENDENCY_WORK.with(|work| work.get()), (expected_edges, 0));
+
                 for _ in 0..3 {
                     for root in 0..n {
                         let closure = index.closure(std::iter::once(root));
@@ -3098,8 +3134,10 @@ mod frontend_phase_tests {
                 let work = DEPENDENCY_WORK.with(|work| work.get());
                 assert_eq!(work, (expected_edges, 3 * expected_visits));
                 println!(
-                    "shape={shape} modules={n} passes=3 build_path_lookups={} closure_path_lookups=0 edge_visits={}",
-                    work.0, work.1
+                    "shape={shape} modules={n} passes=3 build_path_lookups={} shared_route_reads={} route_path_lookups=0 closure_path_lookups=0 edge_visits={}",
+                    work.0,
+                    16 * n,
+                    work.1
                 );
             }
         }

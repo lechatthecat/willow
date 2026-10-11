@@ -397,8 +397,17 @@ impl TypeChecker {
         self.register_interface(decl, None);
     }
 
-    pub(crate) fn set_registration_import_paths(&mut self, paths: HashMap<String, String>) {
-        self.module_access_names = paths;
+    pub(crate) fn set_registration_import_paths(
+        &mut self,
+        paths: std::rc::Rc<HashMap<String, String>>,
+    ) {
+        self.registration_import_paths = paths;
+    }
+
+    fn registration_module_path(&self, path: &str) -> Option<&String> {
+        self.registration_import_paths
+            .get(path)
+            .or_else(|| self.module_access_names.get(path))
     }
 
     pub fn register_module(&mut self, name: &str, canonical: &str, path: &str, program: &Program) {
@@ -451,16 +460,9 @@ impl TypeChecker {
 
     /// Let `spelling` name a module already registered as `registered`.
     ///
-    /// A module is registered ONCE, under the spelling of whichever unit
-    /// reached it first, and every other unit is free to write its own: the
-    /// entry file may say `import sales;` for a module a dependency already
-    /// brought in as `biz`. Registering it a second time under the other
-    /// spelling would make two of everything it declares -- two classes, two
-    /// interfaces, two types that never match (willow-uvlp) -- so the second
-    /// spelling is bound to the FIRST one's registrations instead: the same
-    /// `ClassInfo`, whose `name` stays the registered identity, answers under
-    /// both keys, which is how a directly-imported type already works
-    /// (willow-64gs).
+    /// Declarations are registered once under their canonical namespace.
+    /// Consumer spellings bind to that registration, retaining the same IDs and
+    /// metadata rather than declaring a second set of classes/interfaces.
     pub fn alias_module_spelling(
         &mut self,
         id: crate::module::ModuleId,
@@ -468,62 +470,107 @@ impl TypeChecker {
         registered: &str,
         program: &Program,
     ) {
-        if spelling == registered {
-            return;
+        self.alias_module_spellings(&[(id, spelling, registered, program)]);
+    }
+
+    /// Freeze every target before any source spelling shadows a declaration.
+    pub(crate) fn alias_module_spellings(
+        &mut self,
+        bindings: &[(crate::module::ModuleId, &str, &str, &Program)],
+    ) {
+        enum TypeTarget {
+            Class(ClassInfo),
+            Enum(EnumInfo),
+            Interface(InterfaceInfo),
         }
-        for item in &program.items {
-            let declared = match item {
-                Item::Class(c) => &c.name,
-                Item::Interface(i) => &i.name,
-                Item::Enum(e) => &e.name,
-                Item::Function(_) => continue,
-            };
-            let from = format!("{registered}::{declared}");
-            let to = format!("{spelling}::{declared}");
-            if let Some(info) = self.symbols.lookup_class(&from).cloned() {
-                self.symbols.define_class(to, info);
-            } else if let Some(info) = self.symbols.lookup_interface(&from).cloned() {
-                self.symbols.define_interface(to, info);
-            } else if let Some(info) = self.symbols.lookup_enum(&from).cloned() {
-                self.symbols.define_enum(to, info);
-            }
+        struct Targets<'a> {
+            id: crate::module::ModuleId,
+            spelling: &'a str,
+            registered: &'a str,
+            types: Vec<(String, TypeTarget)>,
+            functions: Vec<(String, std::rc::Rc<FunctionDecl>)>,
+            classes: Vec<(String, std::rc::Rc<ClassDecl>)>,
+            module: Option<ModuleInfo>,
         }
-        for item in &program.items {
-            match item {
-                Item::Function(f) if !f.type_params.is_empty() => {
-                    if let Some(t) = self
-                        .generics
-                        .functions
-                        .get(&format!("{registered}::{}", f.name))
-                        .cloned()
-                    {
-                        let key = format!("{spelling}::{}", f.name);
-                        self.generics.functions.insert(key.clone(), t);
-                        self.generics
-                            .function_paths
-                            .insert(key, spelling.to_string());
+        let targets: Vec<_> = bindings
+            .iter()
+            .filter(|(_, spelling, registered, _)| spelling != registered)
+            .map(|&(id, spelling, registered, program)| {
+                let mut types = Vec::new();
+                let mut functions = Vec::new();
+                let mut classes = Vec::new();
+                for item in &program.items {
+                    let declared = match item {
+                        Item::Class(c) => &c.name,
+                        Item::Interface(i) => &i.name,
+                        Item::Enum(e) => &e.name,
+                        Item::Function(f) if !f.type_params.is_empty() => &f.name,
+                        Item::Function(_) => continue,
+                    };
+                    let from = format!("{registered}::{declared}");
+                    let to = format!("{spelling}::{declared}");
+                    match item {
+                        Item::Function(f) if !f.type_params.is_empty() => {
+                            if let Some(template) = self.generics.functions.get(&from) {
+                                functions.push((to, std::rc::Rc::clone(template)));
+                            }
+                        }
+                        Item::Function(_) => {}
+                        _ => {
+                            if let Some(info) = self.symbols.lookup_class(&from) {
+                                types.push((to.clone(), TypeTarget::Class(info.clone())));
+                            } else if let Some(info) = self.symbols.lookup_interface(&from) {
+                                types.push((to.clone(), TypeTarget::Interface(info.clone())));
+                            } else if let Some(info) = self.symbols.lookup_enum(&from) {
+                                types.push((to.clone(), TypeTarget::Enum(info.clone())));
+                            }
+                            if let Item::Class(c) = item
+                                && !c.type_params.is_empty()
+                                && let Some(template) = self.generics.classes.get(&from)
+                            {
+                                classes.push((to, std::rc::Rc::clone(template)));
+                            }
+                        }
                     }
                 }
-                Item::Class(c) if !c.type_params.is_empty() => {
-                    if let Some(t) = self
-                        .generics
-                        .classes
-                        .get(&format!("{registered}::{}", c.name))
-                        .cloned()
-                    {
-                        let key = format!("{spelling}::{}", c.name);
-                        self.generics.classes.insert(key.clone(), t);
-                        self.generics.class_paths.insert(key, spelling.to_string());
-                    }
+                Targets {
+                    id,
+                    spelling,
+                    registered,
+                    types,
+                    functions,
+                    classes,
+                    module: self.symbols.lookup_module(registered).cloned(),
                 }
-                _ => {}
+            })
+            .collect();
+        for target in targets {
+            for (name, info) in target.types {
+                match info {
+                    TypeTarget::Class(info) => self.symbols.define_class(name, info),
+                    TypeTarget::Enum(info) => self.symbols.define_enum(name, info),
+                    TypeTarget::Interface(info) => self.symbols.define_interface(name, info),
+                }
             }
+            for (name, template) in target.functions {
+                self.generics.functions.insert(name.clone(), template);
+                self.generics
+                    .function_paths
+                    .insert(name, target.registered.to_string());
+            }
+            for (name, template) in target.classes {
+                self.generics.classes.insert(name.clone(), template);
+                self.generics
+                    .class_paths
+                    .insert(name, target.registered.to_string());
+            }
+            if let Some(module) = target.module {
+                self.symbols
+                    .define_module_with_id(target.spelling.to_string(), target.id, module);
+            }
+            self.imported_names
+                .insert(target.spelling.to_string(), None);
         }
-        if let Some(info) = self.symbols.lookup_module(registered).cloned() {
-            self.symbols
-                .define_module_with_id(spelling.to_string(), id, info);
-        }
-        self.imported_names.insert(spelling.to_string(), None);
     }
 
     /// Hide another unit's access name without rebuilding its type identities.
@@ -624,7 +671,10 @@ impl TypeChecker {
         let imported_types: HashMap<String, String> = program
             .imports
             .iter()
-            .filter(|import| !self.module_access_names.contains_key(import.path.as_str()))
+            .filter(|import| {
+                self.registration_module_path(import.path.as_str())
+                    .is_none()
+            })
             .filter_map(|import| {
                 let (module_path, item) = import.path.rsplit_once("::")?;
                 let local = import.alias.clone().unwrap_or_else(|| item.to_string());
@@ -632,8 +682,7 @@ impl TypeChecker {
                     return Some((local, info.name.clone()));
                 }
                 let access = self
-                    .module_access_names
-                    .get(module_path)
+                    .registration_module_path(module_path)
                     .map(String::as_str)
                     .unwrap_or(module_path);
                 let registered = format!("{access}::{item}");
@@ -647,8 +696,7 @@ impl TypeChecker {
             .collect();
         // A path this module writes for a module IT imports -- `biz::Amount`
         // under `import sales as biz;` -- is spelled for this module alone. The
-        // checker keys that module's types by the spelling that reached it
-        // first, which is the one name every unit here can share, so the
+        // checker keys that module's types by its canonical namespace, so the
         // exported signature is translated into it; otherwise one class under
         // two spellings is two types and nothing an importer passes ever
         // matches (willow-uvlp). Dependency order guarantees the map is
@@ -657,7 +705,7 @@ impl TypeChecker {
             .imports
             .iter()
             .filter_map(|import| {
-                let registered = self.module_access_names.get(import.path.as_str())?;
+                let registered = self.registration_module_path(import.path.as_str())?;
                 let access = import.alias.clone().unwrap_or_else(|| {
                     import
                         .path
@@ -795,16 +843,26 @@ impl TypeChecker {
         self.imported_names.insert(local.to_string(), Some(span));
         let key = format!("{module}::{item}");
         if let Some(template) = self.generics.functions.get(&key).cloned() {
+            let origin = self
+                .generics
+                .function_paths
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| module.to_string());
             self.generics.functions.insert(local.to_string(), template);
             self.generics
                 .function_paths
-                .insert(local.to_string(), module.to_string());
+                .insert(local.to_string(), origin);
         }
         if let Some(template) = self.generics.classes.get(&key).cloned() {
-            self.generics.classes.insert(local.to_string(), template);
-            self.generics
+            let origin = self
+                .generics
                 .class_paths
-                .insert(local.to_string(), module.to_string());
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| module.to_string());
+            self.generics.classes.insert(local.to_string(), template);
+            self.generics.class_paths.insert(local.to_string(), origin);
         }
 
         // Functions are registered per-module in the ModuleInfo table.

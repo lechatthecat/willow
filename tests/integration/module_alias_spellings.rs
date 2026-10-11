@@ -953,3 +953,132 @@ fn mas_24_the_example_runs() {
         );
     }
 }
+
+/// Canonical declarations, including class methods and generic specializations,
+/// have the same object symbols for every consumer spelling/import order.
+#[test]
+fn canonical_symbols_ignore_first_import_alias_and_order() {
+    use super::support::TestProject;
+    let project = TestProject::new(
+        "canonical_symbols",
+        &[
+            (
+                "base.wi",
+                "pub interface Read { fn read(self) -> i64; } pub class Parcel implements Read { pub fn read(self) -> i64 { return 42; } } pub fn id<T>(x: T) -> T { return x; }",
+            ),
+            ("main.wi", ""),
+        ],
+    );
+    let mut previous = None;
+    for imports in [
+        "import base as proto; import base::Parcel; import base::Read;",
+        "import base::Read; import base::Parcel; import base as proto;",
+        "import base as again; import base::Parcel; import base as proto; import base::Read;",
+    ] {
+        project.write_file("main.wi", &format!("{imports} fn main() {{ let p: Read = new Parcel(); println(proto::id<i64>(p.read())); }}"));
+        let build = project.compile_with_env("main.wi", &[("WILLOW_KEEP_OBJECT", "1")]);
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&build.stderr).contains("unused import `proto`"),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let run = project.run();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n");
+        let symbols = project.defined_object_symbols();
+        assert!(
+            symbols.iter().any(|name| name == "base.Parcel.read"),
+            "{symbols:?}"
+        );
+        assert!(
+            symbols
+                .iter()
+                .all(|name| !name.contains("proto") && !name.contains("again")),
+            "{symbols:?}"
+        );
+        if let Some(previous) = &previous {
+            assert_eq!(&symbols, previous);
+        }
+        previous = Some(symbols);
+    }
+}
+
+#[test]
+fn overlapping_module_aliases_freeze_targets_in_both_import_orders() {
+    use super::support::TestProject;
+    for imports in [
+        "import a as b; import b as c;",
+        "import b as c; import a as b;",
+    ] {
+        for in_module in [false, true] {
+            let body = "let left = new b::Cell(); let right = new c::Cell(); println(left.left_only()); println(right.right_only()); let l: b::Read = left; let r: c::Read = right; println(l.read()); println(r.read()); println(b::wrap<i64>(1)); println(c::wrap<i64>(2)); let lb = new b::Box<i64>(3); let rb = new c::Box<i64>(4); println(lb.left_only()); println(rb.right_only()); println(lb.value); println(rb.value);";
+            let entry = if in_module {
+                "import caller; fn main() { caller::run(); }".to_string()
+            } else {
+                format!("{imports} fn main() {{ {body} }}")
+            };
+            let caller = format!("{imports} pub fn run() {{ {body} }}");
+            let project = TestProject::new(
+                "overlapping_aliases",
+                &[
+                    (
+                        "a.wi",
+                        "pub interface Read { fn read(self) -> i64; } pub class Cell implements Read { pub fn left_only(self) -> i64 { return 11; } pub fn read(self) -> i64 { return 11; } } pub fn wrap<T>(x: T) -> T { println(11); return x; } pub class Box<T> { pub value: T; pub fn left_only(self) -> i64 { return 11; } }",
+                    ),
+                    (
+                        "b.wi",
+                        "pub interface Read { fn read(self) -> i64; } pub class Cell implements Read { pub fn right_only(self) -> i64 { return 22; } pub fn read(self) -> i64 { return 22; } } pub fn wrap<T>(x: T) -> T { println(22); return x; } pub class Box<T> { pub value: T; pub fn right_only(self) -> i64 { return 22; } }",
+                    ),
+                    ("caller.wi", &caller),
+                    ("main.wi", &entry),
+                ],
+            );
+            let build = project.compile("main.wi");
+            assert!(
+                build.status.success(),
+                "imports={imports} in_module={in_module}: {}",
+                String::from_utf8_lossy(&build.stderr)
+            );
+            let run = project.run();
+            assert!(
+                run.status.success(),
+                "{}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&run.stdout),
+                "11\n22\n11\n22\n11\n1\n22\n2\n11\n22\n3\n4\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn overlapping_module_aliases_reject_cross_module_interface_confusion() {
+    use super::support::TestProject;
+    for imports in [
+        "import a as b; import b as c;",
+        "import b as c; import a as b;",
+    ] {
+        let main = format!("{imports} fn main() {{ let wrong: c::Read = new b::Cell(); }}");
+        let source = "pub interface Read { fn read(self) -> i64; } pub class Cell implements Read { pub fn read(self) -> i64 { return 1; } }";
+        let project = TestProject::new(
+            "overlapping_interface_rejection",
+            &[("a.wi", source), ("b.wi", source), ("main.wi", &main)],
+        );
+        let build = project.compile("main.wi");
+        let errors = String::from_utf8_lossy(&build.stderr);
+        assert!(!build.status.success(), "{imports}");
+        assert!(errors.contains("E0201"), "{errors}");
+        assert!(!errors.contains("$local"), "{errors}");
+    }
+}

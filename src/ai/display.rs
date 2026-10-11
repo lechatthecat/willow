@@ -77,6 +77,9 @@ impl TypeNames {
     }
 
     pub(super) fn name(&self, name: &str, module: Option<&str>) -> String {
+        if let Some(path) = name.strip_prefix("$local::") {
+            return path.to_owned();
+        }
         if let Some(rest) = name.strip_prefix("$pkg")
             && let Some((hash, path)) = rest.split_once("::")
         {
@@ -182,6 +185,20 @@ mod tests {
             packages: HashMap::new(),
             local: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn standalone_display_projects_canonical_namespace_without_changing_type() {
+        let ty = Type::Generic(
+            "$local::b::Box".into(),
+            vec![Type::Named("$local::a::Cell".into())],
+        );
+        assert_eq!(names().render(&ty, None), "b::Box<a::Cell>");
+        let Type::Generic(name, _) = &ty else {
+            unreachable!()
+        };
+        assert_eq!(name, "$local::b::Box");
+        assert_eq!(names().name("$localish::Keep", None), "$localish::Keep");
     }
 
     #[test]

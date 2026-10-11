@@ -100,18 +100,32 @@ impl Diagnostic {
     }
 }
 
-/// Remove only canonical package namespaces from prose, never from identities
+/// Remove only canonical declaration namespaces from prose, never from identities
 /// or fix replacement text. Scan once so messages with many types stay linear.
 pub(crate) fn source_names(
     text: String,
     packages: &std::collections::HashMap<String, String>,
 ) -> String {
-    if !text.contains("$pkg") {
+    if !text.contains("$pkg") && !text.contains("$local") {
         return text;
     }
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
-    for (start, _) in text.match_indices("$pkg") {
+    for (start, _) in text.match_indices('$') {
+        if text[start..].starts_with("$local::") || text[start..].starts_with("$local.") {
+            let end = start
+                + if text[start..].starts_with("$local::") {
+                    8
+                } else {
+                    7
+                };
+            out.push_str(&text[copied..start]);
+            copied = end;
+            continue;
+        }
+        if !text[start..].starts_with("$pkg") {
+            continue;
+        }
         let separator = if text.as_bytes().get(start + 36) == Some(&b'.') {
             "."
         } else {
@@ -138,6 +152,18 @@ pub(crate) fn source_names(
 #[cfg(test)]
 mod source_name_tests {
     use super::*;
+
+    #[test]
+    fn standalone_namespace_is_display_only_and_scans_mixed_names() {
+        let text = "expected $local::a::Cell, got $local.b.Cell; $localish::Keep; $other";
+        assert_eq!(
+            source_names(text.into(), &Default::default()),
+            "expected a::Cell, got b.Cell; $localish::Keep; $other"
+        );
+        let d = Diagnostic::error("$local::a::Cell", Span::dummy());
+        assert_eq!(d.with_source_names(&Default::default()).message, "a::Cell");
+        assert_eq!(d.message, "$local::a::Cell");
+    }
 
     #[test]
     fn backend_names_hide_package_hashes() {

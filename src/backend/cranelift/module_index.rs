@@ -9,7 +9,6 @@ use crate::module::ModuleId;
 #[derive(Clone, Debug)]
 struct ModuleDefinition {
     canonical_path: String,
-    table_name: String,
     linker_prefix: String,
 }
 
@@ -67,7 +66,6 @@ impl ModuleSymbols<'_> {
             .entry(id)
             .or_insert_with(|| ModuleDefinition {
                 canonical_path: canonical_path.to_string(),
-                table_name: access.to_string(),
                 linker_prefix: super::symbols::module_symbol_prefix(canonical_path),
             });
         assert_eq!(
@@ -86,6 +84,11 @@ impl ModuleSymbols<'_> {
             .get(access)
             .or_else(|| self.bindings.get(access))
             .copied()
+    }
+
+    /// Declaration lookup ignores every consumer-local binding.
+    pub(super) fn canonical_id(&self, path: &str) -> Option<ModuleId> {
+        self.canonical.get(path).copied()
     }
 
     pub(super) fn bind(&mut self, access: String, id: ModuleId) -> Option<ModuleId> {
@@ -129,13 +132,6 @@ impl ModuleSymbols<'_> {
         self.resolve(access).is_some()
     }
 
-    pub(super) fn table_name(&self, canonical_path: &str) -> Option<&str> {
-        let id = self.canonical.get(canonical_path)?;
-        self.definitions
-            .get(id)
-            .map(|definition| definition.table_name.as_str())
-    }
-
     #[cfg(test)]
     pub(super) fn insert(&mut self, access: String, prefix: String) -> Option<String> {
         let previous = self.linker_prefix(&access).cloned();
@@ -159,7 +155,6 @@ impl ModuleSymbols<'_> {
                 id,
                 ModuleDefinition {
                     canonical_path: access.clone(),
-                    table_name: access.clone(),
                     linker_prefix: prefix,
                 },
             );
@@ -193,6 +188,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repeated_aliases_store_one_definition() {
+        for count in [16, 64, 256] {
+            let mut symbols = ModuleSymbols::default();
+            for index in 0..count {
+                symbols.register(ModuleId(7), "base::nested", &format!("alias_{index}"));
+            }
+            assert_eq!(symbols.definitions.len(), 1);
+            assert_eq!(symbols.canonical.len(), 1);
+            assert_eq!(symbols.bindings.len(), count);
+            for index in 0..count {
+                assert_eq!(
+                    symbols.resolve(&format!("alias_{index}")),
+                    Some(ModuleId(7))
+                );
+            }
+            println!(
+                "canonical module aliases={count} definitions=1 canonical_paths=1 bindings={count}"
+            );
+        }
+    }
+
+    #[test]
     fn restoring_unit_context_preserves_new_global_registrations() {
         let mut symbols = ModuleSymbols::default();
         symbols.register(ModuleId(0), "pkg::base", "base");
@@ -202,7 +219,7 @@ mod tests {
         symbols.set_resolution_context(outer);
         assert_eq!(symbols.resolve("local"), None);
         assert_eq!(symbols.resolve("new"), Some(ModuleId(1)));
-        assert_eq!(symbols.table_name("pkg::new"), Some("new"));
+        assert_eq!(symbols.canonical_id("pkg::new"), Some(ModuleId(1)));
     }
 
     #[test]
@@ -239,10 +256,10 @@ mod tests {
     }
 
     #[test]
-    fn module_aliases_preserve_identity_and_original_table_names() {
+    fn module_aliases_preserve_canonical_identity() {
         // Twenty perspectives: ten module counts, fresh or shadowed alias.
         // Similar canonical paths exercise prefixes without using linker strings
-        // as identity. Re-registration must retain the first table spelling.
+        // as identity. Re-registration must preserve canonical identity.
         for count in 1..=10 {
             for shadowed in [false, true] {
                 let mut symbols = ModuleSymbols::default();
@@ -266,14 +283,17 @@ mod tests {
                     );
                     symbols.register(ModuleId(index), &path, &format!("second_{index}"));
                     assert_eq!(
-                        symbols.table_name(&path),
-                        Some(format!("original_{index}").as_str())
+                        symbols.resolve(&format!("original_{index}")),
+                        Some(ModuleId(index))
+                    );
+                    assert_eq!(
+                        symbols.resolve(&format!("second_{index}")),
+                        Some(ModuleId(index))
                     );
                     symbols.restore(alias.clone(), previous);
                     assert_eq!(symbols.resolve(&alias), original);
                     assert_eq!(symbols.contains_key(&alias), shadowed);
                 }
-                assert_eq!(symbols.table_name("missing"), None);
                 assert_eq!(symbols.linker_prefix("missing"), None);
             }
         }

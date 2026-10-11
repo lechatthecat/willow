@@ -28,8 +28,11 @@ impl SourceFile {
             .unwrap_or(&self.canonical_path)
     }
 
+    /// Canonical table namespace, independent of the first consumer's alias.
+    /// Package projects use their interned package/module namespace; single-file
+    /// projects use an internal namespace and retain canonical linker spelling.
     pub fn registration_name(&self) -> &str {
-        self.symbol_namespace.as_deref().unwrap_or(&self.name)
+        self.identity_path()
     }
 
     pub fn module_key(&self) -> super::ModuleKey {

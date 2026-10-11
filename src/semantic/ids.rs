@@ -755,10 +755,11 @@ pub enum SymbolId {
 }
 
 /// Canonical cross-file identity. `SymbolId` describes the declaration within
-/// a module; `ModuleId` identifies the parsed source file independent of import
-/// aliases.
+/// a module; `PackageId` and `ModuleId` identify the parsed source file
+/// independent of import aliases. Session handles are never serialized.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResolvedSymbolId {
+    pub package: crate::package::PackageId,
     pub module: ModuleId,
     pub symbol: SymbolId,
 }
@@ -1074,14 +1075,21 @@ mod tests {
     fn resolved_identity_uses_stable_module_id_not_alias_text() {
         let symbol = SymbolId::Function(FunctionId::free("run"));
         let a = ResolvedSymbolId {
+            package: crate::package::PackageId(0),
             module: ModuleId(7),
             symbol: symbol.clone(),
         };
         let b = ResolvedSymbolId {
+            package: crate::package::PackageId(0),
             module: ModuleId(7),
             symbol,
         };
         assert_eq!(a, b);
+        let other_package = ResolvedSymbolId {
+            package: crate::package::PackageId(1),
+            ..b
+        };
+        assert_ne!(a, other_package);
     }
 }
 

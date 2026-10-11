@@ -43,6 +43,7 @@ pub(crate) struct ModuleDependencies {
     units: Vec<module::UnitId>,
     package_by_unit: std::collections::HashMap<module::UnitId, crate::package::PackageId>,
     pub(crate) edges: Vec<Vec<usize>>,
+    registration_paths: Vec<std::rc::Rc<std::collections::HashMap<String, String>>>,
     by_unit: std::collections::HashMap<module::UnitId, usize>,
     closure_queries: QueryTable<module::UnitId, usize>,
 }
@@ -149,10 +150,13 @@ impl ModuleDependencies {
             root_package: packages.map_or(crate::package::PackageId(0), |graph| graph.root),
             package_by_unit: modules.iter().map(|m| (m.id, m.package)).collect(),
             edges: Vec::new(),
+            registration_paths: Vec::new(),
             by_unit: modules.iter().enumerate().map(|(i, m)| (m.id, i)).collect(),
             closure_queries: QueryTable::named("module_dependency_closure"),
         };
-        result.edges = modules
+        // Build canonical signature routes in the same pass as dependency edges.
+        // Every checker borrows the routes; repeated consumers never rebuild them.
+        let (edges, registration_paths) = modules
             .iter()
             .map(|module| {
                 let by_path = ModulePaths {
@@ -160,31 +164,48 @@ impl ModuleDependencies {
                     consumer: module.package,
                 };
                 let mut seen = std::collections::HashSet::new();
-                module
-                    .program
-                    .imports
-                    .iter()
-                    .filter_map(|import| {
-                        #[cfg(test)]
-                        DEPENDENCY_WORK.with(|work| {
-                            let (lookups, visits) = work.get();
-                            work.set((lookups + 1, visits));
-                        });
-                        let id = by_path.get(&import.path).copied().or_else(|| {
+                let mut edges = Vec::new();
+                let mut paths = std::collections::HashMap::new();
+                for import in &module.program.imports {
+                    #[cfg(test)]
+                    DEPENDENCY_WORK.with(|work| {
+                        let (lookups, visits) = work.get();
+                        work.set((lookups + 1, visits));
+                    });
+                    let target = by_path
+                        .get(&import.path)
+                        .map(|&id| (import.path.as_str(), id))
+                        .or_else(|| {
                             let (path, _) = import.path.rsplit_once("::")?;
                             #[cfg(test)]
                             DEPENDENCY_WORK.with(|work| {
                                 let (lookups, visits) = work.get();
                                 work.set((lookups + 1, visits));
                             });
-                            by_path.get(path).copied()
-                        })?;
-                        seen.insert(id).then_some(id)
-                    })
-                    .collect()
+                            by_path.get(path).map(|&id| (path, id))
+                        });
+                    if let Some((path, id)) = target {
+                        paths
+                            .entry(path.to_string())
+                            .or_insert_with(|| modules[id].registration_name().to_string());
+                        if seen.insert(id) {
+                            edges.push(id);
+                        }
+                    }
+                }
+                (edges, std::rc::Rc::new(paths))
             })
-            .collect();
+            .unzip();
+        result.edges = edges;
+        result.registration_paths = registration_paths;
         result
+    }
+
+    pub(crate) fn registration_paths(
+        &self,
+        unit: module::UnitId,
+    ) -> std::rc::Rc<std::collections::HashMap<String, String>> {
+        std::rc::Rc::clone(&self.registration_paths[self.by_unit[&unit]])
     }
 
     /// Sparse closure: unrelated units do not allocate entries or get scanned.
@@ -320,6 +341,11 @@ mod tests {
         assert_eq!(dependency.get("same::util"), None);
         assert_eq!(index.edges[1], [3]);
         assert_eq!(index.edges[5], [1, 4, 2]);
+        let routes = index.registration_paths(graph.files[5].id);
+        assert_eq!(routes["a::util"], graph.files[1].registration_name());
+        assert_eq!(routes["same::util"], graph.files[1].registration_name());
+        assert_eq!(routes["a::util::f"], graph.files[4].registration_name());
+        assert_eq!(routes["b::util"], graph.files[2].registration_name());
         assert_eq!(index.reachable([5].into_iter()), [1, 2, 3, 4, 5]);
         // Entry spans do not occur among imported units. Respect the graph root.
         let mut packages = packages;
@@ -493,6 +519,7 @@ mod tests {
                             }
                         })
                         .collect(),
+                    registration_paths: Vec::new(),
                     by_unit: (0..size).map(|i| (module::ModuleId(i as u32), i)).collect(),
                     closure_queries: QueryTable::named("module_dependency_closure"),
                 };

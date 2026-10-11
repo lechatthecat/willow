@@ -1,0 +1,9 @@
+pub interface Read {
+    fn read(self) -> i64;
+}
+
+pub class Parcel implements Read {
+    pub fn read(self) -> i64 { return 42; }
+}
+
+pub fn id<T>(value: T) -> T { return value; }

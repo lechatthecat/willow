@@ -38,6 +38,7 @@ use type_index::{TypeMap, TypeScope, VtableMap};
 type InterfaceSlotTargets = HashMap<(TypeId, String), Vec<Option<SlotTarget>>>;
 #[cfg(test)]
 thread_local! {
+    static MODULE_ALIAS_TARGET_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METHOD_ALIAS_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -884,7 +885,7 @@ impl UnitCodegenContext<'_> {
         // Direct TYPE import (willow-64gs): alias the compiled tables of the
         // module-qualified type (`module::Item`) under the unqualified `local`
         // name, so the entry's use of `local` resolves to the module's symbols.
-        let qualified = format!("{}::{item}", self.table_module_name(module));
+        let qualified = format!("{module}::{item}");
         if self.classes().is_class(&qualified)
             || self.enum_infos.contains_key(&qualified)
             || self.classes().is_interface(&qualified)
@@ -897,28 +898,6 @@ impl UnitCodegenContext<'_> {
                 self.func_ids.scope().lookup_id(&full),
             );
         }
-    }
-
-    /// The spelling the build's tables key `module`'s items by.
-    ///
-    /// An item import names its module CANONICALLY (`import base::Parcel;`),
-    /// while a module is registered once under the first importer's spelling:
-    /// an entry file that says `import base as proto;` makes every table key
-    /// read `proto::Parcel`, and the item import above then found nothing under
-    /// its own canonical name -- no type alias, no method aliases, and a body
-    /// the walker admitted (a bare class name still resolves by scanning
-    /// modules) but the emitter could not key (willow-kd1v, willow-sxcp).
-    ///
-    /// Canonical module identity records the original table name directly;
-    /// linker spelling and temporary aliases do not determine this lookup.
-    fn table_module_name(&self, module: &str) -> String {
-        if self.known_modules.contains_key(module) {
-            return module.to_string();
-        }
-        self.known_modules
-            .table_name(module)
-            .unwrap_or(module)
-            .to_string()
     }
 
     /// Every `(local alias, mangled symbol)` pair binding the methods of the
@@ -937,7 +916,6 @@ impl UnitCodegenContext<'_> {
         module: &str,
         item: &str,
     ) -> Vec<(String, String)> {
-        let module = self.table_module_name(module);
         let qualified = format!("{module}::{item}");
         if !self.classes().is_class(&qualified) {
             return Vec::new();
@@ -992,80 +970,47 @@ impl UnitCodegenContext<'_> {
         }
     }
 
-    /// Bind the module prefixes THIS unit writes to the names the build's
-    /// tables are keyed by, for the length of this unit's phase (willow-kd1v).
-    ///
-    /// A module is declared once, under the spelling the module graph
-    /// registered it by — the first importer's alias. Every other unit reaches
-    /// it by its own `import` spelling, and the two need not agree: an entry
-    /// file that says `import sales as market;` registers `market`, while the
-    /// module `ledger` that says `import sales;` writes `sales::Amount` and
-    /// calls `sales::describe`. Neither the class tables nor the symbol
-    /// mangler answered to that, so the module's own bodies fell out of the
-    /// LIR walker's subset and, in the AST emitter, mangled to a symbol that
-    /// did not exist.
-    ///
-    /// Both halves are bound: the TYPE half through the shared type scope, so
-    /// `sales::Amount` reads the registered `market::Amount` entry rather than
-    /// a copy of it, and the MODULE half in `known_modules`, which is what
-    /// [`class_method_symbol_name`] and the namespace-call paths resolve a
-    /// prefix through. An enum is keyed by the module's CANONICAL path
-    /// (willow-itcw) even when its classes carry the graph name, so both
-    /// spellings are offered as the alias target and the registered one wins.
-    ///
-    /// Nothing is bound for a spelling that already LANDS on the registered
-    /// entry: an enum is registered under its canonical path and its other
-    /// spellings bound to it (`register_enum_info`), so a unit writing the
-    /// canonical one needs nothing here, and binding it anyway would point the
-    /// canonical entry at its own alias and create a cycle. A spelling that is a
-    /// key of something ELSE is a different case and IS bound: `books` in a
-    /// file that says `import sales as books;` means sales there, whatever a
-    /// real `books` module registered.
+    /// Bind this unit's written module/type prefixes to canonical declarations.
+    /// Module aliases affect only `known_modules` resolution and type aliases
+    /// affect only `type_scope`; neither creates a layout or function definition.
+    /// A unit may shadow another module's canonical source spelling, so freeze
+    /// each alias target to its declaration identity before installing it.
     fn alias_unit_module_spellings(&mut self, spellings: &[compile::ModuleSpelling]) {
+        let mut modules = Vec::with_capacity(spellings.len());
+        let mut types = Vec::new();
+        // Declaration reads never follow unit aliases, including aliases already
+        // installed by item imports or enum normalization before this phase.
         for spelling in spellings {
             if spelling.access == spelling.graph_name {
                 continue;
             }
-            if let Some(id) = self.known_modules.resolve(&spelling.graph_name) {
-                *self.dispatch_cache.get_mut() = Default::default();
-                self.known_modules.bind(spelling.access.clone(), id);
+            #[cfg(test)]
+            MODULE_ALIAS_TARGET_VISITS.with(|count| count.set(count.get() + 1));
+            if let Some(id) = self.known_modules.canonical_id(&spelling.canonical_path) {
+                modules.push((spelling.access.clone(), id));
             }
             for name in &spelling.types {
-                let alias = format!("{}::{name}", spelling.access);
-                let Some(canonical) = [
-                    format!("{}::{name}", spelling.graph_name),
-                    format!("{}::{name}", spelling.canonical_path),
-                ]
-                .into_iter()
-                .find(|candidate| self.registered_type(candidate)) else {
-                    continue;
-                };
-                // The KEY the candidate reaches, since the graph name of an
-                // enum is itself bound to the canonical path. Freeze the declaration
-                // target so another unit alias cannot reinterpret its identity.
-                let canonical = self.resolved_name(&canonical);
-                if self.resolved_name(&alias) == canonical {
-                    continue;
+                #[cfg(test)]
+                MODULE_ALIAS_TARGET_VISITS.with(|count| count.set(count.get() + 1));
+                let canonical = format!("{}::{name}", spelling.canonical_path);
+                let id = TypeId::from_source_name(&canonical);
+                if self.layout_queries.has_class(id)
+                    || self.layout_queries.has_interface(id)
+                    || self.enum_infos.get_canonical_id(&id).is_some()
+                {
+                    types.push((format!("{}::{name}", spelling.access), canonical));
                 }
-                self.bind_canonical_type_alias(&alias, &canonical);
             }
         }
-    }
-
-    /// `name` with any binding currently installed over it followed, which is
-    /// the key the tables would answer it with.
-    fn resolved_name(&self, name: &str) -> String {
-        self.type_scope
-            .resolve(&crate::semantic::ids::TypeId::from_source_name(name))
-            .to_string()
-    }
-
-    /// Whether `name` reaches a registered class, enum or interface — directly
-    /// or through a binding already in the shared type scope.
-    fn registered_type(&self, name: &str) -> bool {
-        self.classes().is_class(name)
-            || self.enum_infos.contains_key(name)
-            || self.classes().is_interface(name)
+        if !modules.is_empty() {
+            *self.dispatch_cache.get_mut() = Default::default();
+        }
+        for (access, id) in modules {
+            self.known_modules.bind(access, id);
+        }
+        for (alias, canonical) in types {
+            self.bind_canonical_type_alias(&alias, &canonical);
+        }
     }
 
     /// While compiling a module body, bind the types this unit IMPORTED by
@@ -1093,18 +1038,7 @@ impl UnitCodegenContext<'_> {
     /// declaration still wins over anything it imported under the same name.
     fn alias_item_import_types(&mut self, items: &[compile::ItemBinding]) {
         for item in items {
-            let table_module = self.table_module_name(&item.module);
-            let qualified = format!("{}::{}", table_module, item.item);
-            let source_qualified = format!("{}::{}", item.module, item.item);
-            if table_module != item.module {
-                if let Some(id) = self.known_modules.resolve(&table_module) {
-                    *self.dispatch_cache.get_mut() = Default::default();
-                    self.known_modules.bind(item.module.clone(), id);
-                }
-                if self.registered_type(&qualified) {
-                    self.bind_type_alias(&source_qualified, &qualified);
-                }
-            }
+            let qualified = format!("{}::{}", item.module, item.item);
             if self.classes().is_interface(&qualified)
                 || self.classes().is_class(&qualified)
                 || self.enum_infos.contains_key(&qualified)

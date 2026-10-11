@@ -262,7 +262,12 @@ impl ModuleGraph {
         self.files.push(SourceFile {
             id,
             package: key.package,
-            symbol_namespace: symbol_module.map(|module| module.namespace()),
+            // A source import cannot spell `$local`, so aliases never shadow
+            // standalone declaration IDs during later normalization or lowering.
+            symbol_namespace: Some(symbol_module.map_or_else(
+                || std::sync::Arc::from(format!("$local::{}", key.path.0)),
+                |module| module.namespace(),
+            )),
             symbol_module,
             name,
             canonical_path: key.path.0,

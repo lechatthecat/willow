@@ -73,6 +73,8 @@ fn with_role(base: &str, role: &str) -> String {
 
 /// The symbol path for a `::`-qualified module path (`a::b` -> `a.b`).
 pub(crate) fn module_symbol_prefix(module_path: &str) -> String {
+    // Standalone module identity is internal; preserve its public linker spelling.
+    let module_path = module_path.strip_prefix("$local::").unwrap_or(module_path);
     symbol_path(&module_path.split("::").collect::<Vec<_>>())
 }
 

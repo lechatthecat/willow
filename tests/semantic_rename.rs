@@ -1053,3 +1053,35 @@ fn repeated_import_path_and_item_rename_keeps_module_qualifier() {
         "import value::answer; import value::{answer as v}; fn main() { println(answer + v); }"
     );
 }
+
+#[test]
+fn refs_and_rename_share_canonical_ids_across_import_order() {
+    let fixture = Fixture::new("");
+    fixture.write("base.wi", "pub class Parcel { pub fn read(self) -> i64 { return 42; } } pub fn value() -> i64 { return 42; }");
+    let mut previous = None;
+    for imports in [
+        "import base as proto; import base::Parcel; import base::value as answer;",
+        "import base::value as answer; import base::Parcel; import base as proto;",
+        "import base as another; import base::Parcel; import base::value as answer; import base as proto;",
+    ] {
+        fixture.write("main.wi", &format!("{imports} fn main() {{ println(new Parcel().read()); println(proto::value()); println(answer()); }}"));
+        let mut ids = Vec::new();
+        for (selector, new_name) in [
+            ("base::value", "renamed_value"),
+            ("base::Parcel::read", "renamed_read"),
+        ] {
+            let refs = fixture.run(&["refs", selector], 0);
+            let rename = fixture.run(&["rename", selector, new_name, "--dry-run"], 0);
+            let id = refs["result"]["selected"]["id"].clone();
+            assert!(id.is_string(), "{refs}");
+            assert_eq!(rename["result"]["selected"]["id"], id, "{rename}");
+            ids.push(id);
+        }
+        if let Some(previous) = &previous {
+            assert_eq!(&ids, previous);
+        }
+        previous = Some(ids);
+    }
+    let applied = fixture.run(&["rename", "base::value", "renamed_value"], 0);
+    assert_eq!(applied["result"]["selected"]["id"], previous.unwrap()[0]);
+}

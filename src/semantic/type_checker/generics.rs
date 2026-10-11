@@ -851,11 +851,15 @@ impl TypeChecker {
             }
             name
         };
-        let target = self
-            .generics
-            .function_paths
-            .get(callee)
-            .map_or(name.clone(), |path| format!("{path}::{name}"));
+        // Template origin is canonical, but the generated source call still
+        // resolves in the consumer's scope. Preserve its written prefix so
+        // source-use diagnostics do not lose a used module import.
+        let path = self.generics.function_paths.get(callee).map(|origin| {
+            callee
+                .rsplit_once("::")
+                .map_or(origin.as_str(), |(written, _)| written)
+        });
+        let target = path.map_or(name.clone(), |path| format!("{path}::{name}"));
         self.generics.calls.insert(id, target);
         Some(if template.is_async {
             Type::Generic("Task".into(), vec![result])

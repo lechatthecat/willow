@@ -569,6 +569,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn overlapping_alias_targets_ignore_existing_overlays_and_scale_linearly() {
+        for count in [16, 64, 256] {
+            for reverse in [false, true] {
+                let mut build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+                let mut context = build.declaration_context();
+                let mut spellings = Vec::new();
+                for i in 0..count {
+                    let name = format!("m{i}");
+                    context
+                        .known_modules
+                        .register(crate::module::ModuleId(i), &name, &name);
+                    let ty = format!("{name}::Kind");
+                    context.enum_infos.insert(ty.clone(), enum_info(&ty));
+                    spellings.push(ModuleSpelling {
+                        access: format!("m{}", i + 1),
+                        graph_name: name.clone(),
+                        canonical_path: name,
+                        types: vec!["Kind".into()],
+                    });
+                }
+                drop(context);
+                let mut context = build.emission_context();
+                // Targets must bypass aliases installed even before this phase.
+                context
+                    .known_modules
+                    .bind("m1".into(), crate::module::ModuleId(0));
+                context.bind_canonical_type_alias("m1::Kind", "m0::Kind");
+                if reverse {
+                    spellings.reverse();
+                }
+                MODULE_ALIAS_TARGET_VISITS.with(|visits| visits.set(0));
+                context.alias_unit_module_spellings(&spellings);
+                assert_eq!(
+                    MODULE_ALIAS_TARGET_VISITS.with(|visits| visits.get()),
+                    2 * count as usize
+                );
+                for i in 0..count {
+                    assert_eq!(
+                        context.known_modules.resolve(&format!("m{}", i + 1)),
+                        Some(crate::module::ModuleId(i))
+                    );
+                    assert_eq!(
+                        context
+                            .enum_infos
+                            .get(&format!("m{}::Kind", i + 1))
+                            .unwrap()
+                            .name
+                            .to_string(),
+                        format!("m{i}::Kind")
+                    );
+                }
+                println!(
+                    "overlapping_aliases count={count} reverse={reverse} target_visits={}",
+                    2 * count
+                );
+            }
+        }
+    }
+
     fn db_identities(db: &BuildCodegenDb) -> Vec<usize> {
         let mut identities = vec![
             db.func_ids.storage_identity(),

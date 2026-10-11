@@ -1,0 +1,8 @@
+import canonical_identity_support::base as proto;
+import canonical_identity_support::base::Parcel;
+import canonical_identity_support::base::Read;
+
+fn main() {
+    let parcel: Read = new Parcel();
+    println(proto::id<i64>(parcel.read()));
+}
