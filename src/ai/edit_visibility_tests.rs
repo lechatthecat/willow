@@ -287,7 +287,7 @@ fn concurrent_process_write_move_and_delete_are_preserved() {
             let target = plan
                 .changes
                 .iter()
-                .position(|c| c.path == "nested/m0.wi")
+                .position(|c| Path::new(&c.path) == Path::new("nested/m0.wi"))
                 .unwrap();
             if !during_apply {
                 assert!(f.worker(&id, mode).status().unwrap().success());
@@ -307,7 +307,7 @@ fn concurrent_process_write_move_and_delete_are_preserved() {
                 .is_err()
             );
             for c in &plan.changes {
-                if c.path != "nested/m0.wi" {
+                if Path::new(&c.path) != Path::new("nested/m0.wi") {
                     assert_eq!(fs::read_to_string(f.0.join(&c.path)).unwrap(), c.before);
                 }
             }
@@ -415,11 +415,10 @@ fn large_nested_rename_has_one_change_per_file_and_rejects_path_churn() {
             w.apply(next, &mut crate::diagnostics::HumanEmitter)
                 .is_err()
         );
-        for c in plan
-            .changes
-            .iter()
-            .filter(|c| c.path != "nested/m0.wi" && c.path != "nested/m1.wi")
-        {
+        for c in plan.changes.iter().filter(|c| {
+            let path = Path::new(&c.path);
+            path != Path::new("nested/m0.wi") && path != Path::new("nested/m1.wi")
+        }) {
             assert_eq!(fs::read_to_string(f.0.join(&c.path)).unwrap(), c.after);
         }
         assert!(!f.0.join("nested/m0.wi").exists());
@@ -428,7 +427,7 @@ fn large_nested_rename_has_one_change_per_file_and_rejects_path_churn() {
             fs::read_to_string(f.0.join("moved.wi")).unwrap(),
             plan.changes
                 .iter()
-                .find(|c| c.path == "nested/m0.wi")
+                .find(|c| Path::new(&c.path) == Path::new("nested/m0.wi"))
                 .unwrap()
                 .after
         );

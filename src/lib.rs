@@ -730,11 +730,13 @@ fn run_frontend_revision(
     // the frontend boundary below, before code generation.
     let desugar_dependencies =
         ModuleDependencies::with_packages(&graph.files, inputs.package_graph.as_deref());
+    // Standalone modules also have canonical namespaces. Resolve their source
+    // imports before indexing inherited interfaces and default methods.
     let desugar = PhaseDiagnostics::new(
         desugar::DesugarPass::run_resolved(
             &mut program,
             &mut graph.files,
-            inputs.package_graph.as_ref().map(|_| &desugar_dependencies),
+            Some(&desugar_dependencies),
         )
         .diagnostics,
     );

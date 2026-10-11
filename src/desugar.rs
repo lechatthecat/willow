@@ -1612,6 +1612,48 @@ fn main() {}
         }
     }
 
+    #[test]
+    fn standalone_canonical_default_fanout_copies_once_per_receiver() {
+        for receivers in [8, 32, 128] {
+            let mut modules = vec![resolved_module(
+                "proto",
+                "pub interface Value { fn value(self) -> i64 { return 42; } }",
+            )];
+            let mut entry = String::new();
+            for i in 0..receivers {
+                let name = format!("m{i}");
+                entry.push_str(&format!("import {name};"));
+                modules.push(resolved_module(
+                    &name,
+                    "import proto as p; import proto::Value; pub class C implements Value {}",
+                ));
+            }
+            for (i, module) in modules.iter_mut().enumerate() {
+                module.id = module::ModuleId(i as u32 + 1);
+                module.symbol_namespace = Some(format!("$local::{}", module.canonical_path).into());
+            }
+            let dependencies = crate::compiler_db::dependencies::ModuleDependencies::new(&modules);
+            let mut program = parse(&format!("{entry} fn main() {{}}"));
+            let output = DesugarPass::run_resolved(&mut program, &mut modules, Some(&dependencies));
+            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+            let mut copies = 0;
+            for module in &modules[1..] {
+                for item in &module.program.items {
+                    if let Item::Class(class) = item {
+                        assert_eq!(class.methods.len(), 1);
+                        assert!(class.methods[0].is_default_injected);
+                        copies += 1;
+                    }
+                }
+            }
+            assert_eq!(copies, receivers);
+            println!(
+                "standalone default receivers={receivers} aliases={} copied_methods={copies}",
+                2 * receivers
+            );
+        }
+    }
+
     fn class_implements(program: &parser::ast::Program, class: &str) -> Vec<Type> {
         program
             .items

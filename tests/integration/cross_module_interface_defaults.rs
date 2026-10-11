@@ -67,6 +67,27 @@ fn fails(files: &[(&str, &str)]) -> String {
 const BOX_MAIN: &str = "import util; class Box implements util::Answer { pub value: i64; } fn main() { println(new Box(1).answer()); }";
 
 #[test]
+fn standalone_imported_default_example_runs() {
+    runs(
+        &[
+            (
+                "main.wi",
+                include_str!("../../example/imported_interface_default.wi"),
+            ),
+            (
+                "imported_interface_default_support/consumer.wi",
+                include_str!("../../example/imported_interface_default_support/consumer.wi"),
+            ),
+            (
+                "imported_interface_default_support/provider.wi",
+                include_str!("../../example/imported_interface_default_support/provider.wi"),
+            ),
+        ],
+        "42\n",
+    );
+}
+
+#[test]
 fn private_provider_helper() {
     runs(
         &[
@@ -650,7 +671,7 @@ fn emit_hir_lowers_foreign_default_in_provider_scope() {
         1,
         "{stdout}"
     );
-    // The provider's `Box`, not the receiving module's.
-    assert!(stdout.contains("new util::Box(5: i64)"), "{stdout}");
+    // HIR names the provider's canonical `Box`, not the receiver's local type.
+    assert!(stdout.contains("new $local::util::Box(5: i64)"), "{stdout}");
     assert!(!stdout.contains("not yet lowered"), "{stdout}");
 }

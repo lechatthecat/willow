@@ -1261,6 +1261,58 @@ mod tests {
     }
 
     #[test]
+    fn revision_standalone_default_import_routes_match_cold() {
+        // 5 source spellings x direct/inherited interface x both consumer orders.
+        // Every route must receive the same canonical default, including edits.
+        for (imports, interface) in [
+            ("import proto::Value;", "Value"),
+            ("import proto::Value as Contract;", "Contract"),
+            ("import proto;", "proto::Value"),
+            ("import proto as p;", "p::Value"),
+            ("import proto as p; import proto::Value;", "Value"),
+        ] {
+            for inherited in [false, true] {
+                for reversed in [false, true] {
+                    let f = Fixture::new();
+                    let entry_imports = if reversed {
+                        "import b; import a;"
+                    } else {
+                        "import a; import b;"
+                    };
+                    f.write("main.wi", &format!("{entry_imports} fn main() {{ println(new a::A().value() + new b::B().value()); }}"));
+                    for (module, class) in [("a.wi", "A"), ("b.wi", "B")] {
+                        f.write(
+                            module,
+                            &format!("{imports} pub class {class} implements {interface} {{}}"),
+                        );
+                    }
+                    let mut warm = AnalysisRevision::default();
+                    let _symbols = warm.symbols.enter();
+                    for value in [1, 20] {
+                        let source = if inherited {
+                            format!(
+                                "pub interface Base {{ fn value(self) -> i64 {{ return {value}; }} }} pub interface Value extends Base {{}}"
+                            )
+                        } else {
+                            format!(
+                                "pub interface Value {{ fn value(self) -> i64 {{ return {value}; }} }}"
+                            )
+                        };
+                        f.write("proto.wi", &source);
+                        assert!(
+                            f.compare(&mut warm),
+                            "imports={imports} inherited={inherited} reversed={reversed} value={value}"
+                        );
+                        // An unchanged revision must reuse all bodies.
+                        assert!(f.compare(&mut warm));
+                        assert_eq!(warm.typechecks, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn revision_invalidation_visits_chain_and_fanout_edges_once() {
         for chain in [false, true] {
             for n in [8, 16, 32] {

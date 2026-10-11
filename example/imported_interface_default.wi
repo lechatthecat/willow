@@ -1,0 +1,7 @@
+import imported_interface_default_support::consumer as c;
+import imported_interface_default_support::provider::Value as Contract;
+
+fn main() {
+    let value: Contract = new c::Counter();
+    println(value.value());
+}

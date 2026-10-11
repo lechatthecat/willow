@@ -1,0 +1,3 @@
+import imported_interface_default_support::provider::Value as Contract;
+
+pub class Counter implements Contract {}

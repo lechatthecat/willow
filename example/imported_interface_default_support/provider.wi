@@ -1,0 +1,7 @@
+fn answer() -> i64 { return 42; }
+
+pub interface Base {
+    fn value(self) -> i64 { return answer(); }
+}
+
+pub interface Value extends Base {}
