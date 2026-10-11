@@ -7,7 +7,7 @@ pub fn bool_text(value: u8) -> &'static str {
     if value != 0 { "true" } else { "false" }
 }
 
-fn write_stdout<'a>(text: impl Into<std::borrow::Cow<'a, str>>) {
+pub(crate) fn write_stdout<'a>(text: impl Into<std::borrow::Cow<'a, str>>) {
     let text = text.into();
     #[cfg(any(
         all(

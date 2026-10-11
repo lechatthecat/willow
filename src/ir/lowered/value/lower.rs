@@ -192,7 +192,10 @@ fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type) -> bool {
     }
     crate::semantic::intrinsics::builtin_call_runtime_name(name).is_some()
         && args.is_empty()
-        && if matches!(name, "gc_collect" | "gc_minor_collect") {
+        && if matches!(
+            name,
+            "gc_collect" | "gc_minor_collect" | "gc_task_frame_diagnostics"
+        ) {
             *result == Type::Void
         } else {
             *result == Type::I64

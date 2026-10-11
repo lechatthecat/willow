@@ -156,6 +156,17 @@ impl Object {
         unsafe { (*self.as_ptr()).allocated }
     }
 
+    pub(super) fn is_async_frame(self) -> bool {
+        let d = self.descriptor();
+        d.layout_id
+            == willow_abi::gc_layout_id(
+                willow_abi::GcObjectKind::AsyncFrame,
+                (d.size as usize - std::mem::size_of::<GcHeader>()) as i64,
+                d.type_id as i64,
+                d.gc_ref_mask,
+            )
+    }
+
     pub(super) fn reclaim_in_place(self) {
         // SAFETY: the closed mark epoch proved this payload unreachable;
         // its readers have quiesced and the heap mutex owns its metadata.

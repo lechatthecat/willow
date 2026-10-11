@@ -1526,6 +1526,9 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_collect() {
+    // An explicit collection must not depend on a later batch of task completions.
+    // Active execution units still protect every covered retirement.
+    crate::scheduler::release_quiescent_frame_roots(true);
     let _relocation = RelocationSafeScope::enter();
     collect_internal();
 }
@@ -2220,6 +2223,7 @@ pub fn header_size_for_test() -> usize {
 #[cfg(test)]
 pub fn reset_internal_for_test() {
     reset_internal();
+    crate::frame_lifetime::reset();
 }
 
 /// A fresh, empty generated-TLS block for tests in sibling modules that need a

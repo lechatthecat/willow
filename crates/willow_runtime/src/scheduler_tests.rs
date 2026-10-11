@@ -5474,10 +5474,22 @@ fn vjaf_08_release_pops_only_the_prefix_below_the_bound() {
     let tags: Vec<u64> = s.pending_frame_unroots.iter().map(|r| r.tag).collect();
     assert!(tags.windows(2).all(|pair| pair[0] < pair[1]));
     assert_eq!(s.frame_roots, 3);
-    assert_eq!(s.take_quiescent_frame_unroots(tags[0]), Vec::<usize>::new());
-    assert_eq!(s.take_quiescent_frame_unroots(tags[1]), frames[..1]);
+    assert!(s.take_quiescent_frame_unroots(tags[0]).is_empty());
+    assert_eq!(
+        s.take_quiescent_frame_unroots(tags[1])
+            .iter()
+            .map(|r| r.frame)
+            .collect::<Vec<_>>(),
+        frames[..1]
+    );
     assert_eq!(s.frame_roots, 2);
-    assert_eq!(s.take_quiescent_frame_unroots(u64::MAX), frames[1..]);
+    assert_eq!(
+        s.take_quiescent_frame_unroots(u64::MAX)
+            .iter()
+            .map(|r| r.frame)
+            .collect::<Vec<_>>(),
+        frames[1..]
+    );
     assert_eq!(s.frame_roots, 0);
     drop(s);
     reset_stress_fixture();
@@ -5549,4 +5561,485 @@ fn static_mut_policy_uses_effective_worker_count() {
         assert!(static_mut_workers_allowed(false, workers));
         assert_eq!(static_mut_workers_allowed(true, workers), workers == 1);
     }
+}
+
+// M2 lifetime cases: snapshots are taken after a joined drive or while the
+// enclosing unit pins the whole nested batch. No sleep/grace constants.
+struct M2Workers;
+impl M2Workers {
+    fn set(workers: usize) -> Self {
+        TEST_WORKER_OVERRIDE.store(workers, Ordering::Release);
+        Self
+    }
+}
+impl Drop for M2Workers {
+    fn drop(&mut self) {
+        TEST_WORKER_OVERRIDE.store(0, Ordering::Release);
+    }
+}
+
+fn m2_wait_reclaimed(expected: u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        willow_gc_collect();
+        let s = crate::frame_lifetime::snapshot();
+        if s.task_frames_reclaimed == expected {
+            assert_eq!(s.allocated_frame_bytes, s.reclaimed_frame_bytes, "{s:?}");
+            assert_eq!(s.task_frames_running, 0, "{s:?}");
+            assert_eq!(s.task_frames_terminal, 0, "{s:?}");
+            assert_eq!(s.task_frames_retired, 0, "{s:?}");
+            assert_eq!(s.task_frames_rooted, 0, "{s:?}");
+            assert_eq!(s.quarantined_frames, 0, "{s:?}");
+            assert_eq!(willow_gc_allocated_bytes(), 0, "{s:?}");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected={expected}, live_bytes={}, {s:?}",
+            willow_gc_allocated_bytes()
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn m2_lifetime_worker_batch_frame_and_handle_matrix() {
+    let _guard = runtime_test_guard();
+    for workers in [1, 4, 8] {
+        let _workers = M2Workers::set(workers);
+        for batch in [1, 7, 63, 65, 257] {
+            for slots in [1, 64, 4096] {
+                reset_stress_fixture();
+                let mut handles = vec![std::ptr::null_mut(); batch];
+                let mut ids = Vec::new();
+                // Stable stack root slots model language Task handles; the
+                // scheduler root and handle root have independent ownership.
+                for handle in &mut handles {
+                    *handle = willow_async_frame_alloc(slots, 0).cast::<u8>();
+                    crate::gc::willow_push_root(handle);
+                    ids.push(willow_sched_spawn(poll_write_result, (*handle).cast()));
+                }
+                willow_sched_run();
+                let before = crate::frame_lifetime::snapshot();
+                assert_eq!(
+                    before.task_frames_rooted, 0,
+                    "workers={workers} batch={batch} slots={slots} {before:?}"
+                );
+                assert_eq!(before.task_frames_terminal, batch as u64, "{before:?}");
+                willow_gc_collect();
+                assert_eq!(
+                    willow_gc_allocated_bytes() as u64,
+                    before.allocated_frame_bytes,
+                    "{before:?}"
+                );
+                // Repeated, terminal and cancellation-aware queries neither
+                // create roots nor need the reaped heavy scheduler record.
+                for (handle, id) in handles.iter().zip(&ids) {
+                    for _ in 0..32 {
+                        assert_eq!(willow_frame_await((*handle).cast(), *id), 1);
+                        assert_eq!(
+                            crate::async_frame::willow_frame_is_cancelled((*handle).cast()),
+                            0
+                        );
+                        assert_eq!(
+                            unsafe { *((*handle).add(async_frame_slot_offset(0)) as *const i64) },
+                            VJAF_RESULT
+                        );
+                    }
+                }
+                let after = crate::frame_lifetime::snapshot();
+                assert_eq!(
+                    before.scheduler_roots_added, after.scheduler_roots_added,
+                    "{after:?}"
+                );
+                // Drop alternating handles, then the rest: varying root count
+                // and frame size independently, with exact reclaimed bytes.
+                let frame_bytes = before.allocated_frame_bytes / batch as u64;
+                for index in (0..batch).step_by(2) {
+                    handles[index] = std::ptr::null_mut();
+                }
+                willow_gc_collect();
+                let half = crate::frame_lifetime::snapshot();
+                assert_eq!(
+                    half.task_frames_reclaimed,
+                    batch.div_ceil(2) as u64,
+                    "{half:?}"
+                );
+                assert_eq!(
+                    half.reclaimed_frame_bytes,
+                    batch.div_ceil(2) as u64 * frame_bytes,
+                    "{half:?}"
+                );
+                handles.fill(std::ptr::null_mut());
+                for _ in &handles {
+                    crate::gc::willow_pop_root();
+                }
+                m2_wait_reclaimed(batch as u64);
+                println!(
+                    "M2 workers={workers} batch={batch} slots={slots} roots={} frames={} allocated={} reclaimed={}",
+                    batch / 2,
+                    batch,
+                    before.allocated_frame_bytes,
+                    crate::frame_lifetime::snapshot().reclaimed_frame_bytes
+                );
+            }
+        }
+    }
+    reset_stress_fixture();
+}
+
+unsafe extern "C" fn m2_nested_last_poll(_frame: *mut c_void) -> i32 {
+    let mut last = 0;
+    for _ in 0..7 {
+        last = willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+    }
+    willow_sched_run_until(last);
+    willow_sched_run();
+    willow_gc_collect();
+    let s = crate::frame_lifetime::snapshot();
+    assert_eq!(s.terminal_events, 7, "{s:?}");
+    assert_eq!(s.task_frames_rooted, 8, "{s:?}");
+    assert_eq!(s.task_frames_retired, 7, "{s:?}");
+    assert_eq!(
+        s.task_frames_reclaimed, 0,
+        "in-flight outer poll must protect children: {s:?}"
+    );
+    RUNTIME_POLL_READY
+}
+
+#[test]
+fn m2_inflight_last_poll_and_subthreshold_release_events() {
+    let _guard = runtime_test_guard();
+    for workers in [1, 4, 8] {
+        let _workers = M2Workers::set(workers);
+        reset_stress_fixture();
+        crate::frame_lifetime::capture_events(true);
+        willow_sched_spawn(m2_nested_last_poll, willow_async_frame_alloc(0, 0));
+        willow_sched_run();
+        m2_wait_reclaimed(8);
+        let events = crate::frame_lifetime::events();
+        for terminal in events
+            .iter()
+            .filter(|event| event.kind == crate::frame_lifetime::FrameEventKind::Terminal)
+        {
+            let index = |kind| {
+                events
+                    .iter()
+                    .position(|event| event.frame == terminal.frame && event.kind == kind)
+                    .unwrap()
+            };
+            use crate::frame_lifetime::FrameEventKind::*;
+            assert!(index(Terminal) < index(Quiescent), "{events:?}");
+            assert!(
+                index(Quiescent) < index(SchedulerRootReleased),
+                "{events:?}"
+            );
+            assert!(
+                index(SchedulerRootReleased) < index(MetadataRemoved),
+                "{events:?}"
+            );
+            assert_eq!(events[index(Quiescent)].epoch, terminal.epoch);
+        }
+        assert_eq!(crate::frame_lifetime::snapshot().poll_exits, 8);
+    }
+    reset_stress_fixture();
+}
+
+static M2_CANCELLED: TestAtomicU64 = TestAtomicU64::new(0);
+static M2_COMPLETED: TestAtomicU64 = TestAtomicU64::new(0);
+unsafe extern "C" fn m2_race_poll(frame: *mut c_void) -> i32 {
+    let phase = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
+    if *phase == 0 {
+        *phase = 1;
+        // Allocation and detached completion race the cancellation requester.
+        willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(1, 0));
+        RUNTIME_POLL_YIELD
+    } else {
+        M2_COMPLETED.fetch_add(1, TestOrdering::SeqCst);
+        RUNTIME_POLL_READY
+    }
+}
+unsafe extern "C" fn m2_race_cancel(frame: *mut c_void) {
+    let count = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(1)) as *mut i64) };
+    *count += 1;
+    assert_eq!(*count, 1, "cancel cleanup runs at most once");
+    M2_CANCELLED.fetch_add(1, TestOrdering::SeqCst);
+}
+#[test]
+fn m2_detached_cancel_completion_allocation_race() {
+    let _guard = runtime_test_guard();
+    for workers in [1, 4, 8] {
+        let _workers = M2Workers::set(workers);
+        for count in [7, 65, 257] {
+            reset_stress_fixture();
+            M2_CANCELLED.store(0, TestOrdering::SeqCst);
+            M2_COMPLETED.store(0, TestOrdering::SeqCst);
+            let ids: Vec<_> = (0..count)
+                .map(|_| {
+                    let id = willow_sched_spawn(m2_race_poll, willow_async_frame_alloc(2, 0));
+                    willow_sched_set_cancel_fn(id, m2_race_cancel);
+                    id
+                })
+                .collect();
+            let start = Arc::new(Barrier::new(2));
+            let requester = {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    // Reverse and interleaved order, including repeated cancel.
+                    for id in ids.into_iter().rev().step_by(2) {
+                        willow_sched_cancel(id);
+                        willow_sched_cancel(id);
+                        std::thread::yield_now();
+                    }
+                })
+            };
+            start.wait();
+            willow_sched_run();
+            requester.join().unwrap();
+            willow_sched_run();
+            let s = crate::frame_lifetime::snapshot();
+            assert_eq!(
+                M2_CANCELLED.load(TestOrdering::SeqCst) + M2_COMPLETED.load(TestOrdering::SeqCst),
+                count,
+                "{s:?}"
+            );
+            assert_eq!(s.terminal_events, s.frames_created, "{s:?}");
+            m2_wait_reclaimed(s.frames_created);
+        }
+    }
+    reset_stress_fixture();
+}
+
+unsafe extern "C" fn m2_subthreshold_driver(frame: *mut c_void) -> i32 {
+    let phase = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
+    if *phase == 0 {
+        *phase = 1;
+        let mut last = 0;
+        for _ in 0..7 {
+            last = willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+        }
+        willow_sched_run_until(last);
+        willow_sched_run();
+        return RUNTIME_POLL_YIELD;
+    }
+    // A newer poll cannot keep the preceding poll's children alive. No
+    // additional retirements are manufactured to reach the scan threshold.
+    willow_gc_collect();
+    let s = crate::frame_lifetime::snapshot();
+    assert_eq!(s.task_frames_rooted, 1, "{s:?}");
+    assert_eq!(s.task_frames_reclaimed, 7, "{s:?}");
+    RUNTIME_POLL_READY
+}
+#[test]
+fn m2_collect_advances_subthreshold_grace_mid_drive() {
+    let _guard = runtime_test_guard();
+    for workers in [1, 4, 8] {
+        let _workers = M2Workers::set(workers);
+        reset_stress_fixture();
+        willow_sched_spawn(m2_subthreshold_driver, willow_async_frame_alloc(1, 0));
+        willow_sched_run();
+        m2_wait_reclaimed(8);
+    }
+    reset_stress_fixture();
+}
+unsafe extern "C" fn m2_park_repeatedly(frame: *mut c_void) -> i32 {
+    let phase = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
+    *phase += 1;
+    if *phase == 16 {
+        RUNTIME_POLL_READY
+    } else {
+        RUNTIME_POLL_PENDING
+    }
+}
+#[test]
+fn m2_running_parked_handoff_preserves_runtime_root() {
+    let _guard = runtime_test_guard();
+    for workers in [1, 4, 8] {
+        let _workers = M2Workers::set(workers);
+        for count in [1, 7, 65] {
+            reset_stress_fixture();
+            let ids: Vec<_> = (0..count)
+                .map(|_| willow_sched_spawn(m2_park_repeatedly, willow_async_frame_alloc(1, 0)))
+                .collect();
+            for _ in 0..15 {
+                willow_sched_run();
+                willow_gc_collect();
+                let s = crate::frame_lifetime::snapshot();
+                assert_eq!(s.task_frames_rooted, count, "{s:?}");
+                assert_eq!(crate::gc::runtime_root_count() as u64, count, "{s:?}");
+                assert_eq!(s.task_frames_running, 0, "{s:?}");
+                assert_eq!(s.task_frames_reclaimed, 0, "{s:?}");
+                for id in &ids {
+                    willow_sched_wake(*id);
+                }
+            }
+            willow_sched_run();
+            m2_wait_reclaimed(count);
+        }
+    }
+    reset_stress_fixture();
+}
+#[test]
+fn m2_live_handle_after_scope_finish_survives_and_scope_releases_owners() {
+    let _guard = runtime_test_guard();
+    for workers in [1, 4, 8] {
+        let _workers = M2Workers::set(workers);
+        reset_stress_fixture();
+        crate::frame_lifetime::capture_events(true);
+        let mut scope = crate::cancellation::willow_task_scope_new();
+        crate::gc::willow_push_root(&mut scope);
+        let mut child = willow_async_frame_alloc(2, 0).cast::<u8>();
+        crate::gc::willow_push_root(&mut child);
+        let id = willow_sched_spawn(poll_write_result, child.cast());
+        unsafe {
+            *(child.add(async_frame_slot_offset(1)) as *mut u64) = id;
+        }
+        crate::cancellation::willow_task_scope_add(scope, child);
+        let finish = crate::cancellation::willow_task_scope_finish(scope);
+        willow_sched_run();
+        assert!(crate::async_frame::frame_is_terminal(finish));
+        willow_gc_collect();
+        let s = crate::frame_lifetime::snapshot();
+        assert_eq!(s.scope_owner_releases, 1, "{s:?}");
+        assert_eq!(
+            s.task_frames_terminal, 1,
+            "live child handle after finish: {s:?}"
+        );
+        assert_eq!(
+            s.task_frames_reclaimed, 1,
+            "unowned finish frame reclaimed: {s:?}"
+        );
+        assert_eq!(willow_frame_await(child.cast(), id), 1);
+        assert_eq!(
+            unsafe { *(child.add(async_frame_slot_offset(0)) as *const i64) },
+            VJAF_RESULT
+        );
+        crate::gc::willow_pop_root(); // child
+        // Keep the scope wrapper itself live: finish has released its child edge.
+        willow_gc_collect();
+        assert_eq!(crate::frame_lifetime::snapshot().task_frames_reclaimed, 2);
+        crate::gc::willow_pop_root(); // scope
+        m2_wait_reclaimed(2);
+    }
+    reset_stress_fixture();
+}
+
+#[test]
+fn m2_event_history_bounded_and_lifetime_operation_counts_linear() {
+    let _guard = runtime_test_guard();
+    let _workers = M2Workers::set(1);
+    for count in [64, 256, 1024, 4096] {
+        reset_stress_fixture();
+        crate::frame_lifetime::capture_events(true);
+        for _ in 0..count {
+            willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+        }
+        willow_sched_run();
+        m2_wait_reclaimed(count);
+        let s = crate::frame_lifetime::snapshot();
+        assert_eq!(s.frames_created, count, "{s:?}");
+        assert_eq!(s.poll_exits, count, "{s:?}");
+        assert_eq!(s.terminal_events, count, "{s:?}");
+        assert_eq!(s.quiescent_events, count, "{s:?}");
+        assert_eq!(s.scheduler_roots_added, count, "{s:?}");
+        assert_eq!(s.scheduler_roots_released, count, "{s:?}");
+        assert_eq!(s.metadata_removed_frames, count, "{s:?}");
+        assert_eq!(crate::frame_lifetime::events().len(), 512);
+        println!(
+            "M2 operations n={count} created={} poll_exits={} terminal={} quiescent={} root_add={} root_release={} metadata={} reclaimed={} allocated_bytes={} reclaimed_bytes={} history={}",
+            s.frames_created,
+            s.poll_exits,
+            s.terminal_events,
+            s.quiescent_events,
+            s.scheduler_roots_added,
+            s.scheduler_roots_released,
+            s.metadata_removed_frames,
+            s.task_frames_reclaimed,
+            s.allocated_frame_bytes,
+            s.reclaimed_frame_bytes,
+            crate::frame_lifetime::events().len()
+        );
+    }
+    reset_stress_fixture();
+}
+
+static M2_FRAME_DROPS: TestAtomicU64 = TestAtomicU64::new(0);
+unsafe fn m2_frame_drop(payload: *mut u8) {
+    let count = unsafe { &mut *(payload.add(async_frame_slot_offset(1)) as *mut i64) };
+    *count += 1;
+    assert_eq!(*count, 1, "GC drop must run at most once per frame");
+    let s = crate::frame_lifetime::snapshot();
+    assert!(s.pending_drops > 0, "{s:?}");
+    assert!(
+        s.quarantined_frames > 0,
+        "drop still owns quarantined storage: {s:?}"
+    );
+    M2_FRAME_DROPS.fetch_add(1, TestOrdering::SeqCst);
+}
+#[test]
+fn m2_pending_drop_quarantine_reusable_and_at_most_once_drop() {
+    let _guard = runtime_test_guard();
+    for workers in [1, 4, 8] {
+        let _workers = M2Workers::set(workers);
+        reset_stress_fixture();
+        crate::frame_lifetime::capture_events(true);
+        M2_FRAME_DROPS.store(0, TestOrdering::SeqCst);
+        // This fixture contains only async frames (runtime type id zero).
+        crate::gc::willow_register_drop(0, m2_frame_drop);
+        for _ in 0..7 {
+            willow_sched_spawn(poll_write_result, willow_async_frame_alloc(2, 0));
+        }
+        willow_sched_run();
+        m2_wait_reclaimed(7);
+        assert_eq!(M2_FRAME_DROPS.load(TestOrdering::SeqCst), 7);
+        assert_eq!(crate::frame_lifetime::snapshot().pending_drops, 0);
+        for _ in 0..3 {
+            willow_gc_collect();
+        }
+        assert_eq!(M2_FRAME_DROPS.load(TestOrdering::SeqCst), 7);
+        let events = crate::frame_lifetime::events();
+        let first_finish = events
+            .iter()
+            .position(|e| e.kind == crate::frame_lifetime::FrameEventKind::SweepCompleted)
+            .unwrap();
+        let drops: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == crate::frame_lifetime::FrameEventKind::DropCompleted)
+            .collect();
+        assert_eq!(drops.len(), 7);
+        assert!(drops.iter().all(|(index, _)| *index < first_finish));
+    }
+    reset_stress_fixture();
+}
+
+#[test]
+fn m2_scope_finalization_reports_owner_release_without_finish() {
+    let _guard = runtime_test_guard();
+    let _workers = M2Workers::set(1);
+    reset_stress_fixture();
+    let mut scope = crate::cancellation::willow_task_scope_new();
+    crate::gc::willow_push_root(&mut scope);
+    let mut child = willow_async_frame_alloc(2, 0).cast::<u8>();
+    crate::gc::willow_push_root(&mut child);
+    let id = willow_sched_spawn(poll_write_result, child.cast());
+    unsafe {
+        *(child.add(async_frame_slot_offset(1)) as *mut u64) = id;
+    }
+    crate::cancellation::willow_task_scope_add(scope, child);
+    willow_sched_run();
+    scope = std::ptr::null_mut();
+    // Both slot addresses stay stable; nulling the scope's slot drops ownership.
+    assert!(scope.is_null());
+    willow_gc_collect();
+    let s = crate::frame_lifetime::snapshot();
+    assert_eq!(s.scope_owner_releases, 1, "{s:?}");
+    assert_eq!(s.task_frames_terminal, 1, "{s:?}");
+    assert_eq!(s.task_frames_reclaimed, 0, "live independent handle: {s:?}");
+    assert_eq!(willow_frame_await(child.cast(), id), 1);
+    crate::gc::willow_pop_root();
+    crate::gc::willow_pop_root();
+    m2_wait_reclaimed(1);
+    reset_stress_fixture();
 }

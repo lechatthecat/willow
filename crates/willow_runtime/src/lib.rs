@@ -53,6 +53,7 @@ pub mod blocking;
 pub mod cancellation;
 pub mod channel;
 pub(crate) mod failure;
+pub mod frame_lifetime;
 pub(crate) mod frame_reclaim;
 pub mod fs;
 pub mod future;

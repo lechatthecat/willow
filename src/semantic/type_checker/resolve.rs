@@ -220,20 +220,22 @@ impl TypeChecker {
                 constant: None,
             },
         );
-        self.symbols.define_func(
-            "gc_minor_collect".to_string(),
-            FuncInfo {
-                foreign: false,
-                param_infos: vec![],
-                params: vec![],
-                return_type: Type::Void,
-                public: true,
-                is_async: false,
-                declaration_span: Span::dummy(),
-                module_path: None,
-                constant: None,
-            },
-        );
+        for name in ["gc_minor_collect", "gc_task_frame_diagnostics"] {
+            self.symbols.define_func(
+                name.to_string(),
+                FuncInfo {
+                    foreign: false,
+                    param_infos: vec![],
+                    params: vec![],
+                    return_type: Type::Void,
+                    public: true,
+                    is_async: false,
+                    declaration_span: Span::dummy(),
+                    module_path: None,
+                    constant: None,
+                },
+            );
+        }
         for name in [
             "sched_local_pop_hits",
             "sched_global_pop_hits",

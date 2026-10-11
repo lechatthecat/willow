@@ -4206,7 +4206,10 @@ fn supported_expr_node<'n>(
             // are zero-argument runtime calls and need no AST-only metadata.
             // `gc_minor_collect` is the MOVING one, and is what a test has to
             // reach to prove a binding survives evacuation (willow-10zt).
-            if callee.is_free_named("gc_collect") || callee.is_free_named("gc_minor_collect") {
+            if callee.is_free_named("gc_collect")
+                || callee.is_free_named("gc_minor_collect")
+                || callee.is_free_named("gc_task_frame_diagnostics")
+            {
                 return args.is_empty() && e.ty == Type::Void;
             }
             // Their read-only siblings: `gc_allocated_bytes` and the other
@@ -9029,7 +9032,7 @@ fn flat_rvalue_supported(
             if callee.is_free_named("sleep") { return params == &[Type::I64] && void_future; }
             if callee.is_free_named("yield") { return params.is_empty() && void_future; }
             if !params.is_empty() { return false; }
-            if callee.is_free_named("gc_collect") || callee.is_free_named("gc_minor_collect") { *result == Type::Void }
+            if callee.is_free_named("gc_collect") || callee.is_free_named("gc_minor_collect") || callee.is_free_named("gc_task_frame_diagnostics") { *result == Type::Void }
             else { callee.is_free_named(callee.unqualified_name().as_deref().unwrap_or("")) && runtime_stat_builtin_runtime_name(callee.unqualified_name().as_deref().unwrap_or("")).is_some() && *result == Type::I64 }
         }
         V::FormatScalar { ty, format, .. } => matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),

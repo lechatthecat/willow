@@ -1,0 +1,27 @@
+// A live Task handle still owns its result after TaskScope.finish().
+async fn value() -> i64 { return 4242; }
+async fn batch() -> i64 {
+    let scope = TaskScope::new();
+    let handle = value();
+    scope.add(handle);
+    await scope.finish();
+    await yield();
+    gc_collect();
+    let first = await handle;
+    let second = await handle;
+    return first + second;
+}
+async fn main() {
+    let result = await batch();
+    await yield();
+    gc_collect();
+    println(result);
+    let mut attempts = 0;
+    while gc_allocated_bytes() >= 4096 && attempts < 1000 {
+        await yield();
+        gc_collect();
+        attempts = attempts + 1;
+    }
+    println(gc_allocated_bytes() < 4096);
+    if gc_allocated_bytes() >= 4096 { gc_task_frame_diagnostics(); }
+}

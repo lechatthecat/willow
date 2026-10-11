@@ -582,3 +582,15 @@ fn aggregate_bridge_runtime_abi_matches_schema() {
         assert_schema(name, params, result);
     }
 }
+
+#[test]
+fn task_frame_diagnostics_are_void_and_may_block_on_output() {
+    let _: extern "C" fn() = crate::frame_lifetime::willow_gc_task_frame_diagnostics;
+    assert_schema("willow_gc_task_frame_diagnostics", &[], None);
+    assert_eq!(
+        runtime_symbol("willow_gc_task_frame_diagnostics")
+            .unwrap()
+            .effects,
+        willow_abi::RuntimeEffects::MAY_BLOCK
+    );
+}

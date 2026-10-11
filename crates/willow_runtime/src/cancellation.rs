@@ -197,6 +197,16 @@ impl Drop for ScopeCore {
                 .state
                 .get_mut()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for task in &state.tasks {
+                // Finalization releases the arena itself. Mark readers have
+                // exited; report the integer identity without accessing GC.
+                crate::frame_lifetime::record(
+                    crate::frame_lifetime::FrameEventKind::ScopeOwnerReleased,
+                    task.frame.load() as usize,
+                    crate::frame_reclaim::current_epoch(),
+                    0,
+                );
+            }
             std::mem::take(&mut state.children)
         };
         while let Some(child) = pending.pop() {
@@ -206,7 +216,7 @@ impl Drop for ScopeCore {
                     .get_mut()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 pending.append(&mut state.children);
-                // `child` now has an empty child list, so its own Drop is O(1).
+                // The child's Drop handles only its own tasks, with no recursive children.
             }
         }
     }
@@ -419,7 +429,14 @@ impl ScopeCore {
         // be reclaimed immediately; the arena retains the physical cells until
         // ScopeCore finalization, so collector-held slot addresses stay valid.
         for task in &state.tasks {
+            let frame = task.frame.load() as usize;
             task.frame.release();
+            crate::frame_lifetime::record(
+                crate::frame_lifetime::FrameEventKind::ScopeOwnerReleased,
+                frame,
+                crate::frame_reclaim::current_epoch(),
+                0,
+            );
         }
         state.tasks.clear();
         state.task_ids = Default::default();

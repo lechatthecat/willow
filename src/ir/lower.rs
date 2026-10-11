@@ -473,6 +473,7 @@ fn lower_env(program: &Program, tables: &CheckerTables) -> LowerEnv {
         ("powf".to_string(), Type::F64),
         ("gc_collect".to_string(), Type::Void),
         ("gc_minor_collect".to_string(), Type::Void),
+        ("gc_task_frame_diagnostics".to_string(), Type::Void),
         ("sched_local_pop_hits".to_string(), Type::I64),
         ("sched_global_pop_hits".to_string(), Type::I64),
         ("sched_global_pop_attempts".to_string(), Type::I64),

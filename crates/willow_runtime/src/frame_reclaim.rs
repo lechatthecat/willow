@@ -123,6 +123,11 @@ impl Drop for ExecutionUnit {
     }
 }
 
+/// Current retire epoch for diagnostics; reading it does not retire a frame.
+pub(crate) fn current_epoch() -> u64 {
+    RETIRE_EPOCH.load(Ordering::Acquire)
+}
+
 /// Tag for a frame retired now. Callers retire under the scheduler lock, so
 /// tags are monotonic in retirement order.
 pub(crate) fn retire_tag() -> u64 {

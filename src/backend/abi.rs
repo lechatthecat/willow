@@ -711,6 +711,14 @@ mod alloc_effects_tests {
     }
 
     #[test]
+    fn task_frame_diagnostics_signature_and_output_effect_match_runtime() {
+        let symbol = runtime_symbol("willow_gc_task_frame_diagnostics").unwrap();
+        assert!(symbol.params.is_empty());
+        assert_eq!(symbol.ret, None);
+        assert_eq!(symbol.effects, RuntimeEffects::MAY_BLOCK);
+    }
+
+    #[test]
     fn gc_stats_snapshot_signature_matches_runtime() {
         let symbol = runtime_symbol("willow_gc_stats_snapshot_v1").unwrap();
         assert_eq!(symbol.params, &[AbiTy::Ptr]);

@@ -153,6 +153,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_gc_stats_size" => ([I64] -> Some(I64));
     NONE; "willow_gc_stats_snapshot" => ([I64, Ptr, I64] -> Some(I64));
     NONE; "willow_gc_set_memory_limit" => ([I64] -> Some(I64));
+    BLOCK; "willow_gc_task_frame_diagnostics" => ([] -> None);
     NONE; "willow_gc_allocated_bytes" => ([] -> Some(I64));
     NONE; "willow_gc_tlab_fast_allocations" => ([] -> Some(I64));
     NONE; "willow_gc_tlab_slow_allocations" => ([] -> Some(I64));

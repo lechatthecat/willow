@@ -24,8 +24,8 @@ struct RetiredFrame {
     tag: u64,
 }
 
-/// Retired frames below this count are never scanned for early release; the
-/// outermost drive end still releases them.
+/// The ordinary run loop scans only once this batch is reached. Explicit
+/// major collection and outermost drive exit also release smaller batches.
 const FRAME_RELEASE_MIN_BATCH: usize = 64;
 
 /// Raised under the scheduler mutex when the retired-frame queue reaches its
@@ -158,6 +158,8 @@ fn park_until_fatal_abort() -> ! {
 /// Nesting depth of live `SingleWorkerForTest` guards.
 #[cfg(test)]
 static TEST_SINGLE_WORKER: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_WORKER_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 
 /// Test-only: make the worker config report a single worker while the guard is
 /// alive, so process-global drives dispatch to one persistent worker.
@@ -194,6 +196,13 @@ pub fn runtime_worker_config() -> RuntimeWorkerConfig {
     #[cfg(test)]
     if TEST_SINGLE_WORKER.load(Ordering::Acquire) > 0 {
         return RuntimeWorkerConfig::single_worker();
+    }
+    #[cfg(test)]
+    if let workers @ 1.. = TEST_WORKER_OVERRIDE.load(Ordering::Acquire) {
+        return RuntimeWorkerConfig {
+            requested_workers: workers,
+            active_workers: workers,
+        };
     }
     RuntimeWorkerConfig::from_env_value(
         std::env::var("WILLOW_WORKERS").ok().as_deref(),
@@ -1451,9 +1460,16 @@ impl RuntimeScheduler {
 
         if task.frame_rooted && !task.frame.is_null() {
             task.frame_rooted = false;
+            let tag = crate::frame_reclaim::retire_tag();
+            crate::frame_lifetime::record(
+                crate::frame_lifetime::FrameEventKind::Terminal,
+                task.frame as usize,
+                tag,
+                0,
+            );
             self.pending_frame_unroots.push_back(RetiredFrame {
                 frame: task.frame as usize,
-                tag: crate::frame_reclaim::retire_tag(),
+                tag,
             });
             if self.pending_frame_unroots.len() >= self.frame_release_scan_at {
                 FRAME_RELEASE_DUE.store(true, Ordering::Release);
@@ -1528,12 +1544,18 @@ impl RuntimeScheduler {
     /// Take the retired frames whose tag is below `bound` (see
     /// [`crate::frame_reclaim::release_bound`]). Tags are monotonic in queue
     /// order, so this pops a prefix: O(frames released + 1).
-    fn take_quiescent_frame_unroots(&mut self, bound: u64) -> Vec<usize> {
+    fn take_quiescent_frame_unroots(&mut self, bound: u64) -> Vec<RetiredFrame> {
         let mut frames = Vec::new();
         while let Some(retired) = self.pending_frame_unroots.front()
             && retired.tag < bound
         {
-            frames.push(retired.frame);
+            crate::frame_lifetime::record(
+                crate::frame_lifetime::FrameEventKind::Quiescent,
+                retired.frame,
+                retired.tag,
+                0,
+            );
+            frames.push(*retired);
             self.pending_frame_unroots.pop_front();
         }
         self.frame_roots = self
@@ -1631,6 +1653,12 @@ impl RuntimeScheduler {
         task.frame_rooted = !frame.is_null();
         if task.frame_rooted {
             self.frame_roots += 1;
+            crate::frame_lifetime::record(
+                crate::frame_lifetime::FrameEventKind::SchedulerRootAdded,
+                frame as usize,
+                crate::frame_reclaim::current_epoch(),
+                0,
+            );
         }
         self.tasks.insert(id, task);
         self.enqueue_ready(id);
@@ -3290,10 +3318,10 @@ fn drain_terminal_cleanups() {
 
 /// Unroot the retired frames whose grace period has ended (willow-vjaf).
 /// Unless `force`d, runs only once a retirement raised [`FRAME_RELEASE_DUE`],
-/// so the run loop's empty case takes no lock. The caller must not be inside
-/// an [`crate::frame_reclaim::ExecutionUnit`] of its own, or that unit's epoch
-/// holds back every frame retired during it.
-fn release_quiescent_frame_roots(force: bool) {
+/// so the run loop's empty case takes no lock. The run loop calls outside its
+/// execution unit. Explicit GC may call inside a unit: that conservatively
+/// keeps covered retirements while allowing older, quiescent ones to progress.
+pub(crate) fn release_quiescent_frame_roots(force: bool) {
     // Load before swapping: the common case must not write the shared line.
     let due = FRAME_RELEASE_DUE.load(Ordering::Acquire)
         && FRAME_RELEASE_DUE.swap(false, Ordering::AcqRel);
@@ -3302,8 +3330,14 @@ fn release_quiescent_frame_roots(force: bool) {
     }
     let bound = crate::frame_reclaim::release_bound();
     let frames = with_global(|sched| sched.take_quiescent_frame_unroots(bound));
-    for frame in frames {
-        crate::gc::willow_gc_remove_runtime_root(frame as *mut u8);
+    for retired in frames {
+        crate::gc::willow_gc_remove_runtime_root(retired.frame as *mut u8);
+        crate::frame_lifetime::record(
+            crate::frame_lifetime::FrameEventKind::SchedulerRootReleased,
+            retired.frame,
+            retired.tag,
+            0,
+        );
     }
 }
 
@@ -4243,6 +4277,12 @@ fn scheduler_run_loop(
         // the scheduler lock (poll-like), then finalize as Cancelled
         // (willow-vynv.3). The frame stays rooted until finalization.
         let cancel_work = take_global_cancel_work(id);
+        let frame_identity = cancel_work
+            .as_ref()
+            .map(|(_, frame)| *frame as usize)
+            .or_else(|| work.as_ref().map(|(_, frame, _)| *frame as usize))
+            .unwrap_or(0);
+        let _poll_lifetime = crate::frame_lifetime::PollLifetime::enter(frame_identity);
         if let Some((cancel_fn, cancel_frame)) = cancel_work {
             #[cfg(any(
                 all(

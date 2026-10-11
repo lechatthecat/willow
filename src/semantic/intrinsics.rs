@@ -1971,10 +1971,13 @@ fn f() {
 /// emission needs only the runtime call (willow-0g8j.3.1).
 ///
 /// Derived from `builtin_call_runtime_name` rather than repeating its list:
-/// `gc_collect` / `gc_minor_collect` are the void pair beside these, and
+/// Collection and task-frame diagnostic calls return void, and
 /// `sleep` / `yield` are futures, not reads.
 pub(crate) fn runtime_stat_builtin_runtime_name(callee: &str) -> Option<&'static str> {
-    if callee == "gc_collect" || callee == "gc_minor_collect" {
+    if matches!(
+        callee,
+        "gc_collect" | "gc_minor_collect" | "gc_task_frame_diagnostics"
+    ) {
         return None;
     }
     callee
@@ -1996,6 +1999,7 @@ pub(crate) fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
         "sched_victim_locks" => Some("willow_sched_victim_locks"),
         "sched_global_pushes" => Some("willow_sched_global_pushes"),
         "sched_local_pushes" => Some("willow_sched_local_pushes"),
+        "gc_task_frame_diagnostics" => Some("willow_gc_task_frame_diagnostics"),
         "gc_allocated_bytes" => Some("willow_gc_allocated_bytes"),
         "gc_tlab_fast_allocations" => Some("willow_gc_tlab_fast_allocations"),
         "gc_tlab_slow_allocations" => Some("willow_gc_tlab_slow_allocations"),

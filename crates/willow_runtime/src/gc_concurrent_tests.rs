@@ -1310,6 +1310,19 @@ fn await_allocation_between_sweep_regions(index: usize) {
     }
 }
 
+fn m2_await_allocation_with_frame_quarantined(index: usize) {
+    if index != 0 {
+        return;
+    }
+    let s = crate::frame_lifetime::snapshot();
+    // When the small frame's region precedes the large one, metadata is gone
+    // but its storage is not reusable while the sweep is between regions.
+    assert_eq!(s.task_frames_reclaimed, 0, "{s:?}");
+    assert_eq!(s.quarantined_frames, s.metadata_removed_frames, "{s:?}");
+    assert_eq!(s.quarantined_bytes, s.metadata_removed_bytes, "{s:?}");
+    await_allocation_between_sweep_regions(index);
+}
+
 #[test]
 fn concurrent_sweep_retains_new_allocations_and_quarantines_processed_spans() {
     let _guard = runtime_test_guard();
@@ -1318,11 +1331,12 @@ fn concurrent_sweep_retains_new_allocations_and_quarantines_processed_spans() {
         SWEEP_MUTATOR_READY.store(false, Ordering::Relaxed);
         SWEEP_MUTATOR_DONE.store(false, Ordering::Relaxed);
         let large = (GC_LARGE_OBJECT_THRESHOLD + 8) as i64;
+        crate::frame_lifetime::capture_events(true);
         let old_small = if allocate_in_pending_region {
             willow_alloc(large);
-            willow_alloc(8)
+            crate::async_frame::willow_async_frame_alloc(0, 0).cast::<u8>()
         } else {
-            let small = willow_alloc(8);
+            let small = crate::async_frame::willow_async_frame_alloc(0, 0).cast::<u8>();
             willow_alloc(large);
             small
         };
@@ -1358,7 +1372,7 @@ fn concurrent_sweep_retains_new_allocations_and_quarantines_processed_spans() {
         while !ready.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
-        *sweep::SWEEP_TEST_HOOK.lock().unwrap() = Some(await_allocation_between_sweep_regions);
+        *sweep::SWEEP_TEST_HOOK.lock().unwrap() = Some(m2_await_allocation_with_frame_quarantined);
         willow_gc_collect();
         *sweep::SWEEP_TEST_HOOK.lock().unwrap() = None;
         stop.store(true, Ordering::Release);
@@ -1373,6 +1387,24 @@ fn concurrent_sweep_retains_new_allocations_and_quarantines_processed_spans() {
         assert_eq!(unsafe { *(address as *const u64) }, 0xAABBCCDD);
         assert!(!unsafe { (*payload_to_header(address as *mut u8)).marked });
         assert!(runtime().heap.lock().unwrap().sweeping.is_none());
+        let lifetime = crate::frame_lifetime::snapshot();
+        assert_eq!(lifetime.task_frames_reclaimed, 1, "{lifetime:?}");
+        assert_eq!(
+            lifetime.reclaimed_frame_bytes, lifetime.allocated_frame_bytes,
+            "{lifetime:?}"
+        );
+        assert_eq!(lifetime.quarantined_frames, 0, "{lifetime:?}");
+        let events = crate::frame_lifetime::events();
+        let dead = events
+            .iter()
+            .find(|e| e.kind == crate::frame_lifetime::FrameEventKind::MetadataRemoved)
+            .unwrap();
+        let finished = events
+            .iter()
+            .find(|e| e.kind == crate::frame_lifetime::FrameEventKind::SweepCompleted)
+            .unwrap();
+        assert_eq!(dead.sweep_epoch, finished.sweep_epoch);
+        assert!(dead.sweep_epoch > 0);
         let stops = crate::gc_telemetry::stops::snapshot_stops();
         assert_eq!(stops.by_reason[1].work.swept_objects, 0);
         willow_gc_collect();

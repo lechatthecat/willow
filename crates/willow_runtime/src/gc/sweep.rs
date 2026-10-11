@@ -6,6 +6,7 @@ use super::*;
 pub(super) struct SweepPlan {
     old: usize,
     chunks: usize,
+    epoch: u64,
     marking: Option<Arc<ConcurrentCycle>>,
 }
 
@@ -22,6 +23,7 @@ pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>
     SweepPlan {
         old: state.old_regions.len(),
         chunks: state.tlab_chunks.len(),
+        epoch: state.major_collections,
         marking,
     }
 }
@@ -41,11 +43,17 @@ pub(super) fn concurrent(plan: SweepPlan) -> usize {
 
 type PendingDrop = (DropFn, *mut u8);
 
-fn run_drops(drops: &mut Vec<PendingDrop>) {
+fn run_drops(drops: &mut Vec<PendingDrop>, epoch: u64) {
     for (hook, payload) in drops.drain(..) {
         // SAFETY: dead storage is quarantined until finish(), and each hook is
         // queued once before its object leaves the live allocation metadata.
         unsafe { run_drop_hook(hook, payload) };
+        crate::frame_lifetime::record_sweep(
+            crate::frame_lifetime::FrameEventKind::DropCompleted,
+            payload as usize,
+            epoch,
+            0,
+        );
     }
 }
 
@@ -64,7 +72,7 @@ fn execute(
             &mut drops,
             plan.marking.as_deref(),
         );
-        run_drops(&mut drops);
+        run_drops(&mut drops, plan.epoch);
         if concurrent {
             between_regions(index);
         }
@@ -80,12 +88,20 @@ fn execute(
         );
         freed += bytes;
         dead_chunks.push(dead);
-        run_drops(&mut drops);
+        run_drops(&mut drops, plan.epoch);
         if concurrent {
             between_regions(plan.old + index);
         }
     }
-    finish(&mut runtime().heap.lock().unwrap(), &dead_chunks);
+    let mut state = runtime().heap.lock().unwrap();
+    finish(&mut state, &dead_chunks);
+    // Account reusable storage before another sweep can start.
+    crate::frame_lifetime::record_sweep(
+        crate::frame_lifetime::FrameEventKind::SweepCompleted,
+        0,
+        plan.epoch,
+        freed as u64,
+    );
     freed
 }
 
@@ -111,6 +127,7 @@ fn sweep_region(
     marking: Option<&ConcurrentCycle>,
 ) -> usize {
     let mut freed_bytes = 0;
+    let sweep_epoch = state.major_collections;
     // Index buffer objects carved during this sweep before visiting them.
     old_lab::retire_region(state, index);
     {
@@ -159,12 +176,17 @@ fn sweep_region(
                     true
                 } else {
                     if let Some(drop_fn) = lookup_drop(object.type_id()) {
+                        crate::frame_lifetime::pending_drop(
+                            object.payload().as_ptr() as usize,
+                            sweep_epoch,
+                        );
                         drops.push((drop_fn, object.payload().as_ptr()));
                     }
                     remembered_set.remove(&(object.payload().as_ptr() as usize));
                     if object.generation() == GC_GENERATION_YOUNG {
                         *young_allocated_bytes = young_allocated_bytes.saturating_sub(size);
                     }
+                    note_dead_frame(object, sweep_epoch);
                     object.reclaim_in_place();
                     region.live_bytes = region.live_bytes.saturating_sub(size);
                     freed_bytes += size;
@@ -255,8 +277,13 @@ fn sweep_chunk(
             let payload = object.payload().as_ptr() as usize;
             state.remembered_set.remove(&payload);
             if let Some(drop_fn) = lookup_drop(object.type_id()) {
+                crate::frame_lifetime::pending_drop(
+                    object.payload().as_ptr() as usize,
+                    state.major_collections,
+                );
                 drops.push((drop_fn, object.payload().as_ptr()));
             }
+            note_dead_frame(object, state.major_collections);
             object.reclaim_in_place();
             if object.generation() == GC_GENERATION_YOUNG {
                 state.young_allocated_bytes = state.young_allocated_bytes.saturating_sub(size);
@@ -365,5 +392,16 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
         && let Err(message) = verify_old_region_metadata(state)
     {
         panic!("willow gc: region verification failed after major collection: {message}");
+    }
+}
+
+fn note_dead_frame(object: HeapObject, sweep_epoch: u64) {
+    if object.is_async_frame() {
+        crate::frame_lifetime::metadata_removed(
+            object.payload().as_ptr() as usize,
+            object.size(),
+            crate::async_frame::frame_is_terminal(object.payload().as_ptr().cast()),
+            sweep_epoch,
+        );
     }
 }

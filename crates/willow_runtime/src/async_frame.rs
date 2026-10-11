@@ -210,12 +210,21 @@ pub extern "C" fn willow_async_frame_alloc(slot_count: i64, gc_slot_mask: u64) -
     // Data slot K maps to payload word (3 + K), i.e. bit (3 + K).
     let gc_ref_mask = gc_slot_mask << ASYNC_FRAME_HEADER_WORDS;
 
-    crate::gc::willow_alloc_with_layout(
+    let frame = crate::gc::willow_alloc_with_layout(
         crate::gc::GcObjectKind::AsyncFrame,
         0,
         payload_bytes as i64,
         gc_ref_mask,
-    ) as *mut c_void
+    ) as *mut c_void;
+    if !frame.is_null() {
+        crate::frame_lifetime::record(
+            crate::frame_lifetime::FrameEventKind::Created,
+            frame as usize,
+            crate::frame_reclaim::current_epoch(),
+            (payload_bytes + std::mem::size_of::<crate::gc::GcHeader>()) as u64,
+        );
+    }
+    frame
     // Zero-initialization is guaranteed by allocate_object (uses alloc_zeroed).
     // state = 0, slot_count = 0. Callers write slot_count via a Cranelift store.
 }
