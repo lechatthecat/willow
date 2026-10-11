@@ -1,0 +1,26 @@
+// GC closure, native Future pointer, scalar Option and both enum layouts.
+enum Tag { First, Second }
+enum Payload { Text(String), Empty }
+class Holder { pub text: String; pub future: Future<void>; }
+fn invoke(f: closure(i64) -> String) -> String { return f(7); }
+fn identity(x: i64) -> i64 { return x; }
+fn prepare() -> Holder {
+    let label = "value" + ":";
+    let f = |n: i64| label + n.toString();
+    let h = new Holder(invoke(f), sleep(0));
+    let words = [h.text, f(identity(8))];
+    let scalar: Option<i64> = Some(9);
+    let tag = Tag::Second;
+    let payload = Payload::Text(words[0]);
+    gc_collect();
+    println(words[1]);
+    match payload { Payload::Text(text) => println(text), Payload::Empty => println("bad"), }
+    println(scalar.unwrap());
+    println(tag == Tag::Second);
+    return h;
+}
+
+async fn main() {
+    let h = prepare();
+    await h.future;
+}

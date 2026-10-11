@@ -306,3 +306,6 @@ mod frozen_iteration;
 
 #[path = "integration/user_generics.rs"]
 mod user_generics;
+
+#[path = "integration/assignable_representations.rs"]
+mod assignable_representations;

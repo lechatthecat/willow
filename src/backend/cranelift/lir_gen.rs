@@ -176,29 +176,6 @@ fn scalar(ty: &Type) -> bool {
     matches!(ty, Type::I64 | Type::F64 | Type::Bool)
 }
 
-/// Whether a *supported* type is a GC-managed heap reference — answerable
-/// during eligibility, before a `FuncGen` exists, and therefore without the
-/// enum table [`is_gc_managed`] needs.
-///
-/// It can do without that table because of where it is called from: the ONLY
-/// caller is [`assignable_repr`]'s catch-all arm, which `Type::Named` never
-/// reaches (two named types are compared by name above it). That matters now
-/// that enums are in the subset (willow-0g8j.8) — an enum is `Type::Named` and
-/// is GC-managed only when some variant carries a payload, which this function
-/// has no way to know. Keep the `Named` arm ahead of the catch-all.
-///
-/// The subset also holds a generic that is NOT a GC heap object — the opaque
-/// runtime-pointer `Future<T>` — which this function would answer `true` for.
-/// It never sees it either: [`assignable_repr`] compares two generics by
-/// equality and rejects a generic against anything else, so no
-/// `Type::Generic` reaches its catch-all arm at all.
-fn gc_managed_supported(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::String | Type::Array(_) | Type::Named(_) | Type::Generic(_, _)
-    )
-}
-
 /// The builtin collection generics the walker emits, split out so eligibility
 /// and emission agree on exactly which `Type::Generic`s are in the subset.
 ///
@@ -325,6 +302,19 @@ fn map_key_supported(ty: &Type) -> bool {
 /// result, a ternary's branches). Store positions, where the walker *can* box,
 /// use [`LirTypeCtx::storable`] instead.
 fn assignable_repr(target: &Type, value: &Type) -> bool {
+    // This is deliberately local: it is not a general runtime-layout query.
+    // Nominal types need metadata (fieldless enums are words), and generic
+    // types include non-GC Future words and scalar ADT pairs. The arms
+    // below must handle them before reaching this exhaustive fallback.
+    fn gc_managed_for_assignable_catchall(ty: &Type) -> bool {
+        match ty {
+            Type::String | Type::Array(_) | Type::Closure(_, _) => true,
+            Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never | Type::Fn(_, _) => false,
+            Type::Named(_) | Type::Generic(_, _) => {
+                unreachable!("nominal type reached assignable representation catch-all")
+            }
+        }
+    }
     match (target, value) {
         (Type::Named(a), Type::Named(b)) => a == b,
         (Type::Named(_), _) | (_, Type::Named(_)) => false,
@@ -341,9 +331,13 @@ fn assignable_repr(target: &Type, value: &Type) -> bool {
         // `FrozenArray<i64>` interchangeable (willow-0g8j.7).
         (Type::Generic(..), Type::Generic(..)) => target == value,
         (Type::Generic(..), _) | (_, Type::Generic(..)) => false,
+        // Both the calling convention and signature belong to the representation.
+        (Type::Fn(..), Type::Fn(..)) | (Type::Closure(..), Type::Closure(..)) => target == value,
+        (Type::Fn(..) | Type::Closure(..), _) | (_, Type::Fn(..) | Type::Closure(..)) => false,
         _ => {
             clif_type(types::I64, target) == clif_type(types::I64, value)
-                && gc_managed_supported(target) == gc_managed_supported(value)
+                && gc_managed_for_assignable_catchall(target)
+                    == gc_managed_for_assignable_catchall(value)
         }
     }
 }
@@ -17598,3 +17592,7 @@ fn f() {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "assignable_repr_tests.rs"]
+mod assignable_repr_tests;

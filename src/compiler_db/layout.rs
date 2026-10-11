@@ -102,7 +102,7 @@ pub(crate) fn is_gc_managed(ty: &Type, named: impl FnOnce(TypeId) -> bool) -> bo
         Type::Named(name) => named(*name),
         Type::Array(_) | Type::String | Type::Closure(_, _) => true,
         Type::Generic(name, _) => name.name().as_ref() != "Future",
-        _ => false,
+        Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never | Type::Fn(_, _) => false,
     }
 }
 
