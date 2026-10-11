@@ -9,9 +9,9 @@ name = "willow_runtime"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-crossbeam-deque = "0.8.6"
-libc = "0.2"
-ryu = "1"
+crossbeam-deque = "0.8.8"
+libc = "0.2.190"
+ryu = "1.0.23"
 socket2 = "0.6.5"
 willow_abi = { path = "../willow_abi" }
 willow_runtime_macros = { path = "../willow_runtime_macros" }

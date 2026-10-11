@@ -399,7 +399,7 @@ impl UnitArtifacts {
         let Some((store, records)) = &self.previous_parsed else {
             return Ok(None);
         };
-        let fingerprint = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let fingerprint = format!("{:x}", crate::hex::Hex(&Sha256::digest(source.as_bytes())));
         records
             .get(&file)
             .filter(|(hash, _)| hash == &fingerprint)
@@ -426,7 +426,7 @@ impl UnitArtifacts {
         {
             self.correspondence.map_tokens(&old, &new);
         }
-        let fingerprint = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let fingerprint = format!("{:x}", crate::hex::Hex(&Sha256::digest(source.as_bytes())));
         for item in &program.items {
             match item {
                 Item::Function(f) => {

@@ -3,6 +3,7 @@ name = "willow"
 default-run = "willow"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
 # Only explicitly registered benchmark sources are public.
 autobenches = false
 autobins = false
@@ -20,29 +21,32 @@ path = "src/willow.rs"
 name = "willow_compiler"
 path = "src/lib.rs"
 
+[features]
+packaged = []
+
 [[bench]]
 name = "compiler_bench"
 harness = false
 
 [dependencies]
-cc = "1.4.2"
-cranelift-codegen = "0.134"
-cranelift-frontend = "0.134"
-cranelift-module = "0.134"
-cranelift-object = "0.134"
-cranelift-native = "0.134"
-target-lexicon = "0.13"
-anyhow = "1.0"
-thiserror = "2.0"
-semver = "1"
-sha2 = "0.10"
-object = "0.40"
-toml = "1.1.4"
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+cc = "1.7.0"
+cranelift-codegen = "0.136.2"
+cranelift-frontend = "0.136.2"
+cranelift-module = "0.136.2"
+cranelift-object = "0.136.2"
+cranelift-native = "0.136.2"
+target-lexicon = "0.13.5"
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+semver = "1.0.28"
+sha2 = "0.11.0"
+object = "0.40.0"
+toml = "1.1.8"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.152"
 willow_abi = { path = "crates/willow_abi" }
 willow_continuations = { path = "crates/willow_continuations" }
-toml_edit = "0.25"
+toml_edit = "0.25.17"
 
 # The runtime's hot FFI entry points (willow_sync_poll_counter, safepoint and
 # barrier fast paths) are called from every generated function. With the

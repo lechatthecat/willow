@@ -802,7 +802,7 @@ fn write_changed(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    format!("{:x}", crate::hex::Hex(&Sha256::digest(bytes)))
 }
 
 /// `fs::canonicalize` without the Windows `\\?\` verbatim prefix. MSVC's
@@ -869,7 +869,7 @@ fn hash_file(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(format!("{:x}", crate::hex::Hex(&digest.finalize())))
 }
 
 #[cfg(test)]

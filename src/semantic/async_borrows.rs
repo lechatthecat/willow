@@ -194,12 +194,10 @@ impl Checker<'_> {
                     }
                 }
                 AstEvent::ExitScope => {
-                    if state
+                    if let Some(block) = state
                         .blocks
-                        .last()
-                        .is_some_and(|block| block.scope == state.scopes.len())
+                        .pop_if(|block| block.scope == state.scopes.len())
                     {
-                        let block = state.blocks.pop().unwrap();
                         for call in block.pending.into_values() {
                             state.escape(self, call, block.span);
                         }

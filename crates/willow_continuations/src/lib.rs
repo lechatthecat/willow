@@ -193,7 +193,7 @@ pub fn methods(arguments: TokenStream, input: TokenStream) -> TokenStream {
         for argument in &mut continuation.sig.inputs {
             match argument {
                 FnArg::Receiver(receiver) => {
-                    if let Some((_, lifetime)) = &mut receiver.reference {
+                    if let syn::ReceiverKind::Reference(_, lifetime, _) = &mut receiver.kind {
                         *lifetime = Some(parse_quote!('stack));
                     }
                 }

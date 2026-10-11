@@ -23,7 +23,7 @@ fn compute_compiler_stamp() -> String {
         Ok(format!(
             "{}:{:x}",
             env!("CARGO_PKG_VERSION"),
-            hasher.finalize()
+            crate::hex::Hex(&hasher.finalize())
         ))
     })();
     // Failure cannot yield a portable compatibility promise.
@@ -78,7 +78,10 @@ impl Snapshot {
         .sum();
         let bytes =
             writer.1 + keys as u64 + 1 + serde_json::to_string(&self.revision)?.len() as u64;
-        Ok((format!("{:x}", writer.0.finalize()), bytes))
+        Ok((
+            format!("{:x}", crate::hex::Hex(&writer.0.finalize())),
+            bytes,
+        ))
     }
     pub fn validate(&self) -> Result<()> {
         self.validate_with_limit(None)

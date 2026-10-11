@@ -40,9 +40,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
       - name: Select native toolchain
-        run: rustup override set 1.95.0-${{ matrix.target }}
+        run: rustup override set 1.96.0-${{ matrix.target }}
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Clippy

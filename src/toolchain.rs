@@ -3,11 +3,15 @@
 pub mod rust_bridge;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+#[cfg(any(not(feature = "packaged"), not(all(windows, target_env = "msvc"))))]
+use std::process::Command;
+use std::process::ExitStatus;
 
 use anyhow::{Context, Result};
 
-use crate::{BuildMode, TargetOptions};
+#[cfg(not(feature = "packaged"))]
+use crate::BuildMode;
+use crate::TargetOptions;
 
 /// Platform boundary used by the compiler after native object generation.
 pub trait Toolchain {
@@ -20,6 +24,7 @@ pub trait Toolchain {
 /// Toolchain for the host Rust target.
 pub struct HostToolchain {
     target: TargetOptions,
+    #[cfg(not(feature = "packaged"))]
     runtime_lock: std::cell::RefCell<Option<std::fs::File>>,
 }
 
@@ -27,6 +32,7 @@ impl HostToolchain {
     pub fn new(target: &TargetOptions) -> Self {
         Self {
             target: target.clone(),
+            #[cfg(not(feature = "packaged"))]
             runtime_lock: std::cell::RefCell::new(None),
         }
     }
@@ -39,6 +45,7 @@ impl HostToolchain {
         }
     }
 
+    #[cfg(not(feature = "packaged"))]
     fn default_runtime_library_path(&self) -> PathBuf {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let target_dir = self
@@ -60,22 +67,32 @@ impl HostToolchain {
 
     /// Read-only availability probe: doctor must not build or link anything.
     pub fn runtime_library_status(&self) -> serde_json::Value {
-        let bundled = std::env::current_exe().ok().and_then(|exe| {
-            exe.parent()?.parent().map(|root| {
-                root.join("lib").join(if cfg!(target_env = "msvc") {
-                    "willow_runtime.lib"
-                } else {
-                    "libwillow_runtime.a"
-                })
-            })
-        });
-        let path = self
-            .target
-            .runtime_lib
-            .clone()
-            .or_else(|| bundled.filter(|p| p.is_file()))
-            .unwrap_or_else(|| self.default_runtime_library_path());
-        serde_json::json!({"required":true, "available":path.is_file(), "path":path})
+        let (path, available) = if let Some(path) = &self.target.runtime_lib {
+            (Some(path.clone()), path.is_file())
+        } else {
+            let path = std::env::current_exe()
+                .ok()
+                .and_then(|exe| bundled_runtime_path(&exe, cfg!(target_env = "msvc")));
+            let available = path.as_ref().is_some_and(|path| path.is_file());
+            #[cfg(not(feature = "packaged"))]
+            let (path, available) = if available {
+                (path, available)
+            } else {
+                let path = self.default_runtime_library_path();
+                let available = path.is_file();
+                (Some(path), available)
+            };
+            (path, available)
+        };
+        serde_json::json!({"required":true, "available":available, "path":path})
+    }
+
+    pub fn runtime_library_help(&self) -> &'static str {
+        if cfg!(feature = "packaged") {
+            "restore lib/<runtime> beside bin/willow from the release archive, or pass --runtime-lib / WILLOW_RUNTIME_LIB"
+        } else {
+            "place the bundled runtime in ../lib relative to willow, build willow_runtime with Cargo, or pass --runtime-lib / WILLOW_RUNTIME_LIB"
+        }
     }
 
     pub fn native_linker_status(&self) -> serde_json::Value {
@@ -96,6 +113,7 @@ impl HostToolchain {
         }
     }
 
+    #[cfg(not(feature = "packaged"))]
     fn build_default_runtime_library(&self) -> Result<()> {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut args = vec!["build", "-p", "willow_runtime"];
@@ -142,36 +160,41 @@ impl Toolchain for HostToolchain {
         }
         // Relocatable installs keep bin/willow beside lib/<runtime>. Do not
         // touch the build tree or invoke Cargo when the bundled library exists.
-        if let Ok(executable) = std::env::current_exe()
-            && let Some(root) = executable.parent().and_then(Path::parent)
+        let bundled = std::env::current_exe()
+            .ok()
+            .and_then(|exe| bundled_runtime_path(&exe, cfg!(target_env = "msvc")));
+        if let Some(path) = bundled.as_ref().filter(|path| path.is_file()) {
+            return Ok(path.clone());
+        }
+        #[cfg(feature = "packaged")]
+        anyhow::bail!(
+            "searched bundled runtime {}; WILLOW_RUNTIME_LIB / --runtime-lib not set",
+            bundled.map_or_else(
+                || "../lib (executable location unavailable)".to_owned(),
+                |path| path.display().to_string()
+            )
+        );
+        #[cfg(not(feature = "packaged"))]
         {
-            let bundled = root.join("lib").join(if cfg!(target_env = "msvc") {
-                "willow_runtime.lib"
-            } else {
-                "libwillow_runtime.a"
-            });
-            if bundled.is_file() {
-                return Ok(bundled);
+            let path = self.default_runtime_library_path();
+            // Cargo may replace the un-hashed staticlib alias even for a fresh
+            // build. Hold a process-shared lock through linking so another Willow
+            // compiler cannot remove that alias while the linker is opening it.
+            if self.runtime_lock.borrow().is_none() {
+                let directory = path.parent().expect("runtime profile directory");
+                std::fs::create_dir_all(directory)?;
+                let lock = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(directory.join(".willow-runtime.lock"))?;
+                lock.lock().context("failed to lock the runtime library")?;
+                *self.runtime_lock.borrow_mut() = Some(lock);
             }
+            self.build_default_runtime_library()?;
+            validate_runtime_library(path)
         }
-        let path = self.default_runtime_library_path();
-        // Cargo may replace the un-hashed staticlib alias even for a fresh
-        // build. Hold a process-shared lock through linking so another Willow
-        // compiler cannot remove that alias while the linker is opening it.
-        if self.runtime_lock.borrow().is_none() {
-            let directory = path.parent().expect("runtime profile directory");
-            std::fs::create_dir_all(directory)?;
-            let lock = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(directory.join(".willow-runtime.lock"))?;
-            lock.lock().context("failed to lock the runtime library")?;
-            *self.runtime_lock.borrow_mut() = Some(lock);
-        }
-        self.build_default_runtime_library()?;
-        validate_runtime_library(path)
     }
 
     fn link(&self, object: &Path, runtime: &Path, output: &str) -> Result<ExitStatus> {
@@ -187,6 +210,14 @@ impl Toolchain for HostToolchain {
         }
         Ok(())
     }
+}
+
+fn bundled_runtime_path(executable: &Path, msvc: bool) -> Option<PathBuf> {
+    Some(executable.parent()?.parent()?.join("lib").join(if msvc {
+        "willow_runtime.lib"
+    } else {
+        "libwillow_runtime.a"
+    }))
 }
 
 /// Keep unsupported linker families unchanged rather than assuming GNU flags.
@@ -439,6 +470,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "packaged"))]
     fn runtime_library_path_uses_profile_and_platform_name() {
         let mut target = crate::CompilerOptions::release().target;
         target.cargo_target_dir = Some(PathBuf::from("custom-target"));
@@ -452,6 +484,75 @@ mod tests {
             } else {
                 "libwillow_runtime.a"
             }
+        );
+    }
+
+    #[test]
+    fn bundled_layouts_use_native_archive_names() {
+        for (root, binary, msvc, archive) in [
+            ("linux", "willow", false, "libwillow_runtime.a"),
+            ("macos-arm64", "willow", false, "libwillow_runtime.a"),
+            ("macos-x86_64", "willow", false, "libwillow_runtime.a"),
+            ("windows", "willow.exe", true, "willow_runtime.lib"),
+        ] {
+            let root = PathBuf::from(root);
+            assert_eq!(
+                bundled_runtime_path(&root.join("bin").join(binary), msvc),
+                Some(root.join("lib").join(archive))
+            );
+        }
+        assert_eq!(bundled_runtime_path(Path::new("willow"), false), None);
+        for depth in [1, 8, 64, 256] {
+            let mut root = PathBuf::from("root with spaces");
+            for _ in 0..depth {
+                root.push("nested");
+            }
+            assert_eq!(
+                bundled_runtime_path(&root.join("bin/willow"), false),
+                Some(root.join("lib/libwillow_runtime.a"))
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_help_matches_distribution_mode() {
+        let host = HostToolchain::new(&crate::CompilerOptions::debug().target);
+        assert_eq!(
+            host.runtime_library_help().contains("Cargo"),
+            !cfg!(feature = "packaged")
+        );
+        assert!(host.runtime_library_help().contains("WILLOW_RUNTIME_LIB"));
+        assert!(host.runtime_library_help().contains("--runtime-lib"));
+    }
+
+    #[test]
+    fn runtime_probe_honors_explicit_path_without_building() {
+        let mut target = crate::CompilerOptions::debug().target;
+        target.runtime_lib = Some(PathBuf::from("absent-explicit-runtime"));
+        let host = HostToolchain::new(&target);
+        let status = host.runtime_library_status();
+        assert_eq!(status["path"], "absent-explicit-runtime");
+        assert_eq!(status["available"], false);
+        assert_eq!(status["required"], true);
+        assert!(
+            host.resolve_runtime_library()
+                .unwrap_err()
+                .to_string()
+                .contains("absent-explicit-runtime")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "packaged")]
+    fn packaged_probe_never_selects_source_runtime() {
+        let host = HostToolchain::new(&crate::CompilerOptions::debug().target);
+        let expected =
+            bundled_runtime_path(&std::env::current_exe().unwrap(), cfg!(target_env = "msvc"));
+        let status = host.runtime_library_status();
+        assert_eq!(status["path"], serde_json::json!(expected));
+        assert_eq!(
+            status["available"],
+            expected.is_some_and(|path| path.is_file())
         );
     }
 

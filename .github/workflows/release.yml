@@ -44,11 +44,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup toolchain install 1.95.0 --profile minimal
+        run: rustup toolchain install 1.96.0 --profile minimal
       - name: Select native toolchain
-        run: rustup override set 1.95.0-${{ matrix.target }}
+        run: rustup override set 1.96.0-${{ matrix.target }}
       - name: Build
-        run: cargo build --locked --release -p willow -p willow_runtime
+        run: cargo build --locked --release --features willow/packaged -p willow -p willow_runtime
       # Relocatable layout: bin/willow finds ../lib/<runtime> without Cargo.
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -68,8 +68,6 @@ jobs:
           Copy-Item README.md, LICENSE "$env:PACKAGE/"
           Compress-Archive -Path $env:PACKAGE -DestinationPath "$env:PACKAGE.zip"
       # Compile and run a program with the packaged runtime library only.
-      # Without the bundled library, willow falls back to `cargo build -p
-      # willow_runtime` in the checkout, so hide cargo to make that fail.
       - name: Smoke test bundled layout (Unix)
         if: runner.os != 'Windows'
         # Explicit bash runs with -eo pipefail, so a failing willow is not
@@ -81,6 +79,14 @@ jobs:
           printf 'fn main() {\n    print("hello");\n}\n' > "$RUNNER_TEMP/hello.wi"
           "$PACKAGE/bin/willow" run "$RUNNER_TEMP/hello.wi" | tee "$RUNNER_TEMP/hello.out"
           grep -qx hello "$RUNNER_TEMP/hello.out"
+          mkdir -p "$RUNNER_TEMP/relocated/bin"
+          cp "$PACKAGE/bin/willow" "$RUNNER_TEMP/relocated/bin/"
+          if "$RUNNER_TEMP/relocated/bin/willow" run "$RUNNER_TEMP/hello.wi" > "$RUNNER_TEMP/missing.out" 2>&1; then
+            echo "relocated binary unexpectedly found a runtime"; exit 1
+          fi
+          grep -F "$RUNNER_TEMP/relocated/lib/libwillow_runtime.a" "$RUNNER_TEMP/missing.out"
+          grep -F WILLOW_RUNTIME_LIB "$RUNNER_TEMP/missing.out"
+          if grep -E 'Permission denied|build willow_runtime with Cargo' "$RUNNER_TEMP/missing.out" || grep -F "$GITHUB_WORKSPACE/" "$RUNNER_TEMP/missing.out"; then exit 1; fi
       - name: Smoke test bundled layout (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -92,6 +98,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $out
           if (@($out) -notcontains "hello") { throw "smoke test output mismatch" }
+          New-Item -ItemType Directory "$env:RUNNER_TEMP/relocated/bin" | Out-Null
+          Copy-Item "$env:PACKAGE/bin/willow.exe" "$env:RUNNER_TEMP/relocated/bin/"
+          $missing = & "$env:RUNNER_TEMP/relocated/bin/willow.exe" run "$env:RUNNER_TEMP/hello.wi" 2>&1
+          if ($LASTEXITCODE -eq 0) { throw "relocated binary unexpectedly found a runtime" }
+          $text = $missing -join "`n"
+          if (-not $text.Contains('willow_runtime.lib') -or -not $text.Contains('WILLOW_RUNTIME_LIB')) { throw "missing runtime diagnostic mismatch: $text" }
+          if ($text -match 'Permission denied|build willow_runtime with Cargo') { throw "source fallback diagnostic: $text" }
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}

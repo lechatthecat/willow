@@ -113,8 +113,9 @@ impl RustBridgeSymbol {
         let package_hash = Sha256::digest(identity.as_bytes());
         let name = self.willow_function.rsplit("::").next().unwrap();
         bound.abi_symbol = format!(
-            "__willow_rust_{package_hash:x}_{name}_{:x}",
-            Sha256::digest(bytes)
+            "__willow_rust_{:x}_{name}_{:x}",
+            crate::hex::Hex(&package_hash),
+            crate::hex::Hex(&Sha256::digest(bytes))
         );
         bound
     }

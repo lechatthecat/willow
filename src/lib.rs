@@ -12,6 +12,7 @@ pub(crate) mod compiler_stack;
 pub mod desugar;
 pub mod diagnostics;
 pub mod errors;
+mod hex;
 pub mod interpolate;
 pub mod ir;
 pub mod lexer;
@@ -2593,7 +2594,7 @@ fn run_backend(
             ErrorCode::E0700,
             format!("runtime library unavailable: {err}"),
         )
-        .with_help("place the bundled runtime in ../lib relative to willow, build willow_runtime with Cargo, or pass --runtime-lib / WILLOW_RUNTIME_LIB");
+        .with_help(toolchain.runtime_library_help());
         match emitter.emit(&d, map) {
             Ok(()) => anyhow::anyhow!("runtime library unavailable"),
             Err(error) => error.into(),

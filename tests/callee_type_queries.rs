@@ -83,21 +83,21 @@ fn non_callee_positions_and_expression_evidence_are_unchanged() {
     let revision = snapshot.revision.clone();
     // Reseal the deliberately altered fixture using the snapshot digest tuple.
     use sha2::{Digest, Sha256};
-    baseline.revision = format!(
-        "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&(
-                baseline.version,
-                &baseline.compiler,
-                &baseline.compatibility,
-                &baseline.workspace,
-                &baseline.sources,
-                &baseline.functions,
-                &baseline.semantic,
-            ))
-            .unwrap()
-        )
-    );
+    baseline.revision = Sha256::digest(
+        serde_json::to_vec(&(
+            baseline.version,
+            &baseline.compiler,
+            &baseline.compatibility,
+            &baseline.workspace,
+            &baseline.sources,
+            &baseline.functions,
+            &baseline.semantic,
+        ))
+        .unwrap(),
+    )
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
     let baseline_revision = baseline.revision.clone();
     let mut baseline = QuerySession::new(baseline).unwrap();
     let mut session = QuerySession::new(snapshot).unwrap();

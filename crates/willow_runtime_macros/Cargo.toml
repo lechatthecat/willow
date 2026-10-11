@@ -8,8 +8,8 @@ license = "Apache-2.0"
 proc-macro = true
 
 [dependencies]
-syn = { version = "2", features = ["full"] }
-quote = "1"
+syn = { version = "3.0.7", features = ["full"] }
+quote = "1.0.47"
 
 [dev-dependencies]
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3.0.7", features = ["full", "visit"] }

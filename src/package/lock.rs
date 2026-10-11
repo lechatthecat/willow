@@ -37,12 +37,12 @@ pub(crate) fn rust_input_hash(
     use sha2::{Digest, Sha256};
     Ok(format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(&(
+        crate::hex::Hex(&Sha256::digest(serde_json::to_vec(&(
             &project.rust_dependencies,
             &project.rust,
             wrapper_schema,
             abi_revision,
-        ))?)
+        ))?))
     ))
 }
 

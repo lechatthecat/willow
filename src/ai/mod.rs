@@ -107,7 +107,7 @@ pub struct Snapshot {
 }
 
 pub(crate) fn hash(bytes: impl AsRef<[u8]>) -> String {
-    format!("{:x}", Sha256::digest(bytes.as_ref()))
+    format!("{:x}", crate::hex::Hex(&Sha256::digest(bytes.as_ref())))
 }
 
 pub(crate) fn hash_serialized(value: &impl Serialize) -> Result<String> {
@@ -123,7 +123,7 @@ pub(crate) fn hash_serialized(value: &impl Serialize) -> Result<String> {
     }
     let mut writer = HashWriter(Sha256::new());
     serde_json::to_writer(&mut writer, value)?;
-    Ok(format!("{:x}", writer.0.finalize()))
+    Ok(format!("{:x}", crate::hex::Hex(&writer.0.finalize())))
 }
 
 pub(crate) struct CapturedUnit {

@@ -542,8 +542,11 @@ fn independent_project_archives_keep_same_named_rust_functions_distinct() {
         let bytes = fs::read(build.staticlib.as_ref().unwrap()).unwrap();
         let archive = object::read::archive::ArchiveFile::parse(&*bytes).unwrap();
         let prefix = format!(
-            "__willow_rust_{:x}_add_",
+            "__willow_rust_{}_add_",
             Sha256::digest(fixture.root.to_str().unwrap().as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         );
         let names: Vec<_> = archive
             .symbols()

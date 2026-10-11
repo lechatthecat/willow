@@ -89,6 +89,8 @@ tar xzf willow-v0.0.1-linux-x86_64.tar.gz
 
 For convenience, add the archive's `bin` directory to your `PATH`. Keep `bin/` and `lib/` together: `willow` finds its runtime library in `../lib`. No Rust toolchain is needed, but Willow links programs with the system C toolchain: `cc` on Linux and macOS, or the MSVC Build Tools on Windows.
 
+Release archives use the `packaged` Cargo feature: a missing bundled runtime reports its searched location and never falls back to the build machine's checkout or invokes Cargo. Restore the archive's `lib/`, or select a compatible runtime with `--runtime-lib` or `WILLOW_RUNTIME_LIB`. Source builds without this feature retain automatic runtime builds with Cargo.
+
 Each release also includes a `SHA256SUMS` file containing the SHA-256 digest of every platform archive. Download it alongside your archive and verify the checksum before extracting.
 
 On Linux, when only the downloaded platform archive is in the directory:

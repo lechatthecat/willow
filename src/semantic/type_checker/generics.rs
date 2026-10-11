@@ -451,7 +451,7 @@ fn uses_parameters(ty: &Type, parameters: &HashSet<&str>) -> bool {
 fn symbol(name: &str, args: &[Type]) -> String {
     let mut digest = Sha256::new();
     digest.update(serde_json::to_vec(args).expect("type serialization"));
-    format!("{name}$mono${:x}", digest.finalize())
+    format!("{name}$mono${:x}", crate::hex::Hex(&digest.finalize()))
 }
 
 impl TypeChecker {

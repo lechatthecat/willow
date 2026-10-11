@@ -35,21 +35,21 @@ jobs:
           ref: ba2b7ab4b5eb84ddf2d9d9f0dcadf0334f9e6a28
           path: baseline
       - name: Install toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component llvm-tools
+        run: rustup toolchain install 1.96.0 --profile minimal --component llvm-tools
       - name: Build compiler and runtime pair
         shell: bash
         run: |
           python3 scripts/prepare_benchmark_baseline.py baseline
-          cargo +1.95.0 build --locked --bin willow
-          cargo +1.95.0 build --locked --release -p willow_runtime
-          cargo +1.95.0 build --locked --release --manifest-path baseline/Cargo.toml -p willow_runtime --target-dir baseline/target
+          cargo +1.96.0 build --locked --bin willow
+          cargo +1.96.0 build --locked --release -p willow_runtime
+          cargo +1.96.0 build --locked --release --manifest-path baseline/Cargo.toml -p willow_runtime --target-dir baseline/target
       - name: Native correctness gates
         shell: bash
         run: |
-          cargo +1.95.0 test --locked -p willow_runtime
-          cargo +1.95.0 test --locked --lib toolchain::
-          cargo +1.95.0 test --locked --test integration toolchain::
-          cargo +1.95.0 test --locked --test integration panic_recover_stress::
+          cargo +1.96.0 test --locked -p willow_runtime
+          cargo +1.96.0 test --locked --lib toolchain::
+          cargo +1.96.0 test --locked --test integration toolchain::
+          cargo +1.96.0 test --locked --test integration panic_recover_stress::
       - name: Timing and accessor disassembly
         shell: bash
         run: |

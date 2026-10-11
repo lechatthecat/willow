@@ -54,7 +54,10 @@ impl InteropGraph {
             .filter(|lock| lock.bridge_input_hash == input_hash);
         let lock = if let Some(lock) = lock {
             match std::fs::read(root.join(".willow/rust/Cargo.lock")) {
-                Ok(bytes) if format!("{:x}", Sha256::digest(&bytes)) == lock.cargo_lock_hash => {
+                Ok(bytes)
+                    if format!("{:x}", crate::hex::Hex(&Sha256::digest(&bytes)))
+                        == lock.cargo_lock_hash =>
+                {
                     Some(lock)
                 }
                 Ok(_) => None,
