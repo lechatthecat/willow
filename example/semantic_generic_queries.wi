@@ -1,0 +1,16 @@
+// willow overview example/semantic_generic_queries.wi --depth 1
+// willow refs semantic_generic_queries::fold --source example/semantic_generic_queries.wi
+// willow rename semantic_generic_queries::Ring::push put --source example/semantic_generic_queries.wi --dry-run
+fn fold<T>(value: T) -> T { return value; }
+// This body is checked and queryable even though main never instantiates it.
+fn unused_wrapper<T>(value: T) -> T { return fold(value); }
+class Ring<T> {
+    pub value: T;
+    pub fn push(self, value: T) -> T { return value; }
+}
+fn main() {
+    println(fold(7));
+    println(fold("generic"));
+    let ring = new Ring<i64>(3);
+    println(ring.push(11));
+}

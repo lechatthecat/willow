@@ -4,6 +4,7 @@ pub mod direct;
 mod dispatch;
 mod display;
 pub mod edit;
+pub(crate) mod generics;
 mod graph;
 pub mod interop;
 pub mod overview;
@@ -520,6 +521,7 @@ pub(crate) fn snapshot(
         .borrow_mut()
         .take()
         .context("analysis capture disabled")?;
+    generics::restore(&frontend.db.generic_sources, &mut captured);
     let mut paths = HashMap::from([(UnitId::ENTRY, entry.to_string_lossy().into_owned())]);
     let mut namespaces = HashMap::new();
     let mut programs = HashMap::from([(UnitId::ENTRY, &frontend.program)]);
@@ -612,7 +614,25 @@ pub(crate) fn snapshot(
     let mut item_imports = Vec::new();
     for (&unit, program) in &programs {
         let mut map = HashMap::new();
+        // Generated imports still resolve checked call targets. Source imports
+        // below supply public selectors and edit provenance, not replacement
+        // compiler namespaces.
         for import in &program.imports {
+            if let Some(target) = frontend.db.dependencies().unit_for_path(unit, &import.path) {
+                let local = import
+                    .alias
+                    .as_deref()
+                    .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+                map.insert(local.to_owned(), (target, None));
+                map.insert(import.path.clone(), (target, None));
+            }
+        }
+        for import in frontend
+            .db
+            .generic_sources
+            .get(&unit)
+            .map_or(&program.imports, |s| &s.imports)
+        {
             let local = import
                 .alias
                 .as_deref()
@@ -641,6 +661,21 @@ pub(crate) fn snapshot(
             {
                 map.insert(local.to_string(), (target, Some(item.to_string())));
                 item_imports.push((unit, target, item, import.span));
+                if let Some(declaration) = frontend
+                    .db
+                    .generic_sources
+                    .get(&target)
+                    .and_then(|s| s.items.get(item))
+                    && let Some(capture) = captured.get_mut(&unit)
+                {
+                    capture.symbols.reference(
+                        import.span,
+                        &import.path,
+                        declaration.clone(),
+                        "import-target",
+                        true,
+                    );
+                }
             }
         }
         aliases.insert(unit, map);
@@ -649,7 +684,20 @@ pub(crate) fn snapshot(
         Some(owner) => FunctionId::method(TypeId::local(owner), id.name()),
         None => FunctionId::free(id.name()),
     };
-    let resolve = |unit: UnitId, id: FunctionId| -> (UnitId, FunctionId) {
+    let resolve_uncached = |unit: UnitId, id: FunctionId| -> (UnitId, FunctionId) {
+        if let (Some(ns), Some(owner)) = (id.namespace(), id.owner()) {
+            // A qualified module function is represented as a static call:
+            // the module's final path segment occupies the owner slot.
+            let module = format!("{ns}::{owner}");
+            if let Some(target) = namespaces.get(&module).copied().or_else(|| {
+                aliases[&unit]
+                    .get(&module)
+                    .filter(|(_, item)| item.is_none())
+                    .map(|(target, _)| *target)
+            }) {
+                return (target, FunctionId::free(id.name()));
+            }
+        }
         if let Some(ns) = id.namespace() {
             if let Some(target) = namespaces.get(ns.as_ref()) {
                 return (*target, local_id(id));
@@ -673,6 +721,16 @@ pub(crate) fn snapshot(
             return (*target, FunctionId::free(item));
         }
         (unit, id)
+    };
+    let resolutions = std::cell::RefCell::new(HashMap::new());
+    let resolve = |unit: UnitId, id: FunctionId| {
+        let key = (unit, id);
+        if let Some(target) = resolutions.borrow().get(&key).copied() {
+            return target;
+        }
+        let target = resolve_uncached(unit, id);
+        resolutions.borrow_mut().insert(key, target);
+        target
     };
     let mut nodes: HashMap<(UnitId, FunctionId), Function> = HashMap::new();
     for (&unit, capture) in &captured {
@@ -718,15 +776,6 @@ pub(crate) fn snapshot(
                     end: span.end,
                 });
             }
-        }
-    }
-    for (unit, target, item, span) in item_imports {
-        if let Some(node) = nodes.get_mut(&(target, FunctionId::free(item))) {
-            node.rename_imports.push(Location {
-                path: paths[&unit].clone(),
-                start: span.start,
-                end: span.end,
-            });
         }
     }
     // Declared types whose calls have no Willow body: an implicit memberwise
@@ -945,6 +994,26 @@ pub(crate) fn snapshot(
             node.runtime_effects = RuntimeEffects::ALL.bits();
         }
     }
+    generics::aggregate(
+        &frontend.db.generic_sources,
+        &paths,
+        &mut functions,
+        &mut semantic,
+    );
+    let by_source: HashMap<_, _> = functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| ((f.module.clone(), f.name.clone()), i))
+        .collect();
+    for (unit, target, item, span) in item_imports {
+        if let Some(&i) = by_source.get(&(paths[&target].clone(), item.to_owned())) {
+            functions[i].rename_imports.push(Location {
+                path: paths[&unit].clone(),
+                start: span.start,
+                end: span.end,
+            });
+        }
+    }
     functions.sort_by(|a, b| a.id.cmp(&b.id));
     for node in &mut functions {
         node.locations
@@ -953,7 +1022,6 @@ pub(crate) fn snapshot(
         node.unresolved.sort();
         node.unresolved.dedup();
     }
-    graph::propagate(&mut functions);
     // Compiler format revision plus build source stamp: snapshots never silently
     // cross a compiler change, even when Cargo's package version stays fixed.
     let compiler = storage::compiler_stamp();
@@ -998,6 +1066,13 @@ pub(crate) fn snapshot(
         })
         .collect();
     semantic.references = frontend.db.references.capture(symbol_references, &ranges)?;
+    generics::source_edges(
+        &frontend.db.generic_sources,
+        &paths,
+        &mut functions,
+        &semantic.references,
+    );
+    graph::propagate(&mut functions);
     packages::attach(frontend, &paths, &captured, &mut functions, &mut semantic)?;
     semantic.rust_bridges = frontend
         .db
@@ -1027,6 +1102,9 @@ pub(crate) fn snapshot(
         functions,
         semantic,
     };
+    if !frontend.db.generic_sources.is_empty() {
+        generics::present_types(&mut snapshot);
+    }
     snapshot.revision = snapshot.digest()?;
     Ok(snapshot)
 }

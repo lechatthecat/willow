@@ -512,3 +512,78 @@ fn difference(
 ) -> Value {
     serde_json::to_value(before.compare(after, Default::default()).unwrap()).unwrap()
 }
+
+#[test]
+fn generic_operations_are_source_facing_in_snapshots_risk_and_queries() {
+    for imported in [false, true] {
+        let source = if imported {
+            "import coll::fold; fn main() { println(fold(1)); println(fold(true)); }"
+        } else {
+            "fn fold<T>(x: T) -> T { return x; } fn main() { println(fold(1)); println(fold(true)); }"
+        };
+        let f = Fixture::new(source);
+        if imported {
+            f.write(
+                "coll.wi",
+                "module coll; pub fn fold<T>(x: T) -> T { return x; }",
+            );
+        }
+        let snapshot = f.analyze();
+        let serialized = serde_json::to_value(&snapshot).unwrap();
+        let risk = snapshot.risk(&snapshot).unwrap();
+        let expected = if imported {
+            "static:coll::fold"
+        } else {
+            "call:fold"
+        };
+        for value in [&serialized["semantic"]["expressions"], &risk["operations"]] {
+            let operations: Vec<_> = value
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|e| e["operation"].as_str())
+                .collect();
+            assert_eq!(
+                operations.iter().filter(|&&op| op == expected).count(),
+                2,
+                "{operations:?}"
+            );
+            assert!(operations.contains(&"io:print"));
+        }
+        for value in [&serialized, &risk] {
+            let text = serde_json::to_string(value).unwrap();
+            assert!(!text.contains("$mono$"), "{text}");
+            assert!(!text.contains("$pkg"), "{text}");
+        }
+        for operation in risk["operations"].as_array().unwrap() {
+            assert_eq!(operation["new_operation"], false);
+            if operation["operation"] == expected {
+                assert_eq!(operation["effect_certainty"], "proven-absent");
+            }
+        }
+        // A changed instantiation still reports source operation names in the diff.
+        let changed = source.replace("fold(true)", "fold(2)");
+        f.write("main.wi", &changed);
+        let changed_snapshot = f.analyze();
+        let diff = changed_snapshot.risk(&snapshot).unwrap();
+        let operations = diff["operations"].as_array().unwrap();
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|e| e["operation"] == expected)
+                .count(),
+            2
+        );
+        let text = serde_json::to_string(&diff).unwrap();
+        assert!(
+            !text.contains("$mono$") && !text.contains("$pkg") && !text.contains("$local"),
+            "{text}"
+        );
+        f.write("queries.json", r#"[{"kind":"symbols","name":"fold"}]"#);
+        let query = f.result(&["query", "main.wi", "--requests", "queries.json"]);
+        assert_eq!(query["results"][0]["result"]["status"], "ok");
+        assert_eq!(query["results"][0]["result"]["symbols"][0]["name"], "fold");
+        let text = serde_json::to_string(&query).unwrap();
+        assert!(!text.contains("$mono$") && !text.contains("$pkg"), "{text}");
+    }
+}

@@ -17,6 +17,7 @@ struct InstantiatedClass {
 /// One owned template per source declaration across every checker in a build.
 #[derive(Default)]
 pub(crate) struct TemplateRegistry {
+    pub capture_source_references: bool,
     pub module_paths: Rc<HashMap<crate::diagnostics::FileId, String>>,
     requested: HashSet<InstantiationKey>,
     nominal_types: HashMap<String, Rc<InstantiationType>>,
@@ -76,6 +77,7 @@ impl TemplateRegistry {
 pub(crate) struct Generics {
     pub registry: Rc<RefCell<TemplateRegistry>>,
     pub abstract_check: bool,
+    pub source_symbols: crate::semantic::analysis_symbols::Facts,
     pub functions: HashMap<String, std::rc::Rc<FunctionDecl>>,
     pub classes: HashMap<String, std::rc::Rc<ClassDecl>>,
     pub instances: HashMap<InstantiationKey, String>,
@@ -135,6 +137,46 @@ mod template_registry_tests {
         program
     }
 
+    #[test]
+    fn abstract_source_references_are_opt_in_and_resolved_once() {
+        for n in [1, 16, 256] {
+            let source = format!(
+                "fn fold<T>(x: T) -> T {{ return x; }} fn wrapper<T>(x: T) -> T {{ {} return x; }} fn main() {{}}",
+                "fold(x);".repeat(n),
+            );
+            let program = parse(&source);
+            let Item::Function(fold) = &program.items[0] else {
+                unreachable!()
+            };
+            for enabled in [false, true] {
+                let mut checker = TypeChecker::new();
+                checker
+                    .generics
+                    .registry
+                    .borrow_mut()
+                    .capture_source_references = enabled;
+                checker.check_program(&program);
+                assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                let references = &checker.generics.source_symbols.references;
+                let calls: Vec<_> = references
+                    .iter()
+                    .filter(|r| r.role == "call" && r.target.kind == "function")
+                    .collect();
+                assert_eq!(calls.len(), if enabled { n } else { 0 });
+                assert!(
+                    calls
+                        .iter()
+                        .all(|r| r.written == "fold" && r.target.span == fold.span)
+                );
+                assert!(checker.generics.pending.is_empty());
+                assert!(checker.generics.emitted.is_empty());
+                println!(
+                    "abstract_calls={n} enabled={enabled} resolved_references={} queued_instances=0",
+                    calls.len()
+                );
+            }
+        }
+    }
     #[test]
     fn nested_reference_inference_checks_each_generic_call_once() {
         for depth in [1, 4, 8, 16] {
@@ -802,6 +844,20 @@ impl TypeChecker {
             .substitute_names(|n| bindings.get(n).cloned());
         let result = self.normalize_type(&result, span);
         if self.generics.abstract_check {
+            if self.capture_call_sites {
+                self.analysis_symbols.reference(
+                    span,
+                    callee,
+                    crate::semantic::analysis_symbols::Declaration::new(
+                        &template.name,
+                        "function",
+                        template.span,
+                        None,
+                    ),
+                    "call",
+                    false,
+                );
+            }
             return Some(if template.is_async {
                 Type::Generic("Task".into(), vec![result])
             } else {
@@ -1025,6 +1081,7 @@ impl TypeChecker {
         // Abstract checking has a separate symbol/output epoch: no symbolic
         // type or speculative body can escape into the concrete artifact set.
         let mut checker = TypeChecker::new();
+        checker.capture_call_sites = self.generics.registry.borrow().capture_source_references;
         *checker.symbols = self.symbols.clone();
         checker.resolution = self.resolution.clone();
         checker.generics.functions = self.generics.functions.clone();
@@ -1078,6 +1135,11 @@ impl TypeChecker {
             checker.register_class(&c);
             checker.check_class(&c);
             checker.generics.pending.clear();
+        }
+        if checker.capture_call_sites {
+            self.generics
+                .source_symbols
+                .extend(checker.analysis_symbols);
         }
         self.errors.extend(checker.errors);
     }

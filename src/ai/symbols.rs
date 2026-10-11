@@ -31,13 +31,21 @@ pub struct DeclarationDetails {
 }
 
 pub(super) fn details(program: &Program) -> HashMap<Span, DeclarationDetails> {
+    details_of(program.items.iter())
+}
+pub(super) fn details_of<'a>(
+    items: impl Iterator<Item = &'a Item>,
+) -> HashMap<Span, DeclarationDetails> {
     let mut result = HashMap::new();
-    for item in &program.items {
+    for item in items {
         match item {
-            Item::Function(f) if f.is_async || f.constant.is_some() => {
+            Item::Function(f)
+                if f.is_async || f.constant.is_some() || !f.type_params.is_empty() =>
+            {
                 result.insert(
                     f.span,
                     DeclarationDetails {
+                        type_params: f.type_params.clone(),
                         is_async: f.is_async,
                         is_const: f.constant.is_some(),
                         ..Default::default()
@@ -48,6 +56,7 @@ pub(super) fn details(program: &Program) -> HashMap<Span, DeclarationDetails> {
                 result.insert(
                     c.span,
                     DeclarationDetails {
+                        type_params: c.type_params.clone(),
                         extends: c
                             .base_class
                             .iter()
@@ -119,8 +128,11 @@ pub struct Reference {
 /// Source owners, captured before module bodies are offloaded. Inherited/default
 /// method copies retain their declaration span and must not acquire a new owner.
 pub(super) fn owners(program: &Program) -> Vec<(Span, String)> {
+    owners_of(program.items.iter())
+}
+pub(super) fn owners_of<'a>(items: impl Iterator<Item = &'a Item>) -> Vec<(Span, String)> {
     let mut owners = Vec::new();
-    for item in &program.items {
+    for item in items {
         match item {
             Item::Function(f) => owners.push((f.span, f.name.clone())),
             Item::Class(c) => {
@@ -153,6 +165,19 @@ pub(super) fn declarations(
     facts: &mut Facts,
     checked: &crate::semantic::symbols::SymbolTable,
 ) {
+    if let Some(module) = &program.module {
+        facts
+            .declarations
+            .push(Declaration::new(&module.path, "module", module.span, None));
+    }
+    declarations_of(&program.imports, program.items.iter(), facts, checked);
+}
+pub(super) fn declarations_of<'a>(
+    imports: &[crate::parser::ast::ImportDecl],
+    items: impl Iterator<Item = &'a Item> + Clone,
+    facts: &mut Facts,
+    checked: &crate::semantic::symbols::SymbolTable,
+) {
     // Reuse registered signatures, including normalized import identities.
     // AST spellings alone are not the checked type of a declaration.
     let mut types = HashMap::new();
@@ -169,7 +194,7 @@ pub(super) fn declarations(
                 types.insert(param.span, ty.clone());
             }
         };
-    for item in &program.items {
+    for item in items.clone() {
         match item {
             Item::Function(f) => {
                 if let Some(info) = checked.lookup_func(&f.name) {
@@ -215,7 +240,7 @@ pub(super) fn declarations(
             _ => {}
         }
     }
-    for item in &program.items {
+    for item in items.clone() {
         if let Item::Class(c) = item
             && let Some(info) = checked.lookup_class(&c.name)
         {
@@ -231,7 +256,7 @@ pub(super) fn declarations(
             }
         }
     }
-    for item in &program.items {
+    for item in items.clone() {
         if let Item::Enum(e) = item
             && let Some(info) = checked.lookup_enum(&e.name)
         {
@@ -252,10 +277,7 @@ pub(super) fn declarations(
             .declarations
             .push(Declaration::new(name, kind, span, ty));
     };
-    if let Some(module) = &program.module {
-        declare(&module.path, "module", module.span, None);
-    }
-    for import in &program.imports {
+    for import in imports {
         declare(
             import
                 .alias
@@ -266,7 +288,7 @@ pub(super) fn declarations(
             None,
         );
     }
-    for item in &program.items {
+    for item in items.clone() {
         match item {
             Item::Function(f) => {
                 declare(

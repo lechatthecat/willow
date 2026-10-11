@@ -92,6 +92,15 @@ fn prefer_allocation(effect: u8, candidate: &Value, existing: &Value) -> bool {
         && !explicit_allocation(existing["cause"]["operation"].as_str())
 }
 impl Captured {
+    pub(super) fn map_types(&mut self, normalize: impl Fn(&Type) -> Type) {
+        for body in &mut self.bodies {
+            for (_, ty, _, _, _) in &mut body.expressions {
+                if let Some(ty) = ty {
+                    *ty = normalize(ty);
+                }
+            }
+        }
+    }
     pub fn capability(&mut self, function: FunctionId, bits: u8, span: Span, operation: &str) {
         let witnesses = self.witnesses.entry(function).or_default();
         for bit in 0..RuntimeEffects::BIT_COUNT {

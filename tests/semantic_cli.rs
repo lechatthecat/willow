@@ -2311,3 +2311,289 @@ fn effect_witness_precision_shadowed_scheduler_names_stay_conservative() {
         .unwrap();
     assert_eq!(block["witness"]["cause"]["operation"], "await", "{value}");
 }
+
+#[test]
+fn generic_source_queries() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/coll.wi"), "module coll;\npub fn fold<T>(value: T) -> T { return value; }\npub fn unused<T>(value: T) -> T { return value; }\npub class Ring<T> {\n    pub value: T;\n    pub fn push(self, value: T) -> T { return value; }\n}\n").unwrap();
+    fs::write(f.0.join("src/main.wi"), "import coll::fold;\nimport coll::Ring;\nfn main() { println(fold(1)); println(fold(2.0)); let r = new Ring<i64>(3); println(r.push(4)); }\n").unwrap();
+    let check = f.run(&["check"]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let overview = f.json(&["overview", "src/coll.wi", "--depth", "1"], 0);
+    let text = overview.to_string();
+    assert!(text.contains("fold"), "{text}");
+    assert!(text.contains("unused"), "{text}");
+    assert!(text.contains("Ring"), "{text}");
+    let symbols = overview["files"][0]["symbols"].as_array().unwrap();
+    for name in ["fold", "unused", "Ring"] {
+        let symbol = symbols.iter().find(|s| s["name"] == name).unwrap();
+        assert_eq!(symbol["type_params"], serde_json::json!(["T"]), "{symbol}");
+    }
+    assert!(!text.contains("$mono$"));
+    assert!(!text.contains("$pkg"));
+    let callee = f.json(&["type", "src/main.wi:3:21"], 0);
+    assert_eq!(callee["result"]["type_display"], "fn(T) -> T", "{callee}");
+    let unused = f.json(&["symbol", "coll::unused"], 0);
+    assert_eq!(
+        unused["result"]["selected"]["selector"], "coll::unused",
+        "{unused}"
+    );
+    let ring = f.json(&["symbol", "coll::Ring"], 0);
+    assert_eq!(
+        ring["result"]["selected"]["selector"], "coll::Ring",
+        "{ring}"
+    );
+    let binding = f.json(&["type", "main::main::r"], 0);
+    assert_eq!(
+        binding["result"]["type_display"], "coll::Ring<i64>",
+        "{binding}"
+    );
+    let effects = f.json(&["effects", "main::main"], 0);
+    assert_eq!(effects["result"]["status"], "ok", "{effects}");
+    for selector in [
+        "coll::fold",
+        "coll::Ring::push",
+        "src/coll.wi:2:8",
+        "src/coll.wi:6:12",
+    ] {
+        for command in ["symbol", "refs", "type", "impact", "effects"] {
+            let value = f.json(&[command, selector], 0);
+            let text = value.to_string();
+            if command == "type" {
+                assert!(
+                    value["result"]["type_display"]
+                        .as_str()
+                        .is_some_and(|ty| ty.starts_with("fn(")),
+                    "callee/declaration must report callable type: {text}"
+                );
+            }
+            if command == "refs" && selector == "coll::fold" {
+                assert_eq!(
+                    value["result"]["references"].as_array().unwrap().len(),
+                    3,
+                    "{value}"
+                );
+            }
+            if command == "effects" {
+                assert_eq!(value["result"]["status"], "ok", "{value}");
+                assert_eq!(
+                    value["result"]["unknown_causes"],
+                    serde_json::json!([]),
+                    "{value}"
+                );
+            }
+            assert!(!text.contains("$mono$"), "{command} {selector}: {text}");
+            assert!(!text.contains("$pkg"), "{command} {selector}: {text}");
+        }
+    }
+    let refs = f.json(&["refs", "coll::fold"], 0);
+    assert!(refs.to_string().contains("main.wi"), "{refs}");
+    let preview = f.json(&["rename", "coll::fold", "reduce", "--dry-run"], 0);
+    assert!(preview.to_string().contains("reduce"), "{preview}");
+    assert_eq!(preview["result"]["edits"], 4, "{preview}");
+    let method = f.json(&["rename", "coll::Ring::push", "put", "--dry-run"], 0);
+    assert_eq!(method["result"]["edits"], 2, "{method}");
+    for format in ["human", "ndjson"] {
+        for args in [
+            vec!["overview", "src/coll.wi", "--depth", "1"],
+            vec!["effects", "main::main"],
+            vec!["symbol", "coll::fol"],
+        ] {
+            let mut args = args;
+            args.extend(["--format", format]);
+            let out = f.run(&args);
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(!text.contains("$mono$"), "{text}");
+            assert!(!text.contains("$pkg"), "{text}");
+        }
+    }
+    f.json(&["rename", "coll::fold", "reduce"], 0);
+    assert!(
+        fs::read_to_string(f.0.join("src/coll.wi"))
+            .unwrap()
+            .contains("fn reduce<T>")
+    );
+    let main = fs::read_to_string(f.0.join("src/main.wi")).unwrap();
+    assert!(main.contains("import coll::reduce;"));
+    assert_eq!(main.matches("reduce(").count(), 2);
+    f.json(&["rename", "coll::Ring::push", "put"], 0);
+    assert!(
+        fs::read_to_string(f.0.join("src/coll.wi"))
+            .unwrap()
+            .contains("fn put(")
+    );
+    assert!(
+        fs::read_to_string(f.0.join("src/main.wi"))
+            .unwrap()
+            .contains("r.put(")
+    );
+    fs::write(f.0.join("src/other.wi"), "module other;\nimport coll::reduce as preserve;\nimport coll::Ring as Bucket;\npub fn apply() -> i64 { let bucket = new Bucket<i64>(2); return preserve(bucket.put(9)); }\n").unwrap();
+    let main = fs::read_to_string(f.0.join("src/main.wi")).unwrap();
+    fs::write(f.0.join("src/main.wi"), format!("import other;\n{main}")).unwrap();
+    let source = fs::read_to_string(f.0.join("src/other.wi")).unwrap();
+    for (token, command, expected) in [
+        ("preserve(bucket", "type", "fn(T) -> T"),
+        ("Bucket<i64>", "symbol", "coll::Ring"),
+    ] {
+        let start = source.find(token).unwrap();
+        let prefix = &source[..start];
+        let line = prefix.bytes().filter(|b| *b == b'\n').count() + 1;
+        let column = prefix.rsplit('\n').next().unwrap().chars().count() + 1;
+        let selector = format!("src/other.wi:{line}:{column}");
+        let result = f.json(&[command, &selector], 0);
+        if command == "type" {
+            assert_eq!(result["result"]["type_display"], expected, "{result}");
+        } else {
+            assert_eq!(
+                result["result"]["selected"]["selector"], expected,
+                "{result}"
+            );
+        }
+    }
+    let refs = f.json(&["refs", "coll::reduce"], 0);
+    assert_eq!(
+        refs["result"]["references"].as_array().unwrap().len(),
+        5,
+        "{refs}"
+    );
+    let preview = f.json(&["rename", "coll::reduce", "combine", "--dry-run"], 0);
+    assert_eq!(preview["result"]["edits"], 5, "{preview}");
+    f.json(&["rename", "coll::reduce", "combine"], 0);
+    let other = fs::read_to_string(f.0.join("src/other.wi")).unwrap();
+    assert!(
+        other.contains("import coll::combine as preserve;"),
+        "{other}"
+    );
+    assert!(other.contains("return preserve(bucket.put(9))"), "{other}");
+}
+
+#[test]
+fn uninstantiated_generic_body_refs_and_rename() {
+    for (cross_module, instantiated_target) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let f = Fixture::new();
+        let (selector, caller, file, original) = if cross_module {
+            fs::write(
+                f.0.join("src/coll.wi"),
+                "module coll;\npub fn fold<T>(x: T) -> T { return x; }\n",
+            )
+            .unwrap();
+            let source = "module unused;\nimport coll::fold as imported;\npub fn wrapper<T>(x: T) -> T { return imported(x); }\n";
+            fs::write(f.0.join("src/unused.wi"), source).unwrap();
+            fs::write(
+                f.0.join("src/main.wi"),
+                if instantiated_target {
+                    "import unused; import coll; fn main() { println(coll::fold(1)); }\n"
+                } else {
+                    "import unused; fn main() {}\n"
+                },
+            )
+            .unwrap();
+            (
+                "coll::fold",
+                "unused::wrapper",
+                "src/unused.wi",
+                source.to_owned(),
+            )
+        } else {
+            let source = format!(
+                "fn fold<T>(x: T) -> T {{ return x; }}\nfn wrapper<T>(x: T) -> T {{ return fold(x); }}\nfn main() {{ {} }}\n",
+                if instantiated_target {
+                    "println(fold(1));"
+                } else {
+                    ""
+                }
+            );
+            fs::write(f.0.join("src/main.wi"), &source).unwrap();
+            ("main::fold", "main::wrapper", "src/main.wi", source)
+        };
+        let refs = f.json(&["refs", selector], 0);
+        let references = refs["result"]["references"].as_array().unwrap();
+        assert_eq!(
+            references.len(),
+            if cross_module { 2 } else { 1 } + usize::from(instantiated_target),
+            "{refs}"
+        );
+        let call = references
+            .iter()
+            .find(|r| r["location"]["path"] == file && r["role"] == "call")
+            .unwrap();
+        let position = format!(
+            "{file}:{}:{}",
+            call["location"]["line"], call["location"]["column"]
+        );
+        let symbol = f.json(&["symbol", &position], 0);
+        assert_eq!(
+            symbol["result"]["selected"]["selector"], selector,
+            "{symbol}"
+        );
+        let typed = f.json(&["type", &position], 0);
+        assert_eq!(typed["result"]["type_display"], "fn(T) -> T", "{typed}");
+        let impact = f.json(&["impact", selector], 0);
+        assert!(impact.to_string().contains(caller), "{impact}");
+        if !cross_module {
+            fs::write(
+                f.0.join(file),
+                format!(
+                    "{original}fn shadow<T>(fold: fn(T) -> T, x: T) -> T {{ return fold(x); }}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let preview = f.json(&["rename", selector, "reduce", "--dry-run"], 0);
+        assert_eq!(
+            preview["result"]["edits"],
+            2 + usize::from(instantiated_target),
+            "{preview}"
+        );
+        f.json(&["rename", selector, "reduce"], 0);
+        let source = fs::read_to_string(f.0.join(file)).unwrap();
+        assert!(
+            source.contains(if cross_module {
+                "return imported(x);"
+            } else {
+                "return reduce(x);"
+            }),
+            "{source}"
+        );
+        if cross_module {
+            assert!(
+                source.contains("import coll::reduce as imported;"),
+                "{source}"
+            );
+            assert!(
+                fs::read_to_string(f.0.join("src/coll.wi"))
+                    .unwrap()
+                    .contains("fn reduce<T>")
+            );
+        } else {
+            assert!(source.contains("fn reduce<T>"));
+            assert!(
+                source.contains("fn shadow<T>(fold: fn(T) -> T, x: T) -> T { return fold(x); }"),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            original.matches("fn wrapper<T>").count(),
+            source.matches("fn wrapper<T>").count()
+        );
+        for text in [
+            refs.to_string(),
+            symbol.to_string(),
+            typed.to_string(),
+            preview.to_string(),
+        ] {
+            assert!(!text.contains("$mono$"), "{text}");
+            assert!(!text.contains("$pkg"), "{text}");
+        }
+    }
+}

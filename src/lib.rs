@@ -694,6 +694,7 @@ fn run_frontend_revision(
             &mut program,
         )?;
     }
+    let mut generic_sources = std::collections::HashMap::new();
     artifacts.snapshot_source(diagnostics::FileId::ENTRY, source)?;
     artifacts.offload(&mut program)?;
     let resolution = module::resolver::resolve_imports_spooled_entry(
@@ -759,6 +760,7 @@ fn run_frontend_revision(
         let registry = std::rc::Rc::new(std::cell::RefCell::new(
             semantic::type_checker::generics::TemplateRegistry::default(),
         ));
+        registry.borrow_mut().capture_source_references = inputs.capture_analysis;
         for module in &graph.files {
             std::rc::Rc::make_mut(&mut registry.borrow_mut().module_paths)
                 .insert(module.id.file_id(), module.identity_path().to_string());
@@ -860,11 +862,23 @@ fn run_frontend_revision(
         let mut fresh_ids = semantic::type_checker::generics::FreshIds::default();
         for (index, module) in graph.files.iter_mut().enumerate() {
             let mut source = storage.hydrate(&module.program, module.id.file_id())?;
+            if inputs.capture_analysis {
+                let mut metadata = ai::generics::Source::capture(&source);
+                metadata.logical_types = checkers[index].generics.logical_types.clone();
+                metadata.symbols = std::mem::take(&mut checkers[index].generics.source_symbols);
+                generic_sources.insert(module.id, metadata);
+            }
             checkers[index].expand_generics(&mut source, &mut fresh_ids);
             storage.offload(&mut source)?;
             module.program = source.into_inner();
         }
         let mut body = storage.hydrate(&program, diagnostics::FileId::ENTRY)?;
+        if inputs.capture_analysis {
+            let mut metadata = ai::generics::Source::capture(&body);
+            metadata.logical_types = checkers[entry].generics.logical_types.clone();
+            metadata.symbols = std::mem::take(&mut checkers[entry].generics.source_symbols);
+            generic_sources.insert(module::UnitId::ENTRY, metadata);
+        }
         checkers[entry].expand_generics(&mut body, &mut fresh_ids);
         storage.offload(&mut body)?;
         program = body.into_inner();
@@ -913,6 +927,7 @@ fn run_frontend_revision(
         std::rc::Rc::clone(&artifacts.store),
         desugar_dependencies,
     );
+    db.generic_sources = generic_sources;
     let mut bridge_identity = None;
     for (namespace, program) in std::iter::once((String::new(), &program)).chain(
         graph
