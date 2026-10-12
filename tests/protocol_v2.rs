@@ -931,10 +931,11 @@ fn declared_types_use_normalized_import_identity() {
         .iter()
         .find(|s| s["kind"] == "field")
         .unwrap();
+    // `ty` retains the compiler identity; `type_display` projects source names.
     assert_eq!(
         field["ty"],
         serde_json::to_value(willow_compiler::parser::ast::Type::<String>::Named(
-            "dep::Color".into()
+            "$local::dep::Color".into()
         ))
         .unwrap()
     );
