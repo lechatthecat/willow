@@ -1,0 +1,10 @@
+import std::collections::Array;
+fn dive(n: i64) -> Result<i64, String> {
+    if n == 0 { return Ok(0); }
+    let value = dive(n - 1)?;
+    return Ok(value + 1);
+}
+fn main(args: Array<String>) {
+    let depth = args[0].len() * 128;
+    println(dive(depth).unwrap());
+}
