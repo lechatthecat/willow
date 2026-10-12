@@ -496,6 +496,7 @@ pub struct MarkWorkQueue {
     /// from a parked value would hand out an epoch number twice — see the
     /// module's epoch rules.
     last_issued: AtomicU64,
+    publication_generation: AtomicU64,
     injector: Mutex<VecDeque<MarkWork>>,
     slots: Vec<LocalSlot>,
     /// Unclaimed slot indices. Claim/return each do one O(1) pop/push;
@@ -520,12 +521,27 @@ impl MarkWorkQueue {
         Arc::new(Self {
             epoch: AtomicU64::new(MarkEpoch::IDLE.0),
             last_issued: AtomicU64::new(MarkEpoch::IDLE.0),
+            publication_generation: AtomicU64::new(0),
             injector: Mutex::new(VecDeque::new()),
             slots: (0..slots).map(|_| LocalSlot::default()).collect(),
             free_slots: Mutex::new((0..slots).rev().collect()),
             quarantine: Mutex::new(Vec::new()),
             counters: Counters::default(),
         })
+    }
+
+    /// Publication ordering, including hidden work becoming stealable. This
+    /// supplements outstanding; it is never an emptiness predicate by itself.
+    pub fn publication_generation(&self) -> u64 {
+        self.publication_generation.load(Ordering::SeqCst)
+    }
+
+    fn advance_publication(&self) {
+        self.publication_generation
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |generation| {
+                generation.checked_add(1)
+            })
+            .expect("mark queue publication generation exhausted");
     }
 
     pub fn slot_count(&self) -> usize {
@@ -653,6 +669,7 @@ impl MarkWorkQueue {
                 // `outstanding == 0` must never be looking at a queue that
                 // already contains this item. Both happen under this lock, so
                 // no epoch transition can separate them.
+                self.advance_publication();
                 self.counters.outstanding.fetch_add(1, Ordering::SeqCst);
                 self.counters.published.fetch_add(1, Ordering::SeqCst);
                 self.counters.injected.fetch_add(1, Ordering::SeqCst);
@@ -774,6 +791,7 @@ impl MarkWorkQueue {
             return 0;
         }
         let total = drained.len();
+        self.advance_publication();
         self.counters
             .published
             .fetch_add(hidden_count, Ordering::SeqCst);
@@ -903,6 +921,7 @@ impl MarkWorker {
             if self.queue.current_epoch() != self.epoch {
                 Err(work)
             } else {
+                self.queue.advance_publication();
                 self.queue
                     .counters
                     .outstanding
@@ -952,6 +971,7 @@ impl MarkWorker {
         let count = limit.min(half).max(1).min(private.len());
         let moved: Vec<MarkWork> = private.drain(..count).collect();
         let moved_count = moved.len() as u64;
+        self.queue.advance_publication();
         // Destination before source, as everywhere else.
         self.queue
             .counters

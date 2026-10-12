@@ -49,6 +49,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                 GC_MARK_PHASE.store(1, Ordering::Release);
                 (before, cycle)
             };
+            let root_job = cycle.termination.enter();
             let mut roots = all_registered_stack_roots(coord);
             roots.extend(runtime_roots_snapshot());
             stop_work.root_values += roots.len() as u64;
@@ -62,6 +63,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                     .saturating_add(roots.len() as u64 * std::mem::size_of::<usize>() as u64);
             }
             cycle.recheck_unindexed();
+            drop(root_job);
             Some((before, cycle))
         },
     )

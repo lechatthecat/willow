@@ -8,6 +8,8 @@ use super::*;
 /// its start bit after initialization. New old allocations publish black.
 pub(super) struct ConcurrentCycle {
     pub(super) collector: ThreadId,
+    pub(super) termination: mark_termination::Termination,
+    pub(super) mark_epoch: crate::gc_mark_queue::MarkEpoch,
     pointer_checks: AtomicU64,
     duplicate_discoveries: AtomicU64,
     unindexed_discoveries: AtomicU64,
@@ -122,7 +124,7 @@ impl ConcurrentCycle {
         // One slot per allowed background worker, plus the collector. Assists
         // beyond these slots use the queue's existing slotless consumer path.
         let queue = crate::gc_mark_queue::MarkWorkQueue::new(mark_workers::configured_count() + 1);
-        queue.begin_epoch();
+        let mark_epoch = queue.begin_epoch();
         static ASSIST_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let assist_epoch = ASSIST_EPOCH
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
@@ -131,6 +133,8 @@ impl ConcurrentCycle {
             .expect("assist epoch exhausted");
         Self {
             collector: std::thread::current().id(),
+            termination: mark_termination::Termination::default(),
+            mark_epoch,
             pointer_checks: AtomicU64::new(0),
             duplicate_discoveries: AtomicU64::new(0),
             unindexed_discoveries: AtomicU64::new(0),
@@ -184,6 +188,7 @@ impl ConcurrentCycle {
     }
 
     pub(super) fn enqueue(&self, value: *mut u8) {
+        let _publication = self.termination.enter();
         use crate::gc_mark_queue::{MarkWork, ObjectRef};
         if self.claim_or_defer(value as usize) {
             // Claim at publication, not at consumption: repeated deletions or
@@ -198,6 +203,7 @@ impl ConcurrentCycle {
     }
 
     pub(super) fn enqueue_satb_batch(&self, values: &[usize]) {
+        let _publication = self.termination.enter();
         use crate::gc_mark_queue::{MarkWork, MarkWorkItem, ObjectRef};
         // Bound one owned queue item even with the maximum configured SATB
         // buffer. Claim and publication cannot safepoint or lose epoch ownership.
@@ -287,6 +293,7 @@ impl ConcurrentCycle {
     }
 
     pub(super) fn enqueue_trace_slice(&self, value: usize, word: usize) {
+        let _publication = self.termination.enter();
         use crate::gc_mark_queue::{MarkWork, MarkWorkItem, ObjectRef};
         self.queue
             .inject(MarkWork::new(
@@ -433,6 +440,7 @@ impl ConcurrentCycle {
             static CHILDREN: std::cell::RefCell<Vec<*mut u8>> =
                 const { std::cell::RefCell::new(Vec::new()) };
         }
+        let _owner = self.termination.enter();
         CHILDREN.with_borrow_mut(|children| {
             let mut worker = self.queue.register_assist();
             self.drain_worker_until(limit, children, &mut worker, deadline)
@@ -441,6 +449,7 @@ impl ConcurrentCycle {
     }
 
     pub(super) fn drain_background(&self, limit: usize, children: &mut Vec<*mut u8>) -> usize {
+        let _owner = self.termination.enter();
         let Some(mut worker) = self.queue.register_worker() else {
             // Mutator assists may temporarily occupy every slot. The collector
             // has a slotless consumer and will drain work not taken here.
@@ -465,10 +474,14 @@ impl ConcurrentCycle {
         worker: &mut crate::gc_mark_queue::MarkWorker,
         deadline: Option<std::time::Instant>,
     ) -> (usize, u64) {
+        let _owner = self.termination.enter();
         use crate::gc_mark_queue::MarkWorkItem;
         // Barriers may enqueue before activation completes, but scanning then
         // could miss a store whose insertion barrier ran before phase=1.
-        if !self.tracing_enabled.load(Ordering::Acquire) {
+        if worker.epoch() != self.mark_epoch
+            || self.queue.current_epoch() != self.mark_epoch
+            || !self.tracing_enabled.load(Ordering::Acquire)
+        {
             return (0, 0);
         }
         let expired = || deadline.is_some_and(|end| std::time::Instant::now() >= end);

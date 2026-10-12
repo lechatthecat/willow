@@ -264,6 +264,11 @@ impl SatbShards {
         self.drained.store(true, Ordering::Release);
     }
 
+    /// Constant-time proof that the one authoritative stopped seal finished.
+    pub(super) fn is_drained(&self) -> bool {
+        self.drained.load(Ordering::Acquire)
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.shards.iter().all(|shard| {
             shard.0.lock().unwrap().values().all(|buffer| {

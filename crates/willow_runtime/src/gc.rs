@@ -54,6 +54,7 @@ mod coordinator;
 mod epoch_index;
 mod free_spans;
 mod mark_closure;
+mod mark_termination;
 mod mark_workers;
 mod memory_control;
 mod minor;

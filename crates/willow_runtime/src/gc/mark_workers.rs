@@ -83,6 +83,9 @@ impl Pool {
     /// The caller owns collection serialization and cannot request remark until
     /// this returns. Trace panics request stopped completion after readers leave.
     pub(super) fn run(&self, cycle: &Arc<ConcurrentCycle>, budget: usize) {
+        // Own the scheduled job before publishing it, including workers not
+        // yet awake. Completion is published only after all readers unregister.
+        let _job_owner = cycle.termination.enter();
         let (lock, cv) = &*self.shared;
         {
             let mut state = lock.lock().unwrap();
@@ -157,6 +160,7 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
         let job = state.job.as_ref().unwrap().clone();
         let cycle = &job.cycle;
         drop(state);
+        let owner = cycle.termination.enter();
         let measurement = JobMeasurement::begin();
         willow_gc_register_mutator();
         {
@@ -190,11 +194,50 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
         }
         children.clear();
         willow_gc_unregister_mutator();
+        drop(owner);
         // Drop the epoch reference before publishing that this reader is gone.
         drop(job);
         drop(measurement);
         let mut state = lock.lock().unwrap();
         state.remaining -= 1;
         cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use super::*;
+
+    #[test]
+    fn termination_spurious_pool_wakes_do_not_duplicate_jobs_or_completion() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let cycle = Arc::new(ConcurrentCycle::new(
+            [],
+            IdSet::default(),
+            IdMap::default(),
+            0,
+        ));
+        let pool = Pool::new(2).unwrap();
+        let shared = pool.shared.clone();
+        let notifier = std::thread::spawn(move || {
+            for _ in 0..1024 {
+                shared.1.notify_all();
+                std::thread::yield_now();
+            }
+        });
+        for _ in 0..16 {
+            pool.run(&cycle, 0);
+            let state = pool.shared.0.lock().unwrap();
+            assert_eq!(state.remaining, 0);
+            assert!(state.job.is_none());
+            assert!(cycle.termination.request(cycle.termination.sample(), true));
+            cycle.termination.restart();
+        }
+        notifier.join().unwrap();
+        assert_eq!(pool.shared.0.lock().unwrap().generation, 16);
+        assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
+        drop(pool);
+        reset_internal_for_test();
     }
 }

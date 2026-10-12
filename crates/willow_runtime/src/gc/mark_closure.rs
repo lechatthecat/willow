@@ -28,6 +28,24 @@ pub(super) fn finish_with_wait(
 pub(super) const MAX_REMARK_ROUNDS: usize = 3;
 pub(super) const MAX_DRAIN_WAVES: usize = 128;
 
+// Queue outstanding counts private segments and work in hand. Flushing once
+// at the seal makes hidden jobs stealable; the election does not repeatedly
+// scan worker slots or mutator buffers. Ownership covers pre-enqueue claims,
+// root enumeration and metadata merges after the last queue item completes.
+fn request_remark(cycle: &ConcurrentCycle) -> bool {
+    let generation = cycle.termination.sample();
+    let publication = cycle.queue.publication_generation();
+    cycle.termination.request(
+        generation,
+        cycle.closing.load(Ordering::Acquire)
+            && cycle.satb_shards.is_drained()
+            && cycle.queue.current_epoch() == cycle.mark_epoch
+            && cycle.queue.snapshot().is_drained()
+            && cycle.active_drains.load(Ordering::Acquire) == 0
+            && cycle.queue.publication_generation() == publication,
+    )
+}
+
 fn require_stopped_completion(
     cycle: &ConcurrentCycle,
 ) -> Option<(crate::gc_telemetry::MarkWork, sweep::SweepPlan)> {
@@ -56,6 +74,7 @@ pub(super) fn finish_with_hooks(
             // The drain also seals the shard buffers: from here on every barrier
             // publication takes this heap lock.
             flush_satb_all_locked(coord, &mut state);
+            cycle.queue.flush_all_locals();
             GC_MARK_PHASE.store(1, Ordering::Release);
         },
     );
@@ -92,6 +111,11 @@ pub(super) fn finish_with_hooks(
         if remark_rounds >= MAX_REMARK_ROUNDS - 1 {
             return require_stopped_completion(cycle);
         }
+        cycle.termination.restart();
+        if !request_remark(cycle) {
+            wait(delay);
+            continue;
+        }
         before_recheck();
         remark_rounds += 1;
         let finished = with_stw(
@@ -100,9 +124,10 @@ pub(super) fn finish_with_hooks(
                 let mut state = runtime().heap.lock().unwrap();
                 GC_MARK_PHASE.store(2, Ordering::Release);
                 flush_satb_all_locked(coord, &mut state);
-                if cycle.queue.snapshot().is_drained()
-                    && cycle.active_drains.load(Ordering::Acquire) == 0
-                {
+                // The flush may publish fresh work and invalidate the optimistic
+                // candidate. Elect again under the stopped producer boundary.
+                cycle.termination.restart();
+                if request_remark(cycle) && cycle.termination.requested() {
                     // Read exception state after the reader acquire. A finishing drain
                     // can merge a deferred hook just before dropping its reader count.
                     if cycle.worker_failed.load(Ordering::Acquire)
@@ -142,6 +167,7 @@ pub(super) fn finish_with_hooks(
                     let plan = sweep::prepare(&mut state, Some(cycle.clone()));
                     return Some((work, plan));
                 }
+                cycle.termination.restart();
                 GC_MARK_PHASE.store(1, Ordering::Release);
                 None
             },
@@ -177,6 +203,7 @@ pub(super) fn finish_stopped(
             flush_satb_all_locked(coord, &mut state);
             retire_tlabs_with_work(&mut state, stop_work);
             drop(state);
+            let root_job = marking.termination.enter();
             let mut roots = all_registered_stack_roots(coord);
             roots.extend(runtime_roots_snapshot());
             stop_work.root_values += roots.len() as u64;
@@ -184,6 +211,7 @@ pub(super) fn finish_stopped(
                 checked_payload_to_header(root, "GC remark root");
                 marking.enqueue(root);
             }
+            drop(root_job);
             let mut fallback = marking.worker_failed.load(Ordering::Acquire)
                 || marking.stopped_completion_required.load(Ordering::Acquire)
                 // Deferred STW-only hooks can coexist with indefinitely retrying
@@ -274,4 +302,102 @@ pub(super) fn finish_stopped(
             }
         },
     )
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use super::*;
+    use crate::gc_mark_queue::{MarkWork, MarkWorkItem, ObjectRef};
+
+    fn cycle() -> ConcurrentCycle {
+        ConcurrentCycle::new([], IdSet::default(), IdMap::default(), 0)
+    }
+
+    fn seal(cycle: &ConcurrentCycle) {
+        cycle.closing.store(true, Ordering::Release);
+        let coord = GcCoord {
+            stop_requested: true,
+            ..Default::default()
+        };
+        cycle.satb_shards.seal_stopped(&coord, |values| {
+            cycle.enqueue_satb_batch(values);
+        });
+    }
+
+    #[test]
+    fn termination_requires_satb_seal_and_root_job_completion() {
+        let cycle = cycle();
+        assert!(!request_remark(&cycle));
+        let root_job = cycle.termination.enter();
+        seal(&cycle);
+        assert!(!request_remark(&cycle));
+        drop(root_job);
+        assert!(request_remark(&cycle));
+    }
+
+    #[test]
+    fn termination_hidden_published_and_last_in_hand_work_defeat_election() {
+        for local in [false, true] {
+            let cycle = cycle();
+            seal(&cycle);
+            let mut worker = cycle.queue.register_assist();
+            let item = MarkWorkItem::Object(ObjectRef::from_addr(8).unwrap());
+            if local {
+                worker.push(item).unwrap();
+            } else {
+                cycle
+                    .queue
+                    .inject(MarkWork::new(cycle.mark_epoch, item))
+                    .unwrap();
+            }
+            assert!(!request_remark(&cycle));
+            let generation = cycle.queue.publication_generation();
+            if local {
+                assert_eq!(cycle.queue.flush_all_locals(), 1);
+                assert!(cycle.queue.publication_generation() > generation);
+            }
+            assert!(!request_remark(&cycle));
+            assert!(worker.next_work().is_some());
+            assert!(!request_remark(&cycle));
+            worker.complete_current();
+            // Engine ownership extends beyond queue completion to batch merge.
+            let merge = cycle.termination.enter();
+            assert!(!request_remark(&cycle));
+            drop(merge);
+            drop(worker);
+            assert!(request_remark(&cycle));
+            assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
+        }
+    }
+
+    #[test]
+    fn termination_epoch_rollover_rejects_stale_cycle_and_worker() {
+        let cycle = cycle();
+        seal(&cycle);
+        let mut stale = cycle.queue.register_assist();
+        cycle.queue.end_epoch();
+        cycle.queue.begin_epoch();
+        assert!(!request_remark(&cycle));
+        let mut children = Vec::new();
+        assert_eq!(cycle.drain_worker(1, &mut children, &mut stale), (0, 0));
+        assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
+        drop(stale);
+        assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
+    }
+
+    #[test]
+    fn termination_repeated_restarts_and_empty_assists_preserve_progress() {
+        let cycle = cycle();
+        seal(&cycle);
+        for _ in 0..256 {
+            assert!(request_remark(&cycle));
+            // No pacer or worker pool participates in the proof.
+            assert_eq!(cycle.drain(1), 0);
+            assert!(!cycle.termination.requested());
+            assert!(request_remark(&cycle));
+            cycle.termination.restart();
+        }
+        assert!(request_remark(&cycle));
+        assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
+    }
 }

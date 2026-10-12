@@ -85,6 +85,7 @@ pub(super) fn record_satb_locked(state: &mut GcState, old: *mut u8) {
         ..
     } = state;
     if let Some(cycle) = concurrent_cycle {
+        let _publication = cycle.termination.enter();
         if cycle.closing.load(Ordering::Acquire) {
             cycle.enqueue(old);
             return;
@@ -112,6 +113,7 @@ fn publish_marking_unlocked(old: *mut u8, value: *mut u8, phase: u8) -> bool {
     let Some((generation, cycle)) = marking::cached_cycle() else {
         return false;
     };
+    let _publication = cycle.termination.enter();
     cycle
         .satb_shards
         .with_current(
@@ -146,6 +148,7 @@ pub(super) fn flush_satb_current(retire: bool) {
     if GC_MARK_PHASE.load(Ordering::Acquire) == 1
         && let Some((generation, cycle)) = marking::cached_cycle()
     {
+        let _publication = cycle.termination.enter();
         // Flush only this mutator's buffer; closure seals all registrations.
         cycle.satb_shards.with_current(
             || marking::ASSIST_CYCLE_GENERATION.load(Ordering::Acquire) == generation,
@@ -197,6 +200,7 @@ pub(super) fn flush_satb_all_locked(coord: &GcCoord, state: &mut GcState) {
             .enqueue_satb_batch(value);
     });
     if let Some(cycle) = cycle {
+        let _publication = cycle.termination.enter();
         cycle
             .satb_shards
             .seal_stopped(coord, |values| cycle.enqueue_satb_batch(values));
