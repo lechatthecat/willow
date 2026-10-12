@@ -456,6 +456,21 @@ impl Parser {
         }
     }
 
+    // Retain the surrounding declaration after a reserved builtin method name.
+    // The recorded diagnostic still rejects the program, but parsing its signature
+    // here prevents the next receiver from being parsed as a free-function parameter.
+    fn expect_method_name(&mut self) -> Result<String, Diagnostic> {
+        if matches!(self.peek_kind(), TokenKind::Print | TokenKind::Println) {
+            let error = self.err(ErrorCode::E0102, "expected identifier");
+            self.recovered_errors.push(error);
+            let name = self.peek_kind().keyword_name().unwrap().to_string();
+            self.advance();
+            Ok(name)
+        } else {
+            self.expect_ident()
+        }
+    }
+
     fn err(&self, code: ErrorCode, msg: impl Into<String>) -> Diagnostic {
         let msg = msg.into();
         let span = self.current_span();
@@ -467,6 +482,9 @@ impl Parser {
             diagnostic
                 .message
                 .push_str(&format!("; '{keyword}' is a reserved keyword"));
+            if matches!(self.peek_kind(), TokenKind::Print | TokenKind::Println) {
+                diagnostic.message.push_str(" (builtin function name)");
+            }
             diagnostic.helps.push(format!(
                 "if you intended '{keyword}' as a name, rename it to a non-keyword identifier"
             ));
