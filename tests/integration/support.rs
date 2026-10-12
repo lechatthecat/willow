@@ -188,6 +188,99 @@ pub(super) fn compile_and_run_release(source: &str) -> (String, bool) {
     )
 }
 
+/// Drain both pipes while enforcing the process deadline. Waiting before
+/// reading can block a verbose child on a full pipe instead of its program.
+fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> (std::process::Output, bool) {
+    fn reader(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes)
+                .expect("failed to read child output");
+            bytes
+        })
+    }
+    let stdout = reader(child.stdout.take().expect("stdout must be piped"));
+    let stderr = reader(child.stderr.take().expect("stderr must be piped"));
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out) = loop {
+        match child.try_wait().expect("failed to poll binary") {
+            Some(status) => break (status, false),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                break (child.wait().expect("failed to reap binary"), true);
+            }
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    (
+        std::process::Output {
+            status,
+            stdout: stdout.join().expect("stdout reader panicked"),
+            stderr: stderr.join().expect("stderr reader panicked"),
+        },
+        timed_out,
+    )
+}
+
+#[test]
+fn timeout_reader_child() {
+    let Ok(mode) = std::env::var("WILLOW_TIMEOUT_READER_CHILD") else {
+        return;
+    };
+    use std::io::Write;
+    std::io::stdout().write_all(&vec![1; 256 * 1024]).unwrap();
+    std::io::stderr().write_all(&vec![2; 256 * 1024]).unwrap();
+    if mode == "hang" {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
+fn output_child(mode: &str) -> std::process::Child {
+    Command::new(std::env::current_exe().unwrap())
+        .args(["support::timeout_reader_child", "--exact", "--nocapture"])
+        .env("WILLOW_TIMEOUT_READER_CHILD", mode)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn timeout_capture_drains_both_large_pipes() {
+    let (output, timed_out) = wait_with_timeout(output_child("data"), Duration::from_secs(10));
+    assert!(!timed_out);
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout.iter().filter(|&&b| b == 1).count(),
+        256 * 1024
+    );
+    assert_eq!(
+        output.stderr.iter().filter(|&&b| b == 2).count(),
+        256 * 1024
+    );
+}
+
+#[test]
+fn runtime_env_failure_preserves_stderr_diagnostics() {
+    let (output, ok) = compile_and_run_with_runtime_env(
+        "fn main() { panic(\"capture failure diagnostic\"); }",
+        &[],
+        Duration::from_secs(10),
+    );
+    assert!(!ok);
+    assert!(output.contains("capture failure diagnostic"), "{output}");
+}
+
+#[test]
+fn timeout_capture_still_terminates_a_stalled_child() {
+    let (output, timed_out) = wait_with_timeout(output_child("hang"), Duration::from_secs(2));
+    assert!(timed_out);
+    assert!(!output.status.success());
+}
+
 /// Compile and run a program with a hard runtime deadline.
 ///
 /// Returns `(stdout+stderr, binary_exit_ok, timed_out)`. This is reserved for
@@ -227,21 +320,8 @@ pub(super) fn compile_and_run_with_env_timeout(
     for (key, value) in env {
         command.env(key, value);
     }
-    let mut child = command.spawn().expect("failed to run binary");
-    let deadline = Instant::now() + timeout;
-    let timed_out = loop {
-        match child.try_wait().expect("failed to poll binary") {
-            Some(_) => break false,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                break true;
-            }
-            None => std::thread::sleep(Duration::from_millis(5)),
-        }
-    };
-    let output = child
-        .wait_with_output()
-        .expect("failed to collect binary output");
+    let child = command.spawn().expect("failed to run binary");
+    let (output, timed_out) = wait_with_timeout(child, timeout);
 
     let _ = fs::remove_file(&src_path);
     remove_output_artifacts(&bin_path);
@@ -1183,32 +1263,21 @@ pub(super) fn compile_and_run_with_runtime_env(
     }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().expect("failed to run binary");
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait().expect("wait failed") {
-            Some(status) => break Some(status),
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            None => std::thread::sleep(std::time::Duration::from_millis(20)),
-        }
-    };
-    let mut stdout = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        use std::io::Read;
-        let _ = pipe.read_to_string(&mut stdout);
-    }
+    let child = cmd.spawn().expect("failed to run binary");
+    let (output, timed_out) = wait_with_timeout(child, timeout);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let _ = fs::remove_file(&src_path);
     remove_output_artifacts(&bin_path);
-    match status {
-        Some(status) => (stdout, status.success()),
-        None => (
-            format!("TIMEOUT after {timeout:?}; stdout so far: {stdout}"),
+    if timed_out {
+        (
+            format!("TIMEOUT after {timeout:?}; stdout so far: {stdout}; stderr: {stderr}"),
             false,
-        ),
+        )
+    } else if output.status.success() {
+        (stdout, true)
+    } else {
+        (format!("{stdout}{stderr}"), false)
     }
 }
 

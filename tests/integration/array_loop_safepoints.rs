@@ -241,14 +241,19 @@ fn main() {
 
 /// A synchronous main loop still stops for a collection another thread's
 /// allocation requests: the GC gate is checked before the countdown.
+/// Synchronize worker admission, retain 64 nested arrays, and require real
+/// major completions. 1024 allocations cover 15 discard boundaries without
+/// turning this polling regression into tens of thousands of major cycles.
 #[test]
 fn main_thread_array_loop_stops_for_collections() {
     let source = r#"
 import std::collections::Array;
-async fn churn() -> i64 {
+async fn churn(start: Channel<i64>, ready: Channel<i64>) -> i64 {
+    ready.send(1);
+    start.recv();
     let mut k: i64 = 0;
     let mut kept: Array<Array<i64>> = [];
-    while k < 20000 {
+    while k < 1024 {
         kept.push([k]);
         if kept.len() > 64 { kept = []; }
         k = k + 1;
@@ -256,16 +261,24 @@ async fn churn() -> i64 {
     return k;
 }
 async fn main() {
-    let task = churn();
+    let start = Channel<i64>::new();
+    let ready = Channel<i64>::new();
     let xs: Array<i64> = [1, 2, 3, 4];
+    let task = churn(start, ready);
+    ready.recv();
+    let before = gc_major_collections();
+    start.send(1);
     let mut i: i64 = 0;
     let mut total: i64 = 0;
     while i < 400000 {
         total = total + xs[i % xs.len()];
         i = i + 1;
     }
+    let completed = await task;
+    let collected = gc_major_collections() - before;
     println(total);
-    println(await task);
+    println(completed);
+    println(collected >= 1024);
 }
 "#;
     let (out, ok) = compile_and_run_with_runtime_env(
@@ -274,5 +287,5 @@ async fn main() {
         Duration::from_secs(120),
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "1000000\n20000\n");
+    assert_eq!(out, "1000000\n1024\ntrue\n");
 }
