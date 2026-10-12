@@ -872,6 +872,7 @@ fn minor_collect_with_roots(
     {
         panic!("willow gc: region verification failed after minor collection: {message}");
     }
+    super::progress::record_success(state.total_allocated_bytes);
     Some((before, state.allocated_bytes as u64, work))
 }
 
@@ -1002,6 +1003,7 @@ pub(super) fn collect_owned() {
         crate::gc_telemetry::stops::StopReason::Minor,
         |coord, stop_work| {
             if foreign_root_stack_owner_active_locked(coord) {
+                super::progress::record_skip(super::GcSkipReason::ForeignOwnerAtHandshake);
                 return;
             }
             collect_stopped(coord, stop_work);
@@ -1024,9 +1026,7 @@ pub(crate) fn minor_collect_internal() {
         return;
     };
     if foreign_root_stack_owner_active() {
-        runtime()
-            .skipped_foreign_owner_collections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::progress::record_skip(super::GcSkipReason::ForeignOwner);
         return;
     }
 
@@ -1048,9 +1048,7 @@ pub(crate) fn minor_collect_internal() {
         },
     );
     let Some(collected) = collected else {
-        runtime()
-            .skipped_foreign_owner_collections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::progress::record_skip(super::GcSkipReason::ForeignOwnerAtHandshake);
         return;
     };
     let Some((before, after, work)) = collected else {

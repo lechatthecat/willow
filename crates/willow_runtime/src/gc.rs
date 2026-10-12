@@ -38,6 +38,8 @@ mod root;
 pub use root::*;
 mod barrier;
 pub use barrier::*;
+mod progress;
+pub use progress::{GcProgressV1, GcSkipReason, gc_progress, willow_gc_progress_v1};
 mod telemetry;
 pub use telemetry::*;
 mod validation;
@@ -832,7 +834,10 @@ impl Default for GcRuntime {
     }
 }
 
-static GC_RUNTIME: LazyLock<GcRuntime> = LazyLock::new(GcRuntime::default);
+static GC_RUNTIME: LazyLock<GcRuntime> = LazyLock::new(|| {
+    progress::initialize();
+    GcRuntime::default()
+});
 
 fn runtime() -> &'static GcRuntime {
     &GC_RUNTIME
@@ -1686,18 +1691,7 @@ fn try_collect_internal() -> bool {
     // A legacy root owner outside the registry cannot publish a snapshot.
     // Other registered workers do not make that foreign stack safe to scan.
     if foreign_root_stack_owner_active() {
-        // Cannot scan another thread's root stack, so skip (safe). Count it so a
-        // GC-stress run can detect when it is mostly skipping rather than
-        // collecting (willow-6fv.2).
-        let skipped = runtime()
-            .skipped_foreign_owner_collections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        if std::env::var("WILLOW_GC_LOG").is_ok() {
-            eprintln!(
-                "[gc] collection skipped because a foreign root stack owner is active (total skipped={skipped})"
-            );
-        }
+        progress::record_skip(GcSkipReason::ForeignOwner);
         return true;
     }
     let gc_log = std::env::var("WILLOW_GC_LOG").is_ok();
@@ -1718,9 +1712,7 @@ fn try_collect_internal() -> bool {
     let pause_before = coordination_ns();
     let external_before = external_bytes() as u64;
     let Some((heap_before, marking)) = root_handshake::begin() else {
-        runtime()
-            .skipped_foreign_owner_collections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        progress::record_skip(GcSkipReason::ForeignOwnerAtHandshake);
         return true;
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1791,6 +1783,7 @@ fn try_collect_internal() -> bool {
                 decision.goal, decision.trigger, decision.overshoot, decision.reason
             );
         }
+        progress::record_success(state.total_allocated_bytes);
         drop(state);
         // Include the required initial/remark stops in V1 as well as V2.
         let pause_ns = coordination_ns().saturating_sub(pause_before);
@@ -2045,6 +2038,7 @@ fn reset_internal() {
     runtime().pin_lease_slots.clear();
     runtime().parked_stack_roots.lock().unwrap().clear();
     *runtime().root_stack_owner.lock().unwrap() = None;
+    progress::reset();
     {
         let (lock, cv) = &runtime().coord;
         let mut coord = lock.lock().unwrap();

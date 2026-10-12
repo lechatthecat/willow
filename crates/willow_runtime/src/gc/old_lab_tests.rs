@@ -483,3 +483,34 @@ fn threshold_policy_old_lab_pressure_matrix() {
     }
     reset_internal_for_test();
 }
+
+#[test]
+fn foreign_owner_progress_sampling_does_not_index_pending_objects() {
+    let _guard = runtime_test_guard();
+    for count in [1, 16, 256] {
+        reset_internal_for_test();
+        let _labs = LabsOn::new();
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        for _ in 0..count {
+            willow_alloc(8);
+        }
+        let pending = local_pending_for_test();
+        let first = gc_progress();
+        for _ in 0..16 {
+            assert_eq!(
+                gc_progress().allocation_bytes_since_success,
+                first.allocation_bytes_since_success
+            );
+            assert_eq!(local_pending_for_test(), pending);
+        }
+        assert_eq!(
+            first.allocation_bytes_since_success,
+            count * (GC_HEADER_SIZE as u64 + 8)
+        );
+        println!(
+            "objects={count} snapshots=17 additional_indexed_objects=0 allocation_bytes={}",
+            first.allocation_bytes_since_success
+        );
+        reset_internal_for_test();
+    }
+}
