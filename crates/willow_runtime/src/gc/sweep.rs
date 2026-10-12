@@ -28,12 +28,70 @@ pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>
     }
 }
 
+/// Only region flags are published under normal remark. Object reclamation
+/// starts in execute(), after with_stw has released the stop gate.
+pub(super) fn prepare_bounded(
+    state: &mut GcState,
+    marking: Arc<ConcurrentCycle>,
+    budget: &mut old_cycle::RemarkBudget,
+    stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
+) -> Option<SweepPlan> {
+    if !old_lab::retire_bounded(state, budget, stop_work) {
+        return None;
+    }
+    if !publish_regions_bounded(state, &marking, budget, crate::gc_telemetry::timestamp_ns) {
+        return None;
+    }
+    assert!(state.sweeping.is_none());
+    state.sweeping = Some(std::thread::current().id());
+    publish_collection_busy(state);
+    state.major_collections = state.major_collections.saturating_add(1);
+    Some(SweepPlan {
+        old: state.old_regions.len(),
+        chunks: state.tlab_chunks.len(),
+        epoch: state.major_collections,
+        marking: Some(marking),
+    })
+}
+
+/// The heap lock serializes this cursor with append-only old-region growth.
+/// Minor collection does not remove/reorder old regions; only the subsequent
+/// major sweep does. Flags already published remain set across remark restarts,
+/// and new buffers copy them, so their allocations remain black. Retiring all
+/// current buffers before each call also freezes buffers with older clear flags.
+fn publish_regions_bounded(
+    state: &mut GcState,
+    marking: &ConcurrentCycle,
+    budget: &mut old_cycle::RemarkBudget,
+    mut now: impl FnMut() -> u64,
+) -> bool {
+    let mut cursor = marking.sweep_publication_cursor.load(Ordering::Relaxed);
+    assert!(cursor <= state.old_regions.len());
+    while cursor < state.old_regions.len() {
+        if !budget.reserve(1, std::mem::size_of::<bool>() as u64, now()) {
+            return false;
+        }
+        state.old_regions[cursor].sweep_pending = true;
+        budget.record_region_publication();
+        cursor += 1;
+        // Preserve even the last admitted flag if the deadline check fails.
+        marking
+            .sweep_publication_cursor
+            .store(cursor, Ordering::Relaxed);
+    }
+    budget.reserve(0, 0, now())
+}
+
 pub(super) fn stopped(work: &mut crate::gc_telemetry::stops::StopWorkV2) -> usize {
     let plan = prepare(&mut runtime().heap.lock().unwrap(), None);
     execute(plan, work, false)
 }
 
 pub(super) fn concurrent(plan: SweepPlan) -> usize {
+    assert!(
+        !runtime().stop_requested.load(Ordering::Acquire),
+        "normal sweep began before mutator resume"
+    );
     execute(
         plan,
         &mut crate::gc_telemetry::stops::StopWorkV2::default(),
@@ -95,6 +153,13 @@ fn execute(
     }
     let mut state = runtime().heap.lock().unwrap();
     finish(&mut state, &dead_chunks);
+    if let Some(marking) = &plan.marking {
+        marking
+            .phase
+            .lock()
+            .unwrap()
+            .transition(old_cycle::Phase::Idle);
+    }
     // Account reusable storage before another sweep can start.
     crate::frame_lifetime::record_sweep(
         crate::frame_lifetime::FrameEventKind::SweepCompleted,
@@ -403,5 +468,106 @@ fn note_dead_frame(object: HeapObject, sweep_epoch: u64) {
             crate::async_frame::frame_is_terminal(object.payload().as_ptr().cast()),
             sweep_epoch,
         );
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    fn cycle() -> ConcurrentCycle {
+        ConcurrentCycle::new([], IdSet::default(), IdMap::default(), 0)
+    }
+
+    fn append(state: &mut GcState, count: usize) {
+        for _ in 0..count {
+            state
+                .old_regions
+                .push(OldRegion::new(RegionKind::Old, 16).unwrap());
+        }
+    }
+
+    #[test]
+    fn region_publication_default_slots_preserve_progress_and_appended_regions() {
+        let mut state = GcState::default();
+        append(&mut state, 5462);
+        let marking = cycle();
+        let mut budget = old_cycle::RemarkBudget::new(4096, 1048576, 1000000, 0);
+        assert!(!publish_regions_bounded(
+            &mut state,
+            &marking,
+            &mut budget,
+            || 0
+        ));
+        assert_eq!(
+            marking.sweep_publication_cursor.load(Ordering::Relaxed),
+            4096
+        );
+        assert!(state.old_regions[..4096].iter().all(|r| r.sweep_pending));
+        assert!(state.old_regions[4096..].iter().all(|r| !r.sweep_pending));
+        append(&mut state, 17);
+        // Exactly the remaining suffix fits: charging the prefix again fails.
+        let mut budget = old_cycle::RemarkBudget::new(5462 + 17 - 4096, 1048576, 1000000, 0);
+        assert!(publish_regions_bounded(
+            &mut state,
+            &marking,
+            &mut budget,
+            || 0
+        ));
+        assert_eq!(
+            marking.sweep_publication_cursor.load(Ordering::Relaxed),
+            5479
+        );
+        assert!(state.old_regions.iter().all(|r| r.sweep_pending));
+        assert_eq!(cycle().sweep_publication_cursor.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn region_publication_fake_clock_preserves_every_chunk_and_final_deadline_progress() {
+        let mut state = GcState::default();
+        append(&mut state, 7);
+        let marking = cycle();
+        for expected in [2, 4, 6, 7] {
+            let mut ticks = 0;
+            let mut budget = old_cycle::RemarkBudget::new(4096, 1048576, 3, 0);
+            assert!(!publish_regions_bounded(
+                &mut state,
+                &marking,
+                &mut budget,
+                || {
+                    ticks += 1;
+                    // The last round publishes its final region, then times out.
+                    if expected == 7 && ticks == 2 {
+                        3
+                    } else {
+                        ticks
+                    }
+                }
+            ));
+            assert_eq!(
+                marking.sweep_publication_cursor.load(Ordering::Relaxed),
+                expected
+            );
+            assert!(
+                state.old_regions[..expected]
+                    .iter()
+                    .all(|r| r.sweep_pending)
+            );
+            assert!(
+                state.old_regions[expected..]
+                    .iter()
+                    .all(|r| !r.sweep_pending)
+            );
+        }
+        append(&mut state, 1);
+        let mut budget = old_cycle::RemarkBudget::new(1, 1, 3, 0);
+        assert!(publish_regions_bounded(
+            &mut state,
+            &marking,
+            &mut budget,
+            || 1
+        ));
+        assert_eq!(marking.sweep_publication_cursor.load(Ordering::Relaxed), 8);
+        assert!(state.old_regions.iter().all(|r| r.sweep_pending));
     }
 }

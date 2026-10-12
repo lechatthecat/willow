@@ -37,7 +37,11 @@ impl Drop for CollectorGuard {
         drop(self.0.take());
         IS_COLLECTOR.set(false);
         coord.cycle_collector = None;
-        coord.cycle_generation = coord.cycle_generation.wrapping_add(1);
+        coord.recovery_requested_for = None;
+        coord.cycle_generation = coord
+            .cycle_generation
+            .checked_add(1)
+            .expect("collection generation exhausted");
         runtime().budget_cv.notify_all();
     }
 }
@@ -67,6 +71,43 @@ pub(super) fn collect_for_budget() {
         coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
     }
     wait_for_cycle(coord, generation);
+}
+
+/// Wait for an elected collector without consuming an automatic request.
+/// The same condition-variable protocol joins sweep completion and services
+/// each subsequent stop while this registered waiter remains enrolled.
+pub(super) fn wait_for_current_cycle() {
+    let coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    let generation = coord.cycle_generation;
+    wait_for_cycle(coord, generation);
+}
+
+/// Explicit requests finish an active epoch through classified stopped
+/// recovery, wait for its sweep publication, then request a full collection.
+/// Reentrant native hooks on the elected collector never wait on themselves.
+pub(super) fn collect_explicit() {
+    if IS_COLLECTOR.get() {
+        return;
+    }
+    let mut coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    if coord.cycle_collector.is_some() {
+        let generation = coord.cycle_generation;
+        coord.recovery_requested_for = Some(generation);
+        wait_for_cycle(coord, generation);
+    } else {
+        drop(coord);
+    }
+    collect_for_budget();
+}
+
+/// Requests are tied to the elected generation under the same lock used to
+/// retire completion. A late request during remark, Recovery or sweep cannot
+/// survive guard drop or target a subsequent election.
+pub(super) fn take_recovery_request() -> bool {
+    let mut coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    let requested = coord.recovery_requested_for.take();
+    coord.cycle_collector == Some(std::thread::current().id())
+        && requested == Some(coord.cycle_generation)
 }
 
 fn wait_for_cycle(mut coord: std::sync::MutexGuard<'_, GcCoord>, generation: u64) {
@@ -168,19 +209,82 @@ mod tests {
             for waiter in waiters {
                 waiter.join().unwrap();
             }
-            assert_eq!(CHECKS.load(Ordering::Relaxed), 3 * count);
-            assert_eq!(SLEEPS.load(Ordering::Relaxed), 2 * count);
-            assert_eq!(
-                runtime().coord.0.lock().unwrap().cycle_generation,
-                generation.wrapping_add(1)
-            );
+            // The joined epoch and the subsequently required full collection
+            // are distinct. Contending full requests may coalesce; no waiter
+            // may return without a post-join collection completing.
+            assert!(CHECKS.load(Ordering::Relaxed) >= 3 * count);
+            assert!(SLEEPS.load(Ordering::Relaxed) >= 2 * count);
+            assert!(runtime().coord.0.lock().unwrap().cycle_generation >= generation + 2);
+            assert!(runtime().heap.lock().unwrap().major_collections >= 1);
             println!(
                 "explicit GC waiters={count} sleeps={} checks={}",
-                2 * count,
-                3 * count
+                SLEEPS.load(Ordering::Relaxed),
+                CHECKS.load(Ordering::Relaxed)
             );
         }
         reset_internal_for_test();
+    }
+
+    fn late_request_is_retired(reason: Option<crate::gc_telemetry::stops::StopReason>) {
+        let _test = runtime_test_guard();
+        reset_internal_for_test();
+        reset_counts();
+        let elected = CollectorGuard::try_acquire().unwrap();
+        // While COORD is held by a late stopped phase, launch a real explicit
+        // request. It must await COORD release, then target this same election.
+        let waiter = if let Some(reason) = reason {
+            with_stw(reason, |_, _| {
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    ready_tx.send(()).unwrap();
+                    collect_explicit();
+                });
+                ready_rx.recv().unwrap();
+                waiter
+            })
+        } else {
+            runtime().heap.lock().unwrap().sweeping = Some(std::thread::current().id());
+            std::thread::spawn(collect_explicit)
+        };
+        await_sleeps(1);
+        {
+            let coord = runtime().coord.0.lock().unwrap();
+            assert_eq!(coord.recovery_requested_for, Some(coord.cycle_generation));
+        }
+        if reason.is_none() {
+            runtime().heap.lock().unwrap().sweeping = None;
+        }
+        drop(elected);
+        waiter.join().unwrap(); // Also finishes its subsequent full collection.
+        let next = CollectorGuard::try_acquire().unwrap();
+        assert!(
+            !take_recovery_request(),
+            "late request leaked into next election"
+        );
+        assert!(
+            runtime()
+                .coord
+                .0
+                .lock()
+                .unwrap()
+                .recovery_requested_for
+                .is_none()
+        );
+        drop(next);
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn cycle_scoped_recovery_late_remark_request_does_not_leak() {
+        late_request_is_retired(Some(crate::gc_telemetry::stops::StopReason::Remark));
+    }
+    #[test]
+    fn cycle_scoped_recovery_completion_request_does_not_leak() {
+        late_request_is_retired(Some(crate::gc_telemetry::stops::StopReason::Recovery));
+    }
+    #[test]
+    fn cycle_scoped_recovery_sweep_request_does_not_leak() {
+        late_request_is_retired(None);
     }
 
     #[test]

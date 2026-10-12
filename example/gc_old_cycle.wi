@@ -1,0 +1,32 @@
+// Same rooted graph survives concurrent marking, minor overlap, and rollout fallback.
+// Expected output: 499500, 499500, 499500.
+class CycleNode {
+    pub value: i64;
+    pub next: Option<CycleNode>;
+}
+
+fn sum(list: Option<CycleNode>) -> i64 {
+    let mut node: Option<CycleNode> = list;
+    let mut total: i64 = 0;
+    while node.is_some() {
+        let current = node.unwrap();
+        total = total + current.value;
+        node = current.next;
+    }
+    return total;
+}
+
+fn main() {
+    let mut list: Option<CycleNode> = None;
+    let mut i: i64 = 0;
+    while i < 1000 {
+        list = Some(new CycleNode(i, list));
+        i = i + 1;
+    }
+    gc_collect();
+    println(sum(list));
+    gc_minor_collect();
+    println(sum(list));
+    gc_collect();
+    println(sum(list));
+}

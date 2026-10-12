@@ -20,8 +20,10 @@
 //! - Mark closure retires every buffer before clearing `GC_MARK_PHASE`, so no
 //!   buffer allocation observes phase 0 while its region still awaits a
 //!   pending sweep without `sweep_pending`.
-//! - Every pending object is flushed into its region before any walk of
-//!   `allocations` (sweep, epoch capture, stopped marking, validation, reset).
+//! - Every pending object is flushed into its region before a walk of
+//!   `allocations` (sweep, baseline stopped marking, validation, reset).
+//!   Concurrent epoch capture uses immutable headers/start maps and counter
+//!   merging; it must not eagerly build per-object indexes under initial STW.
 use super::*;
 
 /// Carve size: four generated TLAB chunks (half an old region). Runtime-heavy
@@ -67,8 +69,12 @@ struct Inner {
     sweep_pending: bool,
     starts: Option<Arc<concurrent_bitmap::ConcurrentMarkBits>>,
     marks: Option<Arc<concurrent_bitmap::ConcurrentMarkBits>>,
-    /// Unindexed `(offset, span)` objects of the current carve, ascending.
+    /// Published `(offset, span)` entries of the current carve, ascending;
+    /// `pending_index` separates the indexed prefix from the pending suffix.
     pending: Vec<(usize, usize)>,
+    /// Already-indexed prefix retained in place across bounded remark retries.
+    /// No prefix removal/copy and no repeated region insertion.
+    pending_index: usize,
     pending_live: usize,
 }
 
@@ -92,6 +98,7 @@ thread_local! {
             starts: None,
             marks: None,
             pending: Vec::new(),
+            pending_index: 0,
             pending_live: 0,
         }),
         bytes: AtomicU64::new(0),
@@ -216,6 +223,7 @@ pub(super) fn refill_and_allocate(
             starts: Some(region_ref.mark_bitmap.bits.clone()),
             marks: Some(region_ref.concurrent_marks.clone()),
             pending: std::mem::take(&mut inner.pending),
+            pending_index: 0,
             pending_live: 0,
         };
         let object = lab.bump(&mut inner, type_id, layout_id, gc_ref_mask, total, span);
@@ -320,16 +328,18 @@ fn flush(state: &mut GcState, index: usize, deactivate: bool) {
             ..
         } = &mut *state;
         let mut inner = old_labs[index].lab.inner.lock().unwrap();
-        if !inner.pending.is_empty() {
+        if inner.pending_index < inner.pending.len() {
             let region = &mut old_regions[inner.region];
             if inner.reused {
-                *old_region_reuses = old_region_reuses.saturating_add(inner.pending.len() as u64);
+                *old_region_reuses = old_region_reuses
+                    .saturating_add((inner.pending.len() - inner.pending_index) as u64);
             }
-            for &(offset, span) in &inner.pending {
+            for &(offset, span) in &inner.pending[inner.pending_index..] {
                 region.allocations.insert(offset, span);
             }
             region.live_bytes = region.live_bytes.saturating_add(inner.pending_live);
             inner.pending.clear();
+            inner.pending_index = 0;
             inner.pending_live = 0;
         }
         if deactivate && inner.active {
@@ -366,6 +376,103 @@ pub(super) fn retire_all(state: &mut GcState) {
         retire(state, index);
     }
     prune(state);
+}
+
+/// Freeze each active buffer and index one pending entry per admitted chunk.
+/// A rejected entry stays in its original Vec, with a durable indexed-prefix
+/// cursor. Mutator refill/full flush consumes only the remaining suffix.
+pub(super) fn retire_bounded(
+    state: &mut GcState,
+    budget: &mut old_cycle::RemarkBudget,
+    work: &mut crate::gc_telemetry::stops::StopWorkV2,
+) -> bool {
+    retire_bounded_with_clock(state, budget, work, crate::gc_telemetry::timestamp_ns)
+}
+
+fn retire_bounded_with_clock(
+    state: &mut GcState,
+    budget: &mut old_cycle::RemarkBudget,
+    work: &mut crate::gc_telemetry::stops::StopWorkV2,
+    mut now: impl FnMut() -> u64,
+) -> bool {
+    for index in 0..state.old_labs.len() {
+        if !budget.reserve(0, 0, now()) {
+            return false;
+        }
+        let complete = {
+            let GcState {
+                old_labs,
+                old_regions,
+                old_region_reuses,
+                ..
+            } = &mut *state;
+            let mut inner = old_labs[index].lab.inner.lock().unwrap();
+            if !inner.active && inner.pending_index == inner.pending.len() {
+                continue; // No capacity charge, retirement, or redundant sync.
+            }
+            if !budget.reserve(1, std::mem::size_of::<(usize, usize)>() as u64, now()) {
+                return false;
+            }
+            let region = &mut old_regions[inner.region];
+            if inner.active {
+                // Revocation precedes indexing: a resumed owner must refill,
+                // which also flushes this suffix before replacing the carve.
+                inner.active = false;
+                inner.starts = None;
+                inner.marks = None;
+                region.active_labs -= 1;
+            }
+            while inner.pending_index < inner.pending.len() {
+                // One tuple and immutable header, never the carved payload.
+                if !budget.reserve(
+                    2,
+                    (std::mem::size_of::<(usize, usize)>() + GC_HEADER_SIZE) as u64,
+                    now(),
+                ) {
+                    break;
+                }
+                let (offset, span) = inner.pending[inner.pending_index];
+                let object = HeapObject::from_raw((inner.base + offset) as *mut GcHeader)
+                    .expect("pending allocation has a valid header");
+                let logical_bytes = object.size();
+                assert!(
+                    region.allocations.insert(offset, span).is_none(),
+                    "buffer indexed twice"
+                );
+                region.live_bytes = region.live_bytes.saturating_add(logical_bytes);
+                inner.pending_live -= logical_bytes;
+                if inner.reused {
+                    *old_region_reuses = old_region_reuses.saturating_add(1);
+                }
+                inner.pending_index += 1;
+                work.metadata_objects += 1;
+                work.metadata_bytes +=
+                    (std::mem::size_of::<(usize, usize)>() + GC_HEADER_SIZE) as u64;
+            }
+            let complete = inner.pending_index == inner.pending.len();
+            if complete {
+                assert_eq!(inner.pending_live, 0);
+                inner.pending.clear();
+                inner.pending_index = 0;
+            }
+            complete
+        };
+        sync_record(state, index);
+        if !complete {
+            return false;
+        }
+    }
+    // Exited empty records are pruned by the existing post-resume sweep owner,
+    // not an extra unchunked registry walk inside bounded normal remark.
+    budget.reserve(0, 0, now())
+}
+
+/// Merge logical counters without enumerating pending objects. Initial mark
+/// uses start-bit views and needs accounting, not per-object region indexes.
+pub(super) fn sync_records(state: &mut GcState) {
+    for index in 0..state.old_labs.len() {
+        sync_record(state, index);
+    }
 }
 
 /// Retire buffers carved from one region before its sweep visit. The region's
@@ -410,7 +517,10 @@ pub(super) fn reset(state: &mut GcState) {
 
 #[cfg(test)]
 pub(super) fn local_pending_for_test() -> usize {
-    LOCAL.with(|lab| lab.inner.lock().unwrap().pending.len())
+    LOCAL.with(|lab| {
+        let inner = lab.inner.lock().unwrap();
+        inner.pending.len() - inner.pending_index
+    })
 }
 
 #[cfg(test)]

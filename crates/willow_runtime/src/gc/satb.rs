@@ -8,6 +8,20 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 
+fn assert_stopped_owners(coord: &super::GcCoord) {
+    assert!(
+        coord.stop_requested,
+        "foreign SATB inspection requires STW under COORD"
+    );
+    // with_stw builds pending before its rendezvous and removes owners as
+    // they park/unregister. It calls the collector only once pending is empty,
+    // retaining COORD so registration/resume cannot invalidate this proof.
+    assert!(
+        coord.stw_pending.is_empty(),
+        "foreign SATB owner must park or unregister before inspection"
+    );
+}
+
 fn configured_capacity() -> usize {
     capacity_from_setting(
         std::env::var("WILLOW_GC_SATB_BUFFER_ENTRIES")
@@ -23,9 +37,104 @@ fn capacity_from_setting(setting: Option<&str>) -> usize {
         .unwrap_or(256)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static ENTRY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LEGACY_EMPTY_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Successfully published prefixes remain in place until the buffer empties.
+/// This keeps partial transfer O(entries) cumulatively, without shifting tails.
+#[derive(Default)]
+struct EntryBuffer {
+    values: Vec<usize>,
+    published: usize,
+}
+impl std::ops::Deref for EntryBuffer {
+    type Target = [usize];
+    fn deref(&self) -> &[usize] {
+        #[cfg(test)]
+        ENTRY_READS.set(ENTRY_READS.get() + 1);
+        &self.values[self.published..]
+    }
+}
+impl EntryBuffer {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(capacity),
+            published: 0,
+        }
+    }
+    fn capacity(&self) -> usize {
+        self.values.capacity()
+    }
+    fn reserve_exact(&mut self, capacity: usize) {
+        self.values.reserve_exact(capacity);
+    }
+    fn push(&mut self, value: usize) {
+        self.values.push(value);
+    }
+    fn clear(&mut self) {
+        self.values.clear();
+        self.published = 0;
+    }
+}
+
+fn transfer_bounded(
+    entries: &mut EntryBuffer,
+    budget: &mut super::old_cycle::RemarkBudget,
+    now: &mut impl FnMut() -> u64,
+    publish: &mut impl FnMut(&[usize]),
+) -> bool {
+    // Matches enqueue_satb_batch's queue-item bound: a callback processes at
+    // most one chunk before the next deadline/work admission check.
+    const CHUNK: usize = 32;
+    while !entries.is_empty() {
+        let count = entries.len().min(CHUNK);
+        if !budget.reserve(
+            count as u64,
+            (count * std::mem::size_of::<usize>()) as u64,
+            now(),
+        ) {
+            return false;
+        }
+        publish(&entries[..count]);
+        entries.published += count;
+    }
+    entries.clear();
+    budget.reserve(0, 0, now())
+}
+
+/// Update logical pending-entry accounting even when publication unwinds or
+/// a bounded transfer returns with a partially published prefix.
+fn account_pending<R>(
+    entries: &mut EntryBuffer,
+    pending: &mut usize,
+    operation: impl FnOnce(&mut EntryBuffer) -> R,
+) -> R {
+    struct Accounting<'a> {
+        entries: &'a mut EntryBuffer,
+        pending: &'a mut usize,
+        before: usize,
+    }
+    impl Drop for Accounting<'_> {
+        fn drop(&mut self) {
+            *self.pending = *self.pending - self.before + self.entries.len();
+        }
+    }
+    let before = entries.len();
+    let guard = Accounting {
+        entries,
+        pending,
+        before,
+    };
+    operation(&mut *guard.entries)
+}
+
 pub(super) struct SatbBuffers {
     capacity: usize,
-    entries: HashMap<ThreadId, Vec<usize>>,
+    entries: HashMap<ThreadId, EntryBuffer>,
+    pending_entries: usize,
 }
 
 impl Default for SatbBuffers {
@@ -36,7 +145,9 @@ impl Default for SatbBuffers {
 
 impl SatbBuffers {
     pub(super) fn is_empty(&self) -> bool {
-        self.entries.values().all(Vec::is_empty)
+        #[cfg(test)]
+        LEGACY_EMPTY_CHECKS.set(LEGACY_EMPTY_CHECKS.get() + 1);
+        self.pending_entries == 0
     }
 
     pub(super) fn new(capacity: usize) -> Self {
@@ -44,6 +155,7 @@ impl SatbBuffers {
         Self {
             capacity,
             entries: HashMap::new(),
+            pending_entries: 0,
         }
     }
 
@@ -59,18 +171,19 @@ impl SatbBuffers {
         let entries = self
             .entries
             .entry(thread)
-            .or_insert_with(|| Vec::with_capacity(self.capacity));
-        // A previous publication may have unwound with a full buffer. Drain
-        // that buffer before appending so recovery never grows past capacity.
-        if entries.len() >= self.capacity {
-            publish(entries);
-            entries.clear();
-        }
-        entries.push(value);
-        if entries.len() >= self.capacity {
-            publish(entries);
-            entries.clear();
-        }
+            .or_insert_with(|| EntryBuffer::with_capacity(self.capacity));
+        account_pending(entries, &mut self.pending_entries, |entries| {
+            // A failed publication leaves the full buffer owned for retry.
+            if entries.len() >= self.capacity {
+                publish(entries);
+                entries.clear();
+            }
+            entries.push(value);
+            if entries.len() >= self.capacity {
+                publish(entries);
+                entries.clear();
+            }
+        });
     }
 
     pub(super) fn flush_thread(
@@ -82,19 +195,60 @@ impl SatbBuffers {
         if let Some(entries) = self.entries.get_mut(&thread)
             && !entries.is_empty()
         {
-            publish(entries);
-            entries.clear();
+            account_pending(entries, &mut self.pending_entries, |entries| {
+                publish(entries);
+                entries.clear();
+            });
         }
         if retire {
             self.entries.remove(&thread);
         }
     }
 
+    pub(super) fn flush_all_bounded(
+        &mut self,
+        coord: &super::GcCoord,
+        budget: &mut super::old_cycle::RemarkBudget,
+        mut publish: impl FnMut(&[usize]),
+    ) -> bool {
+        self.flush_all_bounded_with_clock(
+            coord,
+            budget,
+            crate::gc_telemetry::timestamp_ns,
+            &mut publish,
+        )
+    }
+
+    fn flush_all_bounded_with_clock(
+        &mut self,
+        coord: &super::GcCoord,
+        budget: &mut super::old_cycle::RemarkBudget,
+        mut now: impl FnMut() -> u64,
+        mut publish: impl FnMut(&[usize]),
+    ) -> bool {
+        if !budget.reserve(1, 0, now()) {
+            return false;
+        }
+        assert_stopped_owners(coord);
+        for entries in self.entries.values_mut() {
+            if !budget.reserve(1, 0, now())
+                || !account_pending(entries, &mut self.pending_entries, |entries| {
+                    transfer_bounded(entries, budget, &mut now, &mut publish)
+                })
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(super) fn flush_all(&mut self, mut publish: impl FnMut(&[usize])) {
         for entries in self.entries.values_mut() {
             if !entries.is_empty() {
-                publish(entries);
-                entries.clear();
+                account_pending(entries, &mut self.pending_entries, |entries| {
+                    publish(entries);
+                    entries.clear();
+                });
             }
         }
     }
@@ -115,8 +269,9 @@ thread_local! {
 ///
 /// A producer obtains its private buffer from a sharded registry, releases
 /// the registry lock, then checks `sealed` and epoch validity under the buffer
-/// lock. Publication completes under the buffer lock. `seal` first publishes
-/// `sealed`, then drains each buffer under that same lock. Thus publication
+/// lock. Publication completes under the buffer lock. Stopped sealing validates
+/// ownership under COORD before inspecting foreign buffers, then publishes
+/// `sealed` and drains under the buffer lock. Thus publication
 /// precedes its drain or observes sealing and falls back to the heap lock.
 /// Lock order: heap -> registry -> private buffer -> mark queue; producers
 /// release the registry lock before locking their private buffer.
@@ -134,12 +289,15 @@ pub(super) struct SatbShards {
 struct Shard(Mutex<HashMap<ThreadId, Arc<MutatorBuffer>>>);
 
 /// The registration record owns the buffer; a cycle retains an Arc until its
-/// final drain. A mutex publishes entries even during concurrent closure.
-pub(super) struct MutatorBuffer(Mutex<Vec<usize>>);
+/// final stopped drain. Only the owner publishes while running; foreign reads
+/// additionally require stopped ownership under COORD.
+pub(super) struct MutatorBuffer(Mutex<EntryBuffer>);
 
 impl Default for MutatorBuffer {
     fn default() -> Self {
-        Self(Mutex::new(Vec::with_capacity(configured_capacity())))
+        Self(Mutex::new(
+            EntryBuffer::with_capacity(configured_capacity()),
+        ))
     }
 }
 
@@ -207,20 +365,24 @@ impl SatbShards {
         }))
     }
 
-    pub(super) fn retire_current(&self) {
+    pub(super) fn retire_current(&self, mut publish: impl FnMut(&[usize])) {
         let mut buffers = self.shards[SHARD.with(|shard| *shard)]
             .0
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(buffer) = buffers.remove(&std::thread::current().id()) {
-            assert!(
-                buffer
-                    .0
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .is_empty(),
-                "retirement must drain first"
-            );
+        let owner = std::thread::current().id();
+        if let Some(buffer) = buffers.get(&owner).cloned() {
+            let mut entries = buffer.0.lock().unwrap_or_else(|error| error.into_inner());
+            if !entries.is_empty() {
+                // Closure may have revoked private publication before this
+                // owner reaches unregister. Transfer before removing storage.
+                publish(&entries);
+                entries.clear();
+            }
+            drop(entries);
+            // Removal follows successful publication, so an unwinding callback
+            // leaves owned entries reachable by authoritative seal/recovery.
+            buffers.remove(&owner);
         }
     }
 
@@ -233,15 +395,59 @@ impl SatbShards {
     /// Stop shard publication and hand every pending entry to `publish`.
     /// Idempotent; later producers fall back to the heap-locked path.
     pub(super) fn seal_stopped(&self, coord: &super::GcCoord, publish: impl FnMut(&[usize])) {
-        assert!(coord.stop_requested);
-        let current = std::thread::current().id();
-        assert!(
-            coord
-                .mutators
-                .keys()
-                .all(|id| *id == current || coord.parked.contains(id))
-        );
+        assert_stopped_owners(coord);
         self.seal(publish);
+    }
+
+    /// Only a stopped ownership boundary may inspect foreign buffers. Reserve
+    /// registry and entry work before transfer; rejected buffers keep all entries
+    /// reachable for authoritative Recovery, while admitted buffers clear once.
+    pub(super) fn seal_stopped_bounded(
+        &self,
+        coord: &super::GcCoord,
+        budget: &mut super::old_cycle::RemarkBudget,
+        mut publish: impl FnMut(&[usize]),
+    ) -> bool {
+        self.seal_stopped_bounded_with_clock(
+            coord,
+            budget,
+            crate::gc_telemetry::timestamp_ns,
+            &mut publish,
+        )
+    }
+
+    fn seal_stopped_bounded_with_clock(
+        &self,
+        coord: &super::GcCoord,
+        budget: &mut super::old_cycle::RemarkBudget,
+        mut now: impl FnMut() -> u64,
+        mut publish: impl FnMut(&[usize]),
+    ) -> bool {
+        if !budget.reserve(1, 0, now()) {
+            return false;
+        }
+        assert_stopped_owners(coord);
+        self.sealed.store(true, Ordering::SeqCst);
+        if self.drained.load(Ordering::Acquire) {
+            return true;
+        }
+        for shard in &self.shards {
+            if !budget.reserve(1, 0, now()) {
+                return false;
+            }
+            let buffers = shard.0.lock().unwrap_or_else(|error| error.into_inner());
+            for buffer in buffers.values() {
+                if !budget.reserve(1, 0, now()) {
+                    return false;
+                }
+                let mut entries = buffer.0.lock().unwrap_or_else(|error| error.into_inner());
+                if !transfer_bounded(&mut entries, budget, &mut now, &mut publish) {
+                    return false;
+                }
+            }
+        }
+        self.drained.store(true, Ordering::Release);
+        true
     }
 
     /// Minor relocation has translated the injector and every buffer is empty.
@@ -286,22 +492,28 @@ impl SatbShards {
         self.drained.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.shards.iter().all(|shard| {
-            shard.0.lock().unwrap().values().all(|buffer| {
-                buffer
-                    .0
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .is_empty()
-            })
+            shard
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .all(|buffer| {
+                    buffer
+                        .0
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .is_empty()
+                })
         })
     }
 }
 
 pub(super) struct ShardBuffer<'a> {
     capacity: usize,
-    entries: &'a mut Vec<usize>,
+    entries: &'a mut EntryBuffer,
 }
 
 impl ShardBuffer<'_> {
@@ -345,6 +557,7 @@ mod tests {
             ..Default::default()
         };
         coord.mutators.insert(foreign, Default::default());
+        coord.stw_pending.insert(foreign);
         let buffers = SatbShards::new(256);
         let mut published = Vec::new();
         buffers
@@ -358,12 +571,325 @@ mod tests {
         );
         assert!(!buffers.sealed.load(Ordering::Acquire));
         coord.parked.insert(foreign);
+        coord.stw_pending.remove(&foreign);
         buffers.seal_stopped(&coord, |entries| published.extend_from_slice(entries));
         assert_eq!(published, vec![7]);
         let buffers = SatbShards::new(256);
         coord.parked.remove(&foreign);
         coord.mutators.remove(&foreign);
         buffers.seal_stopped(&coord, |_| panic!("empty"));
+    }
+
+    #[test]
+    fn bounded_stopped_satb_transfer_rejects_running_owner_and_retains_unadmitted_entries() {
+        let buffers = Arc::new(SatbShards::new(256));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let owner_buffers = buffers.clone();
+        let owner = std::thread::spawn(move || {
+            owner_buffers
+                .with_current(
+                    || true,
+                    |buffer| {
+                        buffer.record(7, |_| unreachable!());
+                        buffer.record(9, |_| unreachable!());
+                    },
+                )
+                .unwrap();
+            ready_tx.send(std::thread::current().id()).unwrap();
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        let foreign = ready_rx.recv().unwrap();
+        let mut coord = super::super::GcCoord {
+            stop_requested: true,
+            ..Default::default()
+        };
+        coord.mutators.insert(foreign, Default::default());
+        coord.stw_pending.insert(foreign);
+        let mut budget = super::super::old_cycle::RemarkBudget::new(4096, 8, u64::MAX, 0);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                buffers.seal_stopped_bounded(&coord, &mut budget, |_| {
+                    panic!("running owner must not be inspected")
+                });
+            }))
+            .is_err()
+        );
+        assert!(!buffers.sealed.load(Ordering::Acquire));
+        // The owner is waiting without accessing its buffer. Marking it parked
+        // models the COORD-owned stopped snapshot; no foreign read precedes it.
+        coord.parked.insert(foreign);
+        coord.stw_pending.remove(&foreign);
+        let mut published = Vec::new();
+        assert!(
+            !buffers.seal_stopped_bounded(&coord, &mut budget, |values| published
+                .extend_from_slice(values))
+        );
+        assert!(published.is_empty(), "whole rejected batch remains owned");
+        assert!(!buffers.is_drained());
+        buffers.seal_stopped(&coord, |values| published.extend_from_slice(values));
+        assert_eq!(published, [7, 9]);
+        buffers.seal_stopped(&coord, |_| panic!("must not republish"));
+        assert!(buffers.is_drained());
+        done_tx.send(()).unwrap();
+        owner.join().unwrap();
+    }
+
+    #[test]
+    fn satb_both_buffers_fake_clock_preserves_mid_publication_suffix_exactly_once() {
+        for count in [65, 1025, 65535] {
+            for sharded in [false, true] {
+                let coord = super::super::GcCoord {
+                    stop_requested: true,
+                    ..Default::default()
+                };
+                let clock = std::cell::Cell::new(0);
+                let mut budget =
+                    super::super::old_cycle::RemarkBudget::new(1000000, 1048576, 10, 0);
+                let mut published = Vec::new();
+                let mut legacy = SatbBuffers::new(65536);
+                let shards = SatbShards::new(65536);
+                for value in 1..=count {
+                    if sharded {
+                        shards
+                            .with_current(|| true, |b| b.record(value, |_| panic!("not full")))
+                            .unwrap();
+                    } else {
+                        legacy.record(std::thread::current().id(), value, |_| panic!("not full"));
+                    }
+                }
+                let mut publish = |values: &[usize]| {
+                    assert!(values.len() <= 32);
+                    published.extend_from_slice(values);
+                    clock.set(10); // Deadline expires while the first callback runs.
+                };
+                let finished = if sharded {
+                    shards.seal_stopped_bounded_with_clock(
+                        &coord,
+                        &mut budget,
+                        || clock.get(),
+                        &mut publish,
+                    )
+                } else {
+                    legacy.flush_all_bounded_with_clock(
+                        &coord,
+                        &mut budget,
+                        || clock.get(),
+                        &mut publish,
+                    )
+                };
+                assert!(!finished);
+                assert_eq!(published, (1..=32).collect::<Vec<_>>());
+                let mut budget =
+                    super::super::old_cycle::RemarkBudget::new(1000000, 1048576, 10, 0);
+                if sharded {
+                    assert!(!shards.is_drained());
+                    assert!(shards.seal_stopped_bounded_with_clock(
+                        &coord,
+                        &mut budget,
+                        || 0,
+                        |v| published.extend_from_slice(v)
+                    ));
+                    shards.seal_stopped(&coord, |_| panic!("duplicate"));
+                } else {
+                    assert!(legacy.flush_all_bounded_with_clock(
+                        &coord,
+                        &mut budget,
+                        || 0,
+                        |v| published.extend_from_slice(v)
+                    ));
+                    legacy.flush_all(|_| panic!("duplicate"));
+                }
+                assert_eq!(published, (1..=count).collect::<Vec<_>>());
+                println!(
+                    "satb sharded={sharded} entries={count} first_transfer=32 suffix={} total_transferred={} prefix_moves=0",
+                    count - 32,
+                    published.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn satb_many_owners_tiny_budget_and_fake_clock_have_constant_ownership_checks() {
+        for count in [1, 64, 1024] {
+            let mut coord = super::super::GcCoord {
+                stop_requested: true,
+                ..Default::default()
+            };
+            let mut legacy = SatbBuffers::new(256);
+            let shards = SatbShards::new(256);
+            for _ in 0..count {
+                let id = std::thread::spawn(|| std::thread::current().id())
+                    .join()
+                    .unwrap();
+                coord.mutators.insert(id, Default::default());
+                coord.parked.insert(id);
+                // Empty foreign buffers plus one retained nonempty owner.
+                legacy.entries.insert(id, EntryBuffer::default());
+                shards.shards[0]
+                    .0
+                    .lock()
+                    .unwrap()
+                    .insert(id, Arc::new(MutatorBuffer::default()));
+            }
+            legacy.record(std::thread::current().id(), 99, |_| unreachable!());
+            shards
+                .with_current(|| true, |b| b.record(99, |_| unreachable!()))
+                .unwrap();
+            for sharded in [false, true] {
+                for deadline in [false, true] {
+                    let checks = std::cell::Cell::new(0);
+                    let mut now = || {
+                        let n = checks.get();
+                        checks.set(n + 1);
+                        if deadline && n > 0 { 10 } else { 0 }
+                    };
+                    let mut budget = super::super::old_cycle::RemarkBudget::new(
+                        if deadline { 1000000 } else { 1 },
+                        1048576,
+                        10,
+                        0,
+                    );
+                    let mut publish =
+                        |_: &[usize]| panic!("rejected transfer must preserve entries");
+                    let result = if sharded {
+                        shards.seal_stopped_bounded_with_clock(
+                            &coord,
+                            &mut budget,
+                            &mut now,
+                            &mut publish,
+                        )
+                    } else {
+                        legacy.flush_all_bounded_with_clock(
+                            &coord,
+                            &mut budget,
+                            &mut now,
+                            &mut publish,
+                        )
+                    };
+                    assert!(!result);
+                    assert_eq!(
+                        checks.get(),
+                        2,
+                        "one admitted ownership check then one rejected registry visit, independent of owner count"
+                    );
+                    println!(
+                        "satb owners={count} sharded={sharded} deadline={deadline} ownership_checks=1 budget_checks=2 published_entries=0 retained_entries=1"
+                    );
+                }
+            }
+            let mut published = Vec::new();
+            shards.seal_stopped(&coord, |v| published.extend_from_slice(v));
+            assert_eq!(published, [99]);
+            published.clear();
+            legacy.flush_all(|v| published.extend_from_slice(v));
+            assert_eq!(published, [99]);
+        }
+    }
+
+    #[test]
+    fn legacy_final_remark_many_owner_emptiness_is_constant_and_unwind_safe() {
+        for count in [1, 64, 1024] {
+            let coord = super::super::GcCoord {
+                stop_requested: true,
+                ..Default::default()
+            };
+            let mut buffers = SatbBuffers::new(256);
+            for _ in 0..count {
+                let id = std::thread::spawn(|| std::thread::current().id())
+                    .join()
+                    .unwrap();
+                buffers.entries.insert(id, EntryBuffer::default());
+            }
+            buffers.record(std::thread::current().id(), 99, |_| unreachable!());
+            assert!(!buffers.is_empty());
+            buffers.flush_all(|values| assert_eq!(values, [99]));
+            let visits = std::cell::Cell::new(0);
+            let mut budget = super::super::old_cycle::RemarkBudget::new(1, 1, 10, 0);
+            // Models final remark: the maintained invariant reads no owner
+            // record; deadline admission can reject immediately afterward.
+            let entry_reads = ENTRY_READS.get();
+            let empty_checks = LEGACY_EMPTY_CHECKS.get();
+            assert!(buffers.is_empty());
+            assert_eq!(
+                ENTRY_READS.get() - entry_reads,
+                0,
+                "final invariant must not inspect any retained buffer"
+            );
+            assert_eq!(LEGACY_EMPTY_CHECKS.get() - empty_checks, 1);
+            assert!(!budget.reserve(0, 0, {
+                visits.set(visits.get() + 1);
+                10
+            }));
+            assert_eq!(visits.get(), 1);
+            assert_eq!(
+                buffers.entries.len(),
+                count + 1,
+                "retained empty records exercise final check"
+            );
+            println!(
+                "final_remark legacy_owners={count} emptiness_scalar_reads=1 owner_record_visits=0 budget_checks=1 expired=true"
+            );
+            buffers.record(std::thread::current().id(), 7, |_| unreachable!());
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || buffers.flush_all(|_| panic!("publication failed"))
+                ))
+                .is_err()
+            );
+            assert!(!buffers.is_empty());
+            let mut published = Vec::new();
+            buffers.flush_all_bounded_with_clock(
+                &coord,
+                &mut super::super::old_cycle::RemarkBudget::new(1000000, 1048576, 10, 0),
+                || 0,
+                |v| published.extend_from_slice(v),
+            );
+            assert_eq!(published, [7]);
+            assert!(buffers.is_empty());
+        }
+        let mut buffers = SatbBuffers::new(65536);
+        for value in 1..=65 {
+            buffers.record(std::thread::current().id(), value, |_| unreachable!());
+        }
+        let coord = super::super::GcCoord {
+            stop_requested: true,
+            ..Default::default()
+        };
+        let clock = std::cell::Cell::new(0);
+        let mut delivered = Vec::new();
+        assert!(!buffers.flush_all_bounded_with_clock(
+            &coord,
+            &mut super::super::old_cycle::RemarkBudget::new(1000, 1048576, 10, 0),
+            || clock.get(),
+            |v| {
+                delivered.extend_from_slice(v);
+                clock.set(10);
+            }
+        ));
+        assert_eq!(buffers.pending_entries, 33);
+        assert!(!buffers.is_empty());
+        buffers.flush_thread(std::thread::current().id(), true, |v| {
+            delivered.extend_from_slice(v)
+        });
+        assert_eq!(delivered, (1..=65).collect::<Vec<_>>());
+        assert!(buffers.is_empty());
+        // Capacity publication also updates accounting on normal and unwind paths.
+        let mut buffers = SatbBuffers::new(1);
+        buffers.record(std::thread::current().id(), 1, |_| {});
+        assert!(buffers.is_empty());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| buffers.record(
+                std::thread::current().id(),
+                2,
+                |_| panic!("full publish failed")
+            )))
+            .is_err()
+        );
+        assert!(!buffers.is_empty());
+        buffers.flush_thread(std::thread::current().id(), true, |v| assert_eq!(v, [2]));
+        assert!(buffers.is_empty());
     }
 
     #[test]
@@ -401,6 +927,66 @@ mod tests {
                     published.len()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn retirement_publication_unwind_preserves_buffer_for_authoritative_seal() {
+        let shards = SatbShards::new(256);
+        shards
+            .with_current(|| true, |buffer| buffer.record(123, |_| unreachable!()))
+            .unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                shards.retire_current(|_| panic!("injected publication failure"));
+            }))
+            .is_err()
+        );
+        let mut published = Vec::new();
+        shards.seal(|values| published.extend_from_slice(values));
+        assert_eq!(published, vec![123]);
+        shards.retire_current(|_| unreachable!());
+        assert!(shards.is_empty());
+    }
+
+    #[test]
+    fn concurrent_seal_and_unregister_transfer_each_entry_exactly_once() {
+        for count in [1, 16, 80] {
+            let buffers = Arc::new(SatbShards::new(256));
+            let published = Arc::new(Mutex::new(Vec::new()));
+            let ready = Arc::new(std::sync::Barrier::new(count + 1));
+            let retire = Arc::new(std::sync::Barrier::new(count + 1));
+            std::thread::scope(|scope| {
+                for value in 1..=count {
+                    let (buffers, published, ready, retire) = (
+                        buffers.clone(),
+                        published.clone(),
+                        ready.clone(),
+                        retire.clone(),
+                    );
+                    scope.spawn(move || {
+                        buffers
+                            .with_current(
+                                || true,
+                                |buffer| buffer.record(value, |_| unreachable!()),
+                            )
+                            .unwrap();
+                        ready.wait();
+                        retire.wait();
+                        buffers.retire_current(|values| {
+                            published.lock().unwrap().extend_from_slice(values)
+                        });
+                    });
+                }
+                ready.wait();
+                buffers.seal_without_drain();
+                retire.wait();
+                buffers.seal(|values| published.lock().unwrap().extend_from_slice(values));
+            });
+            let mut values = published.lock().unwrap().clone();
+            values.sort_unstable();
+            assert_eq!(values, (1..=count).collect::<Vec<_>>());
+            assert!(buffers.is_drained());
         }
     }
 
@@ -466,7 +1052,7 @@ mod tests {
                                 || true,
                                 |buffer| {
                                     assert_eq!(
-                                        buffer.entries.as_slice(),
+                                        &buffer.entries[..],
                                         if capacity == 1 {
                                             &[][..]
                                         } else {
@@ -479,7 +1065,7 @@ mod tests {
                                 },
                             )
                             .unwrap();
-                        buffers.retire_current();
+                        buffers.retire_current(|_| panic!("owner flush must precede retirement"));
                     });
                 }
                 ready.wait();

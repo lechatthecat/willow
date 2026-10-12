@@ -408,9 +408,11 @@ pub(super) fn with_stw<R>(
     // mutator forever, and one that unwinds out of the guard poisons the
     // registry, taking every later collection down with it (willow-v6k0).
     measurement.stopped();
+    let collector_start = crate::gc_telemetry::timestamp_ns();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         collect(&coord, measurement.work())
     }));
+    let collector_end = crate::gc_telemetry::timestamp_ns();
     coord.stop_requested = false;
     runtime()
         .stop_requested
@@ -418,7 +420,9 @@ pub(super) fn with_stw<R>(
     runtime().poll_requested.store(false, Ordering::Release);
     cv.notify_all();
     drop(coord);
+    let unlocked = crate::gc_telemetry::timestamp_ns();
     measurement.finish(result.is_err());
+    old_cycle::record_stop(reason as u32, collector_start, collector_end, unlocked);
     match result {
         Ok(value) => value,
         Err(payload) => std::panic::resume_unwind(payload),

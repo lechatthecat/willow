@@ -20,8 +20,58 @@ impl RegionView {
     }
 }
 
+/// Collector serialization owns extent lifetimes. Only Arc metadata and
+/// immutable extent coordinates are copied under the heap mutex; page-index
+/// construction and bitmap reset run after releasing it, with phase inactive.
+pub(super) struct Preparation {
+    views: Vec<(RegionView, bool)>,
+    old_regions: usize,
+    old_objects: usize,
+    objects: usize,
+}
+impl Preparation {
+    pub(super) fn build(self, reset: bool) -> (RegionIndex, usize) {
+        let mut index = RegionIndex {
+            regions: Vec::with_capacity(self.views.len()),
+            tlab_ids: Vec::new(),
+            free_views: Vec::new(),
+            last_id: 0,
+            pages: IdMap::default(),
+            large: IdMap::default(),
+            objects: self.objects,
+            old_regions: self.old_regions,
+            old_objects: self.old_objects,
+            #[cfg(test)]
+            refresh_page_visits: 0,
+        };
+        let mut words = 0;
+        for (position, (view, large)) in self.views.into_iter().enumerate() {
+            if reset {
+                words += view.marks.word_count();
+                view.marks.clear();
+            }
+            index.add(view.base, view.capacity, &view.starts, &view.marks, large);
+            if position >= self.old_regions {
+                index.tlab_ids.push(index.last_view_id());
+            }
+        }
+        (index, words)
+    }
+}
+
+pub(super) struct LatePreparation {
+    views: Vec<(RegionView, bool)>,
+    new_old_regions: usize,
+    old_regions: usize,
+    old_objects: usize,
+    objects: usize,
+}
+
 pub(super) struct RegionIndex {
-    regions: Vec<RegionView>,
+    regions: Vec<Option<RegionView>>,
+    tlab_ids: Vec<usize>,
+    free_views: Vec<usize>,
+    last_id: usize,
     // Fixed-size regular regions/chunks intersect a bounded number of pages.
     // Disjoint allocations of at least one page yield at most two candidates
     // per page, even when the underlying allocator does not page-align them.
@@ -37,52 +87,46 @@ pub(super) struct RegionIndex {
 }
 impl RegionIndex {
     pub(super) fn capture(state: &GcState) -> Self {
-        let index = Self::capture_preserving_marks(state);
-        for region in &index.regions {
-            region.marks.clear();
-        }
-        index
+        // Reset happened before the stop while the collector held epoch
+        // serialization. This stopped publication only captures region views.
+        Self::capture_preserving_marks(state)
     }
-    fn capture_preserving_marks(state: &GcState) -> Self {
-        let mut index = Self {
-            regions: Vec::with_capacity(state.old_regions.len() + state.tlab_chunks.len()),
-            pages: IdMap::default(),
-            large: IdMap::default(),
-            objects: 0,
-            old_regions: 0,
-            old_objects: 0,
-            #[cfg(test)]
-            refresh_page_visits: 0,
-        };
+    pub(super) fn snapshot(state: &GcState) -> Preparation {
+        let mut views = Vec::with_capacity(state.old_regions.len() + state.tlab_chunks.len());
+        let mut old_objects = 0;
         for region in &state.old_regions {
-            index.add(
-                region.start(),
-                region.capacity,
-                &region.mark_bitmap.bits,
-                &region.concurrent_marks,
+            views.push((
+                RegionView {
+                    base: region.start(),
+                    capacity: region.capacity,
+                    starts: region.mark_bitmap.bits.clone(),
+                    marks: region.concurrent_marks.clone(),
+                },
                 region.kind == RegionKind::LargeObject,
-            );
-            index.objects += region.allocations.len();
+            ));
+            old_objects += region.allocations.len();
         }
-        index.old_regions = index.regions.len();
-        index.old_objects = index.objects;
         for chunk in &state.tlab_chunks {
-            index.add(
-                chunk.base as usize,
-                chunk.capacity,
-                &chunk.mark_bitmap.bits,
-                &chunk.concurrent_marks,
+            views.push((
+                RegionView {
+                    base: chunk.base as usize,
+                    capacity: chunk.capacity,
+                    starts: chunk.mark_bitmap.bits.clone(),
+                    marks: chunk.concurrent_marks.clone(),
+                },
                 false,
-            );
-            // A chunk retired since the last walk has no header index yet; its
-            // start bits count its headers in O(chunk words).
-            index.objects += if chunk.needs_index() {
-                chunk.mark_bitmap.bits.count()
-            } else {
-                chunk.header_offsets.len()
-            };
+            ));
         }
-        index
+        Preparation {
+            views,
+            old_regions: state.old_regions.len(),
+            old_objects,
+            objects: state.total_allocs.saturating_sub(state.total_frees) as usize,
+        }
+    }
+
+    fn capture_preserving_marks(state: &GcState) -> Self {
+        Self::snapshot(state).build(false).0
     }
     /// Old extents cannot disappear during minor STW. Retain their page index
     /// and rebuild only TLAB extents plus newly allocated old regions. Work is
@@ -94,16 +138,17 @@ impl RegionIndex {
         {
             self.refresh_page_visits = 0;
         }
-        for (offset, view) in self.regions[self.old_regions..].iter().enumerate() {
+        for id in self.tlab_ids.drain(..) {
+            let view = self.regions[id].take().unwrap();
             for page in view.base / PAGE_BYTES..=(view.base + view.capacity - 1) / PAGE_BYTES {
                 #[cfg(test)]
                 {
                     self.refresh_page_visits += 1;
                 }
                 let candidates = self.pages.get_mut(&page).unwrap();
-                for id in candidates.iter_mut() {
-                    if *id == self.old_regions + offset {
-                        *id = usize::MAX;
+                for candidate in candidates.iter_mut() {
+                    if *candidate == id {
+                        *candidate = usize::MAX;
                     }
                 }
                 if candidates[0] == usize::MAX {
@@ -113,8 +158,8 @@ impl RegionIndex {
                     self.pages.remove(&page);
                 }
             }
+            self.free_views.push(id);
         }
-        self.regions.truncate(self.old_regions);
         self.objects = self.old_objects;
         for region in &state.old_regions[self.old_regions..] {
             self.add(
@@ -126,7 +171,7 @@ impl RegionIndex {
             );
             self.objects += region.allocations.len();
         }
-        self.old_regions = self.regions.len();
+        self.old_regions = state.old_regions.len();
         self.old_objects = self.objects;
         for chunk in &state.tlab_chunks {
             self.add(
@@ -136,6 +181,7 @@ impl RegionIndex {
                 &chunk.concurrent_marks,
                 false,
             );
+            self.tlab_ids.push(self.last_view_id());
             self.objects += if chunk.needs_index() {
                 chunk.mark_bitmap.bits.count()
             } else {
@@ -152,13 +198,22 @@ impl RegionIndex {
         marks: &Arc<concurrent_bitmap::ConcurrentMarkBits>,
         large: bool,
     ) {
-        let id = self.regions.len();
-        self.regions.push(RegionView {
+        #[cfg(test)]
+        old_cycle::REGION_VIEWS.fetch_add(1, Ordering::Relaxed);
+        let view = Some(RegionView {
             base,
             capacity,
             starts: starts.clone(),
             marks: marks.clone(),
         });
+        let id = if let Some(id) = self.free_views.pop() {
+            self.regions[id] = view;
+            id
+        } else {
+            self.regions.push(view);
+            self.regions.len() - 1
+        };
+        self.last_id = id;
         if large {
             self.large.insert(base, id);
         } else {
@@ -180,17 +235,81 @@ impl RegionIndex {
             }
         }
     }
+    pub(super) fn publication_counts(&self) -> (usize, usize) {
+        (self.regions.len(), self.pages.len() + self.large.len())
+    }
+
+    fn last_view_id(&self) -> usize {
+        self.last_id
+    }
+
+    /// Snapshot only new extents under the heap mutex. Publish their page map
+    /// after releasing that mutex and the initial global stop.
+    fn snapshot_late(&self, state: &GcState) -> LatePreparation {
+        let new_old_regions = state.old_regions.len() - self.old_regions;
+        let mut views =
+            Vec::with_capacity(new_old_regions + state.tlab_chunks.len() - self.tlab_ids.len());
+        let mut old_objects = self.old_objects;
+        for region in &state.old_regions[self.old_regions..] {
+            views.push((
+                RegionView {
+                    base: region.start(),
+                    capacity: region.capacity,
+                    starts: region.mark_bitmap.bits.clone(),
+                    marks: region.concurrent_marks.clone(),
+                },
+                region.kind == RegionKind::LargeObject,
+            ));
+            old_objects += region.allocations.len();
+        }
+        for chunk in &state.tlab_chunks[self.tlab_ids.len()..] {
+            views.push((
+                RegionView {
+                    base: chunk.base as usize,
+                    capacity: chunk.capacity,
+                    starts: chunk.mark_bitmap.bits.clone(),
+                    marks: chunk.concurrent_marks.clone(),
+                },
+                false,
+            ));
+        }
+        LatePreparation {
+            views,
+            new_old_regions,
+            old_regions: state.old_regions.len(),
+            old_objects,
+            objects: state.total_allocs.saturating_sub(state.total_frees) as usize,
+        }
+    }
+
+    fn publish_late(&mut self, preparation: LatePreparation) {
+        for (position, (view, large)) in preparation.views.into_iter().enumerate() {
+            self.add(view.base, view.capacity, &view.starts, &view.marks, large);
+            if position >= preparation.new_old_regions {
+                self.tlab_ids.push(self.last_view_id());
+            }
+        }
+        self.old_regions = preparation.old_regions;
+        self.old_objects = preparation.old_objects;
+        self.objects = preparation.objects;
+    }
+
+    #[cfg(test)]
+    fn complete_initial(&mut self, state: &GcState) {
+        self.publish_late(self.snapshot_late(state));
+    }
+
     fn locate_region(&self, address: usize) -> Option<(&RegionView, usize)> {
         let header = address.checked_sub(GC_HEADER_SIZE)?;
         if let Some(&id) = self.large.get(&header) {
-            let view = &self.regions[id];
+            let view = self.regions[id].as_ref().unwrap();
             return view.position(header).map(|bit| (view, bit));
         }
         for &id in self.pages.get(&(header / PAGE_BYTES))? {
             if id == usize::MAX {
                 break;
             }
-            let view = &self.regions[id];
+            let view = self.regions[id].as_ref().unwrap();
             if let Some(bit) = view.position(header) {
                 return Some((view, bit));
             }
@@ -216,6 +335,20 @@ pub(super) struct EpochIndex(std::sync::RwLock<EpochData>);
 impl EpochIndex {
     pub(super) fn regions(index: RegionIndex) -> Self {
         Self(std::sync::RwLock::new(EpochData::Regions(index)))
+    }
+    pub(super) fn snapshot_late(&self, state: &GcState) -> LatePreparation {
+        match &*self.0.read().unwrap() {
+            EpochData::Regions(index) => index.snapshot_late(state),
+            #[cfg(test)]
+            EpochData::Synthetic { .. } => unreachable!("initial capture uses regions"),
+        }
+    }
+    pub(super) fn publish_late(&self, preparation: LatePreparation) {
+        match &mut *self.0.write().unwrap() {
+            EpochData::Regions(index) => index.publish_late(preparation),
+            #[cfg(test)]
+            EpochData::Synthetic { .. } => unreachable!("initial capture uses regions"),
+        }
     }
     pub(super) fn refresh_stopped(&self, state: &GcState) {
         let mut index = self.0.write().unwrap();
@@ -321,7 +454,12 @@ impl EpochIndex {
     #[cfg(test)]
     pub(super) fn marked_count(&self) -> usize {
         match &*self.0.read().unwrap() {
-            EpochData::Regions(index) => index.regions.iter().map(|v| v.marks.count()).sum(),
+            EpochData::Regions(index) => index
+                .regions
+                .iter()
+                .flatten()
+                .map(|v| v.marks.count())
+                .sum(),
             EpochData::Synthetic { marks, .. } => marks.count(),
         }
     }
@@ -372,6 +510,27 @@ mod tests {
                 assert!(cycle.is_marked(root as usize));
             }
             assert!(cycle.is_marked(young as usize));
+            let mut bound = 0;
+            for round in 0..64 {
+                let state = runtime().heap.lock().unwrap();
+                cycle.objects.refresh_stopped(&state);
+                let guard = cycle.objects.0.read().unwrap();
+                let EpochData::Regions(index) = &*guard else {
+                    unreachable!()
+                };
+                if round == 0 {
+                    bound = index.regions.len();
+                }
+                assert_eq!(
+                    index.regions.len(),
+                    bound,
+                    "retired view slots must be reused"
+                );
+                assert!(index.refresh_page_visits <= 2 * (GC_TLAB_CHUNK_SIZE / PAGE_BYTES + 1));
+            }
+            println!(
+                "minor_refresh old_objects={count} repeated_refreshes=64 view_slot_bound={bound}"
+            );
             runtime().runtime_root_slots.remove(slot);
             GC_MARK_PHASE.store(0, Ordering::Release);
             marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
@@ -381,9 +540,101 @@ mod tests {
         reset_internal_for_test();
     }
 
+    #[test]
+    fn epoch_preparation_phase_zero_allocation_race_preserves_pre_activation_edges() {
+        let _test = runtime_test_guard();
+        for _ in 0..32 {
+            reset_internal_for_test();
+            runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+            let collector = cycle_wait::CollectorGuard::try_acquire().unwrap();
+            let mut root = willow_alloc_typed(8, 1);
+            willow_push_root(&mut root);
+            // Stale previous-epoch colors must be reset, while allocation only
+            // publishes starts and immutable headers under phase zero.
+            let snapshot = {
+                let state = runtime().heap.lock().unwrap();
+                state.old_regions[0].concurrent_marks.set(0);
+                RegionIndex::snapshot(&state)
+            };
+            let begin = Arc::new(std::sync::Barrier::new(2));
+            let publisher = {
+                let begin = begin.clone();
+                let address = root as usize;
+                std::thread::spawn(move || {
+                    let _mutator = MutatorRegistration::new();
+                    begin.wait();
+                    let child = willow_gc_alloc_layout(0, 0, GC_OLD_REGION_SIZE as i64, 0);
+                    unsafe {
+                        store_gc_reference(address as *mut *mut u8, child);
+                    }
+                    child as usize
+                })
+            };
+            begin.wait();
+            let (prepared, _) = snapshot.build(true);
+            let child = publisher.join().unwrap();
+            let cycle = Arc::new(ConcurrentCycle::with_index(
+                EpochIndex::regions(prepared),
+                IdSet::default(),
+                IdMap::default(),
+                1,
+            ));
+            let late = {
+                let mut state = runtime().heap.lock().unwrap();
+                marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+                GC_MARK_PHASE.store(1, Ordering::Release);
+                cycle.objects.snapshot_late(&state)
+            };
+            cycle.objects.publish_late(late);
+            cycle.enqueue(root);
+            let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
+            assert!(cycle.is_marked(root as usize));
+            assert!(cycle.is_marked(child));
+            sweep::concurrent(plan);
+            assert_eq!(
+                willow_gc_allocated_bytes(),
+                (2 * GC_HEADER_SIZE + 8 + GC_OLD_REGION_SIZE) as i64
+            );
+            willow_pop_roots(1);
+            drop(collector);
+        }
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn initial_completion_publishes_late_extents_without_rebuilding_prepared_pages() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        let first = willow_alloc(8);
+        let mut index = RegionIndex::capture(&runtime().heap.lock().unwrap());
+        let old_pages = index.pages.clone();
+        let before = index.refresh_page_visits;
+        let mut tls = tlab_state_for_test();
+        let young = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+        let late = willow_gc_alloc_layout(0, 0, GC_OLD_REGION_SIZE as i64, 0);
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_unindexed(&mut state);
+        index.complete_initial(&state);
+        for (page, candidates) in old_pages {
+            assert_eq!(index.pages[&page], candidates);
+        }
+        // Dedicated late objects add no payload pages; only the new TLAB does.
+        assert!(index.refresh_page_visits - before <= GC_TLAB_CHUNK_SIZE / PAGE_BYTES + 1);
+        let epoch = EpochIndex::regions(index);
+        for pointer in [first, young, late] {
+            assert!(epoch.claim(pointer as usize));
+        }
+        drop(state);
+        reset_internal_for_test();
+    }
+
     fn empty() -> RegionIndex {
         RegionIndex {
             regions: Vec::new(),
+            tlab_ids: Vec::new(),
+            free_views: Vec::new(),
+            last_id: 0,
             pages: IdMap::default(),
             large: IdMap::default(),
             objects: 0,
@@ -415,8 +666,14 @@ mod tests {
                 }
                 marks.clear();
                 index.add(base, GC_OLD_REGION_SIZE, &starts, &marks, false);
-                assert!(Arc::ptr_eq(&index.regions[id].marks, &marks));
-                assert!(Arc::ptr_eq(&index.regions[id].starts, &starts));
+                assert!(Arc::ptr_eq(
+                    &index.regions[id].as_ref().unwrap().marks,
+                    &marks
+                ));
+                assert!(Arc::ptr_eq(
+                    &index.regions[id].as_ref().unwrap().starts,
+                    &starts
+                ));
                 assert_eq!(marks.count(), 0, "new epoch resets persistent color");
                 maps.push((base, starts, marks));
             }

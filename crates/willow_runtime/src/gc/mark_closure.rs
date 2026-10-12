@@ -23,8 +23,9 @@ pub(super) fn finish_with_wait(
     finish_with_hooks(cycle, started, wait, || {})
 }
 
-// The initial seal and optimistic rechecks leave the third remark for the
-// authoritative stopped completion. No producer can extend these limits.
+// The first seal and one optimistic recheck are the only normal remark stops.
+// The third round is reserved for authoritative classified Recovery, including
+// metadata exhaustion; it cannot acquire a separate stopped retry allowance.
 pub(super) const MAX_REMARK_ROUNDS: usize = 3;
 pub(super) const MAX_DRAIN_WAVES: usize = 128;
 
@@ -61,26 +62,61 @@ pub(super) fn finish_with_hooks(
     mut wait: impl FnMut(std::time::Duration),
     mut before_recheck: impl FnMut(),
 ) -> Option<(crate::gc_telemetry::MarkWork, sweep::SweepPlan)> {
-    // No new allocation assists are needed during closure. Already-enrolled
-    // assists must finish both payload reads and their batched metadata merge.
-    with_stw(
+    // Owners continue publishing their own buffers at safepoints/unregister.
+    // Closing redirects later heap-locked deletion publications to the queue;
+    // foreign buffers are inspected only at the stopped COORD boundary below.
+    cycle.closing.store(true, Ordering::Release);
+    // Preserve the first-slice stopped boundary, with no buffered graph work.
+    cycle
+        .phase
+        .lock()
+        .unwrap()
+        .transition(old_cycle::Phase::RemarkRequested);
+    let transferred = with_stw(
         crate::gc_telemetry::stops::StopReason::Remark,
         |coord, _| {
-            let mut state = runtime().heap.lock().unwrap();
+            let mut budget =
+                old_cycle::RemarkBudget::configured(crate::gc_telemetry::timestamp_ns());
+            cycle
+                .phase
+                .lock()
+                .unwrap()
+                .transition(old_cycle::Phase::RemarkSTW);
             GC_MARK_PHASE.store(2, Ordering::Release);
-            cycle.closing.store(true, Ordering::Release);
-            // Switch deletion publishers to immediate enqueue before this one
-            // whole-buffer drain. Closure never rescans M buffers for each work wave.
-            // The drain also seals the shard buffers: from here on every barrier
-            // publication takes this heap lock.
-            flush_satb_all_locked(coord, &mut state);
+            let mut state = runtime().heap.lock().unwrap();
+            let transferred =
+                cycle
+                    .satb_shards
+                    .seal_stopped_bounded(coord, &mut budget, |values| {
+                        cycle.enqueue_satb_batch(values)
+                    })
+                    && state.satb.flush_all_bounded(coord, &mut budget, |values| {
+                        cycle.enqueue_satb_batch(values)
+                    });
+            drop(state);
             cycle.queue.flush_all_locals();
+
             GC_MARK_PHASE.store(1, Ordering::Release);
+            if !budget.reserve(0, 0, crate::gc_telemetry::timestamp_ns()) {
+                cycle.termination.restart();
+            }
+            cycle
+                .phase
+                .lock()
+                .unwrap()
+                .transition(old_cycle::Phase::ConcurrentMark);
+            transferred
         },
     );
+    if !transferred {
+        return require_stopped_completion(cycle);
+    }
     let mut remark_rounds = 1;
     for wave in 0..MAX_DRAIN_WAVES {
         minor::service_pending();
+        if cycle_wait::take_recovery_request() {
+            return require_stopped_completion(cycle);
+        }
         if cycle.worker_failed.load(Ordering::Acquire) || !cycle.deferred.lock().unwrap().is_empty()
         {
             return None; // Explicit stopped native-hook/failure fallback.
@@ -118,14 +154,27 @@ pub(super) fn finish_with_hooks(
             continue;
         }
         before_recheck();
+        cycle
+            .phase
+            .lock()
+            .unwrap()
+            .transition(old_cycle::Phase::RemarkRequested);
         remark_rounds += 1;
         let finished = with_stw(
             crate::gc_telemetry::stops::StopReason::Remark,
-            |coord, _| {
+            |_, stop_work| {
+                cycle
+                    .phase
+                    .lock()
+                    .unwrap()
+                    .transition(old_cycle::Phase::RemarkSTW);
+                let mut budget =
+                    old_cycle::RemarkBudget::configured(crate::gc_telemetry::timestamp_ns());
                 let mut state = runtime().heap.lock().unwrap();
                 GC_MARK_PHASE.store(2, Ordering::Release);
-                flush_satb_all_locked(coord, &mut state);
-                // The flush may publish fresh work and invalidate the optimistic
+                assert!(cycle.satb_shards.is_drained());
+                assert!(state.satb.is_empty());
+                // Rendezvous publications can invalidate the optimistic
                 // candidate. Elect again under the stopped producer boundary.
                 cycle.termination.restart();
                 if request_remark(cycle) && cycle.termination.requested() {
@@ -135,6 +184,11 @@ pub(super) fn finish_with_hooks(
                         || !cycle.deferred.lock().unwrap().is_empty()
                     {
                         GC_MARK_PHASE.store(1, Ordering::Release);
+                        cycle
+                            .phase
+                            .lock()
+                            .unwrap()
+                            .transition(old_cycle::Phase::ConcurrentMark);
                         return None;
                     }
                     // Engine merges precede active_drains reaching zero. All mutator
@@ -143,9 +197,28 @@ pub(super) fn finish_with_hooks(
                     // may enroll but cannot acquire an object after end_epoch().
                     #[cfg(debug_assertions)]
                     {
-                        let error = cycle.unindexed.lock().unwrap().iter().find_map(|&address| {
-                            validate_payload_pointer_locked(&state, address as *mut u8).err()
-                        });
+                        let mut error = None;
+                        for &address in cycle.unindexed.lock().unwrap().iter() {
+                            if !budget.reserve(
+                                1,
+                                std::mem::size_of::<usize>() as u64,
+                                crate::gc_telemetry::timestamp_ns(),
+                            ) {
+                                cycle.termination.restart();
+                                GC_MARK_PHASE.store(1, Ordering::Release);
+                                cycle
+                                    .phase
+                                    .lock()
+                                    .unwrap()
+                                    .transition(old_cycle::Phase::ConcurrentMark);
+                                return None;
+                            }
+                            error =
+                                validate_payload_pointer_locked(&state, address as *mut u8).err();
+                            if error.is_some() {
+                                break;
+                            }
+                        }
                         if let Some(message) = error {
                             drop(state); // Invalid user roots must not poison the heap.
                             panic!(
@@ -155,9 +228,21 @@ pub(super) fn finish_with_hooks(
                     }
                     let mut work = *cycle.work.lock().unwrap();
                     work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
-                    // Buffers bump without the heap mutex. Retire them first so none
-                    // allocates white after phase 0 into a region missing sweep_pending.
-                    old_lab::retire_all(&mut state);
+                    // Rejected metadata chunks leave both barrier and allocation
+                    // coloring active. Partially published sweep flags only retain
+                    // extra objects; no free storage is exposed before success.
+                    let Some(plan) =
+                        sweep::prepare_bounded(&mut state, cycle.clone(), &mut budget, stop_work)
+                    else {
+                        cycle.termination.restart();
+                        GC_MARK_PHASE.store(1, Ordering::Release);
+                        cycle
+                            .phase
+                            .lock()
+                            .unwrap()
+                            .transition(old_cycle::Phase::ConcurrentMark);
+                        return None;
+                    };
                     GC_MARK_PHASE.store(0, Ordering::Release);
                     marking::set_concurrent_cycle(&mut state, None);
                     assert_eq!(
@@ -165,11 +250,20 @@ pub(super) fn finish_with_hooks(
                         0,
                         "concurrent closure lost a publisher"
                     );
-                    let plan = sweep::prepare(&mut state, Some(cycle.clone()));
+                    cycle
+                        .phase
+                        .lock()
+                        .unwrap()
+                        .transition(old_cycle::Phase::Sweep);
                     return Some((work, plan));
                 }
                 cycle.termination.restart();
                 GC_MARK_PHASE.store(1, Ordering::Release);
+                cycle
+                    .phase
+                    .lock()
+                    .unwrap()
+                    .transition(old_cycle::Phase::ConcurrentMark);
                 None
             },
         );
@@ -196,9 +290,21 @@ pub(super) fn finish_stopped(
     Option<sweep::SweepPlan>,
     usize,
 ) {
+    marking
+        .phase
+        .lock()
+        .unwrap()
+        .transition(old_cycle::Phase::RemarkRequested);
+    // Legacy callbacks, worker failures and retry-cap completion are explicit
+    // baseline recovery. They cannot masquerade as a bounded normal remark.
     with_stw(
-        crate::gc_telemetry::stops::StopReason::Remark,
+        crate::gc_telemetry::stops::StopReason::Recovery,
         |coord, stop_work| {
+            marking
+                .phase
+                .lock()
+                .unwrap()
+                .transition(old_cycle::Phase::RemarkSTW);
             GC_MARK_PHASE.store(2, Ordering::Release);
             let mut state = runtime().heap.lock().unwrap();
             flush_satb_all_locked(coord, &mut state);
@@ -294,8 +400,19 @@ pub(super) fn finish_stopped(
                 fallback || remaining == 0,
                 "completed mark epoch retained work"
             );
+            marking
+                .phase
+                .lock()
+                .unwrap()
+                .transition(old_cycle::Phase::Sweep);
             if fallback {
-                (work, None, sweep_with_work(stop_work))
+                let freed = sweep_with_work(stop_work);
+                marking
+                    .phase
+                    .lock()
+                    .unwrap()
+                    .transition(old_cycle::Phase::Idle);
+                (work, None, freed)
             } else {
                 let plan =
                     sweep::prepare(&mut runtime().heap.lock().unwrap(), Some(marking.clone()));

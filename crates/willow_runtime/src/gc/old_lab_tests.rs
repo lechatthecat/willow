@@ -165,3 +165,238 @@ fn exited_thread_buffers_are_indexed_and_pruned() {
     assert_eq!(willow_gc_allocated_bytes(), 0);
     reset_internal_for_test();
 }
+
+/// Clear environment overrides in a child without mutating process-wide env
+/// while Rust tests may be running concurrently.
+fn default_budgets_child() -> bool {
+    const NAME: &str = "gc::old_lab::tests::default_budgets_complete_small_allocations_and_cap_full_buffer_recovery";
+    if std::env::var("WILLOW_LAB_DEFAULT_CHILD").as_deref() == Ok("1") {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture"])
+        .env("WILLOW_LAB_DEFAULT_CHILD", "1")
+        .env_remove("WILLOW_GC_REMARK_MAX_SLOTS")
+        .env_remove("WILLOW_GC_REMARK_MAX_BYTES")
+        .env_remove("WILLOW_GC_REMARK_MAX_WORK_NS")
+        .output()
+        .unwrap();
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+#[test]
+fn default_budgets_complete_small_allocations_and_cap_full_buffer_recovery() {
+    if !default_budgets_child() {
+        return;
+    }
+    let _guard = runtime_test_guard();
+    for count in [1, 128, 4096, OLD_LAB_BYTES / GC_HEADER_SIZE] {
+        reset_internal_for_test();
+        let _labs = LabsOn::new();
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        let payload = if count == OLD_LAB_BYTES / GC_HEADER_SIZE {
+            0
+        } else {
+            8
+        };
+        let mut root = std::ptr::null_mut();
+        for index in 0..count {
+            if payload == 0 {
+                let object = willow_alloc(0);
+                if index == 0 {
+                    root = object;
+                }
+            } else {
+                let object = willow_alloc_typed(payload, 1);
+                unsafe {
+                    store_gc_reference(object.cast(), root);
+                }
+                root = object;
+            }
+        }
+        willow_push_root(&mut root);
+        assert_eq!(local_pending_for_test(), count);
+        willow_gc_collect();
+        let stops = crate::gc_telemetry::stops::snapshot_stops();
+        assert_eq!(stops.by_reason[0].work.metadata_objects, 0);
+        if count <= 128 {
+            assert_eq!(stops.by_reason[1].work.metadata_objects, count as u64);
+        } else {
+            assert!(stops.by_reason[1].work.metadata_objects < count as u64);
+        }
+        assert_eq!(stops.by_reason[1].work.swept_objects, 0);
+        assert_eq!(
+            stops.by_reason[3].requests,
+            u64::from(count > 128),
+            "small buffers complete normally; overflowing buffers use capped Recovery"
+        );
+        assert_eq!(local_pending_for_test(), 0);
+        let expected_live = if payload == 0 {
+            GC_HEADER_SIZE as i64
+        } else {
+            count as i64 * (GC_HEADER_SIZE as i64 + payload)
+        };
+        assert_eq!(willow_gc_allocated_bytes(), expected_live);
+        assert!(stops.by_reason[1].requests <= (mark_closure::MAX_REMARK_ROUNDS - 1) as u64);
+        assert!(stops.by_reason[1].requests + stops.by_reason[3].requests <= 3);
+        println!(
+            "default_lab pending_entries={count} root_count=1 initial_metadata_objects=0 remark_metadata_objects={} remark_metadata_bytes={} remark_stops={} recovery_stops={} normal_stopped_sweep=0 max_slots=4096 max_bytes=1048576 max_work_ns=1000000",
+            stops.by_reason[1].work.metadata_objects,
+            stops.by_reason[1].work.metadata_bytes,
+            stops.by_reason[1].requests,
+            stops.by_reason[3].requests
+        );
+        willow_pop_roots(1);
+        willow_gc_collect(); // Includes empty retired owner records.
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn bounded_retirement_fake_clock_keeps_prefix_and_indexes_each_entry_once() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let _labs = LabsOn::new();
+    runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+    let objects: Vec<_> = [1, 8, 17, 40, 200]
+        .into_iter()
+        .map(|size| willow_alloc(size))
+        .collect();
+    let total: usize = objects
+        .iter()
+        .map(|&value| {
+            HeapObject::from_raw(unsafe { value.sub(GC_HEADER_SIZE) }.cast())
+                .unwrap()
+                .size()
+        })
+        .sum();
+    let mut state = runtime().heap.lock().unwrap();
+    let mut work = crate::gc_telemetry::stops::StopWorkV2::default();
+    let now = std::cell::Cell::new(0);
+    let mut budget = old_cycle::RemarkBudget::new(100, 10000, 4, 0);
+    assert!(!retire_bounded_with_clock(
+        &mut state,
+        &mut budget,
+        &mut work,
+        || {
+            let time = now.get();
+            now.set(time + 1);
+            time
+        }
+    ));
+    assert_eq!(work.metadata_objects, 2);
+    assert!(indexed(&state, objects[0]) && indexed(&state, objects[1]));
+    assert!(!indexed(&state, objects[2]));
+    assert_eq!(
+        state
+            .old_regions
+            .iter()
+            .map(|r| r.active_labs)
+            .sum::<usize>(),
+        0
+    );
+    LOCAL.with(|lab| assert_eq!(lab.inner.lock().unwrap().pending_index, 2));
+    for completed in 3..=5 {
+        let mut budget = old_cycle::RemarkBudget::new(3, 1000, 100, 0);
+        let finished = retire_bounded_with_clock(&mut state, &mut budget, &mut work, || 0);
+        assert_eq!(finished, completed == 5);
+        assert_eq!(work.metadata_objects, completed);
+        assert_eq!(
+            state
+                .old_regions
+                .iter()
+                .map(|r| r.allocations.len())
+                .sum::<usize>(),
+            completed as usize
+        );
+    }
+    assert_eq!(
+        state
+            .old_regions
+            .iter()
+            .map(|r| r.live_bytes)
+            .sum::<usize>(),
+        total
+    );
+    assert_eq!(state.allocated_bytes, total);
+    assert_eq!(state.total_allocs, 5);
+    let mut budget = old_cycle::RemarkBudget::new(1, 1, 1, 0);
+    assert!(
+        retire_bounded_with_clock(&mut state, &mut budget, &mut work, || 0),
+        "empty retired record has no carve charge"
+    );
+    assert_eq!(work.metadata_objects, 5);
+    println!(
+        "partial_retirement entries=5 fake_time_yield_after=2 slot_chunk_entries=1 indexed_visits=5 prefix_moves=0 duplicates=0"
+    );
+    drop(state);
+    reset_internal_for_test();
+}
+
+#[test]
+fn partial_retirement_refill_flushes_only_remaining_suffix_without_double_accounting() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let _labs = LabsOn::new();
+    runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+    let objects: Vec<_> = [1, 8, 17, 40, 200]
+        .into_iter()
+        .map(|size| willow_alloc(size))
+        .collect();
+    let mut state = runtime().heap.lock().unwrap();
+    let mut work = crate::gc_telemetry::stops::StopWorkV2::default();
+    let mut budget = old_cycle::RemarkBudget::new(3, 1000, 100, 0);
+    assert!(!retire_bounded_with_clock(
+        &mut state,
+        &mut budget,
+        &mut work,
+        || 0
+    ));
+    assert_eq!(work.metadata_objects, 1);
+    let first_live = state
+        .old_regions
+        .iter()
+        .map(|r| r.live_bytes)
+        .sum::<usize>();
+    assert_eq!(first_live, GC_HEADER_SIZE + 1);
+    drop(state);
+    let next = willow_alloc(8); // Forces suffix flush and a fresh carve.
+    let mut state = runtime().heap.lock().unwrap();
+    flush_all(&mut state);
+    for object in objects.iter().copied().chain([next]) {
+        assert!(indexed(&state, object));
+    }
+    assert_eq!(state.total_allocs, 6);
+    let expected = GC_HEADER_SIZE
+        + 8
+        + [1usize, 8, 17, 40, 200]
+            .iter()
+            .map(|n| GC_HEADER_SIZE + n)
+            .sum::<usize>();
+    assert_eq!(state.allocated_bytes, expected);
+    assert_eq!(
+        state
+            .old_regions
+            .iter()
+            .map(|r| r.live_bytes)
+            .sum::<usize>(),
+        expected
+    );
+    assert_eq!(
+        state
+            .old_regions
+            .iter()
+            .map(|r| r.allocations.len())
+            .sum::<usize>(),
+        6
+    );
+    drop(state);
+    reset_internal_for_test();
+}

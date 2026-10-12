@@ -8,6 +8,9 @@ use super::*;
 /// its start bit after initialization. New old allocations publish black.
 pub(super) struct ConcurrentCycle {
     pub(super) collector: ThreadId,
+    pub(super) phase: Mutex<old_cycle::State>,
+    /// Published old-region prefix; advanced only by the collector under the heap lock.
+    pub(super) sweep_publication_cursor: AtomicUsize,
     pub(super) termination: mark_termination::Termination,
     pub(super) mark_epoch: crate::gc_mark_queue::MarkEpoch,
     pointer_checks: AtomicU64,
@@ -115,24 +118,50 @@ impl ConcurrentCycle {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn with_index(
         objects: epoch_index::EpochIndex,
         legacy_traces: IdSet<u32>,
         traces: IdMap<u32, ConcurrentTraceFn>,
         roots: usize,
     ) -> Self {
-        // One slot per allowed background worker, plus the collector. Assists
-        // beyond these slots use the queue's existing slotless consumer path.
-        let queue = crate::gc_mark_queue::MarkWorkQueue::new(mark_workers::configured_count() + 1);
-        let mark_epoch = queue.begin_epoch();
-        static ASSIST_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let assist_epoch = ASSIST_EPOCH
+        let cycle =
+            Self::with_epoch_index(objects, legacy_traces, traces, roots, Self::reserve_epoch());
+        cycle
+            .phase
+            .lock()
+            .unwrap()
+            .transition(old_cycle::Phase::ConcurrentMark);
+        cycle
+    }
+
+    /// Reserve the monotonic identity and initial phase before requesting STW.
+    pub(super) fn reserve_epoch() -> (u64, Mutex<old_cycle::State>) {
+        static CYCLE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let epoch = CYCLE_EPOCH
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
                 epoch.checked_add(1)
             })
-            .expect("assist epoch exhausted");
+            .expect("cycle epoch exhausted");
+        (epoch, Mutex::new(old_cycle::State::initial(epoch)))
+    }
+
+    pub(super) fn with_epoch_index(
+        objects: epoch_index::EpochIndex,
+        legacy_traces: IdSet<u32>,
+        traces: IdMap<u32, ConcurrentTraceFn>,
+        roots: usize,
+        identity: (u64, Mutex<old_cycle::State>),
+    ) -> Self {
+        // One slot per allowed background worker, plus the collector. Assists
+        // beyond these slots use the queue's existing slotless consumer path.
+        let queue = crate::gc_mark_queue::MarkWorkQueue::new(mark_workers::configured_count() + 1);
+        let (assist_epoch, phase) = identity;
+        let mark_epoch = queue.begin_reserved_epoch(crate::gc_mark_queue::MarkEpoch(assist_epoch));
         Self {
             collector: std::thread::current().id(),
+            phase,
+            sweep_publication_cursor: AtomicUsize::new(0),
             termination: mark_termination::Termination::default(),
             mark_epoch,
             pointer_checks: AtomicU64::new(0),

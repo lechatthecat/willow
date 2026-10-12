@@ -59,6 +59,7 @@ mod mark_workers;
 mod memory_control;
 mod minor;
 mod nursery;
+mod old_cycle;
 mod old_lab;
 mod pacer;
 mod root_handshake;
@@ -761,6 +762,7 @@ struct GcCoord {
     stw_pending: HashSet<ThreadId>,
     cycle_collector: Option<ThreadId>,
     cycle_generation: u64,
+    recovery_requested_for: Option<u64>,
 }
 
 /// Process-wide GC services. Keeping the heap, roots, registries, and STW
@@ -1502,7 +1504,7 @@ pub extern "C" fn willow_gc_collect() {
     // A caller that loses collector election must join the active cycle rather
     // than return while its marking/sweep is still in flight. Budget waiters
     // already publish/park at safepoints and handle collector reentrancy.
-    collect_for_budget();
+    cycle_wait::collect_explicit();
 }
 
 /// Trigger a stop-the-world minor collection. Young objects reachable from
@@ -1673,6 +1675,12 @@ pub(crate) fn collect_for_worker_panic_test() {
 }
 
 fn collect_internal() {
+    let _ = try_collect_internal();
+}
+
+/// False means collector election was lost, not that the requested cycle ran.
+/// Automatic requests must wait cooperatively and retry rather than consume it.
+fn try_collect_internal() -> bool {
     // Collector election (willow-6fv.5.6): only one thread collects at a time.
     // A thread that cannot become the collector must NOT block on runtime().collect_lock —
     // if a stop-the-world collection is in progress, the holder is waiting for
@@ -1684,11 +1692,11 @@ fn collect_internal() {
         .load(std::sync::atomic::Ordering::Acquire)
     {
         willow_gc_safepoint();
-        return;
+        return false;
     }
     let Some(_serialize) = cycle_wait::CollectorGuard::try_acquire() else {
         willow_gc_safepoint();
-        return;
+        return false;
     };
     // A legacy root owner outside the registry cannot publish a snapshot.
     // Other registered workers do not make that foreign stack safe to scan.
@@ -1705,7 +1713,7 @@ fn collect_internal() {
                 "[gc] collection skipped because a foreign root stack owner is active (total skipped={skipped})"
             );
         }
-        return;
+        return true;
     }
     let gc_log = std::env::var("WILLOW_GC_LOG").is_ok();
 
@@ -1728,7 +1736,7 @@ fn collect_internal() {
         runtime()
             .skipped_foreign_owner_collections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return;
+        return true;
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Bounded chunks allow a producer-heavy workload to reach remark;
@@ -1739,7 +1747,10 @@ fn collect_internal() {
             if workers.is_none() {
                 *workers = mark_workers::Pool::new(mark_workers::configured_count()).ok();
             }
-            if let Some(pool) = workers.as_ref().filter(|pool| pool.count() != 0) {
+            if let Some(pool) = workers
+                .as_ref()
+                .filter(|pool| pool.count() != 0 && old_cycle::concurrent_enabled())
+            {
                 pool.run(&marking, budget);
             } else {
                 // Disabled/unavailable background workers use the stopped
@@ -1848,6 +1859,7 @@ fn collect_internal() {
     }
     drop(_serialize);
     crate::gc_telemetry::emit_cycle(event);
+    true
 }
 
 #[cfg(test)]

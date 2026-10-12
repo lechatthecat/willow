@@ -1219,7 +1219,7 @@ fn disabled_mark_workers_use_stopped_graph_tracing() {
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 2 * (GC_HEADER_SIZE + 8) as i64);
     assert_eq!(
-        crate::gc_telemetry::stops::snapshot_stops().by_reason[1]
+        crate::gc_telemetry::stops::snapshot_stops().by_reason[3]
             .work
             .swept_objects,
         2
@@ -2322,9 +2322,11 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
         );
         // Initial stopped retirement, final accounting and the allocated-byte
         // snapshot remain linear in the mutator/TLAB count.
+        let recovery = crate::gc_telemetry::stops::snapshot_stops().by_reason[3].requests as usize;
+        let expected_reads = (4 + recovery) * count;
         assert_eq!(
             TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed),
-            4 * count
+            expected_reads
         );
         assert_eq!(
             crate::gc_telemetry::stops::snapshot_stops().by_reason[0].requests,
@@ -2353,7 +2355,7 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
         assert_eq!(willow_gc_allocated_bytes(), 0);
         println!(
             "root_handshake mutators={count} accounting_record_reads={} initial_stops=1",
-            4 * count
+            expected_reads
         );
     }
     reset_internal_for_test();
@@ -3468,7 +3470,7 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
             assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
             assert_eq!(
                 crate::gc_telemetry::stops::snapshot_stops().by_reason[1].requests as usize,
-                mark_closure::MAX_REMARK_ROUNDS
+                mark_closure::MAX_REMARK_ROUNDS - 1
             );
             done.store(true, Ordering::Release);
             worker.join().unwrap();
@@ -3546,7 +3548,11 @@ fn satb_closure_wave_cap_completes_perpetually_retrying_work_with_stopped_trace(
         );
         assert_eq!(
             crate::gc_telemetry::stops::snapshot_stops().by_reason[1].requests,
-            2
+            1
+        );
+        assert_eq!(
+            crate::gc_telemetry::stops::snapshot_stops().by_reason[3].requests,
+            1
         );
         assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
         willow_gc_collect();
@@ -3658,7 +3664,11 @@ fn satb_deferred_legacy_and_retry_slice_complete_with_snapshot_retention() {
         );
         assert_eq!(
             crate::gc_telemetry::stops::snapshot_stops().by_reason[1].requests,
-            if predrain { 2 } else { 1 }
+            if predrain { 1 } else { 0 }
+        );
+        assert_eq!(
+            crate::gc_telemetry::stops::snapshot_stops().by_reason[3].requests,
+            1
         );
         assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
         willow_gc_collect();
