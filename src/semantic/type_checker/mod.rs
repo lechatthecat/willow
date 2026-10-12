@@ -13,6 +13,7 @@ mod check_ops;
 mod class_cycle_tests;
 mod constructor_flow;
 mod diagnostics;
+mod indirect_lock;
 #[cfg(test)]
 mod match_guard_tests;
 #[cfg(test)]
@@ -206,6 +207,8 @@ pub struct TypeChecker {
     capture_call_sites: bool,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
     effect_inputs: crate::compiler_db::effects::EffectInputs,
+    /// Function values and indirect calls for E2604 (willow-h4t7).
+    indirect_lock: crate::semantic::indirect_lock::IndirectInputs,
     effect_graph_only: Option<crate::semantic::call_graph::CallGraph>,
 }
 
@@ -352,6 +355,7 @@ impl TypeChecker {
             capture_call_sites: false,
             task_method_calls: Vec::new(),
             effect_inputs: Default::default(),
+            indirect_lock: Default::default(),
             effect_graph_only: None,
         }
     }
@@ -1922,15 +1926,14 @@ mod tests {
                 let scalars = (0..scalar_count)
                     .map(|i| format!("let value_{i}: i64 = {i};"))
                     .collect::<String>();
-                let bad = "let op: fn(i64) -> i64 = inc;";
+                let bad = "let op: closure(i64) -> i64 = |x| x;";
                 let body = if bad_first {
                     format!("{bad}{scalars}")
                 } else {
                     format!("{scalars}{bad}")
                 };
                 let source = format!(
-                    "fn inc(x: i64) -> i64 {{ return x; }} \
-                     async fn first() {{ {body} }} \
+                    "async fn first() {{ {body} }} \
                      async fn second() {{ {body} }} \
                      async fn clean() {{ let value = 1; }}"
                 );
@@ -1967,11 +1970,10 @@ mod tests {
     #[test]
     fn synchronous_lambda_send_does_not_add_outer_async_locals() {
         let source = r#"
-fn inc(x: i64) -> i64 { return x; }
 async fn run() {
     (|| {
-        let ch = Channel<fn(i64) -> i64>::new();
-        ch.send(inc);
+        let ch = Channel<closure(i64) -> i64>::new();
+        ch.send(|x| x);
     });
 }
 "#;

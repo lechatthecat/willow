@@ -1,0 +1,25 @@
+// Function values inside a critical section (willow-h4t7).
+//
+// A call through a `fn` or closure value has no static target, so the compiler
+// rejects a lock-held indirect call (E2604) when any function value with the
+// same parameter count may suspend or block. Pure function values stay usable:
+fn inc(x: i64) -> i64 { return x + 1; }
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 { return f(x); }
+
+// A waiting function value is fine outside the lock. It takes two parameters,
+// so it never matches the one-parameter calls made under the lock below.
+fn drain(ch: Channel<i64>, extra: i64) -> i64 { return ch.recv() + extra; }
+
+async fn main() {
+    let counter = Mutex::new(40);
+    let op = inc;
+    lock counter as value {
+        println(apply(op, value));
+        println(Option::Some(value).map(|x: i64| x + 2).unwrap_or(0));
+    }
+    let ch = Channel<i64>::with_capacity(1);
+    ch.send(1);
+    let wait = drain;
+    println(wait(ch, 99));
+    // Rejected with E2604: `lock counter as value { wait(ch, 0); }`
+}

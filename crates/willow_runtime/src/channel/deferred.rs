@@ -105,10 +105,12 @@ pub(super) fn drive_for_test() -> usize {
     jobs.len()
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_receive(frame: *mut c_void) -> i32 {
     unsafe { poll(frame, true) }
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_send(frame: *mut c_void) -> i32 {
     unsafe { poll(frame, false) }
 }

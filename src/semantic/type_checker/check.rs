@@ -408,6 +408,7 @@ impl TypeChecker {
         self.effect_inputs.direct.clear();
         self.effect_inputs.direct_sites.clear();
         self.effect_inputs.sites.clear();
+        self.indirect_lock.clear();
 
         for item in &program.items {
             match item {
@@ -756,19 +757,8 @@ impl TypeChecker {
     /// graph stays complete without the wait leaking into the caller. For the
     /// same reason a bare async call is never itself a lock-held wait site.
     pub(super) fn record_lock_effect_call(&mut self, callee: FunctionId, span: Span) {
-        let callee_is_async = match self.effect_index.callables.get(&callee).copied() {
-            Some(is_async) => is_async,
-            None => {
-                let Some((queries, unit)) = &self.effect_queries else {
-                    return;
-                };
-                let Some((_, _, is_async)) =
-                    queries.external_lock_callable(*unit, &callee, &self.effect_index.imports)
-                else {
-                    return;
-                };
-                is_async
-            }
+        let Some(callee_is_async) = self.lock_callee_is_async(&callee) else {
+            return;
         };
         // A lock-held call site does not depend on the caller having a graph
         // node: non-callable contexts have none, and their direct waits are
@@ -788,6 +778,18 @@ impl TypeChecker {
                 .sites
                 .push(LockEffectCallsite { callee, span });
         }
+    }
+
+    /// Whether a named callable of this unit or an imported one is `async`;
+    /// `None` when it is neither (a builtin, or an unresolved name).
+    pub(super) fn lock_callee_is_async(&self, callee: &FunctionId) -> Option<bool> {
+        if let Some(is_async) = self.effect_index.callables.get(callee) {
+            return Some(*is_async);
+        }
+        let (queries, unit) = self.effect_queries.as_ref()?;
+        queries
+            .external_lock_callable(*unit, callee, &self.effect_index.imports)
+            .map(|(_, _, is_async)| is_async)
     }
 
     /// Record one direct wait operation in the callable currently being
@@ -1022,6 +1024,7 @@ impl TypeChecker {
         }
         self.report_task_method_calls();
         self.report_transitive_lock_effects(&effects.facts);
+        self.report_indirect_lock_effects(&graph, &effects.facts);
     }
 
     /// Whether one constructor call site may panic, from the unit's solved
@@ -1073,6 +1076,52 @@ impl TypeChecker {
             .and_then(|owner| self.symbols.classes.get(&owner))
             .and_then(|declaring| declaring.methods.get(target.name().as_ref()))
             .is_some_and(|method| method.is_static || !method.is_open && !method.is_override)
+    }
+
+    /// Why calling `callee` at `span` may suspend or block before returning,
+    /// or `None` when it cannot. A callable of this unit (lambdas included)
+    /// is read from the unit's own facts; an imported one from its declaring
+    /// unit's frozen evidence, and missing evidence is assumed to wait.
+    pub(super) fn lock_wait_cause(
+        &self,
+        callee: &FunctionId,
+        span: Span,
+        facts: &crate::semantic::effects::EffectFacts<crate::compiler_db::effects::EffectWitness>,
+    ) -> Option<LockEffectCause> {
+        if let Some(cause) = self.effect_inputs.direct.get(callee) {
+            return Some(cause.clone());
+        }
+        let local = self.effect_index.callables.contains_key(callee) || facts.get(callee).is_some();
+        let evidence = self.effect_queries.as_ref().and_then(|(queries, unit)| {
+            if local {
+                queries.effect_evidence(*unit, *callee)
+            } else {
+                let (declaring, id) =
+                    queries.external_target(*unit, callee, &self.effect_index.imports)?;
+                queries.effect_evidence(declaring, id)
+            }
+        });
+        evidence
+            .as_deref()
+            .or_else(|| facts.get(callee))
+            .filter(|summary| summary.intersects(LOCK_EFFECT_WAIT))
+            .map(|summary| {
+                summary
+                    .witness(LOCK_EFFECT_WAIT)
+                    .and_then(|witness| witness.lock().cloned())
+                    .unwrap_or_else(|| LockEffectCause {
+                        span,
+                        operation: "unavailable waiting evidence".into(),
+                        kind: LockEffectKind::SuspendOrBlock,
+                    })
+            })
+            .or_else(|| {
+                (!local && evidence.is_none()).then(|| LockEffectCause {
+                    span,
+                    operation: "unavailable imported effect evidence".into(),
+                    kind: LockEffectKind::SuspendOrBlock,
+                })
+            })
     }
 
     fn report_transitive_lock_effects(
@@ -1137,51 +1186,7 @@ impl TypeChecker {
             // A callable that waits on its own is explained by its own
             // operation; only a purely transitive effect needs the propagated
             // witness.
-            let Some(cause) = self
-                .effect_inputs
-                .direct
-                .get(&site.callee)
-                .cloned()
-                .or_else(|| {
-                    let evidence = self.effect_queries.as_ref().and_then(|(queries, unit)| {
-                        if self.effect_index.callables.contains_key(&site.callee) {
-                            queries.effect_evidence(*unit, site.callee)
-                        } else {
-                            let (declaring, id) = queries.external_target(
-                                *unit,
-                                &site.callee,
-                                &self.effect_index.imports,
-                            )?;
-                            queries.effect_evidence(declaring, id)
-                        }
-                    });
-                    evidence
-                        .as_deref()
-                        .or_else(|| facts.get(&site.callee))
-                        .filter(|summary| summary.intersects(LOCK_EFFECT_WAIT))
-                        .and_then(|summary| {
-                            summary
-                                .witness(LOCK_EFFECT_WAIT)
-                                .and_then(|witness| witness.lock().cloned())
-                                .or_else(|| {
-                                    Some(LockEffectCause {
-                                        span: site.span,
-                                        operation: "unavailable waiting evidence".into(),
-                                        kind: LockEffectKind::SuspendOrBlock,
-                                    })
-                                })
-                        })
-                        .or_else(|| {
-                            (!self.effect_index.callables.contains_key(&site.callee)
-                                && evidence.is_none())
-                            .then(|| LockEffectCause {
-                                span: site.span,
-                                operation: "unavailable imported effect evidence".into(),
-                                kind: LockEffectKind::SuspendOrBlock,
-                            })
-                        })
-                })
-            else {
+            let Some(cause) = self.lock_wait_cause(&site.callee, site.span, facts) else {
                 continue;
             };
             if !reported_spans.insert(site.span) {
@@ -2282,6 +2287,7 @@ impl TypeChecker {
             )],
             _ => return,
         };
+        self.record_indirect_uses(expr, &targets);
         // Constructors always record them: E0842 refinement looks up each
         // call's panic fact by expression id (willow-ssl7.19).
         if self.capture_call_sites || self.local.in_constructor {
@@ -2467,6 +2473,11 @@ impl TypeChecker {
                     }
                     let params = info.params.clone();
                     let ret = info.return_type.clone();
+                    self.record_function_value(
+                        Some(FunctionId::free_from_source_name(name)),
+                        params.len(),
+                        *span,
+                    );
                     return Type::Fn(params, Box::new(ret));
                 }
                 // Give a specialized error for receiver keywords used outside instance methods.

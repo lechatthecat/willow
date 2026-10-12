@@ -67,7 +67,8 @@ fn trace_06_main_task_has_id_but_no_site() {
     let (out, ok) =
         compile_and_run_check_exit("async fn main() { await sleep(1); panic(\"boom\"); }");
     assert!(!ok);
-    assert!(out.contains("async main [task "), "{out}");
+    assert!(out.contains("async main at "), "{out}");
+    assert!(out.contains(":1:35 [task 1]"), "{out}");
     assert!(!out.contains("async main [task 1, spawned"), "{out}");
 }
 
@@ -86,8 +87,10 @@ fn trace_08_nested_chain_ids_per_frame() {
         "async fn inner() -> i64 { await sleep(1); panic(\"boom\"); }\nasync fn outer() -> i64 { let v = await inner(); return v; }\nasync fn main() { println(await outer()); }",
     );
     assert!(!ok);
-    assert!(out.contains("0: async inner [task "), "{out}");
-    assert!(out.contains("1: async outer [task "), "{out}");
+    assert!(out.contains("0: async inner at "), "{out}");
+    assert!(out.contains("1: async outer at "), "{out}");
+    assert!(out.contains("2: async main at "), "{out}");
+    assert!(out.contains("[task 3, spawned at "), "{out}");
 }
 
 #[test]

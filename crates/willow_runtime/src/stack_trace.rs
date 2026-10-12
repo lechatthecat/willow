@@ -137,13 +137,16 @@ pub extern "C" fn willow_trace_site_set(
     col: i64,
     flags: i32,
 ) {
-    crate::panic_context::willow_fault_site_set(file, file_len, line, col);
     let asynchronous = flags & 1 != 0;
     let debug = flags & 2 != 0;
     if !asynchronous && !debug {
+        // Release synchronous code keeps runtime faults location-free
+        // (willow-s9ej.7); drop any site an async caller published.
+        crate::panic_context::willow_fault_site_clear();
         CALL_STACK.with(|slot| slot.borrow_mut().current = None);
         return;
     }
+    crate::panic_context::willow_fault_site_set(file, file_len, line, col);
     let frame = RuntimeFrame {
         function: unsafe { raw_str(function, function_len) },
         file: unsafe { raw_str(file, file_len) },

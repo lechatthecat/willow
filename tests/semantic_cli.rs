@@ -1020,10 +1020,11 @@ fn await_block_bounds_explain_lowering_without_blaming_locks() {
                 assert_eq!(block["witness"]["cause"]["location"]["line"], 4, "{result}");
                 let reason = block["witness"]["reason"].as_str().unwrap();
                 assert!(
-                    reason.contains("willow_future_await_void")
-                        && reason.contains("does not identify the selected lowering"),
+                    reason.contains("Future<void>")
+                        && reason.contains("does not establish which path executes"),
                     "{result}"
                 );
+                assert_eq!(block["witness"]["awaited_type"], "Future<void>", "{result}");
                 let output = f.run(&["effects", &selector]);
                 assert!(output.status.success());
                 let text = String::from_utf8(output.stdout).unwrap();

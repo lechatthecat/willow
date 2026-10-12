@@ -193,8 +193,19 @@ pub extern "C" fn willow_gc_unregister_mutator() {
     let mut coord = lock.lock().unwrap();
     // A previously registered stack must not disappear from both registries.
     // Empty-stack shutdown remains legal during a collection. Nonempty raw
-    // ownership cannot leave a running epoch's barrier/handshake protocol.
+    // ownership cannot leave a running epoch's barrier/handshake protocol, so
+    // finish a foreign epoch while still registered (its roots stay published
+    // through the safepoint protocol), then take legacy ownership under the
+    // same lock that elects the next collector.
     if ROOT_DEPTH.get() != 0 {
+        while coord
+            .cycle_collector
+            .is_some_and(|collector| collector != id)
+        {
+            let generation = coord.cycle_generation;
+            super::cycle_wait::wait_for_cycle(coord, generation);
+            coord = lock.lock().unwrap();
+        }
         claim_legacy_owner_locked(&coord, false);
     }
     coord.mutators.remove(&id);

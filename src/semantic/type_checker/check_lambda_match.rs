@@ -320,10 +320,19 @@ impl TypeChecker {
                 expected_closure,
             )
         };
-        match self.check_lambda_body(l, lambda_body, check) {
+        let result = match self.check_lambda_body(l, lambda_body, check) {
             Ok(result) => result,
             Err(check) => check(self),
-        }
+        };
+        // The same identity `check_lambda_scoped` gives the lambda's callable.
+        let callable = lambda_body
+            .or(match &l.body {
+                LambdaBody::Block(body) => Some(body.id),
+                LambdaBody::Expr(_) => None,
+            })
+            .map(FunctionId::lambda);
+        self.record_function_value(callable, l.params.len(), l.span);
+        result
     }
 
     fn check_lambda_scoped(

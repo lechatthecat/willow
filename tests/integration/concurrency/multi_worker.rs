@@ -61,7 +61,7 @@ fn test_dgwo9_async_task_frame_must_be_send_under_workers() {
         stderr.contains("async task frame is not `Send`"),
         "{stderr}"
     );
-    assert!(stderr.contains("fn(i64) -> i64"), "{stderr}");
+    assert!(stderr.contains("closure(i64) -> i64"), "{stderr}");
 }
 
 #[test]

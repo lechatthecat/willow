@@ -365,14 +365,8 @@ fn direct_and_indirect_foreign_calls_are_rejected_under_mutex_lock() {
             !output.status.success(),
             "{name}: lock-held foreign call accepted"
         );
-        // Function values cannot be retained in an async frame, so indirect
-        // forms fail earlier at Send validation; direct forms exercise effects.
-        let code = if name.ends_with("indirect") {
-            "E2402"
-        } else {
-            "E2604"
-        };
-        assert!(error.contains(code), "{name}: {error}");
+        // Indirect forms call a waiting function value (willow-h4t7).
+        assert!(error.contains("E2604"), "{name}: {error}");
     }
 }
 

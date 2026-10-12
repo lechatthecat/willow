@@ -457,7 +457,7 @@ fn main() {
         "missing panic message: {output}"
     );
     assert!(
-        output.contains("0: tick at"),
+        output.contains("0: Boom::tick at"),
         "missing method frame: {output}"
     );
 }

@@ -228,8 +228,12 @@ async fn main() {
     assert!(!ok, "{out}");
     assert!(!timed_out, "{out}");
     assert!(out.contains("runtime panic: prepared-argument"), "{out}");
-    assert!(out.contains(": explode"), "{out}");
-    assert!(out.contains(": consume"), "{out}");
+    assert!(out.contains("0: explode at "), "{out}");
+    // `consume` has not started while its argument is evaluated: the
+    // prepared frame stays balanced across the await but is not shown.
+    assert!(out.contains(":7:50"), "{out}");
+    assert!(out.contains("1: main at "), "{out}");
+    assert!(!out.contains(": consume"), "{out}");
 }
 
 #[test]

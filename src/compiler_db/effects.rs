@@ -142,6 +142,9 @@ pub(crate) struct EffectQueries {
     /// (willow-jz15.14), which makes those operators recoverable faults.
     /// Release builds wrap. Sessions without a mode stay conservative.
     overflow_checks: bool,
+    /// Function-value facts of the units checked so far in this session, for
+    /// E2604 through indirect calls (willow-h4t7).
+    pub(crate) indirect_lock: std::cell::RefCell<IndirectLockSession>,
 }
 impl Default for EffectQueries {
     fn default() -> Self {
@@ -165,6 +168,7 @@ impl Default for EffectQueries {
             names: HashMap::new(),
             dependencies: None,
             overflow_checks: true,
+            indirect_lock: Default::default(),
         }
     }
 }
@@ -486,6 +490,26 @@ impl EffectQueries {
 
     /// Resolve a declared callable before reading its asyncness or evidence.
     /// Source dependencies also invalidate asyncness and witness-only edits.
+    /// Arity mask of the function values `target`, a callable of an earlier
+    /// checked unit, can call indirectly before returning (willow-h4t7).
+    pub(crate) fn indirect_reach(
+        &self,
+        consumer: UnitId,
+        target: &FunctionId,
+        imports: &HashMap<String, String>,
+    ) -> u64 {
+        let Some((unit, id)) = self.external_target(consumer, target, imports) else {
+            return 0;
+        };
+        self.indirect_lock
+            .borrow()
+            .reach
+            .get(&unit)
+            .and_then(|reach| reach.get(&id))
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub(crate) fn external_lock_callable(
         &self,
         consumer: UnitId,
@@ -1463,6 +1487,19 @@ impl Ord for LockEffectWitness {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.owner.cmp(&other.owner)
     }
+}
+
+/// Session aggregate of function values and indirect lock-held calls, keyed
+/// by arity bit (`1 << min(arity, 63)`) (willow-h4t7). Units add their facts
+/// when they finish, so each cross-unit pair is checked by the later unit.
+#[derive(Default)]
+pub(crate) struct IndirectLockSession {
+    /// Per unit and callable: the arity bits of the indirect calls it can
+    /// make synchronously, through any non-async call path.
+    pub(crate) reach: HashMap<UnitId, HashMap<FunctionId, u64>>,
+    pub(crate) values: crate::semantic::indirect_lock::ValueMasks,
+    /// Arity bits of the indirect calls made while holding a lock.
+    pub(crate) locks: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

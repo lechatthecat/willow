@@ -117,36 +117,71 @@ fn legacy_admission_during_foreign_election_fails_safely() {
     if std::env::var_os(CHILD).is_some() {
         let _collector = cycle_wait::CollectorGuard::try_acquire().unwrap();
         std::thread::spawn(|| {
-            let unregister = std::env::var(CHILD).unwrap() == "unregister";
-            if unregister {
-                willow_gc_register_mutator();
-            }
             let mut slot = std::ptr::null_mut();
             willow_push_root(&mut slot);
-            if unregister {
-                willow_gc_unregister_mutator();
-            }
         })
         .join()
         .unwrap();
         panic!("unsafe admission accepted");
     }
-    for mode in ["claim", "unregister"] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "gc::tests::foreign_owner_tests::legacy_admission_during_foreign_election_fails_safely",
             "--exact",
             "--nocapture",
         ])
-        .env(CHILD, mode)
+        .env(CHILD, "claim")
         .output()
         .unwrap();
-        assert!(!output.status.success());
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unregistered root ownership during GC")
+    );
+}
+
+/// A registered thread that leaves with live roots during a foreign epoch
+/// (a synchronous `main` that drove the scheduler while a blocking worker
+/// collected) keeps its roots published until that epoch ends, then becomes
+/// the legacy owner instead of aborting.
+#[test]
+fn registered_unregister_with_roots_waits_for_foreign_epoch() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    cycle_wait::SLEEPS.store(0, Ordering::Relaxed);
+    let collector = cycle_wait::CollectorGuard::try_acquire().unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (pop_tx, pop_rx) = std::sync::mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        willow_gc_register_mutator();
+        let mut slot = willow_alloc_object(2, 8);
+        willow_push_root(&mut slot);
+        willow_gc_unregister_mutator();
+        done_tx.send(()).unwrap();
+        pop_rx.recv().unwrap();
+        willow_pop_root();
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while cycle_wait::SLEEPS.load(Ordering::Acquire) == 0 {
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("unregistered root ownership during GC")
+            std::time::Instant::now() < deadline,
+            "unregister never waited"
         );
+        std::thread::yield_now();
     }
+    assert!(
+        done_rx.try_recv().is_err(),
+        "left a running epoch with roots"
+    );
+    assert_eq!(registered_mutator_count(), 1);
+    drop(collector);
+    done_rx.recv().unwrap();
+    assert_eq!(registered_mutator_count(), 0);
+    assert!(foreign_root_stack_owner_active());
+    pop_tx.send(()).unwrap();
+    worker.join().unwrap();
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_gc();
 }
 
 #[test]

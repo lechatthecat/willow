@@ -13,6 +13,7 @@ pub use concurrency::ConcurrencyAnalyzer;
 pub use type_checker::TypeChecker;
 
 pub(crate) mod analysis_symbols;
+pub(crate) mod indirect_lock;
 
 pub(crate) mod scopes;
 

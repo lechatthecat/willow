@@ -53,9 +53,8 @@ async fn main() { let xs: Array<i64> = [1, 2, 3]; println(await use_xs(xs)); }
 // ── Multi-worker capstone (willow-dgwo.9) ─────────────────────────────────────
 // Send/Sync checks make task migration sound regardless of worker count.
 const NONSEND_ASYNC_FRAME_SRC: &str = r#"
-fn inc(x: i64) -> i64 { return x + 1; }
 async fn run() -> i64 {
-    let op: fn(i64) -> i64 = inc;
+    let op: closure(i64) -> i64 = |x| x + 1;
     await sleep(1);
     return op(41);
 }
@@ -246,6 +245,8 @@ mod happens_before;
 mod imported_async;
 #[path = "concurrency/imported_preemption.rs"]
 mod imported_preemption;
+#[path = "concurrency/indirect_lock.rs"]
+mod indirect_lock;
 #[path = "concurrency/lock_restrictions.rs"]
 mod lock_restrictions;
 #[path = "concurrency/locks.rs"]

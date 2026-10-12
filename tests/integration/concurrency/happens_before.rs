@@ -98,10 +98,9 @@ async fn main() {
 fn test_dgwo6_channel_item_must_be_send_e2403() {
     let (ok, stderr) = compile_with_data_race_check(
         r#"
-fn dbl(x: i64) -> i64 { return x * 2; }
 fn main() {
-    let ch = Channel<fn(i64) -> i64>::new();
-    let f = dbl;
+    let ch = Channel<closure(i64) -> i64>::new();
+    let f: closure(i64) -> i64 = |x| x * 2;
     ch.send(f);
 }
 "#,
@@ -115,10 +114,9 @@ fn main() {
 fn test_dgwo6_channel_fn_send_rejected_by_default() {
     let (ok, stderr) = compile_with_compiler_env(
         r#"
-fn dbl(x: i64) -> i64 { return x * 2; }
 fn main() {
-    let ch = Channel<fn(i64) -> i64>::new();
-    ch.send(dbl);
+    let ch = Channel<closure(i64) -> i64>::new();
+    ch.send(|x| x * 2);
     let g = ch.recv();
     println(g(21));   // 42
 }

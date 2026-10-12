@@ -110,7 +110,7 @@ pub(super) fn take_recovery_request() -> bool {
         && requested == Some(coord.cycle_generation)
 }
 
-fn wait_for_cycle(mut coord: std::sync::MutexGuard<'_, GcCoord>, generation: u64) {
+pub(super) fn wait_for_cycle(mut coord: std::sync::MutexGuard<'_, GcCoord>, generation: u64) {
     loop {
         #[cfg(test)]
         CHECKS.fetch_add(1, Ordering::Relaxed);
