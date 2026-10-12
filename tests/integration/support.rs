@@ -624,6 +624,50 @@ pub(super) fn compile_and_collect_relocations_by_section(
     names
 }
 
+/// Total bytes of the executable sections in the object compiled from
+/// `source`. Section sizes exist in every object format, unlike per-symbol
+/// sizes (Mach-O and COFF record none), so this measures generated-code growth
+/// portably.
+pub(super) fn compile_and_measure_text_bytes(source: &str, release: bool) -> u64 {
+    use object::SectionKind;
+    use object::read::{Object, ObjectSection};
+
+    let id = unique_test_id();
+    let src_path = temp_path(format!("willow_text_test_{id}.wi"));
+    let bin_path = temp_path(format!("willow_text_test_{id}"));
+    let obj_path = object_path(&bin_path);
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willow");
+    let mut command = Command::new(compiler);
+    command
+        .args(["build", &src_path, "-o", &bin_path])
+        .env("WILLOW_KEEP_OBJECT", "1");
+    if release {
+        command.arg("--release");
+    }
+    let output = command.output().expect("failed to run compiler");
+    assert!(
+        output.status.success(),
+        "compilation failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = fs::read(&obj_path)
+        .unwrap_or_else(|err| panic!("intermediate object {obj_path} unreadable: {err}"));
+    let object = object::File::parse(&*bytes)
+        .unwrap_or_else(|err| panic!("intermediate object {obj_path} unparseable: {err}"));
+    let total = object
+        .sections()
+        .filter(|section| section.kind() == SectionKind::Text)
+        .map(|section| section.size())
+        .sum();
+    let _ = fs::remove_file(&src_path);
+    let _ = fs::remove_file(&obj_path);
+    remove_output_artifacts(&bin_path);
+    total
+}
+
 /// Compile `source` while retaining its object and return all symbols that have
 /// a definition in that object. Unlike relocation targets, this can prove a
 /// private helper was emitted exactly once even when many call sites reach it.

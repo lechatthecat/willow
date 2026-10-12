@@ -215,6 +215,10 @@ pub struct UnitCodegenContext<'a> {
     visible_modules: HashSet<String>,
     builtin_module_aliases: HashMap<String, String>,
     lambda_names: HashMap<ExprId, FunctionId>,
+    /// The lambda expressions among `lambda_names` whose lifted body is a
+    /// safepoint-free leaf, so it can neither raise nor reach a GC point
+    /// (willow-8hq4.28). Their closures tag the code word.
+    leaf_lambdas: HashSet<ExprId>,
     effect_queries: Option<(
         std::rc::Rc<crate::compiler_db::effects::EffectQueries>,
         crate::module::UnitId,
@@ -731,19 +735,29 @@ impl UnitCodegenContext<'_> {
             // ExprIds identify source syntax; copied defaults have distinct
             // BodyIds. Expose only this body's direct lambda constructions.
             self.lambda_names.clear();
+            self.leaf_lambdas.clear();
+            let lir_queries = self
+                .lir_queries
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing LIR query session"))?;
+            let overflow_checks = self.build_mode == BuildMode::Debug;
             if let Some(queries) = &self.body_queries {
                 for (expr, child) in queries.index().child_lambdas(body) {
                     let name = *self.lambda_body_names.get(&child).ok_or_else(|| {
                         anyhow::anyhow!("lambda body {child:?} has no declared symbol")
                     })?;
                     self.lambda_names.insert(expr, name);
+                    // Each lambda has one constructing body, so every lifted
+                    // body is inspected once here and once when emitted.
+                    if root_effect::is_safepoint_free_leaf(
+                        &lir_queries.body(child)?,
+                        overflow_checks,
+                    ) {
+                        self.leaf_lambdas.insert(expr);
+                    }
                 }
             }
-            let mut function = self
-                .lir_queries
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing LIR query session"))?
-                .body(body)?;
+            let mut function = lir_queries.body(body)?;
             function.name = name;
             return Ok(function);
         }
@@ -796,7 +810,11 @@ impl UnitCodegenContext<'_> {
                 (function.name, function)
             })
             .collect();
+        let overflow_checks = self.build_mode == BuildMode::Debug;
         for lambda in lir.lambdas {
+            if root_effect::is_safepoint_free_leaf(&lambda.function, overflow_checks) {
+                self.leaf_lambdas.insert(lambda.id);
+            }
             if let Some(name) = self.lambda_names.get(&lambda.id) {
                 let mut function = lambda.function;
                 function.name = *name;
@@ -1482,6 +1500,7 @@ struct FuncGen<'a, 'b> {
     /// compiled (willow-nswv). Only the LIR path reads it.
     builtin_module_aliases: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<ExprId, FunctionId>,
+    leaf_lambdas: &'a HashSet<ExprId>,
     string_literals: &'a HashMap<String, StringLiteralData>,
     /// This unit's alias-resolving view of the frozen class layouts, base
     /// edges, runtime type ids, virtual slot orders and interface

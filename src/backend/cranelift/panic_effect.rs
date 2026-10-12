@@ -293,6 +293,19 @@ impl FuncGen<'_, '_> {
         !optimization_enabled() || self.function_may_panic.get(name).copied().unwrap_or(true)
     }
 
+    /// [`Self::user_function_may_panic`] by semantic identity.
+    pub(super) fn user_function_may_panic_id(&self, id: &FunctionId) -> bool {
+        !optimization_enabled() || self.function_may_panic.get_id(id).copied().unwrap_or(true)
+    }
+
+    /// Whether the lifted body of lambda `expr` may raise: no-panic by effect
+    /// summary (block lambdas) or by the safepoint-free leaf proof, which also
+    /// covers expression lambdas that have no summary (willow-8hq4.28).
+    pub(super) fn lambda_may_panic(&self, expr: &ExprId, id: &FunctionId) -> bool {
+        self.user_function_may_panic_id(id)
+            && !(optimization_enabled() && self.leaf_lambdas.contains(expr))
+    }
+
     /// What every function an `interface` vtable slot for `method` can hold
     /// guarantees. Every vtable of the build is declared before any body is
     /// lowered, so the slot targets are complete here; a re-dispatching thunk

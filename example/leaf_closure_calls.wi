@@ -1,0 +1,59 @@
+// Leaf closures (willow-8hq4.28).
+//
+// A lambda body that only reads its captures and parameters, compares and
+// does arithmetic — no call, allocation, loop or possible panic — is a
+// "safepoint-free leaf". Its closure environment needs no GC root and no
+// safepoint poll, and the closure's code word carries a tag telling every call
+// site to skip the panic-depth check. The calls below compile to a load, a
+// test of that tag bit and a plain indirect call.
+//
+// Closures that can panic, allocate or loop keep the checked path; the
+// results are the same either way, and a moving collection between calls
+// cannot disturb the captured objects.
+
+import std::collections::Array;
+
+class Point {
+    pub x: i64;
+    pub y: i64;
+}
+
+// Leaf: two field loads, a multiply-add (wrapping in release builds).
+fn dot(p: Point) -> closure(i64, i64) -> i64 {
+    return |a, b| p.x * a + p.y * b;
+}
+
+// Not a leaf: the divisor is a parameter, so `x / d` can panic on zero.
+fn divider(n: i64) -> closure(i64) -> i64 {
+    return |d| n / d;
+}
+
+// Not a leaf: it allocates a string.
+fn labeller(prefix: String) -> closure(i64) -> String {
+    return |v: i64| { return prefix + v.toString(); };
+}
+
+fn main() {
+    let mut fs: Array<closure(i64, i64) -> i64> = [];
+    let mut i = 1;
+    while i <= 10 {
+        fs.push(dot(new Point(i, i * i)));
+        i = i + 1;
+    }
+    let mut total = 0;
+    i = 0;
+    while i < 10 {
+        // A collection between calls moves the captured points.
+        gc_minor_collect();
+        let f = fs[i];
+        total = total + f(1, 0) * f(0, 1);
+        i = i + 1;
+    }
+    println(total);
+
+    let half = divider(100);
+    println(half(4));
+
+    let label = labeller("total=");
+    println(label(total));
+}

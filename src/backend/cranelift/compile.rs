@@ -1751,6 +1751,7 @@ impl UnitCodegenContext<'_> {
             visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
+            leaf_lambdas: &self.leaf_lambdas,
             string_literals: &self.output.string_literals,
             classes: ClassView::new(&self.type_scope, &self.layout_queries),
             static_storage: &self.static_storage,
@@ -1862,7 +1863,11 @@ impl UnitCodegenContext<'_> {
                         ) as i32,
                 );
                 capture_word += 1 + i32::from(fg.is_inline_pair(&capture.ty));
-                fg.bind_param(&capture.name, &capture.ty, &ParamMode::Value, val);
+                if unrooted {
+                    fg.bind_unrooted_param(&capture.name, &capture.ty, val);
+                } else {
+                    fg.bind_param(&capture.name, &capture.ty, &ParamMode::Value, val);
+                }
             }
         }
 
@@ -2185,6 +2190,7 @@ impl UnitCodegenContext<'_> {
             visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
+            leaf_lambdas: &self.leaf_lambdas,
             string_literals: &self.output.string_literals,
             classes: ClassView::new(&self.type_scope, &self.layout_queries),
             static_storage: &self.static_storage,
@@ -2784,6 +2790,7 @@ impl UnitCodegenContext<'_> {
             visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
+            leaf_lambdas: &self.leaf_lambdas,
             string_literals: &self.output.string_literals,
             classes: ClassView::new(&self.type_scope, &self.layout_queries),
             static_storage: &self.static_storage,

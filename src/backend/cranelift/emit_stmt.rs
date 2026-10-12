@@ -450,7 +450,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(resume);
     }
 
-    fn emit_sync_cancel_check(&mut self) {
+    pub(super) fn emit_sync_cancel_check(&mut self) {
         if self.emitting_sync_cancel_cleanup {
             return;
         }
@@ -1025,9 +1025,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Cancellation is sticky even through functions whose panic summary
         // is empty, and is intentionally independent of recoverable panics.
         self.emit_sync_cancel_check();
-        let Some(depth_before) = depth_before else {
-            return;
-        };
+        if let Some(depth_before) = depth_before {
+            self.emit_panic_depth_check(depth_before);
+        }
+    }
+
+    /// The panic half of [`Self::emit_post_willow_call_panic_check`]: branch
+    /// to the unwind when the depth grew past `depth_before`, and continue in
+    /// a fresh block otherwise.
+    pub(super) fn emit_panic_depth_check(&mut self, depth_before: cranelift_codegen::ir::Value) {
         let depth_after = self.emit_value_runtime_call("willow_panic_depth", &[]);
         let raised = self
             .builder

@@ -55,6 +55,8 @@ mod interface_default_inheritance;
 mod interface_super_coercion;
 #[path = "integration/lambda_shadowing.rs"]
 mod lambda_shadowing;
+#[path = "integration/leaf_closure_calls.rs"]
+mod leaf_closure_calls;
 #[path = "integration/leaf_method_calls.rs"]
 mod leaf_method_calls;
 #[path = "integration/lir_async.rs"]
