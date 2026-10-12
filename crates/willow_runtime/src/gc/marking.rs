@@ -8,6 +8,9 @@ use super::*;
 /// its start bit after initialization. New old allocations publish black.
 pub(super) struct ConcurrentCycle {
     pub(super) collector: ThreadId,
+    pointer_checks: AtomicU64,
+    duplicate_discoveries: AtomicU64,
+    unindexed_discoveries: AtomicU64,
     pub(super) assist_epoch: u64,
     pub(super) assist_rate: u64,
     pub(super) objects: epoch_index::EpochIndex,
@@ -25,6 +28,18 @@ pub(super) struct ConcurrentCycle {
     pub(super) work: Mutex<crate::gc_telemetry::MarkWork>,
     /// Deletion buffers filled without the heap mutex while marking.
     pub(super) satb_shards: satb::SatbShards,
+}
+
+// These diagnostics are separate from the stable C snapshot layouts. Publish
+// once when the last reader/owner releases the epoch, never per graph edge.
+impl Drop for ConcurrentCycle {
+    fn drop(&mut self) {
+        crate::gc_telemetry::workers::record_discoveries(
+            self.pointer_checks.load(Ordering::Relaxed),
+            self.duplicate_discoveries.load(Ordering::Relaxed),
+            self.unindexed_discoveries.load(Ordering::Relaxed),
+        );
+    }
 }
 
 // Publish accounting and legacy/unindexed exceptions once per bounded drain,
@@ -116,6 +131,9 @@ impl ConcurrentCycle {
             .expect("assist epoch exhausted");
         Self {
             collector: std::thread::current().id(),
+            pointer_checks: AtomicU64::new(0),
+            duplicate_discoveries: AtomicU64::new(0),
+            unindexed_discoveries: AtomicU64::new(0),
             assist_epoch,
             assist_rate: assist::SCALE,
             objects,
@@ -143,13 +161,17 @@ impl ConcurrentCycle {
         if address == 0 {
             return false;
         }
+        self.pointer_checks.fetch_add(1, Ordering::Relaxed);
         if self.objects.claim(address) {
             return true;
         }
         if !self.objects.contains(address) {
             // A captured active TLAB may not have published its starts yet.
             // Never discard SATB/roots just because retirement has not arrived.
+            self.unindexed_discoveries.fetch_add(1, Ordering::Relaxed);
             self.unindexed.lock().unwrap().insert(address);
+        } else {
+            self.duplicate_discoveries.fetch_add(1, Ordering::Relaxed);
         }
         false
     }
@@ -378,7 +400,25 @@ impl ConcurrentCycle {
         limit: usize,
         deadline: Option<std::time::Instant>,
     ) -> u64 {
-        crate::failure::ffi_boundary("GC marker assist", || self.drain_until(limit, deadline))
+        self.drain_recovering(|| self.drain_until(limit, deadline))
+    }
+
+    /// Unwinding retires the queue consumer and publishes MarkBatch before
+    /// requesting authoritative stopped tracing. Never continue partial scans.
+    pub(super) fn drain_recovering<T: Default>(&self, drain: impl FnOnce() -> T) -> T {
+        if self.worker_failed.load(Ordering::Acquire) {
+            return T::default();
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(drain)) {
+            Ok(work) => work,
+            Err(_) => {
+                self.worker_failed.store(true, Ordering::Release);
+                crate::gc_telemetry::workers::record_failure(
+                    crate::gc_telemetry::workers::Failure::MarkerPanic,
+                );
+                T::default()
+            }
+        }
     }
 
     pub(super) fn drain(&self, limit: usize) -> u64 {

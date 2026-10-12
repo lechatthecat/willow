@@ -1172,35 +1172,34 @@ fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
 }
 
 #[test]
-fn concurrent_trace_panic_terminates_collection() {
-    use super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
-    if std::env::var_os(GC_FATAL_CASE).is_some() {
-        let _guard = runtime_test_guard();
-        reset_internal_for_test();
-        willow_register_type(0xFA72, trace_slot);
-        runtime()
-            .concurrent_trace_registry
-            .lock()
-            .unwrap()
-            .insert(0xFA72, failing_concurrent_trace);
-        let mut parent = willow_alloc_object(0xFA72, 8);
-        let child = willow_alloc_typed(8, 1);
-        let leaf = willow_alloc(8);
-        unsafe {
-            store_gc_reference(parent.cast(), child);
-            store_gc_reference(child.cast(), leaf);
-        }
-        willow_push_root(&mut parent);
-        willow_gc_collect();
-        eprintln!("GC_PANIC_RETURNED");
-        return;
+fn concurrent_trace_panic_completes_with_stopped_graph_tracing() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    willow_register_type(0xFA72, trace_slot);
+    runtime()
+        .concurrent_trace_registry
+        .lock()
+        .unwrap()
+        .insert(0xFA72, failing_concurrent_trace);
+    let mut parent = willow_alloc_object(0xFA72, 8);
+    let child = willow_alloc_typed(8, 1);
+    let leaf = willow_alloc(8);
+    unsafe {
+        store_gc_reference(parent.cast(), child);
+        store_gc_reference(child.cast(), leaf);
     }
-    let stderr = assert_fatal_child(
-        "gc::concurrent_tests::concurrent_trace_panic_terminates_collection",
-        "collection",
-        "runtime fatal: Rust panic in GC marker",
-    );
-    assert!(stderr.contains("injected concurrent trace failure"));
+    willow_push_root(&mut parent);
+    let before = crate::gc_telemetry::workers::snapshot();
+    willow_gc_collect();
+    let after = crate::gc_telemetry::workers::snapshot();
+    assert!(after.marker_panics > before.marker_panics);
+    assert_eq!(after.fallback_cycles, before.fallback_cycles + 1);
+    assert_eq!(willow_gc_allocated_bytes(), 3 * (GC_HEADER_SIZE + 8) as i64);
+    assert_eq!(registered_mutator_count(), 0);
+    willow_pop_roots(1);
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_internal_for_test();
 }
 
 #[test]
@@ -1262,10 +1261,10 @@ fn marker_unregister_without_tlab_does_not_scan_mutator_allocation_records() {
 }
 
 #[test]
-fn marker_panics_terminate_worker_collector_and_assist() {
-    use super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
-    if let Ok(case) = std::env::var(GC_FATAL_CASE) {
-        reset_internal_for_test();
+fn marker_panics_publish_failure_and_retire_worker_collector_and_assist() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    for case in ["worker1", "worker5", "collector", "assist"] {
         let object = willow_alloc(8) as usize;
         let cycle = Arc::new(ConcurrentCycle::new(
             [(
@@ -1282,33 +1281,34 @@ fn marker_panics_terminate_worker_collector_and_assist() {
             1,
         ));
         cycle.enqueue(object as *mut u8);
-        match case.as_str() {
+        let before = crate::gc_telemetry::workers::snapshot().marker_panics;
+        match case {
             "worker1" | "worker5" => {
                 let pool = mark_workers::Pool::new(if case == "worker1" { 1 } else { 5 }).unwrap();
+                pool.run(&cycle, 0);
+                // The same OS threads remain usable after a failed cycle.
                 pool.run(&cycle, 0);
             }
             "collector" => mark_workers::Pool::new(0).unwrap().run(&cycle, 1),
             "assist" => {
                 cycle.drain_checked(1);
             }
-            _ => panic!("invalid child case"),
+            _ => unreachable!(),
         }
-        eprintln!("GC_PANIC_RETURNED");
-        return;
-    }
-    for (case, context) in [
-        ("worker1", "worker"),
-        ("worker5", "worker"),
-        ("collector", "collector"),
-        ("assist", "assist"),
-    ] {
-        let stderr = assert_fatal_child(
-            "gc::concurrent_tests::marker_panics_terminate_worker_collector_and_assist",
-            case,
-            &format!("runtime fatal: Rust panic in GC marker {context}"),
+        assert!(cycle.worker_failed.load(Ordering::Acquire), "{case}");
+        assert_eq!(
+            crate::gc_telemetry::workers::snapshot().marker_panics,
+            before + 1
         );
-        assert!(stderr.contains("injected concurrent trace failure"));
+        let queue = cycle.queue.snapshot();
+        assert_eq!(queue.registered_workers, 0);
+        assert_eq!(queue.registered_assists, 0);
+        assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
+        assert_eq!(registered_mutator_count(), 0);
+        assert!(cycle.is_marked(object));
+        cycle.queue.end_epoch();
     }
+    reset_internal_for_test();
 }
 
 static SWEEP_MUTATOR_READY: AtomicBool = AtomicBool::new(false);
@@ -3668,5 +3668,155 @@ fn satb_deferred_legacy_and_retry_slice_complete_with_snapshot_retention() {
         );
     }
     BUDGET_RETRY_LIMIT.store(0, Ordering::Relaxed);
+    reset_internal_for_test();
+}
+
+#[test]
+fn marker_discovery_diagnostics_count_duplicate_and_unindexed_candidates() {
+    let _guard = runtime_test_guard();
+    for count in [16usize, 128, 1024] {
+        let before = crate::gc_telemetry::workers::discovery_snapshot();
+        let cycle = ConcurrentCycle::new(
+            (1..=count).map(|address| {
+                (
+                    address,
+                    raw_heap::TraceMetadata {
+                        type_id: 0,
+                        layout_id: 0,
+                        gc_ref_mask: 0,
+                        payload_size: 0,
+                    },
+                )
+            }),
+            IdSet::default(),
+            IdMap::default(),
+            0,
+        );
+        for address in 1..=count {
+            for _ in 0..8 {
+                cycle.enqueue(address as *mut u8);
+            }
+        }
+        cycle.enqueue((count + 1) as *mut u8);
+        cycle.enqueue(std::ptr::null_mut());
+        assert_eq!(cycle.queue.snapshot().injected, count as u64);
+        cycle.drain(usize::MAX);
+        assert_eq!(cycle.objects.marked_count(), count);
+        assert_eq!(cycle.queue.end_epoch(), 0);
+        drop(cycle);
+        let after = crate::gc_telemetry::workers::discovery_snapshot();
+        assert_eq!(
+            after.pointer_checks - before.pointer_checks,
+            (8 * count + 1) as u64
+        );
+        assert_eq!(after.duplicates - before.duplicates, (7 * count) as u64);
+        assert_eq!(after.unindexed - before.unindexed, 1);
+        println!(
+            "objects={count} discoveries={} unique_jobs={count} duplicates={} unindexed=1",
+            8 * count + 1,
+            7 * count
+        );
+    }
+}
+
+static ENGINE_READER_ENTERED: AtomicBool = AtomicBool::new(false);
+static ENGINE_MUTATORS_DONE: AtomicUsize = AtomicUsize::new(0);
+static ENGINE_MUTATORS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
+
+unsafe fn await_engine_mutators(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    assert!(
+        std::thread::current()
+            .name()
+            .unwrap()
+            .starts_with("willow-gc-mark-")
+    );
+    ENGINE_READER_ENTERED.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ENGINE_MUTATORS_DONE.load(Ordering::Acquire)
+        != ENGINE_MUTATORS_EXPECTED.load(Ordering::Relaxed)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "mutators did not progress during background scan"
+        );
+        std::thread::yield_now();
+    }
+    children.push(unsafe { load_gc_reference(payload.cast()) });
+}
+
+#[test]
+fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations() {
+    let _guard = runtime_test_guard();
+    for count in [1, 5, 16] {
+        reset_internal_for_test();
+        ENGINE_READER_ENTERED.store(false, Ordering::Relaxed);
+        ENGINE_MUTATORS_DONE.store(0, Ordering::Relaxed);
+        ENGINE_MUTATORS_EXPECTED.store(count, Ordering::Relaxed);
+        const TYPE: u32 = 0xFA99;
+        willow_register_type(TYPE, trace_slot);
+        runtime()
+            .concurrent_trace_registry
+            .lock()
+            .unwrap()
+            .insert(TYPE, await_engine_mutators);
+        let parent = willow_alloc_object(TYPE as i64, 8);
+        let child = willow_alloc(8);
+        unsafe {
+            store_gc_reference(parent.cast(), child);
+        }
+        let cycle = {
+            let mut state = runtime().heap.lock().unwrap();
+            let cycle = Arc::new(ConcurrentCycle::with_index(
+                epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                IdSet::from_iter([TYPE]),
+                runtime().concurrent_trace_registry.lock().unwrap().clone(),
+                1,
+            ));
+            marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+            GC_MARK_PHASE.store(1, Ordering::Release);
+            cycle
+        };
+        cycle.enqueue(parent);
+        let mut mutators = Vec::new();
+        for _ in 0..count {
+            let cycle = cycle.clone();
+            mutators.push(std::thread::spawn(move || {
+                willow_gc_register_mutator();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !ENGINE_READER_ENTERED.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline);
+                    willow_gc_safepoint();
+                    std::thread::yield_now();
+                }
+                // Mutation cannot invalidate the captured callback registry.
+                willow_register_type(TYPE, trace_slot);
+                let new = willow_alloc(8) as usize;
+                assert!(
+                    cycle.objects.retains_allocated(new),
+                    "allocation published white"
+                );
+                willow_gc_unregister_mutator();
+                ENGINE_MUTATORS_DONE.fetch_add(1, Ordering::Release);
+            }));
+        }
+        let pool = mark_workers::Pool::new(1).unwrap();
+        pool.run(&cycle, 0);
+        for mutator in mutators {
+            mutator.join().unwrap();
+        }
+        cycle.drain(usize::MAX);
+        assert!(cycle.is_marked(parent as usize));
+        assert!(cycle.is_marked(child as usize));
+        assert!(!cycle.worker_failed.load(Ordering::Acquire));
+        assert_eq!(cycle.queue.end_epoch(), 0);
+        assert_eq!(registered_mutator_count(), 0);
+        GC_MARK_PHASE.store(0, Ordering::Release);
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+        drop(pool);
+        drop(cycle);
+        println!(
+            "background_workers=1 progressing_mutators={count} registry_replacements={count} black_allocations={count}"
+        );
+    }
     reset_internal_for_test();
 }

@@ -49,6 +49,44 @@ pub fn snapshot() -> MarkWorkerStatsV2 {
     *STATS.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Cumulative discovery diagnostics, without changing either versioned C ABI.
+/// Unindexed candidates include legitimate post-snapshot allocations; they are
+/// not a count of corrupt pointers. Checked builds validate them at remark.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MarkDiscoveryStats {
+    pub pointer_checks: u64,
+    pub duplicates: u64,
+    pub unindexed: u64,
+}
+static DISCOVERIES: Mutex<MarkDiscoveryStats> = Mutex::new(MarkDiscoveryStats {
+    pointer_checks: 0,
+    duplicates: 0,
+    unindexed: 0,
+});
+pub fn discovery_snapshot() -> MarkDiscoveryStats {
+    *DISCOVERIES.lock().unwrap_or_else(|p| p.into_inner())
+}
+pub(crate) fn record_discoveries(checks: u64, duplicates: u64, unindexed: u64) {
+    let mut stats = DISCOVERIES.lock().unwrap_or_else(|p| p.into_inner());
+    stats.pointer_checks = stats.pointer_checks.saturating_add(checks);
+    stats.duplicates = stats.duplicates.saturating_add(duplicates);
+    stats.unindexed = stats.unindexed.saturating_add(unindexed);
+}
+
+impl MarkWorkerStatsV2 {
+    /// Measured CPU / active job wall time, in parts per million. This is
+    /// active worker duty, excluding parked time; unavailable CPU is explicit.
+    pub fn active_duty_ppm(&self) -> Option<u64> {
+        if self.flags & CPU_COMPLETE == 0 || self.wall_ns == 0 {
+            return None;
+        }
+        Some(
+            ((u128::from(self.cpu_ns) * 1_000_000 / u128::from(self.wall_ns)).min(1_000_000))
+                as u64,
+        )
+    }
+}
+
 fn add(field: &mut u64, increment: u64) -> bool {
     match field.checked_add(increment) {
         Some(value) => {
@@ -203,6 +241,18 @@ mod tests {
         if let (Some(before), Some(after)) = (before, after) {
             assert!(after >= before);
         }
+    }
+    #[test]
+    fn worker_duty_requires_complete_cpu_and_nonzero_wall_time() {
+        let mut stats = MarkWorkerStatsV2::default();
+        assert_eq!(stats.active_duty_ppm(), None);
+        stats.wall_ns = 100;
+        stats.cpu_ns = 25;
+        assert_eq!(stats.active_duty_ppm(), Some(250_000));
+        stats.cpu_ns = 200;
+        assert_eq!(stats.active_duty_ppm(), Some(1_000_000));
+        stats.flags &= !CPU_COMPLETE;
+        assert_eq!(stats.active_duty_ppm(), None);
     }
     #[test]
     fn overflow_is_saturated_and_reported() {

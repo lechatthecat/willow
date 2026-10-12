@@ -193,7 +193,7 @@ pub(super) fn finish_stopped(
             if !fallback {
                 // Roots discovered at this stop may introduce legacy hooks or
                 // Retry slices even when the concurrent sample contained none.
-                marking.drain(256);
+                marking.drain_checked_until(256, None);
                 fallback = marking.worker_failed.load(Ordering::Acquire)
                     || !marking.queue.snapshot().is_drained()
                     || !marking.deferred.lock().unwrap().is_empty();

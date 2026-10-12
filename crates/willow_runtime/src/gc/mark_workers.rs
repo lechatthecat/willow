@@ -1,7 +1,8 @@
 //! Dedicated reusable marker threads. Idle threads hold no heap references and
 //! are unregistered; active jobs register, publish work before safepoints, and
 //! unregister before acknowledging completion. Reclamation must wait for that
-//! acknowledgement. Unexpected panics terminate the process.
+//! acknowledgement. Trace panics retire their queue consumer and request stopped fallback.
+//! Unexpected worker infrastructure panics terminate the process.
 use super::*;
 use crate::gc_telemetry::workers::{Failure, JobMeasurement, record_failure};
 use std::thread::JoinHandle;
@@ -80,7 +81,7 @@ impl Pool {
     }
 
     /// The caller owns collection serialization and cannot request remark until
-    /// this returns. Unexpected collector-side panics terminate immediately.
+    /// this returns. Trace panics request stopped completion after readers leave.
     pub(super) fn run(&self, cycle: &Arc<ConcurrentCycle>, budget: usize) {
         let (lock, cv) = &*self.shared;
         {
@@ -100,7 +101,7 @@ impl Pool {
             state.remaining = self.threads.len();
             cv.notify_all();
         }
-        crate::failure::ffi_boundary("GC marker collector", || cycle.drain(budget));
+        cycle.drain_recovering(|| cycle.drain(budget));
         let mut state = lock.lock().unwrap();
         while state.remaining != 0 {
             state = cv.wait(state).unwrap();
@@ -171,8 +172,17 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
                 if budget == 0 {
                     break;
                 }
-                let scanned = cycle.drain_background(budget, &mut children);
-                willow_gc_safepoint();
+                let mut scanned = 0;
+                for _ in 0..budget {
+                    let work = cycle.drain_recovering(|| cycle.drain_background(1, &mut children));
+                    // Retire the consumer and publish private work before
+                    // polling; no queue or heap lock crosses this call.
+                    willow_gc_safepoint();
+                    scanned += work;
+                    if work == 0 || cycle.worker_failed.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
                 if scanned == 0 {
                     break;
                 }
