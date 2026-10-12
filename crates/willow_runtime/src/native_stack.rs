@@ -530,11 +530,12 @@ mod tests {
     fn legacy_timer_wait_completes_through_cooperative_boundary() {
         use crate::scheduler::*;
         unsafe extern "C" fn sleep(_: *mut c_void) -> i32 {
-            let future = crate::timer::willow_runtime_sleep(5);
-            crate::future::willow_future_await_void(future);
-            assert_eq!(crate::future::willow_future_is_ready_void(future), 1);
-            crate::future::willow_future_await_void(future);
-            unsafe { crate::future::willow_future_release_void(future) };
+            let future = crate::future::LegacyFutureOwner::new(
+                crate::future::WillowFutureVoid::sleep_after_millis(5),
+            );
+            future.get().block_until_ready();
+            assert!(future.get().is_ready());
+            future.get().block_until_ready();
             RUNTIME_POLL_READY
         }
         unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
@@ -554,9 +555,10 @@ mod tests {
     fn legacy_timer_wait_parks_and_cancels_without_sleeping_worker() {
         use crate::scheduler::*;
         unsafe extern "C" fn sleeper(_: *mut c_void) -> i32 {
-            let future = crate::timer::willow_runtime_sleep(60_000);
-            crate::future::willow_future_await_void(future);
-            unsafe { crate::future::willow_future_release_void(future) };
+            let future = crate::future::LegacyFutureOwner::new(
+                crate::future::WillowFutureVoid::sleep_after_millis(60_000),
+            );
+            future.get().block_until_ready();
             assert_ne!(cancelled(), 0);
             RUNTIME_POLL_READY
         }
