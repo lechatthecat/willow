@@ -1091,7 +1091,9 @@ impl TypeChecker {
         if let Some(cause) = self.effect_inputs.direct.get(callee) {
             return Some(cause.clone());
         }
-        let local = self.effect_index.callables.contains_key(callee) || facts.get(callee).is_some();
+        // Lambdas are never imported; any other callable outside this unit's
+        // index is imported, even when the unit's graph has a node for it.
+        let local = self.effect_index.callables.contains_key(callee) || callee.is_lambda();
         let evidence = self.effect_queries.as_ref().and_then(|(queries, unit)| {
             if local {
                 queries.effect_evidence(*unit, *callee)

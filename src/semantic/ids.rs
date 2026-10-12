@@ -603,6 +603,10 @@ impl FunctionId {
     pub fn lambda(body: crate::parser::ast::BodyId) -> Self {
         Self::free(format!("<lambda {body}>"))
     }
+    /// Whether this is the identity of a lambda body ([`Self::lambda`]).
+    pub fn is_lambda(&self) -> bool {
+        self.name().starts_with("<lambda ")
+    }
     /// Legacy spelling qualification. Resolved declarations retain their identity;
     /// consumer aliases belong in the scope, not in the canonical symbol.
     pub fn in_namespace(self, namespace: impl AsRef<str>) -> Self {
