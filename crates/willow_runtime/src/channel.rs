@@ -8,7 +8,6 @@ use crate::native_memory::Mutex;
 use crate::task::{ChannelOwnershipToken, ChannelRole};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::Condvar;
 
 use crate::trace::{GcTrace, GcVisitor};
 
@@ -82,7 +81,6 @@ pub struct WillowAbiChannel {
 
 pub struct ChannelCore {
     state: Mutex<WillowChannelState>,
-    not_empty: Condvar,
     /// True when the element type is a GC reference (String / class / array /
     /// ...): queued values are then GC roots scanned by the collector
     /// (willow-dsw GC tracing).
@@ -101,7 +99,6 @@ impl WillowAbiChannel {
         Self {
             inner: Box::new(ChannelCore {
                 state: Mutex::with_base(WillowChannelState::default(), size_of::<ChannelCore>()),
-                not_empty: Condvar::new(),
                 is_ref,
             }),
         }
@@ -290,7 +287,7 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
     };
     let current = crate::scheduler::willow_sched_current_task();
     crate::task::prepare_channel_wait_links();
-    {
+    let (wake_receivers, wake_senders) = {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         if state.closed {
             clear_wait(raw, &mut state.send_waiters, current, ChannelRole::SendWait);
@@ -324,10 +321,16 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
             );
         }
         state.values.push_back(value);
-        channel.not_empty.notify_one();
+        (!state.waiters.is_empty(), !state.send_waiters.is_empty())
+    };
+    // A waiter arriving after this snapshot probes the updated availability
+    // under the same mutex. It cannot depend on this notification.
+    if wake_receivers {
+        wake_recv_waiters(channel);
     }
-    wake_recv_waiters(channel);
-    wake_send_waiters(channel);
+    if wake_senders {
+        wake_send_waiters(channel);
+    }
     1
 }
 
@@ -681,14 +684,20 @@ fn channel_recv_or_closed(raw: *mut c_void) -> Option<WillowChannelValue> {
             let _no_preempt = crate::preempt::NoPreemptGuard::enter();
             let mut state = channel.state.lock().expect("channel mutex poisoned");
             if let Some(mut value) = take_value(raw, &mut state, current) {
+                let wake_senders = !state.send_waiters.is_empty();
+                let wake_receivers = !state.waiters.is_empty();
                 drop(state);
                 // Waking can explicitly collect under scheduler GC stress.
                 // The popped reference no longer has the queue as its root.
                 let root = channel
                     .is_ref
                     .then(|| crate::gc::GcRootHandle::new(unsafe { value.ptr_value.cast() }));
-                wake_send_waiters(channel);
-                wake_recv_waiters(channel);
+                if wake_senders {
+                    wake_send_waiters(channel);
+                }
+                if wake_receivers {
+                    wake_recv_waiters(channel);
+                }
                 if let Some(root) = root {
                     value.ptr_value = root.load().cast();
                 }

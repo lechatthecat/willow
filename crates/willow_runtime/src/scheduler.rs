@@ -69,7 +69,12 @@ enum PollOutcome {
     Invalid(i32),
 }
 
-type ClaimedTaskWork = Option<(RuntimePollFn, *mut c_void, *const c_void)>;
+struct ClaimedTaskWork {
+    poll: Option<(RuntimePollFn, *mut c_void, *const c_void)>,
+    cancel: Option<(RuntimeCancelFn, *mut c_void)>,
+    direct_poll: bool,
+    direct_cancel: bool,
+}
 
 fn classify_poll_result(result: i32) -> PollOutcome {
     match result {
@@ -2242,35 +2247,41 @@ fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) 
     });
 }
 
-fn take_global_cancel_work(id: RuntimeTaskId) -> Option<(RuntimeCancelFn, *mut c_void)> {
-    global_task_table()
-        .with_mut(id, |task| {
-            #[cfg(any(
-                all(
-                    target_os = "linux",
-                    target_env = "gnu",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ),
-                all(
-                    target_os = "macos",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ),
-                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
-            ))]
-            if task
-                .native_stack
-                .as_ref()
-                .is_some_and(|stack| stack.is_suspended())
-            {
-                return None;
-            }
-            if task.state.lifecycle() != TaskLifecycle::Cancelling {
-                return None;
-            }
-            let cancel = task.cancel.take()?;
-            Some((cancel, task.frame))
-        })
-        .flatten()
+/// Snapshot dispatch metadata while the claim owns the task shard. Once
+/// claimed, cancellation requests cannot move a running poll to Cancelling;
+/// they are reconciled at its boundary. Native stack ownership is likewise
+/// exclusive to the worker that claims the task.
+fn claimed_task_work(task: &mut RuntimeTask) -> ClaimedTaskWork {
+    let mut suspended = false;
+    let mut cleanup = false;
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    if let Some(stack) = task.native_stack.as_ref() {
+        suspended = stack.is_suspended();
+        cleanup = stack.is_cleanup();
+    }
+    ClaimedTaskWork {
+        poll: task
+            .poll
+            .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
+        cancel: if !suspended && task.state.lifecycle() == TaskLifecycle::Cancelling {
+            task.cancel.take().map(|cancel| (cancel, task.frame))
+        } else {
+            None
+        },
+        direct_poll: task.cooperative_poll && !cleanup,
+        direct_cancel: task.cooperative_poll && !task.native_cancel_cleanup,
+    }
 }
 
 thread_local! {
@@ -3805,6 +3816,7 @@ fn claim_global_ready_for_worker(
     enum Claim {
         Work(ClaimedTaskWork, Arc<crate::panic_context::PanicContext>),
         FinalizeCancelled,
+        Reroute(usize),
         Drop,
     }
 
@@ -3831,28 +3843,6 @@ fn claim_global_ready_for_worker(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             });
-        #[cfg(any(
-            all(
-                target_os = "linux",
-                target_env = "gnu",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ),
-            all(
-                target_os = "macos",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ),
-            all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
-        ))]
-        if let Some(owner) = tasks
-            .with(id, |task| {
-                task.native_stack.as_ref().map(|stack| stack.worker)
-            })
-            .flatten()
-            && owner != worker
-        {
-            queues.push_local(owner, id);
-            return None;
-        }
         if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             drop(claim_guard);
             // The queue token is still set because no claim occurred.
@@ -3860,22 +3850,35 @@ fn claim_global_ready_for_worker(
             return None;
         }
         let claim = tasks
-            .with_mut(id, |task| match task.claim_for_poll() {
-                ClaimOutcome::Drop => Claim::Drop,
-                ClaimOutcome::Poll => {
-                    task.yield_requested = false;
-                    Claim::Work(
-                        task.poll
-                            .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
-                        task.panic_context(),
-                    )
+            .with_mut(id, |task| {
+                #[cfg(any(
+                    all(
+                        target_os = "linux",
+                        target_env = "gnu",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    ),
+                    all(
+                        target_os = "macos",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    ),
+                    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+                ))]
+                if let Some(owner) = task.native_stack.as_ref().map(|stack| stack.worker)
+                    && owner != worker
+                {
+                    return Claim::Reroute(owner);
                 }
-                ClaimOutcome::Cancel if task_requires_cancel_poll(task) => Claim::Work(
-                    task.poll
-                        .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
-                    task.panic_context(),
-                ),
-                ClaimOutcome::Cancel => Claim::FinalizeCancelled,
+                match task.claim_for_poll() {
+                    ClaimOutcome::Drop => Claim::Drop,
+                    ClaimOutcome::Poll => {
+                        task.yield_requested = false;
+                        Claim::Work(claimed_task_work(task), task.panic_context())
+                    }
+                    ClaimOutcome::Cancel if task_requires_cancel_poll(task) => {
+                        Claim::Work(claimed_task_work(task), task.panic_context())
+                    }
+                    ClaimOutcome::Cancel => Claim::FinalizeCancelled,
+                }
             })
             .unwrap_or(Claim::Drop);
         if matches!(claim, Claim::Work(..))
@@ -3898,6 +3901,10 @@ fn claim_global_ready_for_worker(
                     0,
                 );
                 set_current_task(None);
+            }
+            Claim::Reroute(owner) => {
+                queues.push_local(owner, id);
+                return None;
             }
             Claim::Drop => {}
         }
@@ -4277,11 +4284,11 @@ fn scheduler_run_loop(
         // A task the claim moved to Cancelling: run its cleanup entry WITHOUT
         // the scheduler lock (poll-like), then finalize as Cancelled
         // (willow-vynv.3). The frame stays rooted until finalization.
-        let cancel_work = take_global_cancel_work(id);
+        let cancel_work = work.cancel;
         let frame_identity = cancel_work
             .as_ref()
             .map(|(_, frame)| *frame as usize)
-            .or_else(|| work.as_ref().map(|(_, frame, _)| *frame as usize))
+            .or_else(|| work.poll.as_ref().map(|(_, frame, _)| *frame as usize))
             .unwrap_or(0);
         let _poll_lifetime = crate::frame_lifetime::PollLifetime::enter(frame_identity);
         if let Some((cancel_fn, cancel_frame)) = cancel_work {
@@ -4298,12 +4305,7 @@ fn scheduler_run_loop(
                 all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             ))]
             {
-                let direct = global_task_table()
-                    .with(id, |task| {
-                        task.cooperative_poll && !task.native_cancel_cleanup
-                    })
-                    .unwrap_or(false);
-                if direct {
+                if work.direct_cancel {
                     unsafe { cancel_fn(cancel_frame) };
                 } else {
                     let mut stack =
@@ -4389,7 +4391,7 @@ fn scheduler_run_loop(
             set_current_task(None);
             continue;
         }
-        let Some((poll, frame, preempt_flag)) = work else {
+        let Some((poll, frame, preempt_flag)) = work.poll else {
             // Placeholder task with no executable work: just complete it.
             with_global(|sched| {
                 sched.complete(id);
@@ -4429,16 +4431,7 @@ fn scheduler_run_loop(
             all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
         ))]
         let (result, native_cancelled) = {
-            let direct = global_task_table()
-                .with(id, |task| {
-                    task.cooperative_poll
-                        && !task
-                            .native_stack
-                            .as_ref()
-                            .is_some_and(|stack| stack.is_cleanup())
-                })
-                .unwrap_or(false);
-            if direct {
+            if work.direct_poll {
                 (unsafe { poll(frame) }, false)
             } else {
                 let mut stack = global_task_table()

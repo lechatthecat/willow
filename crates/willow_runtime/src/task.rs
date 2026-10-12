@@ -167,30 +167,47 @@ impl TaskWaitLinks {
 }
 
 thread_local! {
-    /// A wait box allocated before a channel critical section, so a task that
-    /// parks under the channel mutex does not call the allocator while every
-    /// other waiter on that channel queues behind it (willow-lk92).
-    static SPARE_WAIT_LINKS: std::cell::Cell<Option<Box<TaskWaitLinks>>> =
-        const { std::cell::Cell::new(None) };
+    /// At most two small vacant boxes per worker. One may be prepared while
+    /// the running task still owns the box that its receive will release.
+    static SPARE_WAIT_LINKS: std::cell::RefCell<[Option<Box<TaskWaitLinks>>; 2]> =
+        const { std::cell::RefCell::new([None, None]) };
 }
 
-/// Ensure this thread holds a spare wait box sized for a one/two-channel
-/// wait. Call before taking a channel mutex; a no-op once a spare exists.
+/// Prepare outside the channel mutex. A released small wait box supplies the
+/// next registration without allocating on every channel round trip.
 pub(crate) fn prepare_channel_wait_links() {
     SPARE_WAIT_LINKS.with(|spare| {
-        let links = spare.take().unwrap_or_else(|| {
+        let mut spare = spare.borrow_mut();
+        if spare.iter().all(Option::is_none) {
             let mut links = Box::<TaskWaitLinks>::default();
             links.wait_channels.reserve_exact(2);
-            links
-        });
-        spare.set(Some(links));
+            spare[0] = Some(links);
+        }
     });
 }
 
 fn take_spare_wait_links() -> Box<TaskWaitLinks> {
     SPARE_WAIT_LINKS
-        .with(std::cell::Cell::take)
+        .with(|spare| spare.borrow_mut().iter_mut().find_map(Option::take))
         .unwrap_or_default()
+}
+
+fn recycle_wait_links(mut links: Box<TaskWaitLinks>) {
+    // Do not retain large select/await/fanout allocations. These checks inspect
+    // capacities, never relationships; retained memory is bounded per worker.
+    if links.wait_channels.capacity() > 2
+        || links.awaiting.capacity() != 0
+        || links.waiters.native_bytes() != 0
+        || links.channel_ownership_index.is_some()
+    {
+        return;
+    }
+    debug_assert!(links.is_vacant());
+    SPARE_WAIT_LINKS.with(|spare| {
+        if let Some(slot) = spare.borrow_mut().iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(links);
+        }
+    });
 }
 
 /// Debug metadata the compiler tags onto a task in debug builds
@@ -322,7 +339,7 @@ impl RuntimeTask {
 
     fn release_wait_if_vacant(&mut self) {
         if self.wait.as_ref().is_some_and(|wait| wait.is_vacant()) {
-            self.wait = None;
+            recycle_wait_links(self.wait.take().unwrap());
         }
     }
 
@@ -808,6 +825,71 @@ mod footprint {
         task.clear_channel_ownership(channel_token(0x1000));
         assert!(!task.owns_wait_links());
         assert!(task.wait_channels().is_empty());
+    }
+
+    #[test]
+    fn ping_pong_wait_boxes_are_reused_without_retaining_task_ownership() {
+        SPARE_WAIT_LINKS.with(|spare| *spare.borrow_mut() = [None, None]);
+        let mut task = RuntimeTask::new(1);
+        let token = channel_token(0x1000);
+        prepare_channel_wait_links();
+        assert!(task.install_channel_ownership(token));
+        // Prepare while a live task owns a box, exactly as recv_ready does.
+        prepare_channel_wait_links();
+        task.clear_channel_ownership(token);
+        let addresses = SPARE_WAIT_LINKS.with(|spare| {
+            spare
+                .borrow()
+                .iter()
+                .map(|slot| slot.as_deref().unwrap() as *const TaskWaitLinks as usize)
+                .collect::<Vec<_>>()
+        });
+        assert_ne!(addresses[0], addresses[1]);
+        for rounds in [1_000, 10_000, 100_000, 1_000_000] {
+            for _ in 0..rounds {
+                prepare_channel_wait_links();
+                assert!(task.install_channel_ownership(token));
+                let address = task.wait.as_deref().unwrap() as *const TaskWaitLinks as usize;
+                assert!(addresses.contains(&address));
+                prepare_channel_wait_links();
+                assert!(task.clear_channel_ownership(token));
+                assert!(!task.owns_wait_links());
+            }
+            SPARE_WAIT_LINKS.with(|spare| {
+                let spare = spare.borrow();
+                assert!(spare.iter().all(Option::is_some));
+                for links in spare.iter().flatten() {
+                    assert!(links.is_vacant());
+                    assert_eq!(links.wait_channels.capacity(), 2);
+                    assert!(addresses.contains(&(&**links as *const TaskWaitLinks as usize)));
+                }
+            });
+        }
+        SPARE_WAIT_LINKS.with(|spare| *spare.borrow_mut() = [None, None]);
+    }
+
+    #[test]
+    fn ping_pong_cache_rejects_large_or_non_channel_wait_storage() {
+        SPARE_WAIT_LINKS.with(|spare| *spare.borrow_mut() = [None, None]);
+        let mut large = Box::<TaskWaitLinks>::default();
+        large.wait_channels.reserve_exact(1024);
+        recycle_wait_links(large);
+        let mut awaiter = Box::<TaskWaitLinks>::default();
+        awaiter.awaiting.reserve(1024);
+        recycle_wait_links(awaiter);
+        let mut fanout = Box::<TaskWaitLinks>::default();
+        fanout.waiters.register(1);
+        fanout.waiters.remove(1);
+        assert!(fanout.is_vacant());
+        recycle_wait_links(fanout);
+        SPARE_WAIT_LINKS.with(|spare| assert!(spare.borrow().iter().all(Option::is_none)));
+        for _ in 0..1000 {
+            recycle_wait_links(Box::default());
+        }
+        SPARE_WAIT_LINKS.with(|spare| {
+            assert_eq!(spare.borrow().iter().flatten().count(), 2);
+            *spare.borrow_mut() = [None, None];
+        });
     }
 
     #[test]

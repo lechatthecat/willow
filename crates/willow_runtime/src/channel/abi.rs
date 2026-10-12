@@ -305,7 +305,6 @@ pub extern "C" fn willow_channel_close(raw: *mut c_void) {
     {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         state.closed = true;
-        channel.not_empty.notify_all();
         drain_waiters(
             channel,
             &mut state.send_waiters,

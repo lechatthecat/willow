@@ -1879,7 +1879,7 @@ fn validate_payload_pointer(payload: *mut u8, _context: &str) -> Result<*mut GcH
     validate_payload_pointer_locked(&runtime().heap.lock().unwrap(), payload)
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 fn validate_payload_pointer_locked(
     state: &GcState,
     payload: *mut u8,
