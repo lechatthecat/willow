@@ -376,12 +376,13 @@ impl<'a> CompilerSession<'a> {
     ) -> Result<ai::Snapshot> {
         self.analysis_with_policy(emitter, false, true, false)
     }
-    /// Analyze all project sources without importing additional roots into the entry scope.
+    /// Analyze all project sources without importing additional roots into the entry scope
+    /// or publishing lock/edit metadata.
     pub fn overview_with_emitter(
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
-        self.analysis_with_policy(emitter, true, true, true)
+        self.analysis_with_policy(emitter, false, true, true)
     }
 
     fn analysis_with_policy(

@@ -15,6 +15,11 @@ use crate::semantic::symbols::*;
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static LOCAL_INTERFACE_METHOD_RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[willow_continuations::checker]
 impl TypeChecker {
     /// Introduce a local binding (let, parameter, loop variable, pattern
@@ -545,11 +550,25 @@ impl TypeChecker {
                 Item::Class(class) => Some(class),
                 _ => None,
             })
-            .flat_map(|class| {
+            .map(|class| {
+                let canonical = self
+                    .symbols
+                    .lookup_class(&class.name)
+                    .map_or_else(|| class.name.clone(), |info| info.name.clone());
+                (class, canonical)
+            })
+            .flat_map(|(class, canonical)| {
+                let owner = TypeId::local(&class.name);
                 class.methods.iter().map(move |method| {
+                    #[cfg(test)]
+                    LOCAL_INTERFACE_METHOD_RECORDS.with(|records| records.set(records.get() + 1));
                     (
-                        (class.name.clone(), method.name.clone()),
-                        (method.is_default_injected, method.body.id),
+                        (canonical.clone(), method.name.clone()),
+                        (
+                            method.is_default_injected,
+                            method.body.id,
+                            FunctionId::method(owner, &method.name),
+                        ),
                     )
                 })
             })
@@ -600,12 +619,20 @@ impl TypeChecker {
                         // Conformance checking owns the missing-method error.
                         continue;
                     };
-                    let implementation_id = FunctionId::method(
-                        TypeId::from_source_name(&declaring),
-                        method_name.as_str(),
+                    let local = local_methods.get(&(declaring.clone(), method_name.clone()));
+                    // Match declarations by canonical identity, while this
+                    // unit's body graph keeps its source-local callable keys.
+                    let implementation_id = local.map_or_else(
+                        || {
+                            FunctionId::method(
+                                TypeId::from_source_name(&declaring),
+                                method_name.as_str(),
+                            )
+                        },
+                        |(_, _, id)| *id,
                     );
-                    match local_methods.get(&(declaring.clone(), method_name.clone())) {
-                        Some((true, body)) => {
+                    match local {
+                        Some((true, body, _)) => {
                             // A non-generic injected default is checked once as
                             // its own synthetic callable. Connect it only when
                             // this implementation actually selects the default;
@@ -631,7 +658,7 @@ impl TypeChecker {
                                 .or_default()
                                 .insert(interface_default_effect_id(&interface.name, method_name));
                         }
-                        Some((false, _)) => {
+                        Some((false, _, _)) => {
                             self.effect_inputs
                                 .edges
                                 .entry(interface_id)
@@ -3252,6 +3279,28 @@ fn defer_scheduler_drive_span(
 #[cfg(test)]
 mod lock_effect_dispatch_tests {
     use super::*;
+
+    #[test]
+    fn local_interface_method_inventory_has_one_record_per_body() {
+        for count in [16, 64, 256, 1024] {
+            let source = (0..count)
+                .map(|i| format!("class C{i} {{ pub fn run(self) {{}} }}"))
+                .collect::<String>();
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            let (program, errors) = Parser::new(tokens).parse();
+            assert!(errors.is_empty());
+            let mut checker = TypeChecker::new();
+            LOCAL_INTERFACE_METHOD_RECORDS.with(|records| records.set(0));
+            // Exercise only inventory construction; declaration/type checking
+            // and hierarchy dispatch have their own independently sized work.
+            checker.connect_interface_lock_effects(&program);
+            assert_eq!(
+                LOCAL_INTERFACE_METHOD_RECORDS.with(|records| records.get()),
+                count
+            );
+            println!("local interface methods={count} inventory_records={count}");
+        }
+    }
 
     /// The primary-label text of every E2604 in `source`, in report order.
     fn lock_effect_labels(source: &str) -> Vec<String> {

@@ -1183,6 +1183,13 @@ fn test_compound_and_multiline_example() {
 }
 
 #[test]
+fn test_pure_imported_interface_scope_example() {
+    let (out, ok) = compile_file_and_run("example/semantic_scope/main.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, "19\n");
+}
+
+#[test]
 fn test_recent_cli_and_language_examples() {
     for path in [
         "example/language_gaps/main.wi",

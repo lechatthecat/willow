@@ -572,17 +572,17 @@ fn imported_interface_effects_use_completed_implementation_summaries() {
         ("self.channel.recv();", RuntimeEffects::MAY_SUSPEND),
         ("self.cell.get();", RuntimeEffects::MAY_BLOCK),
     ] {
-        for import in [
-            "import pairing;",
-            "import pairing::Lottery; import pairing::Pairing;",
+        for (import, ty) in [
+            ("import pairing;", "pairing::Pairing"),
+            ("import pairing as model;", "model::Pairing"),
+            (
+                "import pairing::Lottery; import pairing::Pairing;",
+                "Pairing",
+            ),
+            ("import pairing::Pairing as Contract;", "Contract"),
         ] {
             let f = Fixture::new();
             fs::write(f.0.join("src/pairing.wi"), format!("pub interface Pairing {{ fn pairings(self); }} pub class Lottery implements Pairing {{ pub channel: Channel<i64>; pub cell: BlockingCell<i64>; pub fn pairings(self) {{ {body} }} }} fn helper() {{ let n = 1; }}")).unwrap();
-            let ty = if import == "import pairing;" {
-                "pairing::Pairing"
-            } else {
-                "Pairing"
-            };
             fs::write(
                 f.0.join("src/main.wi"),
                 format!("{import} fn round(p: {ty}) {{ p.pairings(); }} fn main() {{}}"),
@@ -613,6 +613,27 @@ fn imported_interface_lock_checks_allow_pure_and_reject_waiting_bodies() {
         };
         fs::write(f.0.join("src/pairing.wi"), format!("pub interface Pairing extends Send {{ fn pairings(self); }} pub class Lottery implements Pairing {{ pub channel: Channel<i64>; pub fn pairings(self) {{ {body} }} }}")).unwrap();
         fs::write(f.0.join("src/main.wi"), "import pairing; fn invoke(p: pairing::Pairing) { p.pairings(); } async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); let p = new pairing::Lottery(ch); lock m as n { invoke(p); } }").unwrap();
+        let output = f.run(&["check", "."]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), !waiting, "{stderr}");
+        assert_eq!(stderr.contains("E2604"), waiting, "{stderr}");
+    }
+}
+
+#[test]
+fn imported_interface_defaults_and_overrides_keep_the_selected_wait_effect() {
+    for (default, override_body, waiting) in [
+        ("let value = 1;", None, false),
+        ("ch.recv();", None, true),
+        ("ch.recv();", Some("let value = 1;"), false),
+        ("let value = 1;", Some("ch.recv();"), true),
+    ] {
+        let f = Fixture::new();
+        let method = override_body.map_or_else(String::new, |body| {
+            format!("pub fn pairings(self, ch: Channel<i64>) {{ {body} }}")
+        });
+        fs::write(f.0.join("src/pairing.wi"), format!("pub interface Pairing extends Send {{ fn pairings(self, ch: Channel<i64>) {{ {default} }} }} pub class Lottery implements Pairing {{ {method} }}")).unwrap();
+        fs::write(f.0.join("src/main.wi"), "import pairing; fn invoke(p: pairing::Pairing, ch: Channel<i64>) { p.pairings(ch); } async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); let p = new pairing::Lottery(); lock m as n { invoke(p, ch); } }").unwrap();
         let output = f.run(&["check", "."]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.success(), !waiting, "{stderr}");
