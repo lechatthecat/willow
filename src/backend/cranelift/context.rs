@@ -285,6 +285,63 @@ mod tests {
     }
 
     #[test]
+    fn instantiation_aliases_are_unit_local_and_linear_in_both_phases() {
+        for count in [16, 64, 256, 1024] {
+            let mut program = crate::parser::Parser::new(
+                crate::lexer::Lexer::new("fn main() {}").tokenize().unwrap(),
+            )
+            .parse()
+            .0;
+            for i in 0..count {
+                program.instantiation_types.push((
+                    format!("$type$mono${i:064x}"),
+                    crate::semantic::symbols::InstantiationType::Enum(
+                        crate::semantic::symbols::EnumInfo {
+                            name: format!("origin::Kind{i}"),
+                            public: true,
+                            type_params: vec![],
+                            declaration_span: Span::dummy(),
+                            variants: vec![],
+                        },
+                    ),
+                ));
+            }
+            let mut build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            for emission in [false, true] {
+                super::super::INSTANTIATION_ALIAS_WRITES.with(|writes| writes.set(0));
+                {
+                    let mut unit = if emission {
+                        build.emission_context()
+                    } else {
+                        build.declaration_context()
+                    };
+                    unit.bind_unit_instantiation_types(&program);
+                    for (alias, info) in &program.instantiation_types {
+                        assert_eq!(
+                            unit.type_scope.resolve(&TypeId::from_source_name(alias)),
+                            TypeId::from_source_name(info.name())
+                        );
+                    }
+                    assert_eq!(
+                        super::super::INSTANTIATION_ALIAS_WRITES.with(|writes| writes.get()),
+                        count
+                    );
+                }
+                {
+                    let next = build.emission_context();
+                    for (alias, _) in &program.instantiation_types {
+                        let id = TypeId::from_source_name(alias);
+                        assert_eq!(next.type_scope.resolve(&id), id);
+                    }
+                }
+                println!(
+                    "generic aliases={count} emission={emission} writes={count} leaked_bindings=0"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unit_context_isolation_on_success_error_and_unwind() {
         // 2 phases x 4 binding shapes x 5 exits = 40 explicit perspectives.
         // Shapes: absent base, shadow base, repeated binding, class/enum collision.

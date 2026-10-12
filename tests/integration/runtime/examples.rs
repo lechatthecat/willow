@@ -5,6 +5,7 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),
+        ("example/generic_nominal_bindings.wi", "17\n79\n80\n"),
         (
             "example/assignable_representations.wi",
             "value:8\nvalue:7\n9\ntrue\n",

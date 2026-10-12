@@ -20,6 +20,78 @@ fn rejects(source: &str, relevant_name: &str) {
 const BOX: &str = "class Box<T> { pub value: T; pub fn get(self) -> T { return self.value; } }";
 
 #[test]
+fn nominal_alias_example_runs() {
+    runs(
+        include_str!("../../example/generic_nominal_bindings.wi"),
+        "17\n79\n80\n",
+    );
+}
+
+#[test]
+fn nominal_aliases_cover_twenty_scope_storage_and_gc_cases() {
+    let templates = "pub class Box<T> { pub value: T; pub fn get(self) -> T { return self.value; } } pub fn id<T>(value: T) -> T { return value; }";
+    let cases = [
+        (
+            "class Item { pub value: i64; }",
+            "Item",
+            "new Item(17)",
+            "println(b.get().value);",
+            "17\n",
+        ),
+        (
+            "open class Base { pub open fn value(self) -> i64 { return 1; } } class Child extends Base { pub override fn value(self) -> i64 { return 79; } }",
+            "Base",
+            "new Child()",
+            "println(b.get().value());",
+            "79\n",
+        ),
+        (
+            "interface Answer { fn value(self) -> i64; } class Concrete implements Answer { pub fn value(self) -> i64 { return 80; } }",
+            "Answer",
+            "new Concrete()",
+            "println(b.get().value());",
+            "80\n",
+        ),
+        (
+            "enum Tag { First, Second }",
+            "Tag",
+            "Tag::Second",
+            "println(b.get() == Tag::Second);",
+            "true\n",
+        ),
+        (
+            "enum Payload { Text(String), Empty }",
+            "Payload",
+            "Payload::Text(\"kept\")",
+            "match b.get() { Payload::Text(text) => println(text), Payload::Empty => println(\"bad\"), }",
+            "kept\n",
+        ),
+    ];
+    for (decls, ty, value, print, expected) in cases {
+        for imported in [false, true] {
+            for collect in [false, true] {
+                let prefix = if imported { "util::" } else { "" };
+                let imports = if imported { "import util;" } else { "" };
+                let local = if imported { "" } else { templates };
+                let gc = if collect {
+                    "gc_collect(); gc_minor_collect();"
+                } else {
+                    ""
+                };
+                let source = format!(
+                    "{imports} {local} {decls} fn main() {{ let b = new {prefix}Box<{ty}>({prefix}id<{ty}>({value})); {gc} {print} }}"
+                );
+                if imported {
+                    custom_module_runs(templates, &source, expected);
+                } else {
+                    runs(&source, expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn p01_example_runs() {
     runs(
         include_str!("../../example/user_generics.wi"),

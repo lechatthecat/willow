@@ -504,6 +504,7 @@ impl UnitCodegenContext<'_> {
         // to the raw object (willow-0g8j.3). Bound only in this declaration context, so
         // nothing declared after this unit sees it.
         self.bind_unit_enum_aliases(&enum_aliases);
+        self.bind_unit_instantiation_types(program);
         self.alias_item_import_types(&item_imports);
         let normalized_program = match &self.body_queries {
             Some(queries) => queries.normalized_program(program)?,
@@ -871,6 +872,7 @@ impl UnitCodegenContext<'_> {
         let program = &unit.program;
 
         self.bind_unit_enum_aliases(&unit.enum_aliases);
+        self.bind_unit_instantiation_types(program);
         self.rebind_item_import_functions(&unit.item_imports);
         // Bind the types this unit imported by single-item import under the
         // local names it spells them by (willow-0g8j.3), then the module's own
@@ -932,6 +934,7 @@ impl UnitCodegenContext<'_> {
         // different name (willow-kd1v). These bindings belong only to this
         // context; each later body context resolves its own spellings.
         self.bind_unit_enum_aliases(&enum_aliases);
+        self.bind_unit_instantiation_types(program);
         self.alias_unit_module_spellings(&module_spellings);
         let normalized_program = match &self.body_queries {
             Some(queries) => queries.normalized_program(program)?,
@@ -1056,6 +1059,7 @@ impl UnitCodegenContext<'_> {
         self.visible_modules = unit.visible_modules.clone();
         self.source_file = unit.source_file.clone();
         self.bind_unit_enum_aliases(&unit.enum_aliases);
+        self.bind_unit_instantiation_types(&unit.program);
         self.rebind_item_import_functions(&unit.item_imports);
         // Declarations no longer leak their unit aliases into later body
         // phases. Install this entry unit's type imports explicitly too.

@@ -1,0 +1,22 @@
+class Box<T> {
+    pub value: T;
+    pub fn get(self) -> T { return self.value; }
+}
+
+fn id<T>(value: T) -> T { return value; }
+class Item { pub value: i64; }
+open class Base { pub open fn value(self) -> i64 { return 1; } }
+class Child extends Base { pub override fn value(self) -> i64 { return 79; } }
+interface Answer { fn value(self) -> i64; }
+class Concrete implements Answer { pub fn value(self) -> i64 { return 80; } }
+
+fn main() {
+    let item = new Box<Item>(id<Item>(new Item(17)));
+    let base = new Box<Base>(id<Base>(new Child()));
+    let answer = new Box<Answer>(id<Answer>(new Concrete()));
+    gc_collect();
+    gc_minor_collect();
+    println(item.get().value);
+    println(base.get().value());
+    println(answer.get().value());
+}

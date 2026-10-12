@@ -40,6 +40,7 @@ type InterfaceSlotTargets = HashMap<(TypeId, String), Vec<Option<SlotTarget>>>;
 thread_local! {
     static MODULE_ALIAS_TARGET_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METHOD_ALIAS_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INSTANTIATION_ALIAS_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One direct method body an interface vtable slot points at.
@@ -666,6 +667,19 @@ impl UnitCodegenContext<'_> {
                 self.enum_infos.insert(info.name, info.clone());
             }
             scope.bind_canonical(name, &info.name.to_string());
+        }
+        self.install_type_scope(scope);
+    }
+
+    /// Generic nominal arguments use private `$type$mono$...` spellings.
+    /// Bind their canonical declarations in each unit's fresh alias overlay,
+    /// without duplicating class layouts or interface/vtable metadata.
+    fn bind_unit_instantiation_types(&mut self, program: &Program) {
+        let mut scope = self.type_scope.clone();
+        for (alias, info) in &program.instantiation_types {
+            #[cfg(test)]
+            INSTANTIATION_ALIAS_WRITES.with(|writes| writes.set(writes.get() + 1));
+            scope.bind_canonical(alias, info.name());
         }
         self.install_type_scope(scope);
     }
