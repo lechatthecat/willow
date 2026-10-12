@@ -2571,6 +2571,7 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
                         cycle: &cycle,
                         work: Default::default(),
                         deferred: Vec::new(),
+                        native_counts: Default::default(),
                         unindexed: HashSet::new(),
                     };
                     batch.work.object(GC_HEADER_SIZE + 8, 0);
@@ -2766,6 +2767,7 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
                 cycle: &cycle,
                 work: Default::default(),
                 deferred: Vec::new(),
+                native_counts: Default::default(),
                 unindexed: HashSet::new(),
             };
             batch.work.object(GC_HEADER_SIZE + 8, 1);

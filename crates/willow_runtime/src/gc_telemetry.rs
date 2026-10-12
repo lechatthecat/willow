@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
+pub mod native_trace;
 pub mod stops;
 pub mod workers;
 pub use stops::WillowGcStatsV2;
@@ -658,6 +659,7 @@ pub(crate) fn reset_for_test() {
     telemetry.stats.epoch = epoch;
     telemetry.stats.reset_generation = generation;
     stops::reset_for_test();
+    native_trace::reset();
 }
 
 #[cfg(test)]

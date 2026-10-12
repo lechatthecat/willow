@@ -53,6 +53,7 @@ pub(super) struct MarkBatch<'a> {
     pub(super) cycle: &'a ConcurrentCycle,
     pub(super) work: crate::gc_telemetry::MarkWork,
     pub(super) deferred: Vec<usize>,
+    pub(super) native_counts: crate::gc_telemetry::native_trace::Counts,
     pub(super) unindexed: HashSet<usize>,
     pub(super) cpu_start: Option<u64>,
 }
@@ -269,11 +270,14 @@ impl ConcurrentCycle {
             return;
         };
         if self.legacy_traces.contains(&metadata.type_id)
-            && !self.traces.contains_key(&metadata.type_id)
-            && !self.slices.contains_key(&metadata.type_id)
+            && trace_mode(
+                self.traces.contains_key(&metadata.type_id),
+                self.slices.contains_key(&metadata.type_id),
+            ) == TraceMode::StopOnly
         {
             // Legacy extension callbacks expose mutable slots with an STW-only
             // contract. Preserve that contract instead of racing their payloads.
+            batch.native_counts.deferred(metadata.type_id);
             batch.deferred.push(value);
             return;
         }
@@ -520,6 +524,7 @@ impl ConcurrentCycle {
             cycle: self,
             work: Default::default(),
             deferred: Vec::new(),
+            native_counts: crate::gc_telemetry::native_trace::Counts::default(),
             unindexed: HashSet::new(),
             // Started at the first work item: an empty drain pays no clock read.
             cpu_start: None,
@@ -716,6 +721,8 @@ pub(super) fn mark_worklist(
 ) -> crate::gc_telemetry::MarkWork {
     let started = std::time::Instant::now();
     let mut work = crate::gc_telemetry::MarkWork::roots(worklist.len());
+    let mut hooks = IdMap::default();
+    let mut native_counts = crate::gc_telemetry::native_trace::Counts::default();
     while let Some(obj_ptr) = worklist.pop() {
         let header = checked_payload_to_header(obj_ptr, "GC root graph");
         let object = HeapObject::from_raw(header).expect("validated payload has a header");
@@ -751,14 +758,13 @@ pub(super) fn mark_worklist(
                 worklist.push(child);
             }
         }
-        let trace_fn = type_registry()
-            .lock()
-            .unwrap()
-            .get(&metadata.type_id)
-            .copied();
-        if let Some(trace) = trace_fn {
+        let hook = *hooks
+            .entry(metadata.type_id)
+            .or_insert_with(|| registry::lookup_trace_contract(metadata.type_id));
+        if let Some((trace, mode)) = hook {
             let mut child_slots: Vec<*mut *mut u8> = Vec::new();
             // SAFETY: trace is the registered function for this type_id.
+            native_counts.stopped(metadata.type_id, mode == TraceMode::StopOnly);
             unsafe { trace(object.payload().as_ptr(), &mut child_slots) };
             for slot in child_slots.into_iter().filter(|slot| !slot.is_null()) {
                 scanned_slots += 1;

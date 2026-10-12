@@ -2185,3 +2185,6 @@ mod failure_policy_tests;
 
 #[cfg(test)]
 mod native_memory_tests;
+
+#[cfg(test)]
+mod native_trace_tests;

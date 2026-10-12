@@ -41,15 +41,11 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                 // Generated allocations publish start bits after header initialization.
                 // A publication racing initialization is retried after the handshake.
                 let objects = epoch_index::EpochIndex::regions(prepared);
-                let mut cycle = ConcurrentCycle::with_epoch_index(
-                    objects,
-                    type_registry().lock().unwrap().keys().copied().collect(),
-                    runtime().concurrent_trace_registry.lock().unwrap().clone(),
-                    0,
-                    identity,
-                );
+                let (legacy, traces, slices) = trace_registry_snapshot();
+                let mut cycle =
+                    ConcurrentCycle::with_epoch_index(objects, legacy, traces, 0, identity);
                 let goal = state.soft_memory.decide(memory_inputs(&state)).goal;
-                cycle.slices = runtime().concurrent_slice_registry.lock().unwrap().clone();
+                cycle.slices = slices;
                 cycle.assist_rate = if !old_cycle::concurrent_enabled()
                     || std::env::var("WILLOW_GC_ASSIST").as_deref() == Ok("0")
                 {
