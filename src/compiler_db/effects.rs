@@ -517,7 +517,7 @@ impl EffectQueries {
         if let Some(effect) = intrinsic_effects(target) {
             return Some(EffectCapabilities {
                 runtime: effect,
-                may_io: false,
+                may_io: intrinsic_may_io(target),
             });
         }
         let (unit, id) = self.external_target(consumer, target, imports)?;
@@ -545,10 +545,19 @@ impl EffectQueries {
     }
 }
 
+/// Panic classification only: a known runtime mask is not evidence of IO absence.
 pub(crate) fn intrinsic_effects(target: &FunctionId) -> Option<RuntimeEffects> {
     crate::semantic::intrinsics::builtin_target_effects(target)
+        .or_else(|| crate::semantic::intrinsics::builtin_static_effects(target, &HashMap::new()))
         .map(|effects| effects.intersection(PANIC))
 }
+/// Preserve the IO-free leaf set independently of the panic catalog. Static
+/// builtins include filesystem/network operations and callback dispatch; keep
+/// them IO-capable unless a separate IO proof is available.
+fn intrinsic_may_io(target: &FunctionId) -> bool {
+    crate::semantic::intrinsics::builtin_target_effects(target).is_none()
+}
+
 fn unknown_external_capabilities(target: &FunctionId) -> EffectCapabilities {
     EffectCapabilities {
         runtime: default_external(target),
@@ -953,7 +962,7 @@ pub(crate) fn solve_unit<N>(
                     (Some((_, queries)), Some(unit)) => {
                         queries.external_capabilities(unit, target, &imports).may_io
                     }
-                    _ => intrinsic_effects(target).is_none(),
+                    _ => intrinsic_may_io(target),
                 };
                 if external_io {
                     may_io.insert(*target);
@@ -2150,6 +2159,103 @@ mod tests {
         assert!(
             queries
                 .external_capabilities(UnitId::ENTRY, &target("missing"), &imports)
+                .may_io
+        );
+    }
+
+    #[test]
+    fn static_builtin_io_capabilities_do_not_follow_panic_classification() {
+        let queries = EffectQueries::default();
+        for (owner, method) in [
+            ("fs", "write_string"),
+            ("fs", "read_to_string"),
+            ("fs", "write_string_async"),
+            ("net", "bind"),
+            ("net", "write_async"),
+            ("parallel", "map"),
+        ] {
+            let target = FunctionId::method(TypeId::local(owner), method);
+            assert!(
+                intrinsic_effects(&target).is_some(),
+                "known panic summary: {target}"
+            );
+            assert!(
+                queries
+                    .external_capabilities(UnitId::ENTRY, &target, &HashMap::new())
+                    .may_io,
+                "knowing the panic mask does not prove IO absence: {target}"
+            );
+        }
+        let parse = FunctionId::method(TypeId::local("f64"), "parse");
+        assert_eq!(intrinsic_effects(&parse), Some(RuntimeEffects::NONE));
+        assert!(
+            !queries
+                .external_capabilities(UnitId::ENTRY, &FunctionId::free("pow"), &HashMap::new())
+                .may_io
+        );
+    }
+
+    #[test]
+    fn static_builtin_io_propagates_through_direct_transitive_and_imported_calls() {
+        let mut queries = EffectQueries::default();
+        let dependency = crate::module::ModuleId(7);
+        queries.names.insert("dependency".into(), dependency);
+        let source = program(
+            r#"
+import std::fs;
+import std::net;
+import std::fs as files;
+fn write() { fs::write_string("unused", "data"); }
+fn read_alias() { files::read_to_string("unused"); }
+fn listen() { net::bind("127.0.0.1:0"); }
+fn relay() { write(); }
+fn relay_twice() { relay(); }
+fn network_relay() { listen(); }
+fn pure() { pow(2, 3); }
+"#,
+        );
+        let graph = crate::semantic::TypeChecker::resolved_effect_graph(&source);
+        assert!(graph.iter().all(|(_, sites)| !sites.has_unknown));
+        queries
+            .complete(dependency, || {
+                solve_unit(
+                    &source,
+                    &graph,
+                    &HashMap::<ExprId, Type>::new(),
+                    None,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    |target| intrinsic_effects(target).unwrap_or(PANIC),
+                )
+            })
+            .unwrap();
+        for name in [
+            "write",
+            "read_alias",
+            "listen",
+            "relay",
+            "relay_twice",
+            "network_relay",
+        ] {
+            assert!(
+                queries
+                    .effect_capabilities(dependency, FunctionId::free(name))
+                    .unwrap()
+                    .may_io,
+                "fallback IO solution lost {name}"
+            );
+            let imported = FunctionId::method(TypeId::local("dependency"), name);
+            assert!(
+                queries
+                    .external_capabilities(UnitId::ENTRY, &imported, &HashMap::new())
+                    .may_io,
+                "imported summary lost {name}"
+            );
+        }
+        assert!(
+            !queries
+                .effect_capabilities(dependency, FunctionId::free("pure"))
+                .unwrap()
                 .may_io
         );
     }

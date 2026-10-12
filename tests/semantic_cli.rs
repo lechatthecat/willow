@@ -2597,3 +2597,91 @@ fn uninstantiated_generic_body_refs_and_rename() {
         }
     }
 }
+
+#[test]
+fn builtin_effect_summaries_are_complete_and_located() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        r#"
+import std::collections::Map;
+fn res(r: Result<i64, String>) -> i64 { return r.unwrap(); }
+fn opt(m: Map<String, i64>) -> i64 { return m.get("a").unwrap(); }
+fn some(o: Option<i64>) -> bool { return o.is_some(); }
+fn ok(r: Result<i64, String>) -> bool { return r.is_ok(); }
+fn parse_only(s: String) -> bool { return f64::parse(s).is_ok(); }
+fn conv(s: String) -> f64 { return match f64::parse(s) { Ok(v) => v, Err(_) => 0.0 }; }
+fn main() {}
+"#,
+    )
+    .unwrap();
+    for name in ["res", "opt", "some", "ok", "parse_only", "conv"] {
+        let v = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+        assert_eq!(v["result"]["status"], "ok", "{v}");
+        let bits = v["result"]["runtime_effects"].as_u64().unwrap();
+        assert_eq!(
+            bits & !u64::from(E::MAY_PANIC.union(E::MAY_ALLOCATE).bits()),
+            0,
+            "{v}"
+        );
+        for evidence in v["result"]["effect_evidence"].as_array().unwrap() {
+            assert!(
+                evidence["witness"]["cause"]["location"]["line"].is_number(),
+                "{v}"
+            );
+        }
+    }
+}
+
+#[test]
+fn effect_await_reasons_use_checked_operand_types() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        r#"
+async fn value() -> i64 { return 1; }
+async fn task_wait(t: Task<i64>) -> i64 { return await t; }
+async fn future_wait() { let f = sleep(1); await f; }
+async fn main() {}
+"#,
+    )
+    .unwrap();
+    for (name, ty) in [("task_wait", "Task<i64>"), ("future_wait", "Future<void>")] {
+        let v = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+        let evidence = v["result"]["effect_evidence"].as_array().unwrap();
+        let waits: Vec<_> = evidence
+            .iter()
+            .filter(|e| e["witness"]["cause"]["operation"] == "await")
+            .collect();
+        assert!(!waits.is_empty(), "{v}");
+        for e in waits {
+            assert_eq!(e["witness"]["awaited_type"], ty, "{v}");
+            assert!(e["witness"]["reason"].as_str().unwrap().contains(ty), "{v}");
+            assert!(!e.to_string().contains("willow_future_await_void"), "{v}");
+        }
+    }
+}
+
+#[test]
+fn effect_unresolved_calls_name_the_exact_site() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "fn apply(f: fn(i64) -> i64) -> i64 { return f(1); }\nfn main() {}\n",
+    )
+    .unwrap();
+    let v = f.json(&["effects", "main::apply", "--explain"], 1);
+    let sites = v["result"]["unknown_causes"][0]["call_sites"]
+        .as_array()
+        .unwrap();
+    assert_eq!(sites.len(), 1, "{v}");
+    assert_eq!(sites[0]["operation"], "f", "{v}");
+    assert_eq!(sites[0]["location"]["column"], 45, "{v}");
+    let out = f.run(&["effects", "main::apply"]);
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("Unresolved call `f` at src/main.wi:1:45")
+    );
+}

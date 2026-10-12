@@ -168,6 +168,16 @@ impl Snapshot {
                 "invalid expression flow"
             );
         }
+        for (owner, calls) in &self.semantic.unresolved_calls {
+            ensure!(ids.contains(owner), "invalid unresolved-call owner");
+            for call in calls {
+                ensure!(
+                    call.location.start <= call.location.end
+                        && self.sources.contains_key(&call.location.path),
+                    "invalid unresolved-call location"
+                );
+            }
+        }
         ensure!(
             self.semantic.witnesses.keys().all(|id| ids.contains(id)),
             "invalid witness identity"

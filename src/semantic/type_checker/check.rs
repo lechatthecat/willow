@@ -538,6 +538,7 @@ impl TypeChecker {
     /// ordinary method call graph. Imported implementations reuse completed
     /// effect capability queries, falling back conservatively if unavailable.
     fn connect_interface_lock_effects(&mut self, program: &Program) {
+        let symbols = &self.symbols;
         let local_methods = program
             .items
             .iter()
@@ -546,10 +547,20 @@ impl TypeChecker {
                 _ => None,
             })
             .flat_map(|class| {
+                // Imported-module declarations already carry canonical symbol
+                // owners. Compare in that same identity domain; source names
+                // would misclassify this unit's own methods as external.
+                let owner = symbols
+                    .lookup_class(&class.name)
+                    .map_or(&class.name, |info| &info.name);
                 class.methods.iter().map(move |method| {
                     (
-                        (class.name.clone(), method.name.clone()),
-                        (method.is_default_injected, method.body.id),
+                        (owner.clone(), method.name.clone()),
+                        (
+                            method.is_default_injected,
+                            method.body.id,
+                            FunctionId::method(TypeId::local(&class.name), &method.name),
+                        ),
                     )
                 })
             })
@@ -604,8 +615,10 @@ impl TypeChecker {
                         TypeId::from_source_name(&declaring),
                         method_name.as_str(),
                     );
-                    match local_methods.get(&(declaring.clone(), method_name.clone())) {
-                        Some((true, body)) => {
+                    let local = local_methods.get(&(declaring.clone(), method_name.clone()));
+                    let implementation_id = local.map_or(implementation_id, |(_, _, id)| *id);
+                    match local {
+                        Some((true, body, _)) => {
                             // A non-generic injected default is checked once as
                             // its own synthetic callable. Connect it only when
                             // this implementation actually selects the default;
@@ -631,7 +644,7 @@ impl TypeChecker {
                                 .or_default()
                                 .insert(interface_default_effect_id(&interface.name, method_name));
                         }
-                        Some((false, _)) => {
+                        Some((false, _, _)) => {
                             self.effect_inputs
                                 .edges
                                 .entry(interface_id)
@@ -2222,6 +2235,12 @@ impl TypeChecker {
                             crate::semantic::intrinsics::resolve(ty, &call.method, call.args.len())
                     {
                         return vec![resolved.intrinsic.function_id()];
+                    }
+                    if targets.is_empty()
+                        && let Some(target) =
+                            crate::semantic::intrinsics::adt_method_target(ty, &call.method)
+                    {
+                        return vec![target];
                     }
                     targets
                 })
