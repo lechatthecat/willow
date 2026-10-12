@@ -1,0 +1,53 @@
+// Fused String concatenation (willow-8hq4.29).
+//
+// A chain such as `a + ":" + n.toString() + ":" + b` used to allocate one
+// intermediate String per `+` and one more per `toString()`, copying the
+// growing prefix every time. The compiler now lowers a chain whose
+// intermediates are temporaries to ONE runtime call that sums the part sizes,
+// allocates the result once, and formats each i64 operand's decimal digits
+// straight into it. Operands are still evaluated left to right, exactly once.
+//
+// Named locals stay observable: `let left = ...` below is its own String, and
+// reading it twice later does not fold it into the chain that reads it.
+
+fn trace(tag: String) -> String {
+    println("  evaluating " + tag);
+    return tag;
+}
+
+fn main() {
+    // One allocation for five parts, two of them integers.
+    let name = "willow";
+    let version = 8;
+    let build = -29;
+    println(name + " v" + version.toString() + " build " + build.toString() + "!");
+
+    // Left-to-right evaluation is unchanged.
+    let order = trace("a") + trace("b") + 1.toString() + trace("c");
+    println(order);
+
+    // Empty and non-ASCII operands are copied byte for byte.
+    let empty = "";
+    println("[" + empty + "é水" + empty + "🌲" + "]");
+
+    // Integer extremes format exactly like toString().
+    let min = -9223372036854775807 - 1;
+    println("min=" + min.toString() + " max=" + 9223372036854775807.toString());
+
+    // A named intermediate is still its own value.
+    let left = "L" + version.toString();
+    println(left + "|" + left + "|" + left.len().toString());
+
+    // A loop that appends several parts per iteration builds each step with
+    // one allocation instead of one per `+`.
+    let mut csv = "";
+    let mut i = 0;
+    while i < 5 {
+        csv = csv + i.toString() + "=" + (i * i).toString() + ";";
+        i = i + 1;
+    }
+    println(csv);
+
+    // format() arguments join the same single allocation.
+    println(format("{}:{}:{}", name, version, build));
+}

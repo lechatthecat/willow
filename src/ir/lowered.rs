@@ -714,6 +714,7 @@ pub(crate) fn lower_source_program_with(
         super::optimize::eliminate_tail_recursion(function);
         super::optimize::inline_scalar_recursion(function, overflow_checks);
         super::optimize::unroll_scalar_loops(function);
+        super::optimize::fuse_string_concats(function);
         let liveness = lifetime::clear_dead_temporaries(function);
         function.async_frame = if function.is_async {
             #[cfg(test)]

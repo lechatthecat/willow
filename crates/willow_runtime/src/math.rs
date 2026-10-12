@@ -101,7 +101,7 @@ pub extern "C" fn willow_f64_to_string(value: f64) -> *mut u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_i64_to_string(value: i64) -> *mut u8 {
-    willow_string_from_str(&value.to_string())
+    crate::string::i64_to_string(value)
 }
 
 /// `bool.toString()` — GC-managed WillowString `"true"` or `"false"`. The value

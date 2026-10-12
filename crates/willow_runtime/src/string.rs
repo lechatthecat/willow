@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::gc::{GcObjectKind, willow_alloc_with_layout, willow_gc_add_runtime_root};
+use willow_abi::string_concat::{PART_I64, PART_STRING};
 
 // ---------------------------------------------------------------------------
 // Core allocation helpers
@@ -193,35 +194,152 @@ pub extern "C" fn willow_string_eq(lhs: *const u8, rhs: *const u8) -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u8 {
-    let (_, lhs_len) = unsafe { ws_as_bytes(lhs) };
-    let (_, rhs_len) = unsafe { ws_as_bytes(rhs) };
-    let Some((total_len, payload_size)) = lhs_len
-        .checked_add(rhs_len)
-        .and_then(|len| string_payload_size(len).map(|size| (len, size)))
+    let mut parts = [PART_STRING, lhs as u64, PART_STRING, rhs as u64];
+    concat_parts(&mut parts)
+}
+
+/// Concatenate `count` parts into one new string: one size-summed allocation,
+/// then one copy per part (willow-8hq4.29). `parts` holds `[kind, value]` word
+/// pairs encoded as in [`willow_abi::string_concat`].
+///
+/// Called directly by generated code. The call roots the string slots of
+/// `parts` itself across its allocation, which may move their referents and
+/// rewrite those slots.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_concat_n(parts: *mut u64, count: i64) -> *mut u8 {
+    let Some(words) = usize::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(2))
+        .filter(|&words| words == 0 || !parts.is_null())
     else {
-        crate::panic_context::raise_language_message("string concatenation size overflow");
-        return std::ptr::null_mut();
+        crate::panic_context::fatal_invariant("invalid string concatenation parts");
     };
-    let lhs = crate::gc::GcRootHandle::new(lhs.cast_mut());
-    let rhs = crate::gc::GcRootHandle::new(rhs.cast_mut());
-    let ptr = willow_alloc_with_layout(GcObjectKind::String, 0, payload_size, 0);
+    // SAFETY: generated code passes `count` initialized part pairs that only
+    // this call accesses until it returns.
+    let parts = unsafe { std::slice::from_raw_parts_mut(parts, words) };
+    concat_parts(parts)
+}
+
+/// Shared body of the concatenation entries. O(parts + result length) time,
+/// one managed allocation; it reaches a GC point only on a TLAB miss.
+fn concat_parts(parts: &mut [u64]) -> *mut u8 {
+    let mut total_len = 0usize;
+    for part in parts.chunks_exact(2) {
+        let len = match part[0] {
+            // SAFETY: a string part is null or a live WillowString payload.
+            PART_STRING => unsafe { ws_as_bytes(part[1] as *const u8) }.1,
+            PART_I64 => decimal_len(part[1] as i64),
+            _ => crate::panic_context::fatal_invariant("invalid string concatenation part"),
+        };
+        match total_len.checked_add(len) {
+            Some(sum) => total_len = sum,
+            None => return concat_overflow(),
+        }
+    }
+    let Some(payload_size) = string_payload_size(total_len) else {
+        return concat_overflow();
+    };
+    let payload_size = payload_size as usize;
+    let ptr = match crate::gc::try_alloc_young_string_payload(payload_size) {
+        Some(ptr) => ptr,
+        None => {
+            let _roots = PartRoots::push(parts);
+            crate::gc::alloc_string_payload_slow(payload_size)
+        }
+    };
     if ptr.is_null() {
         return ptr;
     }
-    // Derive interior addresses from the root slots after the allocation.
-    let (lhs_bytes, _) = unsafe { ws_as_bytes(lhs.load()) };
-    let (rhs_bytes, _) = unsafe { ws_as_bytes(rhs.load()) };
+    // Read string parts from their slots only after the allocation, which may
+    // have moved them.
+    // SAFETY: the payload holds the length word, `total_len` bytes and a NUL;
+    // the parts were measured above and are unchanged since.
     unsafe {
         *(ptr as *mut i64) = total_len as i64;
-        if lhs_len > 0 {
-            std::ptr::copy_nonoverlapping(lhs_bytes, ptr.add(8), lhs_len);
+        let mut out = ptr.add(8);
+        for part in parts.chunks_exact(2) {
+            if part[0] == PART_STRING {
+                let (bytes, len) = ws_as_bytes(part[1] as *const u8);
+                if len > 0 {
+                    std::ptr::copy_nonoverlapping(bytes, out, len);
+                }
+                out = out.add(len);
+            } else {
+                out = write_decimal(out, part[1] as i64);
+            }
         }
-        if rhs_len > 0 {
-            std::ptr::copy_nonoverlapping(rhs_bytes, ptr.add(8 + lhs_len), rhs_len);
-        }
-        *ptr.add(8 + total_len) = 0;
+        *out = 0;
     }
     ptr
+}
+
+fn concat_overflow() -> *mut u8 {
+    crate::panic_context::raise_language_message("string concatenation size overflow");
+    std::ptr::null_mut()
+}
+
+/// Root slots for the string parts of one concatenation, popped on drop.
+struct PartRoots(i32);
+
+impl PartRoots {
+    fn push(parts: &mut [u64]) -> Self {
+        let mut pushed = 0;
+        for part in parts.chunks_exact_mut(2) {
+            if part[0] == PART_STRING && part[1] != 0 {
+                crate::gc::willow_push_root((&mut part[1] as *mut u64).cast());
+                pushed += 1;
+            }
+        }
+        Self(pushed)
+    }
+}
+
+impl Drop for PartRoots {
+    fn drop(&mut self) {
+        crate::gc::willow_pop_roots(self.0);
+    }
+}
+
+/// Byte length of `value` in decimal, including a leading `-`.
+pub(crate) fn decimal_len(value: i64) -> usize {
+    let digits = value
+        .unsigned_abs()
+        .checked_ilog10()
+        .map_or(1, |log| log as usize + 1);
+    digits + usize::from(value < 0)
+}
+
+/// Write `value` in decimal at `out`; returns the end of the written bytes.
+///
+/// # Safety
+/// `out` must be valid for [`decimal_len`]`(value)` byte writes.
+unsafe fn write_decimal(out: *mut u8, value: i64) -> *mut u8 {
+    let len = decimal_len(value);
+    let mut magnitude = value.unsigned_abs();
+    // SAFETY: the caller provides `len` writable bytes.
+    unsafe {
+        if value < 0 {
+            *out = b'-';
+        }
+        let end = out.add(len);
+        let mut cursor = end;
+        loop {
+            cursor = cursor.sub(1);
+            *cursor = b'0' + (magnitude % 10) as u8;
+            magnitude /= 10;
+            if magnitude == 0 {
+                break;
+            }
+        }
+        end
+    }
+}
+
+/// `i64.toString()`: decimal digits written straight into the new string.
+pub(crate) fn i64_to_string(value: i64) -> *mut u8 {
+    let mut parts = [PART_I64, value as u64];
+    concat_parts(&mut parts)
 }
 
 // ---------------------------------------------------------------------------
@@ -683,5 +801,128 @@ mod tests {
         let ptr = willow_string_alloc(std::ptr::null(), 0);
         assert!(!ptr.is_null());
         assert_eq!(unsafe { willow_string_as_str(ptr) }, "");
+    }
+
+    fn concat_n(parts: &mut [u64]) -> String {
+        let ptr = willow_string_concat_n(parts.as_mut_ptr(), (parts.len() / 2) as i64);
+        assert!(!ptr.is_null());
+        unsafe { willow_string_as_str(ptr) }.to_owned()
+    }
+
+    #[test]
+    fn concat_n_formats_every_part_kind() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let empty = willow_string_from_str("");
+        let wide = willow_string_from_str("é水🦀");
+        let nul = willow_string_from_str("a\0b");
+        assert_eq!(concat_n(&mut []), "");
+        assert_eq!(concat_n(&mut [PART_STRING, empty as u64]), "");
+        assert_eq!(
+            concat_n(&mut [
+                PART_STRING,
+                empty as u64,
+                PART_STRING,
+                0,
+                PART_STRING,
+                empty as u64
+            ]),
+            ""
+        );
+        assert_eq!(
+            concat_n(&mut [
+                PART_STRING,
+                wide as u64,
+                PART_STRING,
+                nul as u64,
+                PART_STRING,
+                wide as u64,
+            ]),
+            "é水🦀a\0bé水🦀"
+        );
+        for value in [
+            0i64,
+            1,
+            9,
+            10,
+            -1,
+            -10,
+            99,
+            100,
+            1_000_000_007,
+            i64::MAX,
+            i64::MIN,
+            i64::MIN + 1,
+        ] {
+            assert_eq!(concat_n(&mut [PART_I64, value as u64]), value.to_string());
+            assert_eq!(decimal_len(value), value.to_string().len());
+            let ptr = i64_to_string(value);
+            assert_eq!(unsafe { willow_string_as_str(ptr) }, value.to_string());
+        }
+        assert_eq!(
+            concat_n(&mut [
+                PART_I64,
+                (-5i64) as u64,
+                PART_STRING,
+                wide as u64,
+                PART_I64,
+                0,
+                PART_STRING,
+                empty as u64,
+            ]),
+            "-5é水🦀0"
+        );
+        // Larger than a TLAB object: still one exact allocation.
+        let long = willow_string_from_str(&"x".repeat(5000));
+        let joined = concat_n(&mut [
+            PART_STRING,
+            long as u64,
+            PART_I64,
+            42,
+            PART_STRING,
+            long as u64,
+        ]);
+        assert_eq!(joined.len(), 10_002);
+        assert!(joined.starts_with('x') && joined.contains("42") && joined.ends_with('x'));
+    }
+
+    #[test]
+    fn concat_n_rejects_invalid_part_lists() {
+        const CHILD: &str = "WILLOW_TEST_INVALID_CONCAT_PARTS";
+        if let Ok(case) = std::env::var(CHILD) {
+            let _guard = runtime_test_guard();
+            willow_gc_init();
+            match case.as_str() {
+                "negative" => {
+                    willow_string_concat_n(std::ptr::null_mut(), -1);
+                }
+                "null" => {
+                    willow_string_concat_n(std::ptr::null_mut(), 1);
+                }
+                "kind" => {
+                    let mut parts = [7u64, 0];
+                    willow_string_concat_n(parts.as_mut_ptr(), 1);
+                }
+                _ => panic!("unknown child case"),
+            }
+            return;
+        }
+        for case in ["negative", "null", "kind"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "string::tests::concat_n_rejects_invalid_part_lists",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .output()
+                .expect("run invalid concat subprocess");
+            assert!(!output.status.success(), "{case}: invalid parts accepted");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("invalid string concatenation part"),
+                "{case}: {stderr}"
+            );
+        }
     }
 }

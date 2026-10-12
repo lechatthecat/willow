@@ -268,33 +268,61 @@ pub(super) fn retire_owned_tlabs_locked(state: &mut GcState, owner: ThreadId, un
         .flat_map(|addresses| addresses.iter().copied())
         .collect();
     for address in addresses {
-        let record = state
-            .tlab_states
-            .get_mut(&address)
-            .expect("owner index has a TLS record");
-        debug_assert_eq!(record.owner, owner);
-        let bytes = read_tlab_bytes_delta(record);
-        // Retirement at the initial root handshake starts this owner's epoch
-        // after all pre-snapshot allocation. Do not bill it to the new cycle.
-        record.assist_observed_fast_bytes = record.observed_fast_allocated_bytes;
-        add_tlab_accounting(state, 0, bytes);
-        retire_tlab_locked(state, address);
-        // With no active chunk this merges only the retired count: O(1).
-        let GcState {
-            tlab_states,
-            tlab_chunks,
-            tlab_addresses,
-            ..
-        } = &mut *state;
-        let record = tlab_states.get_mut(&address).expect("retired record");
-        let allocations = read_tlab_allocations_delta(record, tlab_chunks, tlab_addresses);
-        add_tlab_accounting(state, allocations, 0);
-        if unregister {
-            state.tlab_states.remove(&address);
-        }
+        retire_tlab_record_locked(state, address, unregister);
     }
     if unregister {
         state.tlab_owners.remove(&owner);
+    }
+}
+
+/// Retire one registered TLS block, folding its counters into the totals, and
+/// optionally forget the record. The caller fixes up `tlab_owners`.
+fn retire_tlab_record_locked(state: &mut GcState, address: usize, unregister: bool) {
+    let record = state
+        .tlab_states
+        .get_mut(&address)
+        .expect("owner index has a TLS record");
+    let bytes = read_tlab_bytes_delta(record);
+    // Retirement at the initial root handshake starts this owner's epoch
+    // after all pre-snapshot allocation. Do not bill it to the new cycle.
+    record.assist_observed_fast_bytes = record.observed_fast_allocated_bytes;
+    add_tlab_accounting(state, 0, bytes);
+    retire_tlab_locked(state, address);
+    // With no active chunk this merges only the retired count: O(1).
+    let GcState {
+        tlab_states,
+        tlab_chunks,
+        tlab_addresses,
+        ..
+    } = &mut *state;
+    let record = tlab_states.get_mut(&address).expect("retired record");
+    let allocations = read_tlab_allocations_delta(record, tlab_chunks, tlab_addresses);
+    add_tlab_accounting(state, allocations, 0);
+    if unregister {
+        state.tlab_states.remove(&address);
+    }
+}
+
+/// Retire and forget the TLS block at `address` if it is registered, e.g.
+/// before the block's thread-local storage is destroyed. O(1) expected.
+pub(super) fn unregister_tlab_state(address: usize) {
+    // Same coord -> heap order as mutator unregistration, so a collector never
+    // observes a half-retired record.
+    let (lock, _) = &runtime().coord;
+    let _coord = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = runtime()
+        .heap
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(owner) = state.tlab_states.get(&address).map(|record| record.owner) else {
+        return;
+    };
+    retire_tlab_record_locked(&mut state, address, true);
+    if let Some(addresses) = state.tlab_owners.get_mut(&owner) {
+        addresses.remove(&address);
+        if addresses.is_empty() {
+            state.tlab_owners.remove(&owner);
+        }
     }
 }
 

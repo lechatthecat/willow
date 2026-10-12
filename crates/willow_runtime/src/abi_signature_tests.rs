@@ -95,6 +95,7 @@ fn collection_handles_are_pointers_and_payload_words_remain_i64() {
     assert_schema("willow_string_literal_slot", &[Ptr, Ptr, I64], Some(Ptr));
     let _: extern "C" fn(*const u8, i64) -> *mut u8 = string::willow_string_alloc;
     let _: extern "C" fn(*const u8, *const u8) -> *mut u8 = string::willow_string_concat;
+    let _: extern "C" fn(*mut u64, i64) -> *mut u8 = string::willow_string_concat_n;
     let _: extern "C" fn(*const u8, *const u8) -> i64 = string::willow_string_eq;
     let _: extern "C" fn(*const u8) -> i64 = string::willow_string_len;
     assert_schema("willow_string_len", &[Ptr], Some(I64));

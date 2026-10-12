@@ -151,10 +151,14 @@ pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
     // the scheduler restores it when a nested/outer drive returns.
     let sync_panic_context = std::sync::Arc::new(panic_context::PanicContext::new(0));
     let previous_panic_context = panic_context::replace_current_context(Some(sync_panic_context));
+    // This thread runs generated code until `main` returns, so runtime string
+    // results may use its young TLAB (willow-8hq4.29).
+    let runtime_tlab = gc::RuntimeTlabOwner::enter();
     // Static properties are initialized once, after the GC is ready and before
     // user `main` runs (willow-qsqf §11).
     unsafe { __willow_static_init() };
     unsafe { willow_user_main() };
+    drop(runtime_tlab);
     gc::shutdown_mark_workers();
     panic_context::replace_current_context(previous_panic_context);
 }

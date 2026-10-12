@@ -308,6 +308,13 @@ pub enum LirRvalue {
         rhs: LirOperand,
         operand_ty: Type,
     },
+    /// Concatenation of `parts` in order, built by one size-summed runtime
+    /// allocation (willow-8hq4.29). `part_types[i]` is `String`, or `I64` for
+    /// a value written in decimal as by `i64.toString()`.
+    StringConcat {
+        parts: Vec<LirOperand>,
+        part_types: Vec<Type>,
+    },
 }
 
 /// Integer operators that debug builds check for signed overflow
@@ -464,6 +471,14 @@ impl LirRvalue {
                         _ => false,
                     }
             }
+            Self::StringConcat { parts, part_types } => {
+                destination.ty == Type::String
+                    && parts.len() == part_types.len()
+                    && parts.iter().zip(part_types).all(|(part, expected)| {
+                        matches!(expected, Type::String | Type::I64)
+                            && ty(part).as_ref() == Some(expected)
+                    })
+            }
         }
     }
 
@@ -521,6 +536,7 @@ impl LirRvalue {
             }
             Self::Unary { operand, .. } => vec![operand],
             Self::Binary { lhs, rhs, .. } => vec![lhs, rhs],
+            Self::StringConcat { parts, .. } => parts.iter().collect(),
         }
     }
 }

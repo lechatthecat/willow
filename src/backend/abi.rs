@@ -196,10 +196,12 @@ mod tests {
         };
 
         assert!(effects("willow_alloc").contains(RuntimeEffects::MAY_ALLOCATE));
-        assert!(
-            effects("willow_string_concat")
-                .contains(RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_PANIC))
-        );
+        for name in ["willow_string_concat", "willow_string_concat_n"] {
+            assert!(
+                effects(name)
+                    .contains(RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_PANIC))
+            );
+        }
         assert!(
             effects("willow_fs_read_to_string")
                 .contains(RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_ALLOCATE))
@@ -446,6 +448,7 @@ mod alloc_effects_tests {
         "willow_format_f64_16f",
         "willow_format_f64_6f",
         "willow_string_concat",
+        "willow_string_concat_n",
         "willow_string_alloc",
         "willow_string_literal_slot",
         "willow_string_repeat",
@@ -670,6 +673,7 @@ mod alloc_effects_tests {
         // signature, because plenty of rows return a word they were given.
         for name in [
             "willow_string_concat",
+            "willow_string_concat_n",
             "willow_array_new",
             "willow_array_to_string",
             "willow_map_new",

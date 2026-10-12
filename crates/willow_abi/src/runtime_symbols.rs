@@ -123,6 +123,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     ALLOC; "willow_format_f64_6f" => ([F64] -> Some(Ptr));
     // --- string ---
     PANIC_ALLOC; "willow_string_concat" => ([Ptr, Ptr] -> Some(Ptr));
+    PANIC_ALLOC; "willow_string_concat_n" => ([Ptr, I64] -> Some(Ptr));
     NONE; "willow_string_len" => ([Ptr] -> Some(I64));
     PANIC_ALLOC; "willow_string_substring" => ([Ptr, I64, I64] -> Some(Ptr));
     PANIC_ALLOC; "willow_string_repeat" => ([Ptr, I64] -> Some(Ptr));

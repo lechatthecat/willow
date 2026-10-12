@@ -306,6 +306,15 @@ pub struct GcLayoutDescriptor {
     pub size: u64,
 }
 
+/// Part encoding of `willow_string_concat_n`: each part is a `[kind, value]`
+/// pair of 64-bit words.
+pub mod string_concat {
+    /// `value` is a WillowString payload pointer; null is the empty string.
+    pub const PART_STRING: u64 = 0;
+    /// `value` is an `i64` written in decimal, as by `i64.toString()`.
+    pub const PART_I64: u64 = 1;
+}
+
 /// GC header ABI. Offsets are fixed-width and independent of Rust field lookup.
 pub mod gc_header {
     pub const MARKED_OFFSET: u32 = 0;

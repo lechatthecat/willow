@@ -6,7 +6,9 @@
 //! wraps in release builds (willow-jz15.14); folding is build-mode
 //! independent, so it leaves both for the backend.
 mod recursive_inline;
+mod string_concat;
 pub(crate) use recursive_inline::inline_scalar_recursion;
+pub(crate) use string_concat::fuse_string_concats;
 
 use std::collections::HashMap;
 

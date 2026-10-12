@@ -333,6 +333,12 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/to_string.wi",
             "answer = 42\nok = true\npi = 3.5\np = (3, 4)\n",
         ),
+        (
+            "example/string_concat_fusion.wi",
+            "willow v8 build -29!\n  evaluating a\n  evaluating b\n  evaluating c\nab1c\n\
+             [é水🌲]\nmin=-9223372036854775808 max=9223372036854775807\nL8|L8|2\n\
+             0=0;1=1;2=4;3=9;4=16;\nwillow:8:-29\n",
+        ),
         ("example/many_tasks.wi", "55\n"),
         (
             "example/match_arm_control_flow.wi",
@@ -1176,6 +1182,18 @@ fn test_runnable_example_catalog_is_complete() {
         actual_paths, expected_paths,
         "every runnable non-future example entrypoint should have an output assertion"
     );
+}
+
+#[test]
+fn test_string_concat_fusion_example() {
+    let path = "example/string_concat_fusion.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
 }
 
 #[test]

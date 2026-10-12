@@ -240,6 +240,16 @@ pub struct GcTlabState {
     start_bits: AtomicUsize,
 }
 
+impl GcTlabState {
+    const fn new() -> Self {
+        Self {
+            cursor: AtomicUsize::new(0),
+            limit: AtomicUsize::new(0),
+            start_bits: AtomicUsize::new(0),
+        }
+    }
+}
+
 pub const GC_TLAB_STATE_SIZE: usize = std::mem::size_of::<GcTlabState>();
 pub const GC_HEADER_SIZE: usize = std::mem::size_of::<GcHeader>();
 pub const GC_TLAB_CHUNK_SIZE: usize = willow_abi::tlab::CHUNK_SIZE as usize;
@@ -248,6 +258,11 @@ pub const GC_TLAB_MAX_OBJECT_SIZE: usize = 4 * 1024;
 
 #[path = "gc/layouts.rs"]
 mod layouts;
+#[path = "gc/runtime_tlab.rs"]
+mod runtime_tlab;
+pub(crate) use runtime_tlab::{
+    RuntimeTlabOwner, alloc_string_payload_slow, try_alloc_young_string_payload,
+};
 
 /// Raw allocation and pointer arithmetic boundary for the collector. The rest
 /// of the GC works with `Object`/`Payload`/`RootSlot` and cannot directly
@@ -1051,13 +1066,31 @@ pub extern "C" fn willow_gc_alloc_slow(
     if tlab_state.is_null() || payload_size < 0 {
         crate::failure::fatal_invariant("invalid TLAB allocation arguments");
     }
+    tlab_alloc_slow(
+        tlab_state as usize,
+        layout_id,
+        type_id,
+        payload_size,
+        gc_ref_mask,
+    )
+}
+
+/// Shared TLAB miss handling for generated code and the runtime's own TLAB
+/// ([`runtime_tlab`]). The caller decides whether this thread's root slots are
+/// relocatable for any collection started here.
+fn tlab_alloc_slow(
+    state_address: usize,
+    layout_id: u64,
+    type_id: i64,
+    payload_size: i64,
+    gc_ref_mask: u64,
+) -> *mut u8 {
     let Some(total_size) = (GC_HEADER_SIZE)
         .checked_add(payload_size as usize)
         .and_then(|size| size.checked_next_multiple_of(std::mem::align_of::<GcHeader>()))
     else {
         crate::failure::resource_exhausted(format_args!("TLAB allocation size overflow"));
     };
-    let state_address = tlab_state as usize;
     let stress = gc_stress_enabled("alloc");
     let small = total_size <= GC_TLAB_MAX_OBJECT_SIZE;
     let fast_bytes = {
@@ -2052,6 +2085,9 @@ fn reset_internal() {
     runtime().parked_stack_roots.lock().unwrap().clear();
     *runtime().root_stack_owner.lock().unwrap() = None;
     progress::reset();
+    // Collectors and TLS-block unregistration take coord before heap; never
+    // wait for coord while holding heap.
+    drop(state);
     {
         let (lock, cv) = &runtime().coord;
         let mut coord = lock.lock().unwrap();
@@ -2106,11 +2142,7 @@ pub fn reset_internal_for_test() {
 /// minor collection will move.
 #[cfg(test)]
 pub(crate) fn tlab_state_for_test() -> GcTlabState {
-    GcTlabState {
-        cursor: AtomicUsize::new(0),
-        limit: AtomicUsize::new(0),
-        start_bits: AtomicUsize::new(0),
-    }
+    GcTlabState::new()
 }
 
 #[cfg(test)]

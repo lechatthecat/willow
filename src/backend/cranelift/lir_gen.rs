@@ -7164,6 +7164,51 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    /// One `willow_string_concat_n` call over a stack array of `[kind, value]`
+    /// part words (willow-8hq4.29). The operands are read and stored after the
+    /// call's panic-depth snapshot, so no GC point separates the stores from
+    /// the call; the runtime roots the string slots itself across its
+    /// allocation, and the caller never reads the array afterwards.
+    fn emit_string_concat_n(
+        &mut self,
+        function: &LirFunction,
+        parts: &[crate::ir::lowered::LirOperand],
+        part_types: &[Type],
+    ) -> cranelift_codegen::ir::Value {
+        use willow_abi::string_concat::{PART_I64, PART_STRING};
+        let bytes = u32::try_from(parts.len() * 16).expect("string concatenation part count");
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            bytes,
+            3,
+        ));
+        let ptr_ty = reference_type(self.module.target_config());
+        self.emit_runtime_call_late_args(
+            "willow_string_concat_n",
+            |this| {
+                for (index, (part, ty)) in parts.iter().zip(part_types).enumerate() {
+                    let kind = if *ty == Type::I64 {
+                        PART_I64
+                    } else {
+                        PART_STRING
+                    };
+                    let offset = (index * 16) as i32;
+                    let kind = this.builder.ins().iconst(types::I64, kind as i64);
+                    this.builder.ins().stack_store(ptr_ty, kind, slot, offset);
+                    let value = this.emit_lir_operand(function, part);
+                    this.builder
+                        .ins()
+                        .stack_store(ptr_ty, value, slot, offset + 8);
+                }
+                let array = this.builder.ins().stack_addr(ptr_ty, slot, 0);
+                let count = this.builder.ins().iconst(types::I64, parts.len() as i64);
+                vec![array, count]
+            },
+            |_| {},
+        )
+        .expect("willow_string_concat_n returns a string")
+    }
+
     fn emit_lir_rvalue(
         &mut self,
         function: &LirFunction,
@@ -7684,6 +7729,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.gc_root_count -= roots;
                 self.emit_post_willow_call_panic_check(panic_depth);
                 result
+            }
+            LirRvalue::StringConcat { parts, part_types } => {
+                self.emit_string_concat_n(function, parts, part_types)
             }
             LirRvalue::Binary {
                 op,
