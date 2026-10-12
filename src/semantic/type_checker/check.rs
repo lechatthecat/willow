@@ -1421,7 +1421,25 @@ impl TypeChecker {
                     ) {
                         self.push(diag);
                     }
-                    inferred
+                    if matches!(&inferred, Type::Array(element) if **element == Type::Void) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1801,
+                                "cannot infer array element type; annotate the binding",
+                            )
+                            .with_label(Label::primary(s.span, "element type annotation required"))
+                            .with_help(format!(
+                                "add an element type, e.g. `let {}: Array<i64> = [];`",
+                                s.name
+                            )),
+                        );
+                        // Poison the binding so push, iteration and await do not
+                        // turn an unresolved element into secondary diagnostics.
+                        Self::error_type()
+                    } else {
+                        inferred
+                    }
                 };
                 if annotation.is_none()
                     && builtin_types::binary_args(&ty, B::Map)
