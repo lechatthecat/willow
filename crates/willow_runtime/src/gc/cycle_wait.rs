@@ -129,6 +129,61 @@ mod tests {
     }
 
     #[test]
+    fn explicit_collect_joins_active_cycles_without_busy_polling() {
+        let _test = runtime_test_guard();
+        reset_internal_for_test();
+        for count in [1, 4, 16, 32] {
+            reset_counts();
+            let elected = CollectorGuard::try_acquire().unwrap();
+            let generation = runtime().coord.0.lock().unwrap().cycle_generation;
+            // Reentrant callbacks on the elected collector must never wait.
+            willow_gc_collect();
+            assert_eq!(CHECKS.load(Ordering::Relaxed), 0);
+            let waiters: Vec<_> = (0..count)
+                .map(|_| {
+                    std::thread::spawn(|| {
+                        let _mutator = MutatorRegistration::new();
+                        willow_gc_collect();
+                    })
+                })
+                .collect();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while SLEEPS.load(Ordering::Acquire) < count {
+                assert!(
+                    waiters.iter().all(|w| !w.is_finished()),
+                    "explicit collection returned before the elected cycle completed"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "explicit collection did not wait"
+                );
+                std::thread::yield_now();
+            }
+            drop(runtime().coord.0.lock().unwrap());
+            assert!(waiters.iter().all(|w| !w.is_finished()));
+            runtime().budget_cv.notify_all();
+            await_sleeps(2 * count);
+            assert!(waiters.iter().all(|w| !w.is_finished()));
+            drop(elected);
+            for waiter in waiters {
+                waiter.join().unwrap();
+            }
+            assert_eq!(CHECKS.load(Ordering::Relaxed), 3 * count);
+            assert_eq!(SLEEPS.load(Ordering::Relaxed), 2 * count);
+            assert_eq!(
+                runtime().coord.0.lock().unwrap().cycle_generation,
+                generation.wrapping_add(1)
+            );
+            println!(
+                "explicit GC waiters={count} sleeps={} checks={}",
+                2 * count,
+                3 * count
+            );
+        }
+        reset_internal_for_test();
+    }
+
+    #[test]
     fn budget_wait_spurious_wakeups_and_scaling() {
         let _test = runtime_test_guard();
         reset_internal_for_test();

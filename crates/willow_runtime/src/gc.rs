@@ -1470,6 +1470,9 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
 
 /// Trigger a full collection. Normal old marking/closure/sweep are concurrent;
 /// legacy trace callbacks or worker failures use the stopped recovery path.
+/// If another collector owns a cycle, join its completion instead of returning
+/// early. A cycle whose root snapshot predates a root release can retain that
+/// object until a subsequent cycle.
 ///
 /// # GC root semantics — why local objects survive an inner gc_collect()
 ///
@@ -1481,8 +1484,8 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
 ///
 /// Consequence: calling `gc_collect()` from **inside** a function that holds
 /// live GC-managed locals will **not** free those locals.  They will be freed
-/// on the first `gc_collect()` that runs **after** the function has returned
-/// and the root slots have been popped.
+/// by a collection whose root snapshot is taken **after** the function has
+/// returned and the root slots have been popped.
 ///
 /// This is intentional and correct.  The GC cannot distinguish "I'm done with
 /// this variable" from "I might use it again later in the same scope".  To
@@ -1496,7 +1499,10 @@ pub extern "C" fn willow_gc_collect() {
     // Active execution units still protect every covered retirement.
     crate::scheduler::release_quiescent_frame_roots(true);
     let _relocation = RelocationSafeScope::enter();
-    collect_internal();
+    // A caller that loses collector election must join the active cycle rather
+    // than return while its marking/sweep is still in flight. Budget waiters
+    // already publish/park at safepoints and handle collector reentrancy.
+    collect_for_budget();
 }
 
 /// Trigger a stop-the-world minor collection. Young objects reachable from
