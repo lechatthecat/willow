@@ -5,6 +5,7 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),
+        ("example/gc_old_cycle.wi", "499500\n499500\n499500\n"),
         ("example/generic_nominal_bindings.wi", "17\n79\n80\n"),
         ("example/standalone_generic_aliases/main.wi", "17\n"),
         (
@@ -1519,4 +1520,11 @@ fn test_standalone_generic_aliases_example() {
     let (out, ok) = compile_file_and_run("example/standalone_generic_aliases/main.wi");
     assert!(ok, "{out}");
     assert_eq!(out, "17\n");
+}
+
+#[test]
+fn test_gc_old_cycle_example() {
+    let (out, ok) = compile_file_and_run("example/gc_old_cycle.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, "499500\n499500\n499500\n");
 }
