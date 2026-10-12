@@ -1,5 +1,103 @@
 use super::*;
 
+/// Run in a fresh process: RSS from unrelated tests/allocator caches must not
+/// contaminate this bound. No forced collections occur inside the churn loop.
+#[test]
+fn short_lived_string_churn_bounds_reservations_and_rss() {
+    const CHILD: &str = "WILLOW_TEST_STRING_CHURN";
+    if std::env::var_os(CHILD).is_none() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "gc::native_memory_tests::short_lived_string_churn_bounds_reservations_and_rss",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("WILLOW_GC_")
+                || name.starts_with("MALLOC_")
+                || name == "GLIBC_TUNABLES"
+            {
+                command.env_remove(key);
+            }
+        }
+        let output = command.output().expect("run isolated string churn");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        return;
+    }
+    let _guard = runtime_test_guard();
+    // Regular old regions, crossing the dedicated-region boundary, then only
+    // dedicated regions. Increasing N keeps the live set fixed.
+    for (size, n) in [
+        (100_000, 1_000),
+        (100_000, 10_000),
+        (100_000, 40_000),
+        (150_000, 40_000),
+        (1_000_000, 4_000),
+    ] {
+        willow_gc_init();
+        let source = vec![b'x'; size];
+        let base = GcRootHandle::new(crate::string::willow_string_alloc(
+            source.as_ptr(),
+            size as i64,
+        ));
+        drop(source);
+        let before = telemetry_heap_snapshot().0;
+        let mut peak_reserved = 0;
+        let mut total = 0u64;
+        for i in 0..n {
+            let rest = crate::string::willow_string_substring(base.load(), i as i64, size as i64);
+            total += crate::string::willow_string_len(rest) as u64;
+            // Sampling heap counters does not allocate managed objects or GC.
+            let (_, heap) = telemetry_heap_snapshot();
+            peak_reserved = peak_reserved.max(heap.reserved_bytes);
+        }
+        let expected = (n * size - n * (n - 1) / 2) as u64;
+        assert_eq!(total, expected);
+        let (after, _) = telemetry_heap_snapshot();
+        assert_eq!(after.allocation_count - before.allocation_count, n as u64);
+        assert_eq!(
+            after.allocation_bytes - before.allocation_bytes,
+            expected + (n * (GC_HEADER_SIZE + 9)) as u64
+        );
+        assert!(after.freed_objects > before.freed_objects);
+        assert!(after.released_bytes > before.released_bytes);
+        assert!(peak_reserved < 16 * 1024 * 1024, "reserved={peak_reserved}");
+        willow_gc_collect();
+        let (counters, heap) = telemetry_heap_snapshot();
+        assert_eq!(heap.occupied_bytes, (size + GC_HEADER_SIZE + 9) as u64);
+        assert_eq!(counters.allocation_count - counters.freed_objects, 1);
+        assert_eq!(crate::string::willow_string_len(base.load()), size as i64);
+        drop(base);
+        willow_gc_collect();
+        assert_eq!(telemetry_heap_snapshot().1.occupied_bytes, 0);
+        println!(
+            "string_churn size={size} n={n} allocations={n} payload_bytes={expected} peak_reserved={peak_reserved} released_bytes={}",
+            after.released_bytes
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage writes the entire result on success.
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+            0
+        );
+        let peak_kib = unsafe { usage.assume_init() }.ru_maxrss;
+        assert!(peak_kib < 64 * 1024, "peak RSS KiB={peak_kib}");
+        println!("string_churn peak_rss_kib={peak_kib}");
+    }
+}
+
 #[test]
 fn native_bytes_participate_in_reservation_and_trigger_inputs() {
     let _guard = runtime_test_guard();
