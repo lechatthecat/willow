@@ -31,6 +31,9 @@ impl ConcurrentMarkBits {
             .get(index / 64)
             .is_some_and(|word| word.load(Ordering::Acquire) & (1u64 << (index % 64)) != 0)
     }
+    pub(super) fn word_count(&self) -> usize {
+        self.words.len()
+    }
     pub(super) fn clear(&self) {
         for word in &self.words {
             word.store(0, Ordering::Release);

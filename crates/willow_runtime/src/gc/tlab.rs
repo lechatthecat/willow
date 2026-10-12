@@ -89,6 +89,17 @@ pub(super) fn sync_tlab_bytes(state: &mut GcState) {
 
 /// Merge fast-path bytes and object counts, for telemetry readers.
 pub(super) fn sync_tlab_accounting(state: &mut GcState) {
+    sync_tlab_counters(state);
+    // Index consumers retain the baseline full flush.
+    old_lab::flush_all(state);
+}
+
+pub(super) fn sync_tlab_accounting_unindexed(state: &mut GcState) {
+    sync_tlab_counters(state);
+    old_lab::sync_records(state);
+}
+
+fn sync_tlab_counters(state: &mut GcState) {
     let (mut allocations, mut bytes) = (0u64, 0u64);
     let GcState {
         tlab_states,
@@ -105,9 +116,6 @@ pub(super) fn sync_tlab_accounting(state: &mut GcState) {
         ));
     }
     add_tlab_accounting(state, allocations, bytes);
-    // Readers of these counters and every walk of region object indexes
-    // (epoch capture, stopped marking, validation) follow this merge.
-    old_lab::flush_all(state);
 }
 
 thread_local! {
@@ -219,6 +227,17 @@ pub(super) fn index_retired_chunk(chunk: &mut BumpChunk) -> usize {
 /// `retire_all_tlabs_locked`.
 pub(super) fn retire_all_tlabs_unindexed(state: &mut GcState) {
     sync_tlab_accounting(state);
+    retire_all_tlab_cursors(state);
+}
+
+/// Initial mark captures start maps and must not index old-LAB objects while
+/// retiring nursery cursors. Minor and baseline index consumers keep their flush.
+pub(super) fn retire_all_tlabs_unindexed_for_mark(state: &mut GcState) {
+    sync_tlab_accounting_unindexed(state);
+    retire_all_tlab_cursors(state);
+}
+
+fn retire_all_tlab_cursors(state: &mut GcState) {
     let addresses: Vec<usize> = state.tlab_states.keys().copied().collect();
     for address in addresses {
         retire_tlab_locked(state, address);

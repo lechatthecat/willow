@@ -155,7 +155,9 @@ pub(super) fn flush_satb_current(retire: bool) {
             |buffer| buffer.flush(|values| cycle.enqueue_satb_batch(values)),
         );
         if retire {
-            cycle.satb_shards.retire_current();
+            cycle
+                .satb_shards
+                .retire_current(|values| cycle.enqueue_satb_batch(values));
         }
     }
     if !retire && !LOCKED_SATB_PENDING.get() {

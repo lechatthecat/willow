@@ -582,6 +582,20 @@ impl MarkWorkQueue {
         next
     }
 
+    /// Activate an identity reserved by the runtime's monotonic cycle owner.
+    /// Fresh per-cycle queues must not issue a separate local identity. The
+    /// caller quiesces consumers just as for begin_epoch; producer exclusion
+    /// and stale-work disposal use the same locked transition.
+    pub(crate) fn begin_reserved_epoch(&self, next: MarkEpoch) -> MarkEpoch {
+        self.last_issued
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |issued| {
+                (next.0 > issued).then_some(next.0)
+            })
+            .expect("reserved mark epoch must advance");
+        self.transition_to(next);
+        next
+    }
+
     /// End the current cycle, discard everything still queued, and return how
     /// many items were dropped. A non-zero return from a *terminated* cycle
     /// means termination detection concluded early — worth asserting on.

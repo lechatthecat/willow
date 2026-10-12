@@ -52,10 +52,10 @@ pub(super) fn request() -> bool {
     if state.shutdown {
         return false;
     }
-    if !state.running {
-        state.pending = true;
-        cv.notify_one();
-    }
+    // Retain requests arriving before the current sweep publishes free spans.
+    // The single coordinator starts the pending cycle only after collect returns.
+    state.pending = true;
+    cv.notify_one();
     true
 }
 
@@ -81,7 +81,27 @@ fn run_loop(shared: Arc<(Mutex<State>, Condvar)>) {
         if PANIC_BEFORE_COLLECTION.load(Ordering::Relaxed) {
             panic!("injected coordinator collection panic");
         }
-        collect_internal();
+        loop {
+            if try_collect_internal() {
+                break;
+            }
+            // Keep this request owned while a different collector finishes.
+            // New requests during our eventual cycle remain a separate pending
+            // request; clear only the request about to attempt election.
+            {
+                let mut state = lock.lock().unwrap();
+                state.pending = true;
+                if state.shutdown {
+                    break;
+                }
+            }
+            cycle_wait::wait_for_current_cycle();
+            let mut state = lock.lock().unwrap();
+            if state.shutdown {
+                break;
+            }
+            state.pending = false;
+        }
         willow_gc_unregister_mutator();
         let mut state = lock.lock().unwrap();
         state.running = false;
@@ -192,6 +212,77 @@ mod tests {
         willow_gc_unregister_mutator();
         collect_internal();
         assert_eq!(willow_gc_allocated_bytes(), 0);
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn automatic_request_survives_explicit_collector_election_loss() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        ENTERED.store(false, Ordering::Relaxed);
+        RELEASE.store(false, Ordering::Relaxed);
+        cycle_wait::SLEEPS.store(0, Ordering::Relaxed);
+        const TYPE: u32 = 0xFA89;
+        willow_register_type(TYPE, legacy);
+        runtime()
+            .concurrent_trace_registry
+            .lock()
+            .unwrap()
+            .insert(TYPE, paused_trace);
+        let _mutator = MutatorRegistration::new();
+        let mut root = willow_alloc_object(TYPE as i64, 8);
+        willow_push_root(&mut root);
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        let explicit = std::thread::spawn(|| {
+            let _mutator = MutatorRegistration::new();
+            willow_gc_collect();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ENTERED.load(Ordering::Acquire) {
+            willow_gc_safepoint();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "explicit marker did not start"
+            );
+            std::thread::yield_now();
+        }
+        assert!(request()); // The only automatic request; no later allocations.
+        while cycle_wait::SLEEPS.load(Ordering::Acquire) == 0 {
+            willow_gc_safepoint();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "automatic collector did not join"
+            );
+            std::thread::yield_now();
+        }
+        {
+            let coordinator = COORDINATOR.lock().unwrap();
+            let state = coordinator.as_ref().unwrap().shared.0.lock().unwrap();
+            assert!(
+                state.pending && state.running,
+                "failed election consumed the request"
+            );
+        }
+        assert_eq!(runtime().heap.lock().unwrap().major_collections, 0);
+        RELEASE.store(true, Ordering::Release);
+        while !explicit.is_finished() || runtime().heap.lock().unwrap().major_collections < 2 {
+            willow_gc_safepoint();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pending post-sweep cycle did not run"
+            );
+            std::thread::yield_now();
+        }
+        explicit.join().unwrap();
+        shutdown();
+        assert_eq!(runtime().heap.lock().unwrap().major_collections, 2);
+        assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
+        println!(
+            "explicit_cycles=1 retained_automatic_cycles=1 additional_requests=0 cooperative_sleeps={}",
+            cycle_wait::SLEEPS.load(Ordering::Relaxed)
+        );
+        willow_pop_roots(1);
+        drop(_mutator);
         reset_internal_for_test();
     }
 
