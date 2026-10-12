@@ -353,11 +353,11 @@ async fn main() {
     );
 }
 
-/// Perspective 39: imported implementation bodies are not part of the entry
-/// TypeChecker's call graph yet. Interface dispatch therefore fails closed
-/// instead of assuming that an unavailable implementation is pure.
+/// Perspective 39: imported implementation capabilities preserve the waiting
+/// operation's source witness, so interface dispatch rejects its actual body.
+/// Unavailable-unit fail-closed behavior is covered by the effect-query tests.
 #[test]
-fn lock_lower_39_imported_interface_implementation_fails_closed() {
+fn lock_lower_39_imported_interface_implementation_reports_waiting_body() {
     let project = TestProject::new(
         "lock_interface_effect_import",
         &[
@@ -399,7 +399,7 @@ async fn main() {
     assert!(!output.status.success(), "unexpectedly compiled: {stderr}");
     assert!(stderr.contains("error[E2604]"), "{stderr}");
     assert!(
-        stderr.contains("interface dispatch to an imported implementation"),
+        stderr.contains("Channel.recv") && stderr.contains("receiver.wi"),
         "{stderr}"
     );
 }
