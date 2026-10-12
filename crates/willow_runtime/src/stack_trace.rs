@@ -6,11 +6,15 @@ pub struct RuntimeFrame {
     pub file: String,
     pub line: usize,
     pub col: usize,
+    /// A prepared method call is hidden until its arguments have completed.
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeStackTrace {
     frames: Vec<RuntimeFrame>,
+    current: Option<RuntimeFrame>,
+    current_async: bool,
 }
 
 impl RuntimeStackTrace {
@@ -29,7 +33,7 @@ impl RuntimeStackTrace {
 
 thread_local! {
     /// Per-thread call stack maintained by debug builds: the compiler emits a
-    /// `willow_callstack_push` before each user-function call and a matching
+    /// `willow_callstack_push` with the caller name/location before each call and a matching
     /// `willow_callstack_pop` after it returns. When a call never returns (it
     /// panics/aborts), its frames remain on the stack and the panic handlers
     /// print the chain (willow-992h).
@@ -70,6 +74,7 @@ unsafe fn raw_str(ptr: *const u8, len: i64) -> String {
 /// Push a call frame. `function`/`file` are pointers to raw static UTF-8 bytes
 /// (NOT WillowStrings) with explicit lengths, copied onto the Rust heap so the
 /// debug call stack does not allocate on the Willow GC heap (willow-992h).
+/// Each frame names the caller and a location inside that caller.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_callstack_push(
@@ -88,8 +93,106 @@ pub extern "C" fn willow_callstack_push(
             file,
             line: line as usize,
             col: col as usize,
+            active: true,
         });
     });
+}
+
+/// Reserve a balanced shadow-stack slot without claiming the call has started.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_callstack_push_pending(
+    function: *const u8,
+    function_len: i64,
+    file: *const u8,
+    file_len: i64,
+    line: i32,
+    col: i32,
+) {
+    willow_callstack_push(function, function_len, file, file_len, line, col);
+    CALL_STACK.with(|slot| slot.borrow_mut().frames.last_mut().unwrap().active = false);
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_callstack_activate() {
+    CALL_STACK.with(|slot| {
+        if let Some(frame) = slot.borrow_mut().frames.last_mut() {
+            frame.active = true;
+        }
+    });
+}
+
+/// Publish the executing function separately from suspended caller frames.
+/// Keeping it in the exchanged trace also isolates native task stacks.
+/// Flags: bit 0 identifies async source code; bit 1 enables the debug call chain.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_trace_site_set(
+    function: *const u8,
+    function_len: i64,
+    file: *const u8,
+    file_len: i64,
+    line: i64,
+    col: i64,
+    flags: i32,
+) {
+    crate::panic_context::willow_fault_site_set(file, file_len, line, col);
+    let asynchronous = flags & 1 != 0;
+    let debug = flags & 2 != 0;
+    if !asynchronous && !debug {
+        CALL_STACK.with(|slot| slot.borrow_mut().current = None);
+        return;
+    }
+    let frame = RuntimeFrame {
+        function: unsafe { raw_str(function, function_len) },
+        file: unsafe { raw_str(file, file_len) },
+        line: line.max(0) as usize,
+        col: col.max(0) as usize,
+        active: true,
+    };
+    if asynchronous {
+        crate::scheduler::set_current_execution_site(frame.clone());
+    }
+    CALL_STACK.with(|slot| {
+        let mut trace = slot.borrow_mut();
+        trace.current = debug.then_some(frame);
+        trace.current_async = asynchronous;
+    });
+}
+
+/// Capture the leaf at the actual panic site, followed by its suspended callers.
+/// Explicit panic locations take precedence over the enclosing LIR statement.
+pub(crate) fn panic_call_stack_text(file: &str, line: usize, col: usize) -> String {
+    CALL_STACK.with(|slot| {
+        let trace = slot.borrow();
+        let Some(current) = &trace.current else {
+            return current_call_stack_text();
+        };
+        if trace.current_async && !file.is_empty() {
+            crate::scheduler::set_current_execution_site(RuntimeFrame {
+                function: current.function.clone(),
+                file: file.to_owned(),
+                line,
+                col,
+                active: true,
+            });
+        }
+        let mut out = String::from("call stack (most recent call first):");
+        for (i, frame) in std::iter::once(current)
+            .chain(trace.frames.iter().rev().filter(|frame| frame.active))
+            .enumerate()
+        {
+            let (file, line, col) = if i == 0 && !file.is_empty() {
+                (file, line, col)
+            } else {
+                (frame.file.as_str(), frame.line, frame.col)
+            };
+            use std::fmt::Write;
+            let _ = write!(out, "\n  {i}: {} at {file}:{line}:{col}", frame.function);
+        }
+        out
+    })
 }
 
 /// Pop the most recent call frame (matched with a successful return).
@@ -102,16 +205,16 @@ pub extern "C" fn willow_callstack_pop() {
 }
 
 /// Render the current call chain (most recent call first). Returns the empty
-/// string when no frames are recorded (e.g. a panic directly in `main`).
+/// string when no suspended callers are recorded. Panic reports prepend the leaf.
 pub fn current_call_stack_text() -> String {
     CALL_STACK.with(|s| {
         let trace = s.borrow();
         let frames = trace.frames();
-        if frames.is_empty() {
+        if !frames.iter().any(|frame| frame.active) {
             return String::new();
         }
         let mut out = String::from("call stack (most recent call first):");
-        for (i, frame) in frames.iter().rev().enumerate() {
+        for (i, frame) in frames.iter().rev().filter(|frame| frame.active).enumerate() {
             out.push_str(&format!(
                 "\n  {i}: {} at {}:{}:{}",
                 frame.function, frame.file, frame.line, frame.col
@@ -132,6 +235,56 @@ pub fn print_current_call_stack() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_frames_skip_unentered_calls_and_survive_stack_exchange() {
+        let previous = replace_current(Default::default());
+        willow_callstack_push(b"main".as_ptr(), 4, b"main.wi".as_ptr(), 7, 8, 5);
+        willow_callstack_push_pending(b"helper".as_ptr(), 6, b"helper.wi".as_ptr(), 9, 3, 5);
+        willow_trace_site_set(b"argument".as_ptr(), 8, b"arg.wi".as_ptr(), 6, 4, 2, 2);
+        let trace = replace_current(Default::default());
+        assert_eq!(panic_call_stack_text("", 0, 0), "");
+        replace_current(trace);
+        assert_eq!(
+            panic_call_stack_text("arg.wi", 9, 3),
+            "call stack (most recent call first):\n  0: argument at arg.wi:9:3\n  1: main at main.wi:8:5"
+        );
+        willow_callstack_activate();
+        assert!(panic_call_stack_text("arg.wi", 9, 3).contains("1: helper at helper.wi:3:5"));
+        willow_callstack_pop();
+        willow_callstack_pop();
+        replace_current(previous);
+    }
+
+    #[test]
+    fn panic_frames_render_linear_activation_counts() {
+        let previous = replace_current(Default::default());
+        for depth in [1, 16, 128] {
+            for _ in 0..depth {
+                willow_callstack_push(b"recur".as_ptr(), 5, b"deep.wi".as_ptr(), 7, 3, 1);
+            }
+            willow_trace_site_set(b"recur".as_ptr(), 5, b"deep.wi".as_ptr(), 7, 2, 1, 2);
+            assert_eq!(snapshot_current().frames.len(), depth);
+            assert_eq!(
+                panic_call_stack_text("deep.wi", 2, 1).lines().count(),
+                depth + 2
+            );
+            for _ in 0..depth {
+                willow_callstack_pop();
+            }
+            assert!(snapshot_current().frames.is_empty());
+        }
+        replace_current(previous);
+    }
+
+    #[test]
+    fn release_site_does_not_inherit_a_previous_debug_leaf() {
+        let previous = replace_current(Default::default());
+        willow_trace_site_set(b"debug".as_ptr(), 5, b"old.wi".as_ptr(), 6, 2, 1, 2);
+        willow_trace_site_set(b"release".as_ptr(), 7, b"new.wi".as_ptr(), 6, 4, 1, 0);
+        assert_eq!(panic_call_stack_text("new.wi", 4, 1), "");
+        replace_current(previous);
+    }
 
     #[test]
     fn current_call_site_tracks_innermost_frame_and_empty_stack() {
@@ -158,6 +311,7 @@ mod tests {
             file: "main.wi".to_string(),
             line: 3,
             col: 5,
+            active: true,
         });
         assert_eq!(trace.frames()[0].function, "main");
         assert_eq!(trace.pop().unwrap().line, 3);

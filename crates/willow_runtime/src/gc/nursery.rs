@@ -3,6 +3,40 @@
 const FLOOR: usize = 256 * 1024;
 const CAP: usize = 32 * 1024 * 1024;
 
+/// Preserve the compact synchronous startup nursery.
+pub(super) fn initial_budget() -> usize {
+    FLOOR
+}
+
+/// Called once when an actual scheduler drive starts, not merely because a
+/// synchronous program configured worker capacity. Do not overwrite learned
+/// survival/pacing feedback when sync work already warmed the collector.
+pub(super) fn scheduler_start(state: &mut super::GcState, workers: usize) {
+    if state.scheduler_runway_initialized {
+        return;
+    }
+    state.scheduler_runway_initialized = true;
+    if state.major_collections != 0
+        || state.minor_collections != 0
+        || state.concurrent_cycle.is_some()
+        || state.sweeping.is_some()
+    {
+        return;
+    }
+    let budget = initial_budget_for(workers);
+    state.nursery_threshold_bytes = state.nursery_policy.bound(
+        state.nursery_policy.fixed.unwrap_or(budget),
+        state.memory_limit_bytes,
+    );
+    super::pacer::scheduler_start(state, budget as u64);
+}
+
+/// Bounded cold runway for actual concurrent allocators, without reserving
+/// storage. Survival feedback can subsequently shrink back to FLOOR.
+fn initial_budget_for(workers: usize) -> usize {
+    workers.clamp(1, 8) * (4 * 1024 * 1024)
+}
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct Policy {
     fixed: Option<usize>,
@@ -28,7 +62,7 @@ impl Policy {
     }
 
     pub(super) fn initial(&self, memory_limit: Option<usize>) -> usize {
-        self.bound(self.fixed.unwrap_or(FLOOR), memory_limit)
+        self.bound(self.fixed.unwrap_or_else(initial_budget), memory_limit)
     }
 
     pub(super) fn next(
@@ -65,6 +99,7 @@ mod tests {
     fn nursery_runtime_survival_updates_live_telemetry() {
         use crate::gc::*;
         let _guard = runtime_test_guard();
+        let initial = initial_budget();
         for n in [32, 128, 512] {
             reset_internal();
             let mut tls = tlab_state_for_test();
@@ -72,7 +107,7 @@ mod tests {
             let mut roots = Vec::<*mut u8>::with_capacity(n);
             assert_eq!(
                 telemetry_heap_snapshot().1.minor_trigger_bytes,
-                FLOOR as u64
+                initial as u64
             );
             for _ in 0..n {
                 let root = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
@@ -85,7 +120,7 @@ mod tests {
             // Every survivor is evacuated: copied to survivor space, not pinned.
             assert_eq!(counters.moved_objects, n as u64);
             assert_eq!(counters.promoted_objects, 0);
-            assert_eq!(heap.minor_trigger_bytes, (2 * FLOOR) as u64);
+            assert_eq!(heap.minor_trigger_bytes, (2 * initial).min(CAP) as u64);
             for root in &mut roots {
                 willow_gc_remove_runtime_root_slot(root);
             }
@@ -95,17 +130,17 @@ mod tests {
             crate::gc::minor_collect_internal();
             assert_eq!(
                 telemetry_heap_snapshot().1.minor_trigger_bytes,
-                FLOOR as u64
+                ((2 * initial).min(CAP) / 2).max(FLOOR) as u64
             );
             // Explicit empty cycles must not repeatedly inflate the threshold.
             crate::gc::minor_collect_internal();
             assert_eq!(
                 telemetry_heap_snapshot().1.minor_trigger_bytes,
-                FLOOR as u64
+                ((2 * initial).min(CAP) / 2).max(FLOOR) as u64
             );
             assert_eq!(runtime().heap.lock().unwrap().minor_collections, 3);
             eprintln!(
-                "nursery objects_per_batch={n} minor_cycles=3 policy_updates=3 thresholds=262144,524288,262144,262144"
+                "nursery objects_per_batch={n} minor_cycles=3 policy_updates=3 initial={initial}"
             );
             reset_internal();
         }
@@ -158,7 +193,7 @@ mod tests {
     #[test]
     fn nursery_policy_growth_shrink_dead_band_and_empty_cycles() {
         let policy = Policy::default();
-        assert_eq!(policy.initial(None), FLOOR);
+        assert_eq!(policy.initial(None), initial_budget());
         let mut threshold = FLOOR;
         for _ in 0..20 {
             let next = policy.next(threshold, 1024, 512, None);
@@ -199,4 +234,71 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn startup_runway_is_worker_bounded_and_respects_limits() {
+    for workers in [0, 1, 2, 4, 8, 64, usize::MAX] {
+        let bytes = initial_budget_for(workers);
+        assert_eq!(bytes, workers.clamp(1, 8) * 4 * 1024 * 1024);
+        assert!(bytes <= CAP);
+    }
+    let policy = Policy::default();
+    assert_eq!(policy.initial(Some(1024)), 1024);
+    let fixed = Policy { fixed: Some(8192) };
+    assert_eq!(fixed.initial(None), 8192);
+    assert_eq!(fixed.initial(Some(1024)), 1024);
+    assert_eq!(policy.next(8 * FLOOR, 1024, 0, None), 4 * FLOOR);
+    assert_eq!(policy.next(FLOOR, 1024, 0, None), FLOOR);
+}
+
+#[cfg(test)]
+#[test]
+fn scheduler_runway_only_initializes_a_cold_heap_once() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    reset_internal();
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        assert_eq!(state.nursery_threshold_bytes, FLOOR);
+        self::scheduler_start(&mut state, 8);
+        assert_eq!(state.nursery_threshold_bytes, CAP);
+        assert_eq!(state.threshold_bytes, CAP);
+        state.nursery_threshold_bytes = FLOOR;
+        self::scheduler_start(&mut state, 8);
+        assert_eq!(state.nursery_threshold_bytes, FLOOR);
+    }
+    for major in [false, true] {
+        reset_internal();
+        let mut state = runtime().heap.lock().unwrap();
+        if major {
+            state.major_collections = 1;
+        } else {
+            state.minor_collections = 1;
+        }
+        self::scheduler_start(&mut state, 8);
+        assert_eq!(state.nursery_threshold_bytes, FLOOR);
+        assert_eq!(state.threshold_bytes, 1024 * 1024);
+    }
+    reset_internal();
+    let (_, cycle) = root_handshake::begin().unwrap();
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        self::scheduler_start(&mut state, 8);
+        assert_eq!(state.nursery_threshold_bytes, FLOOR);
+        assert_eq!(state.threshold_bytes, 1024 * 1024);
+        marking::set_concurrent_cycle(&mut state, None);
+    }
+    GC_MARK_PHASE.store(0, Ordering::Release);
+    cycle.queue.end_epoch();
+    reset_internal();
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        state.nursery_policy = Policy { fixed: Some(8192) };
+        state.memory_limit_bytes = Some(4096);
+        self::scheduler_start(&mut state, 8);
+        assert_eq!(state.nursery_threshold_bytes, 4096);
+    }
+    reset_internal();
 }

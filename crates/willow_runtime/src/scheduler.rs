@@ -69,7 +69,12 @@ enum PollOutcome {
     Invalid(i32),
 }
 
-type ClaimedTaskWork = Option<(RuntimePollFn, *mut c_void, *const c_void)>;
+struct ClaimedTaskWork {
+    poll: Option<(RuntimePollFn, *mut c_void, *const c_void)>,
+    cancel: Option<(RuntimeCancelFn, *mut c_void)>,
+    direct_poll: bool,
+    direct_cancel: bool,
+}
 
 fn classify_poll_result(result: i32) -> PollOutcome {
     match result {
@@ -484,6 +489,11 @@ impl RunQueues {
             Some(queue) => {
                 let backlog = queue.publish(id);
                 if SCHED_RUN_DEPTH.with(|depth| depth.get() > 0) && worker == current_worker() {
+                    if backlog > 1 {
+                        // Requeueing the current poll already publishes the
+                        // deferred batch; do not notify twice at its boundary.
+                        LOCAL_WAKE_NOTIFICATION_PENDING.with(|pending| pending.set(false));
+                    }
                     notify_local_work(backlog);
                 } else {
                     self.notify_idle();
@@ -510,10 +520,30 @@ impl RunQueues {
             self.worker_metrics[worker]
                 .local_pushes
                 .fetch_add(ids.len() as u64, Ordering::Relaxed);
-            notify_local_work(previous + ids.len());
+            let backlog = previous + ids.len();
+            // A small channel fan-in can wake several producers in one poll.
+            // Coalesce thief notifications until its boundary; all tasks are
+            // already published and stealable. Large fanouts notify promptly.
+            if backlog >= 32 {
+                notify_local_work(backlog);
+            } else if backlog > 1 {
+                LOCAL_WAKE_NOTIFICATION_PENDING.with(|pending| pending.set(true));
+            }
         } else {
             self.push_global_batch(ids);
         }
+    }
+
+    fn flush_local_wake_notification(&self, worker: usize) -> bool {
+        if LOCAL_WAKE_NOTIFICATION_PENDING.with(|pending| pending.replace(false)) {
+            let backlog = self
+                .locals
+                .get(worker)
+                .map_or(0, |queue| queue.len.load(Ordering::Acquire));
+            notify_local_work(backlog);
+            return backlog > 1;
+        }
+        false
     }
 
     #[cfg(test)]
@@ -2242,35 +2272,41 @@ fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) 
     });
 }
 
-fn take_global_cancel_work(id: RuntimeTaskId) -> Option<(RuntimeCancelFn, *mut c_void)> {
-    global_task_table()
-        .with_mut(id, |task| {
-            #[cfg(any(
-                all(
-                    target_os = "linux",
-                    target_env = "gnu",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ),
-                all(
-                    target_os = "macos",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ),
-                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
-            ))]
-            if task
-                .native_stack
-                .as_ref()
-                .is_some_and(|stack| stack.is_suspended())
-            {
-                return None;
-            }
-            if task.state.lifecycle() != TaskLifecycle::Cancelling {
-                return None;
-            }
-            let cancel = task.cancel.take()?;
-            Some((cancel, task.frame))
-        })
-        .flatten()
+/// Snapshot dispatch metadata while the claim owns the task shard. Once
+/// claimed, cancellation requests cannot move a running poll to Cancelling;
+/// they are reconciled at its boundary. Native stack ownership is likewise
+/// exclusive to the worker that claims the task.
+fn claimed_task_work(task: &mut RuntimeTask) -> ClaimedTaskWork {
+    let mut suspended = false;
+    let mut cleanup = false;
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    if let Some(stack) = task.native_stack.as_ref() {
+        suspended = stack.is_suspended();
+        cleanup = stack.is_cleanup();
+    }
+    ClaimedTaskWork {
+        poll: task
+            .poll
+            .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
+        cancel: if !suspended && task.state.lifecycle() == TaskLifecycle::Cancelling {
+            task.cancel.take().map(|cancel| (cancel, task.frame))
+        } else {
+            None
+        },
+        direct_poll: task.cooperative_poll && !cleanup,
+        direct_cancel: task.cooperative_poll && !task.native_cancel_cleanup,
+    }
 }
 
 thread_local! {
@@ -2281,6 +2317,7 @@ thread_local! {
     /// drives from inside a poll.
     static CURRENT_WORKER: Cell<usize> = const { Cell::new(0) };
     static SPAWN_NOTIFICATION_PENDING: Cell<bool> = const { Cell::new(false) };
+    static LOCAL_WAKE_NOTIFICATION_PENDING: Cell<bool> = const { Cell::new(false) };
     /// The active parallel run, if this thread is inside a worker pool.
     static CURRENT_RUN_STATE: RefCell<Option<Arc<ParallelRunState>>> = const { RefCell::new(None) };
 }
@@ -2816,47 +2853,54 @@ pub(crate) fn wake_idle_mutators_for_gc() {
     notify_all_idle_waiters();
 }
 
+pub(crate) fn set_current_execution_site(frame: crate::stack_trace::RuntimeFrame) {
+    if let Some(id) = current_task_id() {
+        global_task_table().with_mut(id, |task| task.set_execution_site(frame));
+    }
+}
+
 /// Render the active async chain for panic diagnostics (willow-9lw).
 pub fn async_chain_text() -> String {
-    with_global(|sched| {
-        let Some(mut id) = current_task_id() else {
-            return String::new();
-        };
-        let mut lines = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        // Walk current task -> its awaiter -> ... via the reverse `waiters` link.
-        while seen.insert(id) {
-            let Some((line, awaiter)) = sched.with_task(id, |task| {
-                let name = task.name().unwrap_or("<async task>");
-                let site = match task.spawn_site() {
-                    Some((file, line)) => format!(" [task {id}, spawned at {file}:{line}]"),
-                    None => format!(" [task {id}]"),
-                };
-                // Only inspect the first live waiter; do not copy the task's
-                // other relationships while rendering its diagnostic line.
-                (
-                    format!("  {}: async {}{}", lines.len(), name, site),
-                    task.first_live_waiter(),
-                )
-            }) else {
-                break;
+    let Some(mut id) = current_task_id() else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Walk current task -> its awaiter -> ... via the reverse `waiters` link.
+    while seen.insert(id) {
+        let Some((line, awaiter)) = global_task_table().with(id, |task| {
+            let name = task.name().unwrap_or("<async task>");
+            let location = task.execution_site().map_or_else(String::new, |frame| {
+                format!(" at {}:{}:{}", frame.file, frame.line, frame.col)
+            });
+            let site = match task.spawn_site() {
+                Some((file, line)) => format!(" [task {id}, spawned at {file}:{line}]"),
+                None => format!(" [task {id}]"),
             };
-            lines.push(line);
-            match awaiter {
-                Some(awaiter) => id = awaiter,
-                None => break,
-            }
+            // Only inspect the first live waiter; do not copy the task's
+            // other relationships while rendering its diagnostic line.
+            (
+                format!("  {}: async {}{}{}", lines.len(), name, location, site),
+                task.first_live_waiter(),
+            )
+        }) else {
+            break;
+        };
+        lines.push(line);
+        match awaiter {
+            Some(awaiter) => id = awaiter,
+            None => break,
         }
-        if lines.is_empty() {
-            return String::new();
-        }
-        let mut out = String::from("async stack (current task first):");
-        for line in lines {
-            out.push('\n');
-            out.push_str(&line);
-        }
-        out
-    })
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("async stack (current task first):");
+    for line in lines {
+        out.push('\n');
+        out.push_str(&line);
+    }
+    out
 }
 
 /// Requested worker count from `WILLOW_WORKERS`, or available parallelism.
@@ -3240,6 +3284,7 @@ thread_local! {
 }
 
 fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instant>) -> i64 {
+    crate::gc::scheduler_start(runtime_worker_config().active_workers());
     crate::stack_overflow::protect_current_thread();
     if crate::panic_context::panic_unwind_cleanup_active() {
         crate::panic_context::fatal_invariant(
@@ -3804,6 +3849,7 @@ fn claim_global_ready_for_worker(
     enum Claim {
         Work(ClaimedTaskWork, Arc<crate::panic_context::PanicContext>),
         FinalizeCancelled,
+        Reroute(usize),
         Drop,
     }
 
@@ -3830,28 +3876,6 @@ fn claim_global_ready_for_worker(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             });
-        #[cfg(any(
-            all(
-                target_os = "linux",
-                target_env = "gnu",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ),
-            all(
-                target_os = "macos",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ),
-            all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
-        ))]
-        if let Some(owner) = tasks
-            .with(id, |task| {
-                task.native_stack.as_ref().map(|stack| stack.worker)
-            })
-            .flatten()
-            && owner != worker
-        {
-            queues.push_local(owner, id);
-            return None;
-        }
         if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             drop(claim_guard);
             // The queue token is still set because no claim occurred.
@@ -3859,22 +3883,35 @@ fn claim_global_ready_for_worker(
             return None;
         }
         let claim = tasks
-            .with_mut(id, |task| match task.claim_for_poll() {
-                ClaimOutcome::Drop => Claim::Drop,
-                ClaimOutcome::Poll => {
-                    task.yield_requested = false;
-                    Claim::Work(
-                        task.poll
-                            .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
-                        task.panic_context(),
-                    )
+            .with_mut(id, |task| {
+                #[cfg(any(
+                    all(
+                        target_os = "linux",
+                        target_env = "gnu",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    ),
+                    all(
+                        target_os = "macos",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    ),
+                    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+                ))]
+                if let Some(owner) = task.native_stack.as_ref().map(|stack| stack.worker)
+                    && owner != worker
+                {
+                    return Claim::Reroute(owner);
                 }
-                ClaimOutcome::Cancel if task_requires_cancel_poll(task) => Claim::Work(
-                    task.poll
-                        .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
-                    task.panic_context(),
-                ),
-                ClaimOutcome::Cancel => Claim::FinalizeCancelled,
+                match task.claim_for_poll() {
+                    ClaimOutcome::Drop => Claim::Drop,
+                    ClaimOutcome::Poll => {
+                        task.yield_requested = false;
+                        Claim::Work(claimed_task_work(task), task.panic_context())
+                    }
+                    ClaimOutcome::Cancel if task_requires_cancel_poll(task) => {
+                        Claim::Work(claimed_task_work(task), task.panic_context())
+                    }
+                    ClaimOutcome::Cancel => Claim::FinalizeCancelled,
+                }
             })
             .unwrap_or(Claim::Drop);
         if matches!(claim, Claim::Work(..))
@@ -3897,6 +3934,10 @@ fn claim_global_ready_for_worker(
                     0,
                 );
                 set_current_task(None);
+            }
+            Claim::Reroute(owner) => {
+                queues.push_local(owner, id);
+                return None;
             }
             Claim::Drop => {}
         }
@@ -4143,6 +4184,7 @@ fn scheduler_run_loop(
         if SPAWN_NOTIFICATION_PENDING.with(|pending| pending.replace(false)) {
             notify_idle_waiters();
         }
+        global_run_queues().flush_local_wake_notification(worker);
         if fatal_panic_pending() {
             park_until_fatal_abort();
         }
@@ -4276,11 +4318,11 @@ fn scheduler_run_loop(
         // A task the claim moved to Cancelling: run its cleanup entry WITHOUT
         // the scheduler lock (poll-like), then finalize as Cancelled
         // (willow-vynv.3). The frame stays rooted until finalization.
-        let cancel_work = take_global_cancel_work(id);
+        let cancel_work = work.cancel;
         let frame_identity = cancel_work
             .as_ref()
             .map(|(_, frame)| *frame as usize)
-            .or_else(|| work.as_ref().map(|(_, frame, _)| *frame as usize))
+            .or_else(|| work.poll.as_ref().map(|(_, frame, _)| *frame as usize))
             .unwrap_or(0);
         let _poll_lifetime = crate::frame_lifetime::PollLifetime::enter(frame_identity);
         if let Some((cancel_fn, cancel_frame)) = cancel_work {
@@ -4297,12 +4339,7 @@ fn scheduler_run_loop(
                 all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             ))]
             {
-                let direct = global_task_table()
-                    .with(id, |task| {
-                        task.cooperative_poll && !task.native_cancel_cleanup
-                    })
-                    .unwrap_or(false);
-                if direct {
+                if work.direct_cancel {
                     unsafe { cancel_fn(cancel_frame) };
                 } else {
                     let mut stack =
@@ -4388,7 +4425,7 @@ fn scheduler_run_loop(
             set_current_task(None);
             continue;
         }
-        let Some((poll, frame, preempt_flag)) = work else {
+        let Some((poll, frame, preempt_flag)) = work.poll else {
             // Placeholder task with no executable work: just complete it.
             with_global(|sched| {
                 sched.complete(id);
@@ -4428,16 +4465,7 @@ fn scheduler_run_loop(
             all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
         ))]
         let (result, native_cancelled) = {
-            let direct = global_task_table()
-                .with(id, |task| {
-                    task.cooperative_poll
-                        && !task
-                            .native_stack
-                            .as_ref()
-                            .is_some_and(|stack| stack.is_cleanup())
-                })
-                .unwrap_or(false);
-            if direct {
+            if work.direct_poll {
                 (unsafe { poll(frame) }, false)
             } else {
                 let mut stack = global_task_table()
@@ -4613,6 +4641,7 @@ pub fn reset_global_scheduler_for_test() {
     set_current_task(None);
     CURRENT_WORKER.with(|worker| worker.set(0));
     SPAWN_NOTIFICATION_PENDING.with(|pending| pending.set(false));
+    LOCAL_WAKE_NOTIFICATION_PENDING.with(|pending| pending.set(false));
     CURRENT_RUN_STATE.with(|state| {
         state.replace(None);
     });

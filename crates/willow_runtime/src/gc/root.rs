@@ -111,15 +111,28 @@ pub(crate) unsafe fn park_current_roots(depth: usize) -> u64 {
 /// `token` must own a still-live suspended native stack. The caller must resume
 /// that stack without executing a safepoint against the wrong stack's slots.
 pub(crate) unsafe fn resume_parked_roots(token: u64) {
+    // Legacy admission takes coord; never acquire it while holding parked,
+    // because stopped root snapshots take coord -> parked. Token ownership
+    // keeps the entry stable across these two lock holds.
+    if !current_thread_is_registered() {
+        let has_roots = !runtime()
+            .parked_stack_roots
+            .lock()
+            .unwrap()
+            .get(&token)
+            .expect("unknown parked native stack")
+            .slots
+            .is_empty();
+        if has_roots {
+            claim_root_stack_owner();
+        }
+    }
     let mut parked = runtime().parked_stack_roots.lock().unwrap();
     let PublishedRoots {
         slots, relocatable, ..
     } = parked.remove(&token).expect("unknown parked native stack");
     set_relocation_safe(relocatable);
     retain_transferred_roots(slots.iter().map(|&slot| slot as *mut *mut u8));
-    if !slots.is_empty() {
-        claim_root_stack_owner();
-    }
     ROOT_STACK.with(|roots| {
         let mut roots = roots.borrow_mut();
         roots.extend(slots.into_iter().map(|slot| slot as *mut *mut u8));
@@ -146,8 +159,9 @@ pub(crate) unsafe fn discard_parked_roots(token: u64) {
 /// The holder keeps the raw address, which a moving collection cannot rewrite,
 /// so `object` must not be young: register only runtime allocations (always
 /// old) or objects that already survived promotion. Old objects are never
-/// moved, so a minor collection only scans the root for young children
-/// (willow-9tls.9); registering a young object is fatal. A holder of a
+/// moved. Registration remembers its initial children; subsequent reference
+/// stores must use the GC write barrier. Minors scan remembered owners rather
+/// than enumerating persistent address roots. Registering a young object is fatal. A holder of a
 /// possibly young object registers its storage with
 /// [`willow_gc_add_runtime_root_slot`] instead.
 #[unsafe(no_mangle)]
@@ -163,7 +177,7 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
     // as it crosses the corresponding phase-gated SATB deletion below.
     let marking = GC_MARK_PHASE.load(Ordering::Acquire) != 0;
     if marking || runtime().tlab_ever_allocated.load(Ordering::Acquire) {
-        let state = runtime().heap.lock().unwrap();
+        let mut state = runtime().heap.lock().unwrap();
         if tlab_payload_generation(&state, object as usize) == Some(GC_GENERATION_YOUNG) {
             drop(state);
             crate::failure::fatal_invariant(
@@ -173,6 +187,9 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
         }
         if marking && let Some(cycle) = state.concurrent_cycle.as_ref() {
             cycle.enqueue(object);
+        }
+        if runtime().tlab_ever_allocated.load(Ordering::Acquire) {
+            barrier::remember_owner(&mut state, object as usize);
         }
     }
     runtime().runtime_roots.add(object);
@@ -237,8 +254,27 @@ pub(super) fn claim_root_stack_owner() {
     if current_thread_is_registered() {
         return;
     }
+    let coord = runtime().coord.0.lock().unwrap();
+    claim_legacy_owner_locked(&coord, true);
+}
+
+// Admission and collector election share coord. A raw, unpublished reference
+// cannot safely wait across a collection; reject misuse before publishing it.
+pub(super) fn claim_legacy_owner_locked(coord: &GcCoord, already_unregistered: bool) {
     let current = std::thread::current().id();
     let mut owner = runtime().root_stack_owner.lock().unwrap();
+    // Existing legacy ownership already requires a foreign collector to defer.
+    if already_unregistered && *owner == Some(current) {
+        return;
+    }
+    if coord
+        .cycle_collector
+        .is_some_and(|collector| collector != current)
+    {
+        crate::failure::fatal_invariant(
+            "unregistered root ownership during GC; enter NativeGcScope before acquiring references",
+        );
+    }
     match *owner {
         Some(existing) if existing != current => {
             eprintln!("willow gc: explicit root stacks are single-mutator in the current runtime");

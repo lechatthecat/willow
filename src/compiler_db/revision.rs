@@ -320,13 +320,19 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "willow-revision-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&path).unwrap();
-            Self(path)
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "willow-revision-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    // Separate PID namespaces can share the host temp directory.
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create revision fixture: {error}"),
+                }
+            }
         }
         fn write(&self, file: &str, source: &str) {
             std::fs::write(self.0.join(file), source).unwrap();
@@ -770,6 +776,53 @@ mod tests {
             assert_eq!(warm_object.keys().collect::<Vec<_>>(), cold_object.keys().collect::<Vec<_>>());
             for (name, code) in warm_object {
                 assert_eq!(code, cold_object[&name], "machine code for {name}, edit {iteration}");
+            }
+        }
+    }
+
+    #[test]
+    fn revision_lir_wire_hits_match_cold_across_coordinates_and_shapes() {
+        let f = Fixture::new();
+        for (shape, source) in [
+            (
+                "functions",
+                "fn value() -> i64 { return 42; } fn main() { println(value()); }",
+            ),
+            (
+                "lambda",
+                "fn main() { let f = |x: i64| x + 1; println(f(41)); }",
+            ),
+            ("defer", "fn main() { defer { println(42); } println(1); }"),
+            (
+                "class",
+                "class Counter { pub value: i64; pub fn get(self) -> i64 { return self.value; } } fn main() { println(new Counter(42).get()); }",
+            ),
+            ("async", "async fn main() { await yield(); println(42); }"),
+        ] {
+            let mut warm = AnalysisRevision::default();
+            let _symbols = warm.symbols.enter();
+            for (epoch, edited) in [
+                source.to_owned(),
+                source.to_owned(),
+                format!("\n// shifted\n{source}"),
+                format!("\n\n// shifted again\n{source}"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                f.write("main.wi", edited);
+                assert!(f.compare(&mut warm), "{shape}/{epoch}");
+                if epoch != 0 {
+                    assert_eq!(warm.typechecks, 0, "{shape}/{epoch}");
+                }
+                let actual = native_object(&warm, &f.0.join("main.wi"));
+                let mut cold = AnalysisRevision::default();
+                assert!(f.compare(&mut cold));
+                assert_eq!(
+                    actual,
+                    native_object(&cold, &f.0.join("main.wi")),
+                    "{shape}/{epoch}"
+                );
             }
         }
     }

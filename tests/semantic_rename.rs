@@ -803,9 +803,13 @@ fn rename_keywords_name_the_reserved_word_for_all_target_kinds() {
     for (source, selector) in [
         ("fn old() {} fn main() { old(); }", "old"),
         ("class A { pub old: i64; } fn main() {}", "main::A::old"),
+        (
+            "class A { pub fn old(self) {} } fn main() {}",
+            "main::A::old",
+        ),
         ("fn main() { let old = 1; println(old); }", "old"),
     ] {
-        for keyword in ["open", "if", "class", "return", "i64"] {
+        for keyword in ["open", "if", "class", "return", "i64", "print", "println"] {
             let f = Fixture::new(source);
             let result = f.run(&["rename", selector, keyword], 1);
             assert!(
@@ -815,6 +819,14 @@ fn rename_keywords_name_the_reserved_word_for_all_target_kinds() {
                     .contains(&format!("'{keyword}' is a reserved keyword")),
                 "{result}"
             );
+            if matches!(keyword, "print" | "println") {
+                assert!(
+                    result["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("builtin function name")
+                );
+            }
             assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
         }
     }

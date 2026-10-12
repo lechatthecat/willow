@@ -4102,3 +4102,6 @@ fn runtime_policy_budget_is_per_thread() {
 
 #[path = "root_handle_tests.rs"]
 mod root_handle_tests;
+
+#[path = "foreign_owner_tests.rs"]
+mod foreign_owner_tests;

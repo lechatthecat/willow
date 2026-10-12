@@ -11,6 +11,11 @@ pub(super) fn validate_name(name: &str) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("invalid identifier"))?;
     if tokens.len() == 2 {
         if let Some(keyword) = tokens[0].kind.keyword_name() {
+            if matches!(tokens[0].kind, TokenKind::Print | TokenKind::Println) {
+                anyhow::bail!(
+                    "rename requires an identifier; '{keyword}' is a reserved keyword (builtin function name)"
+                );
+            }
             anyhow::bail!("rename requires an identifier; '{keyword}' is a reserved keyword");
         }
         if matches!(&tokens[0].kind, TokenKind::Ident(s) if s == name) {

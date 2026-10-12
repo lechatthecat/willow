@@ -91,11 +91,12 @@ impl LirQueries {
         let cached = tracking
             .queries
             .borrow_mut()
-            .validate_derived(node.clone(), deps.clone())?;
+            .validate_derived_typed::<V>(node.clone(), deps.clone())?;
         if let Some(value) = cached {
-            let result = tracking
-                .bodies
-                .remap_cached(&serde_json::from_value::<V>(value)?)?;
+            if !tracking.bodies.cached_coordinates_changed() {
+                return Ok(value);
+            }
+            let result = tracking.bodies.remap_cached(&value)?;
             tracking
                 .queries
                 .borrow_mut()
@@ -107,8 +108,7 @@ impl LirQueries {
         tracking
             .queries
             .borrow_mut()
-            .publish_derived(node.clone(), wire.clone(), deps)?;
-        tracking.queries.borrow_mut().refresh_derived(node, wire)?;
+            .publish_derived(node, wire, deps)?;
         Ok(result)
     }
 

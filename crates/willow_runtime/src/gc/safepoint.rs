@@ -191,6 +191,12 @@ pub extern "C" fn willow_gc_unregister_mutator() {
     let id = std::thread::current().id();
     let (lock, cv) = &runtime().coord;
     let mut coord = lock.lock().unwrap();
+    // A previously registered stack must not disappear from both registries.
+    // Empty-stack shutdown remains legal during a collection. Nonempty raw
+    // ownership cannot leave a running epoch's barrier/handshake protocol.
+    if ROOT_DEPTH.get() != 0 {
+        claim_legacy_owner_locked(&coord, false);
+    }
     coord.mutators.remove(&id);
     coord.stw_pending.remove(&id);
     REGISTERED_EPOCH.set(0);
@@ -218,14 +224,23 @@ pub extern "C" fn willow_gc_unregister_mutator() {
 /// path as well. Prefer it over the bare pair wherever the registered region
 /// can panic.
 #[must_use = "dropping the guard unregisters the mutator immediately"]
-pub struct MutatorRegistration(());
+pub struct MutatorRegistration {
+    owned: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
 
 impl MutatorRegistration {
     /// Register the calling thread, joining a collection that has already
     /// requested a stop exactly as `willow_gc_register_mutator` does.
     pub fn new() -> Self {
-        willow_gc_register_mutator();
-        Self(())
+        let owned = !current_thread_is_registered();
+        if owned {
+            willow_gc_register_mutator();
+        }
+        Self {
+            owned,
+            _thread: std::marker::PhantomData,
+        }
     }
 }
 
@@ -237,7 +252,47 @@ impl Default for MutatorRegistration {
 
 impl Drop for MutatorRegistration {
     fn drop(&mut self) {
-        willow_gc_unregister_mutator();
+        if self.owned {
+            willow_gc_unregister_mutator();
+        }
+    }
+}
+
+/// Temporary native/FFI mutator registration. Enter BEFORE acquiring managed
+/// references; poll `willow_gc_safepoint` during long-running managed work.
+/// Roots pushed within this lexical scope are removed on return, cancellation
+/// (Drop), or Rust unwind. Nested scopes preserve the caller's registration and
+/// root prefix. Do not pop caller-owned roots or let raw references escape.
+///
+/// Native calls with no heap references need no scope. Native code that blocks
+/// without polling must instead retain already-published stable handles or
+/// PinLease address loans and must not manipulate unprotected managed values.
+/// Generated FFI calls already on a mutator use explicit safepoints and their
+/// existing handle/PinLease bridge; this scope does not unregister that caller.
+#[must_use]
+pub struct NativeGcScope {
+    depth: usize,
+    _registration: MutatorRegistration,
+}
+
+impl NativeGcScope {
+    pub fn enter() -> Self {
+        let registration = MutatorRegistration::new();
+        Self {
+            depth: ROOT_DEPTH.get(),
+            _registration: registration,
+        }
+    }
+}
+
+impl Drop for NativeGcScope {
+    fn drop(&mut self) {
+        ROOT_STACK.with(|roots| {
+            let mut roots = roots.borrow_mut();
+            roots.truncate(self.depth);
+            ROOT_DEPTH.set(roots.len());
+        });
+        clear_root_stack_owner_if_empty();
     }
 }
 

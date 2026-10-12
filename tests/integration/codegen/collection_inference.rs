@@ -192,3 +192,28 @@ fn freeze_inference_allocation_sites_scale_linearly() {
         }
     }
 }
+
+#[test]
+fn empty_array_binding_task_class_string_annotations() {
+    let source = r#"
+import std::collections::Array;
+class Item { pub value: i64; }
+async fn worker() -> i64 { return 7; }
+async fn main() {
+    let mut tasks: Array<Task<i64>> = [];
+    tasks.push(worker());
+    for task in tasks { println(await task); }
+    let mut items: Array<Item> = [];
+    items.push(new Item(9));
+    for item in items { println(item.value); }
+    let mut strings: Array<String> = [];
+    strings.push("hello");
+    for s in strings { println(s); }
+}
+"#;
+    for run in [compile_and_run, compile_and_run_release] {
+        let (out, ok) = run(source);
+        assert!(ok, "{out}");
+        assert_eq!(out, "7\n9\nhello\n");
+    }
+}

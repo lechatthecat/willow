@@ -260,6 +260,7 @@ pub(crate) fn capture(
             _ => {}
         }
     }
+    let builtin_aliases = crate::compiler_db::normalize::builtin_module_aliases(program);
     let mut lambda_roots = HashMap::new();
     while let Some((id, span, body_id, body, is_async)) = pending.pop() {
         result.identities.insert(id, body_id);
@@ -330,6 +331,30 @@ pub(crate) fn capture(
                     "loop-safepoint",
                 )),
                 AstEvent::Expr(e) => {
+                    if let Some(target) = calls.get(&e.id()) {
+                        let operation = match e {
+                            Expr::Call(c) => Some(c.callee.clone()),
+                            Expr::MethodCall(c) => Some(c.method.clone()),
+                            Expr::StaticCall(c) => Some(format!("{}::{}", c.class, c.method)),
+                            _ => None,
+                        };
+                        let builtin = target.as_ref().is_some_and(|target| {
+                            crate::semantic::intrinsics::builtin_target_effects(target)
+                                .or_else(|| {
+                                    crate::semantic::intrinsics::builtin_static_effects(
+                                        target,
+                                        &builtin_aliases,
+                                    )
+                                })
+                                .is_some()
+                        });
+                        if !builtin && let Some(operation) = operation {
+                            result
+                                .semantic
+                                .call_sites
+                                .push((id, e.span(), *target, operation));
+                        }
+                    }
                     if matches!(e, Expr::String(..)) {
                         // Literal slots can allocate on first use, but a static
                         // literal is not evidence of a per-evaluation allocation.
@@ -384,6 +409,21 @@ pub(crate) fn capture(
                             .and_then(|target| target.as_ref())
                             .and_then(crate::semantic::intrinsics::builtin_target_effects)
                             .map_or(0, |effects| effects.bits()),
+                        Expr::StaticCall(_) => calls
+                            .get(&e.id())
+                            .and_then(|target| target.as_ref())
+                            .filter(|target| {
+                                target
+                                    .owner()
+                                    .is_some_and(|owner| symbols.lookup_class(&owner).is_none())
+                            })
+                            .and_then(|target| {
+                                crate::semantic::intrinsics::builtin_static_effects(
+                                    target,
+                                    &builtin_aliases,
+                                )
+                            })
+                            .map_or(0, |effects| effects.bits()),
                         Expr::Call(c)
                             if symbols
                                 .lookup_func(&c.callee)
@@ -421,7 +461,7 @@ pub(crate) fn capture(
                             "array-length-null-panic"
                         }
                         Expr::MethodCall(_) => "builtin-method-call",
-                        Expr::Call(_) => "builtin-call",
+                        Expr::Call(_) | Expr::StaticCall(_) => "builtin-call",
                         _ => "expression",
                     };
                     Some((effects, e.span(), operation))
@@ -432,6 +472,12 @@ pub(crate) fn capture(
                 bits |= effects;
                 if effects != 0 {
                     result.semantic.capability(id, effects, span, reason);
+                    if let AstEvent::Expr(Expr::Await(a)) = event {
+                        let operand = types
+                            .get(&a.expr.id())
+                            .map(crate::semantic::type_checker::type_name);
+                        result.semantic.await_type(id, span, operand.as_deref());
+                    }
                 }
             }
             match event {

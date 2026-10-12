@@ -652,7 +652,7 @@ impl UnitCodegenContext<'_> {
                 lir_send_offsets,
             },
         )?;
-        self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites)?;
+        self.compile_async_cancel_fn(cancel_fid, &f.name, &sites, &lock_sites)?;
         Ok(())
     }
 
@@ -906,7 +906,11 @@ impl UnitCodegenContext<'_> {
 
         let poll_decl = FunctionDecl {
             type_params: Vec::new(),
-            name: format!("{class_name}::{}", m.name),
+            name: format!(
+                "{}::{}",
+                class_name.strip_prefix("$local::").unwrap_or(class_name),
+                m.name
+            ),
             public: m.public,
             is_async: true,
             params: m.params.clone(),
@@ -936,7 +940,7 @@ impl UnitCodegenContext<'_> {
                 lir_send_offsets,
             },
         )?;
-        self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites)?;
+        self.compile_async_cancel_fn(cancel_fid, &poll_decl.name, &sites, &lock_sites)?;
         Ok(())
     }
 
@@ -1262,14 +1266,9 @@ impl UnitCodegenContext<'_> {
             }
         }
         let result_offset = body.result_offset;
-        // Declare the async fn name as static bytes so the poll fn can tag its
-        // task for async stack traces (debug builds only; willow-9lw).
-        let tag_name = if self.build_mode == BuildMode::Debug {
-            self.declare_string_literal(&f.name)?;
-            Some(f.name.clone())
-        } else {
-            None
-        };
+        // Task identity remains available in release panic diagnostics.
+        self.declare_string_literal(&f.name)?;
+        let tag_name = Some(f.name.clone());
         let mut sig = self.output.module.make_signature();
         sig.params.push(AbiParam::new(reference_type(
             self.output.module.target_config(),
@@ -1402,6 +1401,8 @@ impl UnitCodegenContext<'_> {
                 coop_shadow_roots: Some(CoopShadowRoots::default()),
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
+                diagnostic_function: f.name.clone(),
+                diagnostic_async: true,
                 // Boundary operands already occupy address-stable parent frame
                 // slots. No parent-wide address analysis or local seeding is
                 // needed when emitting just this one call.
@@ -1423,6 +1424,8 @@ impl UnitCodegenContext<'_> {
                 );
             }
             fg.builder.switch_to_block(body_start);
+            fg.fault_site_span = Some(f.span);
+            fg.emit_fault_site();
             fg.coop_frame = (body.boundary.is_none() && body.cleanup.is_none()).then_some(frame);
             fg.coop_suspend_points =
                 (body.boundary.is_none() && body.cleanup.is_none()).then(|| suspends.clone());
@@ -1478,12 +1481,12 @@ impl UnitCodegenContext<'_> {
                 let addr = builder.ins().stack_addr(ptr_ty, *slot, 0);
                 builder.ins().call(push_ref, &[addr]);
             }
-            for (method, span) in &suspend.call_frames {
+            for (_, span) in &suspend.call_frames {
                 let name_data = *self
                     .output
                     .string_literals
-                    .get(method)
-                    .expect("prepared method name registered");
+                    .get(&f.name)
+                    .expect("diagnostic function name registered");
                 let file_data = *self
                     .output
                     .string_literals
@@ -1499,13 +1502,13 @@ impl UnitCodegenContext<'_> {
                     .declare_data_in_func(file_data.bytes, builder.func);
                 let name = builder.ins().symbol_value(ptr_ty, name_global);
                 let file = builder.ins().symbol_value(ptr_ty, file_global);
-                let name_len = builder.ins().iconst(types::I64, method.len() as i64);
+                let name_len = builder.ins().iconst(types::I64, f.name.len() as i64);
                 let file_len = builder
                     .ins()
                     .iconst(types::I64, self.source_file.len() as i64);
                 let line = builder.ins().iconst(types::I32, span.line as i64);
                 let col = builder.ins().iconst(types::I32, span.col as i64);
-                let push = self.func_id("willow_callstack_push");
+                let push = self.func_id("willow_callstack_push_pending");
                 let push = self.output.module.declare_func_in_func(push, builder.func);
                 builder
                     .ins()
@@ -1543,6 +1546,7 @@ impl UnitCodegenContext<'_> {
     pub(super) fn compile_async_cancel_fn(
         &mut self,
         cancel_fid: cranelift_module::FuncId,
+        diagnostic_function: &str,
         sites: &[AsyncDeferSite],
         lock_sites: &[AsyncLockSite],
     ) -> Result<()> {
@@ -1632,7 +1636,11 @@ impl UnitCodegenContext<'_> {
                 coop_shadow_roots: None,
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
-                // The cancel path runs cleanup only; it compiles no user body.
+                // Cancellation replays user defers from this async function.
+                // LIR publishes each deferred instruction's own source span.
+                diagnostic_function: diagnostic_function.to_owned(),
+                diagnostic_async: true,
+                // Cleanup operands already have their frame-backed bindings.
                 address_taken: HashSet::new(),
             };
             // A single order is essential here. Running all defers before all

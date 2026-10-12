@@ -49,9 +49,7 @@ fn assert_rejected_without_aborting(source: &str, expected_code: &str) {
     );
 }
 
-/// A sync taker, so a lambda can be written as an argument. An `fn`-typed
-/// local inside an async frame is separately rejected by E2402, which would
-/// mask the diagnostic under test.
+/// A sync taker exercises lambda context isolation in argument position.
 const APPLY: &str = "fn apply(m: Mutex<i64>, f: fn(Mutex<i64>) -> void) { f(m); }\n";
 
 // 1. The original report now compiles and resumes through LIR.

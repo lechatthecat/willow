@@ -986,6 +986,7 @@ fn bounded_unit_16_stale_head_does_not_swallow_the_single_wake() {
     register_existing_test_ownership(live, ch);
 
     assert_eq!(willow_channel_recv_i64(ch), 1);
+    while deferred::drive_for_test() != 0 {}
     assert!(
         send_waiter_ids(ch).is_empty(),
         "the stale head and the one producer actually woken are both consumed"
@@ -1357,6 +1358,39 @@ fn wq_15_close_wakes_a_dual_registered_task_once() {
     );
     assert_eq!(expected_test_ownership(task, other), vec![other_owner]);
 }
+#[test]
+fn ready_select_cleanup_does_not_relock_empty_wait_queues() {
+    use std::sync::atomic::Ordering;
+
+    let _guard = crate::gc::runtime_test_guard();
+    crate::scheduler::reset_global_scheduler_for_test();
+    let owner = crate::scheduler::with_global_for_test(|s| s.spawn_parked_placeholder());
+    let channels = std::array::from_fn::<_, 4, _>(|_| willow_channel_new_bounded(0, 1));
+    for raw in channels {
+        willow_channel_send_i64(raw, 1);
+    }
+    for messages in [1_000, 10_000, 100_000, 1_000_000] {
+        CHANNEL_RESERVE_LOCKS.store(0, Ordering::Relaxed);
+        crate::scheduler::with_current_task_for_test(owner, || {
+            for message in 0..messages {
+                for raw in channels {
+                    assert_eq!(willow_channel_recv_ready(raw), 1);
+                }
+                let winner = channels[message % channels.len()];
+                for raw in channels {
+                    willow_channel_select_cleanup(raw, winner, 0);
+                }
+                assert_eq!(willow_channel_recv_i64(winner), 1);
+                willow_channel_send_i64(winner, 1);
+            }
+        });
+        let locks = CHANNEL_RESERVE_LOCKS.load(Ordering::Relaxed);
+        assert_eq!(locks, 0);
+        assert!(crate::scheduler::take_channel_waits(owner).is_empty());
+        println!("select messages={messages} cases=4 compensation_locks={locks}");
+    }
+}
+
 #[test]
 fn receive_select_retains_winner_and_compensates_losing_claim() {
     let _guard = crate::gc::runtime_test_guard();

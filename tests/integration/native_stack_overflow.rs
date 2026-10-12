@@ -108,3 +108,122 @@ fn native_stack_overflow_twenty_call_and_frame_perspectives() {
         }
     }
 }
+
+// Linux exposes a reproducible process stack budget through RLIMIT_STACK.
+// Other hosts retain the portable overflow perspectives above.
+#[cfg(target_os = "linux")]
+mod depth_regression {
+    use super::*;
+
+    const STEP: usize = 128;
+
+    fn succeeds(binary: &str, depth: usize, stack_kib: usize) -> bool {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "set -e; ulimit -s \"$1\"; ulimit -c 0; shift; exec \"$@\"",
+                "willow-depth-test",
+                &stack_kib.to_string(),
+                binary,
+                &"x".repeat(depth / STEP),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run depth fixture");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while child.try_wait().expect("poll depth fixture").is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("depth fixture timed out at {depth}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let output = child.wait_with_output().expect("collect depth fixture");
+        if output.status.success() {
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                depth.to_string()
+            );
+            true
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("Willow runtime error: native stack overflow"),
+                "unexpected failure at depth {depth}: {output:?}"
+            );
+            false
+        }
+    }
+
+    fn maximum_depth(binary: &str, stack_kib: usize) -> (usize, usize) {
+        let (mut low, mut high) = (0, STEP);
+        assert!(succeeds(binary, low, stack_kib));
+        while succeeds(binary, high, stack_kib) {
+            low = high;
+            high *= 2;
+            assert!(high <= 4 * 1024 * 1024, "missing stack boundary");
+        }
+        while high - low > STEP {
+            let middle = ((low + high) / (2 * STEP)) * STEP;
+            if succeeds(binary, middle, stack_kib) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        (low, high)
+    }
+
+    fn check_result_depth(release: bool) {
+        let id = unique_test_id();
+        let source = temp_path(format!("willow_result_depth_{id}.wi"));
+        let binary = temp_path(format!("willow_result_depth_{id}"));
+        fs::write(
+            &source,
+            include_str!("../fixtures/native_stack_depth/result.wi"),
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
+        command.args(["build", &source, "-o", &binary]);
+        if release {
+            command.arg("--release");
+        }
+        let output = command.output().expect("compile depth fixture");
+        assert!(output.status.success(), "{output:?}");
+        // Include 8 MiB so the regression crosses the originally reported
+        // 32k boundary, rather than only measuring shallower recursion.
+        let depths = [1024, 2048, 4096, 8192].map(|stack_kib| {
+            let interval = maximum_depth(&binary, stack_kib);
+            eprintln!("Result release={release}: {stack_kib} KiB={interval:?}");
+            interval
+        });
+        let _ = fs::remove_file(source);
+        remove_output_artifacts(&binary);
+        // A hidden root-count/depth cap cannot scale with the stack budget.
+        // Tolerate ASLR, process startup frames and the 128-level search interval.
+        assert!(depths[0].0 >= 2048, "unexpected per-frame cost: {depths:?}");
+        for pair in depths.windows(2) {
+            let [small, large] = pair else { unreachable!() };
+            assert!(
+                large.0 * 10 >= small.1 * 18,
+                "nonproportional depth: {small:?}, {large:?}"
+            );
+            assert!(
+                large.1 * 10 <= small.0 * 22,
+                "unexpected depth ratio: {small:?}, {large:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn result_maximum_depth_scales_with_stack_debug() {
+        check_result_depth(false);
+    }
+
+    #[test]
+    fn result_maximum_depth_scales_with_stack_release() {
+        check_result_depth(true);
+    }
+}

@@ -1,5 +1,56 @@
 use super::*;
 
+#[test]
+fn small_local_wake_notifications_coalesce_without_hiding_work() {
+    let old_depth = SCHED_RUN_DEPTH.with(|depth| depth.replace(1));
+    let old_worker = CURRENT_WORKER.with(|worker| worker.replace(0));
+    LOCAL_WAKE_NOTIFICATION_PENDING.with(|pending| pending.set(false));
+    let queues = RunQueues::new(2);
+    for rounds in [1_000, 10_000, 100_000, 1_000_000] {
+        let mut notifications = 0;
+        for _ in 0..rounds {
+            for id in 1..=4 {
+                queues.push_woken_batch(&[id]);
+            }
+            assert_eq!(queues.len(), 4);
+            notifications += usize::from(queues.flush_local_wake_notification(0));
+            assert!(!queues.flush_local_wake_notification(0));
+            for _ in 0..4 {
+                assert!(queues.pop_for_worker(0).is_some());
+            }
+        }
+        assert_eq!(notifications, rounds);
+        println!(
+            "wake rounds={rounds} published={} notifications={notifications}",
+            4 * rounds
+        );
+    }
+    // A thief may consume the batch before the boundary: no empty wake then.
+    queues.push_woken_batch(&[1, 2]);
+    assert!(queues.pop_for_worker(1).is_some());
+    assert!(queues.pop_for_worker(1).is_some());
+    assert!(!queues.flush_local_wake_notification(0));
+    queues.push_woken_batch(&[1, 2]);
+    queues.push_local(0, 3);
+    assert!(!queues.flush_local_wake_notification(0));
+    for _ in 0..3 {
+        assert!(queues.pop_for_worker(0).is_some());
+    }
+    // Large batches notify immediately, independently of a poll boundary.
+    queues.push_woken_batch(&(1..=32).collect::<Vec<_>>());
+    assert!(!LOCAL_WAKE_NOTIFICATION_PENDING.with(Cell::get));
+    for _ in 0..32 {
+        assert!(queues.pop_for_worker(1).is_some());
+    }
+    // An external publisher does not depend on a future poll boundary.
+    SCHED_RUN_DEPTH.with(|depth| depth.set(0));
+    queues.push_woken_batch(&[3, 4]);
+    assert_eq!(queues.metrics_snapshot().global_pushes, 2);
+    assert!(!LOCAL_WAKE_NOTIFICATION_PENDING.with(Cell::get));
+    CURRENT_WORKER.with(|worker| worker.set(old_worker));
+    SCHED_RUN_DEPTH.with(|depth| depth.set(old_depth));
+}
+
 fn fixture(size: u64, mixed: bool) -> (ShardedTaskTable, RunQueues) {
     let tasks = ShardedTaskTable::new();
     let queues = RunQueues::new(1);

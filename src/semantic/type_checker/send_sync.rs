@@ -21,7 +21,8 @@
 //! - class: Send iff all fields Send; Sync iff all fields Sync
 //! - interface: Send iff it `extends Send` or `extends Sync`; Sync iff it
 //!   `extends Sync`
-//! - function/closure values: conservatively neither (captures unknown)
+//! - plain function pointers: Send + Sync (no environment)
+//! - closure values: conservatively neither (captures unknown)
 
 use std::collections::HashSet;
 
@@ -352,6 +353,11 @@ impl TypeChecker {
         if reasons.is_some() {
             tests::REASON_VISITS.with(|n| n.set(n.get() + 1));
         }
+        // A signature describes calls, not stored captures. Do not clone or walk
+        // arbitrarily large parameter/return types for an environment-free pointer.
+        if matches!(ty, Type::Fn(_, _)) {
+            return true;
+        }
         let key = (ty.clone(), marker);
         if visiting.proven.contains(&key) || self.marker_contract_proven.contains(&key) {
             return true;
@@ -367,9 +373,9 @@ impl TypeChecker {
             Type::Array(elem) => {
                 send && self.marker_holds_with_reason(elem, Marker::Send, visiting, reasons)
             }
-            // Function/closure values capture unknown state — conservatively
-            // neither Send nor Sync in the MVP.
-            Type::Fn(_, _) | Type::Closure(_, _) => false,
+            // Plain pointers returned above; closures retain unknown environments.
+            Type::Fn(_, _) => true,
+            Type::Closure(_, _) => false,
 
             Type::Generic(name, args) => match name.as_str() {
                 // Immutable: Send iff args Send, Sync iff args Sync (the frozen
@@ -436,8 +442,8 @@ impl TypeChecker {
                         "interface values need a declared `extends Sync` contract if every implementation satisfies it"
                     })
                 }
-                Type::Fn(_, _) | Type::Closure(_, _) => Some(
-                    "function and closure values have unknown captures; pass Send/Sync data instead of retaining the callable across a task boundary",
+                Type::Closure(_, _) => Some(
+                    "closure values have unknown captures; pass Send/Sync data or an environment-free fn pointer instead of retaining a closure across a task boundary",
                 ),
                 _ => None,
             };
@@ -655,8 +661,8 @@ mod tests {
     #[test]
     fn task_frame_fallback_labels_only_signatures() {
         for source in [
-            "fn inc(x: i64) -> i64 { return x; } async fn bad() -> fn(i64) -> i64 { return inc; } fn main() {}",
-            "class Bad { f: fn(i64) -> i64; pub async fn run(self) { println(1); } } fn main() {}",
+            "async fn bad() -> closure(i64) -> i64 { let n = 1; return |x: i64| x + n; } fn main() {}",
+            "class Bad { f: closure(i64) -> i64; pub async fn run(self) { println(1); } } fn main() {}",
         ] {
             let (program, errors) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
             assert!(errors.is_empty(), "{errors:?}");
@@ -698,7 +704,7 @@ mod tests {
     #[test]
     fn failure_notes_follow_nested_fields_and_wrapper_marker_rules() {
         let c = checker(
-            "class Inner { pub inboxes: Array<Channel<i64>>; } class Outer { pub nested: Inner; } class Callback { pub action: fn() -> void; } fn main() {}",
+            "class Inner { pub inboxes: Array<Channel<i64>>; } class Outer { pub nested: Inner; } class Callback { pub action: closure() -> void; } fn main() {}",
         );
         let note = c.marker_failure_note(&named("Outer"), Marker::Sync);
         assert!(
@@ -1154,12 +1160,30 @@ mod tests {
         assert!(c.is_send(&named("Node")));
     }
 
-    // Function/closure values are conservatively neither.
+    // Pointer signatures do not describe retained state.
     #[test]
-    fn fn_values_are_neither() {
+    fn fn_values_are_send_sync_without_walking_signatures() {
         let c = checker("fn main() {}");
-        let f = Type::Fn(vec![Type::I64], Box::new(Type::I64));
-        assert!(!c.is_send(&f) && !c.is_sync(&f));
+        for size in [1, 16, 256] {
+            let signature = vec![Type::Closure(vec![], Box::new(Type::Void)); size];
+            let f = Type::Fn(
+                signature.clone(),
+                Box::new(Type::Array(Box::new(Type::I64))),
+            );
+            assert!(c.is_send(&f) && c.is_sync(&f));
+            for marker in [Marker::Send, Marker::Sync] {
+                REASON_VISITS.with(|n| n.set(0));
+                assert!(c.marker_holds_with_reason(
+                    &f,
+                    marker,
+                    &mut MarkerWalk::default(),
+                    &mut Some(MarkerFailure::default())
+                ));
+                assert_eq!(REASON_VISITS.with(|n| n.get()), 1);
+            }
+            let closure = Type::Closure(signature, Box::new(Type::I64));
+            assert!(!c.is_send(&closure) && !c.is_sync(&closure));
+        }
     }
 }
 

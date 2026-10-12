@@ -185,11 +185,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         Some((bytes_ptr, len))
     }
 
-    /// Debug builds: push a call-chain frame (callee name + call-site location)
-    /// before a user-function call. Returns `true` when a frame was pushed (so
-    /// the caller knows to emit the matching pop). Passes raw static bytes (not
-    /// WillowStrings) so the call stack does not allocate on the GC heap. Release
-    /// builds are untouched (willow-992h).
     /// Guard an integer `/` or `%` against a zero divisor and the
     /// `i64::MIN / -1` overflow in every build mode. These are recoverable
     /// language faults, so the runtime raises and generated code propagates
@@ -364,15 +359,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(ok_block);
     }
 
+    /// Reserve a caller frame while a method's arguments are evaluated.
+    pub(super) fn emit_callstack_reserve(&mut self, span: crate::diagnostics::Span) -> bool {
+        self.emit_caller_frame(span, "willow_callstack_push_pending")
+    }
+
     pub(super) fn emit_callstack_push(
         &mut self,
-        callee: &str,
+        _callee: &str,
         span: crate::diagnostics::Span,
     ) -> bool {
+        self.emit_caller_frame(span, "willow_callstack_push")
+    }
+
+    fn emit_caller_frame(&mut self, span: crate::diagnostics::Span, runtime: &str) -> bool {
         if self.build_mode != BuildMode::Debug {
             return false;
         }
-        let Some((name_ptr, name_len)) = self.emit_static_str_bytes(callee) else {
+        let Some((name_ptr, name_len)) =
+            self.emit_static_str_bytes(&self.diagnostic_function.clone())
+        else {
             return false;
         };
         let file = self.source_file.to_string();
@@ -381,7 +387,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         let line = self.builder.ins().iconst(types::I32, span.line as i64);
         let col = self.builder.ins().iconst(types::I32, span.col as i64);
-        let push_id = self.func_id("willow_callstack_push");
+        let push_id = self.func_id(runtime);
         let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
         self.builder.ins().call(
             push_ref,

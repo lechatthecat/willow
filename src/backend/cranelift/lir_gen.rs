@@ -5626,33 +5626,44 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .ins()
                         .select(selected, selected_direction, direction);
                 }
-                let mut channels = Vec::new();
+                // Cleanup may allocate a deferred channel-wake job. Keep the
+                // chosen wrapper relocatable across all arm cleanups, without
+                // rescanning the case list after each safepoint.
+                let roots_before = self.gc_root_count;
+                let winner_root = self.emit_push_relocatable_root(winner_raw);
+                let receive_only = !operations
+                    .iter()
+                    .any(|operation| matches!(operation, LirSelectOp::Send { .. }));
                 for operation in operations {
                     match operation {
                         LirSelectOp::Recv { channel, .. } | LirSelectOp::Send { channel, .. } => {
+                            let winner_raw = self.emit_reload_root(winner_root, winner_raw);
                             let channel = self.load_lir_local(function, *channel);
-                            // Source expressions can alias at runtime. Cleanup
-                            // must run once per raw, retaining the winning
-                            // direction even when it occurs in a later arm.
-                            let cleanup = self.builder.create_block();
-                            let done = self.builder.create_block();
-                            let mut unique = self.builder.ins().iconst(types::I8, 1);
-                            for previous in &channels {
-                                let distinct =
-                                    self.builder.ins().icmp(IntCC::NotEqual, channel, *previous);
-                                unique = self.builder.ins().band(unique, distinct);
-                            }
-                            self.builder.ins().brif(unique, cleanup, &[], done, &[]);
-                            self.builder.switch_to_block(cleanup);
-                            self.builder.seal_block(cleanup);
+                            // Exact-generation cleanup is idempotent and keeps
+                            // the winning direction even for aliased arms.
+                            // One call per arm avoids quadratic alias checks.
+                            // With no send arms, the winner has no losing send
+                            // ownership to release. Its receive commit clears
+                            // the retained claim/wait under the receive lock.
+                            let done = receive_only.then(|| {
+                                let cleanup = self.builder.create_block();
+                                let done = self.builder.create_block();
+                                let selected =
+                                    self.builder.ins().icmp(IntCC::Equal, channel, winner_raw);
+                                self.builder.ins().brif(selected, done, &[], cleanup, &[]);
+                                self.builder.switch_to_block(cleanup);
+                                self.builder.seal_block(cleanup);
+                                done
+                            });
                             self.emit_void_runtime_call(
                                 "willow_channel_select_cleanup",
                                 &[channel, winner_raw, direction],
                             );
-                            self.builder.ins().jump(done, &[]);
-                            self.builder.switch_to_block(done);
-                            self.builder.seal_block(done);
-                            channels.push(channel);
+                            if let Some(done) = done {
+                                self.builder.ins().jump(done, &[]);
+                                self.builder.switch_to_block(done);
+                                self.builder.seal_block(done);
+                            }
                         }
                         LirSelectOp::Join { task, .. } => {
                             let task = self.load_lir_local(function, *task);
@@ -5673,6 +5684,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         LirSelectOp::Timeout { .. } | LirSelectOp::Default => {}
                     }
                 }
+                self.emit_pop_roots_n(self.gc_root_count - roots_before);
+                self.gc_root_count = roots_before;
             }
             LirInst::SelectCommit { operation, success } => {
                 let mut committed = true;
@@ -6588,6 +6601,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let Some((suspends, frame)) = coop.as_mut() else {
                     unreachable!("explicit LIR suspension reached the synchronous emitter")
                 };
+                self.emit_fault_site();
                 self.emit_lir_suspend(function, operation, *resume, blocks, suspends, *frame);
             }
         }
@@ -9325,6 +9339,7 @@ impl FuncGen<'_, '_> {
         {
             self.lir_reference_scopes.push(Vec::new());
         }
+        self.fault_site_span = Some(span);
         let result = self.emit_lir_rvalue(function, value, span);
         if !self.terminated {
             if function.locals[local.0 as usize].is_gc_owner()
@@ -9373,6 +9388,7 @@ impl FuncGen<'_, '_> {
             .func_addr(reference_type(self.module.target_config()), callback);
         // Explicitly handle suspension before panic propagation or observing
         // the result slot. Runtime-call wrappers cannot express this split.
+        self.emit_fault_site();
         let enter = self.func_ids["willow_task_stack_enter"];
         let enter = self.module.declare_func_in_func(enter, self.builder.func);
         let call = self.builder.ins().call(enter, &[address, frame]);

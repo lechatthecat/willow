@@ -497,7 +497,7 @@ impl Parser {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
         let name_span = self.current_span();
-        let name = self.expect_ident()?;
+        let name = self.expect_method_name()?;
         if name == "init" {
             return Err(Diagnostic::new(
                 Severity::Error,
@@ -654,7 +654,7 @@ impl Parser {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
         let name_span = self.current_span();
-        let name = self.expect_ident()?;
+        let name = self.expect_method_name()?;
         if name == "init" {
             return Err(Diagnostic::new(
                 Severity::Error,

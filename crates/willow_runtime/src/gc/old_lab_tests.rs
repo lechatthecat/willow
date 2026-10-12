@@ -85,54 +85,85 @@ fn pending_objects_are_found_by_exact_and_interior_lookup_until_flushed() {
 #[test]
 fn buffer_allocations_survive_mark_closure_and_a_pending_sweep() {
     let _guard = runtime_test_guard();
-    reset_internal_for_test();
-    let _labs = LabsOn::new();
-    let mut rooted = willow_alloc(16);
-    willow_push_root(&mut rooted);
-    let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
-    // Allocated black while marking, from the buffer carved before the cycle.
-    let during_mark = willow_alloc(24);
-    assert!(local_pending_for_test() > 0);
-    let mut consumer = cycle.queue.register_assist();
-    while cycle.drain_worker(64, &mut Vec::new(), &mut consumer).0 > 0 {}
-    drop(consumer);
-    let (_, plan) = mark_closure::finish(&cycle, Instant::now()).expect("closes concurrently");
-    assert_eq!(local_pending_for_test(), 0, "closure retires every buffer");
-    assert!(cycle.is_marked(during_mark as usize));
-    // The sweep is pending: a refilled buffer copies `sweep_pending`, and the
-    // region visit must index this unmarked, unrooted object before freeing.
-    let during_sweep = willow_alloc(32);
-    assert_eq!(local_pending_for_test(), 1);
-    {
-        let state = runtime().heap.lock().unwrap();
-        assert!(state.sweeping.is_some());
-        assert!(!indexed(&state, during_sweep));
-    }
-    sweep::concurrent(plan);
-    {
-        let state = runtime().heap.lock().unwrap();
-        for payload in [rooted, during_mark, during_sweep] {
-            assert!(indexed(&state, payload), "survived its allocation epoch");
-        }
-        assert!(
-            state
-                .old_regions
+    for paced in [false, true] {
+        for limit_kind in [0, 1, 2] {
+            reset_internal_for_test();
+            let _labs = LabsOn::new();
+            {
+                let mut state = runtime().heap.lock().unwrap();
+                state.pacer.set_enabled_for_test(paced);
+                state.soft_memory = memory_control::Controller::default();
+                state.memory_limit_bytes = None;
+                if limit_kind == 1 {
+                    state.soft_memory.set_limit(64 * 1024 * 1024);
+                }
+                if limit_kind == 2 {
+                    state.memory_limit_bytes = Some(64 * 1024 * 1024);
+                }
+            }
+            let mut rooted = willow_alloc(16);
+            willow_push_root(&mut rooted);
+            let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
+            // Allocated black while marking, from the buffer carved before the cycle.
+            let during_mark = willow_alloc(24);
+            assert!(local_pending_for_test() > 0);
+            let mut consumer = cycle.queue.register_assist();
+            while cycle.drain_worker(64, &mut Vec::new(), &mut consumer).0 > 0 {}
+            drop(consumer);
+            let (_, plan) =
+                mark_closure::finish(&cycle, Instant::now()).expect("closes concurrently");
+            assert_eq!(local_pending_for_test(), 0, "closure retires every buffer");
+            assert!(cycle.is_marked(during_mark as usize));
+            // The sweep is pending: a refilled buffer copies `sweep_pending`, and the
+            // region visit must index this unmarked, unrooted object before freeing.
+            // Cross the current goal while collection is already active: the pending
+            // sweep, rather than allocation accounting, must determine policy timing.
+            {
+                let mut state = runtime().heap.lock().unwrap();
+                state.threshold_bytes = 1;
+            }
+            let sweep_goal = 1;
+            let during_sweep = willow_alloc(32);
+            assert_eq!(local_pending_for_test(), 1);
+            {
+                let state = runtime().heap.lock().unwrap();
+                assert!(state.sweeping.is_some());
+                assert!(!indexed(&state, during_sweep));
+            }
+            assert_eq!(runtime().heap.lock().unwrap().threshold_bytes, sweep_goal);
+            sweep::concurrent(plan);
+            assert_eq!(runtime().heap.lock().unwrap().threshold_bytes, sweep_goal);
+            {
+                let state = runtime().heap.lock().unwrap();
+                for payload in [rooted, during_mark] {
+                    assert!(indexed(&state, payload), "captured objects remain indexed");
+                }
+                assert!(
+                    find_old_region_object(&state, during_sweep as usize, false).is_some(),
+                    "new extent remains visible through its published start bit"
+                );
+                assert!(
+                    state
+                        .old_regions
+                        .iter()
+                        .filter(|region| region.sweep_state.epoch != 0)
+                        .all(|region| region.active_labs == 0)
+                );
+            }
+            let expected = [16usize, 24, 32]
                 .iter()
-                .all(|region| region.active_labs == 0)
-        );
+                .map(|size| size + GC_HEADER_SIZE)
+                .sum::<usize>();
+            assert_eq!(willow_gc_allocated_bytes() as usize, expected);
+            // The next cycle frees the two unrooted objects without accounting drift.
+            willow_gc_collect();
+            assert_eq!(willow_gc_allocated_bytes() as usize, 16 + GC_HEADER_SIZE);
+            willow_pop_root();
+            willow_gc_collect();
+            assert_eq!(willow_gc_allocated_bytes(), 0);
+            reset_internal_for_test();
+        }
     }
-    let expected = [16usize, 24, 32]
-        .iter()
-        .map(|size| size + GC_HEADER_SIZE)
-        .sum::<usize>();
-    assert_eq!(willow_gc_allocated_bytes() as usize, expected);
-    // The next cycle frees the two unrooted objects without accounting drift.
-    willow_gc_collect();
-    assert_eq!(willow_gc_allocated_bytes() as usize, 16 + GC_HEADER_SIZE);
-    willow_pop_root();
-    willow_gc_collect();
-    assert_eq!(willow_gc_allocated_bytes(), 0);
-    reset_internal_for_test();
 }
 
 #[test]
@@ -399,4 +430,87 @@ fn partial_retirement_refill_flushes_only_remaining_suffix_without_double_accoun
     );
     drop(state);
     reset_internal_for_test();
+}
+
+#[test]
+fn threshold_policy_old_lab_pressure_matrix() {
+    let _guard = runtime_test_guard();
+    for paced in [false, true] {
+        for limit_kind in [0, 1, 2] {
+            for count in [1usize, 128, 4096] {
+                reset_internal_for_test();
+                let _labs = LabsOn::new();
+                {
+                    let mut state = runtime().heap.lock().unwrap();
+                    state.pacer.set_enabled_for_test(paced);
+                    state.threshold_bytes = usize::MAX;
+                    state.pacer_trigger = usize::MAX as u64;
+                    state.soft_memory = memory_control::Controller::default();
+                    state.memory_limit_bytes = None;
+                }
+                for _ in 0..count {
+                    assert!(!willow_alloc(8).is_null());
+                }
+                let goal = {
+                    let mut state = runtime().heap.lock().unwrap();
+                    // Merge real pending LAB counters after setting a crossed
+                    // goal: neither bytes-only nor full publication may grow it.
+                    state.threshold_bytes = 1;
+                    state.pacer_trigger = 1;
+                    if limit_kind == 1 {
+                        state.soft_memory.set_limit(1);
+                    } else if limit_kind == 2 {
+                        state.memory_limit_bytes = Some(1);
+                    }
+                    sync_bytes(&mut state);
+                    assert_eq!(state.threshold_bytes, 1);
+                    flush_all(&mut state);
+                    assert_eq!(state.threshold_bytes, 1);
+                    assert_eq!(state.total_allocs, count as u64);
+                    assert_eq!(state.allocated_bytes, count * (GC_HEADER_SIZE + 8));
+                    state.threshold_bytes
+                };
+                assert!(
+                    allocation_should_collect(),
+                    "paced={paced} limit={limit_kind} count={count}"
+                );
+                assert_eq!(runtime().heap.lock().unwrap().threshold_bytes, goal);
+                println!(
+                    "threshold_matrix paced={paced} limit={limit_kind} objects={count} goal_writes_during_publication=0"
+                );
+            }
+        }
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn foreign_owner_progress_sampling_does_not_index_pending_objects() {
+    let _guard = runtime_test_guard();
+    for count in [1, 16, 256] {
+        reset_internal_for_test();
+        let _labs = LabsOn::new();
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        for _ in 0..count {
+            willow_alloc(8);
+        }
+        let pending = local_pending_for_test();
+        let first = gc_progress();
+        for _ in 0..16 {
+            assert_eq!(
+                gc_progress().allocation_bytes_since_success,
+                first.allocation_bytes_since_success
+            );
+            assert_eq!(local_pending_for_test(), pending);
+        }
+        assert_eq!(
+            first.allocation_bytes_since_success,
+            count * (GC_HEADER_SIZE as u64 + 8)
+        );
+        println!(
+            "objects={count} snapshots=17 additional_indexed_objects=0 allocation_bytes={}",
+            first.allocation_bytes_since_success
+        );
+        reset_internal_for_test();
+    }
 }

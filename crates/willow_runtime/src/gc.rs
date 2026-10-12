@@ -28,6 +28,7 @@ pub use safepoint::*;
 mod marking;
 use marking::*;
 mod registry;
+mod remembered;
 pub use registry::*;
 mod root_arena;
 pub(crate) use root_arena::*;
@@ -37,6 +38,8 @@ mod root;
 pub use root::*;
 mod barrier;
 pub use barrier::*;
+mod progress;
+pub use progress::{GcProgressV1, GcSkipReason, gc_progress, willow_gc_progress_v1};
 mod telemetry;
 pub use telemetry::*;
 mod validation;
@@ -62,6 +65,7 @@ mod nursery;
 mod old_cycle;
 mod old_lab;
 mod pacer;
+mod region_candidates;
 mod root_handshake;
 mod runtime_roots;
 mod satb;
@@ -76,7 +80,7 @@ use runtime_roots::RuntimeRootSet;
 
 use crate::id_hash::{IdMap, IdSet};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::ThreadId;
@@ -271,7 +275,7 @@ struct GcState {
     old_regions: Vec<OldRegion>,
     old_addresses: address_index::AddressIndex,
     /// (largest available span, region index); excludes dedicated/full regions.
-    old_region_candidates: BinaryHeap<(usize, usize)>,
+    old_region_candidates: region_candidates::RegionCandidates,
     old_reserved_bytes: usize,
     /// Per-thread old allocation buffers used by runtime-side allocation.
     old_labs: Vec<old_lab::OldLabRecord>,
@@ -295,6 +299,7 @@ struct GcState {
     young_allocated_bytes: usize,
     /// Trigger a minor collection at the next TLAB refill after this threshold.
     nursery_threshold_bytes: usize,
+    scheduler_runway_initialized: bool,
     /// Young bytes when the current run of deferred minor collections began
     /// (willow-9tls.9); `None` when the last minor attempt collected.
     minor_deferral_start_bytes: Option<usize>,
@@ -319,7 +324,7 @@ struct GcState {
     /// Old objects that may contain at least one young reference. Owners are
     /// payload addresses and remain stable because the old generation does not
     /// move.
-    remembered_set: HashSet<usize>,
+    remembered_set: remembered::RememberedSet,
     /// Sparse card table keyed by absolute old-heap card. Region bounds make
     /// each dirty card attributable to one old/pinned region without changing
     /// the Stage-4 barrier ABI.
@@ -668,7 +673,7 @@ impl Default for GcState {
             tlab_addresses: address_index::AddressIndex::default(),
             old_regions: Vec::new(),
             old_addresses: address_index::AddressIndex::default(),
-            old_region_candidates: BinaryHeap::new(),
+            old_region_candidates: region_candidates::RegionCandidates::default(),
             old_reserved_bytes: 0,
             old_labs: Vec::new(),
             tlab_states: HashMap::new(),
@@ -684,6 +689,7 @@ impl Default for GcState {
             pacer_trigger: 1024 * 1024,
             young_allocated_bytes: 0,
             nursery_threshold_bytes: nursery_policy.initial(memory_limit_bytes),
+            scheduler_runway_initialized: false,
             minor_deferral_start_bytes: None,
             minor_retry_bytes: 0,
             nursery_policy,
@@ -697,7 +703,7 @@ impl Default for GcState {
             tlab_large_allocations: 0,
             tlab_fast_allocated_bytes: 0,
             tlab_reserved_bytes: 0,
-            remembered_set: HashSet::new(),
+            remembered_set: remembered::RememberedSet::default(),
             dirty_cards: HashSet::new(),
             write_barrier_hits: 0,
             minor_collections: 0,
@@ -831,7 +837,10 @@ impl Default for GcRuntime {
     }
 }
 
-static GC_RUNTIME: LazyLock<GcRuntime> = LazyLock::new(GcRuntime::default);
+static GC_RUNTIME: LazyLock<GcRuntime> = LazyLock::new(|| {
+    progress::initialize();
+    GcRuntime::default()
+});
 
 fn runtime() -> &'static GcRuntime {
     &GC_RUNTIME
@@ -905,14 +914,7 @@ fn allocation_should_collect() -> bool {
         state
             .pacer
             .allocation(crate::gc_telemetry::timestamp_ns(), bytes);
-        // Sampling may advance the trigger, but cannot move the current goal.
-        let input = pacer_inputs(&state);
-        let decision = state.pacer.decision(input);
-        state.pacer_trigger = (state.threshold_bytes as u64)
-            .saturating_sub(decision.runway)
-            .max(input.live.saturating_add(256 * 1024))
-            .min(state.threshold_bytes as u64);
-        invalidate_external_headroom();
+        pacer::sample_threshold(&mut state);
     }
     let hard_pressure = hard_reservation_pressure(&mut state);
     let memory_input = memory_inputs(&state);
@@ -1073,6 +1075,7 @@ pub extern "C" fn willow_gc_alloc_slow(
         }
         fast_bytes
     };
+    sweep::assist();
     assist_concurrent_mark(fast_bytes.saturating_add(total_size as u64));
 
     if !stress && allocation_should_minor_collect() {
@@ -1134,9 +1137,6 @@ pub extern "C" fn willow_gc_alloc_slow(
         .total_allocated_bytes
         .saturating_add(total_size as u64);
     state.tlab_slow_allocations = state.tlab_slow_allocations.saturating_add(1);
-    if state.allocated_bytes >= state.threshold_bytes {
-        state.threshold_bytes = state.threshold_bytes.saturating_mul(2);
-    }
     header.payload().as_ptr()
 }
 
@@ -1246,6 +1246,7 @@ fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask:
         crate::failure::fatal_invariant("negative managed allocation size");
     }
     let total_size = (payload_size as u64).saturating_add(GC_HEADER_SIZE as u64);
+    sweep::assist();
     assist_concurrent_mark(total_size);
     let stress = gc_stress_enabled("alloc");
     // A due check charges the chunk it covers against the lock-free headroom
@@ -1314,10 +1315,10 @@ fn runtime_policy_check_due(bytes: u64) -> bool {
 /// Add a newly reserved regular region if it still has usable space.
 fn index_old_region(state: &mut GcState, index: usize) {
     let region = &state.old_regions[index];
-    if region.kind == RegionKind::Old {
+    if region.kind == RegionKind::Old && !region.sweep_quarantined {
         let available = region.available_span();
         if available >= GC_HEADER_SIZE {
-            state.old_region_candidates.push((available, index));
+            state.old_region_candidates.insert((available, index));
         }
     }
 }
@@ -1336,15 +1337,15 @@ fn allocate_old_region_object_locked(
 
     while state
         .old_region_candidates
-        .peek()
+        .last()
         .is_some_and(|&(_, index)| state.old_regions[index].sweep_quarantined)
     {
         // Each stale candidate is discarded at most once during the sweep.
-        state.old_region_candidates.pop();
+        state.old_region_candidates.pop_last();
     }
     let candidate = state
         .old_region_candidates
-        .peek()
+        .last()
         .copied()
         .filter(|(available, _)| !large && *available >= span_size);
     let (object, reused) = if let Some((_, index)) = candidate {
@@ -1355,14 +1356,9 @@ fn allocate_old_region_object_locked(
             payload_size,
         )?;
         let available = state.old_regions[index].available_span();
-        let mut entry = state
-            .old_region_candidates
-            .peek_mut()
-            .expect("candidate exists");
+        state.old_region_candidates.pop_last();
         if available >= GC_HEADER_SIZE {
-            *entry = (available, index);
-        } else {
-            std::collections::binary_heap::PeekMut::pop(entry);
+            state.old_region_candidates.insert((available, index));
         }
         allocated
     } else {
@@ -1463,9 +1459,6 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
     state.tlab_slow_allocations = state.tlab_slow_allocations.saturating_add(1);
     if header.size() > GC_TLAB_MAX_OBJECT_SIZE {
         state.tlab_large_allocations = state.tlab_large_allocations.saturating_add(1);
-    }
-    if state.allocated_bytes >= state.threshold_bytes {
-        state.threshold_bytes = state.threshold_bytes.saturating_mul(2);
     }
     header.payload().as_ptr()
 }
@@ -1701,18 +1694,7 @@ fn try_collect_internal() -> bool {
     // A legacy root owner outside the registry cannot publish a snapshot.
     // Other registered workers do not make that foreign stack safe to scan.
     if foreign_root_stack_owner_active() {
-        // Cannot scan another thread's root stack, so skip (safe). Count it so a
-        // GC-stress run can detect when it is mostly skipping rather than
-        // collecting (willow-6fv.2).
-        let skipped = runtime()
-            .skipped_foreign_owner_collections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        if std::env::var("WILLOW_GC_LOG").is_ok() {
-            eprintln!(
-                "[gc] collection skipped because a foreign root stack owner is active (total skipped={skipped})"
-            );
-        }
+        progress::record_skip(GcSkipReason::ForeignOwner);
         return true;
     }
     let gc_log = std::env::var("WILLOW_GC_LOG").is_ok();
@@ -1724,7 +1706,7 @@ fn try_collect_internal() -> bool {
     let started = std::time::Instant::now();
     let coordination_ns = || {
         let stops = crate::gc_telemetry::stops::snapshot_stops();
-        [0, 1, 2, 3].into_iter().fold(0u64, |total, index| {
+        [0, 1, 3].into_iter().fold(0u64, |total, index| {
             total
                 .saturating_add(stops.by_reason[index].rendezvous.total_ns)
                 .saturating_add(stops.by_reason[index].stopped.total_ns)
@@ -1733,9 +1715,7 @@ fn try_collect_internal() -> bool {
     let pause_before = coordination_ns();
     let external_before = external_bytes() as u64;
     let Some((heap_before, marking)) = root_handshake::begin() else {
-        runtime()
-            .skipped_foreign_owner_collections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        progress::record_skip(GcSkipReason::ForeignOwnerAtHandshake);
         return true;
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1766,20 +1746,18 @@ fn try_collect_internal() -> bool {
         } else {
             mark_closure::finish_stopped(&marking, started)
         };
-        let (work, plan, stopped_freed) = result;
+        let (mut work, plan, stopped_freed) = result;
         let freed = plan.map_or(stopped_freed, sweep::concurrent);
+        {
+            let swept = marking.work.lock().unwrap();
+            work.sweep_assist_cpu_ns = swept.sweep_assist_cpu_ns;
+            work.sweep_cpu_incomplete = swept.sweep_cpu_incomplete;
+        }
         minor::service_pending();
         let mut state = runtime().heap.lock().unwrap();
         sync_tlab_bytes(&mut state);
         let after = state.allocated_bytes as u64;
         let previous_goal = state.threshold_bytes as u64;
-        // The goal and pacer trigger may move down below.
-        invalidate_external_headroom();
-        state.threshold_bytes = state
-            .allocated_bytes
-            .saturating_add(external_bytes())
-            .saturating_mul(2)
-            .max(1024 * 1024);
         state.last_major_live_bytes = after;
         state.last_major_mark_work = work
             .marked_bytes
@@ -1797,14 +1775,7 @@ fn try_collect_internal() -> bool {
         state
             .pacer
             .allocation(crate::gc_telemetry::timestamp_ns(), bytes);
-        if state.pacer.enabled() {
-            let decision = state.pacer.decision(pacer::Inputs {
-                previous_goal,
-                ..pacer_inputs(&state)
-            });
-            state.threshold_bytes = decision.goal.min(usize::MAX as u64) as usize;
-            state.pacer_trigger = decision.trigger;
-        }
+        pacer::complete_threshold(&mut state, previous_goal);
         // A completed full cycle services any high reservation pressure. If
         // reclamation crossed the low watermark, rearm before new allocations
         // can reserve a region again (even within the same allocation call).
@@ -1820,6 +1791,7 @@ fn try_collect_internal() -> bool {
                 decision.goal, decision.trigger, decision.overshoot, decision.reason
             );
         }
+        progress::record_success(state.total_allocated_bytes);
         drop(state);
         // Include the required initial/remark stops in V1 as well as V2.
         let pause_ns = coordination_ns().saturating_sub(pause_before);
@@ -1907,7 +1879,7 @@ fn validate_payload_pointer(payload: *mut u8, _context: &str) -> Result<*mut GcH
     validate_payload_pointer_locked(&runtime().heap.lock().unwrap(), payload)
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 fn validate_payload_pointer_locked(
     state: &GcState,
     payload: *mut u8,
@@ -1951,7 +1923,11 @@ fn validate_payload_pointer_locked(
     ))
 }
 
-/// True when the current thread is a registered GC mutator (willow-6fv.5.6).
+/// Give a cold collector bounded runway when scheduler execution begins.
+pub(crate) fn scheduler_start(workers: usize) {
+    nursery::scheduler_start(&mut runtime().heap.lock().unwrap(), workers);
+}
+
 fn reset_internal() {
     coordinator::shutdown();
     #[cfg(test)]
@@ -2028,14 +2004,13 @@ fn reset_internal() {
     state.tlab_states.clear();
     state.tlab_owners.clear();
     state.allocated_bytes = 0;
-    state.threshold_bytes = 1024 * 1024;
+    pacer::reset_threshold(&mut state);
     state.memory_limit_bytes = gc_memory_limit_from_env();
     state.hard_pressure_triggered = false;
     state.soft_memory = memory_control::Controller::from_env();
     state.last_major_live_bytes = 0;
     state.last_major_mark_work = 0;
     state.pacer = pacer::Sampler::default();
-    state.pacer_trigger = 1024 * 1024;
     assist::reset();
     state.young_allocated_bytes = 0;
     state.nursery_policy = nursery::Policy::from_env();
@@ -2070,11 +2045,13 @@ fn reset_internal() {
     state.old_region_reuses = 0;
     state.old_regions_released = 0;
     state.major_collections = 0;
+    state.scheduler_runway_initialized = false;
     runtime().runtime_roots.clear();
     runtime().runtime_root_slots.clear();
     runtime().pin_lease_slots.clear();
     runtime().parked_stack_roots.lock().unwrap().clear();
     *runtime().root_stack_owner.lock().unwrap() = None;
+    progress::reset();
     {
         let (lock, cv) = &runtime().coord;
         let mut coord = lock.lock().unwrap();
@@ -2215,3 +2192,6 @@ mod failure_policy_tests;
 
 #[cfg(test)]
 mod native_memory_tests;
+
+#[cfg(test)]
+mod native_trace_tests;

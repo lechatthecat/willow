@@ -182,9 +182,9 @@ mod tests {
     }
 
     fn await_and_release(raw: *mut std::ffi::c_void) -> u8 {
-        let result = future::willow_future_await_void(raw);
-        unsafe { future::willow_future_release_void(raw) };
-        result
+        let owner = unsafe { future::LegacyFutureOwner::<future::WillowFutureVoid>::from_abi(raw) };
+        owner.get().block_until_ready();
+        0
     }
 
     #[test]

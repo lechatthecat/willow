@@ -519,3 +519,70 @@ fn freeze_inference_deep_type_storage_is_explicit() {
         eprintln!("nested freezes depth={depth} element_checks={depth} owned_type_nodes={nodes}");
     }
 }
+
+#[test]
+fn empty_array_binding_annotation_diagnostic() {
+    for (element, value, setup, usage) in [
+        ("String", "\"hello\"", "", "println(t);"),
+        ("A", "new A()", "", "t.value();"),
+        (
+            "Task<i64>",
+            "worker()",
+            "async fn worker() -> i64 { return 1; }",
+            "let result = await t;",
+        ),
+    ] {
+        for annotated in [false, true] {
+            let annotation = if annotated {
+                format!(": Array<{element}>")
+            } else {
+                String::new()
+            };
+            let source = format!(
+                "{PREFIX} {setup} async fn f() {{ let mut xs{annotation} = []; xs.push({value}); for t in xs {{ {usage} }} }}"
+            );
+            let (program, parse) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            assert!(parse.is_empty(), "{parse:?}");
+            let mut checker = TypeChecker::new();
+            checker.check_program(&program);
+            let errors: Vec<_> = checker
+                .errors
+                .iter()
+                .filter(|d| d.severity == Severity::Error)
+                .collect();
+            if annotated {
+                assert!(errors.is_empty(), "{element}: {errors:?}");
+            } else {
+                assert_eq!(errors.len(), 1, "{element}: {errors:?}");
+                assert!(errors[0].message.contains("annotate the binding"));
+                assert!(!errors[0].message.contains("void"));
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_array_binding_diagnostics_scale_per_binding() {
+    for count in [1, 8, 64, 256] {
+        let bindings = (0..count)
+            .map(|i| format!("let xs{i} = []; xs{i}.push(1); for x in xs{i} {{ let y = x; }}"))
+            .collect::<String>();
+        let source = format!("import std::collections::Array; fn f() {{ {bindings} }}");
+        let (program, parse) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(parse.is_empty());
+        let mut checker = TypeChecker::new();
+        checker.check_program(&program);
+        let errors: Vec<_> = checker
+            .errors
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert_eq!(errors.len(), count);
+        assert!(
+            errors
+                .iter()
+                .all(|d| d.message.contains("annotate the binding"))
+        );
+        eprintln!("empty array bindings={count} diagnostics={}", errors.len());
+    }
+}

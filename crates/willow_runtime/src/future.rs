@@ -1,4 +1,12 @@
 //! Legacy futures are native, nonmoving allocations, separate from task frames.
+//! Compatibility ABI v1 (0.1.x) handles are opaque, process-local tokens, never
+//! allocation addresses. Tokens are never reused; all operations check type and
+//! liveness. See docs/audits/legacy-future-abi.md for versioned migration.
+//! Deprecated for new integrations since runtime 0.1.0: use typed Rust owners,
+//! Task futures or allocation-free deadline values. The 0.2.x transition will
+//! retain v1 symbols and introduce Rust warnings after replacement bindings are
+//! published. Removal requires a future breaking ABI release with an announced
+//! migration window; no exports are removed here.
 //! Constructors transfer one owned handle to the caller. Poll, await and complete
 //! borrow that handle; await does not consume it, so repeated awaits remain valid.
 //! The owner must call the matching `willow_future_release_*` exactly once after
@@ -7,7 +15,10 @@
 //! the pointee. Generated sleep/yield futures use allocation-free deadline
 //! values in `timer`, not these native handles.
 
+use std::any::TypeId;
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::trace::{GcRootSet, GcTrace, GcVisitor};
@@ -69,16 +80,122 @@ fn ready_future<T: Clone>(value: T) -> RuntimeFuture<T> {
     future
 }
 
-fn into_raw<T>(future: RuntimeFuture<T>) -> *mut c_void {
-    Box::into_raw(Box::new(future)) as *mut c_void
+// Only the compatibility ABI registers allocations. Internal Rust users own
+// typed values directly. Tokens never repeat, even if Box addresses are reused.
+struct Entry {
+    address: usize,
+    ty: TypeId,
 }
 
-/// `raw` must be the uniquely owned, live Box allocation of exactly `T`.
-unsafe fn release_raw<T>(raw: *mut c_void) {
+#[derive(Default)]
+struct Handles {
+    next: usize,
+    live: HashMap<usize, Entry>,
+}
+
+fn handles() -> &'static Mutex<Handles> {
+    static HANDLES: OnceLock<Mutex<Handles>> = OnceLock::new();
+    HANDLES.get_or_init(Mutex::default)
+}
+
+#[cfg(test)]
+thread_local! {
+    // Per-thread counts isolate scaling evidence from concurrent test cases.
+    static HANDLE_OPERATIONS: std::cell::Cell<[usize; 3]> = const {
+        std::cell::Cell::new([0; 3])
+    };
+}
+
+#[cfg(test)]
+fn record_handle_operations(insert: usize, lookup: usize, remove: usize) {
+    HANDLE_OPERATIONS.with(|counts| {
+        let old = counts.get();
+        counts.set([old[0] + insert, old[1] + lookup, old[2] + remove]);
+    });
+}
+
+fn register<T: 'static>(value: T) -> *mut c_void {
+    let owned = Box::new(value);
+    let mut handles = handles().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(token) = handles.next.checked_add(1) else {
+        crate::panic_context::fatal_invariant("legacy future handle space exhausted");
+    };
+    handles.next = token;
+    handles.live.insert(
+        token,
+        Entry {
+            address: Box::into_raw(owned) as usize,
+            ty: TypeId::of::<T>(),
+        },
+    );
+    #[cfg(test)]
+    record_handle_operations(1, 0, 0);
+    std::ptr::without_provenance_mut(token)
+}
+
+fn checked_address<T: 'static>(raw: *mut c_void, release: bool) -> *mut T {
     if raw.is_null() {
         crate::panic_context::fatal_invariant("null legacy future handle");
     }
-    unsafe { drop(Box::from_raw(raw.cast::<T>())) };
+    let mut handles = handles().lock().unwrap_or_else(|e| e.into_inner());
+    let token = raw.addr();
+    let Some(entry) = handles.live.get(&token) else {
+        crate::panic_context::fatal_invariant("invalid or released legacy future handle");
+    };
+    if entry.ty != TypeId::of::<T>() {
+        crate::panic_context::fatal_invariant("legacy future handle type mismatch");
+    }
+    let address = entry.address as *mut T;
+    if release {
+        handles.live.remove(&token);
+    }
+    #[cfg(test)]
+    record_handle_operations(0, 1, usize::from(release));
+    address
+}
+
+fn into_raw<T: 'static>(future: RuntimeFuture<T>) -> *mut c_void {
+    register(future)
+}
+
+/// The caller must have ended all borrows; lookup rejects stale/wrong-type tokens.
+unsafe fn release_raw<T: 'static>(raw: *mut c_void) {
+    let address = checked_address::<T>(raw, true);
+    // Drop outside the registry lock: destructors may create/release futures.
+    unsafe { drop(Box::from_raw(address)) };
+}
+
+/// Typed ownership for Rust compatibility callers. No Clone or raw accessor:
+/// the borrowed value cannot outlive its owner or be released independently.
+pub struct LegacyFutureOwner<T> {
+    value: T,
+}
+
+impl<T> LegacyFutureOwner<T> {
+    pub fn new(value: T) -> Self {
+        Self { value }
+    }
+
+    pub fn get(&self) -> &T {
+        &self.value
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
+impl<T: 'static> LegacyFutureOwner<T> {
+    /// Transfer a compatibility handle into typed Rust ownership, invalidating
+    /// the token. The allocation is reclaimed without waiting for completion.
+    ///
+    /// # Safety
+    /// All borrowers and aliases of the handle must have ended. The caller
+    /// transfers its sole ownership and must never use the token again.
+    pub unsafe fn from_abi(raw: *mut c_void) -> Self {
+        let address = checked_address::<T>(raw, true);
+        Self::new(unsafe { *Box::from_raw(address) })
+    }
 }
 
 macro_rules! release_abi {
@@ -108,22 +225,18 @@ release_abi!(willow_future_release_ptr, RuntimeFuture<*mut c_void>);
 ///
 /// `raw` must have been created for `RuntimeFuture<T>` and remain allocated for
 /// the lifetime of the returned reference.
-unsafe fn future_from_raw<'a, T: Clone>(raw: *mut c_void) -> &'a RuntimeFuture<T> {
-    if raw.is_null() {
-        crate::panic_context::fatal_invariant("null legacy future handle");
-    }
-    unsafe { &*(raw as *mut RuntimeFuture<T>) }
+unsafe fn future_from_raw<'a, T: Clone + 'static>(raw: *mut c_void) -> &'a RuntimeFuture<T> {
+    unsafe { &*checked_address::<RuntimeFuture<T>>(raw, false) }
 }
 
 /// # Safety
 ///
 /// In addition to naming a live `RuntimeFuture<T>`, `raw` must be exclusively
 /// accessible for the lifetime of the returned mutable reference.
-unsafe fn future_from_raw_mut<'a, T: Clone>(raw: *mut c_void) -> &'a mut RuntimeFuture<T> {
-    if raw.is_null() {
-        crate::panic_context::fatal_invariant("null legacy future handle");
-    }
-    unsafe { &mut *(raw as *mut RuntimeFuture<T>) }
+unsafe fn future_from_raw_mut<'a, T: Clone + 'static>(
+    raw: *mut c_void,
+) -> &'a mut RuntimeFuture<T> {
+    unsafe { &mut *checked_address::<RuntimeFuture<T>>(raw, false) }
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +318,7 @@ impl WillowFutureVoid {
 }
 
 fn void_future_into_raw(future: WillowFutureVoid) -> *mut c_void {
-    Box::into_raw(Box::new(future)) as *mut c_void
+    register(future)
 }
 
 pub fn void_future_into_raw_pub(future: WillowFutureVoid) -> *mut c_void {
@@ -216,10 +329,7 @@ pub fn void_future_into_raw_pub(future: WillowFutureVoid) -> *mut c_void {
 ///
 /// `raw` must name a live `WillowFutureVoid` allocated by this module.
 unsafe fn void_future_from_raw<'a>(raw: *mut c_void) -> &'a WillowFutureVoid {
-    if raw.is_null() {
-        crate::panic_context::fatal_invariant("null legacy future handle");
-    }
-    unsafe { &*(raw as *mut WillowFutureVoid) }
+    unsafe { &*checked_address::<WillowFutureVoid>(raw, false) }
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +508,313 @@ impl<T: GcTrace> GcTrace for RuntimeFuture<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_owners_adopt_each_abi_type() {
+        let void = willow_future_ready_void();
+        let i64 = willow_future_ready_i64(42);
+        let boolean = willow_future_ready_bool(7);
+        let f64 = willow_future_ready_f64(3.5);
+        let ptr = willow_future_ready_ptr(std::ptr::null_mut());
+        let void_owner = unsafe { LegacyFutureOwner::<WillowFutureVoid>::from_abi(void) };
+        let i64_owner = unsafe { LegacyFutureOwner::<RuntimeFuture<i64>>::from_abi(i64) };
+        let bool_owner = unsafe { LegacyFutureOwner::<RuntimeFuture<u8>>::from_abi(boolean) };
+        let f64_owner = unsafe { LegacyFutureOwner::<RuntimeFuture<f64>>::from_abi(f64) };
+        let ptr_owner = unsafe { LegacyFutureOwner::<RuntimeFuture<*mut c_void>>::from_abi(ptr) };
+        assert!(void_owner.get().is_ready());
+        assert_eq!(i64_owner.get().poll(), Poll::Ready(42));
+        assert_eq!(bool_owner.get().poll(), Poll::Ready(1));
+        assert_eq!(f64_owner.get().poll(), Poll::Ready(3.5));
+        assert_eq!(ptr_owner.get().poll(), Poll::Ready(std::ptr::null_mut()));
+        let registry = handles().lock().unwrap();
+        assert!(
+            [void, i64, boolean, f64, ptr]
+                .iter()
+                .all(|p| !registry.live.contains_key(&p.addr()))
+        );
+    }
+
+    #[test]
+    fn legacy_owner_cleanup_on_panic_and_cancellation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Clone)]
+        struct DropCount(Arc<AtomicUsize>);
+        impl Drop for DropCount {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let result = std::panic::catch_unwind({
+            let drops = drops.clone();
+            move || {
+                let raw = into_raw(ready_future(DropCount(drops)));
+                let _owner =
+                    unsafe { LegacyFutureOwner::<RuntimeFuture<DropCount>>::from_abi(raw) };
+                panic!("owner unwinds");
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let mut owner = LegacyFutureOwner::new(RuntimeFuture::<i64>::pending());
+        owner.get_mut().cancel();
+        assert_eq!(owner.get().poll(), Poll::Pending);
+        drop(owner);
+        // Cancellation abandons ready values too; owner drop releases payload.
+        let raw = into_raw(ready_future(DropCount(drops.clone())));
+        let mut owner = unsafe { LegacyFutureOwner::<RuntimeFuture<DropCount>>::from_abi(raw) };
+        owner.get_mut().cancel();
+        assert!(matches!(owner.get().poll(), Poll::Pending));
+        drop(owner);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    // Compatibility harness deliberately retains a registered token across the
+    // ABI await; ordinary Rust consumers instead use LegacyFutureOwner.
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn legacy_abi_timer_completion_and_cancellation_release_once() {
+        use crate::scheduler::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static TOKEN: AtomicUsize = AtomicUsize::new(0);
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct VoidAbiOwner(*mut c_void);
+        impl Drop for VoidAbiOwner {
+            fn drop(&mut self) {
+                unsafe {
+                    willow_future_release_void(self.0);
+                }
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn wait(ms: i64) -> i32 {
+            let owner = VoidAbiOwner(crate::timer::willow_runtime_sleep(ms));
+            TOKEN.store(owner.0.addr(), Ordering::SeqCst);
+            willow_future_await_void(owner.0);
+            if ms == 60_000 {
+                assert_ne!(crate::native_stack::cancelled(), 0);
+            } else {
+                assert_eq!(willow_future_is_ready_void(owner.0), 1);
+                willow_future_await_void(owner.0);
+            }
+            crate::task::RUNTIME_POLL_READY
+        }
+        unsafe extern "C" fn finish(_: *mut c_void) -> i32 {
+            wait(1)
+        }
+        unsafe extern "C" fn cancel(_: *mut c_void) -> i32 {
+            wait(60_000)
+        }
+        let _guard = crate::gc::runtime_test_guard();
+        reset_global_scheduler_for_test();
+        DROPS.store(0, Ordering::SeqCst);
+        for (index, callback) in [finish as crate::task::RuntimePollFn, cancel]
+            .into_iter()
+            .enumerate()
+        {
+            let task = willow_sched_spawn(callback, std::ptr::null_mut());
+            if index == 1 {
+                willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
+                assert_eq!(willow_sched_task_state(task), 2);
+                let token = TOKEN.load(Ordering::SeqCst);
+                assert!(handles().lock().unwrap().live.contains_key(&token));
+                willow_sched_cancel(task);
+            }
+            willow_sched_run_until(task);
+            assert_eq!(DROPS.load(Ordering::SeqCst), index + 1);
+            let token = TOKEN.load(Ordering::SeqCst);
+            assert!(!handles().lock().unwrap().live.contains_key(&token));
+        }
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn legacy_registry_fragmentation_and_generation_counts() {
+        for count in [1_usize, 16, 256, 1024] {
+            let before = HANDLE_OPERATIONS.with(|counts| counts.get());
+            let tokens: Vec<_> = (0..count)
+                .map(|i| willow_future_ready_i64(i as i64))
+                .collect();
+            for (i, &token) in tokens.iter().enumerate().step_by(2) {
+                assert_eq!(willow_future_await_i64(token), i as i64);
+                unsafe {
+                    willow_future_release_i64(token);
+                }
+            }
+            let replacements: Vec<_> = (0..count.div_ceil(2))
+                .map(|_| willow_future_pending_i64())
+                .collect();
+            {
+                let registry = handles().lock().unwrap();
+                for (i, &token) in tokens.iter().enumerate() {
+                    assert_eq!(registry.live.contains_key(&token.addr()), i % 2 == 1);
+                }
+                assert!(
+                    replacements
+                        .iter()
+                        .all(|p| p.addr() > tokens.last().unwrap().addr())
+                );
+            }
+            for &token in tokens.iter().skip(1).step_by(2).chain(replacements.iter()) {
+                unsafe {
+                    willow_future_release_i64(token);
+                }
+            }
+            let registry = handles().lock().unwrap();
+            assert!(
+                tokens
+                    .iter()
+                    .chain(replacements.iter())
+                    .all(|p| !registry.live.contains_key(&p.addr()))
+            );
+            let after = HANDLE_OPERATIONS.with(|counts| counts.get());
+            let operations = std::array::from_fn::<_, 3, _>(|i| after[i] - before[i]);
+            let releases = count + replacements.len();
+            assert_eq!(
+                operations,
+                [releases, releases + count.div_ceil(2), releases]
+            );
+            println!(
+                "legacy-registry originals={count} replacements={} released={} retained_entries=0 map_operations={operations:?}",
+                replacements.len(),
+                count + replacements.len()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_handles_reject_stale_wrong_type_and_duplicate_release() {
+        const CHILD: &str = "WILLOW_TEST_INVALID_LEGACY_HANDLE";
+        if let Ok(case) = std::env::var(CHILD) {
+            let raw = willow_future_ready_i64(7);
+            match case.as_str() {
+                "wrong_adopt" => unsafe {
+                    LegacyFutureOwner::<WillowFutureVoid>::from_abi(raw);
+                },
+                "null_adopt" => unsafe {
+                    LegacyFutureOwner::<RuntimeFuture<i64>>::from_abi(std::ptr::null_mut());
+                },
+                "wrong_poll" => {
+                    willow_future_is_ready_bool(raw);
+                }
+                "wrong_await" => {
+                    willow_future_await_f64(raw);
+                }
+                "wrong_release" => unsafe { willow_future_release_ptr(raw) },
+                "wrong_complete" => {
+                    willow_future_complete_i64(willow_future_ready_bool(1), 5);
+                }
+                "forged" => {
+                    willow_future_await_void(std::ptr::without_provenance_mut(usize::MAX));
+                }
+                "double_void" => {
+                    let raw = willow_future_ready_void();
+                    unsafe {
+                        willow_future_release_void(raw);
+                        willow_future_release_void(raw);
+                    }
+                }
+                "double_bool" => {
+                    let raw = willow_future_ready_bool(1);
+                    unsafe {
+                        willow_future_release_bool(raw);
+                        willow_future_release_bool(raw);
+                    }
+                }
+                "double_f64" => {
+                    let raw = willow_future_ready_f64(1.0);
+                    unsafe {
+                        willow_future_release_f64(raw);
+                        willow_future_release_f64(raw);
+                    }
+                }
+                "double_ptr" => {
+                    let raw = willow_future_ready_ptr(std::ptr::null_mut());
+                    unsafe {
+                        willow_future_release_ptr(raw);
+                        willow_future_release_ptr(raw);
+                    }
+                }
+                _ => {
+                    unsafe {
+                        willow_future_release_i64(raw);
+                    }
+                    // Allocating another future cannot resurrect the old token.
+                    let other = willow_future_ready_i64(9);
+                    assert_ne!(raw, other);
+                    match case.as_str() {
+                        "double_i64" => unsafe { willow_future_release_i64(raw) },
+                        "stale_adopt" => unsafe {
+                            LegacyFutureOwner::<RuntimeFuture<i64>>::from_abi(raw);
+                        },
+                        "stale_poll" => {
+                            willow_future_is_ready_i64(raw);
+                        }
+                        "stale_await" => {
+                            willow_future_await_i64(raw);
+                        }
+                        "stale_complete" => {
+                            willow_future_complete_i64(raw, 10);
+                        }
+                        _ => panic!("unknown case"),
+                    }
+                }
+            }
+            panic!("invalid handle returned");
+        }
+        for case in [
+            "wrong_adopt",
+            "null_adopt",
+            "stale_adopt",
+            "wrong_poll",
+            "wrong_await",
+            "wrong_release",
+            "wrong_complete",
+            "forged",
+            "double_void",
+            "double_i64",
+            "double_bool",
+            "double_f64",
+            "double_ptr",
+            "stale_poll",
+            "stale_await",
+            "stale_complete",
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "future::tests::legacy_handles_reject_stale_wrong_type_and_duplicate_release",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{case}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let expected = if case == "null_adopt" {
+                "null legacy future handle"
+            } else if case.starts_with("wrong") {
+                "legacy future handle type mismatch"
+            } else {
+                "invalid or released legacy future handle"
+            };
+            assert!(stderr.contains(expected), "{case}: {stderr}");
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestRoot(usize);

@@ -1,0 +1,12 @@
+import std::collections::Array;
+enum Node { Value(i64, Array<i64>) }
+fn dive(n: i64) -> Node {
+    if n == 0 { return Node::Value(0, []); }
+    return match dive(n - 1) {
+        Node::Value(value, items) => Node::Value(value + 1, items),
+    };
+}
+fn main(args: Array<String>) {
+    let depth = args[0].len() * 128;
+    println(match dive(depth) { Node::Value(value, items) => value });
+}

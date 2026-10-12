@@ -384,6 +384,7 @@ pub(super) fn finish_stopped(
             } else {
                 work.marked_bytes.saturating_add(legacy.marked_bytes)
             };
+            work.frame_scans = work.frame_scans.saturating_add(legacy.frame_scans);
             work.scanned_bytes = work.scanned_bytes.saturating_add(legacy.scanned_bytes);
             work.root_scan_bytes = work
                 .root_scan_bytes

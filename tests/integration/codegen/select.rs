@@ -1,5 +1,62 @@
 use super::*;
 
+#[test]
+fn coop_select_deferred_closed_fanout_delivers_all_results_under_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+import std::collections::Array;
+async fn receiver(ch: Channel<String>) -> i64 {
+    let mut count = 0;
+    select {
+        let value = ch.recv_opt() => {
+            match value { Some(text) => { if text == "retained" { count = 1; } }, None => {} }
+        }
+    }
+    return count;
+}
+async fn main() {
+    let ch = Channel<String>::with_capacity(1);
+    let tasks: Array<Task<i64>> = [];
+    let mut i = 0;
+    while i < 65 { tasks.push(receiver(ch)); i = i + 1; }
+    await sleep(10);
+    ch.send("retained");
+    ch.close();
+    let mut total = 0;
+    i = 0;
+    while i < tasks.len() { total = total + await tasks[i]; i = i + 1; }
+    println(total);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn select_aliased_arms_preserve_winner_with_repeated_cleanup() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn main() {
+    let ch = Channel<String>::with_capacity(1);
+    let alias = ch;
+    let mut count = 0;
+    while count < 32 {
+        ch.send("kept");
+        select {
+            let value = ch.recv() => { if value == "kept" { count = count + 1; } }
+            let value = alias.recv() => { if value == "kept" { count = count + 1; } }
+            alias.send("wrong") => { println("unexpected sender"); }
+        }
+    }
+    println(count);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "32\n");
+}
+
 // ----------------------------------------------------------------------------
 // select (willow-7aj): wait on multiple channel ops. A recv case is ready when
 // its channel has a value or is closed; a send case (unbounded) is always

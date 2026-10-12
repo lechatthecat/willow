@@ -169,8 +169,8 @@ fn main() { deferred(); }
 }
 
 #[test]
-fn lambda_shadow_19_async_frame_rejects_function_value_before_codegen() {
-    assert_compile_error_contains(
+fn lambda_shadow_19_async_frame_accepts_environment_free_function_value() {
+    let (out, ok) = compile_and_run(
         r#"
 fn f(x: i64) -> i64 { return x + 1; }
 async fn worker() -> i64 {
@@ -180,11 +180,9 @@ async fn worker() -> i64 {
 }
 async fn main() { println(await worker()); }
 "#,
-        &[
-            "error[E2402]",
-            "`fn(i64) -> i64` cannot move between workers",
-        ],
     );
+    assert!(ok, "{out}");
+    assert_eq!(out, "201\n");
 }
 
 #[test]

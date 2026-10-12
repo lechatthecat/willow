@@ -543,6 +543,7 @@ impl TypeChecker {
     /// ordinary method call graph. Imported implementations reuse completed
     /// effect capability queries, falling back conservatively if unavailable.
     fn connect_interface_lock_effects(&mut self, program: &Program) {
+        let symbols = &self.symbols;
         let local_methods = program
             .items
             .iter()
@@ -550,24 +551,22 @@ impl TypeChecker {
                 Item::Class(class) => Some(class),
                 _ => None,
             })
-            .map(|class| {
-                let canonical = self
-                    .symbols
+            .flat_map(|class| {
+                // Imported-module declarations already carry canonical symbol
+                // owners. Compare in that same identity domain; source names
+                // would misclassify this unit's own methods as external.
+                let owner = symbols
                     .lookup_class(&class.name)
-                    .map_or_else(|| class.name.clone(), |info| info.name.clone());
-                (class, canonical)
-            })
-            .flat_map(|(class, canonical)| {
-                let owner = TypeId::local(&class.name);
+                    .map_or(&class.name, |info| &info.name);
                 class.methods.iter().map(move |method| {
                     #[cfg(test)]
                     LOCAL_INTERFACE_METHOD_RECORDS.with(|records| records.set(records.get() + 1));
                     (
-                        (canonical.clone(), method.name.clone()),
+                        (owner.clone(), method.name.clone()),
                         (
                             method.is_default_injected,
                             method.body.id,
-                            FunctionId::method(owner, &method.name),
+                            FunctionId::method(TypeId::local(&class.name), &method.name),
                         ),
                     )
                 })
@@ -1448,7 +1447,25 @@ impl TypeChecker {
                     ) {
                         self.push(diag);
                     }
-                    inferred
+                    if matches!(&inferred, Type::Array(element) if **element == Type::Void) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1801,
+                                "cannot infer array element type; annotate the binding",
+                            )
+                            .with_label(Label::primary(s.span, "element type annotation required"))
+                            .with_help(format!(
+                                "add an element type, e.g. `let {}: Array<i64> = [];`",
+                                s.name
+                            )),
+                        );
+                        // Poison the binding so push, iteration and await do not
+                        // turn an unresolved element into secondary diagnostics.
+                        Self::error_type()
+                    } else {
+                        inferred
+                    }
                 };
                 if annotation.is_none()
                     && builtin_types::binary_args(&ty, B::Map)
@@ -2231,6 +2248,12 @@ impl TypeChecker {
                             crate::semantic::intrinsics::resolve(ty, &call.method, call.args.len())
                     {
                         return vec![resolved.intrinsic.function_id()];
+                    }
+                    if targets.is_empty()
+                        && let Some(target) =
+                            crate::semantic::intrinsics::adt_method_target(ty, &call.method)
+                    {
+                        return vec![target];
                     }
                     targets
                 })

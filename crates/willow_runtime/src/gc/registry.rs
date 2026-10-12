@@ -35,6 +35,116 @@ pub enum TraceSliceProgress {
     Retry,
 }
 
+/// Effective native tracing contract. Bitmap-only payloads need no native hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceMode {
+    StopOnly,
+    ConcurrentSafe,
+    SliceConcurrentSafe,
+}
+
+/// A concurrency capability carries its implementation, never just a flag.
+#[derive(Clone, Copy)]
+pub enum NativeTraceCapability {
+    StopOnly,
+    ConcurrentSafe(ConcurrentTraceFn),
+    SliceConcurrentSafe(ConcurrentTraceSliceFn),
+}
+
+pub(super) fn trace_mode(concurrent: bool, slice: bool) -> TraceMode {
+    if slice {
+        TraceMode::SliceConcurrentSafe
+    } else if concurrent {
+        TraceMode::ConcurrentSafe
+    } else {
+        TraceMode::StopOnly
+    }
+}
+
+/// Register matched hooks before publishing instances. Existing marking epochs
+/// retain their captured callbacks. Replacing a live type's payload layout is
+/// unsupported. All hooks must avoid GC allocation, safepoints and GC reentry;
+/// concurrent hooks require synchronized value snapshots and short critical
+/// sections. Slices additionally require bounded work and stable finite cursors.
+pub fn willow_register_type_capability(
+    type_id: u32,
+    stopped: TraceFn,
+    capability: NativeTraceCapability,
+) {
+    let (trace, slice) = match capability {
+        NativeTraceCapability::StopOnly => (None, None),
+        NativeTraceCapability::ConcurrentSafe(trace) => (Some(trace), None),
+        NativeTraceCapability::SliceConcurrentSafe(slice) => (None, Some(slice)),
+    };
+    register_hooks(type_id, stopped, trace, slice);
+}
+
+fn register_hooks(
+    type_id: u32,
+    stopped: TraceFn,
+    trace: Option<ConcurrentTraceFn>,
+    slice: Option<ConcurrentTraceSliceFn>,
+) {
+    // Common lock order also makes epoch capture and diagnostics coherent.
+    let mut legacy = type_registry().lock().unwrap();
+    let mut traces = runtime().concurrent_trace_registry.lock().unwrap();
+    let mut slices = runtime().concurrent_slice_registry.lock().unwrap();
+    legacy.insert(type_id, stopped);
+    traces.remove(&type_id);
+    slices.remove(&type_id);
+    if let Some(trace) = trace {
+        traces.insert(type_id, trace);
+    }
+    if let Some(slice) = slice {
+        slices.insert(type_id, slice);
+    }
+}
+
+/// Current registered native capabilities, in unspecified order. Already-running
+/// epochs retain their own snapshot. Absent types have no native trace hook.
+pub fn native_trace_modes() -> Vec<(u32, TraceMode)> {
+    let legacy = type_registry().lock().unwrap();
+    let traces = runtime().concurrent_trace_registry.lock().unwrap();
+    let slices = runtime().concurrent_slice_registry.lock().unwrap();
+    legacy
+        .keys()
+        .map(|&id| {
+            (
+                id,
+                trace_mode(traces.contains_key(&id), slices.contains_key(&id)),
+            )
+        })
+        .collect()
+}
+
+// One lookup per encountered type per stopped walk, including absent hooks.
+// This avoids scanning every registered type for a small/empty stopped graph.
+pub(super) fn lookup_trace_contract(type_id: u32) -> Option<(TraceFn, TraceMode)> {
+    let legacy = type_registry().lock().unwrap();
+    let trace = *legacy.get(&type_id)?;
+    let traces = runtime().concurrent_trace_registry.lock().unwrap();
+    let slices = runtime().concurrent_slice_registry.lock().unwrap();
+    Some((
+        trace,
+        trace_mode(traces.contains_key(&type_id), slices.contains_key(&type_id)),
+    ))
+}
+
+pub(super) fn trace_registry_snapshot() -> (
+    IdSet<u32>,
+    IdMap<u32, ConcurrentTraceFn>,
+    IdMap<u32, ConcurrentTraceSliceFn>,
+) {
+    let legacy = type_registry().lock().unwrap();
+    let traces = runtime().concurrent_trace_registry.lock().unwrap();
+    let slices = runtime().concurrent_slice_registry.lock().unwrap();
+    (
+        legacy.keys().copied().collect(),
+        traces.clone(),
+        slices.clone(),
+    )
+}
+
 /// Load a GC reference shared with the concurrent marker.
 /// # Safety
 /// The aligned slot must stay allocated; all concurrent writes must be atomic.
@@ -56,37 +166,18 @@ pub(super) fn type_registry() -> &'static Mutex<HashMap<u32, TraceFn>> {
 
 /// Register a trace function for `type_id`.  Call once per class at startup.
 pub fn willow_register_type(type_id: u32, trace: TraceFn) {
-    type_registry().lock().unwrap().insert(type_id, trace);
-    // A replacement legacy hook must not inherit another implementation's
-    // concurrent contract. Native registration installs its matched hook next.
-    runtime()
-        .concurrent_trace_registry
-        .lock()
-        .unwrap()
-        .remove(&type_id);
-    runtime()
-        .concurrent_slice_registry
-        .lock()
-        .unwrap()
-        .remove(&type_id);
+    willow_register_type_capability(type_id, trace, NativeTraceCapability::StopOnly);
 }
 
-/// Unregister the trace function for `type_id`.
+/// Unregister all trace capabilities for `type_id`.
 pub fn willow_unregister_type(type_id: u32) {
-    type_registry().lock().unwrap().remove(&type_id);
-    runtime()
-        .concurrent_trace_registry
-        .lock()
-        .unwrap()
-        .remove(&type_id);
-    runtime()
-        .concurrent_slice_registry
-        .lock()
-        .unwrap()
-        .remove(&type_id);
-    runtime()
-        .registry_generation
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let mut legacy = type_registry().lock().unwrap();
+    let mut traces = runtime().concurrent_trace_registry.lock().unwrap();
+    let mut slices = runtime().concurrent_slice_registry.lock().unwrap();
+    legacy.remove(&type_id);
+    traces.remove(&type_id);
+    slices.remove(&type_id);
+    runtime().registry_generation.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Finalizer: given a payload pointer, release any non-GC resources the object
@@ -126,10 +217,18 @@ impl NativeGcType {
         }
     }
     pub const fn with_concurrent_trace(mut self, trace: ConcurrentTraceFn) -> Self {
+        assert!(
+            self.trace.is_some(),
+            "concurrent tracing requires a stopped hook"
+        );
         self.concurrent_trace = Some(trace);
         self
     }
     pub const fn with_concurrent_slice(mut self, trace: ConcurrentTraceSliceFn) -> Self {
+        assert!(
+            self.trace.is_some(),
+            "sliced tracing requires a stopped hook"
+        );
         self.concurrent_slice = Some(trace);
         self
     }
@@ -170,21 +269,12 @@ impl NativeGcRegistration {
         }
         for native in types {
             if let Some(trace) = native.trace {
-                willow_register_type(native.type_id, trace);
-            }
-            if let Some(trace) = native.concurrent_trace {
-                runtime()
-                    .concurrent_trace_registry
-                    .lock()
-                    .unwrap()
-                    .insert(native.type_id, trace);
-            }
-            if let Some(trace) = native.concurrent_slice {
-                runtime()
-                    .concurrent_slice_registry
-                    .lock()
-                    .unwrap()
-                    .insert(native.type_id, trace);
+                register_hooks(
+                    native.type_id,
+                    trace,
+                    native.concurrent_trace,
+                    native.concurrent_slice,
+                );
             }
             if let Some(drop_fn) = native.drop_fn {
                 willow_register_drop(native.type_id, drop_fn);

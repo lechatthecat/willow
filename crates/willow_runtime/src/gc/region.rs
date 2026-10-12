@@ -50,6 +50,21 @@ pub(super) struct RegionFreeSpan {
     pub(super) size: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum SweepPhase {
+    Unswept,
+    Sweeping,
+    #[default]
+    Swept,
+    Released,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct SweepState {
+    pub(super) epoch: u64,
+    pub(super) phase: SweepPhase,
+}
+
 /// Metadata for one regular or large-object old-generation region.
 ///
 /// Invariants:
@@ -69,6 +84,8 @@ pub(super) struct OldRegion {
     pub(super) free_spans: FreeSpans,
     pub(super) largest_free_span: usize,
     pub(super) sweep_pending: bool,
+    pub(super) sweep_state: SweepState,
+    pub(super) reusable_after_epoch: u64,
     pub(super) sweep_quarantined: bool,
     /// Active per-thread old allocation buffers carved from this region.
     pub(super) active_labs: usize,
@@ -121,7 +138,6 @@ pub(super) struct TlabStateRecord {
     pub(super) assist_observed_fast_bytes: u64,
 }
 
-#[cfg(test)]
 impl RegionMarkBitmap {
     pub(super) fn unmark(&mut self, offset: usize) {
         self.bits.unset(offset / GC_REGION_MARK_GRANULE);
@@ -152,6 +168,8 @@ impl OldRegion {
             free_spans: FreeSpans::default(),
             largest_free_span: 0,
             sweep_pending: false,
+            sweep_state: SweepState::default(),
+            reusable_after_epoch: 0,
             sweep_quarantined: false,
             active_labs: 0,
             #[cfg(test)]

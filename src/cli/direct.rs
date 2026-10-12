@@ -435,6 +435,15 @@ fn effect_lines(result: &Value, all: bool, lines: &mut Vec<String>) {
                 "Incomplete effect summary: {}",
                 cause["name"].as_str().unwrap_or("unknown")
             ));
+            if let Some(sites) = cause["call_sites"].as_array() {
+                for site in sites {
+                    lines.push(format!(
+                        "  Unresolved call `{}` at {}",
+                        site["operation"].as_str().unwrap_or("unknown"),
+                        location(&site["location"])
+                    ));
+                }
+            }
             if let Some(locations) = cause["locations"].as_array() {
                 for loc in locations {
                     lines.push(format!("  {}", location(loc)));

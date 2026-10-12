@@ -780,8 +780,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .brif(active, propagate, &[], recovered, &[]);
             self.builder.switch_to_block(recovered);
             self.builder.seal_block(recovered);
-            for (name, span) in &scope.call_frames_at_entry {
-                self.emit_callstack_push(name, *span);
+            for (_, span) in &scope.call_frames_at_entry {
+                self.emit_callstack_reserve(*span);
             }
             self.lir_reference_scopes = scope.reference_scopes_at_entry.clone();
             self.emit_replay_reference_scopes();
@@ -976,14 +976,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         Some(reusable.unwrap_or_else(|| self.emit_value_runtime_call("willow_panic_depth", &[])))
     }
 
-    /// Debug builds: publish the statement being executed before a runtime call
-    /// that can raise. Faults raised inside a runtime helper (array bounds, a
-    /// blocked channel op, an awaited cancelled task) carry no location of
-    /// their own, so without this their `PanicInfo` would report `:0:0`
-    /// (willow-s9ej.7). Release builds skip it: the store is not worth a call
-    /// on every collection access.
+    /// Publish the executing function and location before a call that can raise.
+    /// Debug builds retain the synchronous leaf; async tasks retain their own
+    /// location in every mode. Release sync calls update only the fault location
+    /// and clear any prior leaf, so task execution cannot leak stale metadata.
     pub(super) fn emit_fault_site(&mut self) {
-        if self.build_mode != BuildMode::Debug {
+        if self.diagnostic_function.is_empty() {
             return;
         }
         let Some(span) = self.fault_site_span else {
@@ -993,9 +991,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let Some((file_ptr, file_len)) = self.emit_static_str_bytes(&file) else {
             return;
         };
+        let name = self.diagnostic_function.clone();
+        let (name_ptr, name_len) = self
+            .emit_static_str_bytes(&name)
+            .expect("diagnostic function literal declared");
         let line = self.builder.ins().iconst(types::I64, span.line as i64);
         let column = self.builder.ins().iconst(types::I64, span.col as i64);
-        self.emit_void_runtime_call("willow_fault_site_set", &[file_ptr, file_len, line, column]);
+        let asynchronous = self.builder.ins().iconst(
+            types::I32,
+            i64::from(self.diagnostic_async)
+                | (i64::from(self.build_mode == BuildMode::Debug) << 1),
+        );
+        self.emit_void_runtime_call(
+            "willow_trace_site_set",
+            &[
+                name_ptr,
+                name_len,
+                file_ptr,
+                file_len,
+                line,
+                column,
+                asynchronous,
+            ],
+        );
     }
 
     /// Branch away before observing a neutral result only when the callee

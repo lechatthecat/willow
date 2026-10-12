@@ -313,8 +313,8 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     PANIC_ALLOC; "willow_channel_recv_opt_into" => ([Ptr, Ptr] -> Some(I64));
     NONE; "willow_channel_close" => ([Ptr] -> None);
     SUSPEND; "willow_channel_recv_ready" => ([Ptr] -> Some(I32));
-    NONE; "willow_channel_unregister_waiter" => ([Ptr] -> None);
-    NONE; "willow_channel_select_cleanup" => ([Ptr, Ptr, I64] -> None);
+    ALLOC; "willow_channel_unregister_waiter" => ([Ptr] -> None);
+    ALLOC; "willow_channel_select_cleanup" => ([Ptr, Ptr, I64] -> None);
     PANIC_ALLOC; "willow_channel_new_bounded" => ([I64, I64] -> Some(Ptr));
     NONE; "willow_channel_send_ready" => ([Ptr] -> Some(I32));
     NONE; "willow_channel_try_send_i64" => ([Ptr, I64] -> Some(I32));
@@ -346,9 +346,12 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_panic_finish_unhandled" => ([] -> None);
     // --- debug call-chain stack (willow-992h) ---
     NONE; "willow_callstack_push" => ([Ptr, I64, Ptr, I64, I32, I32] -> None);
+    NONE; "willow_callstack_push_pending" => ([Ptr, I64, Ptr, I64, I32, I32] -> None);
+    NONE; "willow_callstack_activate" => ([] -> None);
     NONE; "willow_callstack_pop" => ([] -> None);
     // --- debug fault site: source location for runtime-raised faults ---
     NONE; "willow_fault_site_set" => ([Ptr, I64, I64, I64] -> None);
+    NONE; "willow_trace_site_set" => ([Ptr, I64, Ptr, I64, I64, I64, I32] -> None);
     NONE; "willow_fault_site_clear" => ([] -> None);
     // --- reference debug metadata ---
     NONE; "willow_debug_reference_call_scope_push" => ([] -> None);

@@ -21,7 +21,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_interface_dispatch_nil_check(vtable, span, method);
         }
         if push_frame {
-            self.emit_callstack_push(method, span);
+            self.emit_callstack_reserve(span);
         }
         if let Some((object, _)) = interface_parts {
             self.emit_interface_dispatch_nil_check(object, span, method);
@@ -81,6 +81,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let virtual_slot = plan.virtual_slot;
 
         let pushed = if frame_prepared {
+            if self.flat_method_frame_enabled(method) {
+                self.emit_void_runtime_call("willow_callstack_activate", &[]);
+            }
             self.flat_method_frame_enabled(method)
         } else {
             self.emit_callstack_push(method, span)
@@ -241,6 +244,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Install the method frame before validating the concrete object so a
         // invalid receiver retains the method context in its diagnostic.
         let pushed = if frame_prepared {
+            if self.flat_method_frame_enabled(method) {
+                self.emit_void_runtime_call("willow_callstack_activate", &[]);
+            }
             self.flat_method_frame_enabled(method)
         } else {
             self.emit_callstack_push(method, span)

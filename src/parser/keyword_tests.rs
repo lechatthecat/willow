@@ -59,6 +59,7 @@ fn keyword_open_reserved_positions() {
 fn keyword_valid_modifiers_and_nonkeywords_unchanged() {
     parse_ok("open class C {} interface I { fn f(self); }");
     parse_ok("fn opened() { let opening = 1; }");
+    parse_ok("import std::io::{print, println}; fn main() { print(1); println(2); }");
     for source in ["fn 123() {}", "fn () {}"] {
         let errors = parse_errors(source);
         assert!(errors.iter().any(|e| e.code == ErrorCode::E0102));
@@ -116,4 +117,64 @@ fn keyword_diagnostics_in_declarations_members_locals_and_fields() {
             );
         }
     }
+}
+
+#[test]
+fn builtin_method_names_recover_without_receiver_cascades() {
+    for keyword in ["print", "println"] {
+        for source in [
+            format!(
+                "interface Printer {{ fn {keyword}(self, v: Json) -> String; fn name(self) -> String; }} fn after() {{}}"
+            ),
+            format!(
+                "interface Printer {{ fn {keyword}(self) {{ if true {{ println(1); }} }} fn name(self); }} fn after() {{}}"
+            ),
+            format!(
+                "class Printer {{ pub fn {keyword}(self) {{}} pub fn name(self) {{}} }} fn after() {{}}"
+            ),
+            format!("fn f() {{ p.{keyword}(v); }} fn after() {{}}"),
+            format!("fn f() {{ new X().{keyword}(v); }} fn after() {{}}"),
+        ] {
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            let (program, errors) = Parser::new(tokens).parse();
+            assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+            assert!(errors[0].message.contains("builtin function name"));
+            assert_eq!(
+                errors[0].primary_span().unwrap().start,
+                source.find(keyword).unwrap()
+            );
+            assert!(
+                program
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, ast::Item::Function(f) if f.name == "after"))
+            );
+            for item in &program.items {
+                match item {
+                    ast::Item::Interface(i) => assert_eq!(i.methods[1].name, "name"),
+                    ast::Item::Class(c) => assert_eq!(c.methods[1].name, "name"),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn builtin_method_recovery_token_reads_scale_linearly() {
+    let mut samples = Vec::new();
+    for n in [8, 16, 32, 64] {
+        let source = format!(
+            "interface I {{ {} fn name(self); }}",
+            "fn print(self);".repeat(n)
+        );
+        PARSER_TOKEN_READS.with(|count| count.set(0));
+        assert_eq!(parse_errors(&source).len(), n);
+        samples.push((n, PARSER_TOKEN_READS.with(|count| count.get())));
+    }
+    let slope = (samples[1].1 - samples[0].1) / 8;
+    for pair in samples.windows(2) {
+        assert_eq!(pair[1].1 - pair[0].1, slope * (pair[1].0 - pair[0].0));
+    }
+    eprintln!("builtin recovery token reads: {samples:?}");
 }

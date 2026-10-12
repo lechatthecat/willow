@@ -1,6 +1,9 @@
 //! Channel state, GC integration, ownership cleanup, and wake dispatch.
 
 mod abi;
+mod deferred;
+#[cfg(test)]
+mod deferred_tests;
 pub use abi::*;
 
 use crate::id_hash::IdMap;
@@ -8,7 +11,6 @@ use crate::native_memory::Mutex;
 use crate::task::{ChannelOwnershipToken, ChannelRole};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::Condvar;
 
 use crate::trace::{GcTrace, GcVisitor};
 
@@ -27,11 +29,10 @@ impl Default for WillowChannelValue {
     }
 }
 
-/// A channel's parked-task queue: FIFO order plus expected O(1) membership
-/// (willow-ezs.1.2). The implementation now lives in `crate::wait_queue` so
-/// task-completion waits share exactly the same structure (willow-ezs.2);
-/// channel wake behavior is unchanged.
-type WaiterQueue = crate::wait_queue::WaitQueue<u64>;
+// Channels need bounded unlink/pop work during select cleanup. Task-completion
+// waits retain the separate shared queue and its amortized tombstone policy.
+mod waiters;
+use waiters::WaiterQueue;
 
 #[derive(Default)]
 struct WillowChannelState {
@@ -56,6 +57,7 @@ struct WillowChannelState {
     send_handoffs: IdMap<u64, u64>,
     next_generation: u64,
     native_tables: [usize; 2],
+    deferred_wakes: [bool; 2],
 }
 
 impl crate::native_memory::Footprint for WillowChannelState {
@@ -82,7 +84,6 @@ pub struct WillowAbiChannel {
 
 pub struct ChannelCore {
     state: Mutex<WillowChannelState>,
-    not_empty: Condvar,
     /// True when the element type is a GC reference (String / class / array /
     /// ...): queued values are then GC roots scanned by the collector
     /// (willow-dsw GC tracing).
@@ -101,7 +102,6 @@ impl WillowAbiChannel {
         Self {
             inner: Box::new(ChannelCore {
                 state: Mutex::with_base(WillowChannelState::default(), size_of::<ChannelCore>()),
-                not_empty: Condvar::new(),
                 is_ref,
             }),
         }
@@ -290,7 +290,7 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
     };
     let current = crate::scheduler::willow_sched_current_task();
     crate::task::prepare_channel_wait_links();
-    {
+    let (wake_receivers, wake_senders) = {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         if state.closed {
             clear_wait(raw, &mut state.send_waiters, current, ChannelRole::SendWait);
@@ -324,10 +324,18 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
             );
         }
         state.values.push_back(value);
-        channel.not_empty.notify_one();
+        let receive =
+            (!state.waiters.is_empty()).then(|| reserve_first_waiter(channel, &mut state, true));
+        (receive, !state.send_waiters.is_empty())
+    };
+    // A waiter arriving after this snapshot probes the updated availability
+    // under the same mutex. It cannot depend on this notification.
+    if let Some(first) = wake_receivers {
+        publish_first_waiter(channel, true, first);
     }
-    wake_recv_waiters(channel);
-    wake_send_waiters(channel);
+    if wake_senders {
+        wake_send_waiters(channel);
+    }
     1
 }
 
@@ -456,12 +464,21 @@ fn reserve_waiter_batch<const N: usize>(
     #[cfg(test)]
     CHANNEL_RESERVE_LOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut state = channel.state.lock().expect("channel mutex poisoned");
+    reserve_waiter_batch_locked(channel, &mut state, receive, candidates)
+}
+
+fn reserve_waiter_batch_locked<const N: usize>(
+    channel: &ChannelCore,
+    state: &mut WillowChannelState,
+    receive: bool,
+    candidates: &mut [WakeCandidate; N],
+) -> (usize, bool, bool) {
     let mut count = 0;
     for _ in 0..N {
         if if receive {
             state.values.len() <= state.recv_claims.len()
         } else {
-            state.closed || state_is_full(&state)
+            state.closed || state_is_full(state)
         } {
             return (count, state.closed, true);
         }
@@ -473,7 +490,9 @@ fn reserve_waiter_batch<const N: usize>(
         let Some((task, wait)) = queue.pop_front_ticket() else {
             return (count, state.closed, true);
         };
-        let generation = next_generation(&mut state);
+        #[cfg(test)]
+        CHANNEL_WAITER_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let generation = next_generation(state);
         let (wait_role, owned_role) = if receive {
             (ChannelRole::RecvWait, ChannelRole::RecvClaim)
         } else {
@@ -499,7 +518,7 @@ fn reserve_waiter_batch<const N: usize>(
     let exhausted = if receive {
         state.values.len() <= state.recv_claims.len() || state.waiters.is_empty()
     } else {
-        state.closed || state_is_full(&state) || state.send_waiters.is_empty()
+        state.closed || state_is_full(state) || state.send_waiters.is_empty()
     };
     (count, state.closed, exhausted)
 }
@@ -552,6 +571,24 @@ fn wake_reserved_waiters(channel: &ChannelCore, receive: bool) {
     // storage on this path; a remaining fanout uses bounded batches below.
     let mut first = [(0, core_token(channel, ChannelRole::RecvClaim, 0))];
     let (count, closed, exhausted) = reserve_waiter_batch(channel, receive, &mut first);
+    publish_first_waiter(channel, receive, (first, count, closed, exhausted));
+}
+
+type FirstWaiter = ([WakeCandidate; 1], usize, bool, bool);
+
+fn reserve_first_waiter(
+    channel: &ChannelCore,
+    state: &mut WillowChannelState,
+    receive: bool,
+) -> FirstWaiter {
+    let mut first = [(0, core_token(channel, ChannelRole::RecvClaim, 0))];
+    let (count, closed, exhausted) =
+        reserve_waiter_batch_locked(channel, state, receive, &mut first);
+    (first, count, closed, exhausted)
+}
+
+fn publish_first_waiter(channel: &ChannelCore, receive: bool, first: FirstWaiter) {
+    let (first, count, closed, exhausted) = first;
     let released = publish_waiter_batch(channel, &first[..count], &mut Default::default());
     if exhausted && !released {
         if receive && closed {
@@ -560,6 +597,31 @@ fn wake_reserved_waiters(channel: &ChannelCore, receive: bool) {
         return;
     }
     wake_reserved_batches(channel, receive);
+}
+
+fn publish_first_waiter_bounded(
+    raw: *mut c_void,
+    channel: &ChannelCore,
+    receive: bool,
+    first: FirstWaiter,
+) -> *mut c_void {
+    let (first, count, closed, exhausted) = first;
+    // Publication is non-safepointing except for the explicit scheduler stress
+    // hook. Keep its optional relocation visible before creating a deferred job.
+    let root = (count != 0 && crate::gc::gc_stress_enabled("scheduler"))
+        .then(|| crate::gc::GcRootHandle::new(raw.cast()));
+    let released = publish_waiter_batch(channel, &first[..count], &mut Default::default());
+    let raw = root.as_ref().map_or(raw, |root| root.load().cast());
+    if !exhausted || released || (receive && closed) {
+        return deferred::schedule(raw, channel, receive);
+    }
+    raw
+}
+
+fn wake_waiters_bounded(raw: *mut c_void, channel: &ChannelCore, receive: bool) -> *mut c_void {
+    let mut first = [(0, core_token(channel, ChannelRole::RecvClaim, 0))];
+    let (count, closed, exhausted) = reserve_waiter_batch(channel, receive, &mut first);
+    publish_first_waiter_bounded(raw, channel, receive, (first, count, closed, exhausted))
 }
 
 // Keep large scratch setup out of the frequent zero/single-waiter call frame.
@@ -589,6 +651,10 @@ static CHANNEL_WAKE_BATCHES: std::sync::atomic::AtomicUsize =
 
 #[cfg(test)]
 static CHANNEL_RESERVE_LOCKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static CHANNEL_WAITER_VISITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 fn wake_recv_waiters(channel: &ChannelCore) {
@@ -673,7 +739,7 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
 /// channel also answers `None`. Other failures (a wait that can never be
 /// satisfied) still raise.
 fn channel_recv_or_closed(raw: *mut c_void) -> Option<WillowChannelValue> {
-    let channel = unsafe { channel_from_raw(raw) }?;
+    let channel: &ChannelCore = unsafe { channel_from_raw(raw) }?;
     let current = crate::scheduler::willow_sched_current_task();
     let mut no_progress = false;
     loop {
@@ -681,14 +747,23 @@ fn channel_recv_or_closed(raw: *mut c_void) -> Option<WillowChannelValue> {
             let _no_preempt = crate::preempt::NoPreemptGuard::enter();
             let mut state = channel.state.lock().expect("channel mutex poisoned");
             if let Some(mut value) = take_value(raw, &mut state, current) {
+                let wake_senders = (!state.send_waiters.is_empty())
+                    .then(|| reserve_first_waiter(channel, &mut state, false));
+                let wake_receivers = !state.waiters.is_empty();
                 drop(state);
                 // Waking can explicitly collect under scheduler GC stress.
                 // The popped reference no longer has the queue as its root.
                 let root = channel
                     .is_ref
                     .then(|| crate::gc::GcRootHandle::new(unsafe { value.ptr_value.cast() }));
-                wake_send_waiters(channel);
-                wake_recv_waiters(channel);
+                let raw = if let Some(first) = wake_senders {
+                    publish_first_waiter_bounded(raw, channel, false, first)
+                } else {
+                    raw
+                };
+                if wake_receivers {
+                    wake_waiters_bounded(raw, channel, true);
+                }
                 if let Some(root) = root {
                     value.ptr_value = root.load().cast();
                 }

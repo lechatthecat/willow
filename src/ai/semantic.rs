@@ -22,7 +22,16 @@ pub struct SemanticFacts {
     pub flows: Vec<Flow>,
     pub witnesses: BTreeMap<String, Vec<Value>>,
     pub compiler_effects: BTreeMap<String, u8>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unresolved_calls: BTreeMap<String, Vec<UnresolvedCall>>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnresolvedCall {
+    pub operation: String,
+    pub location: Location,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expression {
@@ -66,6 +75,7 @@ impl std::ops::Deref for CaptureContext<'_> {
 pub(super) struct Captured {
     pub rename_relations: super::rename::Relations,
     bodies: Vec<Body>,
+    pub call_sites: Vec<(FunctionId, Span, Option<FunctionId>, String)>,
     pub witnesses: HashMap<FunctionId, Vec<Value>>,
     pub compiler_effects: HashMap<FunctionId, u8>,
 }
@@ -110,19 +120,22 @@ impl Captured {
             }
             let existing = witnesses.iter().position(|w| w["effect"] == effect);
             if existing.is_some_and(|i| {
-                witnesses[i]["witness"]["kind"] != "unavailable"
-                    && !(effect == RuntimeEffects::MAY_ALLOCATE.bits()
-                        && explicit_allocation(Some(operation))
-                        && !explicit_allocation(
-                            witnesses[i]["witness"]["cause"]["operation"].as_str(),
-                        ))
+                let replace = matches!(
+                    witnesses[i]["witness"]["kind"].as_str(),
+                    Some("unavailable" | "external-boundary")
+                ) || (effect == RuntimeEffects::MAY_ALLOCATE.bits()
+                    && explicit_allocation(Some(operation))
+                    && !explicit_allocation(
+                        witnesses[i]["witness"]["cause"]["operation"].as_str(),
+                    ));
+                !replace
             }) {
                 continue;
             }
             let mut value = json!({"effect":effect,"witness":{"kind":"runtime-capability","certainty":"conservative-bound","cause":{"span":span,"operation":operation}}});
             if effect == RuntimeEffects::MAY_BLOCK.bits() && operation == "await" {
                 value["witness"]["reason"] = json!(
-                    "conservative await bound: stored void futures may use blocking willow_future_await_void; scheduler sleep/yield parks the task; this bound does not identify the selected lowering"
+                    "conservative await bound for the checked operand type: waiting may park or block depending on the selected lowering; this summary does not establish which path executes"
                 );
             }
             if operation == "array-length-null-panic" {
@@ -140,6 +153,22 @@ impl Captured {
             }
         }
         witnesses.sort_by_key(|w| w["effect"].as_u64().unwrap());
+    }
+    pub fn await_type(&mut self, function: FunctionId, span: Span, operand: Option<&str>) {
+        if let Some(witnesses) = self.witnesses.get_mut(&function) {
+            for entry in witnesses {
+                let witness = &mut entry["witness"];
+                if witness["cause"]["operation"] == "await"
+                    && witness["cause"]["span"] == json!(span)
+                {
+                    witness["awaited_type"] = json!(operand);
+                    witness["reason"] = json!(format!(
+                        "Conservative await bound for {}; waiting may park or block depending on the selected lowering. This summary does not establish which path executes.",
+                        operand.unwrap_or("an unresolved operand type")
+                    ));
+                }
+            }
+        }
     }
     pub fn spans(&self) -> impl Iterator<Item = Span> + '_ {
         self.bodies
@@ -171,6 +200,21 @@ pub(super) fn finish(
     let mut units: Vec<_> = captures.keys().copied().collect();
     units.sort();
     for unit in units {
+        for (caller, span, target, operation) in &captures[&unit].semantic.call_sites {
+            if target.is_some_and(|target| functions.contains_key(&resolve(unit, target))) {
+                continue;
+            }
+            if let Some(caller) = functions.get(&resolve(unit, *caller)) {
+                result
+                    .unresolved_calls
+                    .entry(caller.id.clone())
+                    .or_default()
+                    .push(UnresolvedCall {
+                        operation: operation.clone(),
+                        location: location(*span)?,
+                    });
+            }
+        }
         for (&id, &effects) in &captures[&unit].semantic.compiler_effects {
             if let Some(function) = functions.get(&resolve(unit, id)) {
                 *result
@@ -860,6 +904,7 @@ impl QuerySession {
                             unknown_causes.push(json!({"function":cause.id,
                                 "name":cause.name, "module":cause.module,
                                 "locations":cause.locations, "unresolved":cause.unresolved,
+                                "call_sites":self.snapshot.semantic.unresolved_calls.get(&cause.id),
                                 "caller_location":if cause.locations.is_empty() { via.and_then(|v: usize| self.snapshot.functions[v].locations.first()) } else { None },
                                 "reason":cause.unknown_reason()}));
                         }
@@ -920,7 +965,7 @@ impl QuerySession {
                         });
                     }
                     json!({"status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
-                        "reason":f.unknown_reason(), "unknown_causes":unknown_causes, "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence.into_values().collect::<Vec<_>>(),
+                        "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence.into_values().collect::<Vec<_>>(),
                         "witness":witness, "compiler_witnesses":self.snapshot.semantic.witnesses.get(&f.id),
                         "meaning":"compiler facts and conservative runtime capability bounds; external business effects and predicate feasibility are not implied"})
                 }
@@ -1327,6 +1372,76 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unresolved_call_evidence_scales_with_sites_and_reachable_edges() {
+        let directory =
+            std::env::temp_dir().join(format!("willow-unresolved-scaling-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("main.wi");
+        for n in [16, 64, 256] {
+            let mut source = format!(
+                "fn apply(f: fn(i64) -> i64) -> i64 {{ {} return 0; }}\n",
+                "f(1);".repeat(n)
+            );
+            for i in 0..n {
+                let callee = if i == 0 {
+                    "apply".to_owned()
+                } else {
+                    format!("relay{}", i - 1)
+                };
+                source.push_str(&format!(
+                    "fn relay{i}(f: fn(i64) -> i64) -> i64 {{ return {callee}(f); }}\n"
+                ));
+            }
+            source.push_str("fn main() {}\n");
+            std::fs::write(&path, source).unwrap();
+            let snapshot = crate::CompilerSession::new(
+                path.to_str().unwrap(),
+                "",
+                &crate::CompilerOptions::debug(),
+                None,
+            )
+            .analysis_with_emitter(&mut crate::diagnostics::HumanEmitter)
+            .unwrap();
+            assert_eq!(
+                snapshot
+                    .semantic
+                    .unresolved_calls
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                n
+            );
+            let function = snapshot
+                .functions
+                .iter()
+                .find(|f| f.name == format!("relay{}", n - 1))
+                .unwrap()
+                .id
+                .clone();
+            let revision = snapshot.revision.clone();
+            let mut session = QuerySession::new(snapshot).unwrap();
+            let value = session.query(QueryRequest::Effects { revision, function });
+            assert_eq!(
+                value["result"]["unknown_causes"].as_array().unwrap().len(),
+                1
+            );
+            assert_eq!(
+                value["result"]["unknown_causes"][0]["call_sites"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                n
+            );
+            assert_eq!(session.effect_edge_visits, n);
+            println!(
+                "sites={n}, chain_edges={n}, stored_sites={n}, reported_sites={n}, visited_edges={}",
+                session.effect_edge_visits
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn missing_effect_witness_is_incomplete_and_missing_identity_is_unknown() {
         let directory =

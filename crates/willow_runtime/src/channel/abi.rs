@@ -183,8 +183,9 @@ pub extern "C" fn willow_channel_unregister_waiter(raw: *mut c_void) {
     willow_channel_select_cleanup(raw, std::ptr::null_mut(), -1);
 }
 
-/// Called once per distinct runtime channel by select, before committing its
+/// Called per channel arm by select, before committing its
 /// winning operation. Direction: 0 recv, 1 send, -1 non-channel winner.
+/// Repeated calls for aliased arms are harmless and retain the winning role.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_select_cleanup(
@@ -196,11 +197,13 @@ pub extern "C" fn willow_channel_select_cleanup(
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return;
     };
+    // Only the native core may be borrowed across deferred-job allocation.
+    let channel: &ChannelCore = channel;
     let current = crate::scheduler::willow_sched_current_task();
     if current == 0 {
         return;
     }
-    {
+    let (wake_receivers, wake_senders) = {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         if raw != winner || direction != 0 {
             clear_wait(raw, &mut state.waiters, current, ChannelRole::RecvWait);
@@ -215,9 +218,23 @@ pub extern "C" fn willow_channel_select_cleanup(
                 ChannelRole::SendHandoff,
             );
         }
+        (
+            !state.waiters.is_empty()
+                && (state.values.len() > state.recv_claims.len()
+                    || (state.closed && state.values.is_empty())),
+            !state.send_waiters.is_empty() && !state.closed && !state_is_full(&state),
+        )
+    };
+    // A later registration probes availability under this same mutex. Only
+    // existing waiters can need compensation for the reservations released here.
+    let raw = if wake_receivers {
+        wake_waiters_bounded(raw, channel, true)
+    } else {
+        raw
+    };
+    if wake_senders {
+        wake_waiters_bounded(raw, channel, false);
     }
-    wake_recv_waiters(channel);
-    wake_send_waiters(channel);
 }
 
 #[unsafe(no_mangle)]
@@ -305,7 +322,6 @@ pub extern "C" fn willow_channel_close(raw: *mut c_void) {
     {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         state.closed = true;
-        channel.not_empty.notify_all();
         drain_waiters(
             channel,
             &mut state.send_waiters,

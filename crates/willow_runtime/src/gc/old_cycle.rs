@@ -267,7 +267,9 @@ mod integration_tests {
                 .env("WILLOW_OLD_CYCLE_SCALING_CHILD", "1")
                 .env_remove("WILLOW_GC_REMARK_MAX_SLOTS")
                 .env_remove("WILLOW_GC_REMARK_MAX_BYTES")
-                .env_remove("WILLOW_GC_REMARK_MAX_WORK_NS")
+                // This fixture tests the default slot bound, not host speed.
+                // Deadline enforcement is covered by fake-clock budget tests.
+                .env("WILLOW_GC_REMARK_MAX_WORK_NS", "100000000")
                 .output().unwrap();
             print!("{}", String::from_utf8_lossy(&output.stdout));
             assert!(
@@ -581,7 +583,7 @@ pub(super) fn record_stop(reason: u32, start: u64, work_end: u64, unlocked: u64)
                 budget.yields,
                 budget.regions,
                 budget.regions,
-                budget.regions * std::mem::size_of::<bool>() as u64
+                budget.regions * super::sweep::REGION_PUBLICATION_BYTES
             );
         }
         eprintln!(
@@ -600,7 +602,7 @@ pub(super) fn record_stop(reason: u32, start: u64, work_end: u64, unlocked: u64)
 }
 
 #[cfg(test)]
-fn take_stop_diagnostics() -> Vec<StopDiagnostic> {
+pub(super) fn take_stop_diagnostics() -> Vec<StopDiagnostic> {
     STOP_DIAGNOSTICS.lock().unwrap().drain(..).collect()
 }
 

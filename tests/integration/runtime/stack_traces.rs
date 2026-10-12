@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn callchain_01_nested_panic_prints_ordered_chain() {
     // deeper() <- helper() <- main(): the panic prints the active call chain,
-    // most recent call first, with the call-site file:line:col of each frame.
+    // most recent call first, with each location inside its named function.
     let (out, ok) = compile_and_run_check_exit(
         r#"
 fn deeper() {
@@ -36,7 +36,8 @@ fn main() {
         .find("1: helper")
         .unwrap_or_else(|| panic!("no frame 1: {out}"));
     assert!(zero < one, "frames out of order: {out}");
-    // Each frame records its call site, not the callee body.
+    assert!(out.contains("2: main at "), "missing main: {out}");
+    // Locations belong to the named function.
     assert!(
         out.contains("0: deeper at "),
         "frame 0 missing location: {out}"
@@ -48,9 +49,8 @@ fn main() {
 }
 
 #[test]
-fn callchain_02_direct_panic_in_main_has_no_chain() {
-    // main is the entry (not called via the instrumented path), so a panic
-    // directly in main prints no call-stack section.
+fn callchain_02_direct_panic_in_main_has_main_frame() {
+    // The executing leaf is recorded even without an outer caller.
     let (out, ok) = compile_and_run_check_exit(
         r#"
 fn main() {
@@ -61,8 +61,8 @@ fn main() {
     assert!(!ok);
     assert!(out.contains("runtime panic: top"), "{out}");
     assert!(
-        !out.contains("call stack"),
-        "main-only panic should have no chain: {out}"
+        out.contains("0: main at "),
+        "main-only panic should name main: {out}"
     );
 }
 
@@ -147,7 +147,7 @@ fn main() {
     assert!(!ok);
     assert!(out.contains("runtime panic: worker failed"), "{out}");
     let run = out
-        .find("0: run")
+        .find("0: Worker::run")
         .unwrap_or_else(|| panic!("no method frame: {out}"));
     let helper = out
         .find("1: helper")

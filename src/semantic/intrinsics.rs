@@ -433,6 +433,25 @@ impl Intrinsic {
 /// identifier, so no user type can collide with it.
 const INTRINSIC_OWNER: &str = "$intrinsic";
 
+/// Leaf ADT methods lower inline rather than through the intrinsic backend.
+/// Callback combinators deliberately remain unresolved until their callback
+/// targets can be proven; their effects must never be classified as pure.
+pub(crate) fn adt_method_target(ty: &Type, method: &str) -> Option<FunctionId> {
+    let family = builtin_types::resolve(ty)?.id;
+    let known = match family {
+        B::Option => matches!(
+            method,
+            "unwrap" | "expect" | "unwrap_or" | "is_some" | "is_none"
+        ),
+        B::Result => matches!(
+            method,
+            "unwrap" | "expect" | "unwrap_or" | "is_ok" | "is_err"
+        ),
+        _ => false,
+    };
+    known.then(|| FunctionId::method(TypeId::local("$adt"), method))
+}
+
 /// Full runtime effects of a call target that has no Willow body: a builtin
 /// method ([`Intrinsic::function_id`]) or a builtin free function. `None`
 /// means the target is not a known builtin, and the caller must fail closed.
@@ -441,6 +460,15 @@ const INTRINSIC_OWNER: &str = "$intrinsic";
 pub(crate) fn builtin_target_effects(target: &FunctionId) -> Option<RuntimeEffects> {
     if let Some(intrinsic) = Intrinsic::from_function_id(target) {
         return Some(intrinsic.runtime_effects());
+    }
+    if target.owner().as_deref() == Some("$adt") && target.namespace().is_none() {
+        return match target.name().as_ref() {
+            "unwrap" | "expect" => {
+                Some(RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_ALLOCATE))
+            }
+            "unwrap_or" | "is_some" | "is_none" | "is_ok" | "is_err" => Some(RuntimeEffects::NONE),
+            _ => None,
+        };
     }
     if target.owner().is_some() || target.namespace().is_some() {
         return None;

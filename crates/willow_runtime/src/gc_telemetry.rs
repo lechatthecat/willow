@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
+pub mod native_trace;
 pub mod stops;
 pub mod workers;
 pub use stops::WillowGcStatsV2;
@@ -220,9 +221,36 @@ pub(crate) struct MarkWork {
     pub cpu_ns: u64,
     pub cpu_incomplete: bool,
     pub descriptor_bytes: u64,
+    pub frame_scans: u64,
+    pub remembered_owners: u64,
+    pub collector_mark_cpu_ns: u64,
+    pub sweep_assist_cpu_ns: u64,
+    pub sweep_cpu_incomplete: bool,
+}
+
+pub(crate) fn profiling() -> bool {
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("WILLOW_GC_PROFILE").is_some());
+    *ENABLED
 }
 
 impl MarkWork {
+    pub(crate) fn frame(&mut self, layout: u64, ty: u32, bytes: usize, mask: u64) {
+        if profiling()
+            && ty == 0
+            && layout != 0
+            && layout
+                == willow_abi::gc_layout_id(
+                    willow_abi::GcObjectKind::AsyncFrame,
+                    bytes as i64,
+                    0,
+                    mask,
+                )
+        {
+            self.frame_scans += 1;
+        }
+    }
+
     pub(crate) fn roots(count: usize) -> Self {
         Self {
             root_scan_bytes: (count as u64).saturating_mul(std::mem::size_of::<usize>() as u64),
@@ -240,6 +268,7 @@ impl MarkWork {
 #[derive(Default)]
 struct GcTelemetry {
     stats: WillowGcStatsV1,
+    minor_cpu_ns: u64,
 }
 static TELEMETRY: LazyLock<Mutex<GcTelemetry>> =
     LazyLock::new(|| Mutex::new(GcTelemetry::default()));
@@ -258,6 +287,9 @@ pub(crate) struct Cycle {
     epoch: u64,
     start_ns: u64,
     completed: bool,
+    previous_phase: u32,
+    cpu_start: Option<u64>,
+    minor_cpu_before: u64,
 }
 
 impl Drop for Cycle {
@@ -266,7 +298,7 @@ impl Drop for Cycle {
             // An aborted collection has no completed work to publish. Keep its
             // epoch consumed while allowing the next elected collector to start.
             let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
-            telemetry.stats.phase = 0;
+            telemetry.stats.phase = self.previous_phase;
         }
     }
 }
@@ -276,8 +308,13 @@ impl Cycle {
     pub(crate) fn begin(kind: CycleKind) -> Self {
         let start_ns = timestamp_ns();
         let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
+        let minor_cpu_before = telemetry.minor_cpu_ns;
         let stats = &mut telemetry.stats;
-        debug_assert_eq!(stats.phase, 0);
+        let previous_phase = stats.phase;
+        debug_assert!(
+            previous_phase == 0
+                || (previous_phase == CycleKind::Major as u32 && kind == CycleKind::Minor)
+        );
         stats.epoch = stats.epoch.saturating_add(1);
         stats.phase = kind as u32;
         Self {
@@ -285,6 +322,9 @@ impl Cycle {
             epoch: stats.epoch,
             start_ns,
             completed: false,
+            previous_phase,
+            cpu_start: profiling().then(workers::thread_cpu_ns).flatten(),
+            minor_cpu_before,
         }
     }
     /// Called after resuming mutators; returns the trace record for publication
@@ -328,10 +368,54 @@ impl Cycle {
             reclaimed_bytes: reclaimed.unwrap_or_else(|| before.saturating_sub(after)),
             reserved: 0,
         };
-        TELEMETRY
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .complete(cycle);
+        let cpu = self
+            .cpu_start
+            .and_then(|start| workers::thread_cpu_ns()?.checked_sub(start));
+        let cpu = {
+            let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
+            let cpu = cpu.map(|cpu| {
+                if self.kind == CycleKind::Minor {
+                    telemetry.minor_cpu_ns = telemetry.minor_cpu_ns.saturating_add(cpu);
+                    cpu
+                } else {
+                    // Nested minors run on this collector. Mark batches from
+                    // this thread are already in its CPU interval; other
+                    // workers/assists contribute their independently timed CPU.
+                    cpu.saturating_sub(telemetry.minor_cpu_ns.saturating_sub(self.minor_cpu_before))
+                        .saturating_add(work.cpu_ns.saturating_sub(work.collector_mark_cpu_ns))
+                        .saturating_add(work.sweep_assist_cpu_ns)
+                }
+            });
+            let cpu = cpu.filter(|_| {
+                self.kind == CycleKind::Minor || !(work.cpu_incomplete || work.sweep_cpu_incomplete)
+            });
+            telemetry.complete(cycle);
+            telemetry.stats.phase = self.previous_phase;
+            cpu
+        };
+        if profiling()
+            && let Some(trace) = TRACE.as_ref()
+        {
+            let mut trace = trace.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(writer) = trace.writer.as_mut() {
+                let result = writeln!(
+                    writer,
+                    "{{\"event\":\"gc_work\",\"epoch\":{},\"kind\":{},\"root_slots\":{},\"remembered_owners\":{},\"frame_scans\":{},\"mark_cpu_ns\":{},\"cpu_incomplete\":{},\"gc_cpu_ns\":{}}}",
+                    cycle.epoch,
+                    cycle.kind,
+                    work.root_scan_bytes / std::mem::size_of::<usize>() as u64,
+                    work.remembered_owners,
+                    work.frame_scans,
+                    work.cpu_ns,
+                    cpu.is_none(),
+                    cpu.map_or_else(|| "null".to_string(), |cpu| cpu.to_string())
+                );
+                if result.is_err() {
+                    trace_error();
+                    trace.writer = None;
+                }
+            }
+        }
         self.completed = true;
         cycle
     }
@@ -340,7 +424,7 @@ impl GcTelemetry {
     fn complete(&mut self, cycle: GcCycleV1) {
         let s = &mut self.stats;
         s.phase = 0;
-        s.epoch = cycle.epoch;
+        s.epoch = s.epoch.max(cycle.epoch);
         s.pauses.record(cycle.pause_ns);
         if cycle.kind == CycleKind::Major as u32 {
             s.major_cycles = s.major_cycles.saturating_add(1);
@@ -658,6 +742,7 @@ pub(crate) fn reset_for_test() {
     telemetry.stats.epoch = epoch;
     telemetry.stats.reset_generation = generation;
     stops::reset_for_test();
+    native_trace::reset();
 }
 
 #[cfg(test)]

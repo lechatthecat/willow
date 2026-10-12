@@ -32,56 +32,21 @@ fn compute_compiler_stamp() -> String {
 
 impl Snapshot {
     pub(super) fn digest(&self) -> Result<String> {
-        Ok(self.digest_sized()?.0)
+        // This revision-free tuple is the existing digest wire format. Keep its
+        // order and tuple representation compatible with stored snapshots.
+        hash_serialized(&(
+            self.version,
+            &self.compiler,
+            &self.compatibility,
+            &self.workspace,
+            &self.sources,
+            &self.functions,
+            &self.semantic,
+        ))
     }
 
     fn digest_sized(&self) -> Result<(String, u64)> {
-        // Hash by streaming serialization, without cloning a second snapshot.
-        struct HashWriter(Sha256, u64);
-        impl Write for HashWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.update(bytes);
-                self.1 += bytes.len() as u64;
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut writer = HashWriter(Sha256::new(), 0);
-        serde_json::to_writer(
-            &mut writer,
-            &(
-                self.version,
-                &self.compiler,
-                &self.compatibility,
-                &self.workspace,
-                &self.sources,
-                &self.functions,
-                &self.semantic,
-            ),
-        )?;
-        // The digest tuple has the same values as the object except revision.
-        // Add its eight key/colon spellings, one extra comma and revision value.
-        let keys: usize = [
-            "version",
-            "compiler",
-            "compatibility",
-            "workspace",
-            "revision",
-            "sources",
-            "functions",
-            "semantic",
-        ]
-        .iter()
-        .map(|key| key.len() + 3)
-        .sum();
-        let bytes =
-            writer.1 + keys as u64 + 1 + serde_json::to_string(&self.revision)?.len() as u64;
-        Ok((
-            format!("{:x}", crate::hex::Hex(&writer.0.finalize())),
-            bytes,
-        ))
+        Ok((self.digest()?, serialized_size(self)?))
     }
     pub fn validate(&self) -> Result<()> {
         self.validate_with_limit(None)
@@ -202,6 +167,16 @@ impl Snapshot {
                         && e.occurrences.iter().all(|&n| n < f.nodes.len())),
                 "invalid expression flow"
             );
+        }
+        for (owner, calls) in &self.semantic.unresolved_calls {
+            ensure!(ids.contains(owner), "invalid unresolved-call owner");
+            for call in calls {
+                ensure!(
+                    call.location.start <= call.location.end
+                        && self.sources.contains_key(&call.location.path),
+                    "invalid unresolved-call location"
+                );
+            }
         }
         ensure!(
             self.semantic.witnesses.keys().all(|id| ids.contains(id)),
@@ -454,6 +429,30 @@ fn change(old: Option<&Function>, new: Option<&Function>, kind: &str) -> Functio
     }
 }
 
+/// Count the actual Serde wire schema without retaining serialized bytes.
+#[derive(Default)]
+struct CountingWriter(u64);
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("serialized size overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_size(value: &impl Serialize) -> Result<u64> {
+    let mut writer = CountingWriter::default();
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.0)
+}
+
 pub(crate) fn check_size(snapshot: &Snapshot) -> Result<()> {
     struct Counter(usize);
     impl std::io::Write for Counter {
@@ -497,6 +496,113 @@ mod tests {
                     .all(|item| { item["path"] == "${workspace}/main.wi" })
             );
         }
+    }
+
+    #[test]
+    fn snapshot_structural_size_and_legacy_digest() {
+        for n in [0, 1, 16, 32, 64, 128] {
+            let mut s = snapshot("/日本語/\"quoted\"", "/");
+            s.sources.clear();
+            s.semantic = SemanticFacts::default();
+            for i in 0..n {
+                s.sources.insert(format!("/日本語/{i}\n\\"), "é".repeat(i));
+            }
+            for revision in ["", "r", "日本語\n\"\\"] {
+                s.revision = revision.into();
+                let legacy = serde_json::to_vec(&(
+                    s.version,
+                    &s.compiler,
+                    &s.compatibility,
+                    &s.workspace,
+                    &s.sources,
+                    &s.functions,
+                    &s.semantic,
+                ))
+                .unwrap();
+                let (digest, count) = s.digest_sized().unwrap();
+                assert_eq!(digest, hash(&legacy));
+                assert_eq!(count, serde_json::to_vec(&s).unwrap().len() as u64);
+            }
+        }
+        let mut options = snapshot("/w", "/");
+        for present in [false, true] {
+            let symbol = &mut options.semantic.symbols[0];
+            symbol.source_name = present.then(|| "日本語".into());
+            symbol.ty = present.then_some(crate::parser::ast::Type::I64);
+            if !present {
+                symbol.location = None;
+            }
+            assert_eq!(
+                options.digest_sized().unwrap().1,
+                serde_json::to_vec(&options).unwrap().len() as u64
+            );
+        }
+        // Deterministic byte counts for increasing repeated payloads.
+        let mut scaled = snapshot("/w", "/");
+        scaled.sources.clear();
+        scaled.sources.insert("payload".into(), String::new());
+        let base = serialized_size(&scaled).unwrap();
+        for n in [16, 32, 64, 128] {
+            scaled.sources.insert("payload".into(), "x".repeat(n));
+            assert_eq!(serialized_size(&scaled).unwrap(), base + n as u64);
+        }
+        // A newly added serialized field is counted without editing the writer.
+        #[derive(Serialize)]
+        struct Extended<'a> {
+            #[serde(flatten)]
+            snapshot: &'a Snapshot,
+            added: Option<&'a str>,
+        }
+        let s = snapshot("/w", "/");
+        for added in [None, Some(""), Some("日本語\n\"")] {
+            let extended = Extended {
+                snapshot: &s,
+                added,
+            };
+            assert_eq!(
+                serialized_size(&extended).unwrap(),
+                serde_json::to_vec(&extended).unwrap().len() as u64
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_exact_64_mib_boundary_and_stored_compatibility() {
+        let mut s = snapshot("/w", "/");
+        s.compiler = compiler_stamp();
+        s.sources.clear();
+        s.semantic = SemanticFacts::default();
+        s.sources.insert("payload".into(), String::new());
+        s.revision = s.digest().unwrap();
+        let overhead = serialized_size(&s).unwrap() as usize;
+        s.sources
+            .insert("payload".into(), "x".repeat(64 * 1024 * 1024 - overhead));
+        s.revision = s.digest().unwrap();
+        assert_eq!(serialized_size(&s).unwrap(), 64 * 1024 * 1024);
+        assert!(check_size(&s).is_ok());
+        assert!(s.validate_with_limit(Some(64 * 1024 * 1024)).is_ok());
+        s.sources.get_mut("payload").unwrap().push('x');
+        s.revision = s.digest().unwrap();
+        assert!(check_size(&s).is_err());
+        assert!(s.validate_with_limit(Some(64 * 1024 * 1024)).is_err());
+        // Reconstruct the old digest algorithm, then deserialize its stored JSON.
+        let mut old = snapshot("/w", "/");
+        old.compiler = compiler_stamp();
+        old.revision = hash(
+            serde_json::to_vec(&(
+                old.version,
+                &old.compiler,
+                &old.compatibility,
+                &old.workspace,
+                &old.sources,
+                &old.functions,
+                &old.semantic,
+            ))
+            .unwrap(),
+        );
+        let restored: Snapshot =
+            serde_json::from_slice(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(restored.validate().is_ok());
     }
 
     fn snapshot(workspace: &str, sep: &str) -> Snapshot {
