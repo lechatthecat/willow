@@ -2688,7 +2688,11 @@ impl UnitCodegenContext<'_> {
         }
         if m.is_async {
             if std::env::var("WILLOW_LIR_LOG").is_ok() {
-                eprintln!("[lir] compiling async `{lir_name}` from lowered IR");
+                let display = crate::diagnostics::diagnostic::source_names(
+                    lir_name.to_string(),
+                    &Default::default(),
+                );
+                eprintln!("[lir] compiling async `{display}` from lowered IR");
             }
             return self.compile_cooperative_method(class_name, &mangled, m, lir_fn);
         }
@@ -2860,7 +2864,11 @@ impl UnitCodegenContext<'_> {
         }
 
         if std::env::var("WILLOW_LIR_LOG").is_ok() {
-            eprintln!("[lir] compiling `{lir_name}` from lowered IR");
+            let display = crate::diagnostics::diagnostic::source_names(
+                lir_name.to_string(),
+                &Default::default(),
+            );
+            eprintln!("[lir] compiling `{display}` from lowered IR");
         }
         fg.emit_lir_function(&lir_fn);
 

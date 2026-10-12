@@ -1052,8 +1052,8 @@ fn main() { println(ledger::twice(new Other(2))); }
         ),
     ]);
     assert!(
-        stderr.contains("expected `market::Amount`, found `Other`"),
-        "expected the mismatch to name the entry's own spelling:\n{stderr}"
+        stderr.contains("expected `sales::Amount`, found `Other`"),
+        "expected the mismatch to name the canonical source declaration:\n{stderr}"
     );
 }
 

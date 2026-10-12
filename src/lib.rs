@@ -1389,6 +1389,7 @@ fn register_module_imports_with_closure(
         let dep_path = dep.path.to_string_lossy();
         let Some(spellings) = imported.get(&id) else {
             checker.register_module_type_signatures(canonical, &dep_path, &dep.program);
+            checker.register_signature_only_spelling(dep.module_path());
             continue;
         };
         // Keep source spelling order, but register declarations canonically.
