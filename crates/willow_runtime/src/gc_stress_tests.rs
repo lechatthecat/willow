@@ -136,6 +136,9 @@ fn stress_region_01_middle_hole_churn_reuses_one_region() {
     willow_gc_collect();
     assert_eq!(willow_gc_old_region_count(), 1);
 
+    // Swept holes become allocator-visible only after the next mark epoch.
+    // Advance that epoch before measuring reuse, preserving quarantine safety.
+    willow_gc_collect();
     let initial_reuses = willow_gc_old_region_reuses();
     let initial_allocations = willow_gc_old_region_allocations();
     for round in 0..200 {
@@ -146,6 +149,8 @@ fn stress_region_01_middle_hole_churn_reuses_one_region() {
         willow_gc_collect();
         assert_eq!(willow_gc_old_region_count(), 1);
         assert_global_regions_valid();
+        // Make this round's reclaimed spans eligible for the following round.
+        willow_gc_collect();
     }
     assert_eq!(
         willow_gc_old_region_allocations() - initial_allocations,

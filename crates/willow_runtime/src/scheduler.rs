@@ -3240,6 +3240,7 @@ thread_local! {
 }
 
 fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instant>) -> i64 {
+    crate::gc::scheduler_start(runtime_worker_config().active_workers());
     crate::stack_overflow::protect_current_thread();
     if crate::panic_context::panic_unwind_cleanup_active() {
         crate::panic_context::fatal_invariant(

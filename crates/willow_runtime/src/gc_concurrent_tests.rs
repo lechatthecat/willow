@@ -1901,7 +1901,8 @@ fn large_bitmap_continuations_bound_scan_work_without_rescanning_prefixes() {
             assert!(after.descriptor_bytes - before.descriptor_bytes <= 8 * 8);
             jobs += 1;
         }
-        assert_eq!(jobs, 2 + (bitmap_words - 1).div_ceil(8));
+        // The pointer-free child is completed by its discovering slice.
+        assert_eq!(jobs, 1 + (bitmap_words - 1).div_ceil(8));
         let work = *cycle.work.lock().unwrap();
         assert_eq!(work.scanned_bytes, (slots * 8) as u64);
         assert_eq!(work.descriptor_bytes, ((bitmap_words - 1) * 8) as u64);
@@ -1939,7 +1940,8 @@ fn native_reference_arrays_use_bounded_continuations_in_the_real_engine() {
             assert!(after - before <= 512 * 8);
             jobs += 1;
         }
-        assert_eq!(jobs, 2 + slots.div_ceil(512));
+        // Pointer-free child is marked directly by its discovering slice.
+        assert_eq!(jobs, 1 + slots.div_ceil(512));
         assert_eq!(
             cycle.work.lock().unwrap().scanned_bytes,
             ((slots + 1) * 8) as u64
@@ -2136,7 +2138,8 @@ fn task_scope_graph_traces_each_scope_and_frame_once() {
             drop(consumer);
             let (work, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
             assert_eq!(work.scanned_bytes, ((2 * count - 1) * 8) as u64);
-            let expected_jobs = 2 * count + if fan_out { count.div_ceil(512) - 1 } else { 0 };
+            // Leaf frames need a mark bit, but no separate trace job.
+            let expected_jobs = count + if fan_out { count.div_ceil(512) - 1 } else { 0 };
             assert_eq!(jobs, expected_jobs);
             sweep::concurrent(plan);
             let retained = willow_gc_allocated_bytes();
@@ -3828,6 +3831,48 @@ fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations(
         println!(
             "background_workers=1 progressing_mutators={count} registry_replacements={count} black_allocations={count}"
         );
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn pointer_free_leaf_fanout_uses_only_bounded_parent_jobs() {
+    let _guard = runtime_test_guard();
+    for count in [1_000usize, 10_000, 100_000] {
+        reset_internal_for_test();
+        let mut array = crate::array::willow_array_new(count as i64, 1);
+        willow_push_root(&mut array);
+        let mut leaves = Vec::with_capacity(count);
+        for index in 0..count {
+            let child = willow_alloc(8);
+            leaves.push(child);
+            crate::array::willow_array_set(array, index as i64, child as i64);
+        }
+        let (_, cycle) = root_handshake::begin().unwrap();
+        let mut consumer = cycle.queue.register_assist();
+        let mut jobs = 0;
+        while !cycle.queue.snapshot().is_drained() {
+            let (processed, _) = cycle.drain_worker(1, &mut Vec::new(), &mut consumer);
+            assert_eq!(processed, 1);
+            jobs += 1;
+        }
+        assert_eq!(jobs, 1 + count.div_ceil(512));
+        for leaf in leaves {
+            assert!(cycle.is_marked(leaf as usize));
+        }
+        assert_eq!(
+            cycle.work.lock().unwrap().scanned_bytes,
+            ((count + 1) * 8) as u64
+        );
+        println!(
+            "leaf_fanout={count} queue_jobs={jobs} reference_slots={}",
+            count + 1
+        );
+        drop(consumer);
+        assert_eq!(cycle.queue.end_epoch(), 0);
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+        GC_MARK_PHASE.store(0, Ordering::Release);
+        willow_pop_root();
     }
     reset_internal_for_test();
 }

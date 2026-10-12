@@ -396,3 +396,63 @@ fn overlap_post_snapshot_tlab_black_allocation_survives_minor_and_old_sweep() {
     assert_eq!(runtime().heap.lock().unwrap().allocated_bytes, 0);
     reset_internal_for_test();
 }
+
+#[test]
+fn concurrent_minor_snapshot_and_relocation_scale_linearly() {
+    let _guard = runtime_test_guard();
+    for count in [1_000usize, 10_000, 100_000] {
+        reset_internal();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.pacer_trigger = u64::MAX;
+            state.pacer.disable_for_test();
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let mut tls = tlab_state_for_test();
+        let mut nodes = Vec::with_capacity(count);
+        let bytes = GC_HEADER_SIZE + size_of::<usize>();
+        for _ in 0..count {
+            let cursor = tls.cursor.load(Ordering::Acquire);
+            let limit = tls.limit.load(Ordering::Acquire);
+            let node = if cursor == 0 || limit - cursor < bytes {
+                willow_gc_alloc_slow(&mut tls, 1, 0, size_of::<usize>() as i64, 1)
+            } else {
+                initialize_object_at(cursor as *mut u8, bytes, 0, 1, 1).unwrap();
+                publish_tlab_start_for_test(&tls, cursor as *mut u8);
+                tls.cursor.store(cursor + bytes, Ordering::Release);
+                (cursor + GC_HEADER_SIZE) as *mut u8
+            };
+            nodes.push(node);
+        }
+        for pair in nodes.windows(2) {
+            unsafe {
+                *pair[0].cast::<*mut u8>() = pair[1];
+            }
+        }
+        let mut root = nodes[0];
+        let slot = (&mut root as *mut *mut u8).cast();
+        runtime().runtime_root_slots.add(slot);
+        let (_, cycle) = root_handshake::begin().unwrap();
+        runtime().runtime_root_slots.remove(slot);
+        cycle.drain(usize::MAX);
+        for pass in 0..2 {
+            PAGE_QUERIES.set(0);
+            let before = runtime().heap.lock().unwrap().moved_objects;
+            collect_owned();
+            let queries = PAGE_QUERIES.get();
+            assert!(queries <= 16 * count, "queries={queries}, nodes={count}");
+            cycle.drain(usize::MAX);
+            let state = runtime().heap.lock().unwrap();
+            assert_eq!(state.moved_objects - before, count as u64);
+            assert_eq!(cycle.objects.marked_count(), count);
+            assert!(cycle.queue.snapshot().is_drained());
+            verify_old_region_metadata(&state).unwrap();
+            eprintln!(
+                "concurrent-minor nodes={count} pass={pass} page_queries={queries} copies={count} live_marks={count}"
+            );
+        }
+        end(&cycle);
+    }
+    reset_internal();
+}

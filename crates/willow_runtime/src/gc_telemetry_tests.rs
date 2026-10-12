@@ -648,3 +648,27 @@ fn aborted_cycles_restore_idle_without_publishing_partial_work() {
     assert_eq!(recovered.last_cycle.epoch, recovered.epoch);
     assert_consistent(&recovered);
 }
+
+#[test]
+fn nested_minor_preserves_major_phase_and_monotonic_epoch() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let major = Cycle::begin(CycleKind::Major);
+    let minor = Cycle::begin(CycleKind::Minor);
+    assert_eq!(snapshot().phase, CycleKind::Minor as u32);
+    let minor_event = minor.finish(100, 80, MarkWork::roots(3));
+    assert_eq!(snapshot().phase, CycleKind::Major as u32);
+    assert_eq!(snapshot().minor_cycles, 1);
+    let major_event = major.finish_concurrent(100, 70, MarkWork::roots(2), 7, 30);
+    let stats = snapshot();
+    assert!(minor_event.epoch > major_event.epoch);
+    assert_eq!(stats.epoch, minor_event.epoch);
+    assert_eq!(stats.phase, 0);
+    assert_eq!(stats.major_cycles, 1);
+    assert_eq!(stats.last_major_cycle.pause_ns, 7);
+    let major = Cycle::begin(CycleKind::Major);
+    drop(Cycle::begin(CycleKind::Minor));
+    assert_eq!(snapshot().phase, CycleKind::Major as u32);
+    drop(major);
+    assert_eq!(snapshot().phase, 0);
+}

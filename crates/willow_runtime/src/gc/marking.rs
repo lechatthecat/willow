@@ -74,11 +74,16 @@ impl Drop for MarkBatch<'_> {
                 crate::gc_telemetry::workers::thread_cpu_ns()?.checked_sub(start)
             });
             let mut total = self.cycle.work.lock().unwrap();
+            total.frame_scans = total.frame_scans.saturating_add(self.work.frame_scans);
             total.marked_bytes = total.marked_bytes.saturating_add(self.work.marked_bytes);
             total.scanned_bytes = total.scanned_bytes.saturating_add(self.work.scanned_bytes);
             total.descriptor_bytes = total
                 .descriptor_bytes
                 .saturating_add(self.work.descriptor_bytes);
+            if std::thread::current().id() == self.cycle.collector {
+                total.collector_mark_cpu_ns =
+                    total.collector_mark_cpu_ns.saturating_add(cpu.unwrap_or(0));
+            }
             if let Some(cpu) = cpu.and_then(|cpu| total.cpu_ns.checked_add(cpu)) {
                 total.cpu_ns = cpu;
             } else {
@@ -281,6 +286,12 @@ impl ConcurrentCycle {
             batch.deferred.push(value);
             return;
         }
+        batch.work.frame(
+            metadata.layout_id,
+            metadata.type_id,
+            metadata.payload_size,
+            metadata.gc_ref_mask,
+        );
         let payload = value as *mut u8;
         let words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
         let mut slots = 0;
@@ -315,14 +326,42 @@ impl ConcurrentCycle {
             slots += children.len() - before;
         }
         for child in children.drain(..) {
-            if !child.is_null() && !self.objects.contains(child as usize) {
-                batch.unindexed.insert(child as usize);
-            }
-            self.enqueue(child);
+            self.discover_child(child, batch);
         }
         batch
             .work
             .object(GC_HEADER_SIZE + metadata.payload_size, slots);
+    }
+
+    fn discover_child(&self, child: *mut u8, batch: &mut MarkBatch<'_>) {
+        if !self.claim_or_defer(child as usize) {
+            return;
+        }
+        // A pointer-free generated leaf needs only its mark bit and byte
+        // accounting. The active drain owns termination across this claim;
+        // avoid allocating and synchronizing a queue item with no trace work.
+        if let Some(metadata) = self.objects.metadata(child as usize)
+            && metadata.type_id != willow_abi::GC_BITMAP_TYPE_ID
+            && metadata.gc_ref_mask == 0
+            && !self.legacy_traces.contains(&metadata.type_id)
+            && !self.traces.contains_key(&metadata.type_id)
+            && !self.slices.contains_key(&metadata.type_id)
+        {
+            batch.work.frame(
+                metadata.layout_id,
+                metadata.type_id,
+                metadata.payload_size,
+                metadata.gc_ref_mask,
+            );
+            batch.work.object(GC_HEADER_SIZE + metadata.payload_size, 0);
+        } else {
+            self.queue
+                .inject(crate::gc_mark_queue::MarkWork::object(
+                    self.mark_epoch,
+                    crate::gc_mark_queue::ObjectRef::from_ptr(child).unwrap(),
+                ))
+                .expect("claimed child belongs to the active drain");
+        }
     }
 
     pub(super) fn enqueue_trace_slice(&self, value: usize, word: usize) {
@@ -383,7 +422,7 @@ impl ConcurrentCycle {
             .expect("native epoch retains its object");
         let slots = self.snapshot_native_slice(value, metadata.type_id, offset, children);
         for child in children.drain(..) {
-            self.enqueue(child);
+            self.discover_child(child, batch);
         }
         batch.work.object(0, slots);
     }
@@ -414,7 +453,7 @@ impl ConcurrentCycle {
                                 .cast::<*mut u8>(),
                         )
                     };
-                    self.enqueue(child);
+                    self.discover_child(child, batch);
                     slots += 1;
                 }
                 bits &= bits - 1;
@@ -776,6 +815,12 @@ pub(super) fn mark_worklist(
                 }
             }
         }
+        work.frame(
+            metadata.layout_id,
+            metadata.type_id,
+            metadata.payload_size,
+            metadata.gc_ref_mask,
+        );
         work.object(object.size(), scanned_slots);
     }
     work.mark_ns = crate::gc_telemetry::elapsed_ns(started);

@@ -26,6 +26,10 @@ pub(super) fn reset_threshold(state: &mut super::GcState) {
     publish(state, MIN_GOAL, MIN_GOAL, "reset");
 }
 
+pub(super) fn scheduler_start(state: &mut super::GcState, budget: u64) {
+    publish(state, budget, budget, "scheduler_start");
+}
+
 pub(super) fn sample_threshold(state: &mut super::GcState) {
     let input = super::pacer_inputs(state);
     let decision = state.pacer.decision(input);
@@ -230,7 +234,7 @@ mod tests {
         sample_threshold(&mut state);
         assert_eq!(state.threshold_bytes as u64, 6 * MIN_GOAL);
         reset_threshold(&mut state);
-        assert_eq!(state.threshold_bytes as u64, MIN_GOAL);
+        assert_eq!(state.threshold_bytes, MIN_GOAL as usize);
         assert_eq!(state.pacer_trigger, MIN_GOAL);
         drop(state);
         reset_internal();

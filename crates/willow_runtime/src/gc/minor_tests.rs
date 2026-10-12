@@ -839,3 +839,97 @@ fn minor_rejects_unpublished_and_overlapping_start_bits_in_unindexed_chunk() {
     }
     reset_internal();
 }
+
+#[test]
+fn persistent_old_roots_only_scan_changed_young_edges() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    for count in [1_000, 10_000, 100_000] {
+        reset_internal();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.pacer.disable_for_test();
+        }
+        let mut frames = Vec::with_capacity(count);
+        for _ in 0..count {
+            let frame = willow_alloc_typed(8, 1);
+            willow_gc_add_runtime_root(frame);
+            frames.push(frame);
+        }
+        let mut tls = tlab_state_for_test();
+        let first = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+        unsafe { *first.cast::<u64>() = 73 };
+        let frame = frames[count / 2];
+        willow_gc_write_barrier(
+            frame,
+            std::ptr::null_mut(),
+            first,
+            GcStoreDestination::ObjectField as i64,
+        );
+        unsafe { *frame.cast::<*mut u8>() = first };
+        let run = || {
+            let result = with_stw(
+                crate::gc_telemetry::stops::StopReason::Minor,
+                super::collect_stopped,
+            );
+            result.unwrap().2
+        };
+        // The changed old frame and one leaf survive; every other frame is
+        // retained by the major root registry without a per-minor scan.
+        for cycle in 1..=2 {
+            let work = run();
+            assert_eq!(work.root_scan_bytes, 0);
+            assert_eq!(work.marked_bytes, 2 * (GC_HEADER_SIZE + 8) as u64);
+            assert_eq!(work.scanned_bytes, 8);
+            let child = unsafe { *frame.cast::<*mut u8>() };
+            assert_eq!(unsafe { *child.cast::<u64>() }, 73);
+            eprintln!(
+                "persistent_frames={count} cycle={cycle} root_slots=0 scanned_owners=1 scanned_slots=1"
+            );
+        }
+        for cycle in 3..=5 {
+            let work = run();
+            assert_eq!(work.marked_bytes, 0);
+            assert_eq!(work.scanned_bytes, 0);
+            eprintln!(
+                "persistent_frames={count} cycle={cycle} root_slots=0 scanned_owners=0 scanned_slots=0"
+            );
+        }
+        // Roots registered after nursery activation are conservatively dirty
+        // once. Registration work is not repeated on unchanged later cycles.
+        let late: Vec<_> = (0..count)
+            .map(|_| {
+                let frame = willow_alloc_typed(8, 1);
+                willow_gc_add_runtime_root(frame);
+                frame
+            })
+            .collect();
+        let first_scan = run();
+        assert_eq!(
+            first_scan.marked_bytes,
+            (count * (GC_HEADER_SIZE + 8)) as u64
+        );
+        assert_eq!(first_scan.remembered_owners, count as u64);
+        for _ in 0..3 {
+            assert_eq!(run().marked_bytes, 0);
+        }
+        for frame in late {
+            willow_gc_remove_runtime_root(frame);
+        }
+        // Registration itself retains a freshly initialized old owner's
+        // young child, even before the first subsequent barriered mutation.
+        let second = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+        unsafe { *second.cast::<u64>() = 91 };
+        let initial = willow_alloc_typed(8, 1);
+        unsafe { *initial.cast::<*mut u8>() = second };
+        willow_gc_add_runtime_root(initial);
+        run();
+        assert_eq!(unsafe { **initial.cast::<*mut u64>() }, 91);
+        willow_gc_remove_runtime_root(initial);
+        for frame in frames {
+            willow_gc_remove_runtime_root(frame);
+        }
+        reset_internal();
+    }
+}

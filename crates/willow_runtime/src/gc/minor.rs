@@ -31,6 +31,9 @@ mod tests;
 #[path = "minor_overlap_tests.rs"]
 mod overlap_tests;
 
+#[cfg(test)]
+thread_local! { static PAGE_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 struct MinorCollector<'a> {
     work: crate::gc_telemetry::MarkWork,
     stop_work: &'a mut crate::gc_telemetry::stops::StopWorkV2,
@@ -39,6 +42,7 @@ struct MinorCollector<'a> {
     /// Chunks at indices below this existed before the cycle; later ones are
     /// survivor destinations allocated by this cycle.
     source_chunks: usize,
+    chunk_pages: AddressMap<[usize; 2]>,
     forwarding: AddressMap<*mut u8>,
     published: Vec<usize>,
     needs_scan: AddressSet,
@@ -80,12 +84,13 @@ impl<'a> MinorCollector<'a> {
                 runtime.layout != willow_abi::runtime_type_ids::TypeLayout::OpaqueNative
             })
         });
-        Self {
+        let mut collector = Self {
             work: crate::gc_telemetry::MarkWork::default(),
             stop_work,
             state,
             survivor_destination: None,
             source_chunks,
+            chunk_pages: AddressMap::default(),
             forwarding: AddressMap::default(),
             published: Vec::new(),
             needs_scan: AddressSet::default(),
@@ -94,17 +99,59 @@ impl<'a> MinorCollector<'a> {
             trace_registry,
             drop_registry: drop_registry.into_iter().collect(),
             generated_drop,
+        };
+        for index in 0..source_chunks {
+            collector.index_chunk(index);
         }
+        collector
+    }
+
+    fn index_chunk(&mut self, index: usize) {
+        let chunk = &self.state.tlab_chunks[index];
+        let start = chunk.base as usize;
+        let page_bytes = super::GC_TLAB_CHUNK_SIZE;
+        for page in start / page_bytes..=(start + chunk.capacity - 1) / page_bytes {
+            let candidates = self.chunk_pages.entry(page).or_insert([usize::MAX; 2]);
+            *candidates
+                .iter_mut()
+                .find(|slot| **slot == usize::MAX)
+                .expect("disjoint fixed-size chunks overlap at most two page candidates") = index;
+        }
+    }
+
+    // This cycle's fixed-size chunks have at most two candidates per page.
+    // Expected O(1) lookup; no ordered-region search for every live child.
+    // The map is used only before sweep compacts the chunk vector.
+    fn chunk_index(&self, header: usize) -> Option<usize> {
+        #[cfg(test)]
+        PAGE_QUERIES.set(PAGE_QUERIES.get() + 1);
+        self.chunk_pages
+            .get(&(header / super::GC_TLAB_CHUNK_SIZE))?
+            .iter()
+            .copied()
+            .filter(|&index| index != usize::MAX)
+            .find(|&index| {
+                let chunk = &self.state.tlab_chunks[index];
+                let base = chunk.base as usize;
+                header >= base && header < base + chunk.used
+            })
+    }
+
+    fn chunk_generation(&self, address: usize) -> Option<u8> {
+        let header = address.checked_sub(GC_HEADER_SIZE)?;
+        let index = self.chunk_index(header)?;
+        super::object_in_retired_chunk(&self.state.tlab_chunks[index], address, false)
+            .map(|object| object.generation())
     }
 
     /// The young object whose payload starts at `address`, if it lies in a
     /// nursery or survivor chunk that existed when this cycle began. Chunks
     /// created by `allocate_survivor` are destinations, never sources.
-    /// O(log chunks) for the ordered chunk index, O(1) for the start bit,
+    /// Expected O(1) for the bounded page index and start bit,
     /// plus the one-time validation of a chunk not yet indexed.
     fn young_source(&mut self, address: usize) -> Option<HeapObject> {
         let header = address.checked_sub(GC_HEADER_SIZE)?;
-        let index = self.state.tlab_addresses.candidate(header)?;
+        let index = self.chunk_index(header)?;
         if index >= self.source_chunks {
             return None;
         }
@@ -209,6 +256,7 @@ impl<'a> MinorCollector<'a> {
                 ),
                 header_offsets: Vec::new(),
             });
+            self.index_chunk(index);
             self.state.tlab_reserved_bytes += GC_TLAB_CHUNK_SIZE;
             super::note_reservation_growth(self.state);
             self.state.survivor_stats.survivor_space_reserved += GC_TLAB_CHUNK_SIZE as u64;
@@ -341,20 +389,12 @@ impl<'a> MinorCollector<'a> {
         }
     }
 
-    /// Whether `address` names an object copied into survivor storage by this
-    /// cycle. O(log chunks).
+    /// Whether `address` names a destination, expected O(1).
     fn is_destination(&self, address: usize) -> bool {
-        let Some(header) = address.checked_sub(GC_HEADER_SIZE) else {
-            return false;
-        };
-        self.state
-            .tlab_addresses
-            .candidate(header)
-            .filter(|&index| index >= self.source_chunks)
-            .is_some_and(|index| {
-                let chunk = &self.state.tlab_chunks[index];
-                header < chunk.base as usize + chunk.used
-            })
+        address
+            .checked_sub(GC_HEADER_SIZE)
+            .and_then(|header| self.chunk_index(header))
+            .is_some_and(|index| index >= self.source_chunks)
     }
 
     fn scan_object(&mut self, object: HeapObject) {
@@ -362,6 +402,13 @@ impl<'a> MinorCollector<'a> {
         if !object.allocated() || !self.scanned.insert(address) {
             return;
         }
+        let metadata = object.trace_metadata();
+        self.work.frame(
+            metadata.layout_id,
+            metadata.type_id,
+            metadata.payload_size,
+            metadata.gc_ref_mask,
+        );
         let slots = object_reference_slots(object, &self.trace_registry);
         self.work.object(
             object.size(),
@@ -387,12 +434,62 @@ impl<'a> MinorCollector<'a> {
         }
     }
 
+    fn snapshot_roots(&self) -> Vec<*mut u8> {
+        let mut mark_roots = Vec::new();
+        if let Some(cycle) = self.state.concurrent_cycle.as_ref() {
+            assert_eq!(
+                cycle
+                    .active_drains
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            let mut seen = AddressSet::default();
+            let mut retain = |address| {
+                if self.chunk_generation(address) == Some(GC_GENERATION_YOUNG)
+                    && seen.insert(address)
+                {
+                    mark_roots.push(address as *mut u8);
+                }
+            };
+            cycle.queue.remap_stopped(|object| {
+                retain(object.addr());
+                Some(object)
+            });
+            for &address in cycle.deferred.lock().unwrap().iter() {
+                retain(address);
+            }
+            for &address in cycle.unindexed.lock().unwrap().iter() {
+                retain(address);
+            }
+            for chunk in &self.state.tlab_chunks {
+                if chunk.kind == RegionKind::Pinned {
+                    continue;
+                }
+                let bits = if cycle.objects.contains_extent(chunk.base as usize) {
+                    &chunk.concurrent_marks
+                } else {
+                    // Post-capture nursery extents inherit black allocation. Keep
+                    // their starts alive through relocation before making them
+                    // visible to the old epoch's explicit bitmap/index.
+                    &chunk.mark_bitmap.bits
+                };
+                bits.for_each_set(|bit| {
+                    let address =
+                        chunk.base as usize + bit * GC_REGION_MARK_GRANULE + GC_HEADER_SIZE;
+                    retain(address);
+                });
+            }
+        }
+        mark_roots
+    }
+
     fn run(
         mut self,
         roots: MinorRoots,
         remembered: super::remembered::RememberedSet,
     ) -> (usize, crate::gc_telemetry::MarkWork) {
         let started = std::time::Instant::now();
+        self.work.remembered_owners = remembered.len() as u64;
         let count = roots.slots.len() + roots.values.len();
         self.work.root_scan_bytes = crate::gc_telemetry::MarkWork::roots(count).root_scan_bytes;
         self.stop_work.root_values += count as u64;
@@ -424,7 +521,7 @@ impl<'a> MinorCollector<'a> {
                 if let Some(&new) = self.forwarding.get(&address) {
                     return Some(new as usize);
                 }
-                if super::tlab_payload_generation(self.state, address) == Some(GC_GENERATION_YOUNG)
+                if self.chunk_generation(address) == Some(GC_GENERATION_YOUNG)
                     && !self.is_destination(address)
                 {
                     return None;
@@ -702,9 +799,6 @@ pub(super) enum PinSource {
     /// only under a hard memory budget or after the bounded deferral
     /// (`should_defer_minor`) runs out.
     RuntimeCodeStack,
-    /// An address-registered runtime root (never young: registration rejects
-    /// young objects).
-    RuntimeAddressRoot,
     /// A remembered-set owner (always old in a consistent heap).
     RememberedOwner,
     /// A root slot naming an object that is neither a live young source nor a
@@ -720,7 +814,6 @@ impl PinSource {
     fn describe(self) -> &'static str {
         match self {
             Self::RuntimeCodeStack => "root slot published from runtime code",
-            Self::RuntimeAddressRoot => "address-registered runtime root",
             Self::RememberedOwner => "remembered-set owner",
             Self::OldOrForeign => "root slot outside the young source chunks",
             Self::MemoryBudget => "memory budget left no evacuation space",
@@ -771,16 +864,9 @@ fn minor_collect_with_roots(
                     .map(|value| (value.as_ptr(), PinSource::ScopedLoan))
             }),
     );
-    // Address roots are never young (checked at registration), so retaining
-    // them moves nothing; scanning them still finds young children stored by
-    // runtime code, as before this ticket.
-    roots.values.extend(
-        runtime()
-            .runtime_roots
-            .snapshot()
-            .into_iter()
-            .map(|root| (root, PinSource::RuntimeAddressRoot)),
-    );
+    // Address runtime roots are old. Their initial children are remembered at
+    // registration and subsequent stores use the old-to-young barrier. Scanning
+    // the complete registry here would revisit every suspended task each minor.
     let trace_registry = type_registry().lock().unwrap().clone();
     let drop_registry = drop_registry().lock().unwrap().clone();
     let mut state = runtime().heap.lock().unwrap();
@@ -801,53 +887,6 @@ fn minor_collect_with_roots(
     {
         panic!("willow gc: write barrier verification failed: {message}");
     }
-    let mut mark_roots = Vec::new();
-    if let Some(cycle) = state.concurrent_cycle.as_ref() {
-        assert_eq!(
-            cycle
-                .active_drains
-                .load(std::sync::atomic::Ordering::Acquire),
-            0
-        );
-        let mut seen = AddressSet::default();
-        let mut retain = |address| {
-            if super::tlab_payload_generation(&state, address) == Some(GC_GENERATION_YOUNG)
-                && seen.insert(address)
-            {
-                mark_roots.push(address as *mut u8);
-            }
-        };
-        cycle.queue.remap_stopped(|object| {
-            retain(object.addr());
-            Some(object)
-        });
-        for &address in cycle.deferred.lock().unwrap().iter() {
-            retain(address);
-        }
-        for &address in cycle.unindexed.lock().unwrap().iter() {
-            retain(address);
-        }
-        for chunk in &state.tlab_chunks {
-            if chunk.kind == RegionKind::Pinned {
-                continue;
-            }
-            let bits = if cycle.objects.contains_extent(chunk.base as usize) {
-                &chunk.concurrent_marks
-            } else {
-                // Post-capture nursery extents inherit black allocation. Keep
-                // their starts alive through relocation before making them
-                // visible to the old epoch's explicit bitmap/index.
-                &chunk.mark_bitmap.bits
-            };
-            bits.for_each_set(|bit| {
-                let address = chunk.base as usize + bit * GC_REGION_MARK_GRANULE + GC_HEADER_SIZE;
-                retain(address);
-            });
-        }
-        roots
-            .slots
-            .extend(mark_roots.iter_mut().map(|p| p as *mut *mut u8));
-    }
     let remembered = std::mem::take(&mut state.remembered_set);
     state.dirty_cards.clear();
     state.minor_collections = state.minor_collections.saturating_add(1);
@@ -855,8 +894,12 @@ fn minor_collect_with_roots(
     let young_before = state.young_allocated_bytes;
     let promoted_before = state.promoted_bytes;
     let copied_before = state.survivor_stats.survivor_bytes;
-    let (_, work) = MinorCollector::new(&mut state, trace_registry, drop_registry, stop_work)
-        .run(roots, remembered);
+    let collector = MinorCollector::new(&mut state, trace_registry, drop_registry, stop_work);
+    let mut mark_roots = collector.snapshot_roots();
+    roots
+        .slots
+        .extend(mark_roots.iter_mut().map(|p| p as *mut *mut u8));
+    let (_, work) = collector.run(roots, remembered);
     state.nursery_threshold_bytes = state.nursery_policy.next(
         state.nursery_threshold_bytes,
         young_before,
@@ -999,16 +1042,20 @@ fn collect_stopped(
 }
 
 pub(super) fn collect_owned() {
-    with_stw(
+    let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Minor);
+    let collected = with_stw(
         crate::gc_telemetry::stops::StopReason::Minor,
         |coord, stop_work| {
             if foreign_root_stack_owner_active_locked(coord) {
                 super::progress::record_skip(super::GcSkipReason::ForeignOwnerAtHandshake);
-                return;
+                return None;
             }
-            collect_stopped(coord, stop_work);
+            collect_stopped(coord, stop_work)
         },
     );
+    if let Some((before, after, work)) = collected {
+        crate::gc_telemetry::emit_cycle(cycle.finish(before, after, work));
+    }
 }
 
 pub(crate) fn minor_collect_internal() {

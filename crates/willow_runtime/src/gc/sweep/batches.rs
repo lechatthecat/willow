@@ -3,6 +3,7 @@
 //! one liveness decision; hooks, index construction and storage release happen
 //! after that lock has been dropped. The collector owns completion and shutdown.
 use super::*;
+use crate::gc_telemetry::workers;
 use std::sync::TryLockError;
 use std::time::Instant;
 
@@ -50,6 +51,8 @@ struct Report {
     reclaimed_bytes: u64,
     metadata_items: u64,
     swept_objects: u64,
+    assist_cpu_ns: u64,
+    assist_cpu_incomplete: bool,
 }
 
 struct Cursor {
@@ -131,6 +134,11 @@ pub(super) fn execute(plan: SweepPlan) -> usize {
     let mut cursor = job.lock().unwrap();
     cursor.report.sweep_wall_ns = began.elapsed().as_nanos() as u64;
     if let Some(marking) = &cursor.plan.marking {
+        {
+            let mut work = marking.work.lock().unwrap();
+            work.sweep_assist_cpu_ns = cursor.report.assist_cpu_ns;
+            work.sweep_cpu_incomplete = cursor.report.assist_cpu_incomplete;
+        }
         marking
             .phase
             .lock()
@@ -191,6 +199,14 @@ impl Cursor {
             return;
         }
         assert!(limits.objects > 0 && limits.bytes > 0 && limits.ns > 0);
+        let external_assist = assist
+            && crate::gc_telemetry::profiling()
+            && self
+                .plan
+                .marking
+                .as_ref()
+                .is_some_and(|marking| marking.collector != std::thread::current().id());
+        let cpu_start = external_assist.then(workers::thread_cpu_ns).flatten();
         let began = now();
         let before_objects = self.report.objects;
         let before_bytes = self.report.bytes;
@@ -222,6 +238,15 @@ impl Cursor {
             self.report.assist_max_ns = self.report.assist_max_ns.max(elapsed);
             self.report.assist_objects += self.report.objects - before_objects;
             self.report.assist_bytes += self.report.bytes - before_bytes;
+        }
+        if external_assist {
+            if let Some(cpu) =
+                cpu_start.and_then(|start| workers::thread_cpu_ns()?.checked_sub(start))
+            {
+                self.report.assist_cpu_ns = self.report.assist_cpu_ns.saturating_add(cpu);
+            } else {
+                self.report.assist_cpu_incomplete = true;
+            }
         }
         if !self.done {
             self.report.yields += 1;

@@ -159,8 +159,9 @@ pub(crate) unsafe fn discard_parked_roots(token: u64) {
 /// The holder keeps the raw address, which a moving collection cannot rewrite,
 /// so `object` must not be young: register only runtime allocations (always
 /// old) or objects that already survived promotion. Old objects are never
-/// moved, so a minor collection only scans the root for young children
-/// (willow-9tls.9); registering a young object is fatal. A holder of a
+/// moved. Registration remembers its initial children; subsequent reference
+/// stores must use the GC write barrier. Minors scan remembered owners rather
+/// than enumerating persistent address roots. Registering a young object is fatal. A holder of a
 /// possibly young object registers its storage with
 /// [`willow_gc_add_runtime_root_slot`] instead.
 #[unsafe(no_mangle)]
@@ -176,7 +177,7 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
     // as it crosses the corresponding phase-gated SATB deletion below.
     let marking = GC_MARK_PHASE.load(Ordering::Acquire) != 0;
     if marking || runtime().tlab_ever_allocated.load(Ordering::Acquire) {
-        let state = runtime().heap.lock().unwrap();
+        let mut state = runtime().heap.lock().unwrap();
         if tlab_payload_generation(&state, object as usize) == Some(GC_GENERATION_YOUNG) {
             drop(state);
             crate::failure::fatal_invariant(
@@ -186,6 +187,9 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
         }
         if marking && let Some(cycle) = state.concurrent_cycle.as_ref() {
             cycle.enqueue(object);
+        }
+        if runtime().tlab_ever_allocated.load(Ordering::Acquire) {
+            barrier::remember_owner(&mut state, object as usize);
         }
     }
     runtime().runtime_roots.add(object);

@@ -65,6 +65,7 @@ mod nursery;
 mod old_cycle;
 mod old_lab;
 mod pacer;
+mod region_candidates;
 mod root_handshake;
 mod runtime_roots;
 mod satb;
@@ -79,7 +80,7 @@ use runtime_roots::RuntimeRootSet;
 
 use crate::id_hash::{IdMap, IdSet};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::ThreadId;
@@ -274,7 +275,7 @@ struct GcState {
     old_regions: Vec<OldRegion>,
     old_addresses: address_index::AddressIndex,
     /// (largest available span, region index); excludes dedicated/full regions.
-    old_region_candidates: BTreeSet<(usize, usize)>,
+    old_region_candidates: region_candidates::RegionCandidates,
     old_reserved_bytes: usize,
     /// Per-thread old allocation buffers used by runtime-side allocation.
     old_labs: Vec<old_lab::OldLabRecord>,
@@ -298,6 +299,7 @@ struct GcState {
     young_allocated_bytes: usize,
     /// Trigger a minor collection at the next TLAB refill after this threshold.
     nursery_threshold_bytes: usize,
+    scheduler_runway_initialized: bool,
     /// Young bytes when the current run of deferred minor collections began
     /// (willow-9tls.9); `None` when the last minor attempt collected.
     minor_deferral_start_bytes: Option<usize>,
@@ -671,7 +673,7 @@ impl Default for GcState {
             tlab_addresses: address_index::AddressIndex::default(),
             old_regions: Vec::new(),
             old_addresses: address_index::AddressIndex::default(),
-            old_region_candidates: BTreeSet::new(),
+            old_region_candidates: region_candidates::RegionCandidates::default(),
             old_reserved_bytes: 0,
             old_labs: Vec::new(),
             tlab_states: HashMap::new(),
@@ -687,6 +689,7 @@ impl Default for GcState {
             pacer_trigger: 1024 * 1024,
             young_allocated_bytes: 0,
             nursery_threshold_bytes: nursery_policy.initial(memory_limit_bytes),
+            scheduler_runway_initialized: false,
             minor_deferral_start_bytes: None,
             minor_retry_bytes: 0,
             nursery_policy,
@@ -1703,7 +1706,7 @@ fn try_collect_internal() -> bool {
     let started = std::time::Instant::now();
     let coordination_ns = || {
         let stops = crate::gc_telemetry::stops::snapshot_stops();
-        [0, 1, 2, 3].into_iter().fold(0u64, |total, index| {
+        [0, 1, 3].into_iter().fold(0u64, |total, index| {
             total
                 .saturating_add(stops.by_reason[index].rendezvous.total_ns)
                 .saturating_add(stops.by_reason[index].stopped.total_ns)
@@ -1743,8 +1746,13 @@ fn try_collect_internal() -> bool {
         } else {
             mark_closure::finish_stopped(&marking, started)
         };
-        let (work, plan, stopped_freed) = result;
+        let (mut work, plan, stopped_freed) = result;
         let freed = plan.map_or(stopped_freed, sweep::concurrent);
+        {
+            let swept = marking.work.lock().unwrap();
+            work.sweep_assist_cpu_ns = swept.sweep_assist_cpu_ns;
+            work.sweep_cpu_incomplete = swept.sweep_cpu_incomplete;
+        }
         minor::service_pending();
         let mut state = runtime().heap.lock().unwrap();
         sync_tlab_bytes(&mut state);
@@ -1915,7 +1923,11 @@ fn validate_payload_pointer_locked(
     ))
 }
 
-/// True when the current thread is a registered GC mutator (willow-6fv.5.6).
+/// Give a cold collector bounded runway when scheduler execution begins.
+pub(crate) fn scheduler_start(workers: usize) {
+    nursery::scheduler_start(&mut runtime().heap.lock().unwrap(), workers);
+}
+
 fn reset_internal() {
     coordinator::shutdown();
     #[cfg(test)]
@@ -2033,6 +2045,7 @@ fn reset_internal() {
     state.old_region_reuses = 0;
     state.old_regions_released = 0;
     state.major_collections = 0;
+    state.scheduler_runway_initialized = false;
     runtime().runtime_roots.clear();
     runtime().runtime_root_slots.clear();
     runtime().pin_lease_slots.clear();
