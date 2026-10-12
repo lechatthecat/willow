@@ -492,6 +492,8 @@ mod alloc_effects_tests {
         "willow_blocking_cell_new",
         "willow_blocking_rw_cell_new",
         "willow_channel_new",
+        "willow_channel_unregister_waiter",
+        "willow_channel_select_cleanup",
         "willow_channel_send_i64",
         "willow_channel_send_bool",
         "willow_channel_send_f64",
@@ -624,7 +626,9 @@ mod alloc_effects_tests {
         assert!(allocates("willow_channel_new"));
         assert!(allocates("willow_channel_new_bounded"));
         assert!(!allocates("willow_channel_close"));
-        assert!(!allocates("willow_channel_unregister_waiter"));
+        // Losing-case compensation may allocate a traced deferred-wake frame.
+        assert!(allocates("willow_channel_unregister_waiter"));
+        assert!(allocates("willow_channel_select_cleanup"));
     }
 
     #[test]

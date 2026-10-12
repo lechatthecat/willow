@@ -59,6 +59,24 @@ use super::support::{
 /// No extra compiler environment: the ordinary debug build.
 const PLAIN: [(&str, &str); 0] = [];
 
+#[test]
+fn select_cleanup_call_sites_scale_linearly_with_aliased_arms() {
+    for cases in [1, 4, 16, 64] {
+        let mut source =
+            String::from("async fn main() { let c = Channel<i64>::new(); c.send(1); select {\n");
+        for _ in 0..cases {
+            source.push_str("let value = c.recv() => { println(value); }\n");
+        }
+        source.push_str("} }\n");
+        let names = compile_and_collect_relocation_targets_all(&source, &PLAIN);
+        let calls = count_of(&names, |name| {
+            name.ends_with("willow_channel_select_cleanup")
+        });
+        assert_eq!(calls, cases);
+        println!("select cases={cases} cleanup_call_sites={calls}");
+    }
+}
+
 fn count_of(names: &[String], predicate: impl Fn(&str) -> bool) -> usize {
     names.iter().filter(|name| predicate(name)).count()
 }

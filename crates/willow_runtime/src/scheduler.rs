@@ -489,6 +489,11 @@ impl RunQueues {
             Some(queue) => {
                 let backlog = queue.publish(id);
                 if SCHED_RUN_DEPTH.with(|depth| depth.get() > 0) && worker == current_worker() {
+                    if backlog > 1 {
+                        // Requeueing the current poll already publishes the
+                        // deferred batch; do not notify twice at its boundary.
+                        LOCAL_WAKE_NOTIFICATION_PENDING.with(|pending| pending.set(false));
+                    }
                     notify_local_work(backlog);
                 } else {
                     self.notify_idle();
@@ -515,10 +520,30 @@ impl RunQueues {
             self.worker_metrics[worker]
                 .local_pushes
                 .fetch_add(ids.len() as u64, Ordering::Relaxed);
-            notify_local_work(previous + ids.len());
+            let backlog = previous + ids.len();
+            // A small channel fan-in can wake several producers in one poll.
+            // Coalesce thief notifications until its boundary; all tasks are
+            // already published and stealable. Large fanouts notify promptly.
+            if backlog >= 32 {
+                notify_local_work(backlog);
+            } else if backlog > 1 {
+                LOCAL_WAKE_NOTIFICATION_PENDING.with(|pending| pending.set(true));
+            }
         } else {
             self.push_global_batch(ids);
         }
+    }
+
+    fn flush_local_wake_notification(&self, worker: usize) -> bool {
+        if LOCAL_WAKE_NOTIFICATION_PENDING.with(|pending| pending.replace(false)) {
+            let backlog = self
+                .locals
+                .get(worker)
+                .map_or(0, |queue| queue.len.load(Ordering::Acquire));
+            notify_local_work(backlog);
+            return backlog > 1;
+        }
+        false
     }
 
     #[cfg(test)]
@@ -2292,6 +2317,7 @@ thread_local! {
     /// drives from inside a poll.
     static CURRENT_WORKER: Cell<usize> = const { Cell::new(0) };
     static SPAWN_NOTIFICATION_PENDING: Cell<bool> = const { Cell::new(false) };
+    static LOCAL_WAKE_NOTIFICATION_PENDING: Cell<bool> = const { Cell::new(false) };
     /// The active parallel run, if this thread is inside a worker pool.
     static CURRENT_RUN_STATE: RefCell<Option<Arc<ParallelRunState>>> = const { RefCell::new(None) };
 }
@@ -4151,6 +4177,7 @@ fn scheduler_run_loop(
         if SPAWN_NOTIFICATION_PENDING.with(|pending| pending.replace(false)) {
             notify_idle_waiters();
         }
+        global_run_queues().flush_local_wake_notification(worker);
         if fatal_panic_pending() {
             park_until_fatal_abort();
         }
@@ -4607,6 +4634,7 @@ pub fn reset_global_scheduler_for_test() {
     set_current_task(None);
     CURRENT_WORKER.with(|worker| worker.set(0));
     SPAWN_NOTIFICATION_PENDING.with(|pending| pending.set(false));
+    LOCAL_WAKE_NOTIFICATION_PENDING.with(|pending| pending.set(false));
     CURRENT_RUN_STATE.with(|state| {
         state.replace(None);
     });

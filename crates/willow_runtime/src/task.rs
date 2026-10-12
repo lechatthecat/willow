@@ -131,7 +131,7 @@ pub(crate) struct TaskWaitLinks {
     /// task does (the handles sit in its rooted frame).
     // Cancellation groups these by channel; registration order is immaterial.
     wait_channels: Vec<ChannelOwnershipToken>,
-    // Keep the common one/two-channel wait free of hash-table allocations and
+    // Keep small channel waits free of hash-table allocations and
     // inline HashMap metadata. Once promoted, retain the index until drained.
     #[allow(clippy::box_collection)] // Saves inline map metadata on every small wait.
     channel_ownership_index: Option<Box<HashMap<ChannelOwnershipKey, usize>>>,
@@ -166,6 +166,8 @@ impl TaskWaitLinks {
     }
 }
 
+const SMALL_CHANNEL_WAIT: usize = 4;
+
 thread_local! {
     /// At most two small vacant boxes per worker. One may be prepared while
     /// the running task still owns the box that its receive will release.
@@ -195,7 +197,7 @@ fn take_spare_wait_links() -> Box<TaskWaitLinks> {
 fn recycle_wait_links(mut links: Box<TaskWaitLinks>) {
     // Do not retain large select/await/fanout allocations. These checks inspect
     // capacities, never relationships; retained memory is bounded per worker.
-    if links.wait_channels.capacity() > 2
+    if links.wait_channels.capacity() > SMALL_CHANNEL_WAIT
         || links.awaiting.capacity() != 0
         || links.waiters.native_bytes() != 0
         || links.channel_ownership_index.is_some()
@@ -445,8 +447,8 @@ impl RuntimeTask {
         }
         if let Some(index) = &mut wait.channel_ownership_index {
             index.insert(token.key(), wait.wait_channels.len());
-        } else if wait.wait_channels.len() == 2 {
-            let mut index = HashMap::with_capacity(3);
+        } else if wait.wait_channels.len() == SMALL_CHANNEL_WAIT {
+            let mut index = HashMap::with_capacity(SMALL_CHANNEL_WAIT + 1);
             for (slot, existing) in wait.wait_channels.iter().enumerate() {
                 index.insert(existing.key(), slot);
             }
@@ -869,6 +871,41 @@ mod footprint {
     }
 
     #[test]
+    fn four_case_select_reuses_wait_storage_at_increasing_message_counts() {
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+
+        SPARE_WAIT_LINKS.with(|spare| *spare.borrow_mut() = [None, None]);
+        let mut task = RuntimeTask::new(1);
+        let round = |task: &mut RuntimeTask| {
+            for channel in 1..=4 {
+                prepare_channel_wait_links();
+                assert!(task.install_channel_ownership(channel_token(channel)));
+            }
+            for channel in 1..=4 {
+                assert!(task.clear_channel_ownership(channel_token(channel)));
+            }
+            assert!(!task.owns_wait_links());
+        };
+        round(&mut task);
+        round(&mut task); // Warm both bounded worker-local spare boxes.
+        for messages in [1_000, 10_000, 100_000, 1_000_000] {
+            CHANNEL_OWNERSHIP_SCANS.with(|count| count.set(0));
+            let before = counter::thread_allocations();
+            for _ in 0..messages {
+                round(&mut task);
+            }
+            let allocations = counter::thread_allocations() - before;
+            let scans = CHANNEL_OWNERSHIP_SCANS.with(|count| count.get());
+            assert_eq!(allocations, 0);
+            assert_eq!(scans, 12 * messages);
+            println!(
+                "select messages={messages} cases=4 allocations={allocations} ownership_scans={scans}"
+            );
+        }
+        SPARE_WAIT_LINKS.with(|spare| *spare.borrow_mut() = [None, None]);
+    }
+
+    #[test]
     fn ping_pong_cache_rejects_large_or_non_channel_wait_storage() {
         SPARE_WAIT_LINKS.with(|spare| *spare.borrow_mut() = [None, None]);
         let mut large = Box::<TaskWaitLinks>::default();
@@ -1166,7 +1203,7 @@ mod footprint {
     fn channel_ownership_index_promotion_and_drain() {
         let mut task = RuntimeTask::new(1);
         task.add_awaiting(2);
-        for channel in 1..=3 {
+        for channel in 1..=SMALL_CHANNEL_WAIT + 1 {
             assert!(task.install_channel_ownership(channel_token(channel)));
             assert_eq!(
                 task.wait
@@ -1174,7 +1211,7 @@ mod footprint {
                     .unwrap()
                     .channel_ownership_index
                     .is_some(),
-                channel == 3
+                channel == SMALL_CHANNEL_WAIT + 1
             );
         }
         // Removing the middle slot repairs the moved token's index. Retaining
@@ -1191,7 +1228,9 @@ mod footprint {
                     .is_some()
             );
         }
-        assert!(task.clear_channel_ownership(channel_token(3)));
+        for channel in 3..=SMALL_CHANNEL_WAIT + 1 {
+            assert!(task.clear_channel_ownership(channel_token(channel)));
+        }
         assert!(task.clear_channel_ownership(channel_token(1)));
         assert!(
             task.wait
@@ -1263,7 +1302,7 @@ mod footprint {
                 "channels={n} tokens={} hashes={hashes} scans={scans}",
                 4 * n
             );
-            assert_eq!(scans, 9, "only the first two tokens use linear lookup");
+            assert_eq!(scans, 30, "only the first four tokens use linear lookup");
             // Includes growth rehashes and moved-slot index repair. Hash-table
             // probes are expected O(1); this bounds actual key hashing work.
             assert!(hashes <= 80 * n, "{hashes} hashes for {n} channels");
