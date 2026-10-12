@@ -1271,8 +1271,11 @@ mod tests {
         for roots in [0usize, 513, 4097, 65_537] {
             let core = Arc::new(ScopeCore::default());
             let value = 0x1000usize as *mut u8;
+            // Dropping a root handle clears its slot; keep the test roots
+            // alive for the complete multi-slice scan and its appended edge.
+            let mut handles = Vec::with_capacity(roots + 1);
             for _ in 0..roots {
-                core.roots.insert(std::ptr::null_mut(), value);
+                handles.push(core.roots.insert(std::ptr::null_mut(), value));
             }
             for _ in 0..65 {
                 core.child().gc_handle.store(value, Ordering::Release);
@@ -1303,7 +1306,7 @@ mod tests {
                 if cursor == 0 {
                     // Neither appended arena cells nor new child scopes extend
                     // the extent captured by the first successful slice.
-                    core.roots.insert(std::ptr::null_mut(), value);
+                    handles.push(core.roots.insert(std::ptr::null_mut(), value));
                     core.child().gc_handle.store(value, Ordering::Release);
                 }
                 match progress {

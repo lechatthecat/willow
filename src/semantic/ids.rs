@@ -36,6 +36,12 @@ pub fn package_namespace(package: &crate::package::PackageIdentity) -> String {
     format!("$pkg{hash:032x}")
 }
 
+/// Compiler-only module prefixes cannot be spelled by a source import alias.
+/// Recognize both standalone and package origins when restoring source evidence.
+pub(crate) fn has_internal_module_prefix(name: &str) -> bool {
+    name.starts_with("$local::") || name.starts_with("$pkg")
+}
+
 /// Session-owned module identity. Artifacts store package/path, never this handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymbolModule(Handle);

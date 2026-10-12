@@ -195,7 +195,7 @@ pub(super) fn restore(
             // invents a namespace-type use at the same source token. It is
             // compiler provenance, not a second source symbol for that token.
             !(r.target.kind == "builtin-type"
-                && r.written.contains("$pkg")
+                && crate::semantic::ids::has_internal_module_prefix(&r.written)
                 && written
                     .get(&(r.span.file_id.0, r.span.start))
                     .is_some_and(|source| !source.contains("::")))
@@ -211,7 +211,8 @@ pub(super) fn restore(
             if generic_callable && r.role == "member" {
                 r.role = "call".into();
             }
-            r.written = if (r.written.contains("$mono$") || r.written.contains("$pkg"))
+            r.written = if (r.written.contains("$mono$")
+                || crate::semantic::ids::has_internal_module_prefix(&r.written))
                 && let Some(source) = written.get(&(r.span.file_id.0, r.span.start))
             {
                 (*source).clone()

@@ -6,6 +6,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),
         ("example/generic_nominal_bindings.wi", "17\n79\n80\n"),
+        ("example/standalone_generic_aliases/main.wi", "17\n"),
         (
             "example/assignable_representations.wi",
             "value:8\nvalue:7\n9\ntrue\n",
@@ -1511,4 +1512,11 @@ fn test_interface_marker_contract_example() {
     let (out, ok) = compile_file_and_run("example/interface_marker_contract.wi");
     assert!(ok, "{out}");
     assert_eq!(out, "3\n2\n");
+}
+
+#[test]
+fn test_standalone_generic_aliases_example() {
+    let (out, ok) = compile_file_and_run("example/standalone_generic_aliases/main.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, "17\n");
 }

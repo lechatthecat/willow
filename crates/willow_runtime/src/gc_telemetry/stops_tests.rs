@@ -123,8 +123,8 @@ fn actual_baseline_stops_are_visible_even_for_empty_heaps() {
     assert_eq!(stats.flags, STOP_COUNTERS_VALID);
     assert_eq!(stats.active_sequence, 0);
     assert_eq!(stats.events_pending, 0);
-    assert_eq!(stats.by_reason.map(|t| t.requests), [0, 0, 1, 0]);
-    assert_eq!(stats.by_reason.map(|t| t.completed), [0, 0, 1, 0]);
+    assert_eq!(stats.by_reason.map(|t| t.requests), [1, 2, 1, 0]);
+    assert_eq!(stats.by_reason.map(|t| t.completed), [1, 2, 1, 0]);
     let sequence = stats.last_sequence;
     let generation = stats.reset_generation;
     reset_internal_for_test();
@@ -145,7 +145,10 @@ fn normal_old_cycles_do_not_scan_headers_or_sweep_under_stops() {
         }
         willow_gc_collect();
         let stats = snapshot_stops();
-        assert!(stats.by_reason.iter().all(|r| r.requests == 0));
+        // Root handshakes are recorded even with no roots; their stopped
+        // work must remain independent of the heap object count.
+        assert_eq!(stats.by_reason.map(|r| r.requests), [1, 2, 0, 0]);
+        assert_eq!(stats.by_reason.map(|r| r.completed), [1, 2, 0, 0]);
         assert_eq!(stats.by_reason[0].work.root_values, 0);
         assert_eq!(stats.by_reason[0].work.metadata_objects, 0);
         assert_eq!(stats.by_reason[1].work.metadata_objects, 0);

@@ -146,6 +146,16 @@ impl TypeChecker {
         }
         let mut reported = HashSet::new();
         for import in &program.imports {
+            // Generic item lowering creates an unspellable module alias. The
+            // original source import was checked before that lowering; this
+            // compiler provenance must not produce another unused-import warning.
+            if import
+                .alias
+                .as_deref()
+                .is_some_and(crate::semantic::ids::has_internal_module_prefix)
+            {
+                continue;
+            }
             let local = import
                 .alias
                 .as_deref()

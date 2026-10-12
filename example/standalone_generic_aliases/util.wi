@@ -1,0 +1,5 @@
+pub fn id<T>(value: T) -> T { return value; }
+pub class Box<T> {
+    pub value: T;
+    pub fn get(self) -> T { return self.value; }
+}

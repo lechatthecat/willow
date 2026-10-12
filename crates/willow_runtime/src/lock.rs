@@ -613,8 +613,8 @@ mod tests {
 
     /// The constructor's own allocation can collect. The initial word is a
     /// young object the caller may hold nowhere else, so the runtime roots it
-    /// across the allocation; as a direct root it is promoted IN PLACE and the
-    /// word written into the fresh payload is still its address.
+    /// across the allocation; its stable root can be rewritten by copying,
+    /// and the word written into the fresh payload must be the new address.
     ///
     /// Deterministic ordering follows the map-copy recipe (willow-9tls.8): this
     /// thread registers as a mutator so the collector cannot proceed until it
@@ -622,7 +622,7 @@ mod tests {
     /// `collect_internal`, whose first act under a pending stop is to park at
     /// the safepoint. The collection therefore runs exactly inside `new`.
     #[test]
-    fn initial_young_value_survives_a_collection_inside_new() {
+    fn initial_young_value_is_reloaded_after_collection_inside_new() {
         use std::time::{Duration, Instant};
         let _guard = runtime_test_guard();
         crate::gc::willow_gc_init();
@@ -632,7 +632,7 @@ mod tests {
         let young = crate::gc::willow_gc_alloc_slow(&mut tls, 42, 0, 8, 0);
         assert!(!young.is_null());
         unsafe { *(young as *mut i64) = 4242 };
-        let deferred_before = crate::gc::deferred_minor_collections_for_test();
+        let minor_before = crate::gc::willow_gc_minor_collections();
 
         let collector = std::thread::spawn(crate::gc::minor_collect_internal);
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -649,19 +649,20 @@ mod tests {
         collector.join().unwrap();
         willow_push_root(&mut cell as *mut *mut u8);
 
-        // `new` holds the young value in a Rust local, so the collection that
-        // stopped it inside runtime code defers rather than pinning
-        // (willow-9tls.9).
+        // The constructor's stable root permits copying while it allocates;
+        // it reloads the rewritten reference before initializing the payload.
         assert!(
-            crate::gc::deferred_minor_collections_for_test() > deferred_before,
-            "the collection stopped `new` while it was allocating"
+            crate::gc::willow_gc_minor_collections() > minor_before,
+            "the collection must complete inside `new`"
         );
         assert_eq!(crate::gc::willow_gc_pinned_region_count(), 0);
         let held = willow_blocking_cell_get(cell as *mut c_void) as *const i64;
-        assert_eq!(
-            held, young as *const i64,
-            "the deferred collection moved nothing"
+        assert_ne!(
+            held.cast::<u8>(),
+            young.cast_const(),
+            "the young value must move"
         );
+
         assert_eq!(unsafe { *held }, 4242, "the held value is intact");
         willow_pop_roots(1);
         crate::gc::willow_gc_unregister_mutator();

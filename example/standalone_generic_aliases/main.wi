@@ -1,0 +1,7 @@
+import util::id as keep;
+import util::Box as Container;
+class Item { pub value: i64; }
+fn main() {
+    let box = new Container<Item>(keep(new Item(17)));
+    println(box.get().value);
+}

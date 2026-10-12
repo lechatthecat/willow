@@ -2618,3 +2618,194 @@ fn uninstantiated_generic_body_refs_and_rename() {
         }
     }
 }
+
+#[test]
+fn analysis_readonly_routes_leave_lock_and_metadata_untouched() {
+    for project in [true, false] {
+        for existing in [false, true] {
+            for route in ["api", "query", "impact", "overview", "symbol"] {
+                let f = Fixture::new();
+                fs::write(f.0.join("src/main.wi"), "fn main() { println(1); }\n").unwrap();
+                fs::write(f.0.join("requests.json"), "[]").unwrap();
+                let workspace = if project {
+                    f.0.clone()
+                } else {
+                    f.0.join("src")
+                };
+                let metadata = workspace.join(".willow-edits");
+                if existing {
+                    fs::create_dir(&metadata).unwrap();
+                    fs::write(metadata.join("keep"), "unchanged").unwrap();
+                }
+                let entry = f.0.join("src/main.wi");
+                let target = if project { "." } else { "src/main.wi" };
+                if route == "api" {
+                    willow_compiler::CompilerSession::new(
+                        entry.to_str().unwrap(),
+                        "",
+                        &willow_compiler::CompilerOptions::debug(),
+                        project.then(|| f.0.clone()),
+                    )
+                    .analysis_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)
+                    .unwrap();
+                } else {
+                    let args = match route {
+                        "query" => vec!["query", target, "--requests", "requests.json"],
+                        "impact" => vec!["impact", target, "--file", "src/main.wi", "--byte", "3"],
+                        "overview" => vec!["overview", target, "--format=json"],
+                        "symbol" if project => vec![
+                            "symbol",
+                            "main::main",
+                            "--project-dir",
+                            ".",
+                            "--format=json",
+                        ],
+                        "symbol" => vec![
+                            "symbol",
+                            "main::main",
+                            "--source",
+                            "src/main.wi",
+                            "--format=json",
+                        ],
+                        _ => unreachable!(),
+                    };
+                    let output = f.run(&args);
+                    assert!(
+                        output.status.success(),
+                        "route={route} project={project}: {} {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                assert_eq!(
+                    metadata.exists(),
+                    existing,
+                    "route={route} project={project} existing={existing}"
+                );
+                assert!(
+                    !f.0.join("project.lock").exists(),
+                    "route={route} project={project}"
+                );
+                if existing {
+                    assert_eq!(
+                        fs::read_to_string(metadata.join("keep")).unwrap(),
+                        "unchanged"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_import_source_provenance_matches_project_and_standalone() {
+    #[derive(Default)]
+    struct Warnings(Vec<willow_compiler::diagnostics::Diagnostic>);
+    impl willow_compiler::diagnostics::DiagnosticEmitter for Warnings {
+        fn emit(
+            &mut self,
+            diagnostic: &willow_compiler::diagnostics::Diagnostic,
+            _: &dyn willow_compiler::diagnostics::source_map::SourceLookup,
+        ) -> std::io::Result<()> {
+            self.0.push(diagnostic.clone());
+            Ok(())
+        }
+    }
+    for project in [false, true] {
+        for (import, callee) in [
+            ("import coll::fold;", "fold"),
+            ("import coll::fold as keep;", "keep"),
+            ("import coll::{fold};", "fold"),
+            ("import coll;", "coll::fold"),
+            ("import coll as model;", "model::fold"),
+        ] {
+            for explicit in [false, true] {
+                let f = Fixture::new();
+                fs::write(
+                    f.0.join("src/coll.wi"),
+                    "pub fn fold<T>(value: T) -> T { return value; }\n",
+                )
+                .unwrap();
+                let args = if explicit { "<i64>" } else { "" };
+                let source = format!("{import}\nfn main() {{ println({callee}{args}(7)); }}\n");
+                fs::write(f.0.join("src/main.wi"), &source).unwrap();
+                let entry = f.0.join("src/main.wi");
+                let mut diagnostics = Warnings::default();
+                let snapshot = willow_compiler::CompilerSession::new(
+                    entry.to_str().unwrap(),
+                    "",
+                    &willow_compiler::CompilerOptions::debug(),
+                    project.then(|| f.0.clone()),
+                )
+                .analysis_with_emitter(&mut diagnostics)
+                .unwrap();
+                if !callee.contains("::") {
+                    assert!(
+                        !snapshot
+                            .semantic
+                            .symbols
+                            .iter()
+                            .any(|s| s.kind == "builtin-type" && s.name == "coll"),
+                        "phantom namespace for {import} project={project}"
+                    );
+                }
+                assert!(
+                    !diagnostics
+                        .0
+                        .iter()
+                        .any(|d| d.code == willow_compiler::diagnostics::ErrorCode::W2003),
+                    "{import} project={project}: {:?}",
+                    diagnostics.0
+                );
+                let function = snapshot
+                    .semantic
+                    .symbols
+                    .iter()
+                    .find(|s| s.name == "fold" && s.kind == "function")
+                    .unwrap();
+                let calls: Vec<_> = snapshot
+                    .semantic
+                    .references
+                    .iter()
+                    .filter(|r| r.target == function.id && r.role == "call")
+                    .collect();
+                assert_eq!(calls.len(), 1, "{import} project={project}");
+                let call = &calls[0].location;
+                assert_eq!(
+                    &source[call.start..call.end],
+                    callee.rsplit("::").next().unwrap()
+                );
+            }
+        }
+    }
+
+    // The provenance filter must not hide a genuinely unused source import.
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/coll.wi"),
+        "pub fn fold<T>(value: T) -> T { return value; }\n",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import coll::fold as keep; fn main() {}\n",
+    )
+    .unwrap();
+    let entry = f.0.join("src/main.wi");
+    let mut diagnostics = Warnings::default();
+    willow_compiler::CompilerSession::new(
+        entry.to_str().unwrap(),
+        "",
+        &willow_compiler::CompilerOptions::debug(),
+        None,
+    )
+    .analysis_with_emitter(&mut diagnostics)
+    .unwrap();
+    let unused: Vec<_> = diagnostics
+        .0
+        .iter()
+        .filter(|d| d.code == willow_compiler::diagnostics::ErrorCode::W2003)
+        .collect();
+    assert_eq!(unused.len(), 1, "{unused:?}");
+    assert_eq!(unused[0].message, "unused import `keep`");
+}

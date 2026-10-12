@@ -361,12 +361,13 @@ impl<'a> CompilerSession<'a> {
         self.execute(emitter, false)
     }
 
-    /// Build an analysis snapshot from the same checked frontend, without codegen.
+    /// Build a read-only analysis snapshot from the same checked frontend,
+    /// without codegen or publishing project locks/edit metadata.
     pub fn analysis_with_emitter(
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
-        self.analysis_with_policy(emitter, true, false, false)
+        self.analysis_with_policy(emitter, false, false, false)
     }
 
     /// Edit preflight covers all project sources and must not rewrite project inputs.

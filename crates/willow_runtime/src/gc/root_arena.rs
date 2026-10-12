@@ -33,6 +33,7 @@ impl GcRootCell {
 /// One stable mutable reference slot. A scoped handle unregisters and frees
 /// its cell on Drop. An arena handle nulls its cell on Drop; the arena retains
 /// the physical slot until owner finalization, preserving trace-slot lifetimes.
+#[must_use = "retain the handle while its GC reference must remain rooted"]
 pub(crate) struct GcRootHandle {
     cell: Arc<GcRootCell>,
     registered: bool,

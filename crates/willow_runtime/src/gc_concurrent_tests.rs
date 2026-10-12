@@ -26,8 +26,11 @@ fn failed_stopped_callback_resumes_world_and_remains_in_stop_telemetry() {
     assert_eq!(stats.events_pending, 1);
     willow_gc_collect();
     let stats = snapshot_stops();
-    assert_eq!(stats.by_reason[0].requests, 1);
-    assert_eq!(stats.by_reason[1].requests, 0);
+    // The explicit major cycle adds its initial and remark handshakes while
+    // flushing the preceding failed callback's event.
+    assert_eq!(stats.by_reason[0].requests, 2);
+    assert_eq!(stats.by_reason[0].aborted, 1);
+    assert_eq!(stats.by_reason[1].requests, 2);
     assert_eq!(stats.events_pending, 0);
     reset_internal_for_test();
 }
