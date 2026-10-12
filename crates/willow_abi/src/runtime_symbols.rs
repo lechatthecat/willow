@@ -346,9 +346,12 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_panic_finish_unhandled" => ([] -> None);
     // --- debug call-chain stack (willow-992h) ---
     NONE; "willow_callstack_push" => ([Ptr, I64, Ptr, I64, I32, I32] -> None);
+    NONE; "willow_callstack_push_pending" => ([Ptr, I64, Ptr, I64, I32, I32] -> None);
+    NONE; "willow_callstack_activate" => ([] -> None);
     NONE; "willow_callstack_pop" => ([] -> None);
     // --- debug fault site: source location for runtime-raised faults ---
     NONE; "willow_fault_site_set" => ([Ptr, I64, I64, I64] -> None);
+    NONE; "willow_trace_site_set" => ([Ptr, I64, Ptr, I64, I64, I64, I32] -> None);
     NONE; "willow_fault_site_clear" => ([] -> None);
     // --- reference debug metadata ---
     NONE; "willow_debug_reference_call_scope_push" => ([] -> None);

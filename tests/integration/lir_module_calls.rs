@@ -732,9 +732,8 @@ fn main() {
 "#,
         ),
     ];
-    // A module call pushes a call-stack frame naming the call as the source
-    // spells it (willow-0g8j.2.20), and the panic itself is reported at the
-    // callee's `panic` — in the module's OWN file, not the caller's. The frame
+    // The leaf frame names the declaration and its panic in the module,
+    // while main retains the module call location in the entry file. The frame
     // shapes are covered exhaustively in `module_call_frames.rs`; what this
     // asserts is that an unrecovered panic out of a module call names both.
     let (ok, stderr) = compile_temp_project_with_env_run_stderr(&files, "main.wi", &PLAIN);
@@ -745,7 +744,8 @@ fn main() {
         "wrong panic site:\n{stderr}"
     );
     assert!(
-        report.contains("0: checks::checked at main.wi:5:13"),
+        report.contains("0: checked at checks.wi:4:9")
+            && report.contains("1: main at main.wi:5:13"),
         "the module call is not the frame:\n{stderr}"
     );
 }

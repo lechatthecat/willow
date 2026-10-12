@@ -212,11 +212,9 @@ fn recycle_wait_links(mut links: Box<TaskWaitLinks>) {
     });
 }
 
-/// Debug metadata the compiler tags onto a task in debug builds
-/// (willow-ezs.3). Release-mode tasks and runtime-internal placeholders never
-/// carry it, so it is lazily allocated separately from [`TaskWaitLinks`]: a
-/// task that waits should not pay for debug strings, and a debug-tagged task
-/// that never waits should not pay for wait queues.
+/// Diagnostic metadata tagged onto generated async tasks in both build modes.
+/// Runtime-internal placeholders do not need it. It remains lazily allocated
+/// separately from [`TaskWaitLinks`], so metadata does not allocate wait queues.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TaskDebugInfo {
     /// Source name of the async fn this task runs, tagged at poll-fn entry.
@@ -226,6 +224,7 @@ pub(crate) struct TaskDebugInfo {
     /// Source location of the call that spawned this task (file, line), for
     /// panic/debug traces (willow-0a6k.7).
     spawn_site: Option<(String, u32)>,
+    execution_site: Option<crate::stack_trace::RuntimeFrame>,
 }
 
 /// A scheduler-owned task. Inspect it by borrowing; copying the record would
@@ -614,6 +613,16 @@ impl RuntimeTask {
 
     pub fn set_name(&mut self, name: String) {
         self.debug.get_or_insert_with(Box::default).name = Some(name);
+    }
+
+    pub(crate) fn execution_site(&self) -> Option<&crate::stack_trace::RuntimeFrame> {
+        self.debug
+            .as_ref()
+            .and_then(|debug| debug.execution_site.as_ref())
+    }
+
+    pub(crate) fn set_execution_site(&mut self, frame: crate::stack_trace::RuntimeFrame) {
+        self.debug.get_or_insert_with(Box::default).execution_site = Some(frame);
     }
 
     pub fn spawn_site(&self) -> Option<(&str, u32)> {

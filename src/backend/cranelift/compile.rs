@@ -1612,6 +1612,7 @@ impl UnitCodegenContext<'_> {
         f: &FunctionDecl,
         body: Option<crate::parser::ast::BodyId>,
     ) -> Result<()> {
+        self.declare_string_literal(&f.name)?;
         let func_id = self.func_ids[name];
         // `willow_user_main` is always parameterless (the runtime calls it with
         // no arguments). A declared `fn main(args: Array<String>)` parameter is
@@ -1781,6 +1782,8 @@ impl UnitCodegenContext<'_> {
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
+            diagnostic_function: f.name.clone(),
+            diagnostic_async: false,
             address_taken: super::lir_address_taken_locals(&lir_fn),
         };
         // A safepoint-free leaf neither roots its GC parameters nor reaches
@@ -2211,6 +2214,8 @@ impl UnitCodegenContext<'_> {
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
+            diagnostic_function: String::new(),
+            diagnostic_async: false,
             // Static initialisers hold no user body, so nothing takes an address.
             address_taken: HashSet::new(),
         };
@@ -2670,6 +2675,12 @@ impl UnitCodegenContext<'_> {
         m: &MethodDecl,
         body: Option<crate::parser::ast::BodyId>,
     ) -> Result<()> {
+        let diagnostic_function = format!(
+            "{}::{}",
+            class_name.strip_prefix("$local::").unwrap_or(class_name),
+            m.name
+        );
+        self.declare_string_literal(&diagnostic_function)?;
         let mangled = self.class_method_symbol(class_name, &m.name);
         // LIR-walking path for a method body (willow-0g8j.2.18). `lower_program`
         // lowers every method under `Class::method` -- the key
@@ -2803,6 +2814,8 @@ impl UnitCodegenContext<'_> {
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
+            diagnostic_function,
+            diagnostic_async: false,
             address_taken: super::lir_address_taken_locals(&lir_fn),
         };
         // Instance methods bind a rooted `self`, even for scalar bodies, unless

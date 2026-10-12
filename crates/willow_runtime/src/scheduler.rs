@@ -2853,47 +2853,54 @@ pub(crate) fn wake_idle_mutators_for_gc() {
     notify_all_idle_waiters();
 }
 
+pub(crate) fn set_current_execution_site(frame: crate::stack_trace::RuntimeFrame) {
+    if let Some(id) = current_task_id() {
+        global_task_table().with_mut(id, |task| task.set_execution_site(frame));
+    }
+}
+
 /// Render the active async chain for panic diagnostics (willow-9lw).
 pub fn async_chain_text() -> String {
-    with_global(|sched| {
-        let Some(mut id) = current_task_id() else {
-            return String::new();
-        };
-        let mut lines = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        // Walk current task -> its awaiter -> ... via the reverse `waiters` link.
-        while seen.insert(id) {
-            let Some((line, awaiter)) = sched.with_task(id, |task| {
-                let name = task.name().unwrap_or("<async task>");
-                let site = match task.spawn_site() {
-                    Some((file, line)) => format!(" [task {id}, spawned at {file}:{line}]"),
-                    None => format!(" [task {id}]"),
-                };
-                // Only inspect the first live waiter; do not copy the task's
-                // other relationships while rendering its diagnostic line.
-                (
-                    format!("  {}: async {}{}", lines.len(), name, site),
-                    task.first_live_waiter(),
-                )
-            }) else {
-                break;
+    let Some(mut id) = current_task_id() else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Walk current task -> its awaiter -> ... via the reverse `waiters` link.
+    while seen.insert(id) {
+        let Some((line, awaiter)) = global_task_table().with(id, |task| {
+            let name = task.name().unwrap_or("<async task>");
+            let location = task.execution_site().map_or_else(String::new, |frame| {
+                format!(" at {}:{}:{}", frame.file, frame.line, frame.col)
+            });
+            let site = match task.spawn_site() {
+                Some((file, line)) => format!(" [task {id}, spawned at {file}:{line}]"),
+                None => format!(" [task {id}]"),
             };
-            lines.push(line);
-            match awaiter {
-                Some(awaiter) => id = awaiter,
-                None => break,
-            }
+            // Only inspect the first live waiter; do not copy the task's
+            // other relationships while rendering its diagnostic line.
+            (
+                format!("  {}: async {}{}{}", lines.len(), name, location, site),
+                task.first_live_waiter(),
+            )
+        }) else {
+            break;
+        };
+        lines.push(line);
+        match awaiter {
+            Some(awaiter) => id = awaiter,
+            None => break,
         }
-        if lines.is_empty() {
-            return String::new();
-        }
-        let mut out = String::from("async stack (current task first):");
-        for line in lines {
-            out.push('\n');
-            out.push_str(&line);
-        }
-        out
-    })
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("async stack (current task first):");
+    for line in lines {
+        out.push('\n');
+        out.push_str(&line);
+    }
+    out
 }
 
 /// Requested worker count from `WILLOW_WORKERS`, or available parallelism.

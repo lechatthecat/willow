@@ -322,7 +322,7 @@ fn main() { println(measure(new Bomb(1))); }
     let (out, ok) = compile_with_env_and_run_combined(&source, &PLAIN);
     assert!(!ok, "the program must panic: {out}");
     let method = out
-        .find("0: area")
+        .find("0: Bomb::area")
         .unwrap_or_else(|| panic!("trace has no dispatched-method frame: {out}"));
     let caller = out
         .find("1: measure")
@@ -332,10 +332,8 @@ fn main() { println(measure(new Bomb(1))); }
 
 #[test]
 fn lir_callstack_interface_argument_panic_reports_the_argument_as_the_top_frame() {
-    // A dispatched method installs its frame BEFORE its arguments are
-    // evaluated, so an argument that panics does not replace that frame — it
-    // stacks on top of it. The whole chain is therefore pinned: the argument,
-    // then the method it was being passed to, then the caller.
+    // A reserved method frame is not an activation until arguments finish.
+    // An argument panic must show the argument, its actual caller, and main.
     let source = dispatch_source(
         r#"
 fn bad() -> i64 { return 1 / 0; }
@@ -348,16 +346,11 @@ fn main() { println(measure(new Square(3))); }
     let argument = out
         .find("0: bad")
         .unwrap_or_else(|| panic!("trace has no argument frame: {out}"));
-    let method = out
-        .find("1: scaled")
-        .unwrap_or_else(|| panic!("trace has no dispatched-method frame: {out}"));
+    assert!(!out.contains(": scaled at "), "unentered method: {out}");
     let caller = out
-        .find("2: measure")
+        .find("1: measure")
         .unwrap_or_else(|| panic!("trace has no caller frame: {out}"));
-    assert!(
-        argument < method && method < caller,
-        "trace is out of order: {out}"
-    );
+    assert!(argument < caller, "trace is out of order: {out}");
 }
 
 #[test]

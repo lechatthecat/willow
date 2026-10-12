@@ -1,44 +1,7 @@
-//! A call into an imported module pushes a debug call-stack frame
-//! (willow-0g8j.2.20).
-//!
-//! Every other user call is wrapped in a frame — a callee name and a call-site
-//! location pushed before the call and popped when it returns — so a debug
-//! panic report can name the chain that reached it. The module branch of both
-//! emitters pushed none, so a panic raised inside an imported function printed
-//! its own location and stopped: the entry file that called in, the only line
-//! the reader could act on, was missing from the report entirely.
-//!
-//! Two things were wrong, and the second is what made the first invisible. The
-//! branches emitted no push at all; and the frame's name has to exist as static
-//! bytes before a function can point at it, while nothing declared the string
-//! `checks::checked` — the module declares `checked`, the entry file declares
-//! its own items, and no walk spells the pair. A push emitted against a missing
-//! literal is silently skipped, so adding the push alone changed nothing.
-//!
-//! A module frame is named as the SOURCE spells the call: the whole path, under
-//! whatever name the import bound it to (`import checks as c;` makes it
-//! `c::checked`). The bare item name would not say which module it came from.
-//! A class static keeps the bare-method convention it already had, because a
-//! static is reached through its class and the class's own unit declares it.
-//!
-//! Walker coverage is asserted from `WILLOW_LIR_LOG=1`, which names each
-//! function the walker really compiled: the build succeeding says only that
-//! nothing in the project is outside the subset.
-//!
-//! 25 perspectives:
-//!   1 a module panic names the call     14 in a match arm
-//!   2 the path, not the symbol          15 in a defer body
-//!   3 the caller's call site            16 in a lambda body
-//!   4 an import alias names the frame   17 in a ternary branch
-//!   5 the caller's frame below it       18 nested inside another call
-//!   6 module calling module, both hops  19 a class static stays bare
-//!   7 a module's private helper         20 a class method stays bare
-//!   8 a returning call's frames         21 an awaited async call
-//!   9 a returned call leaves no frame   22 a call inside a spawned task
-//!  10 a recovered panic leaves none     23 the walker compiled the caller
-//!  11 a loop accumulates no frames      24 under allocation-stress GC
-//!  12 a release build has no stack      25 the example project agrees
-//!  13 a reference argument, and a frame
+//! Function-owned panic locations across modules (willow-jz15.67).
+//! Callers retain their call sites; frame zero uses the panic site. Names come
+//! from declarations, so import aliases do not rename an executing function.
+//! Coverage includes cleanup, recovery, references, async tasks and GC stress.
 
 use super::support::{
     compile_temp_project_release_run_stderr, compile_temp_project_with_env_and_run,
@@ -199,14 +162,13 @@ fn main() {
     assert_frames(
         &files,
         "negative input",
-        &["checks::checked at main.wi:5:13"],
+        &["checked at checks.wi:22:9", "main at main.wi:5:13"],
     );
 }
 
 #[test]
-fn module_frames_02_the_frame_is_the_source_path_not_the_symbol() {
-    // `checks__checked` is the mangled symbol and `checked` is the item; the
-    // frame is neither, because only the path says which module ran.
+fn module_frames_02_the_frame_is_the_declaration_name_not_the_symbol() {
+    // Declaration name and source file identify the function, without exposing symbols.
     let files = checks_project(
         r#"
 import checks;
@@ -217,14 +179,14 @@ fn main() {
 "#,
     );
     let report = panic_report(&files, "negative input");
-    assert!(report.contains("0: checks::checked at "), "{report}");
+    assert!(report.contains("0: checked at "), "{report}");
     assert!(!report.contains("checks__checked"), "{report}");
-    assert!(!report.contains("0: checked at "), "{report}");
+    assert!(report.contains("1: main at "), "{report}");
 }
 
 #[test]
-fn module_frames_03_the_frame_points_at_the_call_site_not_the_body() {
-    // The panic line is in the module; the frame's line is in the caller.
+fn module_frames_03_frames_pair_locations_with_their_function() {
+    // The leaf is in the module; main retains the caller location.
     let files = checks_project(
         r#"
 import checks;
@@ -246,12 +208,15 @@ fn main() {
         located.contains("runtime panic: negative input at checks.wi:"),
         "{report}"
     );
-    assert_eq!(frames(&report), ["checks::checked at main.wi:7:13"]);
+    assert_eq!(
+        frames(&report),
+        ["checked at checks.wi:22:9", "main at main.wi:7:13"]
+    );
 }
 
 #[test]
-fn module_frames_04_an_import_alias_names_the_frame() {
-    // The frame reads as the source reads: the alias the call was written with.
+fn module_frames_04_an_import_alias_preserves_the_declaration_name() {
+    // Import aliases do not rename the function declaration.
     let files = checks_project(
         r#"
 import checks as c;
@@ -261,7 +226,11 @@ fn main() {
 }
 "#,
     );
-    assert_frames(&files, "negative input", &["c::checked at main.wi:5:13"]);
+    assert_frames(
+        &files,
+        "negative input",
+        &["checked at checks.wi:22:9", "main at main.wi:5:13"],
+    );
 }
 
 #[test]
@@ -284,14 +253,17 @@ fn main() {
     assert_frames(
         &files,
         "negative input",
-        &["checks::checked at main.wi:5:12", "run at main.wi:9:13"],
+        &[
+            "checked at checks.wi:22:9",
+            "run at main.wi:5:12",
+            "main at main.wi:9:13",
+        ],
     );
 }
 
 #[test]
 fn module_frames_06_a_module_calling_a_module_reports_both_hops() {
-    // A frame is pushed by the file doing the calling, so the middle module's
-    // own call is named `checks::deep` and located in relay.wi.
+    // Each hop pairs the source declaration with its own file.
     let files = [
         ("checks.wi", CHECKS),
         (
@@ -319,9 +291,10 @@ fn main() {
         &files,
         "empty reading",
         &[
-            "inner at checks.wi:32:12",
-            "checks::deep at relay.wi:5:12",
-            "relay::forward at main.wi:5:13",
+            "inner at checks.wi:37:9",
+            "deep at checks.wi:32:12",
+            "forward at relay.wi:5:12",
+            "main at main.wi:5:13",
         ],
     );
 }
@@ -342,7 +315,11 @@ fn main() {
     assert_frames(
         &files,
         "empty reading",
-        &["inner at checks.wi:32:12", "checks::deep at main.wi:5:13"],
+        &[
+            "inner at checks.wi:37:9",
+            "deep at checks.wi:32:12",
+            "main at main.wi:5:13",
+        ],
     );
 }
 
@@ -369,7 +346,11 @@ fn main() {
     assert_frames(
         &files,
         "negative input",
-        &["checks::checked at main.wi:5:12", "run at main.wi:10:13"],
+        &[
+            "checked at checks.wi:22:9",
+            "run at main.wi:5:12",
+            "main at main.wi:10:13",
+        ],
     );
 }
 
@@ -393,7 +374,7 @@ fn main() {
     assert_frames(
         &files,
         "negative input",
-        &["checks::checked at main.wi:7:13"],
+        &["checked at checks.wi:22:9", "main at main.wi:7:13"],
     );
 }
 
@@ -422,7 +403,7 @@ fn main() {
     assert_frames(
         &files,
         "negative input",
-        &["checks::checked at main.wi:14:13"],
+        &["checked at checks.wi:22:9", "main at main.wi:14:13"],
     );
 }
 
@@ -449,7 +430,7 @@ fn main() {
     assert_frames(
         &files,
         "negative input",
-        &["checks::checked at main.wi:12:13"],
+        &["checked at checks.wi:22:9", "main at main.wi:12:13"],
     );
 }
 
@@ -496,7 +477,10 @@ fn main() {
         report.contains("reference call: checks::bump parameter `slot` &mut i64"),
         "{report}"
     );
-    assert_eq!(frames(&report), ["checks::bump at main.wi:8:5"]);
+    assert_eq!(
+        frames(&report),
+        ["bump at checks.wi:45:9", "main at main.wi:8:5"]
+    );
 }
 
 #[test]
@@ -516,7 +500,7 @@ fn main() {
     assert_frames(
         &files,
         "negative input",
-        &["checks::checked at main.wi:6:22"],
+        &["checked at checks.wi:22:9", "main at main.wi:6:22"],
     );
 }
 
@@ -535,7 +519,7 @@ fn main() {
     assert_frames(
         &files,
         "negative input",
-        &["checks::checked at main.wi:5:19"],
+        &["checked at checks.wi:22:9", "main at main.wi:5:19"],
     );
 }
 
@@ -557,7 +541,7 @@ fn main() {
     let frames = frames(&report);
     assert_eq!(
         frames.first().map(String::as_str),
-        Some("checks::checked at main.wi:5:33"),
+        Some("checked at checks.wi:22:9"),
         "{report}"
     );
 }
@@ -577,7 +561,7 @@ fn main() {
     assert_frames(
         &files,
         "negative input",
-        &["checks::checked at main.wi:6:20"],
+        &["checked at checks.wi:22:9", "main at main.wi:6:20"],
     );
 }
 
@@ -597,16 +581,15 @@ fn main() {
     assert_frames(
         &files,
         "negative input",
-        &["checks::checked at main.wi:5:26"],
+        &["checked at checks.wi:22:9", "main at main.wi:5:26"],
     );
 }
 
 // ── 19-22 the neighbouring call forms ────────────────────────────────────────
 
 #[test]
-fn module_frames_19_a_module_class_static_keeps_its_bare_frame() {
-    // A static is reached through its class, so its frame is the bare method —
-    // the convention it already had, and the class's own unit declares it.
+fn module_frames_19_a_module_class_static_qualifies_its_frame() {
+    // Static methods carry their declaring class as well as their method name.
     let files = checks_project(
         r#"
 import checks;
@@ -616,11 +599,18 @@ fn main() {
 }
 "#,
     );
-    assert_frames(&files, "negative side", &["of at main.wi:5:13"]);
+    assert_frames(
+        &files,
+        "negative side",
+        &[
+            "checks::Meter::of at checks.wi:7:13",
+            "main at main.wi:5:13",
+        ],
+    );
 }
 
 #[test]
-fn module_frames_20_a_module_class_method_keeps_its_bare_frame() {
+fn module_frames_20_a_module_class_method_qualifies_its_frame() {
     let files = checks_project(
         r#"
 import checks;
@@ -632,13 +622,20 @@ fn main() {
 }
 "#,
     );
-    assert_frames(&files, "zero side", &["area at main.wi:7:18"]);
+    assert_frames(
+        &files,
+        "zero side",
+        &[
+            "checks::Meter::area at checks.wi:14:13",
+            "main at main.wi:7:18",
+        ],
+    );
 }
 
 #[test]
 fn module_frames_21_an_awaited_module_async_call_reports_the_async_stack() {
     // An awaited call is scheduled, not called, so it is the async stack that
-    // names it — the call stack is for direct calls and stays empty here.
+    // names the waiting parents; the call stack also records the panicking leaf.
     let files = [
         (
             "jobs.wi",
@@ -675,7 +672,8 @@ async fn main() {
         "{report}"
     );
     assert!(report.contains("0: async scaled"), "{report}");
-    assert!(frames(&report).is_empty(), "{report}");
+    assert_eq!(frames(&report), ["scaled at jobs.wi:10:9"], "{report}");
+    assert!(report.contains("1: async main at "), "{report}");
 }
 
 #[test]
@@ -703,7 +701,7 @@ async fn main() {
     let report = panic_report(&files, "negative input");
     assert_eq!(
         frames(&report),
-        ["checks::checked at main.wi:5:12"],
+        ["checked at checks.wi:22:9", "work at main.wi:5:12"],
         "{report}"
     );
     assert!(
@@ -757,7 +755,10 @@ fn main() {
     let (ok, stderr) = compile_temp_project_with_env_run_stderr(&files, "main.wi", &STRESS);
     assert!(ok, "compile failed under stress:\n{stderr}");
     assert!(stderr.contains("runtime panic: negative input"), "{stderr}");
-    assert_eq!(frames(&stderr), ["checks::checked at main.wi:13:13"]);
+    assert_eq!(
+        frames(&stderr),
+        ["checked at checks.wi:22:9", "main at main.wi:13:13"]
+    );
 }
 
 #[test]
@@ -783,4 +784,174 @@ fn module_frames_25_the_example_project_runs() {
     let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN);
     assert!(ok, "the example failed:\n{out}");
     assert_eq!(out, expected, "wrong output");
+}
+
+#[test]
+fn panic_frames_async_method_locations_debug_and_release() {
+    let files = [
+        (
+            "worker.wi",
+            "pub class Worker {\n    pub async fn fail(self) -> i64 {\n        await yield();\n        defer println(42);\n        panic(\"async method\");\n    }\n}\n",
+        ),
+        (
+            "main.wi",
+            "import worker::Worker;\nasync fn middle(w: Worker) -> i64 {\n    return await w.fail();\n}\nasync fn main() {\n    let w = new Worker();\n    println(await middle(w));\n}\n",
+        ),
+    ];
+    for release in [false, true] {
+        let (ok, report) = if release {
+            compile_temp_project_release_run_stderr(&files, "main.wi")
+        } else {
+            compile_temp_project_with_env_run_stderr(&files, "main.wi", &PLAIN)
+        };
+        assert!(ok, "{report}");
+        let normalized = report
+            .split_whitespace()
+            .map(file_name)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            normalized.contains("runtime panic: async method at worker.wi:5:9"),
+            "{report}"
+        );
+        assert!(
+            normalized.contains("0: async worker::Worker::fail at worker.wi:5:9"),
+            "{report}"
+        );
+        assert!(
+            normalized.contains("1: async middle at main.wi:3:"),
+            "{report}"
+        );
+        assert!(
+            normalized.contains("2: async main at main.wi:7:"),
+            "{report}"
+        );
+        assert!(!report.contains("<async task>"), "{report}");
+    }
+}
+
+#[test]
+fn panic_frames_release_async_main_has_location() {
+    let files = [(
+        "main.wi",
+        "async fn main() {\n    panic(\"release main\");\n}\n",
+    )];
+    let (ok, report) = compile_temp_project_release_run_stderr(&files, "main.wi");
+    assert!(ok, "{report}");
+    let normalized = report
+        .split_whitespace()
+        .map(file_name)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        normalized.contains("0: async main at main.wi:2:5"),
+        "{report}"
+    );
+}
+
+#[test]
+fn panic_frames_recursion_has_one_frame_per_activation() {
+    for depth in [1, 8, 32] {
+        let source = format!(
+            "fn descend(n: i64) {{\n    if n == 0 {{ panic(\"depth\"); }}\n    descend(n - 1);\n}}\nfn main() {{ descend({depth}); }}\n"
+        );
+        let report = panic_report(&[("main.wi", &source)], "depth");
+        let trace = frames(&report);
+        assert_eq!(trace.len(), depth + 2, "{report}");
+        assert_eq!(trace[0], "descend at main.wi:2:17");
+        for frame in &trace[1..=depth] {
+            assert_eq!(frame, "descend at main.wi:3:5", "{report}");
+        }
+        assert_eq!(trace[depth + 1], "main at main.wi:5:13");
+    }
+}
+
+#[test]
+fn panic_frames_release_sync_helper_does_not_inherit_async_leaf() {
+    let files = [(
+        "main.wi",
+        "fn fail() { panic(\"sync after task\"); }\nasync fn main() {\n    await yield();\n    fail();\n}\n",
+    )];
+    let (ok, report) = compile_temp_project_release_run_stderr(&files, "main.wi");
+    assert!(ok, "{report}");
+    assert!(
+        report.contains("runtime panic: sync after task"),
+        "{report}"
+    );
+    assert!(!report.contains("call stack"), "stale async leaf: {report}");
+}
+
+#[test]
+fn panic_frames_original_method_overflow_pairs_names_and_locations() {
+    let source = "class C {\n    pub v: i64;\n    pub fn boom(self) -> i64 {\n        return self.v * 9223372036854775807;\n    }\n}\nfn middle(c: C) -> i64 {\n    return c.boom();\n}\nfn main() {\n    println(middle(new C(2)));\n}\n";
+    let report = panic_report(&[("main.wi", source)], "integer overflow");
+    assert_eq!(
+        frames(&report),
+        [
+            "C::boom at main.wi:4:23",
+            "middle at main.wi:8:14",
+            "main at main.wi:11:13"
+        ],
+        "{report}"
+    );
+}
+
+#[test]
+fn panic_frames_cancel_cleanup_explicit_panic_debug_and_release() {
+    let worker = "pub async fn waiting(ready: AtomicBool) {\n    defer println(42);\n    defer panic(\"cancel-unhandled\");\n    ready.store(true);\n    await sleep(10000);\n}\n";
+    assert_cancel_cleanup_frames(
+        worker,
+        "worker::waiting(ready)",
+        "waiting",
+        "cancel-unhandled",
+        3,
+    );
+}
+
+#[test]
+fn panic_frames_cancel_cleanup_method_runtime_fault_debug_and_release() {
+    let worker = "import std::collections::Array;\npub class Worker {\n    pub async fn waiting(self, ready: AtomicBool) {\n        let xs: Array<i64> = [1];\n        defer {\n            println(xs[2]);\n        }\n        ready.store(true);\n        await sleep(10000);\n    }\n}\n";
+    assert_cancel_cleanup_frames(
+        worker,
+        "new worker::Worker().waiting(ready)",
+        "worker::Worker::waiting",
+        "index out of bounds",
+        6,
+    );
+}
+
+fn assert_cancel_cleanup_frames(worker: &str, call: &str, name: &str, message: &str, line: usize) {
+    let main = format!(
+        "import worker;\nasync fn main() {{\n    let ready = AtomicBool::new(false);\n    let task = {call};\n    while !ready.load() {{ await yield(); }}\n    task.cancel();\n    await task.result();\n}}\n"
+    );
+    let files = [("worker.wi", worker), ("main.wi", main.as_str())];
+    for release in [false, true] {
+        let (ok, report) = if release {
+            compile_temp_project_release_run_stderr(&files, "main.wi")
+        } else {
+            compile_temp_project_with_env_run_stderr(&files, "main.wi", &PLAIN)
+        };
+        assert!(ok, "compile failed, release={release}: {report}");
+        let panic = report
+            .lines()
+            .find(|text| text.starts_with("runtime panic:"))
+            .unwrap_or_else(|| panic!("missing panic, release={release}: {report}"));
+        assert!(panic.contains(message), "{report}");
+        let site = panic.rsplit_once(" at ").expect("located panic").1;
+        assert!(
+            file_name(site).starts_with(&format!("worker.wi:{line}:")),
+            "wrong cleanup location, release={release}: {report}"
+        );
+        assert!(
+            report.contains(&format!("0: async {name} at {site}")),
+            "wrong async cleanup frame, release={release}: {report}"
+        );
+        if !release {
+            assert_eq!(
+                frames(&report).first(),
+                Some(&format!("{name} at {}", file_name(site))),
+                "{report}"
+            );
+        }
+    }
 }

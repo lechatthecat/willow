@@ -6601,6 +6601,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let Some((suspends, frame)) = coop.as_mut() else {
                     unreachable!("explicit LIR suspension reached the synchronous emitter")
                 };
+                self.emit_fault_site();
                 self.emit_lir_suspend(function, operation, *resume, blocks, suspends, *frame);
             }
         }
@@ -9338,6 +9339,7 @@ impl FuncGen<'_, '_> {
         {
             self.lir_reference_scopes.push(Vec::new());
         }
+        self.fault_site_span = Some(span);
         let result = self.emit_lir_rvalue(function, value, span);
         if !self.terminated {
             if function.locals[local.0 as usize].is_gc_owner()
@@ -9386,6 +9388,7 @@ impl FuncGen<'_, '_> {
             .func_addr(reference_type(self.module.target_config()), callback);
         // Explicitly handle suspension before panic propagation or observing
         // the result slot. Runtime-call wrappers cannot express this split.
+        self.emit_fault_site();
         let enter = self.func_ids["willow_task_stack_enter"];
         let enter = self.module.declare_func_in_func(enter, self.builder.func);
         let call = self.builder.ins().call(enter, &[address, frame]);

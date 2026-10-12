@@ -35,6 +35,7 @@ struct PanicRecord {
     /// balances and removes caller shadow frames before an outer boundary
     /// eventually reports the panic (willow-s9ej.4).
     call_stack: String,
+    async_stack: String,
     reference_call: Option<String>,
 }
 
@@ -97,14 +98,20 @@ impl PanicContext {
     }
 
     fn push(&self, info: *mut u8) {
-        let mut state = self.lock();
-        state.active.push(PanicRecord {
+        let record = PanicRecord {
             info: info as usize,
-            call_stack: crate::stack_trace::current_call_stack_text(),
+            call_stack: crate::stack_trace::panic_call_stack_text(
+                unsafe { panic_info_file(info) },
+                unsafe { panic_info_line(info) } as usize,
+                unsafe { panic_info_column(info) } as usize,
+            ),
+            async_stack: crate::scheduler::async_chain_text(),
             reference_call: crate::reference_debug::current_reference_call()
                 .as_ref()
                 .map(crate::reference_debug::reference_call_context_text),
-        });
+        };
+        let mut state = self.lock();
+        state.active.push(record);
         self.active_depth
             .store(state.active.len(), Ordering::Release);
     }
@@ -279,10 +286,9 @@ pub(crate) fn raise_language_message_at(message: &str, file: *const u8, line: i6
 }
 
 /// Raise a runtime fault that has no location of its own (array bounds, a
-/// blocked channel operation, awaiting a cancelled task). Debug builds publish
-/// the enclosing statement through [`willow_fault_site_set`] before every
-/// runtime call that can raise, so the fault still records `file:line:column`;
-/// release builds keep the empty location (willow-s9ej.7).
+/// blocked channel operation, awaiting a cancelled task). Generated code publishes
+/// the enclosing statement before calls that can raise, so the fault records
+/// `file:line:column` in either build mode.
 pub(crate) fn raise_language_message(message: &str) {
     let (file, line, column) = current_fault_site();
     if file.is_empty() {
@@ -295,7 +301,7 @@ pub(crate) fn raise_language_message(message: &str) {
 }
 
 thread_local! {
-    /// Statement being executed by generated debug-build code on this thread.
+    /// Statement being executed by generated code on this thread.
     /// Set immediately before each runtime call that can raise, so it is never
     /// read as a stale value by the fault it describes.
     static FAULT_SITE: RefCell<(String, i64, i64)> = const { RefCell::new((String::new(), 0, 0)) };
@@ -308,7 +314,7 @@ fn current_fault_site() -> (String, i64, i64) {
 /// Publish the source location generated code is about to execute. `file` is a
 /// pointer to raw static UTF-8 bytes (NOT a Willow String) with an explicit
 /// length, copied onto the Rust heap so the fault site never allocates on the
-/// GC heap. Debug builds only; release builds never call this.
+/// GC heap. Also used by the named diagnostic-site ABI in release builds.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fault_site_set(file: *const u8, file_len: i64, line: i64, column: i64) {
@@ -427,6 +433,11 @@ pub(crate) fn finish_unhandled_with_async_chain(async_chain: &str) -> ! {
     }
     #[cfg(test)]
     tests::observe_unhandled_report();
+    let async_chain = records
+        .last()
+        .map(|record| record.async_stack.as_str())
+        .filter(|chain| !chain.is_empty())
+        .unwrap_or(async_chain);
     for (index, record) in records.iter().rev().enumerate() {
         let info = record.info as *mut u8;
         let message = unsafe { panic_info_message(info) };

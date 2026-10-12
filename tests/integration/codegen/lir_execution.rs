@@ -320,7 +320,7 @@ fn main() { invoke(); }
     let (out, ok) = compile_with_env_and_run_combined(source, &PLAIN);
     assert!(!ok, "the program must panic: {out}");
     let method = out
-        .find("0: explode")
+        .find("0: Crash::explode")
         .unwrap_or_else(|| panic!("trace has no static-method frame: {out}"));
     let caller = out
         .find("1: invoke")
@@ -340,7 +340,7 @@ fn main() { build(); }
     let (out, ok) = compile_with_env_and_run_combined(source, &PLAIN);
     assert!(!ok, "the program must panic: {out}");
     let init = out
-        .find("0: init")
+        .find("0: Item::init")
         .unwrap_or_else(|| panic!("trace has no constructor frame: {out}"));
     let caller = out
         .find("1: build")
@@ -362,7 +362,7 @@ fn main() { build(); }
     assert!(!ok, "the program must panic: {out}");
     assert!(out.contains("0: bad"), "trace has no bad frame: {out}");
     assert!(
-        !out.contains("0: init") && !out.contains("1: init"),
+        !out.contains("0: Item::init") && !out.contains("1: Item::init"),
         "trace attributed an argument panic to init: {out}"
     );
 }
