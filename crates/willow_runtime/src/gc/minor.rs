@@ -27,6 +27,10 @@ type DropMap = HashMap<u32, DropFn, BuildHasherDefault<AddressHasher>>;
 #[path = "minor_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "minor_overlap_tests.rs"]
+mod overlap_tests;
+
 struct MinorCollector<'a> {
     work: crate::gc_telemetry::MarkWork,
     stop_work: &'a mut crate::gc_telemetry::stops::StopWorkV2,
@@ -36,6 +40,8 @@ struct MinorCollector<'a> {
     /// survivor destinations allocated by this cycle.
     source_chunks: usize,
     forwarding: AddressMap<*mut u8>,
+    published: Vec<usize>,
+    needs_scan: AddressSet,
     worklist: Vec<HeapObject>,
     scanned: AddressSet,
     trace_registry: HashMap<u32, TraceFn>,
@@ -81,6 +87,8 @@ impl<'a> MinorCollector<'a> {
             survivor_destination: None,
             source_chunks,
             forwarding: AddressMap::default(),
+            published: Vec::new(),
+            needs_scan: AddressSet::default(),
             worklist: Vec::new(),
             scanned: AddressSet::default(),
             trace_registry,
@@ -138,6 +146,9 @@ impl<'a> MinorCollector<'a> {
                 ));
             }
             object.set_generation(GC_GENERATION_OLD);
+            if self.state.concurrent_cycle.is_some() {
+                self.published.push(address);
+            }
             self.state.survivor_stats.pinned_promotions += 1;
             let size = object.size();
             self.state.young_allocated_bytes =
@@ -290,6 +301,9 @@ impl<'a> MinorCollector<'a> {
         self.state.moved_objects = self.state.moved_objects.saturating_add(1);
         let forwarded = target.payload().as_ptr();
         self.forwarding.insert(address, forwarded);
+        if self.state.concurrent_cycle.is_some() {
+            self.published.push(forwarded as usize);
+        }
         self.worklist.push(target);
         forwarded
     }
@@ -400,6 +414,34 @@ impl<'a> MinorCollector<'a> {
         }
         while let Some(object) = self.worklist.pop() {
             self.scan_object(object);
+        }
+
+        // All referents have moved, but source headers remain valid until sweep.
+        // Translate every transport before freeing storage, including legacy and
+        // not-yet-indexed work. Old/pinned referents keep their identity.
+        if let Some(cycle) = self.state.concurrent_cycle.clone() {
+            let remap = |address: usize| -> Option<usize> {
+                if let Some(&new) = self.forwarding.get(&address) {
+                    return Some(new as usize);
+                }
+                if super::tlab_payload_generation(self.state, address) == Some(GC_GENERATION_YOUNG)
+                    && !self.is_destination(address)
+                {
+                    return None;
+                }
+                Some(address)
+            };
+            let mut needs_scan: AddressSet = self.published.iter().copied().collect();
+            cycle.queue.remap_stopped(|object| {
+                let address = remap(object.addr())?;
+                needs_scan.remove(&address);
+                crate::gc_mark_queue::ObjectRef::from_addr(address)
+            });
+            let mut deferred = cycle.deferred.lock().unwrap();
+            *deferred = deferred.iter().copied().filter_map(&remap).collect();
+            let mut unindexed = cycle.unindexed.lock().unwrap();
+            *unindexed = unindexed.iter().copied().filter_map(remap).collect();
+            self.needs_scan = needs_scan;
         }
 
         self.work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
@@ -553,6 +595,25 @@ impl<'a> MinorCollector<'a> {
             chunk_positions[identity] = Some(index);
         }
         self.state.tlab_addresses.remap(&chunk_positions);
+        if let Some(cycle) = self.state.concurrent_cycle.clone() {
+            cycle.objects.refresh_stopped(self.state);
+            // Publication must scan promoted black objects too; enqueue() would
+            // suppress already-black destinations allocated in existing old regions.
+            for address in self.published {
+                cycle.objects.claim(address);
+                if !self.needs_scan.contains(&address) {
+                    continue;
+                }
+                cycle
+                    .queue
+                    .inject(crate::gc_mark_queue::MarkWork::object(
+                        cycle.mark_epoch,
+                        crate::gc_mark_queue::ObjectRef::from_addr(address).unwrap(),
+                    ))
+                    .expect("minor publications retain the old epoch");
+            }
+            cycle.termination.restart();
+        }
         (reclaimed_bytes, self.work)
     }
 
@@ -740,6 +801,53 @@ fn minor_collect_with_roots(
     {
         panic!("willow gc: write barrier verification failed: {message}");
     }
+    let mut mark_roots = Vec::new();
+    if let Some(cycle) = state.concurrent_cycle.as_ref() {
+        assert_eq!(
+            cycle
+                .active_drains
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        let mut seen = AddressSet::default();
+        let mut retain = |address| {
+            if super::tlab_payload_generation(&state, address) == Some(GC_GENERATION_YOUNG)
+                && seen.insert(address)
+            {
+                mark_roots.push(address as *mut u8);
+            }
+        };
+        cycle.queue.remap_stopped(|object| {
+            retain(object.addr());
+            Some(object)
+        });
+        for &address in cycle.deferred.lock().unwrap().iter() {
+            retain(address);
+        }
+        for &address in cycle.unindexed.lock().unwrap().iter() {
+            retain(address);
+        }
+        for chunk in &state.tlab_chunks {
+            if chunk.kind == RegionKind::Pinned {
+                continue;
+            }
+            let bits = if cycle.objects.contains_extent(chunk.base as usize) {
+                &chunk.concurrent_marks
+            } else {
+                // Post-capture nursery extents inherit black allocation. Keep
+                // their starts alive through relocation before making them
+                // visible to the old epoch's explicit bitmap/index.
+                &chunk.mark_bitmap.bits
+            };
+            bits.for_each_set(|bit| {
+                let address = chunk.base as usize + bit * GC_REGION_MARK_GRANULE + GC_HEADER_SIZE;
+                retain(address);
+            });
+        }
+        roots
+            .slots
+            .extend(mark_roots.iter_mut().map(|p| p as *mut *mut u8));
+    }
     let remembered = std::mem::take(&mut state.remembered_set);
     state.dirty_cards.clear();
     state.minor_collections = state.minor_collections.saturating_add(1);
@@ -844,15 +952,74 @@ pub(crate) fn minor_collect_pinning_for_test() {
     FORCE_PIN_FALLBACK.with(|force| force.set(false));
 }
 
+// Only the major owner may relocate while its epoch exists. Requests coalesce;
+// initial/remark/sweep requests are serviced at a safe owner boundary.
+static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) fn reset_pending() {
+    PENDING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+pub(super) fn requested() -> bool {
+    PENDING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(super) fn service_pending() {
+    if PENDING.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        collect_owned();
+    }
+}
+
+fn collect_stopped(
+    coord: &super::GcCoord,
+    stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
+) -> Option<(u64, u64, crate::gc_telemetry::MarkWork)> {
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        assert!(
+            state.sweeping.is_none(),
+            "minor relocation must wait for old sweep finalization"
+        );
+        if let Some(cycle) = &state.concurrent_cycle {
+            assert_eq!(cycle.collector, std::thread::current().id());
+        }
+        super::flush_satb_all_locked(coord, &mut state);
+        retire_all_tlabs_unindexed(&mut state);
+    }
+    let roots = minor_stack_roots(coord);
+    let result = minor_collect_with_roots(roots, stop_work);
+    if let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref()
+        && !cycle.closing.load(std::sync::atomic::Ordering::Acquire)
+    {
+        cycle.satb_shards.reopen_stopped(coord);
+    }
+    result
+}
+
+pub(super) fn collect_owned() {
+    with_stw(
+        crate::gc_telemetry::stops::StopReason::Minor,
+        |coord, stop_work| {
+            if foreign_root_stack_owner_active_locked(coord) {
+                return;
+            }
+            collect_stopped(coord, stop_work);
+        },
+    );
+}
+
 pub(crate) fn minor_collect_internal() {
     if runtime()
         .stop_requested
         .load(std::sync::atomic::Ordering::Acquire)
     {
+        PENDING.store(true, std::sync::atomic::Ordering::Release);
         willow_gc_safepoint();
         return;
     }
     let Some(_serialize) = super::cycle_wait::CollectorGuard::try_acquire() else {
+        PENDING.store(true, std::sync::atomic::Ordering::Release);
         willow_gc_safepoint();
         return;
     };
@@ -863,6 +1030,8 @@ pub(crate) fn minor_collect_internal() {
         return;
     }
 
+    // This elected minor satisfies any request left at a previous owner boundary.
+    PENDING.swap(false, std::sync::atomic::Ordering::AcqRel);
     let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Minor);
     // Stop the world and scan every registered mutator, for the reason spelled
     // out over the major cycle's mark phase: a registration that races a
@@ -875,12 +1044,7 @@ pub(crate) fn minor_collect_internal() {
             if foreign_root_stack_owner_active_locked(coord) {
                 return None;
             }
-            {
-                let mut state = runtime().heap.lock().unwrap();
-                retire_all_tlabs_unindexed(&mut state);
-            }
-            let roots = minor_stack_roots(coord);
-            Some(minor_collect_with_roots(roots, stop_work))
+            Some(collect_stopped(coord, stop_work))
         },
     );
     let Some(collected) = collected else {

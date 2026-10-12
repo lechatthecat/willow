@@ -26,7 +26,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                 // Generated allocations publish start bits after header initialization.
                 // A publication racing initialization is retried after the handshake.
                 let objects =
-                    epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state));
+                    epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state));
                 let mut cycle = ConcurrentCycle::with_index(
                     objects,
                     type_registry().lock().unwrap().keys().copied().collect(),

@@ -1710,7 +1710,7 @@ fn collect_internal() {
     let started = std::time::Instant::now();
     let coordination_ns = || {
         let stops = crate::gc_telemetry::stops::snapshot_stops();
-        [0, 1, 3].into_iter().fold(0u64, |total, index| {
+        [0, 1, 2, 3].into_iter().fold(0u64, |total, index| {
             total
                 .saturating_add(stops.by_reason[index].rendezvous.total_ns)
                 .saturating_add(stops.by_reason[index].stopped.total_ns)
@@ -1741,6 +1741,7 @@ fn collect_internal() {
                 marking.worker_failed.store(true, Ordering::Release);
             }
         }
+        minor::service_pending();
         let closed = mark_closure::finish(&marking, started);
         let concurrent_closed = closed.is_some();
         let result = if let Some((work, plan)) = closed {
@@ -1750,6 +1751,7 @@ fn collect_internal() {
         };
         let (work, plan, stopped_freed) = result;
         let freed = plan.map_or(stopped_freed, sweep::concurrent);
+        minor::service_pending();
         let mut state = runtime().heap.lock().unwrap();
         sync_tlab_bytes(&mut state);
         let after = state.allocated_bytes as u64;
@@ -1934,6 +1936,8 @@ fn validate_payload_pointer_locked(
 /// True when the current thread is a registered GC mutator (willow-6fv.5.6).
 fn reset_internal() {
     coordinator::shutdown();
+    #[cfg(test)]
+    minor::reset_pending();
     // Exclude a concurrent collection (see runtime().collect_lock).
     let _serialize = runtime()
         .collect_lock

@@ -1722,3 +1722,108 @@ fn explicit_completion_preserves_children_without_abandoned_retirement() {
     assert_eq!(queue.snapshot().abandoned, 0);
     assert_eq!(queue.snapshot().counter_underflows, 0);
 }
+
+#[test]
+fn minor_remap_preserves_epochs_slices_batches_and_exact_queue_accounting() {
+    for count in [1, 16, 64, 256, 1024] {
+        let (queue, epoch) = started_queue(2);
+        let mut worker = queue.register_worker().unwrap();
+        for address in 1..=count {
+            let object = ObjectRef::from_addr(address).unwrap();
+            worker.push(MarkWorkItem::Object(object)).unwrap();
+            queue
+                .inject(MarkWork::new(
+                    epoch,
+                    MarkWorkItem::ObjectSlice { object, word: 17 },
+                ))
+                .unwrap();
+            queue
+                .inject(MarkWork::new(
+                    epoch,
+                    MarkWorkItem::ObjectBatch(vec![object, object].into_boxed_slice()),
+                ))
+                .unwrap();
+        }
+        let mut visits = 0;
+        queue.remap_stopped(|object| {
+            visits += 1;
+            (object.addr() % 2 == 0).then(|| ObjectRef::from_addr(object.addr() + 4096).unwrap())
+        });
+        assert_eq!(visits, 4 * count);
+        assert_eq!(queue.snapshot().outstanding, (3 * (count / 2)) as u64);
+        queue.flush_all_locals();
+        while let Some(work) = worker.next_work() {
+            assert_eq!(work.epoch, epoch);
+            match work.item {
+                MarkWorkItem::Object(object) => assert!(object.addr() > 4096),
+                MarkWorkItem::ObjectSlice { object, word } => {
+                    assert!(object.addr() > 4096);
+                    assert_eq!(word, 17);
+                }
+                MarkWorkItem::ObjectBatch(objects) => {
+                    assert_eq!(objects.len(), 2);
+                    assert!(objects.iter().all(|o| o.addr() > 4096));
+                }
+                _ => unreachable!(),
+            }
+            worker.complete_current();
+        }
+        drop(worker);
+        assert!(queue.snapshot().is_drained());
+        assert_eq!(queue.snapshot().counter_underflows, 0);
+        assert_eq!(queue.current_epoch(), epoch);
+        eprintln!(
+            "minor_remap items={} address_visits={visits} remaining={}",
+            3 * count,
+            3 * (count / 2)
+        );
+    }
+}
+
+#[test]
+fn minor_remap_compacts_partial_batches_and_keeps_non_object_jobs() {
+    let (queue, epoch) = started_queue(1);
+    let object = |address| ObjectRef::from_addr(address).unwrap();
+    queue
+        .inject(MarkWork::new(
+            epoch,
+            MarkWorkItem::ObjectBatch(vec![object(1), object(2), object(3)].into_boxed_slice()),
+        ))
+        .unwrap();
+    queue
+        .inject(MarkWork::new(
+            epoch,
+            MarkWorkItem::RootShard(RootShardId(4)),
+        ))
+        .unwrap();
+    queue
+        .inject(MarkWork::new(
+            epoch,
+            MarkWorkItem::RegionChunk {
+                region: RegionId(5),
+                chunk: 6,
+            },
+        ))
+        .unwrap();
+    queue.remap_stopped(|o| (o.addr() == 2).then(|| object(200)));
+    let mut worker = queue.register_worker().unwrap();
+    assert_eq!(
+        worker.next_work().unwrap().item,
+        MarkWorkItem::ObjectBatch(vec![object(200)].into_boxed_slice())
+    );
+    assert_eq!(
+        worker.next_work().unwrap().item,
+        MarkWorkItem::RootShard(RootShardId(4))
+    );
+    assert_eq!(
+        worker.next_work().unwrap().item,
+        MarkWorkItem::RegionChunk {
+            region: RegionId(5),
+            chunk: 6
+        }
+    );
+    worker.complete_current();
+    drop(worker);
+    assert!(queue.snapshot().is_drained());
+    assert_eq!(queue.snapshot().counter_underflows, 0);
+}

@@ -1103,7 +1103,7 @@ fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
                 };
             }
             let cycle = Arc::new(ConcurrentCycle::with_index(
-                epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(
+                epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(
                     &runtime().heap.lock().unwrap(),
                 )),
                 IdSet::default(),
@@ -2547,7 +2547,7 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
         let cycle = {
             let mut state = runtime().heap.lock().unwrap();
             let cycle = Arc::new(ConcurrentCycle::with_index(
-                epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
                 IdSet::default(),
                 IdMap::default(),
                 0,
@@ -2744,7 +2744,7 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
         let mut state = runtime().heap.lock().unwrap();
         state.satb = satb::SatbBuffers::new(256);
         let cycle = Arc::new(ConcurrentCycle::with_index(
-            epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+            epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
             IdSet::default(),
             IdMap::default(),
             1,
@@ -2902,7 +2902,7 @@ fn concurrent_closure_paces_contention_and_retains_work_until_release() {
         let cycle = {
             let mut state = runtime().heap.lock().unwrap();
             let mut cycle = ConcurrentCycle::with_index(
-                epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
                 IdSet::default(),
                 IdMap::default(),
                 0,
@@ -3239,7 +3239,7 @@ fn satb_reference_store_throughput_baseline_and_current() {
             |_, _| {
                 let mut state = runtime().heap.lock().unwrap();
                 let mut cycle = ConcurrentCycle::with_index(
-                    epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                    epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
                     IdSet::default(),
                     IdMap::default(),
                     1,
@@ -3293,7 +3293,7 @@ fn satb_registration_owns_buffer_and_unwind_unregister_drains_it() {
             let cycle = {
                 let mut state = runtime().heap.lock().unwrap();
                 let mut cycle = ConcurrentCycle::with_index(
-                    epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                    epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
                     IdSet::default(),
                     IdMap::default(),
                     1,
@@ -3367,7 +3367,7 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
             let cycle = {
                 let mut state = runtime().heap.lock().unwrap();
                 let cycle = Arc::new(ConcurrentCycle::with_index(
-                    epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                    epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
                     IdSet::default(),
                     IdMap::default(),
                     0,
@@ -3504,7 +3504,7 @@ fn satb_closure_wave_cap_completes_perpetually_retrying_work_with_stopped_trace(
         let cycle = {
             let mut state = runtime().heap.lock().unwrap();
             let mut cycle = ConcurrentCycle::with_index(
-                epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
                 IdSet::default(),
                 IdMap::default(),
                 0,
@@ -3599,7 +3599,7 @@ fn satb_deferred_legacy_and_retry_slice_complete_with_snapshot_retention() {
             let mut legacy = IdSet::default();
             legacy.insert(LEGACY);
             let mut cycle = ConcurrentCycle::with_index(
-                epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
                 legacy,
                 IdMap::default(),
                 0,
@@ -3767,7 +3767,7 @@ fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations(
         let cycle = {
             let mut state = runtime().heap.lock().unwrap();
             let cycle = Arc::new(ConcurrentCycle::with_index(
-                epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
                 IdSet::from_iter([TYPE]),
                 runtime().concurrent_trace_registry.lock().unwrap().clone(),
                 1,

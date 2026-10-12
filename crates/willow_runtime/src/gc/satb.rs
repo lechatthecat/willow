@@ -244,6 +244,23 @@ impl SatbShards {
         self.seal(publish);
     }
 
+    /// Minor relocation has translated the injector and every buffer is empty.
+    /// Resume private publication in the same epoch, while all owners remain
+    /// stopped. Closure must keep its authoritative seal instead.
+    pub(super) fn reopen_stopped(&self, coord: &super::GcCoord) {
+        assert!(coord.stop_requested);
+        let current = std::thread::current().id();
+        assert!(
+            coord
+                .mutators
+                .keys()
+                .all(|id| *id == current || coord.parked.contains(id))
+        );
+        assert!(self.drained.load(Ordering::Acquire));
+        self.drained.store(false, Ordering::Release);
+        self.sealed.store(false, Ordering::Release);
+    }
+
     fn seal(&self, mut publish: impl FnMut(&[usize])) {
         if self.drained.load(Ordering::Acquire) {
             return;

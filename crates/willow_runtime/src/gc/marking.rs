@@ -497,7 +497,7 @@ impl ConcurrentCycle {
         };
         while scanned < limit {
             // Always permit one work item, even after descheduling at entry.
-            if scanned != 0 && expired() {
+            if scanned != 0 && (expired() || minor::requested()) {
                 break;
             }
             let Some(work) = worker.next_work() else {

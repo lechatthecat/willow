@@ -643,6 +643,86 @@ impl MarkWorkQueue {
         discarded
     }
 
+    /// Owner-only relocation under STW, with no work in a consumer's hands.
+    /// Lock order matches epoch transitions: injector, all shared, all private.
+    /// The callback must not acquire queue locks. None discards a dead referent.
+    /// Visits each address once, preserving slice cursors and epoch tags.
+    pub fn remap_stopped(&self, mut remap: impl FnMut(ObjectRef) -> Option<ObjectRef>) {
+        let mut injector = QueueGuard::new(&self.injector);
+        let mut shared: Vec<_> = self
+            .slots
+            .iter()
+            .map(|s| QueueGuard::new(&s.shared))
+            .collect();
+        let mut private: Vec<_> = self
+            .slots
+            .iter()
+            .map(|s| QueueGuard::new(&s.private))
+            .collect();
+        let mut visit = |work: &mut MarkWork| -> bool {
+            match &mut work.item {
+                MarkWorkItem::Object(object) | MarkWorkItem::ObjectSlice { object, .. } => {
+                    if let Some(new) = remap(*object) {
+                        *object = new;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                MarkWorkItem::ObjectBatch(objects) => {
+                    let mut kept = 0;
+                    for index in 0..objects.len() {
+                        if let Some(object) = remap(objects[index]) {
+                            objects[kept] = object;
+                            kept += 1;
+                        }
+                    }
+                    if kept != objects.len() {
+                        let mut compact = std::mem::take(objects).into_vec();
+                        compact.truncate(kept);
+                        *objects = compact.into_boxed_slice();
+                    }
+                    kept != 0
+                }
+                MarkWorkItem::RootShard(_) | MarkWorkItem::RegionChunk { .. } => true,
+            }
+        };
+        let before = injector.len()
+            + shared.iter().map(|q| q.len()).sum::<usize>()
+            + private.iter().map(|q| q.len()).sum::<usize>();
+        assert_eq!(
+            self.counters.outstanding.load(Ordering::SeqCst),
+            before as u64,
+            "relocation requires all consumer-held work to be published"
+        );
+        let hidden_before: usize = private.iter().map(|q| q.len()).sum();
+        injector.retain_mut(&mut visit);
+        for q in &mut shared {
+            q.retain_mut(&mut visit);
+        }
+        for q in &mut private {
+            q.retain_mut(&mut visit);
+        }
+        let hidden: usize = private.iter().map(|q| q.len()).sum();
+        let published = injector.len() + shared.iter().map(|q| q.len()).sum::<usize>();
+        sub_counter(
+            &self.counters.hidden,
+            (hidden_before - hidden) as u64,
+            &self.counters.counter_underflows,
+        );
+        sub_counter(
+            &self.counters.published,
+            (before - hidden_before - published) as u64,
+            &self.counters.counter_underflows,
+        );
+        sub_counter(
+            &self.counters.outstanding,
+            (before - hidden - published) as u64,
+            &self.counters.counter_underflows,
+        );
+        self.advance_publication();
+    }
+
     /// Publish work from outside the consumer pool: root jobs, SATB buffer
     /// flushes, the remark pause.
     ///

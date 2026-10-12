@@ -80,6 +80,7 @@ pub(super) fn finish_with_hooks(
     );
     let mut remark_rounds = 1;
     for wave in 0..MAX_DRAIN_WAVES {
+        minor::service_pending();
         if cycle.worker_failed.load(Ordering::Acquire) || !cycle.deferred.lock().unwrap().is_empty()
         {
             return None; // Explicit stopped native-hook/failure fallback.

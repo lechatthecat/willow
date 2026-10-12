@@ -169,7 +169,7 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
             // closure. Neither an empty sample nor budget exhaustion ends the
             // epoch. Unused claims are not refunded, avoiding empty-queue spin.
             loop {
-                if cycle.worker_failed.load(Ordering::Acquire) {
+                if cycle.worker_failed.load(Ordering::Acquire) || minor::requested() {
                     break;
                 }
                 let budget = job.claim();
