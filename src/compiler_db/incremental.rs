@@ -407,11 +407,22 @@ impl SyntaxQueries {
             .read(&self.provider(), QueryNode::TypedBody(body))?;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn validate_derived(
         &mut self,
         node: QueryNode,
         dependencies: Vec<QueryNode>,
     ) -> Result<Option<Value>> {
+        self.validate_derived_typed(node, dependencies)
+    }
+
+    /// Decode directly into the caller's owned type. The graph retains only
+    /// stable wire bytes; callers may mutate results without changing a memo.
+    pub(crate) fn validate_derived_typed<V: serde::de::DeserializeOwned>(
+        &mut self,
+        node: QueryNode,
+        dependencies: Vec<QueryNode>,
+    ) -> Result<Option<V>> {
         self.capture_input(
             InputNode::DerivedDependencies(node.clone()),
             QueryValue::new(
@@ -420,9 +431,15 @@ impl SyntaxQueries {
             ),
         )?;
         match self.table.read(&self.provider(), node) {
-            Ok(result) => Ok(Some(serde_json::from_slice(
-                &result.get::<DerivedValue>().wire,
-            )?)),
+            Ok(result) => {
+                let wire = &result.get::<DerivedValue>().wire;
+                match wire.split_first() {
+                    Some((&DERIVED_WIRE_VERSION, payload)) => {
+                        Ok(Some(serde_json::from_slice(payload)?))
+                    }
+                    _ => Ok(None), // An older wire schema must be recomputed.
+                }
+            }
             Err(error)
                 if error
                     .downcast_ref::<super::tracked::DeferredQuery>()
@@ -436,10 +453,18 @@ impl SyntaxQueries {
     pub(crate) fn refresh_derived(&self, node: QueryNode, wire: Value) -> Result<()> {
         let canonical = serde_json::to_vec(&super::syntax::without_spans(&wire))?;
         let fingerprint = ResultFingerprint::bytes(&canonical);
-        let wire = serde_json::to_vec(&wire)?;
+        let mut encoded = vec![DERIVED_WIRE_VERSION];
+        serde_json::to_writer(&mut encoded, &wire)?;
+        let wire = encoded;
         self.table.refresh_value(
             &node,
-            QueryValue::new(DerivedValue { wire, canonical }, fingerprint),
+            QueryValue::new(
+                DerivedValue {
+                    wire: wire.into(),
+                    canonical: canonical.into(),
+                },
+                fingerprint,
+            ),
         )
     }
     pub(crate) fn publish_derived(
@@ -456,11 +481,19 @@ impl SyntaxQueries {
             ),
         )?;
         let canonical = serde_json::to_vec(&super::syntax::without_spans(&wire))?;
-        let wire = serde_json::to_vec(&wire)?;
-        self.derived
-            .insert(node.clone(), DerivedValue { wire, canonical });
-        self.table.read(&self.provider(), node)?;
-        Ok(())
+        let mut encoded = vec![DERIVED_WIRE_VERSION];
+        serde_json::to_writer(&mut encoded, &wire)?;
+        let wire = encoded;
+        let fingerprint = ResultFingerprint::bytes(&canonical);
+        let value = DerivedValue {
+            wire: wire.into(),
+            canonical: canonical.into(),
+        };
+        self.derived.insert(node.clone(), value.clone());
+        self.table.read(&self.provider(), node.clone())?;
+        // Also replaces an old-schema green memo without another JSON pass.
+        self.table
+            .refresh_value(&node, QueryValue::new(value, fingerprint))
     }
     pub(crate) fn validate_effects(&mut self, unit: UnitId, roots: Vec<BodyId>) -> Result<bool> {
         self.capture_input(
@@ -784,10 +817,15 @@ impl SyntaxQueries {
     }
 }
 
+// A process-private derived wire; bump when its payload contract changes.
+const DERIVED_WIRE_VERSION: u8 = 1;
+
 #[derive(Clone)]
 struct DerivedValue {
-    wire: Vec<u8>,
-    canonical: Vec<u8>,
+    // Preparation and the memo share immutable buffers; publication is O(1)
+    // beyond the single encoding/canonicalization pass.
+    wire: Rc<Vec<u8>>,
+    canonical: Rc<Vec<u8>>,
 }
 impl PartialEq for DerivedValue {
     fn eq(&self, other: &Self) -> bool {
@@ -1250,6 +1288,81 @@ impl Retained for EffectInventoryValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn derived_typed_wire_ownership_schema_and_green_hits() {
+        for size in [0, 1, 8, 64, 256] {
+            for shape in ["empty", "flat", "nested", "strings"] {
+                let mut queries = SyntaxQueries::default();
+                let node = QueryNode::LirUnit(UnitId::ENTRY);
+                let payload = match shape {
+                    "empty" => serde_json::json!([]),
+                    "flat" => serde_json::json!((0..size).collect::<Vec<_>>()),
+                    "nested" => {
+                        serde_json::json!((0..size).map(|n| vec![n, n]).collect::<Vec<_>>())
+                    }
+                    _ => serde_json::json!(vec!["repeated"; size]),
+                };
+                queries
+                    .publish_derived(node.clone(), payload.clone(), vec![])
+                    .unwrap();
+                let stats = queries.stats();
+                let mut decoded: Value = queries
+                    .validate_derived_typed(node.clone(), vec![])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(decoded, payload);
+                if let Some(array) = decoded.as_array_mut() {
+                    array.push(Value::Null);
+                }
+                assert_eq!(
+                    queries.validate_derived(node.clone(), vec![]).unwrap(),
+                    Some(payload.clone())
+                );
+                assert_eq!(queries.stats().recomputed, stats.recomputed);
+                let memo = queries.table.peek(&node).unwrap();
+                let old = memo.get::<DerivedValue>();
+                let canonical = old.canonical.clone();
+                for wire in [old.wire[1..].to_vec(), {
+                    let mut wire = old.wire.as_ref().clone();
+                    wire[0] = 0;
+                    wire
+                }] {
+                    queries
+                        .table
+                        .refresh_value(
+                            &node,
+                            QueryValue::new(
+                                DerivedValue {
+                                    wire: wire.into(),
+                                    canonical: canonical.clone(),
+                                },
+                                ResultFingerprint::bytes(&canonical),
+                            ),
+                        )
+                        .unwrap();
+                    assert!(
+                        queries
+                            .validate_derived(node.clone(), vec![])
+                            .unwrap()
+                            .is_none()
+                    );
+                    queries
+                        .publish_derived(node.clone(), payload.clone(), vec![])
+                        .unwrap();
+                    assert_eq!(
+                        queries.validate_derived(node.clone(), vec![]).unwrap(),
+                        Some(payload.clone())
+                    );
+                }
+                queries.finish().unwrap();
+                assert_eq!(
+                    queries.validate_derived(node, vec![]).unwrap(),
+                    Some(payload)
+                );
+            }
+        }
+    }
+
     #[test]
     fn finish_prunes_inventory_for_units_absent_from_candidate() {
         let mut queries = SyntaxQueries::default();

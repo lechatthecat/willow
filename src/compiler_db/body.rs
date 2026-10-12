@@ -267,6 +267,10 @@ impl BodyQueries {
         });
     }
 
+    pub(crate) fn cached_coordinates_changed(&self) -> bool {
+        self.coordinates_changed.get()
+    }
+
     pub(crate) fn remap_cached<V: serde::Serialize + serde::de::DeserializeOwned>(
         &self,
         value: &V,
@@ -616,9 +620,9 @@ impl BodyQueries {
             extra.unwrap_or_else(|| vec![QueryNode::TypedBody(id), QueryNode::SyntaxImports(path)]);
         let cached = syntax
             .borrow_mut()
-            .validate_derived(node.clone(), deps.clone())?;
+            .validate_derived_typed::<V>(node.clone(), deps.clone())?;
         if let Some(value) = cached {
-            let result: V = serde_json::from_value(value)?;
+            let result = value;
             if !self.coordinates_changed.get() {
                 return Ok(result);
             }
@@ -630,10 +634,7 @@ impl BodyQueries {
         }
         let result = compute()?;
         let wire = serde_json::to_value(&result)?;
-        syntax
-            .borrow_mut()
-            .publish_derived(node.clone(), wire.clone(), deps)?;
-        syntax.borrow_mut().refresh_derived(node, wire)?;
+        syntax.borrow_mut().publish_derived(node, wire, deps)?;
         Ok(result)
     }
 
