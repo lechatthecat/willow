@@ -1,0 +1,13 @@
+// Plain fn pointers carry no environment and can cross task boundaries.
+fn twice(x: i64) -> i64 { return x * 2; }
+async fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    await sleep(1);
+    return f(x);
+}
+async fn main() {
+    let f: fn(i64) -> i64 = twice;
+    let a = apply(f, 21);
+    let b = apply(f, 7);
+    println(await a);
+    println(await b);
+}

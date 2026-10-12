@@ -7871,8 +7871,7 @@ async fn f() {
     //   5 an arm resumes after the lambda      11 both RwLock modes
     //   6 lock depth is restored               12 loop depth still resets
 
-    /// A sync taker, so the lambda is an argument rather than a local: an
-    /// `fn`-typed local in an async frame is separately rejected by E2402.
+    /// A sync taker exercises lambda context isolation in argument position.
     const TAKE_LOCK_FN: &str = "fn apply(m: Mutex<i64>, f: fn(Mutex<i64>) -> void) { f(m); } ";
     /// The same, for a lambda that touches no lock.
     const TAKE_PLAIN_FN: &str = "fn call(f: fn(i64) -> i64) -> i64 { return f(1); } ";

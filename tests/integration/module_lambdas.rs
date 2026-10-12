@@ -284,9 +284,7 @@ pub fn deferred(n: i64, total: &mut i64) -> i64 {
     return double(n);
 }
 
-// A lambda in an ASYNC module body. It stays a temporary: a `fn(i64) -> i64`
-// LOCAL makes the task frame non-Send (E2402), which is a language rule of its
-// own and not what lifting is about.
+// A lambda passed as a temporary in an ASYNC module body.
 pub async fn slow(n: i64) -> i64 {
     await yield();
     return apply_twice(|x| x + 1, n);

@@ -240,3 +240,43 @@ async fn main() {
     assert!(!ok);
     assert_eq!(stderr.matches("error[E2402]").count(), 2, "{stderr}");
 }
+
+#[test]
+fn test_fn_pointer_send_sync_async_example() {
+    let (out, ok) = compile_and_run(include_str!("../../../example/async_fn_pointer.wi"));
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n14\n");
+}
+
+#[test]
+fn test_closure_async_e2402_help() {
+    for source in [
+        "async fn apply(f: closure(i64) -> i64) -> i64 { await sleep(1); return f(1); } fn main() {}",
+        "async fn apply(f: closure(i64) -> i64) -> i64 { return f(1); } fn main() { let n = 2; let f: closure(i64) -> i64 = |x| x + n; let t = apply(f); }",
+        "async fn main() { let f: closure(i64) -> i64 = |x| x + 1; await sleep(1); println(f(1)); }",
+    ] {
+        let (ok, stderr) = compile_with_data_race_check(source);
+        assert!(!ok, "{stderr}");
+        assert!(stderr.contains("E2402"), "{stderr}");
+        assert!(
+            stderr.contains("closure values have unknown captures"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("environment-free fn pointer"), "{stderr}");
+        assert!(!stderr.contains("function and closure values"), "{stderr}");
+    }
+}
+
+#[test]
+fn test_fn_pointer_send_sync_return_and_field_gc_release() {
+    let source = "fn twice(x: i64) -> i64 { return x * 2; }
+        class Callback { pub f: fn(i64) -> i64; }
+        async fn get() -> fn(i64) -> i64 { await sleep(1); return twice; }
+        async fn apply(c: Callback) -> i64 { let f = c.f; await sleep(1); return f(21); }
+        async fn main() { let f = await get(); println(f(7)); println(await apply(new Callback(f))); }";
+    for run in [compile_and_run_gc_stress, compile_and_run_release] {
+        let (out, ok) = run(source);
+        assert!(ok, "{out}");
+        assert_eq!(out, "14\n42\n");
+    }
+}

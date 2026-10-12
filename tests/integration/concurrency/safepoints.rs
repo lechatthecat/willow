@@ -4,8 +4,8 @@ use super::*;
 // The task-aware design closed as: (1) coop loops (ALL while/for in async
 // fns, await or not) carry backedge safepoints; (2) long sync helpers called
 // from task context are REJECTED (E0810) rather than safepoint-cloned;
-// (3) fn-values/lambdas cannot smuggle a nonpreemptible helper into a task —
-// the Send rule forbids fn values in async frames (E2402); (4) statement
+// (3) environment-free fn values can enter tasks; native sync-stack
+// safepoints keep their callees preemptible; (4) statement
 // call-bearing statement boundaries carry safepoints; (5) runtime calls
 // (string/array/map ops) are
 // BOUNDED no-preempt regions and run to completion. 11 pinning perspectives
@@ -46,15 +46,15 @@ fn psp_03_nested_busy_loops_preemptible() {
 }
 
 #[test]
-fn psp_04_fn_value_cannot_enter_task() {
-    // A lambda calling a nonpreemptible helper can never ride into a task:
-    // fn values are not Send (closes the E0810 dataflow gap structurally).
-    let (ok, stderr) = compile_with_compiler_env(
-        "fn heavy() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn worker() -> i64 { let f = || heavy(); return f(); }\nasync fn main() { println(await worker()); }",
-        &[],
+fn psp_04_fn_value_can_enter_task() {
+    // A pointer to a looping sync helper must still yield on native task stacks.
+    let (out, ok) = compile_and_run_with_runtime_env(
+        "fn spin(done: AtomicBool) -> i64 { while !done.load() {} return 42; }\nasync fn worker(f: fn(AtomicBool) -> i64, done: AtomicBool) -> i64 { return f(done); }\nasync fn main() { let done = AtomicBool::new(false); let t = worker(spin, done); await sleep(5); done.store(true); println(await t); }",
+        &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", "1")],
+        std::time::Duration::from_secs(20),
     );
-    assert!(!ok);
-    assert!(stderr.contains("E2402"), "{stderr}");
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
 }
 
 #[cfg(not(any(
