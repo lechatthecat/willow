@@ -155,9 +155,24 @@ fn package_queries_preserve_identity_across_aliases_and_follow_dry_run_delta() {
             .any(|s| s["identity"]["package"]["name"] == "library")
     );
     assert_eq!(event["data"]["results"][1]["result"]["status"], "ok");
-    fixture.manifest("renamed", "1.1.0");
     let root = fixture.0.join("app");
+    // Analysis and query are read-only; initialize the update fixture through
+    // an explicit publishing package operation rather than an analysis side effect.
+    assert!(!root.join("project.lock").exists());
+    assert!(!root.join(".willow-edits").exists());
+    let initialized = mutate_packages_report(
+        &root,
+        PackageMutation::Update {
+            alias: None,
+            breaking: false,
+        },
+        false,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert!(initialized.applied);
     let lock_before = fs::read(root.join("project.lock")).unwrap();
+    fixture.manifest("renamed", "1.1.0");
     let report = mutate_packages_report(
         &root,
         PackageMutation::Update {
