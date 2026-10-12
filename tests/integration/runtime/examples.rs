@@ -5,6 +5,19 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),
+        (
+            "example/assignable_representations.wi",
+            "value:8\nvalue:7\n9\ntrue\n",
+        ),
+        ("example/canonical_identity.wi", "42\n"),
+        ("example/imported_interface_default.wi", "42\n"),
+        ("example/lock_imported_effects/main.wi", "7\n"),
+        (
+            "example/module_generic_members/main.wi",
+            "5\n5\n7\n7\nkept\n",
+        ),
+        ("example/semantic_generic_queries.wi", "7\ngeneric\n11\n"),
+        ("example/task_frame_lifetime.wi", "8484\ntrue\n"),
         ("example/codegen_unit_context/main.wi", "42\n"),
         ("example/interface_pairs.wi", "7\n11\n7\n11\n"),
         ("example/leaf_method_calls.wi", "385\n1210\n7\n"),
@@ -1450,6 +1463,26 @@ fn test_repaired_example_catalog_entries() {
                 | "example/effect_explanations.wi"
                 | "example/void_tasks_frozen_iteration.wi"
                 | "example/shared_cancellation_cleanup.wi"
+        ) {
+            let (out, ok) = compile_file_and_run(path);
+            assert!(ok, "{path}: {out}");
+            assert_eq!(out, expected, "{path}");
+        }
+    }
+}
+
+#[test]
+fn test_october_ci_catalog_additions() {
+    for &(path, expected) in runnable_example_cases() {
+        if matches!(
+            path,
+            "example/assignable_representations.wi"
+                | "example/canonical_identity.wi"
+                | "example/imported_interface_default.wi"
+                | "example/lock_imported_effects/main.wi"
+                | "example/module_generic_members/main.wi"
+                | "example/semantic_generic_queries.wi"
+                | "example/task_frame_lifetime.wi"
         ) {
             let (out, ok) = compile_file_and_run(path);
             assert!(ok, "{path}: {out}");

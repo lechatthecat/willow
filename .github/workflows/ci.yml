@@ -53,12 +53,6 @@ jobs:
         run: python scripts/gc_stop_telemetry_repro.py --output "${{ runner.temp }}/willow-gc-stops"
       - name: Normal old GC phase-stop trace
         run: python scripts/gc_stop_telemetry_repro.py --major-only --output "${{ runner.temp }}/willow-gc-stops/major-only"
-      - name: Preserve GC stop evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gc-stops-${{ matrix.target }}
-          path: ${{ runner.temp }}/willow-gc-stops/
       - name: Workspace tests
         run: cargo test --locked --workspace -- --skip runtime::examples::test_runnable_example_files_compile_and_run
       - name: GC region and concurrency stress (Linux)
