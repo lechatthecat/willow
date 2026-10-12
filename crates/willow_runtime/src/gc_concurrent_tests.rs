@@ -139,7 +139,12 @@ fn assert_satb_mutation_retains(old: *mut u8, mutation: impl FnOnce()) {
         cycle
     };
     mutation();
-    flush_satb_all_locked(&mut runtime().heap.lock().unwrap());
+    with_stw(
+        crate::gc_telemetry::stops::StopReason::Remark,
+        |coord, _| {
+            flush_satb_all_locked(coord, &mut runtime().heap.lock().unwrap());
+        },
+    );
     cycle.drain(usize::MAX);
     assert!(cycle.is_marked(old as usize), "deleted edge was not traced");
     assert!(cycle.queue.snapshot().is_drained());
@@ -270,7 +275,12 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
     assert!(cycle.is_marked(value as usize));
     assert!(!cycle.is_marked(old as usize));
     assert!(!cycle.is_marked(deleted as usize));
-    flush_satb_all_locked(&mut runtime().heap.lock().unwrap());
+    with_stw(
+        crate::gc_telemetry::stops::StopReason::Remark,
+        |coord, _| {
+            flush_satb_all_locked(coord, &mut runtime().heap.lock().unwrap());
+        },
+    );
     assert!(
         cycle.is_marked(old as usize),
         "sealing lost a shard deletion"
@@ -281,7 +291,12 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
     satb_delete(late);
     assert!(cycle.satb_shards.is_empty());
     assert!(!runtime().heap.lock().unwrap().satb.is_empty());
-    flush_satb_all_locked(&mut runtime().heap.lock().unwrap());
+    with_stw(
+        crate::gc_telemetry::stops::StopReason::Remark,
+        |coord, _| {
+            flush_satb_all_locked(coord, &mut runtime().heap.lock().unwrap());
+        },
+    );
     assert!(cycle.is_marked(late as usize));
     cycle.drain(usize::MAX);
     GC_MARK_PHASE.store(0, Ordering::Release);
@@ -452,7 +467,12 @@ fn satb_repeated_equivalent_deletions_do_not_expand_mark_work() {
             for _ in 0..n {
                 satb_delete(old);
             }
-            flush_satb_all_locked(&mut runtime().heap.lock().unwrap());
+            with_stw(
+                crate::gc_telemetry::stops::StopReason::Remark,
+                |coord, _| {
+                    flush_satb_all_locked(coord, &mut runtime().heap.lock().unwrap());
+                },
+            );
             let state = runtime().heap.lock().unwrap();
             assert_eq!(
                 state
@@ -2197,130 +2217,68 @@ fn channel_pops_and_appends_do_not_shift_or_extend_the_snapshot() {
 }
 
 #[test]
-fn root_handshake_resumes_early_mutator_and_replays_unretired_tlab_deletion() {
+fn satb_phase_flip_stops_owners_before_activation_and_remark() {
     let _guard = runtime_test_guard();
-    for unregister in [false, true] {
+    for _cycle_number in 0..2 {
         reset_internal_for_test();
-        runtime().heap.lock().unwrap().satb = satb::SatbBuffers::new(1);
-        willow_gc_register_mutator();
-        let mut parent = willow_alloc_typed(8, 1);
-        let grandchild = willow_alloc(8) as usize;
-        willow_push_root(&mut parent);
-        let deleted = Arc::new(AtomicBool::new(false));
-        let finished = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let slow = {
-            let (deleted, finished) = (deleted.clone(), finished.clone());
-            std::thread::spawn(move || {
-                willow_gc_register_mutator();
-                let mut tls = tlab_state_for_test();
-                let child = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 1);
-                unsafe {
-                    store_gc_reference(child.cast(), grandchild as *mut u8);
-                }
-                tx.send(child as usize).unwrap();
-                // No safepoint until the fast peer has resumed and deleted its
-                // edge. An all-mutator parking protocol would deadlock here.
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !deleted.load(Ordering::Acquire) {
-                    assert!(
-                        Instant::now() < deadline,
-                        "early root publisher did not resume"
-                    );
-                    std::thread::yield_now();
-                }
-                if unregister {
-                    willow_gc_unregister_mutator();
-                } else {
-                    willow_gc_safepoint();
-                    while !finished.load(Ordering::Acquire) {
-                        willow_gc_safepoint();
-                        std::thread::yield_now();
-                    }
-                    willow_gc_unregister_mutator();
-                }
-            })
-        };
-        let child = rx.recv().unwrap();
-        unsafe {
-            store_gc_reference(parent.cast(), child as *mut u8);
-        }
         let ready = Arc::new(AtomicBool::new(false));
-        let fast = {
-            let parent = parent as usize;
-            let (ready, deleted, finished) = (ready.clone(), deleted.clone(), finished.clone());
+        let deleted = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let (ready, deleted, done) = (ready.clone(), deleted.clone(), done.clone());
             std::thread::spawn(move || {
-                let mutator = crate::gc::MutatorRegistration::new();
+                let _registration = MutatorRegistration::new();
+                let mut owner = willow_alloc_typed(8, 1);
+                let child = willow_alloc(8);
+                unsafe {
+                    store_gc_reference(owner.cast(), child);
+                }
+                willow_push_root(&mut owner);
+                tx.send(child as usize).unwrap();
                 ready.store(true, Ordering::Release);
-                while !runtime().poll_requested.load(Ordering::Acquire) {
+                while GC_MARK_PHASE.load(Ordering::Acquire) == 0 {
+                    willow_gc_safepoint();
                     std::thread::yield_now();
                 }
-                willow_gc_safepoint();
                 assert!(!runtime().stop_requested.load(Ordering::Acquire));
-                let epoch = runtime()
-                    .heap
-                    .lock()
-                    .unwrap()
-                    .concurrent_cycle
-                    .clone()
-                    .unwrap();
-                assert!(
-                    epoch.objects.contains(child),
-                    "slow allocation must publish its start bit"
-                );
-                assert!(!epoch.is_marked(child));
-                assert!(
-                    runtime()
-                        .heap
-                        .lock()
-                        .unwrap()
-                        .tlab_chunks
-                        .iter()
-                        .any(|chunk| chunk.owner_state.is_some()),
-                    "slow owner was not yet allowed to retire"
-                );
                 willow_gc_write_barrier(
-                    parent as *mut u8,
-                    child as *mut u8,
+                    owner,
+                    child,
                     std::ptr::null_mut(),
                     GcStoreDestination::ObjectField as i64,
                 );
                 unsafe {
-                    store_gc_reference(parent as *mut *mut u8, std::ptr::null_mut());
+                    store_gc_reference(owner.cast(), std::ptr::null_mut());
                 }
-                // The concurrent-phase barrier buffers the deletion in its
-                // cycle shard (willow-jz15.53); publish it as a safepoint
-                // would, without reaching one.
-                barrier::flush_satb_current(false);
-                assert!(epoch.is_marked(child), "pre-retirement deletion was lost");
                 deleted.store(true, Ordering::Release);
-                while !finished.load(Ordering::Acquire) {
+                while !done.load(Ordering::Acquire) {
                     willow_gc_safepoint();
                     std::thread::yield_now();
                 }
-                drop(mutator);
+                willow_pop_root();
             })
         };
+        let child = rx.recv().unwrap();
         while !ready.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
-        willow_gc_collect();
-        finished.store(true, Ordering::Release);
-        fast.join().unwrap();
-        slow.join().unwrap();
-        assert_eq!(willow_gc_allocated_bytes(), 3 * (GC_HEADER_SIZE + 8) as i64);
+        let (_, cycle) = root_handshake::begin().unwrap();
+        while !deleted.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let (_, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
+        assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+        assert!(cycle.is_marked(child));
+        assert!(cycle.satb_shards.is_empty());
         let stops = crate::gc_telemetry::stops::snapshot_stops();
-        assert_eq!(stops.by_reason[0].requests, 0);
-        assert_eq!(stops.by_reason[1].requests, 0);
-        willow_gc_collect();
-        assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
-        willow_pop_root();
-        willow_gc_unregister_mutator();
+        assert_eq!(stops.by_reason[0].completed, 1);
+        assert!(stops.by_reason[1].completed >= 1);
+        sweep::concurrent(plan);
+        done.store(true, Ordering::Release);
+        worker.join().unwrap();
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
-        println!(
-            "root_handshake unregister={unregister} early_mutator_progress=true late_tlab_satb_retained=2 initial_stops=0"
-        );
     }
     reset_internal_for_test();
 }
@@ -2355,31 +2313,31 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
             std::thread::yield_now();
         }
         TLAB_ACCOUNTING_RECORD_VISITS.store(0, Ordering::Relaxed);
-        root_handshake::ACTIVATION_ACKS.store(0, Ordering::Relaxed);
-        root_handshake::ROOT_ACKS.store(0, Ordering::Relaxed);
-        root_handshake::ACK_NOTIFICATIONS.store(0, Ordering::Relaxed);
+        root_handshake::INITIAL_PARTICIPANTS.store(0, Ordering::Relaxed);
         willow_gc_collect();
-        assert_eq!(root_handshake::ACK_NOTIFICATIONS.load(Ordering::Relaxed), 2);
-        println!("root_handshake mutators={count} ack_notifications=2");
+        println!("initial_stw mutators={count} completed_stops=1");
         assert_eq!(
             willow_gc_allocated_bytes(),
             (count * (GC_HEADER_SIZE + 8)) as i64
         );
-        // Capture accounting, per-owner publication, final accounting and the
-        // allocated-bytes snapshot immediately above. No remark scan remains.
+        // Initial stopped retirement, final accounting and the allocated-byte
+        // snapshot remain linear in the mutator/TLAB count.
         assert_eq!(
             TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed),
             4 * count
         );
         assert_eq!(
             crate::gc_telemetry::stops::snapshot_stops().by_reason[0].requests,
-            0
+            1
         );
         assert_eq!(
-            root_handshake::ACTIVATION_ACKS.load(Ordering::Relaxed),
+            root_handshake::INITIAL_PARTICIPANTS.load(Ordering::Relaxed),
             count + 1
         );
-        assert_eq!(root_handshake::ROOT_ACKS.load(Ordering::Relaxed), count + 1);
+        assert_eq!(
+            root_handshake::INITIAL_PARTICIPANTS.load(Ordering::Relaxed),
+            count + 1
+        );
         println!(
             "activation participants={} acknowledgements={} root_snapshots={}",
             count + 1,
@@ -2394,7 +2352,7 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         println!(
-            "root_handshake mutators={count} accounting_record_reads={} initial_stops=0",
+            "root_handshake mutators={count} accounting_record_reads={} initial_stops=1",
             4 * count
         );
     }
@@ -2437,6 +2395,7 @@ fn legacy_owner_unregistering_during_activation_still_publishes_its_roots() {
         std::thread::spawn(move || {
             willow_gc_register_mutator();
             while !leaving.load(Ordering::Acquire) {
+                willow_gc_safepoint();
                 std::thread::yield_now();
             }
             // Hold the activation round open until the owner has left the
@@ -2487,7 +2446,7 @@ fn root_handshake_refuses_an_unregistered_owner_with_a_nonempty_stack() {
     });
     held_rx.recv().unwrap();
     assert!(root_handshake::begin().is_none());
-    assert!(runtime().coord.0.lock().unwrap().handshake.is_none());
+    assert!(!runtime().coord.0.lock().unwrap().stop_requested);
     assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
     release_tx.send(()).unwrap();
     owner.join().unwrap();
@@ -2662,17 +2621,20 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
             crate::gc_telemetry::stops::snapshot_stops()
                 .by_reason
                 .iter()
-                .all(|r| r.requests == 0)
+                .take(2)
+                .any(|r| r.requests > 0)
         );
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
-        println!("closure outcome={outcome} empty_queue_waited_for_batch=true global_stops=0");
+        println!(
+            "closure outcome={outcome} empty_queue_waited_for_batch=true global_stops=required_stw"
+        );
     }
     reset_internal_for_test();
 }
 
 #[test]
-fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_without_stopping_its_owner() {
+fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_after_stopped_ownership_transfer() {
     let _guard = runtime_test_guard();
     reset_internal_for_test();
     SNAPSHOT_READY.store(false, Ordering::Relaxed);
@@ -2746,7 +2708,8 @@ fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_without_stopping_its_
         crate::gc_telemetry::stops::snapshot_stops()
             .by_reason
             .iter()
-            .all(|r| r.requests == 0)
+            .take(2)
+            .any(|r| r.requests > 0)
     );
     {
         let state = runtime().heap.lock().unwrap();
@@ -2807,6 +2770,7 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
             batch.work.object(GC_HEADER_SIZE + 8, 1);
             ready.store(true, Ordering::Release);
             while !cycle.closing.load(Ordering::Acquire) {
+                willow_gc_safepoint();
                 std::thread::yield_now();
             }
             willow_gc_write_barrier(
@@ -2836,7 +2800,8 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
         crate::gc_telemetry::stops::snapshot_stops()
             .by_reason
             .iter()
-            .all(|r| r.requests == 0)
+            .take(2)
+            .any(|r| r.requests > 0)
     );
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
@@ -2991,10 +2956,11 @@ fn concurrent_closure_paces_contention_and_retains_work_until_release() {
             crate::gc_telemetry::stops::snapshot_stops()
                 .by_reason
                 .iter()
-                .all(|r| r.requests == 0)
+                .take(2)
+                .any(|r| r.requests > 0)
         );
         println!(
-            "closure waits={waits} retries={previous_calls} upper_bound={} requested_sleep_ns={} completion_calls=1 global_stops=0",
+            "closure waits={waits} retries={previous_calls} upper_bound={} requested_sleep_ns={} completion_calls=1 global_stops=required_stw",
             waits * 256,
             requested_sleep.as_nanos()
         );
@@ -3008,21 +2974,26 @@ fn root_activation_crosses_pending_stores_before_snapshots_or_assist_scans() {
     for deletion in [true, false] {
         for unregister in [false, true] {
             reset_internal_for_test();
-            willow_gc_register_mutator();
-            let parent = willow_alloc_typed(8, 1) as usize;
+            let mut parent = willow_alloc_typed(8, 1);
             let child = willow_alloc(8) as usize;
             if deletion {
-                unsafe { store_gc_reference(parent as *mut *mut u8, child as *mut u8) };
+                unsafe {
+                    store_gc_reference(parent.cast(), child as *mut u8);
+                }
             }
-            let done = Arc::new(AtomicBool::new(false));
+            willow_push_root(&mut parent);
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-            let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let done = Arc::new(AtomicBool::new(false));
             let writer = {
-                let (done, ready_tx) = (done.clone(), ready_tx.clone());
+                let (done, parent) = (done.clone(), parent as usize);
                 std::thread::spawn(move || {
-                    willow_gc_register_mutator();
-                    assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+                    let registration = MutatorRegistration::new();
+                    let value = if deletion {
+                        std::ptr::null_mut()
+                    } else {
+                        child as *mut u8
+                    };
                     willow_gc_write_barrier(
                         parent as *mut u8,
                         if deletion {
@@ -3030,102 +3001,44 @@ fn root_activation_crosses_pending_stores_before_snapshots_or_assist_scans() {
                         } else {
                             std::ptr::null_mut()
                         },
-                        if deletion {
-                            std::ptr::null_mut()
-                        } else {
-                            child as *mut u8
-                        },
+                        value,
                         GcStoreDestination::ObjectField as i64,
                     );
                     ready_tx.send(()).unwrap();
-                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                     unsafe {
-                        store_gc_reference(
-                            parent as *mut *mut u8,
-                            if deletion {
-                                std::ptr::null_mut()
-                            } else {
-                                child as *mut u8
-                            },
-                        )
-                    };
-                    if !unregister {
-                        while !done.load(Ordering::Acquire) {
-                            willow_gc_safepoint();
-                            std::thread::yield_now();
-                        }
+                        store_gc_reference(parent as *mut *mut u8, value);
                     }
-                    willow_gc_unregister_mutator();
-                })
-            };
-            let reader = {
-                let done = done.clone();
-                std::thread::spawn(move || {
-                    let mutator = crate::gc::MutatorRegistration::new();
-                    let mut parent_root = parent as *mut u8;
-                    let mut local = std::ptr::null_mut();
-                    willow_push_root(&mut parent_root);
-                    willow_push_root(&mut local);
-                    ready_tx.send(()).unwrap();
-                    let deadline = Instant::now() + Duration::from_secs(10);
-                    while !runtime().poll_requested.load(Ordering::Acquire) {
-                        assert!(Instant::now() < deadline);
-                        std::thread::yield_now();
+                    if unregister {
+                        drop(registration);
+                        return;
                     }
-                    willow_gc_safepoint();
-                    // This first acknowledgement must return without waiting
-                    // for the writer, whose barrier/store interval is open.
-                    local = unsafe { load_gc_reference(parent as *mut *mut u8) };
-                    let cycle = runtime()
-                        .heap
-                        .lock()
-                        .unwrap()
-                        .concurrent_cycle
-                        .clone()
-                        .unwrap();
-                    cycle.enqueue(parent as *mut u8);
-                    let assist_work = cycle.drain_checked(8);
-                    let work = *cycle.work.lock().unwrap();
-                    observed_tx
-                        .send((
-                            local as usize,
-                            assist_work,
-                            work.root_scan_bytes,
-                            work.marked_bytes,
-                        ))
-                        .unwrap();
-                    resume_tx.send(()).unwrap();
                     while !done.load(Ordering::Acquire) {
                         willow_gc_safepoint();
                         std::thread::yield_now();
                     }
-                    std::hint::black_box(local);
-                    willow_pop_roots(2);
-                    drop(mutator);
+                    drop(registration);
                 })
             };
             ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            let before = willow_gc_allocated_bytes();
-            willow_gc_collect();
-            let after = willow_gc_allocated_bytes();
+            let observer = std::thread::spawn(move || {
+                while !runtime().stop_requested.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+                assert!(runtime().heap.lock().unwrap().concurrent_cycle.is_none());
+                release_tx.send(()).unwrap();
+            });
+            let (_, cycle) = root_handshake::begin().unwrap();
+            observer.join().unwrap();
+            cycle.drain(usize::MAX);
+            assert_eq!(cycle.is_marked(child), !deletion);
+            let (_, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
+            sweep::concurrent(plan);
+            assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
             done.store(true, Ordering::Release);
             writer.join().unwrap();
-            reader.join().unwrap();
-            willow_gc_unregister_mutator();
-            let (local, assist_work, root_bytes, marked_bytes) = observed_rx.recv().unwrap();
-            assert_eq!(local, if deletion { child } else { 0 });
-            assert_eq!((assist_work, root_bytes, marked_bytes), (0, 0, 0));
-            assert_eq!(after, before, "deletion={deletion} unregister={unregister}");
-            assert!(
-                crate::gc_telemetry::stops::snapshot_stops()
-                    .by_reason
-                    .iter()
-                    .all(|r| r.requests == 0)
-            );
-            println!(
-                "activation deletion={deletion} unregister={unregister} before={before} after={after} early_progress=true early_roots=0 early_trace=0 stops=0"
-            );
+            willow_pop_root();
             willow_gc_collect();
             assert_eq!(willow_gc_allocated_bytes(), 0);
         }
@@ -3134,95 +3047,39 @@ fn root_activation_crosses_pending_stores_before_snapshots_or_assist_scans() {
 }
 
 #[test]
-fn root_activation_late_registration_joins_the_current_round() {
+fn root_activation_late_registration_waits_for_the_stw_boundary() {
     let _guard = runtime_test_guard();
-    for during_snapshots in [false, true] {
-        reset_internal_for_test();
-        willow_gc_register_mutator();
-        let mut root = willow_alloc(8);
-        willow_push_root(&mut root);
-        root_handshake::ACTIVATION_ACKS.store(0, Ordering::Relaxed);
-        root_handshake::ROOT_ACKS.store(0, Ordering::Relaxed);
-        let done = Arc::new(AtomicBool::new(false));
-        let collector = {
-            let done = done.clone();
-            std::thread::spawn(move || {
-                let mutator = crate::gc::MutatorRegistration::new();
-                willow_gc_collect();
-                drop(mutator);
-                done.store(true, Ordering::Release);
-            })
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !runtime().poll_requested.load(Ordering::Acquire) {
-            assert!(Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        if during_snapshots {
-            willow_gc_safepoint(); // Release the activation round only.
-            loop {
-                let cycle = runtime()
-                    .heap
-                    .lock()
-                    .unwrap()
-                    .concurrent_cycle
-                    .clone()
-                    .unwrap();
-                if cycle.tracing_enabled.load(Ordering::Acquire) {
-                    break;
-                }
-                assert!(Instant::now() < deadline);
+    reset_internal_for_test();
+    let started = Arc::new(AtomicBool::new(false));
+    let registered = Arc::new(AtomicBool::new(false));
+    let worker = with_stw(
+        crate::gc_telemetry::stops::StopReason::InitialMark,
+        |coord, _| {
+            assert!(coord.stop_requested);
+            let (started, registered) = (started.clone(), registered.clone());
+            let worker = {
+                let (started, registered) = (started.clone(), registered.clone());
+                std::thread::spawn(move || {
+                    started.store(true, Ordering::Release);
+                    let _registration = MutatorRegistration::new();
+                    registered.store(true, Ordering::Release);
+                })
+            };
+            while !started.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }
-        }
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let late = {
-            let (done, address) = (done.clone(), root as usize);
-            std::thread::spawn(move || {
-                willow_gc_register_mutator();
-                let mut root = address as *mut u8;
-                willow_push_root(&mut root);
-                ready_tx.send(()).unwrap();
-                while !done.load(Ordering::Acquire) {
-                    willow_gc_safepoint();
-                    std::thread::yield_now();
-                }
-                std::hint::black_box(root);
-                willow_pop_root();
-                willow_gc_unregister_mutator();
-            })
-        };
-        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        while !done.load(Ordering::Acquire) {
-            willow_gc_safepoint();
-            assert!(Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        collector.join().unwrap();
-        late.join().unwrap();
-        assert_eq!(
-            root_handshake::ACTIVATION_ACKS.load(Ordering::Relaxed),
-            if during_snapshots { 2 } else { 3 }
-        );
-        assert_eq!(root_handshake::ROOT_ACKS.load(Ordering::Relaxed), 3);
-        assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
-        assert!(
-            crate::gc_telemetry::stops::snapshot_stops()
-                .by_reason
-                .iter()
-                .all(|r| r.requests == 0)
-        );
-        println!("late_registration during_snapshots={during_snapshots} root_snapshots=3 stops=0");
-        willow_pop_root();
-        willow_gc_unregister_mutator();
-        willow_gc_collect();
-        assert_eq!(willow_gc_allocated_bytes(), 0);
-    }
+            assert!(
+                !registered.load(Ordering::Acquire),
+                "new registration cannot pass COORD while stopped"
+            );
+            worker
+        },
+    );
+    worker.join().unwrap();
+    assert!(registered.load(Ordering::Acquire));
     reset_internal_for_test();
 }
 
-/// A registered mutator that unwinds must leave the registry, or the next
-/// collection waits for an acknowledgement that can never arrive (willow-utqy).
 #[test]
 fn a_registered_mutator_that_panics_still_unregisters() {
     let _guard = runtime_test_guard();
@@ -3275,7 +3132,7 @@ fn a_mutator_that_dies_registered_reports_instead_of_hanging_the_collector() {
         assert!(!output.status.success(), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("root handshake activation round did not complete within 2s"),
+            stderr.contains("stop-the-world park did not complete within 2s"),
             "{output:?}"
         );
         assert!(
@@ -3295,4 +3152,521 @@ fn a_mutator_that_dies_registered_reports_instead_of_hanging_the_collector() {
         .unwrap();
     willow_gc_collect();
     unreachable!("the collector returned from a wedged handshake");
+}
+
+/// Explicitly selected same-host throughput benchmark. No timing assertion:
+/// the median comparison is retained as review evidence, including failures.
+#[test]
+#[ignore = "reference-store throughput measurement"]
+fn satb_reference_store_throughput_baseline_and_current() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let owner = willow_alloc(8);
+    let values = [willow_alloc(8), willow_alloc(8)];
+    let mutator = MutatorRegistration::new();
+    willow_gc_add_runtime_root(owner);
+    for value in values {
+        willow_gc_add_runtime_root(value);
+    }
+    for entries in [1024, 65536, 4194304] {
+        let passes = (16_777_216 / entries).max(1);
+        let stores = entries * passes;
+        let mut slots: Vec<_> = (0..entries)
+            .map(|_| std::sync::atomic::AtomicPtr::new(values[0]))
+            .collect();
+        let mut baseline = Vec::new();
+        let mut current = Vec::new();
+        // Warm both compiled variants before the three measured pairs.
+        unsafe {
+            barrier::reference_store_batch::<false>(owner, &mut slots, values, 1);
+            barrier::reference_store_batch::<true>(owner, &mut slots, values, 1);
+        }
+        for run in 0..3 {
+            for satb in if run & 1 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let start = Instant::now();
+                unsafe {
+                    if satb {
+                        barrier::reference_store_batch::<true>(
+                            std::hint::black_box(owner),
+                            &mut slots,
+                            std::hint::black_box(values),
+                            passes,
+                        );
+                    } else {
+                        barrier::reference_store_batch::<false>(
+                            std::hint::black_box(owner),
+                            &mut slots,
+                            std::hint::black_box(values),
+                            passes,
+                        );
+                    }
+                }
+                let ns = start.elapsed().as_nanos();
+                println!(
+                    "reference_store target={}-{} entries={entries} stores={stores} phase=0 satb={satb} run={run} elapsed_ns={ns}",
+                    std::env::consts::ARCH,
+                    std::env::consts::OS
+                );
+                if satb {
+                    current.push(ns);
+                } else {
+                    baseline.push(ns);
+                }
+                assert_eq!(
+                    slots.last().unwrap().load(Ordering::Acquire),
+                    values[(entries - 1 + passes - 1) & 1]
+                );
+            }
+        }
+        baseline.sort_unstable();
+        current.sort_unstable();
+        let regression = (current[1] as f64 / baseline[1] as f64 - 1.0) * 100.0;
+        let throughput_loss = (1.0 - baseline[1] as f64 / current[1] as f64) * 100.0;
+        println!(
+            "reference_store_median entries={entries} stores={stores} baseline_ns={} current_ns={} regression_percent={regression:.3} throughput_loss_percent={throughput_loss:.3} g8_pass={}",
+            baseline[1],
+            current[1],
+            throughput_loss <= 5.0
+        );
+    }
+    for capacity in [1, 256] {
+        let cycle = with_stw(
+            crate::gc_telemetry::stops::StopReason::InitialMark,
+            |_, _| {
+                let mut state = runtime().heap.lock().unwrap();
+                let mut cycle = ConcurrentCycle::with_index(
+                    epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                    IdSet::default(),
+                    IdMap::default(),
+                    1,
+                );
+                cycle.satb_shards = satb::SatbShards::new(capacity);
+                let cycle = Arc::new(cycle);
+                marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+                GC_MARK_PHASE.store(1, Ordering::Release);
+                cycle
+            },
+        );
+        let mut slots: Vec<_> = (0..1024)
+            .map(|_| std::sync::atomic::AtomicPtr::new(values[0]))
+            .collect();
+        let mut timings = Vec::new();
+        for run in 0..3 {
+            let start = Instant::now();
+            unsafe {
+                barrier::reference_store_batch::<true>(owner, &mut slots, values, 100);
+            }
+            let ns = start.elapsed().as_nanos();
+            timings.push(ns);
+            println!(
+                "reference_store_active capacity={capacity} run={run} stores=102400 elapsed_ns={ns}"
+            );
+        }
+        timings.sort_unstable();
+        println!(
+            "reference_store_active_median capacity={capacity} stores=102400 elapsed_ns={}",
+            timings[1]
+        );
+        let (_, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
+        sweep::concurrent(plan);
+        assert!(values.iter().all(|value| cycle.is_marked(*value as usize)));
+    }
+    willow_gc_remove_runtime_root(owner);
+    for value in values {
+        willow_gc_remove_runtime_root(value);
+    }
+    drop(mutator);
+    reset_internal_for_test();
+}
+
+#[test]
+fn satb_registration_owns_buffer_and_unwind_unregister_drains_it() {
+    let _guard = runtime_test_guard();
+    for capacity in [1, 256] {
+        for unwind in [false, true] {
+            reset_internal_for_test();
+            let old = willow_alloc(8) as usize;
+            let cycle = {
+                let mut state = runtime().heap.lock().unwrap();
+                let mut cycle = ConcurrentCycle::with_index(
+                    epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                    IdSet::default(),
+                    IdMap::default(),
+                    1,
+                );
+                cycle.satb_shards = satb::SatbShards::new(capacity);
+                let cycle = Arc::new(cycle);
+                marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+                GC_MARK_PHASE.store(1, Ordering::Release);
+                cycle
+            };
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(|| {
+                    let _registration = MutatorRegistration::new();
+                    let local = safepoint::current_satb_buffer().unwrap();
+                    {
+                        let coord = runtime().coord.0.lock().unwrap();
+                        let record = &coord.mutators[&std::thread::current().id()];
+                        assert!(Arc::ptr_eq(&local, record.satb_buffer.as_ref().unwrap()));
+                    }
+                    satb_delete(old as *mut u8);
+                    if unwind {
+                        panic!("exercise mutator unwind drain");
+                    }
+                });
+                assert_eq!(result.is_err(), unwind);
+                assert!(safepoint::current_satb_buffer().is_none());
+                assert!(
+                    !runtime()
+                        .coord
+                        .0
+                        .lock()
+                        .unwrap()
+                        .mutators
+                        .contains_key(&std::thread::current().id())
+                );
+            })
+            .join()
+            .unwrap();
+            assert!(
+                cycle.is_marked(old),
+                "unregister must publish without a collector drain"
+            );
+            assert!(cycle.satb_shards.is_empty());
+            cycle.drain(usize::MAX);
+            assert!(cycle.queue.snapshot().is_drained());
+            GC_MARK_PHASE.store(0, Ordering::Release);
+            marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+            reset_internal_for_test();
+        }
+    }
+}
+
+#[test]
+fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
+    let _guard = runtime_test_guard();
+    for count in [1, 16, 257] {
+        for unregister in [false, true] {
+            reset_internal_for_test();
+            let mut owners = Vec::new();
+            for _ in 0..count {
+                let owner = willow_alloc_typed(8, 1);
+                let child = willow_alloc_typed(8, 1);
+                let leaf = willow_alloc(8);
+                unsafe {
+                    store_gc_reference(owner.cast(), child);
+                    store_gc_reference(child.cast(), leaf);
+                }
+                owners.push(owner as usize);
+            }
+            willow_alloc(8); // white garbage proves the fallback also sweeps.
+            let cycle = {
+                let mut state = runtime().heap.lock().unwrap();
+                let cycle = Arc::new(ConcurrentCycle::with_index(
+                    epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                    IdSet::default(),
+                    IdMap::default(),
+                    0,
+                ));
+                for owner in &owners {
+                    assert!(cycle.objects.claim(*owner));
+                }
+                marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+                GC_MARK_PHASE.store(1, Ordering::Release);
+                cycle
+            };
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (arm_tx, arm_rx) = std::sync::mpsc::channel();
+            let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+            let done = Arc::new(AtomicBool::new(false));
+            let worker = {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    let registration = MutatorRegistration::new();
+                    let mut owners: Vec<_> =
+                        owners.into_iter().map(|value| value as *mut u8).collect();
+                    for owner in &mut owners {
+                        willow_push_root(owner);
+                    }
+                    ready_tx.send(()).unwrap();
+                    loop {
+                        if arm_rx.try_recv().is_ok() {
+                            break;
+                        }
+                        willow_gc_safepoint();
+                        std::thread::yield_now();
+                    }
+                    armed_tx.send(()).unwrap();
+                    // Keep the rendezvous open until all deletions publish.
+                    while !runtime().stop_requested.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    for &owner in &owners {
+                        let old = unsafe { load_gc_reference(owner.cast()) };
+                        willow_gc_write_barrier(
+                            owner,
+                            old,
+                            std::ptr::null_mut(),
+                            GcStoreDestination::ObjectField as i64,
+                        );
+                        unsafe {
+                            store_gc_reference(owner.cast(), std::ptr::null_mut());
+                        }
+                    }
+                    if unregister {
+                        willow_pop_roots(count as i32);
+                        drop(registration);
+                        while !done.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                    } else {
+                        while !done.load(Ordering::Acquire) {
+                            willow_gc_safepoint();
+                            std::thread::yield_now();
+                        }
+                        willow_pop_roots(count as i32);
+                        drop(registration);
+                    }
+                })
+            };
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let mut rechecks = 0;
+            let finished = mark_closure::finish_with_hooks(
+                &cycle,
+                Instant::now(),
+                |_| std::thread::yield_now(),
+                || {
+                    rechecks += 1;
+                    arm_tx.send(()).unwrap();
+                    armed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                },
+            );
+            assert!(finished.is_none());
+            assert_eq!(rechecks, 1);
+            assert!(cycle.stopped_completion_required.load(Ordering::Acquire));
+            assert!(!cycle.worker_failed.load(Ordering::Acquire));
+            assert!(
+                !cycle.queue.snapshot().is_drained(),
+                "late snapshot edges must remain queued"
+            );
+            assert_eq!(
+                crate::gc_telemetry::stops::snapshot_stops().by_reason[1].requests,
+                2
+            );
+            let (work, plan, freed) = mark_closure::finish_stopped(&cycle, Instant::now());
+            assert!(plan.is_none());
+            assert_eq!(freed, GC_HEADER_SIZE + 8);
+            assert_eq!(work.marked_bytes, (3 * count * (GC_HEADER_SIZE + 8)) as u64);
+            assert_eq!(
+                willow_gc_allocated_bytes(),
+                (3 * count * (GC_HEADER_SIZE + 8)) as i64
+            );
+            assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+            assert_eq!(
+                crate::gc_telemetry::stops::snapshot_stops().by_reason[1].requests as usize,
+                mark_closure::MAX_REMARK_ROUNDS
+            );
+            done.store(true, Ordering::Release);
+            worker.join().unwrap();
+            willow_gc_collect();
+            assert_eq!(willow_gc_allocated_bytes(), 0);
+            println!(
+                "remark_cap nodes={} unregister={unregister} optimistic_rechecks={rechecks} total_remark_rounds=3 retained_then_reclaimed=true",
+                3 * count
+            );
+        }
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn satb_closure_wave_cap_completes_perpetually_retrying_work_with_stopped_trace() {
+    let _guard = runtime_test_guard();
+    for count in [1, 16, 257] {
+        reset_internal_for_test();
+        BUDGET_RETRY_CALLS.store(0, Ordering::Relaxed);
+        BUDGET_RETRY_LIMIT.store(usize::MAX, Ordering::Relaxed);
+        const TYPE: u32 = 0xFA79;
+        willow_register_type(TYPE, trace_slot);
+        let mut parents = Vec::new();
+        for _ in 0..count {
+            let parent = willow_alloc_object(TYPE as i64, 8);
+            let child = willow_alloc(8);
+            unsafe {
+                store_gc_reference(parent.cast(), child);
+            }
+            parents.push(parent);
+        }
+        let cycle = {
+            let mut state = runtime().heap.lock().unwrap();
+            let mut cycle = ConcurrentCycle::with_index(
+                epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                IdSet::default(),
+                IdMap::default(),
+                0,
+            );
+            cycle.slices.insert(TYPE, budget_retry_slice);
+            let cycle = Arc::new(cycle);
+            for parent in parents {
+                cycle.enqueue(parent);
+            }
+            marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+            GC_MARK_PHASE.store(1, Ordering::Release);
+            cycle
+        };
+        let mut waits = 0;
+        assert!(
+            mark_closure::finish_with_wait(&cycle, Instant::now(), |_| {
+                waits += 1;
+            })
+            .is_none()
+        );
+        assert_eq!(waits, mark_closure::MAX_DRAIN_WAVES - 1);
+        let calls = BUDGET_RETRY_CALLS.load(Ordering::Relaxed);
+        assert!(
+            (mark_closure::MAX_DRAIN_WAVES..=mark_closure::MAX_DRAIN_WAVES * 256).contains(&calls)
+        );
+        assert!(cycle.stopped_completion_required.load(Ordering::Acquire));
+        assert!(!cycle.queue.snapshot().is_drained());
+        let (work, plan, _) = mark_closure::finish_stopped(&cycle, Instant::now());
+        assert!(plan.is_none());
+        assert_eq!(
+            BUDGET_RETRY_CALLS.load(Ordering::Relaxed),
+            calls,
+            "stopped completion must not retry the concurrent hook"
+        );
+        assert_eq!(work.marked_bytes, (2 * count * (GC_HEADER_SIZE + 8)) as u64);
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            (2 * count * (GC_HEADER_SIZE + 8)) as i64
+        );
+        assert_eq!(
+            crate::gc_telemetry::stops::snapshot_stops().by_reason[1].requests,
+            2
+        );
+        assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        println!(
+            "closure_cap objects={count} waves=128 concurrent_retry_calls={calls} remark_rounds=2 stopped_trace_completed=true"
+        );
+    }
+    BUDGET_RETRY_LIMIT.store(0, Ordering::Relaxed);
+    reset_internal_for_test();
+}
+
+#[test]
+fn satb_deferred_legacy_and_retry_slice_complete_with_snapshot_retention() {
+    let _guard = runtime_test_guard();
+    for (count, predrain) in [
+        (1, true),
+        (16, true),
+        (257, true),
+        (1, false),
+        (16, false),
+        (257, false),
+    ] {
+        reset_internal_for_test();
+        BUDGET_RETRY_CALLS.store(0, Ordering::Relaxed);
+        BUDGET_RETRY_LIMIT.store(usize::MAX, Ordering::Relaxed);
+        const LEGACY: u32 = 0xFA7A;
+        const RETRY: u32 = 0xFA79;
+        willow_register_type(LEGACY, trace_slot);
+        willow_register_type(RETRY, trace_slot);
+        let mut parents = Vec::new();
+        let mut deleted = Vec::new();
+        for _ in 0..count {
+            for kind in [LEGACY, RETRY] {
+                let parent = willow_alloc_object(kind as i64, 8);
+                let child = willow_alloc_typed(8, 1);
+                let leaf = willow_alloc(8);
+                unsafe {
+                    store_gc_reference(parent.cast(), child);
+                    store_gc_reference(child.cast(), leaf);
+                }
+                parents.push(parent);
+                if kind == LEGACY {
+                    deleted.push((parent, child));
+                }
+            }
+        }
+        let cycle = {
+            let mut state = runtime().heap.lock().unwrap();
+            let mut legacy = IdSet::default();
+            legacy.insert(LEGACY);
+            let mut cycle = ConcurrentCycle::with_index(
+                epoch_index::EpochIndex::Regions(epoch_index::RegionIndex::capture(&state)),
+                legacy,
+                IdMap::default(),
+                0,
+            );
+            cycle.slices.insert(RETRY, budget_retry_slice);
+            let cycle = Arc::new(cycle);
+            for parent in parents {
+                cycle.enqueue(parent);
+            }
+            marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+            GC_MARK_PHASE.store(1, Ordering::Release);
+            cycle
+        };
+        if predrain {
+            cycle.drain_checked(4 * count);
+        }
+        assert_eq!(
+            cycle.deferred.lock().unwrap().len(),
+            if predrain { count } else { 0 }
+        );
+        assert!(!cycle.queue.snapshot().is_drained());
+        for (parent, child) in deleted.into_iter().filter(|_| predrain) {
+            willow_gc_write_barrier(
+                parent,
+                child,
+                std::ptr::null_mut(),
+                GcStoreDestination::ObjectField as i64,
+            );
+            unsafe {
+                store_gc_reference(parent.cast(), std::ptr::null_mut());
+            }
+        }
+        let calls = BUDGET_RETRY_CALLS.load(Ordering::Relaxed);
+        assert_eq!(calls, if predrain { 3 * count } else { 0 });
+        let mut waits = 0;
+        if predrain {
+            assert!(
+                mark_closure::finish_with_wait(&cycle, Instant::now(), |_| waits += 1).is_none()
+            );
+        }
+        assert_eq!(waits, 0);
+        assert!(!cycle.stopped_completion_required.load(Ordering::Acquire));
+        assert!(!cycle.worker_failed.load(Ordering::Acquire));
+        let (work, plan, _) = mark_closure::finish_stopped(&cycle, Instant::now());
+        assert!(plan.is_none());
+        let stopped_calls = BUDGET_RETRY_CALLS.load(Ordering::Relaxed);
+        if predrain {
+            assert_eq!(stopped_calls, calls);
+        } else {
+            assert!(stopped_calls <= 256);
+        }
+        assert_eq!(work.marked_bytes, (6 * count * (GC_HEADER_SIZE + 8)) as u64);
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            (6 * count * (GC_HEADER_SIZE + 8)) as i64
+        );
+        assert_eq!(
+            crate::gc_telemetry::stops::snapshot_stops().by_reason[1].requests,
+            if predrain { 2 } else { 1 }
+        );
+        assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        println!(
+            "mixed_legacy_retry graphs={count} predrain={predrain} retry_calls={calls} stopped_calls={stopped_calls} snapshot_retained_then_reclaimed=true"
+        );
+    }
+    BUDGET_RETRY_LIMIT.store(0, Ordering::Relaxed);
+    reset_internal_for_test();
 }

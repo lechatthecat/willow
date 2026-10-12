@@ -112,8 +112,9 @@ pub(crate) unsafe fn park_current_roots(depth: usize) -> u64 {
 /// that stack without executing a safepoint against the wrong stack's slots.
 pub(crate) unsafe fn resume_parked_roots(token: u64) {
     let mut parked = runtime().parked_stack_roots.lock().unwrap();
-    let PublishedRoots { slots, relocatable } =
-        parked.remove(&token).expect("unknown parked native stack");
+    let PublishedRoots {
+        slots, relocatable, ..
+    } = parked.remove(&token).expect("unknown parked native stack");
     set_relocation_safe(relocatable);
     retain_transferred_roots(slots.iter().map(|&slot| slot as *mut *mut u8));
     if !slots.is_empty() {

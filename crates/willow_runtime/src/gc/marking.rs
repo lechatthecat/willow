@@ -15,6 +15,7 @@ pub(super) struct ConcurrentCycle {
     pub(super) traces: IdMap<u32, ConcurrentTraceFn>,
     pub(super) slices: IdMap<u32, ConcurrentTraceSliceFn>,
     pub(super) worker_failed: std::sync::atomic::AtomicBool,
+    pub(super) stopped_completion_required: std::sync::atomic::AtomicBool,
     pub(super) closing: std::sync::atomic::AtomicBool,
     pub(super) tracing_enabled: std::sync::atomic::AtomicBool,
     pub(super) active_drains: AtomicUsize,
@@ -119,6 +120,7 @@ impl ConcurrentCycle {
             assist_rate: assist::SCALE,
             objects,
             worker_failed: std::sync::atomic::AtomicBool::new(false),
+            stopped_completion_required: std::sync::atomic::AtomicBool::new(false),
             closing: std::sync::atomic::AtomicBool::new(false),
             tracing_enabled: std::sync::atomic::AtomicBool::new(true),
             active_drains: AtomicUsize::new(0),
@@ -560,7 +562,7 @@ pub(super) static ASSIST_CYCLE_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// them first), so a thread still holding it can no longer publish into it.
 pub(super) fn set_concurrent_cycle(state: &mut GcState, cycle: Option<Arc<ConcurrentCycle>>) {
     if let Some(previous) = state.concurrent_cycle.take() {
-        previous.satb_shards.seal(|_| {});
+        previous.satb_shards.seal_without_drain();
     }
     state.concurrent_cycle = cycle;
     publish_collection_busy(state);

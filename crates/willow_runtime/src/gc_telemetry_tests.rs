@@ -160,6 +160,10 @@ fn major_cycle_reports_live_graph_null_slots_and_duplicate_roots() {
     let after = snapshot();
     assert_consistent(&after);
     assert_eq!(after.major_cycles, 1);
+    assert!(
+        after.last_cycle.pause_ns > 0,
+        "required phase stops must be included in V1"
+    );
     assert_eq!(
         after.last_cycle.marked_bytes,
         2 * GC_HEADER_SIZE as u64 + 24
@@ -473,7 +477,7 @@ fn run_trace_child_version(path: &std::path::Path, expected_errors: u64, version
 }
 
 #[test]
-fn v2_trace_records_major_cycles_without_inventing_global_stops() {
+fn v2_trace_records_required_initial_and_remark_stops() {
     let dir = std::env::temp_dir().join(format!(
         "willow-gc-stops-{}-{}",
         std::process::id(),
@@ -487,9 +491,24 @@ fn v2_trace_records_major_cycles_without_inventing_global_stops() {
         .lines()
         .filter(|line| line.contains("\"version\":2"))
         .collect();
-    assert!(
-        events.is_empty(),
-        "normal old cycles must not emit global-stop events"
+    assert_eq!(
+        events.len(),
+        12,
+        "two cycles have six request/release pairs"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.contains("\"reason\":1"))
+            .count(),
+        4
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.contains("\"reason\":2"))
+            .count(),
+        8
     );
     assert_eq!(
         text.lines()

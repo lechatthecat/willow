@@ -40,8 +40,8 @@ def main():
     after = json.loads((output / "after.json").read_text())
     with trace.open() as stream:
         result = check(stream, before, after)
-    assert result["by_reason"] == ([0, 0, 0, 0] if args.major_only else [0, 0, 1, 0]), result
-    assert result["zero_stw"] == args.major_only, result
+    assert result["by_reason"] == ([1, 2, 0, 0] if args.major_only else [1, 2, 1, 0]), result
+    assert result["zero_stw"] is False, result
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
 

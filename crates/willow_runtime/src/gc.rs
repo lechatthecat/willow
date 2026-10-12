@@ -743,8 +743,8 @@ std::thread_local! {
 // TLS/RefCell aliasing. The collector accesses published slots only while
 // their owners are parked; it does not access another thread's RefCell.
 //
-// Major collection uses an independent root-publication handshake initially
-// and this parking protocol for final remark. Tracing reads atomic references
+// Major collection takes its initial snapshot and seals/drains foreign SATB
+// buffers inside this parking protocol. Mark work proceeds concurrently. Tracing reads atomic references
 // and concurrent container snapshots while SATB/insertion barriers retain edges.
 #[derive(Default)]
 struct GcCoord {
@@ -755,7 +755,9 @@ struct GcCoord {
     stop_requested: bool,
     /// Mutators currently parked at a safepoint.
     parked: HashSet<ThreadId>,
-    handshake: Option<root_handshake::Handshake>,
+    /// Outstanding registered owners for the current stop. Updated once per
+    /// park/unregister, rather than rescanning the registry after every wake.
+    stw_pending: HashSet<ThreadId>,
     cycle_collector: Option<ThreadId>,
     cycle_generation: u64,
 }
@@ -1702,10 +1704,18 @@ fn collect_internal() {
 
     let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Major);
 
-    // First every mutator crosses barrier activation, then each publishes roots
-    // independently. Payload tracing is gated until the activation round ends;
-    // late TLAB starts are retried after the root-publication round.
+    // Initial STW completes all pre-activation stores, retires TLAB metadata,
+    // snapshots roots, and publishes the active mark epoch before resuming.
     let started = std::time::Instant::now();
+    let coordination_ns = || {
+        let stops = crate::gc_telemetry::stops::snapshot_stops();
+        [0, 1, 3].into_iter().fold(0u64, |total, index| {
+            total
+                .saturating_add(stops.by_reason[index].rendezvous.total_ns)
+                .saturating_add(stops.by_reason[index].stopped.total_ns)
+        })
+    };
+    let pause_before = coordination_ns();
     let external_before = external_bytes() as u64;
     let Some((heap_before, marking)) = root_handshake::begin() else {
         runtime()
@@ -1731,109 +1741,11 @@ fn collect_internal() {
             }
         }
         let closed = mark_closure::finish(&marking, started);
-        let mut pause_ns = 0;
+        let concurrent_closed = closed.is_some();
         let result = if let Some((work, plan)) = closed {
             (work, Some(plan), 0)
         } else {
-            let remark_started = std::time::Instant::now();
-            let result = with_stw(
-                crate::gc_telemetry::stops::StopReason::Remark,
-                |coord, stop_work| {
-                    GC_MARK_PHASE.store(2, Ordering::Release);
-                    let mut state = runtime().heap.lock().unwrap();
-                    flush_satb_all_locked(&mut state);
-                    retire_tlabs_with_work(&mut state, stop_work);
-                    drop(state);
-                    let mut roots = all_registered_stack_roots(coord);
-                    roots.extend(runtime_roots_snapshot());
-                    stop_work.root_values += roots.len() as u64;
-                    for &root in &roots {
-                        checked_payload_to_header(root, "GC remark root");
-                        marking.enqueue(root);
-                    }
-                    let fallback = marking.worker_failed.load(Ordering::Acquire);
-                    if fallback {
-                        crate::gc_telemetry::workers::record_failure(
-                            crate::gc_telemetry::workers::Failure::Fallback,
-                        );
-                    }
-                    marking.queue.flush_all_locals();
-                    if !fallback {
-                        marking.drain(usize::MAX);
-                        assert!(
-                            marking.queue.snapshot().is_drained(),
-                            "remark left outstanding marking work"
-                        );
-                    }
-                    for &address in marking.unindexed.lock().unwrap().iter() {
-                        checked_payload_to_header(address as *mut u8, "GC concurrent graph edge");
-                    }
-                    // This remaining remark pass also supplies fallback candidates;
-                    // never enumerate the entire heap a second time on failure.
-                    let objects = if fallback {
-                        epoch_objects(&runtime().heap.lock().unwrap(), stop_work)
-                    } else {
-                        Vec::new()
-                    };
-                    let deferred = if fallback {
-                        // Re-trace every discovered object, including SATB-deleted
-                        // roots and a job whose concurrent hook unwound. The STW
-                        // hook is the authoritative fallback for native containers.
-                        objects
-                            .iter()
-                            .map(|object| object.payload().as_ptr() as usize)
-                            .filter(|&address| marking.is_marked(address))
-                            .collect()
-                    } else {
-                        marking.deferred.lock().unwrap().clone()
-                    };
-                    let deferred_set: HashSet<_> = deferred.iter().copied().collect();
-                    {
-                        for object in objects {
-                            let address = object.payload().as_ptr() as usize;
-                            if (!marking.objects.contains(address) || marking.is_marked(address))
-                                && !deferred_set.contains(&address)
-                            {
-                                object.begin_trace();
-                            }
-                        }
-                    }
-                    // Extension callbacks without a concurrent contract remain sound.
-                    let legacy = mark_worklist(
-                        deferred.into_iter().map(|value| value as *mut u8).collect(),
-                        (!fallback).then_some((&marking.objects, &deferred_set)),
-                    );
-                    let mut work = *marking.work.lock().unwrap();
-                    work.marked_bytes = work.marked_bytes.saturating_add(legacy.marked_bytes);
-                    work.scanned_bytes = work.scanned_bytes.saturating_add(legacy.scanned_bytes);
-                    work.root_scan_bytes = work
-                        .root_scan_bytes
-                        .saturating_add(roots.len() as u64 * std::mem::size_of::<usize>() as u64);
-                    work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
-                    let mut state = runtime().heap.lock().unwrap();
-                    // No buffer may allocate white between phase 0 and sweep_pending.
-                    old_lab::retire_all(&mut state);
-                    GC_MARK_PHASE.store(0, Ordering::Release);
-                    marking::set_concurrent_cycle(&mut state, None);
-                    drop(state);
-                    let remaining = marking.queue.end_epoch();
-                    assert!(
-                        fallback || remaining == 0,
-                        "completed mark epoch retained work"
-                    );
-                    if fallback {
-                        (work, None, sweep_with_work(stop_work))
-                    } else {
-                        let plan = sweep::prepare(
-                            &mut runtime().heap.lock().unwrap(),
-                            Some(marking.clone()),
-                        );
-                        (work, Some(plan), 0)
-                    }
-                },
-            );
-            pause_ns = crate::gc_telemetry::elapsed_ns(remark_started);
-            result
+            mark_closure::finish_stopped(&marking, started)
         };
         let (work, plan, stopped_freed) = result;
         let freed = plan.map_or(stopped_freed, sweep::concurrent);
@@ -1854,7 +1766,7 @@ fn collect_internal() {
             .saturating_add(work.scanned_bytes)
             .saturating_add(work.descriptor_bytes)
             .saturating_add(work.root_scan_bytes);
-        let cpu = (!work.cpu_incomplete && pause_ns == 0).then_some(work.cpu_ns);
+        let cpu = (!work.cpu_incomplete && concurrent_closed).then_some(work.cpu_ns);
         state.pacer.mark(
             work.marked_bytes
                 .saturating_add(work.scanned_bytes)
@@ -1889,6 +1801,8 @@ fn collect_internal() {
             );
         }
         drop(state);
+        // Include the required initial/remark stops in V1 as well as V2.
+        let pause_ns = coordination_ns().saturating_sub(pause_before);
         (after, freed, work, pause_ns)
     }));
     let (heap_after, freed, work, pause_ns) = match result {
@@ -1898,9 +1812,9 @@ fn collect_internal() {
             // another stop so the next collection can safely retry.
             with_stw(
                 crate::gc_telemetry::stops::StopReason::Recovery,
-                |_, stop_work| {
+                |coord, stop_work| {
                     let mut state = runtime().heap.lock().unwrap();
-                    flush_satb_all_locked(&mut state);
+                    flush_satb_all_locked(coord, &mut state);
                     old_lab::retire_all(&mut state);
                     GC_MARK_PHASE.store(0, Ordering::Release);
                     marking::set_concurrent_cycle(&mut state, None);

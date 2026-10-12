@@ -25,6 +25,7 @@ std::thread_local! {
     /// registered. Only the owning thread inserts or removes its own registry
     /// entry, so this cache answers `current_thread_is_registered` without the
     /// coordination lock that every root push/pop would otherwise contend on.
+    static SATB_BUFFER: std::cell::RefCell<Option<Arc<satb::MutatorBuffer>>> = const { std::cell::RefCell::new(None) };
     static REGISTERED_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Whether every native frame on this thread that holds a managed pointer
     /// keeps it only in registered root slots and reloads it after a GC point.
@@ -78,6 +79,7 @@ pub(super) fn set_relocation_safe(value: bool) -> bool {
 pub(super) struct PublishedRoots {
     pub(super) slots: Vec<usize>,
     pub(super) relocatable: bool,
+    pub(super) satb_buffer: Option<Arc<satb::MutatorBuffer>>,
 }
 
 impl PublishedRoots {
@@ -85,6 +87,7 @@ impl PublishedRoots {
         Self {
             slots,
             relocatable: relocation_safe(),
+            satb_buffer: current_satb_buffer(),
         }
     }
 
@@ -125,6 +128,17 @@ pub(super) fn current_thread_is_registered() -> bool {
     epoch != 0 && epoch == MUTATOR_EPOCH.load(Ordering::Acquire)
 }
 
+pub(super) fn current_satb_buffer() -> Option<Arc<satb::MutatorBuffer>> {
+    let epoch = REGISTERED_EPOCH.try_with(|epoch| epoch.get()).ok()?;
+    if epoch == 0 || epoch != MUTATOR_EPOCH.load(Ordering::Acquire) {
+        return None;
+    }
+    SATB_BUFFER
+        .try_with(|local| local.borrow().clone())
+        .ok()
+        .flatten()
+}
+
 /// Called with the coordination lock held after the registry is cleared.
 pub(super) fn invalidate_mutator_registrations() {
     MUTATOR_EPOCH.fetch_add(1, Ordering::AcqRel);
@@ -153,10 +167,12 @@ pub extern "C" fn willow_gc_register_mutator() {
     {
         let mut coord = lock.lock().unwrap();
         let id = std::thread::current().id();
-        coord.mutators.entry(id).or_default();
+        let record = coord.mutators.entry(id).or_default();
+        let buffer = record.satb_buffer.get_or_insert_with(Default::default);
+        SATB_BUFFER.with(|local| *local.borrow_mut() = Some(Arc::clone(buffer)));
         REGISTERED_EPOCH.set(MUTATOR_EPOCH.load(Ordering::Acquire));
-        if let Some(handshake) = coord.handshake.as_mut() {
-            handshake.pending.insert(id);
+        if coord.stop_requested {
+            coord.stw_pending.insert(id);
         }
     }
     // Registration can race with a collection that has already requested a
@@ -174,11 +190,11 @@ pub extern "C" fn willow_gc_unregister_mutator() {
     flush_satb_current(true);
     let id = std::thread::current().id();
     let (lock, cv) = &runtime().coord;
-    let coord = lock.lock().unwrap();
-    let mut coord = root_handshake::wait_for_publication_round(cv, coord);
-    root_handshake::publish_current(&mut coord);
+    let mut coord = lock.lock().unwrap();
     coord.mutators.remove(&id);
+    coord.stw_pending.remove(&id);
     REGISTERED_EPOCH.set(0);
+    SATB_BUFFER.with(|local| *local.borrow_mut() = None);
     coord.parked.remove(&id);
     // A legacy owner can register, then empty its stack while registered.
     // Retire that ownership before releasing coord, using coord -> owner order.
@@ -332,7 +348,6 @@ pub extern "C" fn willow_gc_safepoint() {
     crate::gc_mark_queue::assert_no_queue_lock_held("willow_gc_safepoint");
     let (lock, cv) = &runtime().coord;
     let mut coord = lock.lock().unwrap();
-    root_handshake::publish_current(&mut coord);
     if !coord.stop_requested {
         return;
     }
@@ -344,7 +359,10 @@ pub extern "C" fn willow_gc_safepoint() {
         *slot = roots;
     }
     coord.parked.insert(id);
-    cv.notify_all(); // wake the collector waiting for everyone to park
+    coord.stw_pending.remove(&id);
+    if coord.stw_pending.is_empty() {
+        cv.notify_all();
+    }
     while coord.stop_requested {
         coord = cv.wait(coord).unwrap();
     }
@@ -369,27 +387,20 @@ pub(super) fn with_stw<R>(
     runtime().poll_requested.store(true, Ordering::Release);
     let mut coord = lock.lock().unwrap_or_else(|poison| poison.into_inner());
     coord.stop_requested = true;
+    coord.stw_pending = coord
+        .mutators
+        .keys()
+        .copied()
+        .filter(|id| *id != me && !coord.parked.contains(id))
+        .collect();
     runtime().budget_cv.notify_all();
     crate::scheduler::wake_idle_mutators_for_gc();
     coord = wait_for_mutators(
         cv,
         coord,
         "stop-the-world park",
-        |coord| {
-            coord
-                .mutators
-                .keys()
-                .filter(|&&id| id != me)
-                .all(|id| coord.parked.contains(id))
-        },
-        |coord| {
-            coord
-                .mutators
-                .keys()
-                .copied()
-                .filter(|&id| id != me && !coord.parked.contains(&id))
-                .collect()
-        },
+        |coord| coord.stw_pending.is_empty(),
+        |coord| coord.stw_pending.iter().copied().collect(),
     );
     // A collection can panic: the debug pointer validation aborts the cycle on
     // a corrupt root, and callers catch that. The world has to be resumed

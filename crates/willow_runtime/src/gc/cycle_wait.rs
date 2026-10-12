@@ -42,12 +42,8 @@ impl Drop for CollectorGuard {
     }
 }
 
-fn participation_required(coord: &GcCoord, me: ThreadId) -> bool {
+fn participation_required(coord: &GcCoord) -> bool {
     coord.stop_requested
-        || coord
-            .handshake
-            .as_ref()
-            .is_some_and(|handshake| handshake.pending.contains(&me))
 }
 
 #[cfg(test)]
@@ -70,17 +66,17 @@ pub(super) fn collect_for_budget() {
         collect_internal();
         coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
     }
-    wait_for_cycle(coord, generation, me);
+    wait_for_cycle(coord, generation);
 }
 
-fn wait_for_cycle(mut coord: std::sync::MutexGuard<'_, GcCoord>, generation: u64, me: ThreadId) {
+fn wait_for_cycle(mut coord: std::sync::MutexGuard<'_, GcCoord>, generation: u64) {
     loop {
         #[cfg(test)]
         CHECKS.fetch_add(1, Ordering::Relaxed);
         if coord.cycle_generation != generation || coord.cycle_collector.is_none() {
             return;
         }
-        if participation_required(&coord, me) {
+        if participation_required(&coord) {
             // Never sleep through a request that needs this mutator. The
             // safepoint owns root publication and the STW parking protocol.
             drop(coord);
@@ -181,7 +177,7 @@ mod tests {
         let workers: Vec<_> = (0..16).map(|_| waiter()).collect();
         await_sleeps(16);
         let (_, marking) = root_handshake::begin().unwrap();
-        assert!(runtime().coord.0.lock().unwrap().handshake.is_none());
+        assert!(!runtime().coord.0.lock().unwrap().stop_requested);
         let failed = std::panic::catch_unwind(|| {
             with_stw(
                 crate::gc_telemetry::stops::StopReason::Remark,
@@ -265,7 +261,7 @@ mod tests {
         // a delayed waiter reacquires coord. It owes only the previous cycle.
         std::thread::spawn(move || {
             let coord = runtime().coord.0.lock().unwrap();
-            wait_for_cycle(coord, old_generation, std::thread::current().id());
+            wait_for_cycle(coord, old_generation);
         })
         .join()
         .unwrap();

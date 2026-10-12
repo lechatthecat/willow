@@ -7,6 +7,26 @@ use super::*;
 /// vector growth and keeps it alive after a logical root is released.
 pub(super) struct GcRootCell(std::sync::atomic::AtomicPtr<u8>);
 
+impl GcRootCell {
+    /// Log before publishing the replacement. A failed CAS only retains an
+    /// extra snapshot edge; retrying logs the actual value we next overwrite.
+    /// This preserves atomic replacement when handles are shared by readers
+    /// and writers, without exposing an unlogged deletion to the marker.
+    fn replace(&self, value: *mut u8, mut before_store: impl FnMut(*mut u8)) {
+        let mut old = self.0.load(Ordering::Acquire);
+        loop {
+            before_store(old);
+            match self
+                .0
+                .compare_exchange_weak(old, value, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(actual) => old = actual,
+            }
+        }
+    }
+}
+
 // Atomic publication permits concurrent marking; the Arc allocation keeps
 // slot addresses stable until owner finalization. Relocation writes stay STW.
 
@@ -37,15 +57,20 @@ impl GcRootHandle {
 
     pub(crate) fn store(&self, value: *mut u8) {
         let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-        publish_native_reference(value);
-        satb_delete(self.cell.0.swap(value, Ordering::AcqRel));
+        self.cell.replace(value, |old| {
+            willow_gc_write_barrier(
+                std::ptr::null_mut(),
+                old,
+                value,
+                GcStoreDestination::GlobalStatic as i64,
+            );
+        });
     }
 
     pub(crate) fn release(&self) {
-        let _no_preempt = crate::preempt::NoPreemptGuard::enter();
         // SAFETY: see `GcRootCell`'s synchronization contract. Null is the GC
         // root protocol's explicit inactive-slot value.
-        satb_delete(self.cell.0.swap(std::ptr::null_mut(), Ordering::AcqRel));
+        self.store(std::ptr::null_mut());
     }
 }
 
@@ -214,5 +239,33 @@ impl GcRootArena {
 pub(crate) fn publish_native_reference(value: *mut u8) {
     if let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref() {
         cycle.enqueue(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_cell_logs_before_publication_and_retries_changed_values() {
+        // Synthetic addresses: replacement never dereferences the referents.
+        let first = 8usize as *mut u8;
+        let competing = 16usize as *mut u8;
+        let replacement = 24usize as *mut u8;
+        for value in [std::ptr::null_mut(), replacement] {
+            let cell = GcRootCell(std::sync::atomic::AtomicPtr::new(first));
+            let mut logged = Vec::new();
+            cell.replace(value, |old| {
+                assert_eq!(cell.0.load(Ordering::Acquire), old);
+                logged.push(old);
+                if logged.len() == 1 {
+                    // Force a competing writer between the pre-write and CAS.
+                    cell.0.store(competing, Ordering::Release);
+                }
+            });
+            assert_eq!(logged[0], first);
+            assert!(logged[1..].iter().all(|&old| old == competing));
+            assert_eq!(cell.0.load(Ordering::Acquire), value);
+        }
     }
 }

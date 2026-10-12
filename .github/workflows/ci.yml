@@ -51,7 +51,7 @@ jobs:
         run: python scripts/gc_stop_trace_check.py --self-test
       - name: GC stop trace completeness
         run: python scripts/gc_stop_telemetry_repro.py --output "${{ runner.temp }}/willow-gc-stops"
-      - name: Normal old GC zero-stop trace
+      - name: Normal old GC phase-stop trace
         run: python scripts/gc_stop_telemetry_repro.py --major-only --output "${{ runner.temp }}/willow-gc-stops/major-only"
       - name: Preserve GC stop evidence
         if: always()
