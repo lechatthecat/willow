@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock, RwLockReadGuard, TryLockError};
 use willow_abi::GcLayoutDescriptor;
 
 const MIN_PURGE_ENTRIES: usize = 1024;
@@ -97,6 +97,28 @@ pub(super) fn acquire(layout: GcLayoutDescriptor) -> usize {
 
 pub(super) fn release(address: usize) {
     registry().read().unwrap().release(address);
+}
+
+/// Pins the registry during one reclamation without waiting behind a purge.
+/// The object reference remains live until release() is called under this guard.
+pub(super) struct ReleaseGuard(RwLockReadGuard<'static, Registry>);
+impl ReleaseGuard {
+    pub(super) fn release(&self, address: usize) {
+        self.0.release(address);
+    }
+}
+pub(super) fn try_release_guard() -> Option<ReleaseGuard> {
+    match registry().try_read() {
+        Ok(guard) => Some(ReleaseGuard(guard)),
+        Err(TryLockError::WouldBlock) => None,
+        Err(TryLockError::Poisoned(_)) => panic!("GC descriptor registry poisoned"),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn with_exclusive_registry(action: impl FnOnce()) {
+    let _guard = registry().write().unwrap();
+    action();
 }
 
 #[cfg(test)]

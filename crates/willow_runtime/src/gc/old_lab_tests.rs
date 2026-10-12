@@ -111,13 +111,18 @@ fn buffer_allocations_survive_mark_closure_and_a_pending_sweep() {
     sweep::concurrent(plan);
     {
         let state = runtime().heap.lock().unwrap();
-        for payload in [rooted, during_mark, during_sweep] {
-            assert!(indexed(&state, payload), "survived its allocation epoch");
+        for payload in [rooted, during_mark] {
+            assert!(indexed(&state, payload), "captured objects remain indexed");
         }
+        assert!(
+            find_old_region_object(&state, during_sweep as usize, false).is_some(),
+            "new extent remains visible through its published start bit"
+        );
         assert!(
             state
                 .old_regions
                 .iter()
+                .filter(|region| region.sweep_state.epoch != 0)
                 .all(|region| region.active_labs == 0)
         );
     }

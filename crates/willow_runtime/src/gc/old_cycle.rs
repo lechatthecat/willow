@@ -581,7 +581,7 @@ pub(super) fn record_stop(reason: u32, start: u64, work_end: u64, unlocked: u64)
                 budget.yields,
                 budget.regions,
                 budget.regions,
-                budget.regions * std::mem::size_of::<bool>() as u64
+                budget.regions * super::sweep::REGION_PUBLICATION_BYTES
             );
         }
         eprintln!(
@@ -600,7 +600,7 @@ pub(super) fn record_stop(reason: u32, start: u64, work_end: u64, unlocked: u64)
 }
 
 #[cfg(test)]
-fn take_stop_diagnostics() -> Vec<StopDiagnostic> {
+pub(super) fn take_stop_diagnostics() -> Vec<StopDiagnostic> {
     STOP_DIAGNOSTICS.lock().unwrap().drain(..).collect()
 }
 

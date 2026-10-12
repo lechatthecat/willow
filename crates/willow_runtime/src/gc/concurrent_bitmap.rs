@@ -44,11 +44,17 @@ impl ConcurrentMarkBits {
             word.fetch_or(1u64 << (index % 64), Ordering::Release);
         }
     }
-    #[cfg(test)]
     pub(super) fn unset(&self, index: usize) {
         if let Some(word) = self.words.get(index / 64) {
             word.fetch_and(!(1u64 << (index % 64)), Ordering::Release);
         }
+    }
+    /// First set bit at/after index in its current word. A sweep caller
+    /// advances to the next word on None, retaining that cursor across yields.
+    pub(super) fn first_in_word(&self, index: usize) -> Option<usize> {
+        let word_index = index / 64;
+        let bits = self.words.get(word_index)?.load(Ordering::Acquire) & (u64::MAX << (index % 64));
+        (bits != 0).then(|| word_index * 64 + bits.trailing_zeros() as usize)
     }
     /// Highest set index in `[floor, index]`: O((index - floor) / 64 + 1).
     pub(super) fn last_set_in(&self, floor: usize, index: usize) -> Option<usize> {

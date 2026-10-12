@@ -44,6 +44,12 @@ impl AddressIndex {
     pub(super) fn exact(&self, start: usize) -> Option<usize> {
         self.starts.get(&Address(start)).copied()
     }
+    pub(super) fn remove(&mut self, start: usize) {
+        assert!(self.starts.remove(&Address(start)).is_some());
+    }
+    pub(super) fn move_index(&mut self, start: usize, index: usize) {
+        *self.starts.get_mut(&Address(start)).expect("live extent") = index;
+    }
     /// Bulk sweep already visits all regions. Update vector positions in one
     /// ordered traversal instead of performing a tree lookup per survivor.
     pub(super) fn remap(&mut self, positions: &[Option<usize>]) {

@@ -12,8 +12,9 @@
 //! buffer mutex while acquiring the heap mutex.
 //!
 //! Invariants:
-//! - An active buffer's region index stays valid: regions are reindexed only
-//!   by `sweep::finish` and reset, which retire every buffer first.
+//! - A buffer owns a stable region base. Incremental sweep may swap vector
+//!   positions; flush/retirement resolve that base through old_addresses before
+//!   using the cached region index. New buffers survive unrelated releases.
 //! - An active buffer's `sweep_pending` copy equals its region's flag:
 //!   `sweep::prepare` retires every buffer before setting the flags, and
 //!   `sweep_region` retires the region's buffers before visiting it.
@@ -239,13 +240,13 @@ pub(super) fn refill_and_allocate(
 fn carve(state: &mut GcState, span: usize) -> Option<(usize, usize, usize, bool)> {
     while state
         .old_region_candidates
-        .peek()
+        .last()
         .is_some_and(|&(_, index)| state.old_regions[index].sweep_quarantined)
     {
         // Each stale candidate is discarded at most once during the sweep.
-        state.old_region_candidates.pop();
+        state.old_region_candidates.pop_last();
     }
-    if let Some(&(available, index)) = state.old_region_candidates.peek()
+    if let Some(&(available, index)) = state.old_region_candidates.last()
         && available >= span
     {
         let minimum = OLD_LAB_MIN_BYTES.max(span).min(available);
@@ -253,14 +254,9 @@ fn carve(state: &mut GcState, span: usize) -> Option<(usize, usize, usize, bool)
             .carve(minimum, OLD_LAB_BYTES)
             .expect("candidate offers its indexed available span");
         let available = state.old_regions[index].available_span();
-        let mut entry = state
-            .old_region_candidates
-            .peek_mut()
-            .expect("candidate exists");
+        state.old_region_candidates.pop_last();
         if available >= GC_HEADER_SIZE {
-            *entry = (available, index);
-        } else {
-            std::collections::binary_heap::PeekMut::pop(entry);
+            state.old_region_candidates.insert((available, index));
         }
         return Some((index, offset, len, reused));
     }
@@ -324,10 +320,14 @@ fn flush(state: &mut GcState, index: usize, deactivate: bool) {
         let GcState {
             old_labs,
             old_regions,
+            old_addresses,
             old_region_reuses,
             ..
         } = &mut *state;
         let mut inner = old_labs[index].lab.inner.lock().unwrap();
+        if inner.active || inner.pending_index < inner.pending.len() {
+            inner.region = old_addresses.exact(inner.base).expect("live buffer region");
+        }
         if inner.pending_index < inner.pending.len() {
             let region = &mut old_regions[inner.region];
             if inner.reused {
@@ -403,6 +403,7 @@ fn retire_bounded_with_clock(
             let GcState {
                 old_labs,
                 old_regions,
+                old_addresses,
                 old_region_reuses,
                 ..
             } = &mut *state;
@@ -413,6 +414,7 @@ fn retire_bounded_with_clock(
             if !budget.reserve(1, std::mem::size_of::<(usize, usize)>() as u64, now()) {
                 return false;
             }
+            inner.region = old_addresses.exact(inner.base).expect("live buffer region");
             let region = &mut old_regions[inner.region];
             if inner.active {
                 // Revocation precedes indexing: a resumed owner must refill,
@@ -484,7 +486,7 @@ pub(super) fn retire_region(state: &mut GcState, region: usize) {
     for index in 0..state.old_labs.len() {
         let in_region = {
             let inner = state.old_labs[index].lab.inner.lock().unwrap();
-            inner.active && inner.region == region
+            inner.active && inner.base == state.old_regions[region].start()
         };
         if in_region {
             retire(state, index);

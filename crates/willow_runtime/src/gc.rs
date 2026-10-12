@@ -28,6 +28,7 @@ pub use safepoint::*;
 mod marking;
 use marking::*;
 mod registry;
+mod remembered;
 pub use registry::*;
 mod root_arena;
 pub(crate) use root_arena::*;
@@ -76,7 +77,7 @@ use runtime_roots::RuntimeRootSet;
 
 use crate::id_hash::{IdMap, IdSet};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::ThreadId;
@@ -271,7 +272,7 @@ struct GcState {
     old_regions: Vec<OldRegion>,
     old_addresses: address_index::AddressIndex,
     /// (largest available span, region index); excludes dedicated/full regions.
-    old_region_candidates: BinaryHeap<(usize, usize)>,
+    old_region_candidates: BTreeSet<(usize, usize)>,
     old_reserved_bytes: usize,
     /// Per-thread old allocation buffers used by runtime-side allocation.
     old_labs: Vec<old_lab::OldLabRecord>,
@@ -319,7 +320,7 @@ struct GcState {
     /// Old objects that may contain at least one young reference. Owners are
     /// payload addresses and remain stable because the old generation does not
     /// move.
-    remembered_set: HashSet<usize>,
+    remembered_set: remembered::RememberedSet,
     /// Sparse card table keyed by absolute old-heap card. Region bounds make
     /// each dirty card attributable to one old/pinned region without changing
     /// the Stage-4 barrier ABI.
@@ -668,7 +669,7 @@ impl Default for GcState {
             tlab_addresses: address_index::AddressIndex::default(),
             old_regions: Vec::new(),
             old_addresses: address_index::AddressIndex::default(),
-            old_region_candidates: BinaryHeap::new(),
+            old_region_candidates: BTreeSet::new(),
             old_reserved_bytes: 0,
             old_labs: Vec::new(),
             tlab_states: HashMap::new(),
@@ -697,7 +698,7 @@ impl Default for GcState {
             tlab_large_allocations: 0,
             tlab_fast_allocated_bytes: 0,
             tlab_reserved_bytes: 0,
-            remembered_set: HashSet::new(),
+            remembered_set: remembered::RememberedSet::default(),
             dirty_cards: HashSet::new(),
             write_barrier_hits: 0,
             minor_collections: 0,
@@ -1073,6 +1074,7 @@ pub extern "C" fn willow_gc_alloc_slow(
         }
         fast_bytes
     };
+    sweep::assist();
     assist_concurrent_mark(fast_bytes.saturating_add(total_size as u64));
 
     if !stress && allocation_should_minor_collect() {
@@ -1246,6 +1248,7 @@ fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask:
         crate::failure::fatal_invariant("negative managed allocation size");
     }
     let total_size = (payload_size as u64).saturating_add(GC_HEADER_SIZE as u64);
+    sweep::assist();
     assist_concurrent_mark(total_size);
     let stress = gc_stress_enabled("alloc");
     // A due check charges the chunk it covers against the lock-free headroom
@@ -1314,10 +1317,10 @@ fn runtime_policy_check_due(bytes: u64) -> bool {
 /// Add a newly reserved regular region if it still has usable space.
 fn index_old_region(state: &mut GcState, index: usize) {
     let region = &state.old_regions[index];
-    if region.kind == RegionKind::Old {
+    if region.kind == RegionKind::Old && !region.sweep_quarantined {
         let available = region.available_span();
         if available >= GC_HEADER_SIZE {
-            state.old_region_candidates.push((available, index));
+            state.old_region_candidates.insert((available, index));
         }
     }
 }
@@ -1336,15 +1339,15 @@ fn allocate_old_region_object_locked(
 
     while state
         .old_region_candidates
-        .peek()
+        .last()
         .is_some_and(|&(_, index)| state.old_regions[index].sweep_quarantined)
     {
         // Each stale candidate is discarded at most once during the sweep.
-        state.old_region_candidates.pop();
+        state.old_region_candidates.pop_last();
     }
     let candidate = state
         .old_region_candidates
-        .peek()
+        .last()
         .copied()
         .filter(|(available, _)| !large && *available >= span_size);
     let (object, reused) = if let Some((_, index)) = candidate {
@@ -1355,14 +1358,9 @@ fn allocate_old_region_object_locked(
             payload_size,
         )?;
         let available = state.old_regions[index].available_span();
-        let mut entry = state
-            .old_region_candidates
-            .peek_mut()
-            .expect("candidate exists");
+        state.old_region_candidates.pop_last();
         if available >= GC_HEADER_SIZE {
-            *entry = (available, index);
-        } else {
-            std::collections::binary_heap::PeekMut::pop(entry);
+            state.old_region_candidates.insert((available, index));
         }
         allocated
     } else {

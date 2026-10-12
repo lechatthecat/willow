@@ -181,6 +181,68 @@ impl std::ops::Index<usize> for FreeSpans {
     }
 }
 
+/// Incremental sweep-only construction. Allocation reserves capacity outside
+/// the heap lock; every initialized slot/leaf/parent is one resumable work item.
+pub(super) struct Builder {
+    source: Vec<RegionFreeSpan>,
+    result: FreeSpans,
+    copied: usize,
+    parent: usize,
+}
+impl Builder {
+    pub(super) fn new(source: Vec<RegionFreeSpan>) -> Self {
+        let leaves = if source.is_empty() {
+            0
+        } else {
+            source.len().next_power_of_two()
+        };
+        Self {
+            result: FreeSpans {
+                spans: Vec::with_capacity(source.len()),
+                maxima: Vec::with_capacity(2 * leaves),
+                leaves,
+                #[cfg(test)]
+                node_visits: 0,
+                #[cfg(test)]
+                build_visits: 0,
+            },
+            source,
+            copied: 0,
+            parent: leaves.saturating_sub(1),
+        }
+    }
+    /// True once construction is complete. No iteration/allocation in a step.
+    pub(super) fn step(&mut self) -> bool {
+        if self.result.maxima.len() < 2 * self.result.leaves {
+            self.result.maxima.push(0);
+        } else if self.copied < self.source.len() {
+            let span = self.source[self.copied];
+            self.result.spans.push(Some(span));
+            self.result.maxima[self.result.leaves + self.copied] = span.size;
+            self.copied += 1;
+            #[cfg(test)]
+            {
+                self.result.build_visits += 1;
+            }
+        } else if self.parent != 0 {
+            let index = self.parent;
+            self.result.maxima[index] =
+                self.result.maxima[2 * index].max(self.result.maxima[2 * index + 1]);
+            self.parent -= 1;
+            #[cfg(test)]
+            {
+                self.result.build_visits += 1;
+            }
+        }
+        self.result.maxima.len() == 2 * self.result.leaves
+            && self.copied == self.source.len()
+            && self.parent == 0
+    }
+    pub(super) fn finish(self) -> (FreeSpans, Vec<RegionFreeSpan>) {
+        (self.result, self.source)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -167,7 +167,30 @@ impl Object {
             )
     }
 
+    /// No state changes on contention. A successful permit pins an interned
+    /// descriptor through the liveness bookkeeping and header conversion.
+    pub(super) fn try_reclaim_permit(self) -> Option<ReclaimPermit> {
+        if unsafe { (*self.as_ptr()).descriptor_owned } && self.allocated() {
+            super::layouts::try_release_guard().map(|guard| ReclaimPermit(Some(guard)))
+        } else {
+            Some(ReclaimPermit(None))
+        }
+    }
+    pub(super) fn reclaim_with_permit(self, permit: ReclaimPermit) {
+        self.reclaim_with_release(|address| {
+            permit
+                .0
+                .as_ref()
+                .expect("interned descriptor permit")
+                .release(address);
+        });
+    }
+
     pub(super) fn reclaim_in_place(self) {
+        self.reclaim_with_release(super::layouts::release);
+    }
+
+    fn reclaim_with_release(self, release: impl FnOnce(usize)) {
         // SAFETY: the closed mark epoch proved this payload unreachable;
         // its readers have quiesced and the heap mutex owns its metadata.
         unsafe {
@@ -175,7 +198,7 @@ impl Object {
             let header = &mut *self.as_ptr();
             if header.allocated {
                 if header.descriptor_owned {
-                    super::layouts::release(header.descriptor);
+                    release(header.descriptor);
                 }
                 header.descriptor = size;
                 header.descriptor_owned = false;
@@ -265,3 +288,6 @@ impl RootSlot {
         Payload::from_raw(unsafe { *self.0.as_ptr() })
     }
 }
+
+/// Optional registry guard: generated immutable descriptors need no release.
+pub(super) struct ReclaimPermit(Option<super::layouts::ReleaseGuard>);

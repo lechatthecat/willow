@@ -1,7 +1,18 @@
-//! Region-at-a-time old sweep. Heap metadata is protected per region; mutators
-//! run between visits. Reclaimed spans/regions stay quarantined until all epoch
-//! readers are gone and the sweep batch is finalized.
+//! Bounded normal old sweep with a shared resumable cursor; the classified
+//! stopped Recovery path retains its compatibility sweep. New reclaimed spans
+//! wait for completion and the next mark epoch before allocator reuse.
 use super::*;
+mod batches;
+pub(super) fn assist() {
+    batches::assist();
+}
+
+/// Region flag/state writes plus one candidate-index key. Tree-node traffic
+/// is accounted by lock/work time rather than pretending to be payload bytes.
+pub(super) const REGION_PUBLICATION_BYTES: u64 = (2 * std::mem::size_of::<bool>()
+    + std::mem::size_of::<region::SweepState>()
+    + std::mem::size_of::<(usize, usize)>())
+    as u64;
 
 pub(super) struct SweepPlan {
     old: usize,
@@ -17,8 +28,18 @@ pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>
     state.major_collections = state.major_collections.saturating_add(1);
     // Active buffers copied a clear sweep_pending flag.
     old_lab::retire_all(state);
-    for region in &mut state.old_regions {
+    for (index, region) in state.old_regions.iter_mut().enumerate() {
         region.sweep_pending = true;
+        region.sweep_quarantined = true;
+        region.sweep_state = region::SweepState {
+            epoch: marking
+                .as_ref()
+                .map_or(state.major_collections, |cycle| cycle.assist_epoch),
+            phase: region::SweepPhase::Unswept,
+        };
+        state
+            .old_region_candidates
+            .remove(&(region.available_span(), index));
     }
     SweepPlan {
         old: state.old_regions.len(),
@@ -68,10 +89,19 @@ fn publish_regions_bounded(
     let mut cursor = marking.sweep_publication_cursor.load(Ordering::Relaxed);
     assert!(cursor <= state.old_regions.len());
     while cursor < state.old_regions.len() {
-        if !budget.reserve(1, std::mem::size_of::<bool>() as u64, now()) {
+        if !budget.reserve(1, REGION_PUBLICATION_BYTES, now()) {
             return false;
         }
-        state.old_regions[cursor].sweep_pending = true;
+        let region = &mut state.old_regions[cursor];
+        region.sweep_pending = true;
+        region.sweep_quarantined = true;
+        region.sweep_state = region::SweepState {
+            epoch: marking.assist_epoch,
+            phase: region::SweepPhase::Unswept,
+        };
+        state
+            .old_region_candidates
+            .remove(&(region.available_span(), cursor));
         budget.record_region_publication();
         cursor += 1;
         // Preserve even the last admitted flag if the deadline check fails.
@@ -80,6 +110,24 @@ fn publish_regions_bounded(
             .store(cursor, Ordering::Relaxed);
     }
     budget.reserve(0, 0, now())
+}
+
+/// Publish eligible swept spans only after the next mark epoch has activated.
+/// Each visit is region-local and runs after initial stop release; no heap-wide
+/// index rebuild or sweep work is hidden in the initial pause.
+pub(super) fn release_quarantine(epoch: u64) {
+    let count = runtime().heap.lock().unwrap().old_regions.len();
+    for index in 0..count {
+        let mut state = runtime().heap.lock().unwrap();
+        let region = &mut state.old_regions[index];
+        if region.sweep_state.phase == region::SweepPhase::Swept
+            && region.sweep_quarantined
+            && region.reusable_after_epoch <= epoch
+        {
+            region.sweep_quarantined = false;
+            index_old_region(&mut state, index);
+        }
+    }
 }
 
 pub(super) fn stopped(work: &mut crate::gc_telemetry::stops::StopWorkV2) -> usize {
@@ -92,11 +140,7 @@ pub(super) fn concurrent(plan: SweepPlan) -> usize {
         !runtime().stop_requested.load(Ordering::Acquire),
         "normal sweep began before mutator resume"
     );
-    execute(
-        plan,
-        &mut crate::gc_telemetry::stops::StopWorkV2::default(),
-        true,
-    )
+    batches::execute(plan)
 }
 
 type PendingDrop = (DropFn, *mut u8);
@@ -560,7 +604,7 @@ mod publication_tests {
             );
         }
         append(&mut state, 1);
-        let mut budget = old_cycle::RemarkBudget::new(1, 1, 3, 0);
+        let mut budget = old_cycle::RemarkBudget::new(1, REGION_PUBLICATION_BYTES, 3, 0);
         assert!(publish_regions_bounded(
             &mut state,
             &marking,

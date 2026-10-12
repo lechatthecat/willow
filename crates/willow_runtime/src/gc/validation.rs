@@ -213,7 +213,7 @@ pub(super) fn verify_old_region_metadata(state: &GcState) -> Result<(), String> 
         .old_regions
         .iter()
         .enumerate()
-        .filter(|(_, region)| region.kind == RegionKind::Old)
+        .filter(|(_, region)| region.kind == RegionKind::Old && !region.sweep_quarantined)
         .map(|(index, region)| (region.available_span(), index))
         .filter(|(available, _)| *available >= GC_HEADER_SIZE)
         .collect();

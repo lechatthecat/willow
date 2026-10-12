@@ -1399,10 +1399,9 @@ fn concurrent_sweep_retains_new_allocations_and_quarantines_processed_spans() {
         worker.join().unwrap();
         let address = address.load(Ordering::Acquire);
         assert_ne!(address, 0);
-        assert_eq!(
-            (old_base..old_base + GC_OLD_REGION_SIZE).contains(&address),
-            allocate_in_pending_region
-        );
+        // Pending extents are conservatively quarantined before resume. A new
+        // allocation must use safe storage regardless of visitation order.
+        assert!(!(old_base..old_base + GC_OLD_REGION_SIZE).contains(&address));
         assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
         assert_eq!(unsafe { *(address as *const u64) }, 0xAABBCCDD);
         assert!(!unsafe { (*payload_to_header(address as *mut u8)).marked });

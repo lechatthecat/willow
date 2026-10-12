@@ -91,6 +91,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
         },
     );
     if let Some((_, cycle)) = &result {
+        sweep::release_quarantine(cycle.assist_epoch);
         // Late extents may be arbitrarily numerous after collector descheduling.
         // Publish them after resume, before starting workers; captured roots and
         // SATB claims retain unresolved values in owned unindexed work meanwhile.

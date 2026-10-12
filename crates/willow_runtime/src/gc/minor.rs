@@ -390,7 +390,7 @@ impl<'a> MinorCollector<'a> {
     fn run(
         mut self,
         roots: MinorRoots,
-        remembered: HashSet<usize>,
+        remembered: super::remembered::RememberedSet,
     ) -> (usize, crate::gc_telemetry::MarkWork) {
         let started = std::time::Instant::now();
         let count = roots.slots.len() + roots.values.len();
