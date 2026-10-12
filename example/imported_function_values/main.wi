@@ -1,0 +1,16 @@
+// Item-imported functions are function values like local ones (willow-yf49).
+// An async function or an inline builtin has no address: wrap the call in a
+// lambda instead (`let f = later;` is E1012).
+import worker::twice;
+import worker::apply;
+import worker::later;
+
+async fn main() {
+    let f = twice;
+    println(f(21));
+    println(apply(twice, 4));
+    let g = |x: i64| later(x);
+    println(await g(41));
+    let p = pow;
+    println(p(2.0, 10.0) == 1024.0);
+}

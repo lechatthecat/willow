@@ -145,7 +145,8 @@ impl UnitCodegenContext<'_> {
         self.define_pow_f64(pow_id, pow_sig, log_id, exp_id)?;
 
         let fn_ty = Type::Fn(vec![Type::F64, Type::F64], Box::new(Type::F64));
-        for name in [POW_F64_SYMBOL, "pow", "powf"] {
+        let names = crate::semantic::intrinsics::ADDRESSABLE_BUILTINS;
+        for name in std::iter::once(POW_F64_SYMBOL).chain(names) {
             self.func_ids.insert(name, pow_id);
             self.func_return_types.insert(name, Type::F64);
             self.fn_types.insert(name, fn_ty.clone());

@@ -2473,6 +2473,55 @@ impl TypeChecker {
                     }
                     let params = info.params.clone();
                     let ret = info.return_type.clone();
+                    // An async function has no plain entry point (a call
+                    // creates its Task), and a builtin is lowered inline at
+                    // each call site, so neither has an address to take
+                    // (willow-yf49). Builtins are the functions without a
+                    // source declaration; a few are defined as real functions.
+                    let is_async = info.is_async;
+                    let not_addressable = if is_async {
+                        Some("an async function")
+                    } else if info.declaration_span == Span::dummy()
+                        && !crate::semantic::intrinsics::ADDRESSABLE_BUILTINS
+                            .contains(&name.as_str())
+                    {
+                        Some("a builtin function")
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = not_addressable {
+                        let args = (0..params.len())
+                            .map(|i| format!("a{i}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let typed = params
+                            .iter()
+                            .enumerate()
+                            .map(|(i, ty)| format!("a{i}: {}", type_name(ty)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1012,
+                                format!(
+                                    "`{name}` is {kind} and cannot be used as a function value"
+                                ),
+                            )
+                            .with_label(Label::primary(*span, "named here as a value"))
+                            .with_help(format!(
+                                "wrap the call in a lambda instead: `|{typed}| {name}({args})`"
+                            )),
+                        );
+                        // The type the call would have, so uses of the
+                        // value do not report follow-on errors.
+                        let ret = if is_async {
+                            Type::Generic("Task".into(), vec![ret])
+                        } else {
+                            ret
+                        };
+                        return Type::Fn(params, Box::new(ret));
+                    }
                     self.record_function_value(
                         Some(FunctionId::free_from_source_name(name)),
                         params.len(),

@@ -16,20 +16,6 @@ fn check(name: &str, files: &[(&str, &str)]) -> (String, bool) {
     )
 }
 
-/// Type-check only, for shapes whose code generation is tracked separately.
-fn checked(name: &str, files: &[(&str, &str)]) -> (String, bool) {
-    let project = TestProject::new(name, files);
-    let output = project.check("main.wi");
-    (
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-        output.status.success(),
-    )
-}
-
 fn rejected(name: &str, source: &str) -> String {
     let (diagnostics, ok) = check(name, &[("main.wi", source)]);
     assert!(!ok, "{name}: expected E2604");
@@ -157,32 +143,25 @@ fn indirect_lock_08_waiting_lambda_local_call() {
     );
 }
 
-/// Perspective 9: calling an async function value only creates a Task, so it
-/// never waits in the critical section.
+/// Perspective 9: calling a lambda that calls an async function only creates
+/// a Task, so it never waits in the critical section. (An async function
+/// itself is not a function value: E1012, willow-yf49.)
 #[test]
-fn indirect_lock_09_async_function_value_accepted() {
-    let (out, _) = checked(
+fn indirect_lock_09_async_call_lambda_accepted() {
+    accepted(
         "ind09",
-        &[(
-            "main.wi",
-            "async fn work(x: i64) -> i64 { await sleep(1); return x; }\nasync fn main() { let m = Mutex::new(0); let f = work; lock m as v { let t = f(1); } }\n",
-        )],
+        "async fn work(x: i64) -> i64 { await sleep(1); return x; }\nasync fn main() { let m = Mutex::new(0); let f = |x: i64| work(x); let mut t = work(0); lock m as v { t = f(1); } println(await t); }\n",
     );
-    assert!(!out.contains("E2604"), "{out}");
 }
 
-/// Perspective 10: a builtin used as a value (`sleep`) creates a Future and is
-/// accepted.
+/// Perspective 10: a lambda that only creates a builtin Future (`sleep`)
+/// without awaiting it is accepted.
 #[test]
-fn indirect_lock_10_builtin_value_accepted() {
-    let (out, _) = checked(
+fn indirect_lock_10_future_lambda_accepted() {
+    accepted(
         "ind10",
-        &[(
-            "main.wi",
-            "async fn main() { let m = Mutex::new(0); let s = sleep; lock m as v { s(1); } }\n",
-        )],
+        "async fn main() { let m = Mutex::new(0); let s = |ms: i64| sleep(ms); lock m as v { s(1); } }\n",
     );
-    assert!(!out.contains("E2604"), "{out}");
 }
 
 /// Perspective 11: an indirect call can only reach values with its own
@@ -320,11 +299,11 @@ fn indirect_lock_20_imported_value_and_helper() {
     assert!(out.contains("error[E2604]"), "{out}");
 }
 
-/// Perspective 21: the same two-module shape with a pure function value
-/// compiles.
+/// Perspective 21: the same two-module shape with a pure imported function
+/// value compiles and runs.
 #[test]
 fn indirect_lock_21_imported_pure_value_accepted() {
-    let (out, ok) = checked(
+    let project = TestProject::new(
         "ind21",
         &[
             (
@@ -337,7 +316,13 @@ fn indirect_lock_21_imported_pure_value_accepted() {
             ),
         ],
     );
-    assert!(ok, "{out}");
+    let compiled = project.compile("main.wi");
+    let stderr = String::from_utf8_lossy(&compiled.stderr);
+    assert!(compiled.status.success(), "{stderr}");
+    let output = project.run();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n", "{stderr}");
 }
 
 /// Perspective 22: an accepted program still runs the indirect calls inside the

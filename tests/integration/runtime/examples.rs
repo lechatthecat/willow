@@ -149,6 +149,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/async_fn_pointer.wi", "42\n14\n"),
         ("example/lock_function_values.wi", "41\n42\n100\n"),
         (
+            "example/imported_function_values/main.wi",
+            "42\n8\n42\ntrue\n",
+        ),
+        (
             "example/async_frame_narrowing.wi",
             "2\n1\n102\n13\n12\n3\n30\ntask\n4\n7\nhello\n6\n",
         ),

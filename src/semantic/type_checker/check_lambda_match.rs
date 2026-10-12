@@ -311,10 +311,21 @@ impl TypeChecker {
             .current_body
             .zip(self.body_queries.as_ref())
             .and_then(|(parent, queries)| queries.index().lambda_in(parent, l.id));
+        // The lambda's callable identity. Without body queries an expression
+        // body has no BodyId, so it gets a fresh one: its waits and calls must
+        // still be attributed to it, as under body queries, or a function
+        // value made from it could not be classified (willow-h4t7).
+        let callable = lambda_body
+            .or(match &l.body {
+                LambdaBody::Block(body) => Some(body.id),
+                LambdaBody::Expr(_) => self.body_queries.is_none().then(BodyId::fresh),
+            })
+            .map(FunctionId::lambda);
         let check = move |checker: &mut TypeChecker| {
             checker.check_lambda_scoped(
                 l,
                 lambda_body,
+                callable,
                 expected_params,
                 expected_return,
                 expected_closure,
@@ -324,13 +335,6 @@ impl TypeChecker {
             Ok(result) => result,
             Err(check) => check(self),
         };
-        // The same identity `check_lambda_scoped` gives the lambda's callable.
-        let callable = lambda_body
-            .or(match &l.body {
-                LambdaBody::Block(body) => Some(body.id),
-                LambdaBody::Expr(_) => None,
-            })
-            .map(FunctionId::lambda);
         self.record_function_value(callable, l.params.len(), l.span);
         result
     }
@@ -339,17 +343,12 @@ impl TypeChecker {
         &mut self,
         l: &LambdaExpr,
         lambda_body: Option<BodyId>,
+        lambda_callable: Option<FunctionId>,
         expected_params: Option<&[Type]>,
         expected_return: Option<&Type>,
         expected_closure: bool,
     ) -> (Type, Vec<String>) {
         let previous_body = std::mem::replace(&mut self.local.current_body, lambda_body);
-        let lambda_callable = lambda_body
-            .or(match &l.body {
-                LambdaBody::Block(body) => Some(body.id),
-                LambdaBody::Expr(_) => None,
-            })
-            .map(FunctionId::lambda);
         if let Some(callable) = lambda_callable {
             // A lambda without call sites still owns a graph node; a missing
             // node would read as an unchecked body and pessimize its facts.

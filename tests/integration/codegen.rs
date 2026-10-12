@@ -668,6 +668,8 @@ mod expression_roots;
 mod filesystem;
 #[path = "codegen/formatting.rs"]
 mod formatting;
+#[path = "codegen/function_value_targets.rs"]
+mod function_value_targets;
 #[path = "codegen/function_values.rs"]
 mod function_values;
 #[path = "codegen/integer_division.rs"]

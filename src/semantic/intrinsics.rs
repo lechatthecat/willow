@@ -452,6 +452,12 @@ pub(crate) fn adt_method_target(ty: &Type, method: &str) -> Option<FunctionId> {
     known.then(|| FunctionId::method(TypeId::local("$adt"), method))
 }
 
+/// The builtin free functions code generation defines as ordinary
+/// Willow-ABI functions, so they can be used as `fn` values. Every other
+/// builtin is lowered inline at each call site and has no address
+/// (willow-yf49).
+pub(crate) const ADDRESSABLE_BUILTINS: [&str; 2] = ["pow", "powf"];
+
 /// Full runtime effects of a call target that has no Willow body: a builtin
 /// method ([`Intrinsic::function_id`]) or a builtin free function. `None`
 /// means the target is not a known builtin, and the caller must fail closed.

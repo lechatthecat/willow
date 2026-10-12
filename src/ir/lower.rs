@@ -1465,8 +1465,14 @@ fn lower_var_expr(
     // willow-0g8j.2.2). The checker types the bare identifier as the
     // function's `fn(...) -> ...`; taking that from the checker rather
     // than rebuilding it keeps the parameter modes and the return type
-    // exactly what the call site was checked against.
-    if ctx.fn_returns.contains_key(name)
+    // exactly what the call site was checked against. A function bound by an
+    // item import is not in `fn_returns`; the back end binds its local name
+    // to the imported symbol, as for a direct call (willow-yf49).
+    if (ctx.fn_returns.contains_key(name)
+        || ctx
+            .tables
+            .symbols
+            .is_some_and(|symbols| symbols.lookup_func(name).is_some()))
         && let Some(ty @ Type::Fn(..)) = ctx.tables.expr_type(&expr.id())
     {
         return Ok(HirExpr {
