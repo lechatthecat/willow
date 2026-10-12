@@ -906,14 +906,7 @@ fn allocation_should_collect() -> bool {
         state
             .pacer
             .allocation(crate::gc_telemetry::timestamp_ns(), bytes);
-        // Sampling may advance the trigger, but cannot move the current goal.
-        let input = pacer_inputs(&state);
-        let decision = state.pacer.decision(input);
-        state.pacer_trigger = (state.threshold_bytes as u64)
-            .saturating_sub(decision.runway)
-            .max(input.live.saturating_add(256 * 1024))
-            .min(state.threshold_bytes as u64);
-        invalidate_external_headroom();
+        pacer::sample_threshold(&mut state);
     }
     let hard_pressure = hard_reservation_pressure(&mut state);
     let memory_input = memory_inputs(&state);
@@ -1136,9 +1129,6 @@ pub extern "C" fn willow_gc_alloc_slow(
         .total_allocated_bytes
         .saturating_add(total_size as u64);
     state.tlab_slow_allocations = state.tlab_slow_allocations.saturating_add(1);
-    if state.allocated_bytes >= state.threshold_bytes {
-        state.threshold_bytes = state.threshold_bytes.saturating_mul(2);
-    }
     header.payload().as_ptr()
 }
 
@@ -1462,9 +1452,6 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
     if header.size() > GC_TLAB_MAX_OBJECT_SIZE {
         state.tlab_large_allocations = state.tlab_large_allocations.saturating_add(1);
     }
-    if state.allocated_bytes >= state.threshold_bytes {
-        state.threshold_bytes = state.threshold_bytes.saturating_mul(2);
-    }
     header.payload().as_ptr()
 }
 
@@ -1771,13 +1758,6 @@ fn try_collect_internal() -> bool {
         sync_tlab_bytes(&mut state);
         let after = state.allocated_bytes as u64;
         let previous_goal = state.threshold_bytes as u64;
-        // The goal and pacer trigger may move down below.
-        invalidate_external_headroom();
-        state.threshold_bytes = state
-            .allocated_bytes
-            .saturating_add(external_bytes())
-            .saturating_mul(2)
-            .max(1024 * 1024);
         state.last_major_live_bytes = after;
         state.last_major_mark_work = work
             .marked_bytes
@@ -1795,14 +1775,7 @@ fn try_collect_internal() -> bool {
         state
             .pacer
             .allocation(crate::gc_telemetry::timestamp_ns(), bytes);
-        if state.pacer.enabled() {
-            let decision = state.pacer.decision(pacer::Inputs {
-                previous_goal,
-                ..pacer_inputs(&state)
-            });
-            state.threshold_bytes = decision.goal.min(usize::MAX as u64) as usize;
-            state.pacer_trigger = decision.trigger;
-        }
+        pacer::complete_threshold(&mut state, previous_goal);
         // A completed full cycle services any high reservation pressure. If
         // reclamation crossed the low watermark, rearm before new allocations
         // can reserve a region again (even within the same allocation call).
@@ -2026,14 +1999,13 @@ fn reset_internal() {
     state.tlab_states.clear();
     state.tlab_owners.clear();
     state.allocated_bytes = 0;
-    state.threshold_bytes = 1024 * 1024;
+    pacer::reset_threshold(&mut state);
     state.memory_limit_bytes = gc_memory_limit_from_env();
     state.hard_pressure_triggered = false;
     state.soft_memory = memory_control::Controller::from_env();
     state.last_major_live_bytes = 0;
     state.last_major_mark_work = 0;
     state.pacer = pacer::Sampler::default();
-    state.pacer_trigger = 1024 * 1024;
     assist::reset();
     state.young_allocated_bytes = 0;
     state.nursery_policy = nursery::Policy::from_env();

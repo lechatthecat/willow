@@ -2,6 +2,56 @@
 //! unavailable CPU measurements never masquerade as zero-cost marking.
 const MIN_GOAL: u64 = 1024 * 1024;
 
+/// The sole mutable writer of the heap goal and pacing trigger. Allocation
+/// accounting never grants runway; reservation budgets are enforced separately.
+fn publish(state: &mut super::GcState, goal: u64, trigger: u64, reason: &str) {
+    let goal = goal.min(usize::MAX as u64) as usize;
+    let trigger = trigger.min(goal as u64);
+    // Inputs (including live bytes) may change even if the thresholds do not.
+    super::invalidate_external_headroom();
+    if state.threshold_bytes == goal && state.pacer_trigger == trigger {
+        return;
+    }
+    if std::env::var("WILLOW_GC_LOG").is_ok() {
+        eprintln!(
+            "[gc] threshold goal={} trigger={} previous_goal={} previous_trigger={} reason={}",
+            goal, trigger, state.threshold_bytes, state.pacer_trigger, reason
+        );
+    }
+    state.threshold_bytes = goal;
+    state.pacer_trigger = trigger;
+}
+
+pub(super) fn reset_threshold(state: &mut super::GcState) {
+    publish(state, MIN_GOAL, MIN_GOAL, "reset");
+}
+
+pub(super) fn sample_threshold(state: &mut super::GcState) {
+    let input = super::pacer_inputs(state);
+    let decision = state.pacer.decision(input);
+    let goal = state.threshold_bytes as u64;
+    let trigger = goal
+        .saturating_sub(decision.runway)
+        .max(input.live.saturating_add(MIN_GOAL / 4))
+        .min(goal);
+    publish(state, goal, trigger, "allocation_sample");
+}
+
+pub(super) fn complete_threshold(state: &mut super::GcState, previous_goal: u64) {
+    let input = Inputs {
+        previous_goal,
+        ..super::pacer_inputs(state)
+    };
+    let (goal, trigger, reason) = if state.pacer.enabled() {
+        let decision = state.pacer.decision(input);
+        (decision.goal, decision.trigger, "cycle_paced")
+    } else {
+        let goal = input.live.saturating_mul(2).max(MIN_GOAL);
+        (goal, goal, "cycle_fixed")
+    };
+    publish(state, goal, trigger, reason);
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Inputs {
     pub live: u64,
@@ -88,7 +138,12 @@ impl Sampler {
     /// Isolate a minor-GC policy test from concurrent major-GC pacing.
     #[cfg(test)]
     pub(super) fn disable_for_test(&mut self) {
-        self.enabled = false;
+        self.set_enabled_for_test(false);
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_enabled_for_test(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
 
     pub(super) fn sample_due(&self, bytes: u64) -> bool {
@@ -159,6 +214,26 @@ mod tests {
             cpu_capacity: 1,
             active: false,
         }
+    }
+
+    #[test]
+    fn threshold_policy_completion_reset_and_samples() {
+        use super::super::*;
+        let _guard = runtime_test_guard();
+        reset_internal();
+        let mut state = runtime().heap.lock().unwrap();
+        state.pacer.disable_for_test();
+        state.last_major_live_bytes = 3 * MIN_GOAL;
+        complete_threshold(&mut state, MIN_GOAL);
+        assert_eq!(state.threshold_bytes as u64, 6 * MIN_GOAL);
+        assert_eq!(state.pacer_trigger, 6 * MIN_GOAL);
+        sample_threshold(&mut state);
+        assert_eq!(state.threshold_bytes as u64, 6 * MIN_GOAL);
+        reset_threshold(&mut state);
+        assert_eq!(state.threshold_bytes as u64, MIN_GOAL);
+        assert_eq!(state.pacer_trigger, MIN_GOAL);
+        drop(state);
+        reset_internal();
     }
 
     #[test]

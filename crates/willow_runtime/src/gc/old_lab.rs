@@ -294,9 +294,6 @@ fn add_counts(state: &mut GcState, bytes: u64, objects: u64) {
     state.total_allocs = state.total_allocs.saturating_add(objects);
     state.tlab_slow_allocations = state.tlab_slow_allocations.saturating_add(objects);
     state.old_region_allocations = state.old_region_allocations.saturating_add(objects);
-    if state.allocated_bytes >= state.threshold_bytes {
-        state.threshold_bytes = state.threshold_bytes.saturating_mul(2);
-    }
 }
 
 /// Bytes-only merge for allocation-policy checks: one atomic load per buffer,
