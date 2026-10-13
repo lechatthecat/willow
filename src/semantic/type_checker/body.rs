@@ -660,7 +660,40 @@ mod tests {
     }
 
     fn compare(source: &str) -> (TypeChecker, Rc<BodyQueries>, Program) {
-        let mut program = parse(source);
+        compare_program(parse(source))
+    }
+
+    /// Instantiate and expand generic templates the way the driver does
+    /// before body queries run: templates are checked by a checker without
+    /// queries, and only the expanded, template-free program reaches the
+    /// cached body checker (willow-r6v4).
+    fn expand_generics(program: &mut Program) {
+        if !program.items.iter().any(|item| match item {
+            Item::Function(f) => !f.type_params.is_empty(),
+            Item::Class(c) => !c.type_params.is_empty(),
+            _ => false,
+        }) {
+            return;
+        }
+        let mut checker = TypeChecker::new();
+        checker.check_program(program);
+        let mut seen = HashSet::new();
+        while let Some(instance) = checker.generics.pending.pop_front() {
+            let (file, name, kind) = match &instance.item {
+                Item::Function(f) => (f.span.file_id, f.name.clone(), 0u8),
+                Item::Class(c) => (c.span.file_id, c.name.clone(), 1u8),
+                Item::Interface(i) => (i.span.file_id, i.name.clone(), 2u8),
+                Item::Enum(_) => unreachable!(),
+            };
+            if seen.insert((file, name, kind)) {
+                checker.check_generic_instance(instance);
+            }
+        }
+        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        checker.expand_generics(program, &mut generics::FreshIds::default());
+    }
+
+    fn compare_program(mut program: Program) -> (TypeChecker, Rc<BodyQueries>, Program) {
         let queries = queries(&mut program);
         let mut standalone = TypeChecker::new();
         standalone.check_program(&program);
@@ -1262,7 +1295,7 @@ mod tests {
                 continue;
             }
             let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
-            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            let (mut program, errors) = crate::parser::Parser::new(tokens).parse();
             // Module imports need the driver; those examples run in integration.
             if !errors.is_empty()
                 || !program
@@ -1272,11 +1305,47 @@ mod tests {
             {
                 continue;
             }
-            let (checker, _, _) = compare(&source);
+            expand_generics(&mut program);
+            let (checker, _, _) = compare_program(program);
             assert_eq!(checker.inline_lambda_rechecks, 0, "{}", path.display());
             checked += 1;
         }
         assert!(checked >= 10, "only {checked} lambda examples checked");
+    }
+
+    /// Lambdas passed to generic functions (willow-jz15.64) reach the cached
+    /// checker only inside expanded instantiations, as in the driver; the
+    /// per-lambda records must then match inline checking (willow-r6v4).
+    #[test]
+    fn expanded_generic_lambda_calls_match_inline_typing() {
+        let mut program = parse(
+            r#"
+            import std::collections::Array;
+            fn map<T, U>(xs: Array<T>, f: fn(T) -> U) -> Array<U> {
+                let out: Array<U> = [];
+                for x in xs { out.push(f(x)); }
+                return out;
+            }
+            fn apply<T, U>(x: T, f: closure(T) -> U) -> U { return f(x); }
+            fn main() {
+                let k = 3;
+                let ys = map([1, 2], |x| x * 2);
+                let n: i64 = apply(ys[0], |a| apply(a, |b| b + k));
+                let s = map(ys, |y| { if y > 2 { return "big"; } return "small"; });
+                println(n);
+                println(s[0]);
+            }
+        "#,
+        );
+        expand_generics(&mut program);
+        assert!(program.items.iter().all(|item| match item {
+            Item::Function(f) => f.type_params.is_empty(),
+            _ => true,
+        }));
+        let (checker, _, _) = compare_program(program);
+        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        assert_eq!(checker.inline_lambda_rechecks, 0);
+        assert_eq!(checker.lambda_captures.len(), 4);
     }
 
     /// A map whose element types are inferred from a use inside a lambda:
