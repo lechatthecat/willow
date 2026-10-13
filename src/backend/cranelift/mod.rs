@@ -1569,6 +1569,7 @@ struct FuncGen<'a, 'b> {
     /// Source-level owner of diagnostic locations (including class qualification).
     diagnostic_function: String,
     diagnostic_async: bool,
+    overflow_helper_literal: Option<DataId>,
     /// Locals of this function whose address is taken by some `&place`
     /// argument. They are bound to a stack slot at their declaration instead of
     /// to an SSA variable, so the slot exists on every path and is written

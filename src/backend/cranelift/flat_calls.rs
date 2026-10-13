@@ -97,10 +97,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         // An indirect call cannot be cleared by one implementation's summary:
         // any reachable target's panic is this call site's panic.
-        let panic_depth = plan
-            .may_panic
-            .then(|| self.emit_pre_willow_call_panic_depth())
-            .flatten();
+        let panic_depth = if plan.may_panic {
+            self.emit_pre_willow_call_panic_depth()
+        } else {
+            self.emit_stack_helper();
+            None
+        };
         // Descriptor and vtable slots are immutable. Resolve them without an
         // intervening allocation after the prepared arguments are available.
         let fnptr = virtual_slot.map(|slot| self.emit_vtable_slot_load(self_ptr, slot));
@@ -306,6 +308,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let panic_depth = if slots.may_panic {
             self.emit_pre_willow_call_panic_depth()
         } else {
+            self.emit_stack_helper();
             None
         };
         let result_ty = (ret_type != Type::Void).then(|| self.clif_type(&ret_type));

@@ -352,6 +352,9 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_callstack_pop" => ([] -> None);
     // --- debug fault site: source location for runtime-raised faults ---
     NONE; "willow_fault_site_set" => ([Ptr, I64, I64, I64] -> None);
+    // Static UTF-8 name pointer/byte length; ordinary execution only. The
+    // runtime records it only while a task-owned native stack is active.
+    NONE; "willow_stack_helper_set" => ([Ptr, I64] -> None);
     NONE; "willow_trace_site_set" => ([Ptr, I64, Ptr, I64, I64, I64, I32] -> None);
     NONE; "willow_fault_site_clear" => ([] -> None);
     // --- reference debug metadata ---

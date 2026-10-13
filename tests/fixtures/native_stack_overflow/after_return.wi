@@ -1,0 +1,10 @@
+fn bar() { println(7); }
+
+fn foo() {
+    bar();
+    let mut count = 0;
+    while count < 100000 { count = count + 1; }
+    println(count);
+}
+
+async fn main() { foo(); }

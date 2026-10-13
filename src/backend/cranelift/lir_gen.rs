@@ -5069,6 +5069,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// All paths are terminated by the LIR, so the caller must skip its
     /// implicit-return epilogue.
     pub(super) fn emit_lir_function(&mut self, f: &LirFunction) {
+        self.emit_stack_helper();
         self.emit_lir_function_inner(f, None);
     }
 
@@ -8038,6 +8039,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let panic_depth = match unchecked {
             None => self.emit_pre_willow_call_panic_depth(),
             Some(unchecked) => {
+                self.emit_stack_helper();
                 let depth = crate::backend::abi::runtime_symbol("willow_panic_depth")
                     .and_then(|symbol| symbol.ret)
                     .expect("willow_panic_depth returns the depth");
@@ -8076,6 +8078,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_post_willow_call_panic_check(panic_depth);
             return result;
         };
+        // The unchecked closure continuation skips the shared post-call path.
+        self.emit_stack_helper();
         self.emit_sync_cancel_check();
         let checked = self.builder.create_block();
         let done = self.builder.create_block();

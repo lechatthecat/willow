@@ -40,6 +40,15 @@ fn run_bounded(binary: &str, overflow: bool) -> std::process::Output {
 
 #[test]
 fn native_stack_overflow_twenty_call_and_frame_perspectives() {
+    check_call_and_frame_perspectives(false);
+}
+
+#[test]
+fn task_stack_overflow_twenty_call_and_frame_perspectives() {
+    check_call_and_frame_perspectives(true);
+}
+
+fn check_call_and_frame_perspectives(task: bool) {
     let direct = "fn dive(n: i64) -> i64 { if n == 0 { return 0; } return dive(n - 1) + 1; }";
     let mut cases: Vec<(&str, String, String)> = vec![
         ("direct", direct.into(), "dive(depth)".into()),
@@ -66,8 +75,9 @@ fn native_stack_overflow_twenty_call_and_frame_perspectives() {
                 "willow_stack_{id}{}",
                 if cfg!(windows) { ".exe" } else { "" }
             ));
+            let entry = if task { "async fn" } else { "fn" };
             let source = format!(
-                "import std::collections::Array;\n{declarations}\nfn main(args: Array<String>) {{ let depth = args.len() == 0 ? 8 : 1000000; println({call}); }}"
+                "import std::collections::Array;\n{declarations}\n{entry} main(args: Array<String>) {{ let depth = args.len() == 0 ? 8 : 10000000; println({call}); }}"
             );
             fs::write(&source_path, source).unwrap();
             let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
@@ -99,13 +109,122 @@ fn native_stack_overflow_twenty_call_and_frame_perspectives() {
                 "{name} release={release}"
             );
             assert!(!overflow.status.success(), "{name} release={release}");
+            let stderr = String::from_utf8_lossy(&overflow.stderr);
+            let diagnostic = if task {
+                "Willow runtime error: task stack overflow while executing synchronous helper "
+            } else {
+                "Willow runtime error: native stack overflow"
+            };
             assert!(
-                String::from_utf8_lossy(&overflow.stderr)
-                    .contains("Willow runtime error: native stack overflow"),
-                "{name} release={release}: {:?}",
-                overflow
+                stderr.contains(diagnostic),
+                "{name} release={release}: {overflow:?}"
             );
+            if task {
+                assert!(
+                    !stderr.contains("<unknown>"),
+                    "{name} release={release}: {stderr}"
+                );
+                let expected: &[&str] = match name {
+                    "mutual" => &["dive", "other"],
+                    "method" | "static" => &["Dive::run"],
+                    "virtual" | "interface" => &["Dive::run", "invoke"],
+                    "constructor" => &["Dive::init"],
+                    "closure" => &["dive", "$lambda."],
+                    _ => &["dive"],
+                };
+                let helper = stderr.split(diagnostic).nth(1).unwrap();
+                assert!(
+                    expected.iter().any(|name| helper.starts_with(name)),
+                    "{name} release={release}: {stderr}"
+                );
+            }
         }
+    }
+}
+
+// GNU link wrapping injects a real guard-page overflow inside a non-panicking
+// runtime operation after a differently named helper has returned. Other hosts
+// still exercise the portable task/native call-and-frame matrix above.
+#[cfg(target_os = "linux")]
+#[test]
+fn task_stack_overflow_attributes_safepoint_after_callee_return_to_caller() {
+    check_after_return_runtime(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn task_stack_overflow_attributes_cleanup_after_callee_return_to_caller() {
+    check_after_return_runtime(true);
+}
+
+#[cfg(target_os = "linux")]
+fn check_after_return_runtime(cleanup: bool) {
+    for release in [false, true] {
+        let id = unique_test_id();
+        let binary = temp_path(format!("willow_after_return_{id}"));
+        let shim = temp_path(format!("willow_after_return_{id}.c"));
+        fs::write(
+            &shim,
+            include_str!("../fixtures/native_stack_overflow/after_return.c"),
+        )
+        .unwrap();
+        let mut compile = Command::new(env!("CARGO_BIN_EXE_willow"));
+        let source = if cleanup {
+            "tests/fixtures/native_stack_overflow/after_return_cleanup.wi"
+        } else {
+            "tests/fixtures/native_stack_overflow/after_return.wi"
+        };
+        compile.args(["build", source, "-o", &binary]);
+        compile.env("WILLOW_KEEP_OBJECT", "1");
+        if release {
+            compile.arg("--release");
+        }
+        let output = compile.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let shallow = run_bounded(&binary, false);
+        assert!(shallow.status.success(), "release={release}: {shallow:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&shallow.stdout),
+            if cleanup { "7\nvalue\n" } else { "7\n100000\n" }
+        );
+        let object = object_path(&binary);
+        // Acquire the runtime's link lock only after the compiler child exits.
+        let runtime = build_runtime_staticlib(release);
+        let mut linker = Command::new("cc");
+        if cleanup {
+            linker.arg("-DOVERFLOW_CLEANUP");
+        }
+        let link = linker
+            .args(["-O0", "-fno-optimize-sibling-calls", &shim, &object])
+            .arg(runtime.as_ref())
+            .args([
+                "-no-pie",
+                "-lm",
+                "-lpthread",
+                "-ldl",
+                "-Wl,--wrap=willow_stack_helper_set",
+                "-Wl,--wrap=willow_sync_safepoint",
+                "-Wl,--wrap=willow_pop_roots",
+                "-o",
+                &binary,
+            ])
+            .output()
+            .unwrap();
+        assert!(link.status.success(), "{link:?}");
+        let output = run_bounded(&binary, false);
+        fs::remove_file(shim).unwrap();
+        fs::remove_file(object).unwrap();
+        remove_output_artifacts(&binary);
+        assert_eq!(
+            output.status.code(),
+            Some(101),
+            "release={release}: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "Willow runtime error: task stack overflow while executing synchronous helper foo\n",
+            "release={release}"
+        );
     }
 }
 

@@ -372,9 +372,12 @@ impl FuncGen<'_, '_> {
         &mut self,
         callee: &str,
     ) -> Option<cranelift_codegen::ir::Value> {
-        self.user_function_may_panic(callee)
-            .then(|| self.emit_pre_willow_call_panic_depth())
-            .flatten()
+        if self.user_function_may_panic(callee) {
+            self.emit_pre_willow_call_panic_depth()
+        } else {
+            self.emit_stack_helper();
+            None
+        }
     }
 }
 

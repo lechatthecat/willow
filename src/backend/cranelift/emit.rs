@@ -106,10 +106,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if n == 0 {
             return;
         }
-        let pop_id = self.func_id("willow_pop_roots");
-        let pop_ref = self.module.declare_func_in_func(pop_id, self.builder.func);
         let n_val = self.builder.ins().iconst(types::I32, n as i64);
-        self.builder.ins().call(pop_ref, &[n_val]);
+        self.emit_void_runtime_call("willow_pop_roots", &[n_val]);
     }
 
     /// Form an inline `[object (GC ref) | vtable (raw)]` interface value.

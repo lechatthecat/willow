@@ -130,6 +130,7 @@ pub(crate) struct NativeStack {
     root_depth: usize,
     parked_roots: Option<u64>,
     trace: RuntimeStackTrace,
+    overflow_helper: crate::stack_overflow::TaskHelper,
     reference_context: crate::reference_debug::ReferenceCallState,
 }
 
@@ -159,6 +160,7 @@ impl NativeStack {
             stack.poll_granted = 0;
             stack.entry_panic_depth = crate::panic_context::willow_panic_depth();
             stack.trace = RuntimeStackTrace::default();
+            stack.overflow_helper = Some(b"<unknown>");
             stack.reference_context = Default::default();
             stack
         } else {
@@ -221,6 +223,7 @@ impl NativeStack {
             root_depth: 0,
             parked_roots: None,
             trace: RuntimeStackTrace::default(),
+            overflow_helper: Some(b"<unknown>"),
             reference_context: Default::default(),
         })
     }
@@ -261,9 +264,11 @@ impl NativeStack {
             }
             #[cfg(unix)]
             let guard = crate::stack_overflow::replace_guard((*stack).guard.0, (*stack).guard.1);
+            let outer_helper = crate::stack_overflow::replace_task_helper((*stack).overflow_helper);
             // Borrow only the coroutine field: user code accesses the other
             // fields through CURRENT while this activation is suspended.
             let switched = (*std::ptr::addr_of_mut!((*stack).coroutine)).resume(());
+            (*stack).overflow_helper = crate::stack_overflow::replace_task_helper(outer_helper);
             #[cfg(unix)]
             crate::stack_overflow::replace_guard(guard.0, guard.1);
             assert!(matches!(switched, CoroutineResult::Yield(())));
@@ -667,6 +672,7 @@ mod tests {
                 recurse(depth - 1).wrapping_add(std::hint::black_box(padding[0]) as usize)
             }
             unsafe extern "C" fn overflow(_: *mut c_void) -> i32 {
+                crate::stack_overflow::willow_stack_helper_set(b"recurse".as_ptr(), 7);
                 std::hint::black_box(recurse(1_000_000));
                 RUNTIME_POLL_READY
             }
@@ -687,7 +693,7 @@ mod tests {
         assert_eq!(output.status.code(), Some(101), "{output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr)
-                .contains("Willow runtime error: native stack overflow; reduce recursion depth"),
+                .contains("task stack overflow while executing synchronous helper recurse"),
             "{output:?}"
         );
     }
@@ -986,6 +992,53 @@ mod tests {
             "scheduler-context"
         );
         crate::reference_debug::replace_current(saved);
+    }
+
+    #[test]
+    fn task_overflow_names_survive_suspend_peers_and_recycling() {
+        let _guard = crate::gc::runtime_test_guard();
+        const NAMES: [&[u8]; 3] = [b"first", b"second_longer", b"third"];
+        unsafe extern "C" fn poll(frame: *mut c_void) -> i32 {
+            let name = NAMES[frame as usize % NAMES.len()];
+            crate::stack_overflow::willow_stack_helper_set(name.as_ptr(), name.len() as i64);
+            assert!(suspend());
+            assert_eq!(
+                crate::stack_overflow::replace_task_helper(Some(name)),
+                Some(name)
+            );
+            RUNTIME_POLL_READY
+        }
+        unsafe extern "C" fn ready(_: *mut c_void) -> i32 {
+            RUNTIME_POLL_READY
+        }
+        for count in [1, 8, 64] {
+            let mut stacks: Vec<_> = (0..count)
+                .map(|index| NativeStack::acquire(poll, index as *mut c_void))
+                .collect();
+            for (index, stack) in stacks.iter_mut().enumerate() {
+                assert_eq!(
+                    unsafe { NativeStack::resume(&mut **stack) },
+                    RUNTIME_POLL_PREEMPTED
+                );
+                assert_eq!(crate::stack_overflow::replace_task_helper(None), None);
+                assert_eq!(stack.overflow_helper, Some(NAMES[index % NAMES.len()]));
+            }
+            for mut stack in stacks {
+                assert_eq!(
+                    unsafe { NativeStack::resume(&mut *stack) },
+                    RUNTIME_POLL_READY
+                );
+                NativeStack::recycle(stack);
+            }
+            let mut recycled = NativeStack::acquire(ready, std::ptr::null_mut());
+            assert_eq!(recycled.overflow_helper, Some(&b"<unknown>"[..]));
+            assert_eq!(
+                unsafe { NativeStack::resume(&mut *recycled) },
+                RUNTIME_POLL_READY
+            );
+            assert_eq!(crate::stack_overflow::replace_task_helper(None), None);
+            NativeStack::recycle(recycled);
+        }
     }
 
     unsafe extern "C" fn trace_poll(_: *mut c_void) -> i32 {

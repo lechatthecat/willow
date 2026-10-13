@@ -1,0 +1,9 @@
+fn bar() { println(7); }
+
+fn foo() -> String {
+    let value = "value";
+    bar();
+    return value;
+}
+
+async fn main() { println(foo()); }

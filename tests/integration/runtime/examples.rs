@@ -553,6 +553,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "hello from willow-demo\n99\n199\n299\n5\nquiet\n",
         ),
         ("example/native_stack_overflow.wi", "8\n"),
+        ("example/task_stack_overflow.wi", "8\n"),
         ("example/recursion.wi", "3628800\n1024\n6\n"),
         ("example/range_value.wi", "2\n6\n4\n14\n0\n1\n2\n"),
         (

@@ -163,11 +163,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if self.build_mode != BuildMode::Debug {
             return;
         }
-        let clear_id = self.func_id("willow_debug_reference_call_clear");
-        let clear_ref = self
-            .module
-            .declare_func_in_func(clear_id, self.builder.func);
-        self.builder.ins().call(clear_ref, &[]);
+        self.emit_void_runtime_call("willow_debug_reference_call_clear", &[]);
     }
 
     /// Address + length of a declared string literal's raw static UTF-8 bytes,
@@ -414,9 +410,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .callstack_frame_depth
             .checked_sub(1)
             .expect("compiler call-stack frame underflow");
-        let pop_id = self.func_id("willow_callstack_pop");
-        let pop_ref = self.module.declare_func_in_func(pop_id, self.builder.func);
-        self.builder.ins().call(pop_ref, &[]);
+        self.emit_void_runtime_call("willow_callstack_pop", &[]);
     }
 
     pub(super) fn emit_replay_reference_scopes(&mut self) {

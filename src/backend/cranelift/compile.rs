@@ -1937,6 +1937,7 @@ impl UnitCodegenContext<'_> {
             source_file: &self.source_file,
             diagnostic_function: f.name.clone(),
             diagnostic_async: false,
+            overflow_helper_literal: None,
             address_taken: super::lir_address_taken_locals(&lir_fn),
         };
         // A safepoint-free leaf neither roots its GC parameters nor reaches
@@ -2374,6 +2375,7 @@ impl UnitCodegenContext<'_> {
             source_file: &self.source_file,
             diagnostic_function: String::new(),
             diagnostic_async: false,
+            overflow_helper_literal: None,
             // Static initialisers hold no user body, so nothing takes an address.
             address_taken: HashSet::new(),
         };
@@ -2976,6 +2978,7 @@ impl UnitCodegenContext<'_> {
             source_file: &self.source_file,
             diagnostic_function,
             diagnostic_async: false,
+            overflow_helper_literal: None,
             address_taken: super::lir_address_taken_locals(&lir_fn),
         };
         // Instance methods bind a rooted `self`, even for scalar bodies, unless

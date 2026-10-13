@@ -10,8 +10,85 @@ use std::cell::RefCell;
 
 const DIAGNOSTIC: &[u8] = b"Willow runtime error: native stack overflow; reduce recursion depth or use an iterative algorithm\n";
 
+/// Static generated name, copied at task switches; never read through Rust TLS
+/// by a fault handler. `None` distinguishes an OS stack from a task stack.
+pub(crate) type TaskHelper = Option<&'static [u8]>;
+
+const TASK_DIAGNOSTIC: &[u8] =
+    b"Willow runtime error: task stack overflow while executing synchronous helper ";
+
+#[derive(Default)]
+struct DiagnosticState {
+    task: std::sync::atomic::AtomicBool,
+    name: std::sync::atomic::AtomicPtr<u8>,
+    len: std::sync::atomic::AtomicUsize,
+}
+
+impl DiagnosticState {
+    fn replace(&self, helper: TaskHelper) -> TaskHelper {
+        let previous = self.get();
+        self.publish(helper);
+        previous
+    }
+
+    fn publish(&self, helper: TaskHelper) {
+        use std::sync::atomic::Ordering::SeqCst;
+        // A synchronous fault interrupting publication can see an empty name,
+        // but never a new length paired with an old pointer. All bytes are
+        // process-lifetime static data, and only the owning thread writes.
+        self.len.store(0, SeqCst);
+        let name = helper.unwrap_or_default();
+        self.name.store(name.as_ptr().cast_mut(), SeqCst);
+        self.len.store(name.len(), SeqCst);
+        self.task.store(helper.is_some(), SeqCst);
+    }
+
+    fn get(&self) -> TaskHelper {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.task.load(SeqCst) {
+            return None;
+        }
+        let len = self.len.load(SeqCst);
+        Some(if len == 0 {
+            b"<unknown>"
+        } else {
+            // SAFETY: published only from process-lifetime generated literals.
+            unsafe { std::slice::from_raw_parts(self.name.load(SeqCst), len) }
+        })
+    }
+}
+
+pub(crate) fn replace_task_helper(helper: TaskHelper) -> TaskHelper {
+    PROTECTION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|protection| protection.diagnostic().replace(helper))
+    })
+}
+
+/// Record the executing helper outside signal/exception context. Generated
+/// code passes process-lifetime UTF-8 bytes. OS-stack execution stays untagged.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_stack_helper_set(name: *const u8, len: i64) {
+    PROTECTION.with(|slot| {
+        if let Some(protection) = slot.borrow().as_ref() {
+            let state = protection.diagnostic();
+            if state.task.load(std::sync::atomic::Ordering::SeqCst) {
+                let name = if name.is_null() || len <= 0 {
+                    &b"<unknown>"[..]
+                } else {
+                    // SAFETY: the runtime ABI requires static data.
+                    unsafe { std::slice::from_raw_parts(name, len as usize) }
+                };
+                state.publish(Some(name));
+            }
+        }
+    });
+}
+
 thread_local! {
-    // TLS is used only during ordinary initialization and thread teardown.
+    // Rust TLS is used only in ordinary execution, never in fault handlers.
     static PROTECTION: RefCell<Option<platform::Protection>> = const { RefCell::new(None) };
 }
 
@@ -53,6 +130,7 @@ mod platform {
         lower: AtomicUsize,
         upper: AtomicUsize,
         next: *mut ThreadSlot,
+        diagnostic: super::DiagnosticState,
     }
 
     impl ThreadSlot {
@@ -64,6 +142,7 @@ mod platform {
             {
                 return false;
             }
+            self.diagnostic.replace(None);
             self.lower.store(bounds.lower, Ordering::Relaxed);
             self.upper.store(bounds.upper, Ordering::Relaxed);
             self.key.store(key, Ordering::Release);
@@ -185,11 +264,21 @@ mod platform {
                     };
                     if bounds.contains(address) {
                         unsafe {
-                            libc::write(
-                                libc::STDERR_FILENO,
-                                DIAGNOSTIC.as_ptr().cast(),
-                                DIAGNOSTIC.len(),
-                            );
+                            if let Some(name) = slot.diagnostic.get() {
+                                for bytes in [super::TASK_DIAGNOSTIC, name, b"\n"] {
+                                    libc::write(
+                                        libc::STDERR_FILENO,
+                                        bytes.as_ptr().cast(),
+                                        bytes.len(),
+                                    );
+                                }
+                            } else {
+                                libc::write(
+                                    libc::STDERR_FILENO,
+                                    DIAGNOSTIC.as_ptr().cast(),
+                                    DIAGNOSTIC.len(),
+                                );
+                            }
                             libc::_exit(101);
                         }
                     }
@@ -276,6 +365,7 @@ mod platform {
             lower: AtomicUsize::new(bounds.lower),
             upper: AtomicUsize::new(bounds.upper),
             next: SLOTS.load(Ordering::Relaxed),
+            diagnostic: Default::default(),
         }));
         SLOTS.store(node, Ordering::Release);
         Ok(node)
@@ -365,6 +455,10 @@ mod platform {
     }
 
     impl Protection {
+        pub(super) fn diagnostic(&self) -> &super::DiagnosticState {
+            unsafe { &(*self.slot).diagnostic }
+        }
+
         pub(super) fn replace_guard(&self, lower: usize, upper: usize) -> (usize, usize) {
             let slot = unsafe { &*self.slot };
             let previous = (
@@ -589,6 +683,9 @@ mod platform {
                     libc::signal(libc::SIGSEGV, custom_handler as *const () as usize);
                 }
                 super::super::protect_current_thread();
+                // Even during a named task, synthetic/non-guard faults belong
+                // to the host handler rather than the overflow diagnostic.
+                super::super::replace_task_helper(Some(b"task_helper"));
                 for _ in 0..2 {
                     assert_eq!(unsafe { libc::raise(libc::SIGSEGV) }, 0);
                 }
@@ -719,6 +816,7 @@ mod platform {
                 lower: AtomicUsize::new(0),
                 upper: AtomicUsize::new(0),
                 next: ptr::null_mut(),
+                diagnostic: Default::default(),
             };
             assert!(slot.claim(2, bounds));
             assert!(!slot.claim(3, bounds));
@@ -742,6 +840,7 @@ mod platform {
     use super::DIAGNOSTIC;
 
     const STATUS_STACK_OVERFLOW: u32 = 0xc00000fd;
+    static TLS_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 
     // Only the initial, ABI-stable exception code is inspected.
     #[repr(C)]
@@ -757,6 +856,9 @@ mod platform {
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        fn TlsAlloc() -> u32;
+        fn TlsSetValue(index: u32, value: *const c_void) -> i32;
+        fn TlsGetValue(index: u32) -> *mut c_void;
         fn SetThreadStackGuarantee(bytes: *mut u32) -> i32;
         fn AddVectoredExceptionHandler(
             first: u32,
@@ -779,13 +881,30 @@ mod platform {
         if unsafe { (*(*info).record).code } == STATUS_STACK_OVERFLOW {
             unsafe {
                 let mut written = 0;
-                WriteFile(
-                    GetStdHandle(-12i32 as u32),
-                    DIAGNOSTIC.as_ptr().cast(),
-                    DIAGNOSTIC.len() as u32,
-                    &mut written,
-                    ptr::null_mut(),
-                );
+                let index = TLS_INDEX.load(std::sync::atomic::Ordering::Acquire);
+                let state = if index == u32::MAX {
+                    ptr::null_mut()
+                } else {
+                    TlsGetValue(index)
+                };
+                let helper = state
+                    .cast::<super::DiagnosticState>()
+                    .as_ref()
+                    .and_then(|state| state.get());
+                let parts: &[&[u8]] = if let Some(name) = helper {
+                    &[super::TASK_DIAGNOSTIC, name, b"\n"]
+                } else {
+                    &[DIAGNOSTIC]
+                };
+                for bytes in parts {
+                    WriteFile(
+                        GetStdHandle(-12i32 as u32),
+                        bytes.as_ptr().cast(),
+                        bytes.len() as u32,
+                        &mut written,
+                        ptr::null_mut(),
+                    );
+                }
                 TerminateProcess(GetCurrentProcess(), 101);
                 ExitProcess(101);
             }
@@ -793,9 +912,24 @@ mod platform {
         0 // EXCEPTION_CONTINUE_SEARCH: preserve unrelated exception handling.
     }
 
-    pub(super) struct Protection;
+    pub(super) struct Protection(Box<super::DiagnosticState>);
+
+    impl Drop for Protection {
+        fn drop(&mut self) {
+            unsafe {
+                TlsSetValue(
+                    TLS_INDEX.load(std::sync::atomic::Ordering::Acquire),
+                    ptr::null(),
+                );
+            }
+        }
+    }
 
     impl Protection {
+        pub(super) fn diagnostic(&self) -> &super::DiagnosticState {
+            &self.0
+        }
+
         pub(super) fn new() -> Result<Self, String> {
             // A guarantee is thread-lifetime OS state. Windows only increases
             // an existing guarantee, so no previous reservation is destroyed.
@@ -809,6 +943,11 @@ mod platform {
             static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
             INSTALLED
                 .get_or_init(|| {
+                    let index = unsafe { TlsAlloc() };
+                    if index == u32::MAX {
+                        return Err("TlsAlloc for overflow diagnostics failed".into());
+                    }
+                    TLS_INDEX.store(index, std::sync::atomic::Ordering::Release);
                     if unsafe { AddVectoredExceptionHandler(1, exception_handler) }.is_null() {
                         Err(format!(
                             "AddVectoredExceptionHandler: {}",
@@ -819,18 +958,84 @@ mod platform {
                     }
                 })
                 .clone()?;
-            Ok(Self)
+            let state = Box::<super::DiagnosticState>::default();
+            if unsafe {
+                TlsSetValue(
+                    TLS_INDEX.load(std::sync::atomic::Ordering::Acquire),
+                    (&*state as *const super::DiagnosticState).cast(),
+                )
+            } == 0
+            {
+                return Err("TlsSetValue for overflow diagnostics failed".into());
+            }
+            Ok(Self(state))
         }
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod platform {
-    pub(super) struct Protection;
+    pub(super) struct Protection(super::DiagnosticState);
 
     impl Protection {
+        pub(super) fn diagnostic(&self) -> &super::DiagnosticState {
+            &self.0
+        }
         pub(super) fn new() -> Result<Self, String> {
             Err("native stack overflow diagnostics are unsupported on this target".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn task_names_are_static_and_native_stacks_remain_untagged() {
+        let state = DiagnosticState::default();
+        assert_eq!(state.get(), None);
+        assert_eq!(state.replace(Some(b"first")), None);
+        assert_eq!(state.replace(Some(b"second-longer")), Some(&b"first"[..]));
+        assert_eq!(state.replace(None), Some(&b"second-longer"[..]));
+        assert_eq!(state.get(), None);
+        assert_eq!(state.replace(Some(b"")), None);
+        assert_eq!(state.get(), Some(&b"<unknown>"[..]));
+    }
+
+    #[test]
+    fn helper_publication_preserves_native_and_handles_empty_names() {
+        protect_current_thread();
+        let previous = replace_task_helper(None);
+        willow_stack_helper_set(b"not-a-task".as_ptr(), 10);
+        assert_eq!(replace_task_helper(Some(b"initial")), None);
+        for (pointer, len) in [
+            (std::ptr::null(), 12),
+            (b"ignored".as_ptr(), 0),
+            (b"ignored".as_ptr(), -1),
+        ] {
+            willow_stack_helper_set(pointer, len);
+            assert_eq!(
+                replace_task_helper(Some(b"initial")),
+                Some(&b"<unknown>"[..])
+            );
+        }
+        willow_stack_helper_set("補助関数".as_ptr(), "補助関数".len() as i64);
+        assert_eq!(replace_task_helper(previous), Some("補助関数".as_bytes()));
+    }
+
+    #[test]
+    fn repeated_publication_retains_only_one_static_name() {
+        // Deterministic increasing counts: no history, copying, or growth with
+        // recursion/call count or name length. Pointer identity proves reuse.
+        let state = DiagnosticState::default();
+        for count in [1, 16, 256, 4096] {
+            for _ in 0..count {
+                state.replace(Some(b"recursive_helper"));
+            }
+            let name = state.get().unwrap();
+            assert_eq!(name.as_ptr(), b"recursive_helper".as_ptr());
+            assert_eq!(name.len(), 16);
         }
     }
 }

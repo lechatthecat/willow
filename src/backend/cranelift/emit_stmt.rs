@@ -933,6 +933,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .unwrap_or_else(|| panic!("backend: undeclared runtime symbol `{name}`"));
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let args = args(self);
+        // NONE does not mean stack-free: safepoints and cleanup still enter
+        // Rust. Restore the executing caller after any preceding user call,
+        // including late argument evaluation. MAY_PANIC already publishes via
+        // its pre-call bracket. Never recursively instrument the marker itself.
+        if !may_panic && name != "willow_stack_helper_set" {
+            self.emit_stack_helper();
+        }
         let call = self.builder.ins().call(fref, &args);
         let result = self.builder.inst_results(call).first().copied();
         assert!(
@@ -985,11 +992,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         Some(reusable.unwrap_or_else(|| self.emit_value_runtime_call("willow_panic_depth", &[])))
     }
 
+    /// Publish a synchronous helper in every build mode, independently of
+    /// recoverable-panic effects and debug source-location policy.
+    pub(super) fn emit_stack_helper(&mut self) {
+        // Overflow names are independent of debug/panic source locations.
+        // Publish before a potentially stack-consuming call, including release
+        // synchronous code. The handler consumes only static bytes.
+        if !self.diagnostic_async && !self.diagnostic_function.is_empty() {
+            // Cache the literal lookup per function: long names must not be
+            // cloned/hashed again at every call or duplicated cleanup exit.
+            let data = *self
+                .overflow_helper_literal
+                .get_or_insert_with(|| self.string_literals[&self.diagnostic_function].bytes);
+            let global = self.module.declare_data_in_func(data, self.builder.func);
+            let pointer = self
+                .builder
+                .ins()
+                .symbol_value(reference_type(self.module.target_config()), global);
+            let length = self
+                .builder
+                .ins()
+                .iconst(types::I64, self.diagnostic_function.len() as i64);
+            self.emit_void_runtime_call("willow_stack_helper_set", &[pointer, length]);
+        }
+    }
+
     /// Publish the executing function and location before a call that can raise.
     /// Debug builds retain the synchronous leaf; async tasks retain their own
-    /// location in every mode. Release synchronous code publishes nothing: its
-    /// faults are location-free (willow-s9ej.7), and a hot loop must not pay a
-    /// runtime call per raising operation (willow-9686). An async site cannot
+    /// location in every mode. Release synchronous code publishes only the
+    /// separate overflow name: ordinary faults remain location-free
+    /// (willow-s9ej.7), without the full trace-site call (willow-9686). An async site cannot
     /// leak into it because the runtime drops the fault location when async
     /// code enters a Willow call and at every poll boundary.
     pub(super) fn emit_fault_site(&mut self) {
@@ -999,6 +1031,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// [`Self::emit_fault_site`]; `enters_willow` marks a call into generated
     /// code, which publishes its own fault location if it has one.
     fn emit_fault_site_for(&mut self, enters_willow: bool) {
+        self.emit_stack_helper();
         if self.diagnostic_function.is_empty()
             || (self.build_mode != BuildMode::Debug && !self.diagnostic_async)
         {
@@ -1043,6 +1076,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         depth_before: Option<cranelift_codegen::ir::Value>,
     ) {
+        // The callee's marker must not survive its return, even if there is
+        // no panic/cancellation branch on the continuation.
+        self.emit_stack_helper();
         // Cancellation is sticky even through functions whose panic summary
         // is empty, and is intentionally independent of recoverable panics.
         self.emit_sync_cancel_check();
