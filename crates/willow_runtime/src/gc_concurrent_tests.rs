@@ -2466,7 +2466,9 @@ fn native_stack_root_transfers_publish_during_initial_handshake() {
     for resume_during_mark in [false, true] {
         reset_internal_for_test();
         let mut root = willow_alloc_typed(8, 1);
-        let child = willow_alloc(8);
+        // A traced child takes a queue job; a pointer-free leaf would be
+        // marked inline and break the one-job-per-mark accounting below.
+        let child = willow_alloc_typed(8, 1);
         unsafe {
             store_gc_reference(root.cast(), child);
         }

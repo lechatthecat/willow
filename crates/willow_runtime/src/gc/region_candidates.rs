@@ -9,6 +9,9 @@ pub(super) struct RegionCandidates {
     // Runtime-assigned region indices need no SipHash (see `id_hash`).
     entries: IdMap<usize, ((usize, usize), usize)>,
     largest: Option<(usize, usize)>,
+    // Emptied bucket storage. Every old-region allocation re-keys its region
+    // under a smaller span; reusing the buffer keeps that allocation-free.
+    spare: Option<Vec<usize>>,
 }
 
 impl RegionCandidates {
@@ -26,7 +29,11 @@ impl RegionCandidates {
             assert_eq!(existing, key, "candidate must be removed before resizing");
             return false;
         }
-        let bucket = self.buckets.entry(bytes).or_default();
+        let spare = &mut self.spare;
+        let bucket = self
+            .buckets
+            .entry(bytes)
+            .or_insert_with(|| spare.take().unwrap_or_default());
         self.entries.insert(index, (key, bucket.len()));
         bucket.push(index);
         self.refresh();
@@ -47,7 +54,7 @@ impl RegionCandidates {
             self.entries.get_mut(&moved).unwrap().1 = position;
         }
         if bucket.is_empty() {
-            self.buckets.remove(&key.0);
+            self.spare = self.buckets.remove(&key.0);
         }
         self.refresh();
         true

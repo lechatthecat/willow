@@ -73,8 +73,16 @@ unsafe extern "C" fn consumer(frame: *mut c_void) -> i32 {
     sample
         .latency
         .store(elapsed.saturating_sub(published).max(1), Ordering::Release);
+    // A stale retry crosses this round's publication once it follows the
+    // round's first wake: that wake is what changed the generation. The worker
+    // may then poll any task of the burst, including one published after its
+    // retry, so comparing against this task's own timestamp would make the
+    // check depend on which task it happens to claim first.
+    let round_start = probe.samples[index - index % probe.burst]
+        .published
+        .load(Ordering::Acquire);
     sample.crossed_stale_retry.store(
-        stale.is_some_and(|s| s.duration_since(probe.start).as_nanos() >= u128::from(published)),
+        stale.is_some_and(|s| s.duration_since(probe.start).as_nanos() >= u128::from(round_start)),
         Ordering::Release,
     );
     RUNTIME_POLL_READY

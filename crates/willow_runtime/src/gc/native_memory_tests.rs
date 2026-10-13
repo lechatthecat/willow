@@ -86,13 +86,16 @@ fn short_lived_string_churn_bounds_reservations_and_rss() {
     }
     #[cfg(target_os = "linux")]
     {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        // SAFETY: getrusage writes the entire result on success.
-        assert_eq!(
-            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
-            0
-        );
-        let peak_kib = unsafe { usage.assume_init() }.ru_maxrss;
+        // `getrusage` maxrss also keeps the high-water mark of the image this
+        // process replaced at exec; spawned from a busy test harness, that is
+        // the parent's RSS. `VmHWM` belongs to this process's own address space.
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let peak_kib: u64 = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.trim().strip_suffix("kB"))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("VmHWM in /proc/self/status");
         assert!(peak_kib < 64 * 1024, "peak RSS KiB={peak_kib}");
         println!("string_churn peak_rss_kib={peak_kib}");
     }

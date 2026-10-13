@@ -2039,40 +2039,49 @@ mod tests {
         let program = program(
             r#"fn f() -> String { return format("{}:{}", gc_allocated_bytes(), gc_allocated_bytes()); }"#,
         );
-        let kinds: Vec<_> = program.functions[0]
+        // Every operand and literal segment is evaluated in source order.
+        // String-concat fusion (willow-8hq4.29) then formats the `{i64}`
+        // segments straight into one sized result instead of allocating each
+        // piece, so only the final concatenation follows the operands.
+        let mut kinds = Vec::new();
+        let mut segments = Vec::new();
+        for inst in program.functions[0]
             .blocks
             .iter()
             .flat_map(|block| &block.instrs)
-            .filter_map(|inst| match inst {
-                SourceInst::Compute {
-                    value: LirRvalue::BuiltinCall { .. },
+        {
+            let SourceInst::Compute { local, value, .. } = inst else {
+                continue;
+            };
+            match value {
+                LirRvalue::BuiltinCall { .. } => {
+                    kinds.push("call");
+                    segments.push(*local);
+                }
+                LirRvalue::StringLiteral(_) => {
+                    kinds.push("literal");
+                    segments.push(*local);
+                }
+                LirRvalue::FormatScalar { .. } => kinds.push("format"),
+                LirRvalue::Binary {
+                    operand_ty: Type::String,
                     ..
-                } => Some("call"),
-                SourceInst::Compute {
-                    value: LirRvalue::FormatScalar { .. },
-                    ..
-                } => Some("format"),
-                SourceInst::Compute {
-                    value: LirRvalue::StringLiteral(_),
-                    ..
-                } => Some("literal"),
-                SourceInst::Compute {
-                    value:
-                        LirRvalue::Binary {
-                            operand_ty: Type::String,
-                            ..
-                        },
-                    ..
-                } => Some("concat"),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            kinds,
-            [
-                "call", "format", "literal", "concat", "call", "format", "concat"
-            ]
-        );
+                } => kinds.push("concat"),
+                LirRvalue::StringConcat { parts, .. } => {
+                    kinds.push("concat");
+                    let parts: Vec<_> = parts
+                        .iter()
+                        .map(|part| match part {
+                            LirOperand::Local(local) => *local,
+                            other => panic!("unexpected part {other:?}"),
+                        })
+                        .collect();
+                    assert_eq!(parts, segments, "segments keep source order");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(kinds, ["call", "literal", "call", "concat"]);
     }
 
     #[test]

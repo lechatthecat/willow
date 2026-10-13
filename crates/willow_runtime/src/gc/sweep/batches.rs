@@ -1398,7 +1398,14 @@ mod tests {
                 stalls.last().unwrap(),
                 report
             );
-            assert!(report.heap_holds <= report.objects + 2 * (mib + 1) as u64);
+            // Background batches hold the heap at most once per object plus
+            // twice per MiB of partial progress. Each allocation assist adds
+            // one bounded hold; slower runners overlap more allocations with
+            // the sweep, so assists vary with the machine, not with heap size.
+            assert!(
+                report.heap_holds <= report.objects + 2 * (mib + 1) as u64 + report.assists,
+                "{report:?}"
+            );
             willow_pop_root();
         }
         reset_internal_for_test();

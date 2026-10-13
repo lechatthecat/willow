@@ -15,6 +15,26 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/canonical_identity.wi", "42\n"),
         ("example/imported_interface_default.wi", "42\n"),
         (
+            "example/interface_default_receiver_names.wi",
+            "provider point\n1019\nprovider point\n1007\n",
+        ),
+        (
+            "example/interface_default_receiver_signatures.wi",
+            "109\n101\n",
+        ),
+        (
+            "example/interface_qualified_self_reference.wi",
+            "36\n16\n25\n",
+        ),
+        (
+            "example/interface_default_self_signature.wi",
+            "beta\nbeta\n14\n12\nbeta\n",
+        ),
+        (
+            "example/generic_interface_default_self.wi",
+            "300\n3\n[tank]\nfull\n[sign]\n",
+        ),
+        (
             "example/imported_generic_interface_default.wi",
             "20\n27\n7\nwillow\n",
         ),
@@ -1524,6 +1544,11 @@ fn test_october_ci_catalog_additions() {
                 | "example/canonical_identity.wi"
                 | "example/imported_interface_default.wi"
                 | "example/imported_generic_interface_default.wi"
+                | "example/interface_default_receiver_names.wi"
+                | "example/interface_default_receiver_signatures.wi"
+                | "example/interface_qualified_self_reference.wi"
+                | "example/interface_default_self_signature.wi"
+                | "example/generic_interface_default_self.wi"
                 | "example/lock_imported_effects/main.wi"
                 | "example/module_generic_members/main.wi"
                 | "example/semantic_generic_queries.wi"
