@@ -397,3 +397,88 @@ fn async_mut_scalar_reference_sync_import_overlap() {
         }
     }
 }
+
+const SCOPED_EXAMPLE: &str = include_str!("../../../example/async_scoped_borrow.wi");
+
+#[test]
+fn async_scoped_borrow_example() {
+    let (out, ok) = compile_and_run(SCOPED_EXAMPLE);
+    assert!(ok, "{out}");
+    assert_eq!(out, "40\n80\n3\n42\n");
+}
+
+#[test]
+fn async_scoped_borrow_release_and_gc() {
+    let (out, ok) = compile_and_run_release(SCOPED_EXAMPLE);
+    assert!(ok, "{out}");
+    assert_eq!(out, "40\n80\n3\n42\n");
+    for mode in ["minor", "all", "relocate"] {
+        let (out, ok) = compile_and_run_gc_stress_mode(SCOPED_EXAMPLE, mode);
+        assert!(ok, "{mode}: {out}");
+        assert_eq!(out, "40\n80\n3\n42\n");
+    }
+}
+
+#[test]
+fn async_scoped_borrow_scalar_paths() {
+    for (ty, initial, updated, expected) in SCALARS {
+        for nested in [false, true] {
+            let scope = if nested {
+                "let c = s.child();"
+            } else {
+                "let c = TaskScope::new();"
+            };
+            let finish = if nested {
+                "await s.finish();"
+            } else {
+                "await c.finish();"
+            };
+            let source = format!(
+                "async fn update(x: &mut {ty}) {{ await sleep(1); x = {updated}; }} async fn read(x: &{ty}) -> {ty} {{ await sleep(1); return x; }} async fn main() {{ let mut x = {initial}; let s = TaskScope::new(); {scope} c.add(update(&x)); {finish} let y = await read(&x); println(y); }}"
+            );
+            let (out, ok) = compile_and_run(&source);
+            assert!(ok, "{source}\n{out}");
+            assert_eq!(out, expected);
+        }
+    }
+}
+
+#[test]
+fn async_scoped_borrow_return_rejected() {
+    for ret in [
+        "return read(&x);",
+        "let t = read(&x); return t;",
+        "let s = TaskScope::new(); return s.add(read(&x));",
+    ] {
+        let errors = compile_error_stderr(&format!(
+            "async fn read(x: &i64) -> i64 {{ return x; }} fn escape(x: &i64) -> Task<i64> {{ {ret} }} fn main() {{}}"
+        ));
+        assert!(errors.contains("E1708"), "{ret}: {errors}");
+    }
+}
+
+#[test]
+fn async_scoped_borrow_heap_and_imported_forwarding() {
+    let source = "import std::collections::Array;
+        class Box { pub value: i64; pub async fn read(self, x: &i64) -> i64 { await sleep(1); gc_collect(); return x; } }
+        async fn update(x: &mut i64) { await sleep(1); gc_collect(); x = x + 1; }
+        async fn main() { let b = new Box(40); let values: Array<i64> = [41]; let s = TaskScope::new(); let c = s.child(); c.add(update(&values[0])); let t = s.add(b.read(&b.value)); await s.finish(); println(await t); println(values[0]); }";
+    let (out, ok) = compile_and_run_gc_stress_mode(source, "relocate");
+    assert!(ok, "{out}");
+    assert_eq!(out, "40\n42\n");
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "worker.wi",
+                "module worker; async fn update(x: &mut i64) { await sleep(1); x = x + 1; } pub async fn scoped(x: &mut i64) { let s = TaskScope::new(); let c = s.child(); c.add(update(&x)); await s.finish(); }",
+            ),
+            (
+                "main.wi",
+                "import worker::scoped; async fn main() { let mut x = 41; let s = TaskScope::new(); s.add(scoped(&x)); await s.finish(); println(x); }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}

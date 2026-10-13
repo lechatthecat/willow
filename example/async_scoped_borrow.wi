@@ -1,0 +1,38 @@
+// Borrowed tasks join before their owning lexical block ends.
+async fn read(value: &i64) -> i64 {
+    await sleep(1);
+    return value;
+}
+
+async fn increment(value: &mut i64) {
+    await sleep(1);
+    value = value + 1;
+}
+
+async fn main() {
+    let value = 40;
+    let direct = await read(&value);
+    println(direct);
+
+    let scope = TaskScope::new();
+    let child = scope.child();
+    let first = scope.add(read(&value));
+    let pending = read(&value);
+    let second = child.add(pending);
+    let mut counter = 1;
+    child.add(increment(&counter));
+    await scope.finish();
+    println(await first + await second);
+    await increment(&counter);
+    println(counter);
+
+    let parent = TaskScope::new();
+    if true {
+        let local = 42;
+        let nested = parent.child();
+        let task = nested.add(read(&local));
+        await nested.finish();
+        println(await task);
+    }
+    await parent.finish();
+}

@@ -1,4 +1,5 @@
 //! Conservative lexical discharge proof for tasks holding reference arguments.
+//! Direct awaits and locally tracked TaskScope joins discharge captured loans.
 //! Shared and mutable scalar declarations are supported; this pass still rejects task
 //! escape independently of the declaration restrictions for other references.
 use std::collections::{HashMap, HashSet};
@@ -153,10 +154,10 @@ impl Checker<'_> {
         let mut diagnostic = Diagnostic::new(
             Severity::Error, ErrorCode::E1708,
             "async reference borrow escapes its discharge block",
-        ).with_label(Label::primary(span, "task must be awaited directly in its originating block"))
+        ).with_label(Label::primary(span, "task must be awaited or joined by its scope in its originating block"))
          .with_label(Label::secondary(task.origin, "task captures reference arguments here"))
          .with_label(Label::secondary(task.block, "borrow discharge block"))
-         .with_help("await the call directly, or bind its task locally and await it in the same block before any transfer or exit");
+         .with_help("await the task or its owning TaskScope.finish() in the same block before any transfer or exit");
         for &(reference, mutable) in &task.references {
             diagnostic = diagnostic.with_label(Label::secondary(
                 reference,
@@ -179,6 +180,7 @@ impl Checker<'_> {
         let mut statements = Vec::new();
         let mut callable = 0usize;
         let mut loops = 0usize;
+        let mut deferred = 0usize;
         for event in AstWalk::new(root) {
             count_event();
             match event {
@@ -190,6 +192,7 @@ impl Checker<'_> {
                             span,
                             scope: state.scopes.len(),
                             pending: HashMap::new(),
+                            scoped: Vec::new(),
                         });
                     }
                 }
@@ -198,7 +201,7 @@ impl Checker<'_> {
                         .blocks
                         .pop_if(|block| block.scope == state.scopes.len())
                     {
-                        for call in block.pending.into_values() {
+                        for call in block.pending.into_values().chain(block.scoped) {
                             state.escape(self, call, block.span);
                         }
                     }
@@ -223,7 +226,14 @@ impl Checker<'_> {
                     let mut statement = StatementState {
                         allowed_call: None,
                         new_binding: None,
+                        scope_binding: None,
+                        scope_receiver: None,
+                        transferred: None,
+                        attach: None,
                     };
+                    if matches!(stmt, Stmt::Defer(_)) {
+                        deferred += 1;
+                    }
                     let block_span = state.blocks.last().map_or(boundary, |b| b.span);
                     if let Stmt::Let(binding) = stmt {
                         let old = state
@@ -241,7 +251,7 @@ impl Checker<'_> {
                                 .map(|(name, _, _)| state.place_key(name))
                                 .collect();
                             statement.new_binding = Some(PendingBinding {
-                                name: binding.name.as_str(),
+                                name: Some(binding.name.as_str()),
                                 task,
                                 keys,
                             });
@@ -253,6 +263,17 @@ impl Checker<'_> {
                         Stmt::Return(s) => s.value.as_ref(),
                         _ => None,
                     };
+                    if deferred == 0 {
+                        state.prepare_scope(
+                            self,
+                            stmt,
+                            root,
+                            &mut statement,
+                            callable,
+                            loops,
+                            block_span,
+                        );
+                    }
                     if let Some(Expr::Await(wait)) = root {
                         let operand = match &wait.expr {
                             Expr::MethodCall(c)
@@ -281,7 +302,10 @@ impl Checker<'_> {
                     statements.push(statement);
                     match stmt {
                         Stmt::While(_) | Stmt::For(_) => loops += 1,
-                        Stmt::Assign(assign) => state.use_name(self, &assign.name, assign.span),
+                        Stmt::Assign(assign) => {
+                            state.invalidate_scope(self, &assign.name, assign.span);
+                            state.use_name(self, &assign.name, assign.span);
+                        }
                         Stmt::Return(ret) => state.exit(self, callable, None, ret.span),
                         Stmt::Break(span) | Stmt::Continue(span) => {
                             state.exit(self, callable, Some(loops), *span)
@@ -293,12 +317,20 @@ impl Checker<'_> {
                     if matches!(stmt, Stmt::While(_) | Stmt::For(_)) {
                         loops -= 1;
                     }
-                    if let Some(PendingBinding { name, task, keys }) =
-                        statements.pop().unwrap().new_binding
-                    {
+                    if matches!(stmt, Stmt::Defer(_)) {
+                        deferred -= 1;
+                    }
+                    let statement = statements.pop().unwrap();
+                    if let Some((name, scope)) = statement.scope_binding {
+                        let binding = state.names[name].last().unwrap().0;
+                        state.scope_bindings.insert(binding, scope);
+                    }
+                    if let Some(PendingBinding { name, task, keys }) = statement.new_binding {
                         let call = task.call;
-                        state.blocks.last_mut().unwrap().pending.insert(name, call);
-                        state.names.get_mut(name).unwrap().last_mut().unwrap().1 = Some(call);
+                        if let Some(name) = name {
+                            state.blocks.last_mut().unwrap().pending.insert(name, call);
+                            state.names.get_mut(name).unwrap().last_mut().unwrap().1 = Some(call);
+                        }
                         state.by_callable.entry(callable).or_default().insert(call);
                         state
                             .by_loop
@@ -308,11 +340,27 @@ impl Checker<'_> {
                         state.retain_places(&task, keys);
                         state.active.insert(call, (task, callable, loops));
                     }
+                    if let Some((scope, call, binding)) = statement.attach {
+                        state.task_scopes[scope].tasks.push(call);
+                        state.blocks.last_mut().unwrap().scoped.push(call);
+                        if let Some(name) = binding {
+                            state.blocks.last_mut().unwrap().pending.insert(name, call);
+                            state.names.get_mut(name).unwrap().last_mut().unwrap().1 = Some(call);
+                        }
+                    }
                 }
                 AstEvent::Expr(expr) => {
                     match expr {
                         Expr::Lambda(_) => callable += 1,
-                        Expr::Var(name, span, _) => state.use_name(self, name, *span),
+                        Expr::Var(name, span, id) => {
+                            let statement = statements.last();
+                            if statement.and_then(|s| s.scope_receiver) != Some(*id) {
+                                state.invalidate_scope(self, name, *span);
+                            }
+                            if statement.and_then(|s| s.transferred) != Some(*id) {
+                                state.use_name(self, name, *span);
+                            }
+                        }
                         Expr::TryPropagate(_, span, _) => state.exit(self, callable, None, *span),
                         _ => {}
                     }
@@ -358,18 +406,25 @@ struct BlockState<'a> {
     span: Span,
     scope: usize,
     pending: HashMap<&'a str, ExprId>,
+    scoped: Vec<ExprId>,
 }
 struct StatementState<'a> {
     allowed_call: Option<ExprId>,
     new_binding: Option<PendingBinding<'a>>,
+    scope_binding: Option<(&'a str, usize)>,
+    scope_receiver: Option<ExprId>,
+    transferred: Option<ExprId>,
+    attach: Option<(usize, ExprId, Option<&'a str>)>,
 }
 struct PendingBinding<'a> {
-    name: &'a str,
+    name: Option<&'a str>,
     task: BorrowedTask,
     keys: Vec<(usize, String)>,
 }
 #[derive(Default)]
 struct WalkState<'a> {
+    scope_bindings: HashMap<usize, usize>,
+    task_scopes: Vec<TaskScopeState>,
     scopes: Vec<Vec<&'a str>>,
     names: HashMap<&'a str, Vec<(usize, Option<ExprId>)>>,
     next_binding: usize,
@@ -379,6 +434,13 @@ struct WalkState<'a> {
     active: HashMap<ExprId, (BorrowedTask, usize, usize)>,
     by_callable: HashMap<usize, HashSet<ExprId>>,
     by_loop: HashMap<(usize, usize), HashSet<ExprId>>,
+}
+struct TaskScopeState {
+    children: Vec<usize>,
+    tasks: Vec<ExprId>,
+    open: bool,
+    callable: usize,
+    loops: usize,
 }
 #[derive(Default)]
 struct PlaceLoans {
@@ -415,7 +477,168 @@ impl LoanSet {
     }
 }
 
-impl WalkState<'_> {
+impl<'a> WalkState<'a> {
+    fn scope_named(&self, name: &str) -> Option<usize> {
+        let binding = self.names.get(name)?.last()?.0;
+        self.scope_bindings.get(&binding).copied()
+    }
+
+    fn scope_receiver(
+        &self,
+        checker: &Checker<'_>,
+        expr: &Expr,
+        callable: usize,
+        loops: usize,
+    ) -> Option<usize> {
+        let Expr::Var(name, _, _) = expr else {
+            return None;
+        };
+        if builtin_types::resolve(checker.types.get(&expr.id())?)?.id != BuiltinTypeId::TaskScope {
+            return None;
+        }
+        let scope = self.scope_named(name)?;
+        let node = &self.task_scopes[scope];
+        (node.open && node.callable == callable && node.loops == loops).then_some(scope)
+    }
+
+    // Each scope edge and registration is drained at most once. Finishing a
+    // parent includes descendants; a conditional finish cannot discharge a
+    // task originating outside the current lexical block.
+    fn drain_scope(
+        &mut self,
+        checker: &mut Checker<'_>,
+        scope: usize,
+        finish: Option<Span>,
+        span: Span,
+    ) {
+        let mut work = vec![scope];
+        while let Some(scope) = work.pop() {
+            count_scope_work();
+            let node = &mut self.task_scopes[scope];
+            node.open = false;
+            work.append(&mut node.children);
+            let tasks = std::mem::take(&mut node.tasks);
+            for call in tasks {
+                count_scope_work();
+                if finish.is_some_and(|block| {
+                    self.active
+                        .get(&call)
+                        .is_some_and(|(task, _, _)| task.block == block)
+                }) {
+                    self.remove(call);
+                } else {
+                    self.escape(checker, call, span);
+                }
+            }
+        }
+    }
+
+    fn invalidate_scope(&mut self, checker: &mut Checker<'_>, name: &str, span: Span) {
+        if let Some(scope) = self.scope_named(name) {
+            self.drain_scope(checker, scope, None, span);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_scope(
+        &mut self,
+        checker: &mut Checker<'_>,
+        stmt: &'a Stmt,
+        root: Option<&'a Expr>,
+        statement: &mut StatementState<'a>,
+        callable: usize,
+        loops: usize,
+        block: Span,
+    ) {
+        let binding = match stmt {
+            Stmt::Let(s) => Some(s.name.as_str()),
+            _ => None,
+        };
+        let Some(root) = root else {
+            return;
+        };
+        if let Some(name) = binding
+            && matches!(root, Expr::StaticCall(c) if c.class == "TaskScope" && c.method == "new" && c.args.is_empty())
+        {
+            let scope = self.task_scopes.len();
+            self.task_scopes.push(TaskScopeState {
+                children: Vec::new(),
+                tasks: Vec::new(),
+                open: true,
+                callable,
+                loops,
+            });
+            statement.scope_binding = Some((name, scope));
+            return;
+        }
+        let awaited = match root {
+            Expr::Await(wait) => Some(&wait.expr),
+            Expr::Match(m) => match &*m.scrutinee {
+                Expr::Await(wait) => Some(&wait.expr),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(Expr::MethodCall(call)) = awaited
+            && call.method == "finish"
+            && call.args.is_empty()
+            && let Some(scope) = self.scope_receiver(checker, &call.object, callable, loops)
+        {
+            statement.scope_receiver = Some(call.object.id());
+            self.drain_scope(checker, scope, Some(block), call.span);
+            return;
+        }
+        let Expr::MethodCall(call) = root else {
+            return;
+        };
+        let Some(scope) = self.scope_receiver(checker, &call.object, callable, loops) else {
+            return;
+        };
+        if call.method == "child"
+            && call.args.is_empty()
+            && let Some(name) = binding
+        {
+            let child = self.task_scopes.len();
+            self.task_scopes.push(TaskScopeState {
+                children: Vec::new(),
+                tasks: Vec::new(),
+                open: true,
+                callable,
+                loops,
+            });
+            self.task_scopes[scope].children.push(child);
+            statement.scope_binding = Some((name, child));
+            statement.scope_receiver = Some(call.object.id());
+        } else if call.method == "add" && call.args.len() == 1 {
+            let arg = &call.args[0].expr;
+            if let Some(task) = checker.borrowed_call(arg, block) {
+                let keys = task
+                    .places
+                    .iter()
+                    .map(|(name, _, _)| self.place_key(name))
+                    .collect();
+                statement.allowed_call = Some(task.call);
+                statement.attach = Some((scope, task.call, binding));
+                statement.new_binding = Some(PendingBinding {
+                    name: None,
+                    task,
+                    keys,
+                });
+            } else if let Expr::Var(name, _, _) = arg
+                && let Some(call) = self
+                    .blocks
+                    .last()
+                    .and_then(|b| b.pending.get(name.as_str()))
+                    .copied()
+                && self.active.contains_key(&call)
+            {
+                statement.transferred = Some(arg.id());
+                statement.attach = Some((scope, call, binding));
+            }
+            statement.scope_receiver = Some(call.object.id());
+        }
+    }
+
     fn place_key(&self, name: &str) -> (usize, String) {
         let root = name.split(['.', '[']).next().unwrap();
         let binding = self
@@ -529,6 +752,14 @@ fn remove_active_index<K: std::hash::Hash + Eq>(
 }
 
 #[inline]
+fn count_scope_work() {
+    #[cfg(test)]
+    SCOPE_WORK.with(|count| count.set(count.get() + 1));
+}
+#[cfg(test)]
+thread_local! { static SCOPE_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[inline]
 fn count_event() {
     #[cfg(test)]
     AST_EVENTS.with(|count| count.set(count.get() + 1));
@@ -563,6 +794,157 @@ mod tests {
         checker.check_module_program(&program);
         let borrows = check(&program, &checker.expr_types, &checker.reference_arg_modes);
         (borrows, checker.errors)
+    }
+
+    #[test]
+    fn scoped_borrow_many_registrations_fragmented_and_repeated() {
+        for n in [1, 8, 64, 128] {
+            for repeated in [false, true] {
+                let mut body = String::from("let s = TaskScope::new();");
+                if repeated {
+                    body.push_str("let t = borrow(&x);");
+                }
+                for i in 0..n {
+                    if repeated {
+                        body.push_str("s.add(t);");
+                    } else {
+                        body.push_str(&format!("let t{i} = s.add(borrow(&x));"));
+                    }
+                }
+                if !repeated {
+                    for i in (0..n).step_by(2) {
+                        body.push_str(&format!("await t{i};"));
+                    }
+                }
+                body.push_str("await s.finish();");
+                SCOPE_WORK.with(|count| count.set(0));
+                let (borrows, errors) = analyze(&body);
+                assert!(errors.is_empty(), "{errors:?}");
+                assert!(borrows.is_empty(), "{borrows:?}");
+                let work = SCOPE_WORK.with(|count| count.get());
+                assert_eq!(work, n + 1);
+                println!("registrations={n} repeated={repeated} scope_work={work}");
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_borrow_discharge_scales_with_scopes_and_registrations() {
+        for n in [1, 8, 64, 128] {
+            for chain in [false, true] {
+                for separate in [false, true] {
+                    let mut body = String::from("let s0 = TaskScope::new(); s0.add(borrow(&x));");
+                    for i in 1..n {
+                        let parent = if chain { i - 1 } else { 0 };
+                        body.push_str(&format!(
+                            "let s{i} = s{parent}.child(); s{i}.add(borrow(&x));"
+                        ));
+                    }
+                    if separate {
+                        for i in (0..n).rev() {
+                            body.push_str(&format!("await s{i}.finish();"));
+                        }
+                    } else {
+                        body.push_str("await s0.finish();");
+                    }
+                    SCOPE_WORK.with(|count| count.set(0));
+                    let (borrows, errors) = analyze(&body);
+                    assert!(errors.is_empty(), "{errors:?}");
+                    assert!(borrows.is_empty(), "{borrows:?}");
+                    let work = SCOPE_WORK.with(|count| count.get());
+                    assert_eq!(work, if separate { 3 * n - 1 } else { 2 * n });
+                    println!(
+                        "scopes={n} chain={chain} separate_finishes={separate} scope_work={work}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_borrow_discharge_accepts_proven_paths() {
+        for body in [
+            "s.add(borrow(&x)); await s.finish();",
+            "let t = s.add(borrow(&x)); await s.finish(); let y = await t;",
+            "let t = borrow(&x); s.add(t); await s.finish();",
+            "let t = borrow(&x); let h = s.add(t); await s.finish(); let y = await h;",
+            "let t = s.add(borrow(&x)); await t;",
+            "s.add(borrow(&x)); let done = await s.finish();",
+            "s.add(borrow(&x)); match await s.finish() { _ => {} }",
+            "let c = s.child(); c.add(borrow(&x)); await s.finish();",
+            "let c = s.child(); c.add(borrow(&x)); await c.finish(); await s.finish();",
+            "let c = s.child(); let d = c.child(); d.add(borrow(&x)); await s.finish();",
+            "let c = s.child(); s.add(borrow(&x)); c.add(borrow(&x)); await s.finish();",
+            "if true { let c = s.child(); let y = 2; c.add(borrow(&y)); await c.finish(); } await s.finish();",
+            "if true { let s = TaskScope::new(); s.add(borrow(&x)); await s.finish(); }",
+            "while false { let c = TaskScope::new(); c.add(borrow(&x)); await c.finish(); }",
+            "let t = s.add(borrow(&x)); await t.result();",
+        ] {
+            let (borrows, errors) = analyze(&format!("let s = TaskScope::new(); {body}"));
+            assert!(errors.is_empty(), "{body}: {errors:?}");
+            assert!(borrows.is_empty(), "{body}: {borrows:?}");
+        }
+    }
+
+    #[test]
+    fn scoped_borrow_discharge_rejects_unproven_paths() {
+        for body in [
+            "s.add(borrow(&x));",
+            "s.add(borrow(&x)); s.finish();",
+            "s.add(borrow(&x)); if true { await s.finish(); }",
+            "s.add(borrow(&x)); while false { await s.finish(); }",
+            "s.add(borrow(&x)); return; await s.finish();",
+            "s.add(borrow(&x)); if true { return; } await s.finish();",
+            "let c = s.child(); c.add(borrow(&x)); await c.finish(); s.add(borrow(&x));",
+            "if true { let y = 2; s.add(borrow(&y)); } await s.finish();",
+            "let c = s.child(); if true { let y = 2; c.add(borrow(&y)); } await s.finish();",
+            "s.add(borrow(&x)); let c = s.child(); await c.finish();",
+            "let alias = s; s.add(borrow(&x)); await s.finish();",
+            "s.add(borrow(&x)); let alias = s; await s.finish();",
+            "await s.finish(); s.add(borrow(&x)); await s.finish();",
+            "let c = s.child(); await s.finish(); c.add(borrow(&x)); await c.finish();",
+            "s.add(borrow(&x)); let f = || { await s.finish(); };",
+            "s.add(borrow(&x)); defer { await s.finish(); }",
+            "let t = s.add(borrow(&x)); consume(t); await s.finish();",
+            "return s.add(borrow(&x));",
+            "let t = s.add(borrow(&x)); return t;",
+            "let t = borrow(&x); if true { s.add(t); } await s.finish();",
+            "while false { s.add(borrow(&x)); await s.finish(); }",
+            "s.add(borrow(&x)); let s = TaskScope::new(); await s.finish();",
+        ] {
+            let (borrows, _) = analyze(&format!("let s = TaskScope::new(); {body}"));
+            assert!(
+                borrows.iter().any(|d| d.code == ErrorCode::E1708),
+                "{body}: {borrows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_mutable_loans_last_until_finish() {
+        for (middle, conflict) in [
+            ("write(&x); await s.finish();", true),
+            ("await s.finish(); write(&x);", false),
+            (
+                "let c = s.child(); await c.finish(); write(&x); await s.finish();",
+                true,
+            ),
+        ] {
+            let source = format!(
+                "async fn borrow(x: &mut i64) {{ await sleep(1); }} fn write(x: &mut i64) {{}} async fn main() {{ let mut x = 1; let s = TaskScope::new(); s.add(borrow(&x)); {middle} }}"
+            );
+            let (borrows, errors) = analyze_source(&source);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(
+                borrows.iter().any(|d| d.code == ErrorCode::E1706),
+                conflict,
+                "{middle}: {borrows:?}"
+            );
+            assert!(
+                borrows.iter().all(|d| d.code == ErrorCode::E1706),
+                "{borrows:?}"
+            );
+        }
     }
 
     #[test]
