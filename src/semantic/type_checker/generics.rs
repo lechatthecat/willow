@@ -1546,6 +1546,17 @@ impl TypeChecker {
                 m.default_body = None;
             }
         }
+        // `self` in the instance's defaults is the written instantiation, so
+        // it converts like the receiver's declared interface (and its
+        // super-interfaces) and diagnostics never name the instance.
+        instance.instance_of = Some(Type::Generic(
+            template.name.clone(),
+            template
+                .type_params
+                .iter()
+                .map(|p| Type::Named(p.clone()))
+                .collect(),
+        ));
         let mut item = Item::Interface(instance);
         substitute_item(&mut item, &bindings);
         let Item::Interface(instance) = item else {
@@ -1855,6 +1866,9 @@ fn visit_item(
             }
         }
         Item::Interface(i) => {
+            if let Some(t) = &mut i.instance_of {
+                *t = ty(t);
+            }
             for m in &mut i.methods {
                 for p in &mut m.params {
                     p.ty = ty(&p.ty);

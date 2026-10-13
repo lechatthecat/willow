@@ -1,0 +1,24 @@
+// `self` in another module's generic interface default has the written
+// interface type, so it converts to `Gauge<i64>` and to the super-interface
+// `Labeled` there (willow-rktm).
+import generic_interface_default_self_support::meters;
+
+class Tank implements meters::Meter<i64>, meters::Gauge<i64> {
+    pub fill: i64;
+    pub fn level(self) -> i64 { return self.fill; }
+    pub fn label(self) -> String { return "tank"; }
+}
+
+class Sign implements meters::Meter<String> {
+    pub fn level(self) -> String { return "full"; }
+    pub fn label(self) -> String { return "sign"; }
+}
+
+fn main() {
+    let tank = new Tank(3);
+    println(tank.scaled());
+    println(tank.peek());
+    println(tank.banner());
+    println(new Sign().peek());
+    println(new Sign().banner());
+}

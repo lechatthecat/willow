@@ -489,6 +489,7 @@ impl Parser {
             type_params,
             extends,
             methods,
+            instance_of: None,
             span,
         })
     }

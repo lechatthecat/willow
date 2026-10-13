@@ -256,6 +256,10 @@ pub struct InterfaceDecl {
     /// qualified. v1 supports a single super-interface.
     pub extends: Vec<String>,
     pub methods: Vec<InterfaceMethodDecl>,
+    /// For a generic interface's concrete instance, the written
+    /// instantiation it stands for (`Get<i64>`): `self` in its defaults has
+    /// that type (willow-rktm). `None` for a declared interface.
+    pub instance_of: Option<Type>,
     pub span: Span,
 }
 

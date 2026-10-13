@@ -1647,6 +1647,10 @@ impl TypeChecker {
             (Type::Named(child), Type::Generic(_, _)) => {
                 self.class_implements_interface(child, expected)
             }
+            // A generic interface instantiation is a subtype of every
+            // interface its declaration extends: `extends` names no type
+            // arguments (E0427), so `Get<i64>` <: `Base` (willow-rktm).
+            (Type::Generic(child, _), Type::Named(parent)) => self.interface_extends(child, parent),
             _ => false,
         }
     }

@@ -104,7 +104,7 @@ impl TypeChecker {
         if decl.type_params.is_empty() {
             for m in &decl.methods {
                 if m.default_body.is_some() {
-                    self.check_interface_default_body(m, &decl.name);
+                    self.check_interface_default_body(m, decl);
                 }
             }
         }
@@ -115,17 +115,18 @@ impl TypeChecker {
     pub(super) fn check_interface_default_body(
         &mut self,
         m: &InterfaceMethodDecl,
-        iface_name: &str,
+        decl: &InterfaceDecl,
     ) {
         if let Some(body) = &m.default_body {
-            self.query_body(body.id, |checker| checker.check_default_body(m, iface_name));
+            self.query_body(body.id, |checker| checker.check_default_body(m, decl));
         }
     }
 
-    fn check_default_body(&mut self, m: &InterfaceMethodDecl, iface_name: &str) {
+    fn check_default_body(&mut self, m: &InterfaceMethodDecl, decl: &InterfaceDecl) {
         let Some(body) = &m.default_body else {
             return;
         };
+        let iface_name = decl.name.as_str();
         let return_type = self.normalize_type(&m.return_type, m.span);
         let param_types = self.normalize_param_types(&m.params);
         let previous_class = self.local.current_class.replace(iface_name.to_string());
@@ -142,7 +143,10 @@ impl TypeChecker {
         self.define_var(
             "self".to_string(),
             VarInfo {
-                ty: Type::Named(iface_name.to_string()),
+                ty: decl
+                    .instance_of
+                    .clone()
+                    .unwrap_or_else(|| Type::Named(iface_name.to_string())),
                 mutable: false,
                 is_param: true,
                 declaration_span: m.span,

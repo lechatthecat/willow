@@ -1,0 +1,22 @@
+// Defaults of a generic interface pass `self` to this module's helpers, typed
+// with the written instantiation and with a non-generic super-interface.
+pub interface Labeled {
+    fn label(self) -> String;
+}
+
+pub interface Meter<T> extends Labeled {
+    fn level(self) -> T;
+    fn peek(self) -> T { return peek_at(self); }
+    fn banner(self) -> String { return framed(self); }
+}
+
+pub interface Gauge<T> {
+    fn level(self) -> T;
+    fn scaled(self) -> i64 { return hundredfold(self); }
+}
+
+fn peek_at<T>(m: Meter<T>) -> T { return m.level(); }
+
+fn framed(l: Labeled) -> String { return "[" + l.label() + "]"; }
+
+fn hundredfold(g: Gauge<i64>) -> i64 { return g.level() * 100; }

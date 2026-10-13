@@ -1211,7 +1211,11 @@ impl LirTypeCtx<'_> {
     /// Identity is handled by [`assignable_repr`], so this answers only a
     /// strict interface-to-super-interface conversion.
     fn iface_widen_path(&self, target: &Type, value: &Type) -> Option<Vec<usize>> {
-        let (Type::Named(target_iface), Type::Named(value_iface)) = (target, value) else {
+        // A generic interface widens to the non-generic supers it extends
+        // (willow-rktm); type arguments do not change its vtable.
+        let (Type::Named(target_iface), Type::Named(value_iface) | Type::Generic(value_iface, _)) =
+            (target, value)
+        else {
             return None;
         };
         (target_iface != value_iface
