@@ -45,6 +45,18 @@ fn psp_03_nested_busy_loops_preemptible() {
     assert_eq!(out, "3\n");
 }
 
+#[cfg(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+))]
 #[test]
 fn psp_04_fn_value_can_enter_task() {
     // A pointer to a looping sync helper must still yield on native task stacks.
@@ -93,34 +105,35 @@ fn psp_06_busy_tasks_exceed_worker_count() {
     assert_eq!(out, "6\n");
 }
 
+#[cfg(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+))]
 #[test]
 fn psp_07_call_boundary_safepoints() {
-    // Call-boundary safepoints, isolated from loop backedges (review
-    // fix: a for-loop body only proved the BACKEDGE safepoint): the spinning
-    // task is a straight-line chain of call-bearing statements — bounded sync
-    // helper calls with no Willow loop between them at the top level — so only
-    // the safepoints before those call statements can let the sleeper run
-    // before the chain finishes.
-    //
-    // The helper is bounded: loop-free AND non-recursive. It used to recurse
-    // (`chunk(n - 1) + chunk(n - 2)`), which made every statement
-    // multi-millisecond, but Stage A-prime rejects a recursive sync helper
-    // called from task context because recursion runs unbounded work with no
-    // safepoint (E0810, willow-38w.2.1) — `psp_07b` pins that rejection. The
-    // timing-sensitive form returns as a Stage G acceptance case once
-    // task-aware sync-stack preemption ships.
-    let chunk = "s = s + chunk(s);";
-    let chain = chunk.repeat(50);
+    // Recursive, loop-free synchronous workload. Native sync-stack preemption
+    // accepts it; other targets reject it (psp_07b).
+    // One worker and a tiny quantum require the sleeper to run while churn
+    // remains busy; every recursive call has a generated boundary safepoint.
+    let chain = "s = s + chunk(24);".repeat(10);
     let source = format!(
-        "fn chunk(n: i64) -> i64 {{ if n <= 1 {{ return 1; }} return n / 2 + 1; }}\nasync fn churn() -> i64 {{ let mut s = 0; {chain} return s; }}\nasync fn main() {{ let t = churn(); await sleep(10); println(7); await t; }}"
+        "fn chunk(n: i64) -> i64 {{ if n <= 1 {{ return 1; }} return chunk(n - 1) + chunk(n - 2); }}\nasync fn churn(done: AtomicBool) -> i64 {{ let mut s = 0; {chain} done.store(true); return s; }}\nasync fn main() {{ let done = AtomicBool::new(false); let t = churn(done); await sleep(10); println(7); println(done.load()); await t; }}"
     );
     let (out, ok) = compile_and_run_with_runtime_env(
         &source,
-        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        &[("WILLOW_TIME_QUANTUM_MS", "5"), ("WILLOW_WORKERS", "1")],
         std::time::Duration::from_secs(60),
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "7\n");
+    assert_eq!(out, "7\nfalse\n");
 }
 
 #[cfg(not(any(
