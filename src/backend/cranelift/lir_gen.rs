@@ -1042,6 +1042,22 @@ impl LirTypeCtx<'_> {
             )
     }
 
+    /// Whether a declared callable signature and the type a function value
+    /// carries share one ABI. A generic instance's lifted lambda is declared
+    /// with the `$type$mono$...` spelling of a nominal argument while its
+    /// lowered body names the declaration itself (willow-s71l).
+    fn same_callable(&self, known: &Type, ty: &Type) -> bool {
+        match (known, ty) {
+            (Type::Fn(a, a_out), Type::Fn(b, b_out))
+            | (Type::Closure(a, a_out), Type::Closure(b, b_out)) => {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(a, b)| self.same_repr(a, b))
+                    && self.same_repr(a_out, b_out)
+            }
+            _ => known == ty,
+        }
+    }
+
     /// [`assignable_repr`], plus the one identity a string comparison cannot
     /// see: two spellings of the SAME class (willow-0g8j.16).
     ///
@@ -2016,7 +2032,9 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                     }
                     match value {
                         crate::ir::lowered::LirRvalue::FunctionRef { function, ty }
-                            if !ctx.fn_value_of(function).is_some_and(|known| known == *ty) =>
+                            if !ctx
+                                .fn_value_of(function)
+                                .is_some_and(|known| ctx.same_callable(&known, ty)) =>
                         {
                             return Some(format!(
                                 "the function value `{function}` at line {} has an incompatible signature",
@@ -2026,7 +2044,7 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                         crate::ir::lowered::LirRvalue::Closure { id, ty, .. }
                             if !(ctx.lambda_symbol)(*id)
                                 .and_then(|symbol| ctx.fn_value_of(&symbol))
-                                .is_some_and(|known| known == *ty) =>
+                                .is_some_and(|known| ctx.same_callable(&known, ty)) =>
                         {
                             return Some(format!(
                                 "a lambda at line {} has an unsupported environment or signature",
@@ -4079,7 +4097,9 @@ fn supported_expr_node<'n>(
         // signature must be the type this expression carries: the pointer is
         // later CALLED through a Cranelift signature built from `e.ty`, so a
         // disagreement would call the target under the wrong ABI.
-        HirExprKind::FnRef(name) => ctx.fn_value_of(name).is_some_and(|ty| ty == e.ty),
+        HirExprKind::FnRef(name) => ctx
+            .fn_value_of(name)
+            .is_some_and(|ty| ctx.same_callable(&ty, &e.ty)),
         // A lambda evaluates to its lifted function — the address itself for a
         // `fn`, an environment object carrying that address for a `closure`. Its
         // BODY is not this function's problem: that is compiled under its own
@@ -4091,7 +4111,7 @@ fn supported_expr_node<'n>(
         HirExprKind::Lambda { id, captures, .. } => {
             (ctx.lambda_symbol)(*id)
                 .and_then(|sym| ctx.fn_value_of(&sym))
-                .is_some_and(|ty| ty == e.ty)
+                .is_some_and(|ty| ctx.same_callable(&ty, &e.ty))
                 && captures.iter().all(|c| {
                     names
                         .get(c.source.as_str())

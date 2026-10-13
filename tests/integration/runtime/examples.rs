@@ -14,6 +14,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/canonical_identity.wi", "42\n"),
         ("example/imported_interface_default.wi", "42\n"),
+        (
+            "example/imported_generic_interface_default.wi",
+            "20\n27\n7\nwillow\n",
+        ),
         ("example/lock_imported_effects/main.wi", "7\n"),
         (
             "example/module_generic_members/main.wi",
@@ -1519,6 +1523,7 @@ fn test_october_ci_catalog_additions() {
             "example/assignable_representations.wi"
                 | "example/canonical_identity.wi"
                 | "example/imported_interface_default.wi"
+                | "example/imported_generic_interface_default.wi"
                 | "example/lock_imported_effects/main.wi"
                 | "example/module_generic_members/main.wi"
                 | "example/semantic_generic_queries.wi"

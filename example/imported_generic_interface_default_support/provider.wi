@@ -1,0 +1,32 @@
+// Private items the generic default bodies below rely on. Implementing
+// classes in other modules never see these names.
+fn base() -> i64 { return 20; }
+
+enum Mode { Plain, Bumped }
+
+class Cell<T> {
+    pub value: T;
+    pub fn get(self) -> T { return self.value; }
+}
+
+fn keep<T>(x: T) -> T { return x; }
+
+pub interface Source<T> {
+    fn read(self) -> T;
+
+    fn total(self) -> i64 { return base(); }
+
+    fn bumped(self, by: i64) -> i64 {
+        let mode: Mode = Mode::Bumped;
+        match mode {
+            Mode::Plain => { return base(); }
+            Mode::Bumped => { return base() + by; }
+        }
+    }
+
+    fn current(self) -> T {
+        let cell = new Cell<T>(self.read());
+        let f = |x: T| keep(x);
+        return f(cell.get());
+    }
+}

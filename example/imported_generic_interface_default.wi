@@ -1,0 +1,19 @@
+// Generic interface defaults from another module keep the provider's scope.
+import imported_generic_interface_default_support::provider::Source;
+
+class Number implements Source<i64> {
+    pub fn read(self) -> i64 { return 7; }
+}
+
+class Name implements Source<String> {
+    pub fn read(self) -> String { return "willow"; }
+}
+
+fn show(source: Source<i64>) -> i64 { return source.total(); }
+
+fn main() {
+    println(show(new Number()));
+    println(new Number().bumped(7));
+    println(new Number().current());
+    println(new Name().current());
+}

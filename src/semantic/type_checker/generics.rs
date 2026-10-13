@@ -24,6 +24,14 @@ pub(crate) struct TemplateRegistry {
     instantiated_classes: HashMap<InstantiationKey, Rc<InstantiatedClass>>,
     functions: HashMap<(crate::diagnostics::FileId, String), Rc<FunctionDecl>>,
     classes: HashMap<(crate::diagnostics::FileId, String), Rc<ClassDecl>>,
+    /// Generic interfaces with default bodies, by declaring file and name: a
+    /// class in another unit receives their defaults (willow-s71l).
+    interfaces: HashMap<(crate::diagnostics::FileId, String), Rc<InterfaceDecl>>,
+    /// Each concrete instantiation of such an interface, checked once in its
+    /// declaring unit and shared by every receiving class.
+    interface_instances: HashMap<InstantiationKey, Rc<InterfaceDecl>>,
+    #[cfg(test)]
+    interface_specializations: usize,
     #[cfg(test)]
     function_specializations: usize,
     #[cfg(test)]
@@ -61,6 +69,13 @@ impl TemplateRegistry {
             .clone()
     }
 
+    /// Retain a generic interface whose defaults other units may instantiate.
+    pub(crate) fn intern_interface(&mut self, declaration: &InterfaceDecl) {
+        self.interfaces
+            .entry((declaration.span.file_id, declaration.name.clone()))
+            .or_insert_with(|| Rc::new(declaration.clone()));
+    }
+
     pub(crate) fn intern_class(&mut self, declaration: &ClassDecl) -> Rc<ClassDecl> {
         self.classes
             .entry((declaration.span.file_id, declaration.name.clone()))
@@ -92,6 +107,11 @@ pub(crate) struct Generics {
     pub function_paths: HashMap<String, String>,
     pub class_paths: HashMap<String, String>,
     pub objects: HashMap<ExprId, String>,
+    /// Interface defaults this checker's classes received from a generic
+    /// interface another unit declares, by (class, method): each is replaced
+    /// by the default at that method index of the instance checked in that
+    /// unit (willow-s71l).
+    pub default_copies: HashMap<String, HashMap<String, (Rc<InterfaceDecl>, usize)>>,
 }
 
 enum InstantiationTypeRef<'a> {
@@ -417,6 +437,57 @@ mod template_registry_tests {
     }
 
     #[test]
+    fn foreign_default_receivers_share_one_interface_instance() {
+        // Every receiver of one instantiation reuses the provider's single
+        // checked instance; only a new type argument adds one (willow-s71l).
+        for width in [1, 16, 256] {
+            let provider = parse(&format!(
+                "pub interface Get<T> {{ fn raw(self) -> T; fn get(self) -> i64 {{ {} return 1; }} }}",
+                "println(1);".repeat(width)
+            ));
+            let Item::Interface(template) = &provider.items[0] else {
+                unreachable!()
+            };
+            let default = template.methods[1].default_body.clone().unwrap();
+            for receivers in [1, 16, 256] {
+                let registry = Rc::new(RefCell::new(TemplateRegistry::default()));
+                registry.borrow_mut().intern_interface(template);
+                let mut pending = 0;
+                for consumer in 0..receivers {
+                    let mut checker = TypeChecker::new();
+                    checker.generics.registry = registry.clone();
+                    checker.register_module("util", "util", "util.wi", &provider);
+                    let arg = if consumer % 2 == 0 { "i64" } else { "String" };
+                    let program = parse(&format!(
+                        "class C implements util::Get<{arg}> {{ pub fn raw(self) -> {arg} {{ return self.raw(); }} pub fn get(self) -> i64 {{ return 0; }} }}"
+                    ));
+                    let Item::Class(class) = &program.items[0] else {
+                        unreachable!()
+                    };
+                    let mut class = class.clone();
+                    class.span.file_id = FileId(1);
+                    let copy = &mut class.methods[1];
+                    copy.body = default.clone();
+                    copy.is_interface_default = true;
+                    copy.is_default_injected = false;
+                    let handled = checker.instantiate_foreign_defaults(&class);
+                    assert!(handled.contains("get"), "{:?}", checker.errors);
+                    pending += checker.generics.pending.len();
+                }
+                let distinct = receivers.min(2);
+                let registry = registry.borrow();
+                assert_eq!(registry.interface_specializations, distinct);
+                assert_eq!(registry.interface_instances.len(), distinct);
+                assert_eq!(pending, distinct);
+                println!(
+                    "WILLOW_GENERIC_AUDIT {}",
+                    serde_json::json!({"case":"foreign_default_receivers", "body_width":width, "receivers":receivers, "interface_specializations":registry.interface_specializations, "queued_bodies":pending})
+                );
+            }
+        }
+    }
+
+    #[test]
     fn repeated_nominal_bindings_copy_metadata_once() {
         for width in [1, 16, 256] {
             let fields: String = (0..width)
@@ -544,6 +615,12 @@ fn class_signature(class: &ClassDecl) -> ClassDecl {
 
 fn uses_parameters(ty: &Type, parameters: &HashSet<&str>) -> bool {
     mentions(ty, |name| parameters.contains(name))
+}
+
+/// Whether an interface method's signature names the implementing type.
+fn names_self(m: &InterfaceMethodDecl) -> bool {
+    let is_self = |n: &str| n == "Self";
+    mentions(&m.return_type, is_self) || m.params.iter().any(|p| mentions(&p.ty, is_self))
 }
 
 /// Whether any name in `ty`, a generic head included, satisfies `matches`.
@@ -1307,6 +1384,186 @@ impl TypeChecker {
         Some(Type::Named(name))
     }
 
+    /// Request, from the unit that declares each generic interface `c`
+    /// implements, the concrete instance whose defaults `c`'s copies reuse
+    /// (willow-s71l). A copy of another unit's generic default must name that
+    /// unit's items, so it is checked there, once per distinct interface
+    /// instantiation, as a non-generic interface; the class's copy is then
+    /// rebound to that body when generics are expanded and lowered in that
+    /// unit's scope like any other foreign default (willow-rvpp). Returns the
+    /// copies handled this way, which `c` must not check itself.
+    pub(super) fn instantiate_foreign_defaults<'c>(
+        &mut self,
+        c: &'c ClassDecl,
+    ) -> HashSet<&'c str> {
+        let copies: Vec<&MethodDecl> = c
+            .methods
+            .iter()
+            .filter(|m| {
+                m.is_interface_default
+                    && !m.is_default_injected
+                    && m.body.span.file_id != c.span.file_id
+            })
+            .collect();
+        let mut handled = HashSet::new();
+        if copies.is_empty() {
+            return handled;
+        }
+        // A template's copies still name its own parameters; each concrete
+        // instance of the class requests its own interface instance.
+        if self.generics.abstract_check {
+            handled.extend(copies.iter().map(|m| m.name.as_str()));
+            return handled;
+        }
+        let copy_names: HashSet<&'c str> = copies.iter().map(|m| m.name.as_str()).collect();
+        // Each default method name to the first implemented interface that
+        // provides it, in the order desugaring chose the copies in.
+        let mut providers: HashMap<&str, (Rc<InterfaceDecl>, &'c [Type], usize)> = HashMap::new();
+        for ty in &c.implements {
+            let Type::Generic(name, args) = ty else {
+                continue;
+            };
+            let Some(info) = self.symbols.lookup_interface(name) else {
+                continue;
+            };
+            let local = info.name.rsplit("::").next().unwrap_or(&info.name);
+            let key = (info.declaration_span.file_id, local.to_string());
+            let Some(template) = self
+                .generics
+                .registry
+                .borrow()
+                .interfaces
+                .get(&key)
+                .cloned()
+            else {
+                continue;
+            };
+            for (index, m) in template.methods.iter().enumerate() {
+                if m.default_body.is_none() {
+                    continue;
+                }
+                if let Some(&name) = copy_names.get(m.name.as_str()) {
+                    providers
+                        .entry(name)
+                        .or_insert_with(|| (Rc::clone(&template), args.as_slice(), index));
+                }
+            }
+        }
+        let mut instances: HashMap<*const InterfaceDecl, Rc<InterfaceDecl>> = HashMap::new();
+        for m in copies {
+            let Some((template, args, index)) = providers.get(m.name.as_str()) else {
+                continue;
+            };
+            // Spans survive class instantiation; body ids are renumbered.
+            let declared = &template.methods[*index];
+            let provides = !names_self(declared)
+                && declared
+                    .default_body
+                    .as_ref()
+                    .is_some_and(|b| b.span == m.body.span);
+            if !provides {
+                continue;
+            }
+            let instance = match instances.get(&Rc::as_ptr(template)) {
+                Some(instance) => Rc::clone(instance),
+                None => {
+                    let Some(instance) =
+                        self.instantiate_interface_template(template, args, c.span)
+                    else {
+                        continue;
+                    };
+                    instances.insert(Rc::as_ptr(template), Rc::clone(&instance));
+                    instance
+                }
+            };
+            self.generics
+                .default_copies
+                .entry(c.name.clone())
+                .or_default()
+                .insert(m.name.clone(), (instance, *index));
+            handled.insert(m.name.as_str());
+        }
+        handled
+    }
+
+    /// The non-generic instance of generic interface `template` at `args`,
+    /// queued once per build for the declaring unit's checker.
+    fn instantiate_interface_template(
+        &mut self,
+        template: &Rc<InterfaceDecl>,
+        args: &[Type],
+        span: Span,
+    ) -> Option<Rc<InterfaceDecl>> {
+        if args.len() != template.type_params.len() {
+            return None;
+        }
+        let args: Vec<_> = args.iter().map(|t| self.normalize_type(t, span)).collect();
+        if args.iter().any(|ty| mentions(ty, Self::is_error_name))
+            || !self.check_instantiation_size(&args, span)
+        {
+            return None;
+        }
+        let identity_args: Vec<_> = args
+            .iter()
+            .map(|ty| ty.map_names(|n| self.generic_type_identity(n)))
+            .collect();
+        let key = (
+            2,
+            format!("{}::{}", template.span.file_id.0, template.name),
+            identity_args,
+        );
+        let cached = self
+            .generics
+            .registry
+            .borrow()
+            .interface_instances
+            .get(&key)
+            .cloned();
+        if let Some(instance) = cached {
+            return Some(instance);
+        }
+        if self.reserve_instantiation(&key, span) != Some(true) {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            self.generics
+                .registry
+                .borrow_mut()
+                .interface_specializations += 1;
+        }
+        let bindings = template.type_params.iter().cloned().zip(args).collect();
+        let (bindings, classes) = self.instantiation_bindings(span, &bindings);
+        let mut instance = (**template).clone();
+        instance.name = symbol(&template.name, &key.2);
+        instance.type_params.clear();
+        // Inherited methods are already composed into `methods`.
+        instance.extends.clear();
+        // Interface-level checking binds `self` to the interface, not to
+        // `Self`; such defaults stay with each receiver's own copy.
+        for m in &mut instance.methods {
+            if names_self(m) {
+                m.default_body = None;
+            }
+        }
+        let mut item = Item::Interface(instance);
+        substitute_item(&mut item, &bindings);
+        let Item::Interface(instance) = item else {
+            unreachable!()
+        };
+        let instance = Rc::new(instance);
+        self.generics
+            .registry
+            .borrow_mut()
+            .interface_instances
+            .insert(key, Rc::clone(&instance));
+        self.generics.pending.push_back(Instantiation {
+            item: Item::Interface((*instance).clone()),
+            classes,
+        });
+        Some(instance)
+    }
+
     pub(crate) fn validate_generic_templates(&mut self, file: crate::diagnostics::FileId) {
         // Abstract checking has a separate symbol/output epoch: no symbolic
         // type or speculative body can escape into the concrete artifact set.
@@ -1402,7 +1659,11 @@ impl TypeChecker {
                 self.register_class(c);
                 self.check_class(c);
             }
-            _ => unreachable!(),
+            Item::Interface(i) => {
+                self.register_interface(i, None);
+                self.check_interface(i);
+            }
+            Item::Enum(_) => unreachable!(),
         }
         self.generics.emitted.push(item);
     }
@@ -1441,6 +1702,26 @@ impl TypeChecker {
             _ => true,
         });
         program.items.append(&mut self.generics.emitted);
+        if !self.generics.default_copies.is_empty() {
+            for item in &mut program.items {
+                let Item::Class(c) = item else { continue };
+                let Some(copies) = self.generics.default_copies.get(&c.name) else {
+                    continue;
+                };
+                for m in &mut c.methods {
+                    let Some((instance, index)) = copies.get(&m.name) else {
+                        continue;
+                    };
+                    let Some(body) = instance.methods[*index].default_body.as_ref() else {
+                        continue;
+                    };
+                    // The copy now shares the instance's body, checked and
+                    // lowered in the interface's unit.
+                    m.body = body.clone();
+                    m.is_default_injected = true;
+                }
+            }
+        }
         program.instantiation_types = self
             .generics
             .imported_types

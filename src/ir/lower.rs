@@ -402,9 +402,36 @@ pub fn lower_foreign_methods(
 ) -> (HirProgram, Vec<Diagnostic>) {
     let LowerEnv {
         fn_returns,
-        classes: env_classes,
+        classes: mut env_classes,
         enums,
     } = lower_env(scope, scope_tables);
+    // A call on `self` must take the receiver's own member types: the
+    // checker typed the body against the interface, so a `Self` result
+    // there names the interface rather than the receiver class.
+    for (id, info) in classes {
+        let std::collections::hash_map::Entry::Vacant(entry) =
+            env_classes.map.entry(id.to_string())
+        else {
+            continue;
+        };
+        let entry = entry.insert(ClassInfo::default());
+        entry.base = info.base.map(|base| base.to_string());
+        for (name, ty) in &info.fields {
+            entry.fields.insert(name.clone(), ty.to_source());
+        }
+        for (name, ty) in &info.static_fields {
+            entry.static_fields.insert(name.clone(), ty.to_source());
+        }
+        for (name, signature) in &info.methods {
+            let ty = call_site_type(&signature.return_type.to_source(), signature.is_async);
+            let members = if signature.is_static {
+                &mut entry.static_methods
+            } else {
+                &mut entry.methods
+            };
+            members.insert(name.clone(), ty);
+        }
+    }
     let mut hir_classes = Vec::with_capacity(receivers.len());
     let mut diagnostics = Vec::new();
     for receiver in receivers {

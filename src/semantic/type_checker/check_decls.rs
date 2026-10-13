@@ -227,7 +227,12 @@ impl TypeChecker {
             self.validate_type(&ty, field.span);
         }
         self.check_static_property_initializers(c);
+        let instantiated = self.instantiate_foreign_defaults(c);
         for m in &c.methods {
+            // Checked with its interface instance in the declaring unit.
+            if instantiated.contains(m.name.as_str()) {
+                continue;
+            }
             // A non-generic interface default body is checked once at the
             // interface level; skip the injected class copy to avoid duplicate
             // diagnostics (willow-1js.7).

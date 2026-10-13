@@ -757,7 +757,31 @@ fn run_frontend_revision(
             _ => false,
         })
     };
-    if has_generics(&program) || graph.files.iter().any(|m| has_generics(&m.program)) {
+    // A copy of another unit's generic interface default is checked there,
+    // per interface instantiation, by this phase (willow-s71l).
+    let has_foreign_generic_default = |p: &parser::ast::Program| {
+        p.items.iter().any(|i| match i {
+            parser::ast::Item::Class(c) => c.methods.iter().any(|m| {
+                m.is_interface_default
+                    && !m.is_default_injected
+                    && m.body.span.file_id != c.span.file_id
+            }),
+            _ => false,
+        })
+    };
+    let has_templates = |p: &parser::ast::Program| {
+        has_generics(p)
+            || p.items.iter().any(|i| match i {
+                parser::ast::Item::Interface(i) => {
+                    !i.type_params.is_empty() && i.methods.iter().any(|m| m.default_body.is_some())
+                }
+                _ => false,
+            })
+    };
+    if std::iter::once(&program)
+        .chain(graph.files.iter().map(|m| &m.program))
+        .any(|p| has_generics(p) || has_foreign_generic_default(p))
+    {
         let storage = graph.artifacts.take().expect("spooled imports");
         let registry = std::rc::Rc::new(std::cell::RefCell::new(
             semantic::type_checker::generics::TemplateRegistry::default(),
@@ -775,12 +799,18 @@ fn run_frontend_revision(
             .map(|m| (&m.program, m.id.file_id()))
             .chain(std::iter::once((&program, diagnostics::FileId::ENTRY)))
         {
-            if !has_generics(shell) {
+            if !has_templates(shell) {
                 continue;
             }
             let source = storage.hydrate(shell, file)?;
             for item in &source.items {
                 match item {
+                    parser::ast::Item::Interface(i)
+                        if !i.type_params.is_empty()
+                            && i.methods.iter().any(|m| m.default_body.is_some()) =>
+                    {
+                        registry.borrow_mut().intern_interface(i);
+                    }
                     parser::ast::Item::Function(f) if !f.type_params.is_empty() => {
                         registry.borrow_mut().intern_function(f);
                     }
@@ -840,7 +870,8 @@ fn run_frontend_revision(
             let (file, name, kind) = match &item.item {
                 parser::ast::Item::Function(f) => (f.span.file_id, f.name.clone(), 0u8),
                 parser::ast::Item::Class(c) => (c.span.file_id, c.name.clone(), 1u8),
-                _ => unreachable!(),
+                parser::ast::Item::Interface(i) => (i.span.file_id, i.name.clone(), 2u8),
+                parser::ast::Item::Enum(_) => unreachable!(),
             };
             if !seen.insert((file, name, kind)) {
                 continue;
