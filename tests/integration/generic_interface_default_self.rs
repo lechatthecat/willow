@@ -2,8 +2,9 @@
 //!
 //! A class implementing another module's `Get<A>` receives its defaults
 //! through one non-generic instance checked in the provider (willow-s71l).
-//! `self` there has the written type `Get<A>`, so it converts wherever the
-//! receiver's declared interface would and no diagnostic names the instance.
+//! `self` there is the opaque `Self` (willow-dnia), converting to the written
+//! type `Get<A>` wherever the receiver's declared interface would, and no
+//! diagnostic names the instance.
 //! A generic interface value also converts to the non-generic interfaces its
 //! declaration extends, in the checker and in the backend.
 //!
@@ -29,8 +30,8 @@
 //! 18. `self` stored in a provider class field
 //! 19. `self` passed to a lambda typed `|g: Get<i64>|`
 //! 20. default→default calls next to `h(self)`
-//! 21. wrong instantiation: `expected Get<String>, found Get<i64>`
-//! 22. `let s: String = self` reports `Get<i64>`
+//! 21. wrong instantiation: `expected Get<String>, found Self`
+//! 22. `let s: String = self` reports `Self`
 //! 23. unrelated interface and class parameters stay rejected
 //! 24. missing method names `Get`, not the instance
 //! 25. a generic interface value does not convert to an unrelated interface
@@ -417,7 +418,7 @@ fn wrong_instantiation_names_written_types() {
         ("main.wi", &main_with("println(new Z(7).get());")),
     ]);
     assert!(
-        stderr.contains("expected `Get<String>`, found `Get<i64>`"),
+        stderr.contains("expected `Get<String>`, found `Self`"),
         "{stderr}"
     );
     assert!(stderr.contains("util.wi"), "{stderr}");
@@ -435,7 +436,7 @@ fn mismatched_local_reports_written_instantiation() {
         ("main.wi", &main_with("println(new Z(7).get());")),
     ]);
     assert!(
-        stderr.contains("expected `String`, found `Get<i64>`"),
+        stderr.contains("expected `String`, found `Self`"),
         "{stderr}"
     );
 }
@@ -455,7 +456,7 @@ fn unrelated_parameters_stay_rejected() {
             ),
             ("main.wi", &main_with("println(new Z(7).get());")),
         ]);
-        assert!(stderr.contains("found `Get<i64>`"), "{stderr}");
+        assert!(stderr.contains("found `Self`"), "{stderr}");
     }
 }
 

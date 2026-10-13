@@ -1633,6 +1633,13 @@ impl TypeChecker {
     }
 
     fn is_subtype(&self, actual: &Type, expected: &Type) -> bool {
+        // An interface default's opaque receiver converts to its interface,
+        // and on from there (willow-dnia).
+        if let (Type::Named(name), Some(interface)) = (actual, &self.local.self_interface)
+            && name == "Self"
+        {
+            return self.types_compatible(expected, interface);
+        }
         match (actual, expected) {
             (Type::Named(child), Type::Named(parent)) => {
                 // A class is a subtype of its base class, and of any interface it

@@ -602,6 +602,17 @@ impl UnitCodegenContext<'_> {
             .iter()
             .map(|(alias, info)| (alias.as_str(), info.name()))
             .collect();
+        // This unit's own type declarations, which an instance argument can
+        // name bare without being the entry's (`id<Get<i64>>` in the module
+        // declaring `Get`).
+        let declared_here: std::collections::HashSet<_> = (program.items.iter())
+            .filter_map(|item| match item {
+                Item::Class(c) => Some(c.span),
+                Item::Enum(e) => Some(e.span),
+                Item::Interface(i) => Some(i.span),
+                Item::Function(_) => None,
+            })
+            .collect();
         // An instance argument that is the entry file's bare identity, while
         // this unit declares or item-imports its own type of that name, is
         // spelled under the receiver prefix, which names it in every unit:
@@ -609,21 +620,25 @@ impl UnitCodegenContext<'_> {
         // entry's types are declared last, so any binding of the bare name in
         // this unit's scope (item-import and enum aliases, bound above) is
         // this unit's own.
-        let shadowed: std::collections::HashSet<&str> = (instantiation_types.values())
-            .copied()
-            .filter(|target| {
-                local_signature_type_names.contains(*target)
-                    || local_enum_names.contains(*target)
+        // Keyed by alias, not target name: this unit's own `Get` and the
+        // entry's shadowed `Get` can both be instance arguments here.
+        let shadowed: std::collections::HashSet<&str> = (program.instantiation_types.iter())
+            .filter(|(_, info)| !declared_here.contains(&info.declaration_span()))
+            .filter(|(_, info)| {
+                let target = info.name();
+                local_signature_type_names.contains(target)
+                    || local_enum_names.contains(target)
                     || !target.contains("::") && {
                         let id = TypeId::local(target);
                         self.type_scope.resolve(&id) != id
                             || (self.enum_infos.get_id(&id)).is_some_and(|info| info.name != id)
                     }
             })
+            .map(|(alias, _)| alias.as_str())
             .collect();
         let resolve_instantiation = |ty: &crate::parser::ast::Type| {
             ty.map_names(|name| match instantiation_types.get(name.as_str()) {
-                Some(target) if shadowed.contains(target) => {
+                Some(target) if shadowed.contains(name.as_str()) => {
                     crate::semantic::ids::foreign_receiver_name(target)
                 }
                 Some(target) => (*target).to_string(),

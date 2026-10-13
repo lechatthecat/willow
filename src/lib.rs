@@ -2424,8 +2424,20 @@ fn run_backend(
         for info in checked.symbols.enums.values() {
             codegen.register_enum_info(tables.codegen_enum_info(info, &declared));
         }
-        for info in checked.symbols.interfaces.values() {
-            let identity = semantic::ids::TypeId::from_source_name(&info.name);
+        // An identity registers once (first wins). A `$type$mono$` alias key
+        // can carry another unit's type spelled like one declared here (the
+        // entry's `Get` beside `util::Get`), so declarations under their own
+        // key register before alias entries; hash order used to pick.
+        let (own, aliased): (Vec<_>, Vec<_>) = (checked.symbols.interfaces.iter())
+            .map(|(key, info)| {
+                (
+                    key,
+                    semantic::ids::TypeId::from_source_name(&info.name),
+                    info,
+                )
+            })
+            .partition(|(key, identity, _)| *key == identity);
+        for (_, identity, info) in own.into_iter().chain(aliased) {
             codegen.register_interface_info(identity, || info.to_semantic())?;
         }
     }

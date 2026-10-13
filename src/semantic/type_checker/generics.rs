@@ -617,14 +617,8 @@ fn uses_parameters(ty: &Type, parameters: &HashSet<&str>) -> bool {
     mentions(ty, |name| parameters.contains(name))
 }
 
-/// Whether an interface method's signature names the implementing type.
-fn names_self(m: &InterfaceMethodDecl) -> bool {
-    let is_self = |n: &str| n == "Self";
-    mentions(&m.return_type, is_self) || m.params.iter().any(|p| mentions(&p.ty, is_self))
-}
-
 /// Whether any name in `ty`, a generic head included, satisfies `matches`.
-fn mentions(ty: &Type, matches: impl Fn(&str) -> bool) -> bool {
+pub(super) fn mentions(ty: &Type, matches: impl Fn(&str) -> bool) -> bool {
     let mut pending = vec![ty];
     while let Some(ty) = pending.pop() {
         match ty {
@@ -834,6 +828,39 @@ impl TypeChecker {
         }
     }
 
+    /// An argument of a generic call inside an interface default, as
+    /// inference sees it (willow-dnia). The receiver is unknown there, so no
+    /// instantiation may be keyed by `Self`: a whole `self` is inferred as
+    /// the interface it converts to, and `Self` inside another type, which no
+    /// conversion reaches, is reported (`None`).
+    fn generic_self_argument(&mut self, ty: Type, callee: &str, span: Span) -> Option<Type> {
+        let Some(interface) = self.local.self_interface.clone() else {
+            return Some(ty);
+        };
+        if matches!(&ty, Type::Named(name) if name == "Self") {
+            return Some(interface);
+        }
+        if !mentions(&ty, |name| name == "Self") {
+            return Some(ty);
+        }
+        let interface = type_name(&interface);
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0201,
+                format!(
+                    "`{}` cannot be passed to generic function `{callee}`: its `Self` is not a whole value that converts to `{interface}`",
+                    type_name(&ty)
+                ),
+            )
+            .with_label(Label::primary(span, "the implementing class is unknown here"))
+            .with_help(format!(
+                "convert `self` first (`let it: {interface} = self;`) and build the argument from `it`"
+            )),
+        );
+        None
+    }
+
     pub(super) fn generic_error(&mut self, span: Span, message: impl Into<String>) {
         self.push(
             Diagnostic::new(Severity::Error, ErrorCode::E0201, message)
@@ -1000,6 +1027,10 @@ impl TypeChecker {
             } else {
                 ty.clone()
             };
+            let Some(ty) = self.generic_self_argument(ty, &template.name, call_args[i].span) else {
+                poisoned = true;
+                continue;
+            };
             let ty = self.canonical_generic_type(&ty, &mut spellings);
             if mentions(&ty, Self::is_error_name) {
                 poisoned = true;
@@ -1070,7 +1101,14 @@ impl TypeChecker {
                 .insert(call_args[i].expr.id(), lambda_ty.clone());
             let lambda_ty =
                 lambda_ty.substitute_names(|n| self.generics.logical_types.get(n).cloned());
-            let canonical = self.canonical_generic_type(&lambda_ty, &mut spellings);
+            let canonical = match self.generic_self_argument(
+                lambda_ty.clone(),
+                &template.name,
+                call_args[i].span,
+            ) {
+                Some(ty) => self.canonical_generic_type(&ty, &mut spellings),
+                None => Self::error_type(),
+            };
             if mentions(&canonical, Self::is_error_name) {
                 poisoned = true;
             } else if !mismatched
@@ -1456,11 +1494,10 @@ impl TypeChecker {
             };
             // Spans survive class instantiation; body ids are renumbered.
             let declared = &template.methods[*index];
-            let provides = !names_self(declared)
-                && declared
-                    .default_body
-                    .as_ref()
-                    .is_some_and(|b| b.span == m.body.span);
+            let provides = declared
+                .default_body
+                .as_ref()
+                .is_some_and(|b| b.span == m.body.span);
             if !provides {
                 continue;
             }
@@ -1539,13 +1576,6 @@ impl TypeChecker {
         instance.type_params.clear();
         // Inherited methods are already composed into `methods`.
         instance.extends.clear();
-        // Interface-level checking binds `self` to the interface, not to
-        // `Self`; such defaults stay with each receiver's own copy.
-        for m in &mut instance.methods {
-            if names_self(m) {
-                m.default_body = None;
-            }
-        }
         // `self` in the instance's defaults is the written instantiation, so
         // it converts like the receiver's declared interface (and its
         // super-interfaces) and diagnostics never name the instance.

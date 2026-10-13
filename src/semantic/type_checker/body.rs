@@ -51,6 +51,9 @@ pub(super) struct BodyState {
     /// record their type here instead of checking against `current_return_type`.
     pub(super) lambda_return_stack: Vec<Option<Type>>,
     pub(super) current_class: Option<String>,
+    /// While an interface default body is checked once for every receiver
+    /// (willow-dnia): the interface type its opaque `Self` converts to.
+    pub(super) self_interface: Option<Type>,
     /// Whether the body being checked is an `async fn` (or async method), i.e.
     /// whether it has a task frame to suspend into. Cleared inside a lambda
     /// body: a lambda has no `async` form and the backend lifts it into a plain
@@ -92,6 +95,7 @@ impl Default for BodyState {
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
             current_class: None,
+            self_interface: None,
             current_async_context: false,
             in_static_method: false,
             in_static_initializer: false,

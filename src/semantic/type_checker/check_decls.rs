@@ -96,7 +96,7 @@ impl TypeChecker {
             );
         }
         // Type-check default method bodies even when no class implements the
-        // interface (willow-1js.7). `self` is the interface type; the body is the
+        // interface (willow-1js.7). `self` is the opaque `Self`; the body is the
         // canonical default (the injected class copies of non-generic defaults are
         // skipped in check_class to avoid duplicates). Generic interfaces are
         // skipped — their type parameters are not concrete, so the body is checked
@@ -111,7 +111,7 @@ impl TypeChecker {
     }
 
     /// Type-check an interface default method body with `self` bound to the
-    /// interface type (willow-1js.7). Mirrors `check_method`'s scope handling.
+    /// opaque receiver type `Self` (willow-1js.7, willow-dnia). Mirrors `check_method`'s scope handling.
     pub(super) fn check_interface_default_body(
         &mut self,
         m: &InterfaceMethodDecl,
@@ -137,16 +137,22 @@ impl TypeChecker {
         let previous_async = self.local.current_async_context;
         let previous_static = self.local.in_static_method;
         let previous_return = std::mem::replace(&mut self.local.current_return_type, return_type);
+        // `self` is the receiver, opaque here: `Self`, which converts to the
+        // interface (the written instantiation for a generic interface's
+        // instance) and reaches its methods. Each receiver's copy lowers it
+        // as its own class (willow-dnia).
+        let previous_self = self.local.self_interface.replace(
+            decl.instance_of
+                .clone()
+                .unwrap_or_else(|| Type::Named(iface_name.to_string())),
+        );
         self.local.current_async_context = false;
         self.local.in_static_method = false;
         self.symbols.push_scope();
         self.define_var(
             "self".to_string(),
             VarInfo {
-                ty: decl
-                    .instance_of
-                    .clone()
-                    .unwrap_or_else(|| Type::Named(iface_name.to_string())),
+                ty: Type::Named("Self".to_string()),
                 mutable: false,
                 is_param: true,
                 declaration_span: m.span,
@@ -175,6 +181,7 @@ impl TypeChecker {
         );
         self.symbols.pop_scope();
         self.local.current_class = previous_class;
+        self.local.self_interface = previous_self;
         self.local.current_effect_callable = previous_effect_callable;
         self.local.current_async_context = previous_async;
         self.local.in_static_method = previous_static;

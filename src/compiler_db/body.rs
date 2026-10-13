@@ -1486,6 +1486,69 @@ mod tests {
         assert_eq!(queries.typed.stats().computations, typed_computations);
     }
 
+    /// willow-dnia: a default whose signature names `Self` is typed once for
+    /// the interface: next to the same program without it, it adds one body
+    /// check whatever the receiver count, and every copy reuses the canonical
+    /// record.
+    #[test]
+    fn self_signature_default_is_typed_once_for_every_receiver() {
+        let computations = |receivers: usize, with_self: bool| {
+            let classes: String = (0..receivers)
+                .map(|i| format!("class C{i} implements I {{}}"))
+                .collect();
+            let calls: String = (0..receivers)
+                .map(|i| {
+                    if with_self {
+                        format!("println(new C{i}().pick(new C{i}()).value());")
+                    } else {
+                        format!("println(new C{i}().value());")
+                    }
+                })
+                .collect();
+            let pick = if with_self {
+                "fn pick(self, other: Self) -> Self { return other; }"
+            } else {
+                ""
+            };
+            let (program, queries, _) = prepare(
+                &format!(
+                    "interface I {{ fn value(self) -> i64 {{ return 42; }} {pick} }} {classes} fn main() {{ {calls} }}"
+                ),
+                true,
+            );
+            let Item::Interface(interface) = &program.items[0] else {
+                panic!()
+            };
+            let mut copies = 0;
+            for item in &program.items {
+                if let Item::Class(class) = item {
+                    for method in &class.methods {
+                        assert!(method.is_default_injected);
+                        let source = queries.index.source_body(method.body.id);
+                        let canonical = interface
+                            .methods
+                            .iter()
+                            .find(|m| m.name == method.name)
+                            .and_then(|m| m.default_body.as_ref())
+                            .unwrap();
+                        assert_eq!(source, canonical.id);
+                        assert_eq!(
+                            *queries.typed_record(method.body.id).unwrap(),
+                            *queries.typed_record(source).unwrap()
+                        );
+                        copies += 1;
+                    }
+                }
+            }
+            assert_eq!(copies, if with_self { 2 } else { 1 } * receivers);
+            queries.typechecks()
+        };
+        let added = |receivers| computations(receivers, true) - computations(receivers, false);
+        assert_eq!(added(1), 1);
+        assert_eq!(added(4), 1);
+        assert_eq!(added(16), 1);
+    }
+
     /// willow-afb5.17: lambdas in constructors, static initializers and each
     /// copy of an injected default get their own normalized records, and the
     /// walk-only split leaves bodies outside the normalization boundary as

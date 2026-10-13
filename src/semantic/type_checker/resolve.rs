@@ -1218,6 +1218,51 @@ impl TypeChecker {
         );
     }
 
+    /// Whether `method` of an interface value `obj_ty` names `Self` where
+    /// the value's unknown class matters, reporting it: no argument is known
+    /// to be that class, and a result that only contains `Self` would carry
+    /// the class object unconverted. A whole `-> Self` result is rebuilt as
+    /// the interface by the backend, and an interface default's own `self`
+    /// is the opaque receiver, so neither is rejected (willow-dnia).
+    fn rejects_unknown_self(
+        &mut self,
+        iface: &InterfaceInfo,
+        method: &str,
+        obj_ty: &Type,
+        span: Span,
+    ) -> bool {
+        let Some(m) = iface.methods.get(method) else {
+            return false;
+        };
+        let is_self = |n: &str| n == "Self";
+        let position = if m
+            .params
+            .iter()
+            .any(|ty| super::generics::mentions(ty, is_self))
+        {
+            "a parameter"
+        } else if m.return_type != Type::Named("Self".into())
+            && super::generics::mentions(&m.return_type, is_self)
+        {
+            "its result"
+        } else {
+            return false;
+        };
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0201,
+                format!(
+                    "method `{method}` names `Self` in {position}, so it cannot be called through interface type `{}`",
+                    type_name(obj_ty)
+                ),
+            )
+            .with_label(Label::primary(span, "the implementing class is unknown here"))
+            .with_help("call it on a value of the implementing class"),
+        );
+        true
+    }
+
     /// Substitute an interface's generic type parameters with `type_args` and
     /// `Self` with `class_name`, yielding concrete required method signatures
     /// for conformance checking (willow-1js.1).
@@ -1343,6 +1388,25 @@ impl TypeChecker {
                 return Type::Void;
             }
         };
+        // An interface default's receiver is any implementing class, so it
+        // has only the interface's methods (willow-dnia).
+        if class_name == "Self"
+            && let Some(interface) = &self.local.self_interface
+        {
+            let interface = type_name(interface);
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0502,
+                    format!("no field `{field_name}` on `Self` in a default of `{interface}`"),
+                )
+                .with_label(Label::primary(span, "fields are not part of an interface"))
+                .with_help(format!(
+                    "declare an accessor method in `{interface}` and call it on `self`"
+                )),
+            );
+            return Type::Void;
+        }
         if self.symbols.lookup_class(&class_name).is_none() {
             self.push(
                 Diagnostic::new(
@@ -1516,10 +1580,30 @@ impl TypeChecker {
         if let Type::Generic(name, type_args) = obj_ty
             && let Some(iface) = self.symbols.lookup_interface(name).cloned()
         {
+            if self.rejects_unknown_self(&iface, method_name, obj_ty, span) {
+                return Self::error_type();
+            }
             // `Self` in a method called through the interface is the full
             // receiver instantiation (`Box<i64>`), not bare `Box`.
             let instantiated = self.instantiate_interface(&iface, type_args, obj_ty);
             return self.resolve_interface_method(&instantiated, method_name, args, span);
+        }
+        // An interface default's opaque receiver reaches its interface's
+        // methods, whose `Self` stays the receiver (willow-dnia).
+        if matches!(obj_ty, Type::Named(n) if n == "Self")
+            && let Some((name, type_args)) = match &self.local.self_interface {
+                Some(Type::Named(name)) => Some((name.clone(), Vec::new())),
+                Some(Type::Generic(name, args)) => Some((name.clone(), args.clone())),
+                _ => None,
+            }
+            && let Some(iface) = self.symbols.lookup_interface(&name).cloned()
+        {
+            let iface = if type_args.is_empty() {
+                iface
+            } else {
+                self.instantiate_interface(&iface, &type_args, obj_ty)
+            };
+            return self.resolve_interface_method(&iface, method_name, args, span);
         }
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
@@ -1538,6 +1622,9 @@ impl TypeChecker {
         // Interface-typed receiver: only the interface's declared methods are
         // callable, and the call dispatches through the interface vtable.
         if let Some(mut iface) = self.symbols.lookup_interface(&class_name).cloned() {
+            if self.rejects_unknown_self(&iface, method_name, obj_ty, span) {
+                return Self::error_type();
+            }
             // Dispatch returns the concrete object for `-> Self`; the backend
             // rebuilds the receiver's interface pair. Only specialize the
             // selected return, without traversing every interface signature or

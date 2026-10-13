@@ -1,0 +1,35 @@
+// An interface default whose signature names `Self` is checked once, with
+// `self` as the opaque receiver, and each implementing class gets it typed
+// as itself: in this module and from another module's generic and plain
+// interfaces, whose private helpers stay reachable (willow-dnia).
+import interface_default_self_signature_support::shapes;
+
+interface Named {
+    fn name(self) -> String;
+    fn same(self) -> Self { return self; }
+    fn first(self, other: Self) -> Self {
+        if describe(self).len() <= describe(other).len() { return self; }
+        return other;
+    }
+}
+
+fn describe(n: Named) -> String { return n.name(); }
+
+class Tag implements Named, shapes::Sized, shapes::Scored<i64> {
+    pub label: String;
+    pub fn name(self) -> String { return self.label; }
+    pub fn size(self) -> i64 { return self.label.len(); }
+    pub fn score(self) -> i64 { return self.label.len() * 2; }
+}
+
+fn main() {
+    let tag: Tag = new Tag("beta").same();
+    println(tag.label);
+    let early: Tag = tag.first(new Tag("alpha"));
+    println(early.label);
+    println(tag.itself().padded());
+    let best: Tag = tag.better(new Tag("gamma!"));
+    println(best.score());
+    let named: Named = tag;
+    println(named.same().name());
+}

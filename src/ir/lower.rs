@@ -886,6 +886,9 @@ fn lower_method(
             .cloned()
             .unwrap_or_else(|| ctx.normalize(&Type::Named(class_name.to_string())));
         ctx.bind("self".to_string(), self_ty.clone());
+        if m.is_interface_default {
+            ctx.receiver = Some(self_ty.clone());
+        }
         params.push(HirParam {
             name: "self".to_string(),
             ty: self_ty.into(),
@@ -985,6 +988,9 @@ struct LowerCtx<'a> {
     binds_seen: HashMap<String, usize>,
     next_defer_id: u32,
     current_class: Option<String>,
+    /// The receiver class an interface default's copy lowers the opaque
+    /// `Self` its shared check typed the body with as (willow-dnia).
+    receiver: Option<Type>,
     fn_returns: &'a HashMap<String, Type>,
     classes: &'a Classes,
     enums: &'a Enums,
@@ -1005,6 +1011,7 @@ impl<'a> LowerCtx<'a> {
             binds_seen: HashMap::new(),
             next_defer_id: 0,
             current_class: None,
+            receiver: None,
             fn_returns,
             classes,
             enums,
@@ -1014,7 +1021,21 @@ impl<'a> LowerCtx<'a> {
 
     /// The checker's type for a written annotation (willow-0g8j.3).
     fn normalize(&self, ty: &Type) -> Type {
-        self.tables.normalize(ty)
+        self.receiver_self(self.tables.normalize(ty))
+    }
+
+    /// The checker's type for expression `id`, with `Self` as the receiver.
+    fn expr_type(&self, id: &ExprId) -> Option<Type> {
+        self.tables.expr_type(id).map(|ty| self.receiver_self(ty))
+    }
+
+    fn receiver_self(&self, ty: Type) -> Type {
+        match &self.receiver {
+            Some(receiver) => {
+                ty.substitute_names(|name| (name == "Self").then(|| receiver.clone()))
+            }
+            None => ty,
+        }
     }
 
     fn push_scope(&mut self) {
@@ -1450,7 +1471,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             if s.method == "new"
                 && s.args.is_empty()
                 && ctx.tables.static_call_class(&s.id, &s.class) == "Array"
-                && matches!(ctx.tables.expr_type(&s.id), Some(Type::Array(_))) =>
+                && matches!(ctx.expr_type(&s.id), Some(Type::Array(_))) =>
         {
             lower_array_literal_expr(expr, &[], s.span, ctx)
         }
@@ -1502,7 +1523,6 @@ fn lower_var_expr(
     // records both the enum and the expression type.
     if let Some(enum_name) = ctx.tables.enum_variant_resolution(&expr.id()) {
         let ty = ctx
-            .tables
             .expr_type(&expr.id())
             .unwrap_or_else(|| Type::Named(enum_name.to_string()));
         return Ok(HirExpr {
@@ -1532,7 +1552,7 @@ fn lower_var_expr(
             .tables
             .symbols
             .is_some_and(|symbols| symbols.lookup_func(name).is_some()))
-        && let Some(ty @ Type::Fn(..)) = ctx.tables.expr_type(&expr.id())
+        && let Some(ty @ Type::Fn(..)) = ctx.expr_type(&expr.id())
     {
         return Ok(HirExpr {
             kind: HirExprKind::FnRef(name.into()),
@@ -1678,7 +1698,7 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
     if let Some(enum_name) = ctx.tables.enum_variant_resolution(&c.id) {
         // Prefer the checker's recorded type (it carries generic type
         // arguments, e.g. `Result<i64, String>` for `Ok(42)`).
-        let ty = match ctx.tables.expr_type(&c.id) {
+        let ty = match ctx.expr_type(&c.id) {
             Some(ty) => ty,
             None => enum_variant_construction_type(ctx.enums, enum_name, &args, c.span)?,
         };
@@ -1715,7 +1735,7 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
         // symbol of the module THIS unit imported, rebinding it before
         // each unit's bodies, so the call the type came from is the
         // call that gets emitted (willow-28h8).
-        .or_else(|| ctx.tables.expr_type(&c.id))
+        .or_else(|| ctx.expr_type(&c.id))
         .ok_or_else(|| {
             internal(
                 c.span,
@@ -1815,7 +1835,7 @@ fn lower_array_literal_expr(
     // The checker owns contextual typing for every literal, not only empty
     // ones. Inferring again from element 0 loses interface storage/boxing.
     // The first-element fallback supports callers lowering unchecked syntax.
-    let ty = match ctx.tables.expr_type(&expr.id()) {
+    let ty = match ctx.expr_type(&expr.id()) {
         Some(recorded @ Type::Array(_)) => recorded.into(),
         _ => match lowered.first() {
             Some(first) => Type::Array(Box::new(first.ty.clone())),
@@ -1927,7 +1947,7 @@ fn lower_ternary_expr(t: &TernaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Di
     } else {
         then_expr.ty.clone()
     };
-    let ty = match ctx.tables.expr_type(&t.id) {
+    let ty = match ctx.expr_type(&t.id) {
         Some(checked) if ty != Type::Never => checked.into(),
         _ => ty,
     };
@@ -2018,7 +2038,6 @@ fn lower_field_access_expr(
         {
             Some(ty) => ty,
             None => ctx
-                .tables
                 .expr_type(&expr.id())
                 .ok_or_else(|| unsupported(span, "field not found on receiver"))?,
         }
@@ -2065,8 +2084,8 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
         && name == "super"
         && ctx.lookup("super").is_none()
     {
-        let base = ctx.tables.expr_type(id);
-        let (Some(Type::Named(base)), Some(ty)) = (&base, ctx.tables.expr_type(&m.id)) else {
+        let base = ctx.expr_type(id);
+        let (Some(Type::Named(base)), Some(ty)) = (&base, ctx.expr_type(&m.id)) else {
             return Err(unsupported(m.span, "unresolved `super` method call"));
         };
         let Some(binding) = ctx.lookup("self") else {
@@ -2099,8 +2118,7 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
     } else {
         // Checker authority: interface methods, generic receivers,
         // Option/Result methods, and anything else it typed.
-        ctx.tables
-            .expr_type(&m.id)
+        ctx.expr_type(&m.id)
             .ok_or_else(|| unsupported(m.span, "method not found on receiver"))?
     };
     let args = lower_value_args(&m.args, ctx)?;
@@ -2180,7 +2198,7 @@ fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<Hi
         // it: `Self::prop` inside a class body names a class the
         // registry has no entry for, and the checker has already
         // resolved and typed the read (willow-0g8j.13).
-        .or_else(|| ctx.tables.expr_type(&s.id))
+        .or_else(|| ctx.expr_type(&s.id))
         .ok_or_else(|| unsupported(s.span, "static property not found"))?;
     Ok(HirExpr {
         kind: HirExprKind::StaticField {
@@ -2237,7 +2255,7 @@ fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirE
         .or_else(|| ctx.classes.static_method_type(class, &s.method))
         // Checker authority: generic-enum construction, `Self::`,
         // module-qualified statics, constructors.
-        .or_else(|| ctx.tables.expr_type(&s.id))
+        .or_else(|| ctx.expr_type(&s.id))
         .ok_or_else(|| {
             unsupported(
                 s.span,
@@ -2546,13 +2564,7 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
         .tables
         .lambda_captures(&l.id)
         .iter()
-        .map(|c| {
-            (
-                c.name.clone(),
-                ctx.hir_name(&c.name),
-                ctx.tables.normalize(&c.ty),
-            )
-        })
+        .map(|c| (c.name.clone(), ctx.hir_name(&c.name), ctx.normalize(&c.ty)))
         .collect();
     let mut params = Vec::with_capacity(l.params.len());
     let mut param_tys = Vec::with_capacity(l.params.len());
@@ -2905,7 +2917,7 @@ fn lower_match(
         .find(|t| **t != Type::Never)
         .cloned()
         .unwrap_or(Type::Never);
-    let ty = match ctx.tables.expr_type(&m.id) {
+    let ty = match ctx.expr_type(&m.id) {
         Some(checked) if ty != Type::Never => checked.into(),
         _ => ty,
     };
@@ -3311,9 +3323,29 @@ pub(crate) fn lower_resolution(
             is_async,
         }
     };
+    // A unit's tables also hold entries under alias keys: `$type$mono$`
+    // aliases for the types its generic instances name (the entry's `Get` in
+    // `util::id<Get>`) and module access paths. An alias's type can share its
+    // bare name with a type declared under that very key (the unit's own
+    // `Get`), which the HIR spells bare; an alias entry therefore never
+    // replaces it (which one won used to depend on hash order).
+    fn insert_declared<V>(
+        table: &mut std::collections::HashMap<TypeId, V>,
+        key: &TypeId,
+        name: TypeId,
+        info: V,
+    ) {
+        if *key == name {
+            table.insert(name, info);
+        } else {
+            table.entry(name).or_insert(info);
+        }
+    }
     if let Some(enums) = tables.enums {
-        for info in enums.values() {
-            out.enums.insert(
+        for (key, info) in enums {
+            insert_declared(
+                &mut out.enums,
+                key,
                 TypeId::from_source_name(&info.name),
                 HirEnumInfo {
                     type_params: info
@@ -3377,8 +3409,10 @@ pub(crate) fn lower_resolution(
                 ),
             );
         }
-        for interface in symbols.interfaces.values() {
-            out.interfaces.insert(
+        for (key, interface) in &symbols.interfaces {
+            insert_declared(
+                &mut out.interfaces,
+                key,
                 TypeId::from_source_name(&interface.name),
                 HirInterfaceInfo {
                     type_params: interface
@@ -3416,8 +3450,10 @@ pub(crate) fn lower_resolution(
                 },
             );
         }
-        for class in symbols.classes.values() {
-            out.classes.insert(
+        for (key, class) in &symbols.classes {
+            insert_declared(
+                &mut out.classes,
+                key,
                 TypeId::from_source_name(&class.name),
                 HirClassInfo {
                     base: class.base_class.as_ref().map(|name| canonical(name)),

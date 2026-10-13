@@ -251,6 +251,14 @@ impl InstantiationType {
             Self::Interface(i) => &i.name,
         }
     }
+
+    pub fn declaration_span(&self) -> Span {
+        match self {
+            Self::Class(i) => i.declaration_span,
+            Self::Enum(i) => i.declaration_span,
+            Self::Interface(i) => i.declaration_span,
+        }
+    }
 }
 
 /// A required method signature declared inside an `interface`.

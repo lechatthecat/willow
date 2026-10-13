@@ -1,0 +1,17 @@
+module interface_default_self_signature_support::shapes;
+
+fn bonus() -> i64 { return 10; }
+
+pub interface Scored<T> {
+    fn score(self) -> T;
+    fn better(self, other: Self) -> Self {
+        if bonus() > 0 { return other; }
+        return self;
+    }
+}
+
+pub interface Sized {
+    fn size(self) -> i64;
+    fn itself(self) -> Self { return self; }
+    fn padded(self) -> i64 { return self.itself().size() + bonus(); }
+}

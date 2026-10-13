@@ -61,6 +61,8 @@ mod imported_enum_payload;
 mod interface_box_dynamic_dispatch;
 #[path = "integration/interface_default_inheritance.rs"]
 mod interface_default_inheritance;
+#[path = "integration/interface_default_self_signature.rs"]
+mod interface_default_self_signature;
 #[path = "integration/interface_super_coercion.rs"]
 mod interface_super_coercion;
 #[path = "integration/lambda_shadowing.rs"]
