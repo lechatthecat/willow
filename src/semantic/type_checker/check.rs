@@ -2253,6 +2253,9 @@ impl TypeChecker {
                     .insert(*id, Some(FunctionId::free_from_source_name(name)));
                 return;
             }
+            // A variant constructor (`Err(e)` inferred without context) is a
+            // value, like the contextual form that never records a call.
+            Expr::Call(call) if self.enum_variant_resolutions.contains_key(&call.id) => return,
             Expr::Call(call) => {
                 if self.symbols.lookup_var(&call.callee).is_some() {
                     Vec::new()
