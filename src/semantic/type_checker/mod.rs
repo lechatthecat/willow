@@ -118,6 +118,8 @@ pub struct TypeChecker {
     marker_contracts: HashMap<String, Option<send_sync::Marker>>,
     marker_contract_proven: HashSet<(Type, send_sync::Marker)>,
 
+    /// Injected signatures carry provider metadata, not names written in this unit.
+    signature_metadata: bool,
     resolution: std::rc::Rc<ResolutionContext>,
     body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
     body_query_error: Option<anyhow::Error>,
@@ -320,6 +322,7 @@ impl TypeChecker {
             marker_contracts: HashMap::new(),
             marker_contract_proven: HashSet::new(),
             resolution,
+            signature_metadata: false,
             body_queries: None,
             body_query_error: None,
             effect_queries: None,
@@ -421,7 +424,8 @@ impl TypeChecker {
         let Some((module, _)) = name.rsplit_once("::") else {
             return true;
         };
-        if !self.signature_only_modules.contains(module)
+        if self.signature_metadata
+            || !self.signature_only_modules.contains(module)
             || self.symbols.lookup_module(module).is_some()
         {
             return true;
@@ -702,6 +706,8 @@ impl TypeChecker {
             }
         });
         for method in &class.methods {
+            let outer_metadata = self.signature_metadata;
+            self.signature_metadata |= method.is_interface_default;
             let params = method
                 .params
                 .iter()
@@ -727,6 +733,7 @@ impl TypeChecker {
                     declaration_span: method.span,
                 },
             );
+            self.signature_metadata = outer_metadata;
         }
 
         ClassInfo {

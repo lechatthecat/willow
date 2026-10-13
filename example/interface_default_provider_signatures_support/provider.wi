@@ -1,0 +1,6 @@
+pub class Payload { pub value: i64; }
+pub interface Get {
+    fn n(self) -> i64;
+    fn read(self, other: Get) -> i64 { return other.n(); }
+    fn echo(self, value: Payload) -> Payload { return value; }
+}

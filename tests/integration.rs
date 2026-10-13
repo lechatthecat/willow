@@ -331,3 +331,6 @@ mod module_generic_members;
 mod release_fault_sites;
 #[path = "integration/string_concat_fusion.rs"]
 mod string_concat_fusion;
+
+#[path = "integration/interface_default_provider_signatures.rs"]
+mod interface_default_provider_signatures;

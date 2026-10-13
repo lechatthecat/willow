@@ -2,6 +2,11 @@
 
 use crate::{diagnostics, module, parser};
 
+#[cfg(test)]
+thread_local! {
+    static PROVIDER_SIGNATURE_NAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Result of desugaring the entry program and its resolved modules.
 pub struct DesugarOutput {
     pub diagnostics: Vec<diagnostics::Diagnostic>,
@@ -507,14 +512,16 @@ fn build_module_iface_index_with_imports(
         // A source-local super-interface alias must not escape into a
         // consumer's implements list, including standalone multi-file builds.
         let import_names = import_name_index(imports);
-        // Local interface names declared by this module (to detect same-module
-        // supers that need qualifying).
+        // Index provider-owned nominal types once, before composing inheritance.
+        // Copied signatures must keep their declaring module's identities.
         let local: std::collections::HashSet<&str> = m
             .program
             .items
             .iter()
             .filter_map(|it| match it {
                 Item::Interface(i) => Some(i.name.as_str()),
+                Item::Class(c) => Some(c.name.as_str()),
+                Item::Enum(e) => Some(e.name.as_str()),
                 _ => None,
             })
             .collect();
@@ -532,7 +539,29 @@ fn build_module_iface_index_with_imports(
                         }
                     })
                     .collect();
-                index.insert(qualified, (supers, i.methods.clone()));
+                let bound: std::collections::HashSet<&str> =
+                    i.type_params.iter().map(String::as_str).collect();
+                let qualify = |ty: &parser::ast::Type| {
+                    ty.map_names(|name| {
+                        #[cfg(test)]
+                        PROVIDER_SIGNATURE_NAMES.with(|count| count.set(count.get() + 1));
+                        if name == "Self" || bound.contains(name.as_str()) {
+                            name.clone()
+                        } else if local.contains(name.as_str()) && !parser::tuples::is_tuple(name) {
+                            format!("{}::{name}", m.registration_name())
+                        } else {
+                            qualify_imported_name(name, &import_names)
+                        }
+                    })
+                };
+                let mut methods = i.methods.clone();
+                for method in &mut methods {
+                    method.return_type = qualify(&method.return_type);
+                    for param in &mut method.params {
+                        param.ty = qualify(&param.ty);
+                    }
+                }
+                index.insert(qualified, (supers, methods));
             }
         }
     }
@@ -1609,6 +1638,138 @@ fn main() {}
             path: std::path::PathBuf::from(format!("{name}.wi")),
             source: source.to_string(),
             program: parse(source),
+        }
+    }
+
+    #[test]
+    fn provider_signature_nested_types_and_bound_names() {
+        let mut module = resolved_module(
+            "provider",
+            "class Payload {} enum Kind { A } interface View {} interface Get<T> { fn pass(self, x: i64) -> i64 { return x; } }",
+        );
+        module.symbol_namespace = Some("$local::provider".into());
+        module.program.imports = parse("import other as o; import other::Thing as Alias;").imports;
+        let Item::Interface(interface) = &mut module.program.items[3] else {
+            panic!()
+        };
+        let nested = Type::Fn(
+            vec![
+                Type::Array(Box::new(Type::Named("Payload".into()))),
+                Type::Generic("Option".into(), vec![Type::Named("Kind".into())]),
+                Type::Generic("o::Box".into(), vec![Type::Named("T".into())]),
+            ],
+            Box::new(Type::Closure(
+                vec![Type::Named("Alias".into()), Type::Named("Self".into())],
+                Box::new(Type::Named("View".into())),
+            )),
+        );
+        interface.methods[0].params[0].ty = nested.clone();
+        interface.methods[0].return_type = nested;
+        let imports = vec![module.program.imports.clone()];
+        let index = build_module_iface_index_with_imports(&[module], &imports);
+        let method = &index["$local::provider::Get"].1[0];
+        let expected = Type::Fn(
+            vec![
+                Type::Array(Box::new(Type::Named("$local::provider::Payload".into()))),
+                Type::Generic(
+                    "Option".into(),
+                    vec![Type::Named("$local::provider::Kind".into())],
+                ),
+                Type::Generic("other::Box".into(), vec![Type::Named("T".into())]),
+            ],
+            Box::new(Type::Closure(
+                vec![
+                    Type::Named("other::Thing".into()),
+                    Type::Named("Self".into()),
+                ],
+                Box::new(Type::Named("$local::provider::View".into())),
+            )),
+        );
+        assert_eq!(method.params[0].ty, expected);
+        assert_eq!(method.return_type, expected);
+        // Only the signature is rewritten; provider body identifiers stay local.
+        assert!(method.default_body.is_some());
+    }
+
+    #[test]
+    fn provider_signature_qualification_scales_with_declarations_not_receivers() {
+        for (methods, receivers) in [(8, 8), (8, 128), (32, 8), (128, 8)] {
+            let mut source = String::from("pub class Payload {} pub interface Get {");
+            for i in 0..methods {
+                source.push_str(&format!(
+                    "fn p{i}(self, p: Payload) -> Payload {{ return p; }}"
+                ));
+            }
+            source.push('}');
+            let mut modules = vec![resolved_module("provider", &source)];
+            let mut source = String::from("import provider;");
+            for i in 0..receivers {
+                source.push_str(&format!("class C{i} implements provider::Get {{}}"));
+            }
+            let mut program = parse(&source);
+            PROVIDER_SIGNATURE_NAMES.with(|count| count.set(0));
+            let result = DesugarPass::run(&mut program, &mut modules);
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            let visits = PROVIDER_SIGNATURE_NAMES.with(|count| count.get());
+            assert_eq!(visits, methods * 2);
+            let copies: usize = program
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Class(class) => {
+                        assert_eq!(class.methods.len(), methods);
+                        for method in &class.methods {
+                            assert_eq!(
+                                method.params[0].ty,
+                                Type::Named("provider::Payload".into())
+                            );
+                            assert_eq!(method.return_type, Type::Named("provider::Payload".into()));
+                        }
+                        Some(class.methods.len())
+                    }
+                    _ => None,
+                })
+                .sum();
+            assert_eq!(copies, methods * receivers);
+            println!(
+                "provider signatures methods={methods} receivers={receivers} name_visits={visits} injected_methods={copies}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_signature_deep_inheritance_qualifies_only_the_origin() {
+        for depth in [8, 32, 128] {
+            let mut source = String::from(
+                "pub class Payload {} pub interface I0 { fn echo(self, p: Payload) -> Payload { return p; } }",
+            );
+            for i in 1..=depth {
+                source.push_str(&format!("pub interface I{i} extends I{} {{}}", i - 1));
+            }
+            let mut modules = vec![resolved_module("provider", &source)];
+            let imports = vec![Vec::new()];
+            PROVIDER_SIGNATURE_NAMES.with(|count| count.set(0));
+            let index = build_module_iface_index_with_imports(&modules, &imports);
+            let defaults = build_module_default_methods(&modules, &index);
+            assert_eq!(PROVIDER_SIGNATURE_NAMES.with(|count| count.get()), 2);
+            assert_eq!(defaults.len(), depth + 1);
+            for (_, methods) in defaults.values() {
+                assert_eq!(methods.len(), 1);
+                assert_eq!(
+                    methods[0].return_type,
+                    Type::Named("provider::Payload".into())
+                );
+            }
+            let mut program = parse(&format!(
+                "import provider; class C implements provider::I{depth} {{}}"
+            ));
+            let result = DesugarPass::run(&mut program, &mut modules);
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            let Item::Class(class) = &program.items[0] else {
+                panic!()
+            };
+            assert_eq!(class.methods.len(), 1);
+            println!("provider signatures depth={depth} origin_name_visits=2 injected_methods=1");
         }
     }
 

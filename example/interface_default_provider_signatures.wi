@@ -1,0 +1,10 @@
+// Defaults retain the provider's signature types across an aliased import.
+import interface_default_provider_signatures_support::provider as p;
+class A implements p::Get {
+    pub fn n(self) -> i64 { return 42; }
+}
+fn main() {
+    let a = new A();
+    println(a.read(a));
+    println(a.echo(new p::Payload(7)).value);
+}

@@ -858,7 +858,8 @@ impl TypeChecker {
             self.push(diagnostic);
         }
 
-        if place.ty != param.ty {
+        // References are invariant, but import aliases still name the same type.
+        if !self.same_type_identity(&param.ty, &place.ty) {
             let mut diagnostic = Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E1705,

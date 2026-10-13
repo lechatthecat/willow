@@ -1138,6 +1138,8 @@ impl TypeChecker {
         let mut methods = HashMap::new();
         let mut method_order = Vec::new();
         for m in &decl.methods {
+            let outer_metadata = self.signature_metadata;
+            self.signature_metadata |= m.span.file_id != decl.span.file_id;
             // Signature types are normalized here and VALIDATED in
             // `check_interface`, once every declaration is registered: a
             // method may name a type declared later in the file, and a
@@ -1158,6 +1160,7 @@ impl TypeChecker {
             } else {
                 m.params.iter().map(|p| p.ty.clone()).collect()
             };
+            self.signature_metadata = outer_metadata;
             if methods.contains_key(&m.name) {
                 self.push(
                     Diagnostic::new(

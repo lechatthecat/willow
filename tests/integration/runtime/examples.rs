@@ -15,6 +15,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/canonical_identity.wi", "42\n"),
         ("example/imported_interface_default.wi", "42\n"),
         (
+            "example/interface_default_provider_signatures.wi",
+            "42\n7\n",
+        ),
+        (
             "example/interface_default_receiver_names.wi",
             "provider point\n1019\nprovider point\n1007\n",
         ),
