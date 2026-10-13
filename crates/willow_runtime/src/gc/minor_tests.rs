@@ -3,6 +3,90 @@
 use super::{MinorCollector, MinorRoots, PinSource, verify_no_pin_enabled};
 
 #[test]
+fn minor_registry_active_collection_retains_trace_during_registration() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static OLD_TRACES: AtomicUsize = AtomicUsize::new(0);
+    static NEW_TRACES: AtomicUsize = AtomicUsize::new(0);
+    unsafe fn old_trace(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+        OLD_TRACES.fetch_add(1, Ordering::Relaxed);
+        slots.push(payload.cast());
+    }
+    unsafe fn new_trace(_: *mut u8, _: &mut Vec<*mut *mut u8>) {
+        NEW_TRACES.fetch_add(1, Ordering::Relaxed);
+    }
+    let _guard = runtime_test_guard();
+    reset_internal();
+    OLD_TRACES.store(0, Ordering::Relaxed);
+    NEW_TRACES.store(0, Ordering::Relaxed);
+    crate::gc::willow_register_type(123_456, old_trace);
+    let mut tls = tlab_state_for_test();
+    let child = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+    let mut root = willow_gc_alloc_slow(&mut tls, 1, 123_456, 8, 0);
+    assert!(!child.is_null() && !root.is_null());
+    // SAFETY: root owns one initialized pointer slot, exposed by old_trace.
+    unsafe { *root.cast::<*mut u8>() = child };
+    let registry = minor_registry_snapshot();
+    let mut state = runtime().heap.lock().unwrap();
+    retire_all_tlabs_unindexed(&mut state);
+    let mut stop = Default::default();
+    let collector = MinorCollector::new(&mut state, registry, &mut stop);
+    std::thread::spawn(|| crate::gc::willow_register_type(123_456, new_trace))
+        .join()
+        .unwrap();
+    let (_, work) = collector.run(
+        MinorRoots {
+            slots: vec![&raw mut root],
+            values: Vec::new(),
+        },
+        Default::default(),
+    );
+    assert_eq!(OLD_TRACES.load(Ordering::Relaxed), 1);
+    assert_eq!(NEW_TRACES.load(Ordering::Relaxed), 0);
+    assert_eq!(work.marked_bytes, (2 * (GC_HEADER_SIZE + 8)) as u64);
+    drop(state);
+    reset_internal();
+}
+
+#[test]
+fn minor_registry_active_collection_retains_drop_during_registration() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static OLD_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static NEW_DROPS: AtomicUsize = AtomicUsize::new(0);
+    unsafe fn old_drop(_: *mut u8) {
+        OLD_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe fn new_drop(_: *mut u8) {
+        NEW_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+    let _guard = runtime_test_guard();
+    reset_internal();
+    OLD_DROPS.store(0, Ordering::Relaxed);
+    NEW_DROPS.store(0, Ordering::Relaxed);
+    crate::gc::willow_register_drop(123_456, old_drop);
+    let mut tls = tlab_state_for_test();
+    assert!(!willow_gc_alloc_slow(&mut tls, 1, 123_456, 8, 0).is_null());
+    let registry = minor_registry_snapshot();
+    let mut state = runtime().heap.lock().unwrap();
+    retire_all_tlabs_unindexed(&mut state);
+    let mut stop = Default::default();
+    let collector = MinorCollector::new(&mut state, registry, &mut stop);
+    // Deterministically pause the collection after capture while a mutator
+    // replaces the callback. Its finalization must still use the old snapshot.
+    std::thread::spawn(|| crate::gc::willow_register_drop(123_456, new_drop))
+        .join()
+        .unwrap();
+    collector.run(MinorRoots::default(), Default::default());
+    assert_eq!(OLD_DROPS.load(Ordering::Relaxed), 1);
+    assert_eq!(NEW_DROPS.load(Ordering::Relaxed), 0);
+    assert!(std::ptr::fn_addr_eq(
+        minor_registry_snapshot().drops[&123_456],
+        new_drop as crate::gc::DropFn
+    ));
+    drop(state);
+    reset_internal();
+}
+
+#[test]
 fn scoped_lease_policy_visits_scale_with_roots_plus_loans() {
     use crate::gc::*;
     let _guard = runtime_test_guard();
@@ -34,7 +118,7 @@ fn scoped_lease_policy_visits_scale_with_roots_plus_loans() {
     reset_internal();
 }
 use crate::gc::{
-    GC_HEADER_SIZE, drop_registry, reset_internal, retire_all_tlabs_unindexed, runtime,
+    GC_HEADER_SIZE, minor_registry_snapshot, reset_internal, retire_all_tlabs_unindexed, runtime,
     runtime_test_guard, tlab_state_for_test, type_registry, verify_old_region_metadata,
     willow_gc_alloc_slow,
 };
@@ -73,12 +157,11 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
             }
 
             let root_count = if shape == "duplicate_roots" { n } else { 1 };
-            let trace = type_registry().lock().unwrap().clone();
-            let drops = drop_registry().lock().unwrap().clone();
+            let registry = minor_registry_snapshot();
             let mut state = runtime().heap.lock().unwrap();
             retire_all_tlabs_unindexed(&mut state);
             let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
-            let (_, work) = MinorCollector::new(&mut state, trace, drops, &mut stop).run(
+            let (_, work) = MinorCollector::new(&mut state, registry, &mut stop).run(
                 MinorRoots {
                     slots: Vec::new(),
                     values: vec![(nodes[0], PinSource::RuntimeCodeStack); root_count],
@@ -137,13 +220,12 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
 }
 
 fn collect(roots: Vec<*mut u8>) -> crate::gc_telemetry::MarkWork {
-    let trace = type_registry().lock().unwrap().clone();
-    let drops = drop_registry().lock().unwrap().clone();
+    let registry = minor_registry_snapshot();
     let mut state = runtime().heap.lock().unwrap();
     retire_all_tlabs_unindexed(&mut state);
     let remembered = std::mem::take(&mut state.remembered_set);
     state.dirty_cards.clear();
-    let (_, work) = MinorCollector::new(&mut state, trace, drops, &mut Default::default()).run(
+    let (_, work) = MinorCollector::new(&mut state, registry, &mut Default::default()).run(
         MinorRoots {
             slots: Vec::new(),
             values: roots
@@ -326,13 +408,7 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
                 state.dirty_cards.clear();
                 let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
                 let roots = if young == 0 { vec![] } else { vec![owner] };
-                let (_, work) = MinorCollector::new(
-                    &mut state,
-                    Default::default(),
-                    Default::default(),
-                    &mut stop,
-                )
-                .run(
+                let (_, work) = MinorCollector::new(&mut state, Default::default(), &mut stop).run(
                     MinorRoots {
                         slots: Vec::new(),
                         values: roots
@@ -468,12 +544,7 @@ fn young_source_accepts_only_exact_pre_cycle_young_payloads() {
     let mut state = runtime().heap.lock().unwrap();
     retire_all_tlabs_unindexed(&mut state);
     let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
-    let mut collector = MinorCollector::new(
-        &mut state,
-        Default::default(),
-        Default::default(),
-        &mut stop,
-    );
+    let mut collector = MinorCollector::new(&mut state, Default::default(), &mut stop);
     let address = young as usize;
     assert!(collector.young_source(address).is_some());
     assert!(collector.young_source(address + 8).is_none(), "interior");
@@ -664,12 +735,11 @@ fn fill_chunks(
 /// Run one minor collection over the production (unindexed) retirement and
 /// return its stop counters.
 fn collect_with_stop(slots: Vec<*mut *mut u8>) -> crate::gc_telemetry::stops::StopWorkV2 {
-    let trace = type_registry().lock().unwrap().clone();
-    let drops = drop_registry().lock().unwrap().clone();
+    let registry = minor_registry_snapshot();
     let mut state = runtime().heap.lock().unwrap();
     retire_all_tlabs_unindexed(&mut state);
     let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
-    MinorCollector::new(&mut state, trace, drops, &mut stop).run(
+    MinorCollector::new(&mut state, registry, &mut stop).run(
         MinorRoots {
             slots,
             values: Vec::new(),
@@ -814,13 +884,7 @@ fn minor_rejects_unpublished_and_overlapping_start_bits_in_unindexed_chunk() {
             retire_all_tlabs_unindexed(&mut state);
             assert!(state.tlab_chunks[0].needs_index());
             let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
-            MinorCollector::new(
-                &mut state,
-                Default::default(),
-                Default::default(),
-                &mut stop,
-            )
-            .run(
+            MinorCollector::new(&mut state, Default::default(), &mut stop).run(
                 MinorRoots {
                     slots: vec![slot as *mut *mut u8],
                     values: Vec::new(),

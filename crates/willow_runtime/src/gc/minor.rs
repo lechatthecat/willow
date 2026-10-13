@@ -8,12 +8,12 @@ use std::hash::BuildHasherDefault;
 
 use super::{
     DropFn, GC_GENERATION_OLD, GC_GENERATION_YOUNG, GC_HEADER_SIZE, GC_REGION_MARK_GRANULE,
-    GcHeader, GcPayload, GcState, HeapObject, RegionKind, RootSlot, TraceFn,
-    allocate_old_region_object_locked, append_parked_roots, drop_registry,
-    foreign_root_stack_owner_active, foreign_root_stack_owner_active_locked, index_retired_chunk,
+    GcHeader, GcPayload, GcState, HeapObject, MinorRegistrySnapshot, RegionKind, RootSlot,
+    allocate_old_region_object_locked, append_parked_roots, foreign_root_stack_owner_active,
+    foreign_root_stack_owner_active_locked, index_retired_chunk, minor_registry_snapshot,
     minor_stack_roots, object_reference_slots, retire_all_tlabs_unindexed, runtime,
-    runtime_root_slots, tlab_payload_generation, type_registry, verify_old_region_metadata,
-    verify_remembered_set, willow_gc_safepoint, with_stw,
+    runtime_root_slots, tlab_payload_generation, verify_old_region_metadata, verify_remembered_set,
+    willow_gc_safepoint, with_stw,
 };
 
 /// Collector-private address keys use the shared folded multiply; SipHash
@@ -21,7 +21,6 @@ use super::{
 pub(super) use crate::id_hash::IdHasher as AddressHasher;
 type AddressMap<V> = HashMap<usize, V, BuildHasherDefault<AddressHasher>>;
 type AddressSet = HashSet<usize, BuildHasherDefault<AddressHasher>>;
-type DropMap = HashMap<u32, DropFn, BuildHasherDefault<AddressHasher>>;
 
 #[cfg(test)]
 #[path = "minor_tests.rs"]
@@ -48,22 +47,13 @@ struct MinorCollector<'a> {
     needs_scan: AddressSet,
     worklist: Vec<HeapObject>,
     scanned: AddressSet,
-    trace_registry: HashMap<u32, TraceFn>,
-    /// Consulted once per swept young object, so rehashed from the global
-    /// SipHash registry once per cycle (O(types)).
-    drop_registry: DropMap,
-    /// Whether a drop hook is registered for a type that generated code can
-    /// allocate on the inline TLAB path: any type but an opaque native
-    /// payload, which only the runtime allocates. Normally false, so only a
-    /// chunk's slow-path first object can need a drop hook. O(types) per cycle.
-    generated_drop: bool,
+    registry: std::sync::Arc<MinorRegistrySnapshot>,
 }
 
 impl<'a> MinorCollector<'a> {
     fn new(
         state: &'a mut GcState,
-        trace_registry: HashMap<u32, TraceFn>,
-        drop_registry: HashMap<u32, DropFn>,
+        registry: std::sync::Arc<MinorRegistrySnapshot>,
         stop_work: &'a mut crate::gc_telemetry::stops::StopWorkV2,
     ) -> Self {
         debug_assert!(
@@ -79,11 +69,6 @@ impl<'a> MinorCollector<'a> {
         // membership is answered by the chunk index plus start bitmap, so no
         // per-object index is built for the (mostly dead) nursery.
         let source_chunks = state.tlab_chunks.len();
-        let generated_drop = drop_registry.keys().any(|&type_id| {
-            willow_abi::runtime_type_ids::runtime_type(type_id).is_none_or(|runtime| {
-                runtime.layout != willow_abi::runtime_type_ids::TypeLayout::OpaqueNative
-            })
-        });
         let mut collector = Self {
             work: crate::gc_telemetry::MarkWork::default(),
             stop_work,
@@ -96,9 +81,7 @@ impl<'a> MinorCollector<'a> {
             needs_scan: AddressSet::default(),
             worklist: Vec::new(),
             scanned: AddressSet::default(),
-            trace_registry,
-            drop_registry: drop_registry.into_iter().collect(),
-            generated_drop,
+            registry,
         };
         for index in 0..source_chunks {
             collector.index_chunk(index);
@@ -409,7 +392,7 @@ impl<'a> MinorCollector<'a> {
             metadata.payload_size,
             metadata.gc_ref_mask,
         );
-        let slots = object_reference_slots(object, &self.trace_registry);
+        let slots = object_reference_slots(object, &self.registry.trace);
         self.work.object(
             object.size(),
             slots.iter().filter(|slot| !slot.is_null()).count(),
@@ -621,7 +604,7 @@ impl<'a> MinorCollector<'a> {
                     let drop_fn = match last_type {
                         Some((cached, drop_fn)) if cached == type_id => drop_fn,
                         _ => {
-                            let drop_fn = self.drop_registry.get(&type_id).copied();
+                            let drop_fn = self.registry.drops.get(&type_id).copied();
                             last_type = Some((type_id, drop_fn));
                             drop_fn
                         }
@@ -718,14 +701,14 @@ impl<'a> MinorCollector<'a> {
     /// O(1): only its slow-path first object at offset 0 can, unless
     /// `generated_drop`.
     fn may_drop(&self, chunk_index: usize) -> bool {
-        if self.generated_drop {
+        if self.registry.generated_drop {
             return true;
         }
         let chunk = &self.state.tlab_chunks[chunk_index];
         // SAFETY: the runtime slow path initialized the header at offset 0 of
         // this nonempty chunk before publishing it to generated code.
         let first = HeapObject::from_raw(chunk.base.cast()).expect("chunk base is non-null");
-        self.drop_registry.contains_key(&first.type_id())
+        self.registry.drops.contains_key(&first.type_id())
     }
 
     /// Debug-only check of the unwalked dead-chunk shortcut: its start bits
@@ -742,7 +725,7 @@ impl<'a> MinorCollector<'a> {
             assert!(
                 object.allocated()
                     && object.generation() == GC_GENERATION_YOUNG
-                    && !self.drop_registry.contains_key(&object.type_id())
+                    && !self.registry.drops.contains_key(&object.type_id())
                     && !self
                         .forwarding
                         .contains_key(&(object.payload().as_ptr() as usize)),
@@ -867,8 +850,7 @@ fn minor_collect_with_roots(
     // Address runtime roots are old. Their initial children are remembered at
     // registration and subsequent stores use the old-to-young barrier. Scanning
     // the complete registry here would revisit every suspended task each minor.
-    let trace_registry = type_registry().lock().unwrap().clone();
-    let drop_registry = drop_registry().lock().unwrap().clone();
+    let registry = minor_registry_snapshot();
     let mut state = runtime().heap.lock().unwrap();
     // Promotion raises `occupied` per object; drop the lock-free headrooms
     // once instead of charging each copy.
@@ -883,7 +865,7 @@ fn minor_collect_with_roots(
     state.minor_deferral_start_bytes = None;
     state.minor_retry_bytes = 0;
     if std::env::var("WILLOW_GC_VERIFY_BARRIER").is_ok()
-        && let Err(message) = verify_remembered_set(&state, &trace_registry)
+        && let Err(message) = verify_remembered_set(&state, &registry.trace)
     {
         panic!("willow gc: write barrier verification failed: {message}");
     }
@@ -894,7 +876,7 @@ fn minor_collect_with_roots(
     let young_before = state.young_allocated_bytes;
     let promoted_before = state.promoted_bytes;
     let copied_before = state.survivor_stats.survivor_bytes;
-    let collector = MinorCollector::new(&mut state, trace_registry, drop_registry, stop_work);
+    let collector = MinorCollector::new(&mut state, registry, stop_work);
     let mut mark_roots = collector.snapshot_roots();
     roots
         .slots

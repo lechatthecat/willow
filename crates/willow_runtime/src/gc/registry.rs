@@ -1,5 +1,78 @@
 use super::*;
 
+/// Immutable minor-collection view, including derived drop dispatch metadata.
+/// The public trace/drop registration calls are separate transactions; capture
+/// observes one point between those calls, never a mixture of different times.
+#[derive(Default)]
+pub(super) struct MinorRegistrySnapshot {
+    pub trace: HashMap<u32, TraceFn>,
+    /// Fast ID hashing is prepared once per registry generation.
+    pub drops: IdMap<u32, DropFn>,
+    /// Only opaque native payloads are excluded from inline-TLAB allocation.
+    pub generated_drop: bool,
+    generation: u64,
+}
+
+#[derive(Default)]
+pub(super) struct MinorRegistryCache {
+    generation: u64,
+    snapshot: Option<std::sync::Arc<MinorRegistrySnapshot>>,
+}
+
+impl MinorRegistryCache {
+    fn changed(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        // Also clear on wraparound; a stale generation can never alias a hit.
+        self.snapshot = None;
+    }
+}
+
+/// Lock order for writers/capture: minor cache, trace, concurrent hooks, drop.
+/// Read-only legacy lookups need no cache lock. Registration invalidates without copying;
+/// the next capture rebuilds once, avoiding quadratic startup registration.
+pub(super) fn minor_registry_snapshot() -> std::sync::Arc<MinorRegistrySnapshot> {
+    let mut cache = runtime().minor_registry_cache.lock().unwrap();
+    if let Some(snapshot) = &cache.snapshot
+        && snapshot.generation == cache.generation
+    {
+        return std::sync::Arc::clone(snapshot);
+    }
+    let trace = type_registry().lock().unwrap();
+    let drops = drop_registry().lock().unwrap();
+    let mut generated_drop = false;
+    let drops = drops
+        .iter()
+        .map(|(&id, &hook)| {
+            generated_drop = generated_drop
+                || willow_abi::runtime_type_ids::runtime_type(id).is_none_or(|ty| {
+                    ty.layout != willow_abi::runtime_type_ids::TypeLayout::OpaqueNative
+                });
+            (id, hook)
+        })
+        .collect();
+    let snapshot = std::sync::Arc::new(MinorRegistrySnapshot {
+        trace: trace.clone(),
+        drops,
+        generated_drop,
+        generation: cache.generation,
+    });
+    cache.snapshot = Some(std::sync::Arc::clone(&snapshot));
+    snapshot
+}
+
+pub(super) fn clear_hook_registries() {
+    let mut cache = runtime().minor_registry_cache.lock().unwrap();
+    type_registry().lock().unwrap().clear();
+    runtime().concurrent_trace_registry.lock().unwrap().clear();
+    runtime().concurrent_slice_registry.lock().unwrap().clear();
+    drop_registry().lock().unwrap().clear();
+    cache.changed();
+}
+
+#[cfg(test)]
+#[path = "minor_registry_tests.rs"]
+mod minor_registry_tests;
+
 // ---------------------------------------------------------------------------
 // TypeInfo registry
 // ---------------------------------------------------------------------------
@@ -86,6 +159,7 @@ fn register_hooks(
     slice: Option<ConcurrentTraceSliceFn>,
 ) {
     // Common lock order also makes epoch capture and diagnostics coherent.
+    let mut cache = runtime().minor_registry_cache.lock().unwrap();
     let mut legacy = type_registry().lock().unwrap();
     let mut traces = runtime().concurrent_trace_registry.lock().unwrap();
     let mut slices = runtime().concurrent_slice_registry.lock().unwrap();
@@ -98,6 +172,7 @@ fn register_hooks(
     if let Some(slice) = slice {
         slices.insert(type_id, slice);
     }
+    cache.changed();
 }
 
 /// Current registered native capabilities, in unspecified order. Already-running
@@ -171,12 +246,14 @@ pub fn willow_register_type(type_id: u32, trace: TraceFn) {
 
 /// Unregister all trace capabilities for `type_id`.
 pub fn willow_unregister_type(type_id: u32) {
+    let mut cache = runtime().minor_registry_cache.lock().unwrap();
     let mut legacy = type_registry().lock().unwrap();
     let mut traces = runtime().concurrent_trace_registry.lock().unwrap();
     let mut slices = runtime().concurrent_slice_registry.lock().unwrap();
     legacy.remove(&type_id);
     traces.remove(&type_id);
     slices.remove(&type_id);
+    cache.changed();
     runtime().registry_generation.fetch_add(1, Ordering::AcqRel);
 }
 
@@ -299,7 +376,9 @@ pub(super) fn drop_registry() -> &'static Mutex<HashMap<u32, DropFn>> {
 /// Register a finalizer for `type_id`, run by the sweep phase before an object
 /// of that type is deallocated.
 pub fn willow_register_drop(type_id: u32, drop_fn: DropFn) {
+    let mut cache = runtime().minor_registry_cache.lock().unwrap();
     drop_registry().lock().unwrap().insert(type_id, drop_fn);
+    cache.changed();
 }
 
 pub(super) fn lookup_drop(type_id: u32) -> Option<DropFn> {

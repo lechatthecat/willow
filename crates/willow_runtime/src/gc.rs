@@ -828,6 +828,7 @@ struct GcRuntime {
     concurrent_trace_registry: Mutex<IdMap<u32, ConcurrentTraceFn>>,
     concurrent_slice_registry: Mutex<IdMap<u32, ConcurrentTraceSliceFn>>,
     drop_registry: Mutex<HashMap<u32, DropFn>>,
+    minor_registry_cache: Mutex<MinorRegistryCache>,
     /// Advances only when registered hooks are invalidated. Runtime container
     /// types use this to cache per-generation registration without taking the
     /// registry mutex on every allocation.
@@ -856,6 +857,7 @@ impl Default for GcRuntime {
             concurrent_trace_registry: Mutex::new(IdMap::default()),
             concurrent_slice_registry: Mutex::new(IdMap::default()),
             drop_registry: Mutex::new(HashMap::new()),
+            minor_registry_cache: Mutex::new(MinorRegistryCache::default()),
             registry_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -2112,10 +2114,7 @@ fn reset_internal() {
             .store(false, std::sync::atomic::Ordering::Release);
         cv.notify_all();
     }
-    type_registry().lock().unwrap().clear();
-    runtime().concurrent_trace_registry.lock().unwrap().clear();
-    runtime().concurrent_slice_registry.lock().unwrap().clear();
-    drop_registry().lock().unwrap().clear();
+    clear_hook_registries();
     runtime()
         .registry_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
