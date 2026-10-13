@@ -1203,6 +1203,42 @@ fn async_chain_text_walks_awaiter_links() {
 }
 
 #[test]
+fn async_chain_reads_awaiter_site_persisted_at_registration() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let (inner, main) = with_global(|sched| {
+        let inner = sched.spawn_task(poll_ready_now, std::ptr::null_mut());
+        let main = sched.spawn_task(poll_ready_now, std::ptr::null_mut());
+        (inner, main)
+    });
+    // main publishes its name and site thread-locally (no task-table write),
+    // then registers as inner's awaiter, which copies both into its record.
+    set_current_task(Some(main));
+    willow_sched_tag_current_task(b"main_fn".as_ptr(), 7);
+    crate::stack_trace::willow_trace_site_set(b"main_fn".as_ptr(), 7, b"m.wi".as_ptr(), 4, 3, 9, 1);
+    assert!(with_global(|sched| sched.with_task(main, |task| task.name().is_none())).unwrap());
+    with_global(|sched| sched.register_waiter(inner, main));
+    // inner is now polled on this thread and overwrites the thread-local trace.
+    set_current_task(Some(inner));
+    willow_sched_tag_current_task(b"inner_fn".as_ptr(), 8);
+    crate::stack_trace::willow_trace_site_set(
+        b"inner_fn".as_ptr(),
+        8,
+        b"i.wi".as_ptr(),
+        4,
+        5,
+        1,
+        1,
+    );
+    let text = async_chain_text();
+    set_current_task(None);
+    crate::panic_context::willow_fault_site_clear();
+    let i = text.find("inner_fn at i.wi:5:1").expect(&text);
+    let m = text.find("main_fn at m.wi:3:9").expect(&text);
+    assert!(i < m, "{text}");
+}
+
+#[test]
 fn async_chain_inspection_handles_depth_fanout_tombstones_and_cycles() {
     let _guard = runtime_test_guard();
     for depth in [1, 32, 256] {
@@ -5575,6 +5611,42 @@ impl M2Workers {
 impl Drop for M2Workers {
     fn drop(&mut self) {
         TEST_WORKER_OVERRIDE.store(0, Ordering::Release);
+    }
+}
+
+#[test]
+fn striped_poll_counters_sum_across_threads_and_shard_wraparound() {
+    use crate::frame_lifetime::PollLifetime;
+    let _guard = runtime_test_guard();
+    // More threads than stripes, so some stripes are shared.
+    for (threads, polls) in [(1, 1), (8, 100), (70, 25)] {
+        reset_stress_fixture();
+        let held = std::sync::Barrier::new(threads + 1);
+        let release = std::sync::Barrier::new(threads + 1);
+        std::thread::scope(|scope| {
+            for thread in 0..threads {
+                let (held, release) = (&held, &release);
+                scope.spawn(move || {
+                    // Frame identity 0 means "no frame" and is not counted.
+                    let frame = thread + 1;
+                    let _outer = PollLifetime::enter(frame);
+                    for _ in 0..polls {
+                        drop(PollLifetime::enter(frame));
+                    }
+                    held.wait();
+                    release.wait();
+                });
+            }
+            held.wait();
+            // Assert only after releasing, so a failure cannot strand workers.
+            let s = crate::frame_lifetime::snapshot();
+            release.wait();
+            assert_eq!(s.task_frames_running, threads as u64, "{s:?}");
+            assert_eq!(s.poll_exits, (threads * polls) as u64, "{s:?}");
+        });
+        let s = crate::frame_lifetime::snapshot();
+        assert_eq!(s.task_frames_running, 0, "{s:?}");
+        assert_eq!(s.poll_exits, (threads * (polls + 1)) as u64, "{s:?}");
     }
 }
 

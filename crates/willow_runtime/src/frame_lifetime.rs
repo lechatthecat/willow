@@ -1,9 +1,10 @@
 //! Task-frame diagnostics. Counters never own GC references. Optional events
 //! retain only integer identities in a bounded ring, so diagnostics cannot
 //! manufacture a permanent root or grow with completed tasks.
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameEventKind {
@@ -44,6 +45,8 @@ macro_rules! counters {
         #[derive(Debug, Clone, Copy, Default)]
         pub struct FrameLifetimeSnapshot {
             $(pub $field: u64,)+
+            pub task_frames_running: u64,
+            pub poll_exits: u64,
             pub task_frames_rooted: u64,
             pub task_frames_retired: u64,
             pub task_frames_terminal: u64,
@@ -55,6 +58,9 @@ macro_rules! counters {
                 $($field: $field.load(Ordering::Acquire),)+
                 ..Default::default()
             };
+            let (entered, exited) = poll_totals();
+            s.task_frames_running = entered.saturating_sub(exited);
+            s.poll_exits = exited;
             s.task_frames_rooted = s.scheduler_roots_added.saturating_sub(s.scheduler_roots_released);
             s.task_frames_retired = s.terminal_events.saturating_sub(s.scheduler_roots_released);
             s.task_frames_terminal = s.terminal_events.saturating_sub(s.terminal_frames_reclaimed);
@@ -65,6 +71,8 @@ macro_rules! counters {
         fn maximum_counter_diagnostic_is_bounded() {
             let counters = FrameLifetimeSnapshot {
                 $($field: u64::MAX,)+
+                task_frames_running: u64::MAX,
+                poll_exits: u64::MAX,
                 task_frames_rooted: u64::MAX,
                 task_frames_retired: u64::MAX,
                 task_frames_terminal: u64::MAX,
@@ -78,10 +86,63 @@ macro_rules! counters {
         #[cfg(test)]
         pub(crate) fn reset() {
             $($field.store(0, Ordering::Release);)+
+            for shard in &POLL_SHARDS {
+                shard.entered.store(0, Ordering::Release);
+                shard.exited.store(0, Ordering::Release);
+            }
             EVENTS.lock().unwrap_or_else(|p| p.into_inner()).clear();
             CAPTURE.store(false, Ordering::Release);
         }
     };
+}
+
+/// Poll entry/exit counts run on every task poll of every worker, so they are
+/// striped per thread instead of contending on two process-global words
+/// (willow-a6o0). Snapshots sum the stripes: running = entered - exited.
+const POLL_SHARD_COUNT: usize = 64;
+
+#[repr(align(128))]
+struct PollShard {
+    entered: AtomicU64,
+    exited: AtomicU64,
+}
+
+static POLL_SHARDS: [PollShard; POLL_SHARD_COUNT] = [const {
+    PollShard {
+        entered: AtomicU64::new(0),
+        exited: AtomicU64::new(0),
+    }
+}; POLL_SHARD_COUNT];
+static NEXT_POLL_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static POLL_SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+fn poll_shard() -> &'static PollShard {
+    let index = POLL_SHARD.with(|slot| {
+        let mut index = slot.get();
+        if index == usize::MAX {
+            index = NEXT_POLL_SHARD.fetch_add(1, Ordering::Relaxed) % POLL_SHARD_COUNT;
+            slot.set(index);
+        }
+        index
+    });
+    &POLL_SHARDS[index]
+}
+
+/// Sum exits before entries: an exit is counted only after its entry, so a
+/// concurrent snapshot never observes more exits than entries.
+fn poll_totals() -> (u64, u64) {
+    let exited = POLL_SHARDS
+        .iter()
+        .map(|shard| shard.exited.load(Ordering::Acquire))
+        .sum::<u64>();
+    let entered = POLL_SHARDS
+        .iter()
+        .map(|shard| shard.entered.load(Ordering::Acquire))
+        .sum::<u64>();
+    (entered, exited)
 }
 
 // Lowercase names deliberately match the public snapshot fields.
@@ -89,10 +150,10 @@ macro_rules! counters {
 mod counts {
     use super::*;
     counters! {
-        frames_created, allocated_frame_bytes, task_frames_running,
+        frames_created, allocated_frame_bytes,
         terminal_events, terminal_frames_reclaimed,
         scheduler_roots_added, scheduler_roots_released,
-        poll_exits, quiescent_events, scope_owner_releases,
+        quiescent_events, scope_owner_releases,
         metadata_removed_frames, metadata_removed_bytes,
         quarantined_frames, quarantined_bytes, pending_drops,
         task_frames_reclaimed, reclaimed_frame_bytes, sweep_completions,
@@ -108,10 +169,11 @@ mod counts {
                 allocated_frame_bytes.fetch_add(bytes, Ordering::AcqRel);
             }
             FrameEventKind::SchedulerRootAdded => increment(&scheduler_roots_added),
-            FrameEventKind::PollEntered => increment(&task_frames_running),
+            FrameEventKind::PollEntered => {
+                poll_shard().entered.fetch_add(1, Ordering::Release);
+            }
             FrameEventKind::PollExited => {
-                task_frames_running.fetch_sub(1, Ordering::AcqRel);
-                increment(&poll_exits);
+                poll_shard().exited.fetch_add(1, Ordering::Release);
             }
             FrameEventKind::Terminal => increment(&terminal_events),
             FrameEventKind::Quiescent => increment(&quiescent_events),
@@ -186,11 +248,7 @@ pub(crate) fn record_sweep(kind: FrameEventKind, frame: usize, sweep_epoch: u64,
 fn record_with_sweep(kind: FrameEventKind, frame: usize, epoch: u64, sweep_epoch: u64, bytes: u64) {
     counts::record(kind, bytes);
     if CAPTURE.load(Ordering::Acquire) {
-        let mut events = EVENTS.lock().unwrap_or_else(|p| p.into_inner());
-        if events.len() == EVENT_LIMIT {
-            events.pop_front();
-        }
-        events.push_back(FrameEvent {
+        push_event(FrameEvent {
             kind,
             epoch,
             sweep_epoch,
@@ -198,6 +256,13 @@ fn record_with_sweep(kind: FrameEventKind, frame: usize, epoch: u64, sweep_epoch
             bytes,
         });
     }
+}
+fn push_event(event: FrameEvent) {
+    let mut events = EVENTS.lock().unwrap_or_else(|p| p.into_inner());
+    if events.len() == EVENT_LIMIT {
+        events.pop_front();
+    }
+    events.push_back(event);
 }
 pub(crate) fn metadata_removed(frame: usize, bytes: usize, terminal: bool, sweep_epoch: u64) {
     if terminal {
@@ -224,27 +289,30 @@ pub(crate) struct PollLifetime(usize);
 impl PollLifetime {
     pub(crate) fn enter(frame: usize) -> Self {
         if frame != 0 {
-            record(
-                FrameEventKind::PollEntered,
-                frame,
-                crate::frame_reclaim::current_epoch(),
-                0,
-            );
+            record_poll(FrameEventKind::PollEntered, frame);
         }
         Self(frame)
     }
 }
 impl Drop for PollLifetime {
     fn drop(&mut self) {
-        if self.0 == 0 {
-            return;
+        if self.0 != 0 {
+            record_poll(FrameEventKind::PollExited, self.0);
         }
-        record(
-            FrameEventKind::PollExited,
-            self.0,
-            crate::frame_reclaim::current_epoch(),
-            0,
-        );
+    }
+}
+
+/// Poll events read the retire epoch only when events are being captured.
+fn record_poll(kind: FrameEventKind, frame: usize) {
+    counts::record(kind, 0);
+    if CAPTURE.load(Ordering::Acquire) {
+        push_event(FrameEvent {
+            kind,
+            epoch: crate::frame_reclaim::current_epoch(),
+            sweep_epoch: 0,
+            frame,
+            bytes: 0,
+        });
     }
 }
 

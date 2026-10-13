@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeFrame {
@@ -10,11 +10,147 @@ pub struct RuntimeFrame {
     pub active: bool,
 }
 
+/// Location published by `willow_trace_site_set`. The bytes are the generated
+/// program's static string data, so a site is recorded without copying or
+/// allocating; text is materialized only when a diagnostic is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TraceSite {
+    function: &'static [u8],
+    file: &'static [u8],
+    line: usize,
+    col: usize,
+}
+
+impl TraceSite {
+    /// # Safety
+    /// Non-null pointers must reference `len` bytes that live for the rest of
+    /// the process (generated static data).
+    unsafe fn from_static(
+        function: *const u8,
+        function_len: i64,
+        file: *const u8,
+        file_len: i64,
+        line: i64,
+        col: i64,
+    ) -> Self {
+        Self {
+            function: unsafe { static_bytes(function, function_len) },
+            file: unsafe { static_bytes(file, file_len) },
+            line: line.max(0) as usize,
+            col: col.max(0) as usize,
+        }
+    }
+
+    pub(crate) fn file(&self) -> &'static [u8] {
+        self.file
+    }
+
+    pub(crate) fn line(&self) -> usize {
+        self.line
+    }
+
+    pub(crate) fn col(&self) -> usize {
+        self.col
+    }
+
+    fn function_name(&self) -> std::borrow::Cow<'static, str> {
+        String::from_utf8_lossy(self.function)
+    }
+
+    pub(crate) fn file_name(&self) -> std::borrow::Cow<'static, str> {
+        String::from_utf8_lossy(self.file)
+    }
+}
+
+/// Last known location of a task, read when another task renders its chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExecutionSite {
+    /// Published by generated code (copied from the thread-local site when
+    /// the task registers as an awaiter).
+    Published(TraceSite),
+    /// An explicit panic location that superseded the published site.
+    Panic(RuntimeFrame),
+}
+
+impl ExecutionSite {
+    pub(crate) fn location_text(&self) -> String {
+        match self {
+            Self::Published(site) => {
+                format!(" at {}:{}:{}", site.file_name(), site.line, site.col)
+            }
+            Self::Panic(frame) => format!(" at {}:{}:{}", frame.file, frame.line, frame.col),
+        }
+    }
+}
+
+/// # Safety
+/// See [`TraceSite::from_static`].
+unsafe fn static_bytes(ptr: *const u8, len: i64) -> &'static [u8] {
+    if ptr.is_null() || len <= 0 {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeStackTrace {
     frames: Vec<RuntimeFrame>,
-    current: Option<RuntimeFrame>,
+    /// Debug-build leaf: the executing function and its current statement.
+    current: Option<TraceSite>,
     current_async: bool,
+}
+
+/// Diagnostics of the async task last polled on this thread: its async fn name
+/// (tagged at every poll entry) and latest published site. They are kept here
+/// rather than in the shared task table so publishing costs no lock or
+/// allocation on the hot path (willow-a6o0). The owner id keeps another task
+/// polled on this worker from reading them, and the cell is deliberately not
+/// part of the native-stack trace exchange, so the scheduler can still read
+/// them after a poll returns. A task copies them into its record when it
+/// registers as an awaiter, where another task's panic chain reads them.
+#[derive(Debug, Clone, Copy)]
+struct AsyncTaskTrace {
+    task: crate::task::RuntimeTaskId,
+    name: Option<&'static [u8]>,
+    site: Option<TraceSite>,
+}
+
+thread_local! {
+    static ASYNC_TRACE: Cell<Option<AsyncTaskTrace>> = const { Cell::new(None) };
+}
+
+fn update_async_trace(task: crate::task::RuntimeTaskId, update: impl FnOnce(&mut AsyncTaskTrace)) {
+    ASYNC_TRACE.with(|slot| {
+        let mut trace = match slot.get() {
+            Some(trace) if trace.task == task => trace,
+            _ => AsyncTaskTrace {
+                task,
+                name: None,
+                site: None,
+            },
+        };
+        update(&mut trace);
+        slot.set(Some(trace));
+    });
+}
+
+/// Tag `task` with the static name of the async fn whose poll it entered.
+///
+/// # Safety
+/// `name` must reference `len` bytes of process-lifetime static data.
+pub(crate) unsafe fn tag_async_task(task: crate::task::RuntimeTaskId, name: *const u8, len: i64) {
+    let name = unsafe { static_bytes(name, len) };
+    update_async_trace(task, |trace| trace.name = Some(name));
+}
+
+/// The name and site `task` last published on this thread.
+pub(crate) fn async_trace_of(
+    task: crate::task::RuntimeTaskId,
+) -> (Option<std::borrow::Cow<'static, str>>, Option<TraceSite>) {
+    match ASYNC_TRACE.with(Cell::get) {
+        Some(trace) if trace.task == task => (trace.name.map(String::from_utf8_lossy), trace.site),
+        _ => (None, None),
+    }
 }
 
 impl RuntimeStackTrace {
@@ -146,20 +282,20 @@ pub extern "C" fn willow_trace_site_set(
         CALL_STACK.with(|slot| slot.borrow_mut().current = None);
         return;
     }
-    crate::panic_context::willow_fault_site_set(file, file_len, line, col);
-    let frame = RuntimeFrame {
-        function: unsafe { raw_str(function, function_len) },
-        file: unsafe { raw_str(file, file_len) },
-        line: line.max(0) as usize,
-        col: col.max(0) as usize,
-        active: true,
+    // SAFETY: generated code passes its static string data (see the ABI doc).
+    let site = unsafe { TraceSite::from_static(function, function_len, file, file_len, line, col) };
+    crate::panic_context::set_static_fault_site(site);
+    let task = if asynchronous {
+        crate::scheduler::current_task()
+    } else {
+        None
     };
-    if asynchronous {
-        crate::scheduler::set_current_execution_site(frame.clone());
+    if let Some(task) = task {
+        update_async_trace(task, |trace| trace.site = Some(site));
     }
     CALL_STACK.with(|slot| {
         let mut trace = slot.borrow_mut();
-        trace.current = debug.then_some(frame);
+        trace.current = debug.then_some(site);
         trace.current_async = asynchronous;
     });
 }
@@ -169,30 +305,55 @@ pub extern "C" fn willow_trace_site_set(
 pub(crate) fn panic_call_stack_text(file: &str, line: usize, col: usize) -> String {
     CALL_STACK.with(|slot| {
         let trace = slot.borrow();
-        let Some(current) = &trace.current else {
+        let Some(current) = trace.current else {
+            drop(trace);
             return current_call_stack_text();
         };
-        if trace.current_async && !file.is_empty() {
+        let current_async = trace.current_async;
+        drop(trace);
+        if current_async && !file.is_empty() {
+            let function = current.function_name().into_owned();
+            if let Some(task) = crate::scheduler::current_task() {
+                // The explicit location supersedes the last published site.
+                update_async_trace(task, |trace| trace.site = None);
+            }
             crate::scheduler::set_current_execution_site(RuntimeFrame {
-                function: current.function.clone(),
+                function,
                 file: file.to_owned(),
                 line,
                 col,
                 active: true,
             });
         }
+        let trace = slot.borrow();
         let mut out = String::from("call stack (most recent call first):");
-        for (i, frame) in std::iter::once(current)
-            .chain(trace.frames.iter().rev().filter(|frame| frame.active))
+        use std::fmt::Write;
+        let (leaf_file, leaf_line, leaf_col) = if file.is_empty() {
+            (current.file_name(), current.line, current.col)
+        } else {
+            (std::borrow::Cow::Borrowed(file), line, col)
+        };
+        let _ = write!(
+            out,
+            "\n  0: {} at {leaf_file}:{leaf_line}:{leaf_col}",
+            current.function_name()
+        );
+        for (i, frame) in trace
+            .frames
+            .iter()
+            .rev()
+            .filter(|frame| frame.active)
             .enumerate()
         {
-            let (file, line, col) = if i == 0 && !file.is_empty() {
-                (file, line, col)
-            } else {
-                (frame.file.as_str(), frame.line, frame.col)
-            };
-            use std::fmt::Write;
-            let _ = write!(out, "\n  {i}: {} at {file}:{line}:{col}", frame.function);
+            let _ = write!(
+                out,
+                "\n  {}: {} at {}:{}:{}",
+                i + 1,
+                frame.function,
+                frame.file,
+                frame.line,
+                frame.col
+            );
         }
         out
     })
@@ -287,6 +448,26 @@ mod tests {
         willow_trace_site_set(b"release".as_ptr(), 7, b"new.wi".as_ptr(), 6, 4, 1, 0);
         assert_eq!(panic_call_stack_text("new.wi", 4, 1), "");
         replace_current(previous);
+    }
+
+    #[test]
+    fn async_trace_is_owned_by_the_last_publishing_task() {
+        let site = unsafe { TraceSite::from_static(b"f".as_ptr(), 1, b"a.wi".as_ptr(), 4, 3, 2) };
+        unsafe { tag_async_task(7, b"seven".as_ptr(), 5) };
+        update_async_trace(7, |trace| trace.site = Some(site));
+        let (name, published) = async_trace_of(7);
+        assert_eq!(name.as_deref(), Some("seven"));
+        assert_eq!(published, Some(site));
+        // Re-tagging the same task keeps its site; another task resets both.
+        unsafe { tag_async_task(7, b"seven".as_ptr(), 5) };
+        assert_eq!(async_trace_of(7).1, Some(site));
+        unsafe { tag_async_task(8, b"eight".as_ptr(), 5) };
+        assert_eq!(async_trace_of(7), (None, None));
+        assert_eq!(async_trace_of(8).0.as_deref(), Some("eight"));
+        assert_eq!(async_trace_of(8).1, None);
+        // Empty or null names never become a dangling slice.
+        unsafe { tag_async_task(9, std::ptr::null(), 4) };
+        assert_eq!(async_trace_of(9).0.as_deref(), Some(""));
     }
 
     #[test]

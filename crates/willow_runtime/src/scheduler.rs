@@ -1026,6 +1026,14 @@ fn register_waiter_sharded(
     awaitee: RuntimeTaskId,
     waiter: RuntimeTaskId,
 ) -> bool {
+    // A registering task is suspending at its latest published site; copy its
+    // diagnostics where an awaitee's panic chain can read them from another
+    // thread.
+    let (name, site) = if current_task_id() == Some(waiter) {
+        crate::stack_trace::async_trace_of(waiter)
+    } else {
+        (None, None)
+    };
     tasks.with_two_mut(awaitee, waiter, |awaitee_task, waiter_task| {
         let Some(awaitee_task) = awaitee_task else {
             return false;
@@ -1034,8 +1042,16 @@ fn register_waiter_sharded(
             return false;
         }
         let registered = awaitee_task.register_waiter(waiter);
-        if registered && let Some(task) = waiter_task {
-            task.add_awaiting(awaitee);
+        if let Some(task) = waiter_task {
+            if registered {
+                task.add_awaiting(awaitee);
+            }
+            if let Some(name) = name {
+                task.set_name(name);
+            }
+            if let Some(site) = site {
+                task.set_execution_site(crate::stack_trace::ExecutionSite::Published(site));
+            }
         }
         true
     })
@@ -2113,7 +2129,22 @@ fn global_task_table() -> &'static Arc<ShardedTaskTable> {
 /// republish work between two of its reads unseen (willow-8hq4.19). All
 /// accesses are `SeqCst`: the word is one half of the store/load handshake with
 /// [`ParallelRunState::stop_intent`] that lets claims skip `claim_gate`.
-static CLAIM_WORD: AtomicU64 = AtomicU64::new(0);
+///
+/// Every claim RMWs the word twice, so it sits alone on its cache line: the
+/// adjacent read-mostly flags (`FRAME_RELEASE_DUE`, polled once per loop
+/// iteration) would otherwise miss on every claim elsewhere (willow-a6o0).
+static CLAIM_WORD: ClaimWord = ClaimWord(AtomicU64::new(0));
+
+#[repr(align(128))]
+struct ClaimWord(AtomicU64);
+
+impl std::ops::Deref for ClaimWord {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &AtomicU64 {
+        &self.0
+    }
+}
 
 const CLAIM_COUNT_BITS: u32 = 32;
 const CLAIM_COUNT_MASK: u64 = (1 << CLAIM_COUNT_BITS) - 1;
@@ -2824,18 +2855,20 @@ pub extern "C" fn willow_sched_current_task() -> u64 {
 }
 
 /// Tag the currently-running task with its async fn name (raw static UTF-8 bytes
-/// plus length). Emitted at the top of each async poll fn so a panic can render
-/// the async chain (willow-9lw). No-op when no task is running.
+/// plus length, which must remain valid for the process lifetime). Emitted at
+/// the top of each async poll fn so a panic can render the async chain
+/// (willow-9lw). No-op when no task is running.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) {
     if name.is_null() || name_len <= 0 {
         return;
     }
-    let bytes = unsafe { std::slice::from_raw_parts(name, name_len as usize) };
-    let name = String::from_utf8_lossy(bytes).into_owned();
+    // Every poll entry tags, so this only publishes thread-locally; a task
+    // copies its name into its record when it registers as an awaiter.
     if let Some(id) = current_task_id() {
-        global_task_table().with_mut(id, |task| task.set_name(name));
+        // SAFETY: generated code passes its static string data.
+        unsafe { crate::stack_trace::tag_async_task(id, name, name_len) };
     }
 }
 
@@ -2853,15 +2886,23 @@ pub(crate) fn wake_idle_mutators_for_gc() {
     notify_all_idle_waiters();
 }
 
+/// Record an explicit panic location for the current task (cold path).
 pub(crate) fn set_current_execution_site(frame: crate::stack_trace::RuntimeFrame) {
     if let Some(id) = current_task_id() {
-        global_task_table().with_mut(id, |task| task.set_execution_site(frame));
+        global_task_table().with_mut(id, |task| {
+            task.set_execution_site(crate::stack_trace::ExecutionSite::Panic(frame))
+        });
     }
+}
+
+pub(crate) fn current_task() -> Option<RuntimeTaskId> {
+    current_task_id()
 }
 
 /// Render the active async chain for panic diagnostics (willow-9lw).
 pub fn async_chain_text() -> String {
-    let Some(mut id) = current_task_id() else {
+    let current = current_task_id();
+    let Some(mut id) = current else {
         return String::new();
     };
     let mut lines = Vec::new();
@@ -2869,10 +2910,23 @@ pub fn async_chain_text() -> String {
     // Walk current task -> its awaiter -> ... via the reverse `waiters` link.
     while seen.insert(id) {
         let Some((line, awaiter)) = global_task_table().with(id, |task| {
-            let name = task.name().unwrap_or("<async task>");
-            let location = task.execution_site().map_or_else(String::new, |frame| {
-                format!(" at {}:{}:{}", frame.file, frame.line, frame.col)
-            });
+            // The running task's name and latest site stay thread-local;
+            // suspended awaiters carry the copies made when they registered.
+            let (published_name, published_site) = if Some(id) == current {
+                crate::stack_trace::async_trace_of(id)
+            } else {
+                (None, None)
+            };
+            let name = published_name
+                .as_deref()
+                .or(task.name())
+                .unwrap_or("<async task>");
+            let location = match published_site {
+                Some(site) => crate::stack_trace::ExecutionSite::Published(site).location_text(),
+                None => task
+                    .execution_site()
+                    .map_or_else(String::new, |site| site.location_text()),
+            };
             let site = match task.spawn_site() {
                 Some((file, line)) => format!(" [task {id}, spawned at {file}:{line}]"),
                 None => format!(" [task {id}]"),

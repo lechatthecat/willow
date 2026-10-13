@@ -220,11 +220,11 @@ pub(crate) struct TaskDebugInfo {
     /// Source name of the async fn this task runs, tagged at poll-fn entry.
     /// Used to render async stack traces from the suspended future chain
     /// (willow-9lw).
-    name: Option<String>,
+    name: Option<std::borrow::Cow<'static, str>>,
     /// Source location of the call that spawned this task (file, line), for
     /// panic/debug traces (willow-0a6k.7).
     spawn_site: Option<(String, u32)>,
-    execution_site: Option<crate::stack_trace::RuntimeFrame>,
+    execution_site: Option<crate::stack_trace::ExecutionSite>,
 }
 
 /// A scheduler-owned task. Inspect it by borrowing; copying the record would
@@ -611,18 +611,18 @@ impl RuntimeTask {
         self.debug.as_ref().and_then(|debug| debug.name.as_deref())
     }
 
-    pub fn set_name(&mut self, name: String) {
-        self.debug.get_or_insert_with(Box::default).name = Some(name);
+    pub fn set_name(&mut self, name: impl Into<std::borrow::Cow<'static, str>>) {
+        self.debug.get_or_insert_with(Box::default).name = Some(name.into());
     }
 
-    pub(crate) fn execution_site(&self) -> Option<&crate::stack_trace::RuntimeFrame> {
+    pub(crate) fn execution_site(&self) -> Option<&crate::stack_trace::ExecutionSite> {
         self.debug
             .as_ref()
             .and_then(|debug| debug.execution_site.as_ref())
     }
 
-    pub(crate) fn set_execution_site(&mut self, frame: crate::stack_trace::RuntimeFrame) {
-        self.debug.get_or_insert_with(Box::default).execution_site = Some(frame);
+    pub(crate) fn set_execution_site(&mut self, site: crate::stack_trace::ExecutionSite) {
+        self.debug.get_or_insert_with(Box::default).execution_site = Some(site);
     }
 
     pub fn spawn_site(&self) -> Option<(&str, u32)> {

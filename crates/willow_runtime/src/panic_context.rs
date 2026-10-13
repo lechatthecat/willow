@@ -300,21 +300,53 @@ pub(crate) fn raise_language_message(message: &str) {
     raise_language_message_at(message, file_string.load(), line, column);
 }
 
+/// File of the published fault site. Generated code publishes its static
+/// string data, which is borrowed rather than copied on every raising call.
+enum FaultFile {
+    Static(&'static [u8]),
+    Owned(String),
+}
+
+impl FaultFile {
+    const NONE: Self = Self::Static(&[]);
+
+    fn to_text(&self) -> String {
+        match self {
+            Self::Static(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            Self::Owned(file) => file.clone(),
+        }
+    }
+}
+
 thread_local! {
     /// Statement being executed by generated code on this thread.
     /// Set immediately before each runtime call that can raise, so it is never
     /// read as a stale value by the fault it describes.
-    static FAULT_SITE: RefCell<(String, i64, i64)> = const { RefCell::new((String::new(), 0, 0)) };
+    static FAULT_SITE: RefCell<(FaultFile, i64, i64)> = const { RefCell::new((FaultFile::NONE, 0, 0)) };
 }
 
 fn current_fault_site() -> (String, i64, i64) {
-    FAULT_SITE.with(|site| site.borrow().clone())
+    FAULT_SITE.with(|site| {
+        let site = site.borrow();
+        (site.0.to_text(), site.1, site.2)
+    })
+}
+
+/// Publish a site whose file is generated static data, without copying it.
+pub(crate) fn set_static_fault_site(site: crate::stack_trace::TraceSite) {
+    FAULT_SITE.with(|slot| {
+        *slot.borrow_mut() = (
+            FaultFile::Static(site.file()),
+            site.line() as i64,
+            site.col() as i64,
+        )
+    });
 }
 
 /// Publish the source location generated code is about to execute. `file` is a
-/// pointer to raw static UTF-8 bytes (NOT a Willow String) with an explicit
-/// length, copied onto the Rust heap so the fault site never allocates on the
-/// GC heap. Also used by the named diagnostic-site ABI in release builds.
+/// pointer to raw UTF-8 bytes (NOT a Willow String) with an explicit length,
+/// copied onto the Rust heap so the fault site never allocates on the GC heap.
+/// Generated code publishes through `willow_trace_site_set` instead.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fault_site_set(file: *const u8, file_len: i64, line: i64, column: i64) {
@@ -324,7 +356,8 @@ pub extern "C" fn willow_fault_site_set(file: *const u8, file_len: i64, line: i6
         String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(file, file_len as usize) })
             .into_owned()
     };
-    FAULT_SITE.with(|site| *site.borrow_mut() = (file, line.max(0), column.max(0)));
+    FAULT_SITE
+        .with(|site| *site.borrow_mut() = (FaultFile::Owned(file), line.max(0), column.max(0)));
 }
 
 /// Drop the published fault site (used by tests and by contexts that leave
@@ -332,7 +365,7 @@ pub extern "C" fn willow_fault_site_set(file: *const u8, file_len: i64, line: i6
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fault_site_clear() {
-    FAULT_SITE.with(|site| *site.borrow_mut() = (String::new(), 0, 0));
+    FAULT_SITE.with(|site| *site.borrow_mut() = (FaultFile::NONE, 0, 0));
 }
 
 /// True while generated code is running a defer as compiler-driven cleanup —
