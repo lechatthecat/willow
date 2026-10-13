@@ -1,0 +1,17 @@
+// Generic receivers preserve their concrete type through interface defaults.
+interface Identity {
+    fn me(self) -> Self { return self; }
+    fn choose(self, other: Self) -> Self { return other; }
+}
+
+class Cell<T> implements Identity {
+    pub value: T;
+    pub fn direct(self) -> Cell<T> { return self; }
+}
+
+fn main() {
+    let number: Cell<i64> = new Cell<i64>(5).direct().me();
+    println(number.value);
+    let text = new Cell<String>("first").choose(new Cell<String>("second"));
+    println(text.me().value);
+}

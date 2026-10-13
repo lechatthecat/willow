@@ -334,3 +334,6 @@ mod string_concat_fusion;
 
 #[path = "integration/interface_default_provider_signatures.rs"]
 mod interface_default_provider_signatures;
+
+#[path = "integration/generic_class_self.rs"]
+mod generic_class_self;

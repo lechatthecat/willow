@@ -1173,7 +1173,7 @@ fn inject_default_interface_methods(
             for (p, a) in type_params.iter().zip(type_args.iter()) {
                 subst.insert(p.clone(), a.clone());
             }
-            subst.insert("Self".to_string(), Type::Named(class.name.clone()));
+            subst.insert("Self".to_string(), class.receiver_type());
             for dm in methods {
                 // The class explicitly overrides this default: nothing to inject.
                 if overridden.contains(&dm.name) {

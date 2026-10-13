@@ -34,6 +34,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/interface_default_self_signature.wi",
             "beta\nbeta\n14\n12\nbeta\n",
         ),
+        ("example/generic_class_self.wi", "5\nsecond\n"),
         (
             "example/generic_interface_default_self.wi",
             "300\n3\n[tank]\nfull\n[sign]\n",
@@ -1553,6 +1554,7 @@ fn test_october_ci_catalog_additions() {
                 | "example/interface_qualified_self_reference.wi"
                 | "example/interface_default_self_signature.wi"
                 | "example/generic_interface_default_self.wi"
+                | "example/generic_class_self.wi"
                 | "example/lock_imported_effects/main.wi"
                 | "example/module_generic_members/main.wi"
                 | "example/semantic_generic_queries.wi"

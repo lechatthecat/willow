@@ -221,6 +221,7 @@ impl TypeChecker {
     }
 
     pub(super) fn check_class(&mut self, c: &ClassDecl) {
+        let receiver_ty = self.normalize_type(&c.receiver_type(), c.span);
         self.check_class_inheritance(c);
         // A class on, or extending into, an `extends` cycle has no usable base
         // chain, so the checks that walk it (base constructor rules, interface
@@ -230,7 +231,7 @@ impl TypeChecker {
         // (willow-jlky).
         if self.class_extends_cycle(&c.name).is_none() {
             self.check_constructor_inheritance_rules(c);
-            self.check_class_implements(c);
+            self.check_class_implements(c, &receiver_ty);
             self.check_class_marker_contract(c);
         }
         for field in &c.fields {
@@ -251,28 +252,44 @@ impl TypeChecker {
                 self.reused_bodies.push(m.body.id);
                 continue;
             }
-            self.check_method(m, &c.name);
+            self.check_method(m, c, &receiver_ty);
         }
         for ctor in &c.constructors {
-            self.check_constructor(ctor, c);
+            self.check_constructor(ctor, c, &receiver_ty);
         }
     }
 
     /// Type-check an `init(...)` constructor body (willow-scq2): bind `self`,
     /// reject returning a value (E0841), and require every instance field to be
     /// assigned (E0842).
-    pub(super) fn check_constructor(&mut self, ctor: &ConstructorDecl, c: &ClassDecl) {
+    pub(super) fn check_constructor(
+        &mut self,
+        ctor: &ConstructorDecl,
+        c: &ClassDecl,
+        receiver_ty: &Type,
+    ) {
         self.query_body(ctor.body.id, |checker| {
-            checker.check_constructor_body(ctor, c)
+            checker.check_constructor_body(ctor, c, receiver_ty)
         });
     }
 
-    fn check_constructor_body(&mut self, ctor: &ConstructorDecl, c: &ClassDecl) {
+    fn check_constructor_body(
+        &mut self,
+        ctor: &ConstructorDecl,
+        c: &ClassDecl,
+        receiver_ty: &Type,
+    ) {
         let param_types = self.normalize_param_types(&ctor.params);
         for (param, ty) in ctor.params.iter().zip(param_types.iter()) {
             self.validate_type(ty, param.type_span);
         }
-        let previous_class = self.local.current_class.replace(c.name.clone());
+        // Access ownership must match `self`, including symbolic instances
+        // used while validating generic templates.
+        let owner = match receiver_ty {
+            Type::Named(name) => name,
+            _ => &c.name,
+        };
+        let previous_class = self.local.current_class.replace(owner.clone());
         let previous_effect_callable = self
             .local
             .current_effect_callable
@@ -285,7 +302,7 @@ impl TypeChecker {
         self.define_var(
             "self".to_string(),
             VarInfo {
-                ty: Type::Named(c.name.clone()),
+                ty: receiver_ty.clone(),
                 mutable: false,
                 is_param: true,
                 declaration_span: ctor.span,
@@ -982,7 +999,7 @@ impl TypeChecker {
     /// Validate a class's `implements` clause: each named interface must exist
     /// and be an interface, must not be repeated, and the class (including its
     /// inherited methods) must satisfy every required method signature exactly.
-    pub(super) fn check_class_implements(&mut self, c: &ClassDecl) {
+    pub(super) fn check_class_implements(&mut self, c: &ClassDecl, receiver_ty: &Type) {
         let mut seen: HashSet<String> = HashSet::new();
         for (index, written) in c.implements.iter().enumerate() {
             if index < c.source_implements_len {
@@ -1111,8 +1128,7 @@ impl TypeChecker {
             // Instantiate the interface for this class: substitute its type
             // parameters with the given arguments and `Self` with the class
             // (so `fn from(e: E) -> Self` conforms to a concrete signature).
-            let instantiated =
-                self.instantiate_interface(&iface, &type_args, &Type::Named(c.name.clone()));
+            let instantiated = self.instantiate_interface(&iface, &type_args, receiver_ty);
             self.check_interface_conformance(c, &instantiated);
         }
     }
@@ -1574,13 +1590,14 @@ impl TypeChecker {
         }
     }
 
-    pub(super) fn check_method(&mut self, m: &MethodDecl, class_name: &str) {
+    pub(super) fn check_method(&mut self, m: &MethodDecl, class: &ClassDecl, receiver_ty: &Type) {
         self.query_body(m.body.id, |checker| {
-            checker.check_method_body(m, class_name)
+            checker.check_method_body(m, class, receiver_ty)
         });
     }
 
-    fn check_method_body(&mut self, m: &MethodDecl, class_name: &str) {
+    fn check_method_body(&mut self, m: &MethodDecl, class: &ClassDecl, receiver_ty: &Type) {
+        let class_name = class.name.as_str();
         let return_type = self.normalize_type(&m.return_type, m.span);
         let param_types = self.normalize_param_types(&m.params);
         self.validate_type(&return_type, m.span);
@@ -1603,7 +1620,12 @@ impl TypeChecker {
                 ),
             );
         }
-        let previous_class = self.local.current_class.replace(class_name.to_string());
+        // Keep private/protected ownership aligned with the receiver binding.
+        let owner = match receiver_ty {
+            Type::Named(name) => name,
+            _ => &class.name,
+        };
+        let previous_class = self.local.current_class.replace(owner.clone());
         let previous_effect_callable =
             self.local
                 .current_effect_callable
@@ -1623,7 +1645,6 @@ impl TypeChecker {
         // or not the (legacy) explicit `self` parameter was written (willow-qsqf
         // §9.1). Static methods get no `self`; references to it there are E0831.
         if !m.is_static {
-            let receiver_ty = Type::Named(class_name.to_string());
             self.define_var(
                 "self".to_string(),
                 VarInfo {
@@ -1659,10 +1680,9 @@ impl TypeChecker {
         );
         let locals = self.local.async_local_types.split_off(async_locals_before);
         if m.is_async {
-            let receiver = Type::Named(class_name.to_string());
             let mut task_params = Vec::with_capacity(param_types.len() + usize::from(!m.is_static));
             if !m.is_static {
-                task_params.push((&receiver, m.span));
+                task_params.push((receiver_ty, m.span));
             }
             task_params.extend(
                 param_types

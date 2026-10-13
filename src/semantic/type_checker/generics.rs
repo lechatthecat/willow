@@ -1277,7 +1277,7 @@ impl TypeChecker {
         {
             self.generics.registry.borrow_mut().class_requests += 1;
         }
-        if !template.public && template.span.file_id != span.file_id {
+        if !self.signature_metadata && !template.public && template.span.file_id != span.file_id {
             self.generic_error(span, format!("generic class `{name}` is private"));
             return Some(Self::error_type());
         }
@@ -1335,6 +1335,7 @@ impl TypeChecker {
             .cloned()
             .zip(args.iter().cloned())
             .collect();
+        let template_access = name.to_string();
         let local_name = symbol(&template.name, &identity_args);
         let name = self
             .generics
@@ -1386,12 +1387,52 @@ impl TypeChecker {
         let (bindings, classes) = self.instantiation_bindings(span, &bindings);
         self.register_shared_instantiation_types(&classes);
         let mut item = Item::Class(class);
-        substitute_item(&mut item, &bindings);
+        visit_item(
+            &mut item,
+            &mut |ty| crate::semantic::generic_inference::substitute(ty, &bindings),
+            &mut |_| {},
+            true,
+            true,
+            Some((&template.name, &local_name)),
+            &mut FreshIds::default(),
+        );
         let Item::Class(mut class) = item else {
             unreachable!()
         };
         let generation = self.error_generation;
-        self.register_class(&class);
+        if template_access == template.name {
+            self.register_class(&class);
+        } else {
+            // Registration happens in the consumer, while the queued body is
+            // checked in the provider. Only the consumer's signature copy may
+            // use its import path for the template's own receiver type.
+            let mut signature = class_signature(&template);
+            signature.name = name.clone();
+            signature.type_params.clear();
+            let mut signature = Item::Class(signature);
+            visit_item(
+                &mut signature,
+                &mut |ty| {
+                    let qualified = ty.map_names(|n| {
+                        if n == &template.name {
+                            template_access.clone()
+                        } else {
+                            n.clone()
+                        }
+                    });
+                    crate::semantic::generic_inference::substitute(&qualified, &bindings)
+                },
+                &mut |_| {},
+                false,
+                true,
+                None,
+                &mut FreshIds::default(),
+            );
+            let Item::Class(signature) = signature else {
+                unreachable!()
+            };
+            self.register_class(&signature);
+        }
         self.generics.active_class_depth -= 1;
         if self.error_generation != generation {
             return Some(Self::error_type());
@@ -1824,6 +1865,7 @@ impl TypeChecker {
                 },
                 true,
                 false,
+                None,
                 ids,
             );
         }
@@ -1837,6 +1879,7 @@ fn substitute_item(item: &mut Item, bindings: &HashMap<String, Type>) {
         &mut |_| {},
         true,
         true,
+        None,
         &mut FreshIds::default(),
     );
 }
@@ -1847,6 +1890,7 @@ fn visit_item(
     expr: &mut impl FnMut(&mut Expr),
     fresh: bool,
     preserve_interface_defaults: bool,
+    static_receiver: Option<(&str, &str)>,
     ids: &mut FreshIds,
 ) {
     let mut blocks = Vec::new();
@@ -1872,14 +1916,13 @@ fn visit_item(
             for m in &mut c.methods {
                 // Nongeneric interface defaults retain their defining body and scope.
                 // The final program-wide ID pass remaps all shared copies together.
-                if preserve_interface_defaults && m.is_default_injected {
-                    continue;
-                }
                 for p in &mut m.params {
                     p.ty = ty(&p.ty);
                 }
                 m.return_type = ty(&m.return_type);
-                blocks.push(&mut m.body);
+                if !(preserve_interface_defaults && m.is_default_injected) {
+                    blocks.push(&mut m.body);
+                }
             }
             for c in &mut c.constructors {
                 for p in &mut c.params {
@@ -1928,8 +1971,21 @@ fn visit_item(
                         }
                     }
                     Expr::StaticCall(c) => {
+                        if c.type_args.is_empty()
+                            && let Some((template, receiver)) = static_receiver
+                            && c.class == template
+                        {
+                            c.class = receiver.to_string();
+                        }
                         for t in &mut c.type_args {
                             *t = ty(t);
+                        }
+                    }
+                    Expr::StaticField(c) => {
+                        if let Some((template, receiver)) = static_receiver
+                            && c.class == template
+                        {
+                            c.class = receiver.to_string();
                         }
                     }
                     Expr::New(c) => {
@@ -1963,6 +2019,12 @@ fn visit_item(
                 NodeMut::Expr(e).for_each_child(|n| nodes.push(n));
             }
             NodeMut::Stmt(s) => {
+                if let Stmt::StaticFieldAssign(assign) = s
+                    && let Some((template, receiver)) = static_receiver
+                    && assign.class == template
+                {
+                    assign.class = receiver.to_string();
+                }
                 if let Stmt::Let(l) = s
                     && let Some(t) = &mut l.ty
                 {

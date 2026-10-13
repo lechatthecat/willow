@@ -2552,7 +2552,7 @@ impl TypeChecker {
                                 )),
                             );
                         }
-                    } else {
+                    } else if !self.can_access_private_member(class_name) {
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -2646,6 +2646,15 @@ impl TypeChecker {
         }
     }
 
+    /// An unparameterized reference to the enclosing generic declaration uses
+    /// its current receiver. Compare declaration identity, never name prefixes.
+    pub(super) fn enclosing_static_receiver(&self, written: &str) -> Option<&str> {
+        let current = self.local.current_class.as_deref()?;
+        let template = self.generics.classes.get(written)?;
+        let receiver = self.symbols.lookup_class(current)?;
+        (template.span == receiver.declaration_span).then_some(current)
+    }
+
     /// What a written static-call class names, reporting nothing.
     ///
     /// The same answer [`Self::resolve_static_call_class_name`] gives, without
@@ -2659,6 +2668,9 @@ impl TypeChecker {
     pub(super) fn resolve_static_call_class_quiet(&self, class_name: &str) -> Option<String> {
         if class_name == "Self" {
             return self.local.current_class.clone();
+        }
+        if let Some(receiver) = self.enclosing_static_receiver(class_name) {
+            return Some(receiver.to_string());
         }
         if let Some(item) = self.imported_collection_aliases.get(class_name) {
             return Some(item.clone());
@@ -2699,6 +2711,9 @@ impl TypeChecker {
     ) -> Option<String> {
         if !self.check_source_type_name(class_name, span) {
             return None;
+        }
+        if let Some(receiver) = self.enclosing_static_receiver(class_name) {
+            return Some(receiver.to_string());
         }
         if class_name != "Self" {
             // The same answer [`Self::resolve_static_call_class_quiet`] gives,

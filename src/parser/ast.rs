@@ -318,6 +318,21 @@ pub struct ClassDecl {
     pub span: Span,
 }
 
+impl ClassDecl {
+    /// The receiver in this declaration's type-parameter scope.
+    /// Concrete monomorphizations have no parameters and use their own name.
+    pub(crate) fn receiver_type(&self) -> Type {
+        if self.type_params.is_empty() {
+            Type::Named(self.name.clone())
+        } else {
+            Type::Generic(
+                self.name.clone(),
+                self.type_params.iter().cloned().map(Type::Named).collect(),
+            )
+        }
+    }
+}
+
 /// An `init(self, params...) { ... }` constructor declaration (willow-scq2). No
 /// return type; `self` is bound in the body and omitted from `params`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

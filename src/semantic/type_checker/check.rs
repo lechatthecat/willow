@@ -2408,6 +2408,11 @@ impl TypeChecker {
         let generic_class = match expr {
             Expr::ObjectLiteral(o) => Some((&o.class, &o.type_args)),
             Expr::New(n) => Some((&n.class_name, &n.type_args)),
+            Expr::StaticCall(c)
+                if c.type_args.is_empty() && self.enclosing_static_receiver(&c.class).is_some() =>
+            {
+                None
+            }
             Expr::StaticCall(c) => Some((&c.class, &c.type_args)),
             _ => None,
         };
