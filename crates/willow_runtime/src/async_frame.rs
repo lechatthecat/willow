@@ -223,6 +223,8 @@ pub extern "C" fn willow_async_frame_alloc(slot_count: i64, gc_slot_mask: u64) -
         gc_ref_mask,
     ) as *mut c_void;
     if !frame.is_null() {
+        #[cfg(feature = "borrow-migration-probe")]
+        crate::borrow_migration_probe::allocated(frame as usize, payload_bytes, gc_slot_mask);
         crate::frame_lifetime::record(
             crate::frame_lifetime::FrameEventKind::Created,
             frame as usize,

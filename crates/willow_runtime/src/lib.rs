@@ -50,6 +50,8 @@ pub mod async_mutex;
 pub mod async_rwlock;
 pub mod atomic;
 pub mod blocking;
+#[cfg(feature = "borrow-migration-probe")]
+mod borrow_migration_probe;
 pub mod cancellation;
 pub mod channel;
 pub(crate) mod failure;

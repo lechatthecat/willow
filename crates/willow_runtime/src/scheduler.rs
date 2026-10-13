@@ -2292,6 +2292,10 @@ fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) 
             GlobalPollBoundary::Runnable => task.state.requeue_after_poll(),
             GlobalPollBoundary::BlockedSyscall => task.state.block_on_syscall(),
         };
+        #[cfg(feature = "borrow-migration-probe")]
+        if task.state.lifecycle() == TaskLifecycle::Parked {
+            crate::borrow_migration_probe::parked(task.frame as usize);
+        }
         if outcome == BoundaryOutcome::Requeue {
             // A task that remains runnable after its poll keeps worker
             // affinity. External wakes and newly spawned work enter the shared
@@ -3944,6 +3948,8 @@ fn claim_global_ready_for_worker(
         }
         let claim = tasks
             .with_mut(id, |task| {
+                #[cfg(feature = "borrow-migration-probe")]
+                let probe_poll = std::cell::Cell::new(task.cooperative_poll);
                 #[cfg(any(
                     all(
                         target_os = "linux",
@@ -3956,14 +3962,35 @@ fn claim_global_ready_for_worker(
                     ),
                     all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
                 ))]
-                if let Some(owner) = task.native_stack.as_ref().map(|stack| stack.worker)
-                    && owner != worker
+                {
+                    if let Some(owner) = task.native_stack.as_ref().map(|stack| stack.worker)
+                        && owner != worker
+                    {
+                        return Claim::Reroute(owner);
+                    }
+                    // A suspended synchronous call must finish on its native
+                    // stack's owner. Force migration only at stackless polls.
+                    #[cfg(feature = "borrow-migration-probe")]
+                    probe_poll.set(task.cooperative_poll && task.native_stack.is_none());
+                }
+                #[cfg(feature = "borrow-migration-probe")]
+                if probe_poll.get()
+                    && task.state.lifecycle() == TaskLifecycle::Ready
+                    && let Some(owner) = crate::borrow_migration_probe::route(
+                        task.frame as usize,
+                        worker,
+                        queues.worker_count(),
+                    )
                 {
                     return Claim::Reroute(owner);
                 }
                 match task.claim_for_poll() {
                     ClaimOutcome::Drop => Claim::Drop,
                     ClaimOutcome::Poll => {
+                        #[cfg(feature = "borrow-migration-probe")]
+                        if probe_poll.get() {
+                            crate::borrow_migration_probe::claimed(task.frame as usize, worker, id);
+                        }
                         task.yield_requested = false;
                         Claim::Work(claimed_task_work(task), task.panic_context())
                     }

@@ -265,6 +265,8 @@ fn push_event(event: FrameEvent) {
     events.push_back(event);
 }
 pub(crate) fn metadata_removed(frame: usize, bytes: usize, terminal: bool, sweep_epoch: u64) {
+    #[cfg(feature = "borrow-migration-probe")]
+    crate::borrow_migration_probe::removed(frame);
     if terminal {
         counts::terminal_reclaimed();
     }

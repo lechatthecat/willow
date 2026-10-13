@@ -8,6 +8,10 @@ license = "Apache-2.0"
 name = "willow_runtime"
 crate-type = ["staticlib", "rlib"]
 
+[features]
+# Acceptance-test runtime only; never enabled by the compiler's normal build.
+borrow-migration-probe = []
+
 [dependencies]
 crossbeam-deque = "0.8.8"
 libc = "0.2.190"

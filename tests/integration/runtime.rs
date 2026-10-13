@@ -117,3 +117,6 @@ mod virtual_error_conversion;
 
 #[path = "runtime/async_scalar_references.rs"]
 mod async_scalar_references;
+
+#[path = "runtime/async_borrow_migration.rs"]
+mod async_borrow_migration;

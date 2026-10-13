@@ -1,0 +1,22 @@
+// The marker is an inert ordinary parameter in normal builds. The opt-in
+// borrow-migration-probe runtime recognizes it and forces each resumed poll
+// onto a different worker while checking the generated borrow cell.
+async fn increment(marker: i64, value: &mut i64) {
+    let mut i = 0;
+    while i < 8 {
+        await sleep(10);
+        value = value + 1;
+        i = i + 1;
+    }
+}
+
+async fn forward(marker: i64, value: &mut i64) {
+    await sleep(10);
+    await increment(marker, &value);
+}
+
+async fn main() {
+    let mut value = 34;
+    await forward(731207731, &value);
+    println(value);
+}

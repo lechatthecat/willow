@@ -936,6 +936,35 @@ impl TestProject {
             .expect("failed to run compiler")
     }
 
+    pub(super) fn compile_with_args(&self, entry: &str, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_willow"))
+            .args([
+                "build",
+                path_str(&self.root.join(entry)),
+                "-o",
+                path_str(&self.bin_path),
+            ])
+            .args(args)
+            .output()
+            .expect("failed to run compiler")
+    }
+
+    pub(super) fn run_with_env_timeout(
+        &self,
+        env: &[(&str, &str)],
+        timeout: Duration,
+    ) -> std::process::Output {
+        let child = Command::new(&self.bin_path)
+            .envs(env.iter().copied())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run binary");
+        let (output, timed_out) = wait_with_timeout(child, timeout);
+        assert!(!timed_out, "{}", String::from_utf8_lossy(&output.stderr));
+        output
+    }
+
     /// [`Self::compile`] with extra COMPILER environment variables, so a
     /// multi-file project can be built twice under different backend settings.
     pub(super) fn compile_with_env(
