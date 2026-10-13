@@ -2900,6 +2900,55 @@ fn marker_pool_shared_budget_bounds_retries_and_preserves_pending_work() {
 }
 
 #[test]
+fn marker_pool_drains_each_claim_in_one_batch() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let pool = mark_workers::Pool::new(1).unwrap();
+    for objects in [256usize, 1024, 4096] {
+        BUDGET_RETRY_CALLS.store(0, Ordering::Relaxed);
+        BUDGET_RETRY_LIMIT.store(0, Ordering::Relaxed);
+        let mut cycle = ConcurrentCycle::new(
+            (1..=objects).map(|address| {
+                (
+                    address,
+                    raw_heap::TraceMetadata {
+                        type_id: 0xFA79,
+                        layout_id: 0,
+                        gc_ref_mask: 0,
+                        payload_size: 0,
+                    },
+                )
+            }),
+            IdSet::default(),
+            IdMap::default(),
+            0,
+        );
+        cycle.slices.insert(0xFA79, budget_retry_slice);
+        let cycle = Arc::new(cycle);
+        for address in 1..=objects {
+            cycle.enqueue(address as *mut u8);
+        }
+        mark_workers::BACKGROUND_DRAINS.store(0, Ordering::Relaxed);
+        // A zero collector budget leaves every object to the single worker.
+        pool.run(&cycle, 0);
+        let drains = mark_workers::BACKGROUND_DRAINS.load(Ordering::Relaxed);
+        assert_eq!(BUDGET_RETRY_CALLS.load(Ordering::Relaxed), objects);
+        assert_eq!(cycle.objects.marked_count(), objects);
+        // One drain per 32-object claim plus the final empty probe, not one
+        // drain, batch publication and safepoint per object.
+        assert!(
+            drains <= objects.div_ceil(32) + 1,
+            "objects={objects} drains={drains}"
+        );
+        assert!(!cycle.worker_failed.load(Ordering::Acquire));
+        assert_eq!(registered_mutator_count(), 0);
+        assert!(cycle.queue.snapshot().is_drained());
+        assert_eq!(cycle.queue.end_epoch(), 0);
+    }
+    reset_internal_for_test();
+}
+
+#[test]
 fn concurrent_closure_paces_contention_and_retains_work_until_release() {
     let _guard = runtime_test_guard();
     for waits_before_release in [1usize, 4, 16, 64] {

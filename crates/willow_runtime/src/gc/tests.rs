@@ -1985,6 +1985,8 @@ fn test_gc_old_region_sweep_creates_and_reuses_middle_hole() {
     willow_push_root(&mut c_root);
 
     willow_gc_collect();
+    // A newly reclaimed hole stays quarantined until the next mark epoch.
+    willow_gc_collect();
 
     assert_eq!(unsafe { *(a as *mut i64) }, 10);
     assert_eq!(unsafe { *(c as *mut i64) }, 30);

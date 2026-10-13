@@ -17,6 +17,9 @@ const ALLOCATION: Limits = Limits {
     bytes: 64 * 1024,
     ns: 100_000,
 };
+// Ordinary steps scan one object or start-map word, so the batch deadline is
+// sampled once per stride. Hooks, releases and index work force a sample.
+const DEADLINE_STRIDE: u32 = 16;
 
 #[derive(Clone, Copy)]
 struct Limits {
@@ -38,6 +41,9 @@ struct Report {
     sweep_wall_ns: u64,
     partial_batches: u64,
     heap_holds: u64,
+    // Allocation-index descents; tests bound them by heap holds.
+    #[cfg(test)]
+    index_reads: u64,
     heap_hold_ns: u64,
     heap_wait_ns: u64,
     heap_max_hold_ns: u64,
@@ -74,6 +80,15 @@ struct Cursor {
     finalize_old: usize,
     finalize_chunks: usize,
     done: bool,
+    // Heap wait/hold timings feed only logs, profiles and tests. Ordinary runs
+    // skip their four clock reads per step; the batch deadline stays timed.
+    timed_holds: bool,
+    // Set by a step whose cost is not bounded by one object or map word.
+    deadline_due: bool,
+    // Allocation entries at `offset..`, read with one map descent per heap
+    // hold, nearest last. Only this cursor mutates the quarantined region's
+    // index, and only behind `offset`; the hold's end discards the snapshot.
+    ahead: Vec<(usize, usize)>,
     report: Report,
 }
 
@@ -165,6 +180,10 @@ pub(super) fn execute(plan: SweepPlan) -> usize {
     freed
 }
 
+fn elapsed_ns(start: Option<Instant>) -> u64 {
+    start.map_or(0, |start| start.elapsed().as_nanos() as u64)
+}
+
 impl Cursor {
     fn new(plan: SweepPlan) -> Self {
         Self {
@@ -186,8 +205,17 @@ impl Cursor {
             build_headers: false,
             headers: None,
             done: false,
+            timed_holds: cfg!(test)
+                || crate::gc_telemetry::profiling()
+                || std::env::var_os("WILLOW_GC_LOG").is_some(),
+            deadline_due: false,
+            ahead: Vec::with_capacity(DEADLINE_STRIDE as usize),
             report: Report::default(),
         }
+    }
+
+    fn hold_clock(&self) -> Option<Instant> {
+        self.timed_holds.then(Instant::now)
     }
 
     fn batch(&mut self, limits: Limits, assist: bool) {
@@ -213,15 +241,29 @@ impl Cursor {
         let before_region = self.old;
         self.report.batches += 1;
         self.report.assists += u64::from(assist);
+        self.deadline_due = false;
+        let mut unsampled = 0;
         loop {
             if self.report.objects - before_objects >= limits.objects
                 || self.report.bytes - before_bytes >= limits.bytes
-                || now().saturating_sub(began) >= limits.ns
-                || runtime().stop_requested.load(Ordering::Acquire)
             {
                 break;
             }
-            if !self.step(assist, limits.bytes - (self.report.bytes - before_bytes)) {
+            unsampled += 1;
+            if unsampled == DEADLINE_STRIDE || std::mem::take(&mut self.deadline_due) {
+                unsampled = 0;
+                if now().saturating_sub(began) >= limits.ns {
+                    break;
+                }
+            }
+            if runtime().stop_requested.load(Ordering::Acquire) {
+                break;
+            }
+            // Steps up to the next deadline sample may share one heap hold.
+            let run = DEADLINE_STRIDE - unsampled;
+            let (progress, steps) = self.step(assist, limits, before_objects, before_bytes, run);
+            unsampled += steps - 1;
+            if !progress {
                 break;
             }
             if self.done || self.old != before_region {
@@ -254,36 +296,46 @@ impl Cursor {
         }
     }
 
-    fn step(&mut self, assist: bool, remaining: u64) -> bool {
+    /// Runs one step, or up to `run` consecutive heap-locked Progress steps.
+    /// Returns whether the batch may continue and how many steps ran.
+    fn step(
+        &mut self,
+        assist: bool,
+        limits: Limits,
+        before_objects: u64,
+        before_bytes: u64,
+        run: u32,
+    ) -> (bool, u32) {
+        let remaining = limits.bytes - (self.report.bytes - before_bytes);
         if let Some((index, builder)) = &mut self.building {
             const METADATA_BYTES: u64 =
                 (std::mem::size_of::<RegionFreeSpan>() + 3 * std::mem::size_of::<usize>()) as u64;
             if assist && remaining < METADATA_BYTES {
-                return false;
+                return (false, 1);
             }
             self.report.objects += 1;
             self.report.metadata_items += 1;
             self.report.bytes += METADATA_BYTES;
             if !builder.step() {
-                return true;
+                return (true, 1);
             }
             let index = *index;
             // Only a completed index is published; a rejected lock attempt
             // retains the completed builder for the next batch.
-            let wait = Instant::now();
+            let wait = self.hold_clock();
             let mut state = if assist {
                 match runtime().heap.try_lock() {
                     Ok(state) => state,
-                    Err(TryLockError::WouldBlock) => return true,
+                    Err(TryLockError::WouldBlock) => return (true, 1),
                     Err(TryLockError::Poisoned(_)) => panic!("GC heap poisoned"),
                 }
             } else {
                 runtime().heap.lock().unwrap()
             };
-            let waited = wait.elapsed().as_nanos() as u64;
+            let waited = elapsed_ns(wait);
             self.report.heap_wait_ns += waited;
             self.report.heap_max_wait_ns = self.report.heap_max_wait_ns.max(waited);
-            let held = Instant::now();
+            let held = self.hold_clock();
             let (_, builder) = self.building.take().unwrap();
             let region = &mut state.old_regions[index];
             let (spans, source) = builder.finish();
@@ -305,44 +357,64 @@ impl Cursor {
             self.region_reclaimed = false;
             self.started_region = false;
             self.report.heap_holds += 1;
-            let held_ns = held.elapsed().as_nanos() as u64;
+            let held_ns = elapsed_ns(held);
             self.report.heap_hold_ns += held_ns;
             self.report.heap_max_hold_ns = self.report.heap_max_hold_ns.max(held_ns);
             drop(state);
             let mut source = source;
             source.clear();
             self.gaps = source;
-            return true;
+            return (true, 1);
         }
-        let wait = Instant::now();
+        let wait = self.hold_clock();
         let mut state = if assist {
             match runtime().heap.try_lock() {
                 Ok(state) => state,
-                Err(TryLockError::WouldBlock) => return false,
+                Err(TryLockError::WouldBlock) => return (false, 1),
                 Err(TryLockError::Poisoned(_)) => panic!("GC heap poisoned"),
             }
         } else {
             runtime().heap.lock().unwrap()
         };
-        let waited_ns = wait.elapsed().as_nanos() as u64;
+        let waited_ns = elapsed_ns(wait);
         self.report.heap_wait_ns = self.report.heap_wait_ns.saturating_add(waited_ns);
         self.report.heap_max_wait_ns = self.report.heap_max_wait_ns.max(waited_ns);
-        let held = Instant::now();
-        let action = if self.old < self.plan.old {
-            self.old_step(&mut state, assist, remaining)
-        } else if self.chunks < self.plan.chunks {
-            self.chunk_step(&mut state, assist, remaining)
-        } else if assist {
-            Action::Yield // Finalization, hooks and release are collector-only.
-        } else {
-            self.finish_step(&mut state)
+        let held = self.hold_clock();
+        let region = self.old;
+        let mut steps = 0;
+        self.ahead.clear();
+        // Cheap Progress steps share the hold; every per-step batch limit is
+        // rechecked, and a stride bounds the hold like the deadline sample.
+        let action = loop {
+            let remaining = limits.bytes - (self.report.bytes - before_bytes);
+            let action = if self.old < self.plan.old {
+                self.old_step(&mut state, assist, remaining, run - steps)
+            } else if self.chunks < self.plan.chunks {
+                self.chunk_step(&mut state, assist, remaining)
+            } else if assist {
+                Action::Yield // Finalization, hooks and release are collector-only.
+            } else {
+                self.finish_step(&mut state)
+            };
+            steps += 1;
+            if !matches!(action, Action::Progress)
+                || steps == run
+                || self.done
+                || self.old != region
+                || self.report.objects - before_objects >= limits.objects
+                || self.report.bytes - before_bytes >= limits.bytes
+                || runtime().stop_requested.load(Ordering::Acquire)
+            {
+                break action;
+            }
         };
         self.report.heap_holds += 1;
-        let held_ns = held.elapsed().as_nanos() as u64;
+        let held_ns = elapsed_ns(held);
         self.report.heap_hold_ns = self.report.heap_hold_ns.saturating_add(held_ns);
         self.report.heap_max_hold_ns = self.report.heap_max_hold_ns.max(held_ns);
         drop(state);
-        match action {
+        self.deadline_due = !matches!(action, Action::Yield | Action::Progress);
+        let progress = match action {
             Action::Yield => false,
             Action::Progress => true,
             Action::Drop(hook, payload) => {
@@ -388,10 +460,11 @@ impl Cursor {
                 self.report.release_ns += began.elapsed().as_nanos() as u64;
                 true
             }
-        }
+        };
+        (progress, steps)
     }
 
-    fn old_step(&mut self, state: &mut GcState, assist: bool, remaining: u64) -> Action {
+    fn old_step(&mut self, state: &mut GcState, assist: bool, remaining: u64, want: u32) -> Action {
         let index = self.old;
         let region = &mut state.old_regions[index];
         if !self.started_region {
@@ -410,12 +483,20 @@ impl Cursor {
             region.sweep_state.phase = region::SweepPhase::Sweeping;
             self.started_region = true;
         }
-        let next = region
-            .allocations
-            .range(self.offset..)
-            .next()
-            .map(|(&offset, &span)| (offset, span));
-        let Some((offset, span)) = next else {
+        if self.ahead.is_empty() {
+            #[cfg(test)]
+            {
+                self.report.index_reads += 1;
+            }
+            let entries = region.allocations.range(self.offset..);
+            self.ahead.extend(
+                entries
+                    .take(want as usize)
+                    .map(|(&offset, &span)| (offset, span)),
+            );
+            self.ahead.reverse();
+        }
+        let Some(&(offset, span)) = self.ahead.last() else {
             if assist {
                 return Action::Yield;
             }
@@ -462,6 +543,7 @@ impl Cursor {
         self.report.objects += 1;
         self.report.bytes += work_bytes;
         self.report.swept_objects += 1;
+        self.ahead.pop();
         self.offset = offset + span;
         if live {
             if offset > self.live_end {
@@ -851,8 +933,11 @@ mod tests {
                 now
             },
         );
-        assert_eq!(cursor.report.objects, 2);
-        assert_eq!(cursor.offset, 2 * (GC_HEADER_SIZE + 8));
+        // The start read is tick 0; strided samples read ticks 1, 2 and 3,
+        // and the third stops before its own step.
+        let swept = 3 * DEADLINE_STRIDE as usize - 1;
+        assert_eq!(cursor.report.objects, swept as u64);
+        assert_eq!(cursor.offset, swept * (GC_HEADER_SIZE + 8));
         assert_eq!(cursor.report.yields, 1);
         finish(&mut cursor);
         assert_eq!(
@@ -881,6 +966,94 @@ mod tests {
                 size + GC_HEADER_SIZE
             );
             assert_eq!(willow_gc_allocated_bytes(), 0);
+        }
+        reset_internal_for_test();
+    }
+
+    static COUNTED_HOOKS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe fn counted_hook(_: *mut u8) {
+        COUNTED_HOOKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn bounded_sweep_hooks_force_deadline_samples_between_strides() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        COUNTED_HOOKS.store(0, Ordering::Relaxed);
+        willow_register_drop(99003, counted_hook);
+        let hooked = 4 * DEADLINE_STRIDE as usize;
+        for _ in 0..hooked {
+            willow_gc_alloc_layout(0, 99003, 8, 0);
+        }
+        let mut cursor = make_cursor();
+        let mut clock = 0;
+        let limits = Limits {
+            objects: u64::MAX,
+            bytes: u64::MAX,
+            ns: 3,
+        };
+        cursor.batch_with_clock(limits, false, || {
+            clock += 1;
+            clock - 1
+        });
+        // Without forced samples the stride alone would admit at least
+        // 3 * DEADLINE_STRIDE - 1 steps; each hook samples the next step.
+        let hooks = COUNTED_HOOKS.load(Ordering::Relaxed);
+        assert!((1..=3).contains(&hooks), "hooks={hooks}");
+        assert!(cursor.report.objects < DEADLINE_STRIDE as u64);
+        assert_eq!(cursor.report.yields, 1);
+        finish(&mut cursor);
+        assert_eq!(COUNTED_HOOKS.load(Ordering::Relaxed), hooked);
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn bounded_sweep_amortizes_heap_holds_and_index_reads_over_strides() {
+        let _guard = runtime_test_guard();
+        for objects in [513usize, 8193, 40_000] {
+            reset_internal_for_test();
+            runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+            let mut live = Vec::new();
+            for index in 0..objects {
+                let pointer = willow_alloc(8);
+                if index % 3 == 0 {
+                    HeapObject::from_payload(GcPayload::from_raw(pointer).unwrap()).begin_trace();
+                    live.push(pointer as usize);
+                }
+            }
+            let mut cursor = make_cursor();
+            let limits = Limits {
+                objects: u64::MAX,
+                bytes: u64::MAX,
+                ns: u64::MAX,
+            };
+            while cursor.old < cursor.plan.old {
+                cursor.batch_with_clock(limits, false, || 0);
+            }
+            let regions = cursor.plan.old as u64;
+            let report = cursor.report.clone();
+            println!(
+                "sweep_holds objects={objects} regions={regions} holds={} index_reads={}",
+                report.heap_holds, report.index_reads
+            );
+            // One hold per stride plus each region's start, end and rebuild.
+            let strides = (objects as u64).div_ceil(DEADLINE_STRIDE as u64);
+            assert!(report.heap_holds <= strides + 3 * regions, "{report:?}");
+            assert!(report.index_reads <= report.heap_holds, "{report:?}");
+            finish(&mut cursor);
+            assert_eq!(
+                willow_gc_allocated_bytes() as usize,
+                live.len() * (GC_HEADER_SIZE + 8)
+            );
+            let state = runtime().heap.lock().unwrap();
+            verify_old_region_metadata(&state).unwrap();
+            for address in live {
+                assert!(find_old_region_object(&state, address, false).is_some());
+            }
+            drop(state);
         }
         reset_internal_for_test();
     }

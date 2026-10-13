@@ -7,6 +7,10 @@ use super::*;
 use crate::gc_telemetry::workers::{Failure, JobMeasurement, record_failure};
 use std::thread::JoinHandle;
 
+/// Background drain calls, so tests can bound per-claim batching.
+#[cfg(test)]
+pub(super) static BACKGROUND_DRAINS: AtomicUsize = AtomicUsize::new(0);
+
 struct Job {
     cycle: Arc<ConcurrentCycle>,
     remaining_work: AtomicUsize,
@@ -176,17 +180,17 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
                 if budget == 0 {
                     break;
                 }
-                let mut scanned = 0;
-                for _ in 0..budget {
-                    let work = cycle.drain_recovering(|| cycle.drain_background(1, &mut children));
-                    // Retire the consumer and publish private work before
-                    // polling; no queue or heap lock crosses this call.
-                    willow_gc_safepoint();
-                    scanned += work;
-                    if work == 0 || cycle.worker_failed.load(Ordering::Acquire) {
-                        break;
-                    }
-                }
+                // One drain per claim: per-drain consumer registration, batch
+                // publication and CPU clock reads amortize over the claim. A
+                // trace panic unwinds the drain, retiring its consumer and
+                // publishing the batch; the loop head then observes failure.
+                let scanned =
+                    cycle.drain_recovering(|| cycle.drain_background(budget, &mut children));
+                #[cfg(test)]
+                BACKGROUND_DRAINS.fetch_add(1, Ordering::Relaxed);
+                // Retire the consumer and publish private work before
+                // polling; no queue or heap lock crosses this call.
+                willow_gc_safepoint();
                 if scanned == 0 {
                     break;
                 }

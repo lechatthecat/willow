@@ -1,11 +1,13 @@
 //! Largest available-span selection. Span keys are bounded by one regular
 //! region; region identities within a bucket use expected-constant swap removal.
-use std::collections::{BTreeMap, HashMap};
+use crate::id_hash::IdMap;
+use std::collections::BTreeMap;
 
 #[derive(Default)]
 pub(super) struct RegionCandidates {
     buckets: BTreeMap<usize, Vec<usize>>,
-    entries: HashMap<usize, ((usize, usize), usize)>,
+    // Runtime-assigned region indices need no SipHash (see `id_hash`).
+    entries: IdMap<usize, ((usize, usize), usize)>,
     largest: Option<(usize, usize)>,
 }
 

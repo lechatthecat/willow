@@ -254,6 +254,12 @@ pub(super) fn claim_root_stack_owner() {
     if current_thread_is_registered() {
         return;
     }
+    // Only the owning thread clears its own claim, so an existing claim stays
+    // valid without coord; collectors already defer to it.
+    let current = std::thread::current().id();
+    if *runtime().root_stack_owner.lock().unwrap() == Some(current) {
+        return;
+    }
     let coord = runtime().coord.0.lock().unwrap();
     claim_legacy_owner_locked(&coord, true);
 }
