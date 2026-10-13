@@ -42,6 +42,8 @@ pub(super) struct BodyState {
     /// without this the same statement would also be reported as an ordinary
     /// mutability error, which points the reader at the wrong fix.
     pub(super) capture_writes: HashSet<Span>,
+    /// Binding identities captured by the lambda currently being checked.
+    pub(super) current_capture_declarations: HashSet<Span>,
     /// The type a `match` in value position flows into, set for the duration of
     /// that one `match` by [`TypeChecker::check_expr_expecting`] and taken by
     /// [`TypeChecker::check_match_expr`] (willow-0g8j.3).
@@ -91,6 +93,7 @@ impl Default for BodyState {
             inferred_maps: HashMap::new(),
             pending_map_uses: HashSet::new(),
             capture_writes: HashSet::new(),
+            current_capture_declarations: HashSet::new(),
             match_expected: None,
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
@@ -857,6 +860,34 @@ mod tests {
                 .any(|captures| !captures.is_empty())
         );
         assert!(checker.expr_types.values().any(|ty| matches!(ty, Type::Generic(name, args) if name == "Map" && args == &[Type::I64, Type::I64])));
+    }
+
+    #[test]
+    fn typed_body_mutable_capture_metadata_survives_splicing() {
+        let (checker, _, _) = compare(
+            r#"
+            fn make() -> closure() -> i64 {
+                let mut n = 0;
+                let read = || n;
+                let change = || { let inner = || { n = n + 1; }; inner(); };
+                change();
+                return read;
+            }
+            fn main() { let f = make(); println(f()); }
+        "#,
+        );
+        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        let mutable: Vec<_> = checker
+            .lambda_captures
+            .values()
+            .flatten()
+            .filter(|capture| capture.mutable)
+            .collect();
+        assert_eq!(mutable.len(), 2);
+        assert_eq!(mutable[0].declaration_span, mutable[1].declaration_span);
+        let encoded = serde_json::to_string(&checker.lambda_captures).unwrap();
+        let decoded: HashMap<ExprId, Vec<LambdaCapture>> = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, checker.lambda_captures);
     }
 
     #[test]

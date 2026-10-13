@@ -394,7 +394,7 @@ fn clo_25_a_capturing_lambda_is_refused_where_a_fn_value_is_wanted() {
 #[test]
 fn clo_26_a_write_to_a_capture_is_refused() {
     let (ok, stderr) = compile_with_compiler_env(
-        "fn main() { let mut n = 1; let f = |x: i64| { n = n + x; return n; }; println(f(1)); }",
+        "fn main() { let n = 1; let f = |x: i64| { n = n + x; return n; }; println(f(1)); }",
         &PLAIN,
     );
     assert!(!ok, "a write to a capture must not compile");
@@ -415,5 +415,379 @@ fn clo_27_a_capture_of_self_is_refused() {
     assert!(
         stderr.contains("E1002") && stderr.contains("cannot capture `self`"),
         "the refusal must name `self`: {stderr}"
+    );
+}
+
+#[test]
+fn mutable_capture_counter() {
+    assert_program_output(
+        r#"fn main() { let mut n = 0; let inc = || { n = n + 1; }; inc(); inc(); println(n); }"#,
+        "2\n",
+    );
+}
+
+#[test]
+fn mutable_capture_outer_write() {
+    assert_program_output(
+        r#"fn main() { let mut n = 0; let inc = || { n = n + 1; return n; }; n = 40; println(inc()); println(n); }"#,
+        "41\n41\n",
+    );
+}
+
+#[test]
+fn mutable_capture_siblings() {
+    assert_program_output(
+        r#"fn main() { let mut n = 0; let a = || { n = n + 1; }; let b = || { n = n + 10; }; a(); b(); println(n); }"#,
+        "11\n",
+    );
+}
+
+#[test]
+fn mutable_capture_reader_before_writer() {
+    assert_program_output(
+        r#"fn main() { let mut n = 0; let read = || n; let inc = || { n = n + 1; }; inc(); println(read()); }"#,
+        "1\n",
+    );
+}
+
+#[test]
+fn mutable_capture_reader_after_writer() {
+    assert_program_output(
+        r#"fn main() { let mut n = 0; let inc = || { n = n + 1; }; let read = || n; inc(); println(read()); }"#,
+        "1\n",
+    );
+}
+
+#[test]
+fn mutable_capture_escaped() {
+    assert_program_output(
+        r#"fn make() -> closure() -> i64 { let mut n = 0; return || { n = n + 1; return n; }; } fn main() { let f = make(); println(f()); println(f()); }"#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn mutable_capture_independent() {
+    assert_program_output(
+        r#"fn make() -> closure() -> i64 { let mut n = 0; return || { n = n + 1; return n; }; } fn main() { let f = make(); let g = make(); println(f()); println(f()); println(g()); }"#,
+        "1\n2\n1\n",
+    );
+}
+
+#[test]
+fn mutable_capture_nested() {
+    assert_program_output(
+        r#"fn main() { let mut n = 0; let outer = || { let inner = || { n = n + 1; }; inner(); }; outer(); outer(); println(n); }"#,
+        "2\n",
+    );
+}
+
+#[test]
+fn mutable_capture_nested_local() {
+    assert_program_output(
+        r#"fn main() { let outer = || { let mut n = 0; return || { n = n + 1; return n; }; }; let f = outer(); println(f()); println(f()); }"#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn mutable_capture_shadow() {
+    assert_program_output(
+        r#"fn main() { let mut n = 1; let f = || { n = n + 1; let mut n = 100; n = n + 1; return n; }; println(f()); println(n); }"#,
+        "101\n2\n",
+    );
+}
+
+#[test]
+fn mutable_capture_loop_cells() {
+    assert_program_output(
+        r#"fn main() { let mut i = 0; let mut total = 0; while i < 3 { let mut n = i; let f = || { n = n + 10; return n; }; total = total + f(); i = i + 1; } println(total); }"#,
+        "33\n",
+    );
+}
+
+#[test]
+fn mutable_capture_bool() {
+    assert_program_output(
+        r#"fn main() { let mut v = false; let f = || { v = !v; }; f(); println(v); f(); println(v); }"#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn mutable_capture_float() {
+    assert_program_output(
+        r#"fn main() { let mut v = 1.5; let f = || { v = v + 0.5; }; f(); println(v); }"#,
+        "2\n",
+    );
+}
+
+#[test]
+fn mutable_capture_string() {
+    assert_program_output(
+        r#"fn main() { let mut v = "a"; let f = || { v = v + "b"; }; f(); f(); println(v); }"#,
+        "abb\n",
+    );
+}
+
+#[test]
+fn mutable_capture_array() {
+    assert_program_output(
+        r#"import std::collections::Array; fn main() { let mut v: Array<i64> = [1]; let f = || { v = [2, 3]; }; f(); println(v[1]); }"#,
+        "3\n",
+    );
+}
+
+#[test]
+fn mutable_capture_option() {
+    assert_program_output(
+        r#"fn main() { let mut v: Option<i64> = None; let f = || { v = Some(42); }; f(); println(v.unwrap()); }"#,
+        "42\n",
+    );
+}
+
+#[test]
+fn mutable_capture_fn_value() {
+    assert_program_output(
+        r#"fn one() -> i64 { return 1; } fn two() -> i64 { return 2; } fn main() { let mut v: fn() -> i64 = one; let f = || { v = two; }; f(); println(v()); }"#,
+        "2\n",
+    );
+}
+
+#[test]
+fn mutable_capture_closure_value() {
+    assert_program_output(
+        r#"fn main() { let x = 1; let y = 2; let mut v: closure() -> i64 = || x; let f = || { v = || y; }; f(); println(v()); }"#,
+        "2\n",
+    );
+}
+
+#[test]
+fn mutable_capture_defer() {
+    assert_program_output(
+        r#"fn main() { let mut n = 0; let f = || { defer { n = n + 1; } }; f(); println(n); }"#,
+        "1\n",
+    );
+}
+
+#[test]
+fn mutable_capture_assignment_only() {
+    assert_program_output(
+        r#"fn main() { let mut n = 0; let f = || { n = 7; }; f(); println(n); }"#,
+        "7\n",
+    );
+}
+
+#[test]
+fn mutable_capture_multiple_cells() {
+    assert_program_output(
+        r#"fn main() { let mut a = 0; let mut b = 10; let f = || { a = a + 1; b = b + a; }; f(); f(); println(a); println(b); }"#,
+        "2\n13\n",
+    );
+}
+
+#[test]
+fn mutable_capture_readonly_snapshot() {
+    assert_program_output(
+        r#"fn main() { let mut n = 1; let f = || n; n = 2; println(f()); }"#,
+        "1\n",
+    );
+}
+
+#[test]
+fn mutable_capture_gc_string_cell_and_environment() {
+    assert_program_output(
+        r#"
+fn make() -> closure() -> String {
+    let mut value = "first";
+    return || { gc_collect(); value = value + "!"; gc_minor_collect(); return value; };
+}
+fn main() { let f = make(); gc_collect(); println(f()); gc_collect(); println(f()); }
+"#,
+        "first!\nfirst!!\n",
+    );
+}
+
+#[test]
+fn mutable_capture_gc_replaced_array() {
+    assert_program_output(
+        r#"
+import std::collections::Array;
+fn main() {
+    let mut xs: Array<String> = ["old"];
+    let replace = || { xs = ["new" + " value"]; gc_collect(); };
+    gc_collect(); replace(); gc_minor_collect(); println(xs[0]);
+}
+"#,
+        "new value\n",
+    );
+}
+
+#[test]
+fn mutable_capture_immutable_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "fn main() { let n = 0; let f = || { n = 1; }; f(); }",
+        &PLAIN,
+    );
+    assert!(!ok);
+    assert!(
+        stderr.contains("E1009") && stderr.contains("let mut"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn mutable_capture_async_transfer_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn consume(f: closure() -> i64) -> i64 { return f(); } async fn main() { let mut n = 0; let f = || { n = n + 1; return n; }; println(await consume(f)); }",
+        &PLAIN,
+    );
+    assert!(!ok);
+    assert!(stderr.contains("E2402"), "{stderr}");
+}
+
+#[test]
+fn mutable_capture_reference_parameter_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "fn bad(n: &mut i64) { let f = || { n = 1; }; f(); } fn main() {}",
+        &PLAIN,
+    );
+    assert!(!ok);
+    assert!(stderr.contains("E1009"), "{stderr}");
+}
+
+#[test]
+fn mutable_capture_mutable_reference_deferred() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "fn bump(n: &mut i64) { n = n + 1; } fn main() { let mut n = 0; let f = || { bump(&n); }; f(); }",
+        &PLAIN,
+    );
+    assert!(!ok);
+    assert!(stderr.contains("E1009"), "{stderr}");
+}
+
+#[test]
+fn mutable_capture_outer_reference_uses_shared_cell() {
+    assert_program_output(
+        "fn bump(n: &mut i64) { n = n + 10; } fn main() { let mut n = 0; let f = || { n = n + 1; }; f(); bump(&n); f(); println(n); }",
+        "12\n",
+    );
+}
+
+#[test]
+fn mutable_capture_callable_cfg_and_evaluation_order() {
+    assert_program_output(
+        r#"
+fn one(x: i64) -> i64 { return x + 1; }
+fn two(x: i64) -> i64 { return x + 2; }
+fn main() {
+    let mut f: fn(i64) -> i64 = one;
+    let change = || { f = two; return 10; };
+    println(f(true ? change() : 0));
+    println(f(false ? 0 : 10));
+}
+"#,
+        "11\n12\n",
+    );
+}
+
+#[test]
+fn mutable_capture_release_gc() {
+    let (out, ok) = compile_and_run_release(
+        "fn make() -> closure() -> String { let mut s = \"a\"; return || { s = s + \"b\"; gc_collect(); return s; }; } fn main() { let f = make(); println(f()); println(f()); }",
+    );
+    assert!(ok);
+    assert_eq!(out, "ab\nabb\n");
+}
+
+#[test]
+fn mutable_capture_interface_pair_gc() {
+    assert_output_under_gc_stress(
+        &dispatch_source(
+            r#"
+fn make() -> closure() -> i64 {
+    let mut shape: Shape = new Square(3);
+    return || { shape = new Rect(2, 5); gc_collect(); return shape.area(); };
+}
+fn main() { let f = make(); gc_collect(); println(f()); println(f()); }
+"#,
+        ),
+        "10\n10\n",
+    );
+}
+
+#[test]
+fn mutable_capture_method_local_and_branch() {
+    assert_program_output(
+        r#"
+class C {
+    pub initial: i64;
+    pub fn counter(self) -> closure(bool) -> i64 {
+        let mut n = self.initial;
+        return |up: bool| { if up { n = n + 1; } else { n = n - 1; } return n; };
+    }
+}
+fn main() { let f = new C(10).counter(); println(f(true)); println(f(false)); }
+"#,
+        "11\n10\n",
+    );
+}
+
+#[test]
+fn mutable_capture_defer_invoke_arguments_at_registration() {
+    assert_program_output(
+        r#"
+fn show(x: i64) { println(x); }
+fn main() {
+    let mut f: fn(i64) -> void = show;
+    let replace = || { f = show; };
+    let mut n = 0;
+    let next = || { n = n + 1; return n; };
+    defer f(next());
+    println(n);
+    n = 9;
+    replace();
+}
+"#,
+        "1\n1\n",
+    );
+}
+
+#[test]
+fn mutable_capture_defer_invoke_freezes_callee_before_arguments() {
+    assert_program_output(
+        r#"
+fn first(x: i64, y: i64) { println(100 + x * 10 + y); }
+fn second(x: i64, y: i64) { println(200 + x * 10 + y); }
+fn main() {
+    let mut f: fn(i64, i64) -> void = first;
+    let mut n = 0;
+    let next = || { n = n + 1; f = second; return n; };
+    defer f(true ? next() : 0, next());
+    println(n);
+    f = second;
+}
+"#,
+        "2\n112\n",
+    );
+}
+
+#[test]
+fn mutable_capture_defer_invoke_roots_replaced_closure() {
+    assert_output_under_gc_stress(
+        r#"
+fn main() {
+    let label = "old" + " value";
+    let other = "new" + " value";
+    let mut f: closure(String) -> void = |s: String| { println(label + s); };
+    let replace = || { f = |s: String| { println(other + s); }; };
+    defer f("!");
+    replace();
+    gc_collect();
+    gc_minor_collect();
+    println("registered");
+}
+"#,
+        "registered\nold value!\n",
     );
 }

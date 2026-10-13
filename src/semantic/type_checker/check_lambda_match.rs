@@ -203,6 +203,7 @@ impl TypeChecker {
                 l.params.iter().map(|p| (p.name.clone(), ())),
             ),
             captures: Vec::new(),
+            capture_indices: HashMap::new(),
             writes: Vec::new(),
         };
         match &l.body {
@@ -210,46 +211,42 @@ impl TypeChecker {
             LambdaBody::Block(b) => scan.walk(AstEvent::Block(b)),
         }
         let CaptureScan {
-            captures, writes, ..
+            mut captures,
+            capture_indices,
+            writes,
+            ..
         } = scan;
-        // A capture is a COPY taken when the closure value is built
-        // (willow-0g8j.2.12), so rebinding one inside the body could not change
-        // anything the enclosing function goes on to observe — and a second
-        // call would start from the same copy again. `let mut` does not change
-        // that: sharing a variable between the two frames would need a heap
-        // cell that the language does not have. Silence would be the worst of
-        // the three answers, so every such write is rejected.
         for (name, span) in writes {
-            if captures.iter().any(|c| c.name == name) {
-                self.local.capture_writes.insert(span);
-                self.push_capture_write(&name, span, &captures);
+            if let Some(&index) = capture_indices.get(&name) {
+                if self
+                    .symbols
+                    .lookup_var(&name)
+                    .is_some_and(|info| info.mutable && !info.is_param)
+                {
+                    captures[index].mutable = true;
+                } else {
+                    self.local.capture_writes.insert(span);
+                    self.push_capture_write(&name, span, captures[index].declaration_span);
+                }
             }
         }
         captures
     }
 
-    fn push_capture_write(&mut self, name: &str, span: Span, captures: &[LambdaCapture]) {
-        let declaration = captures
-            .iter()
-            .find(|c| c.name == name)
-            .map(|c| c.declaration_span);
-        let mut diagnostic = Diagnostic::new(
+    fn push_capture_write(&mut self, name: &str, span: Span, declaration: Span) {
+        let diagnostic = Diagnostic::new(
             Severity::Error,
             ErrorCode::E1009,
             format!("cannot assign to captured variable `{name}`"),
         )
         .with_label(Label::primary(span, "cannot assign to a capture"))
         .with_help(
-            "a lambda captures by value, so this write could not be seen outside it: \
-             return the new value instead, or mutate a field or element of a captured object"
-                .to_string(),
-        );
-        if let Some(declaration) = declaration {
-            diagnostic = diagnostic.with_label(Label::secondary(
-                declaration,
-                format!("`{name}` is declared here and captured by value"),
-            ));
-        }
+            "declare the outer binding with `let mut` to share a mutable capture cell".to_string(),
+        )
+        .with_label(Label::secondary(
+            declaration,
+            format!("`{name}` must be a mutable local, declared here"),
+        ));
         self.push(diagnostic);
     }
 
@@ -410,6 +407,13 @@ impl TypeChecker {
         // while the enclosing function's locals are still the visible variable
         // scope (willow-0g8j.2.12).
         let captures = self.collect_lambda_captures(l);
+        let saved_capture_declarations = std::mem::replace(
+            &mut self.local.current_capture_declarations,
+            captures
+                .iter()
+                .map(|capture| capture.declaration_span)
+                .collect(),
+        );
 
         // Params may be annotated directly or inferred from an expected fn type.
         // An annotation is normalized the way a named function's is: it may
@@ -523,6 +527,7 @@ impl TypeChecker {
                 }
             }
         };
+        self.local.current_capture_declarations = saved_capture_declarations;
         self.local.lexical_block_depth = saved_block_depth;
         self.local.current_return_type = saved_ret_ty;
         self.symbols.pop_scope();
@@ -1516,6 +1521,9 @@ impl TypeChecker {
 /// resolve to it without renaming.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LambdaCapture {
+    /// This lambda or a nested lambda assigns to the outer binding.
+    #[serde(default)]
+    pub mutable: bool,
     pub name: String,
     pub ty: Type,
     /// Where it was declared, for the diagnostic that points at it.
@@ -1528,6 +1536,7 @@ struct CaptureScan<'a> {
     /// The captures found so far, in first-mention order — which is the order
     /// the closure environment lays its slots out.
     captures: Vec<LambdaCapture>,
+    capture_indices: HashMap<String, usize>,
     /// Names the lambda ASSIGNS to that are not bound inside it. Kept apart
     /// from `captures` because whether a write is legal depends on the
     /// declaration, which is decided once the whole body has been seen.
@@ -1560,13 +1569,16 @@ impl CaptureScan<'_> {
         if self.bound_inside(name) {
             return; // bound inside the lambda
         }
-        if self.captures.iter().any(|c| c.name == name) {
+        if self.capture_indices.contains_key(name) {
             return; // already recorded; first mention fixes the slot
         }
         let Some(info) = self.checker.symbols.lookup_var(name).cloned() else {
             return; // a free function, a class, a constant — not a capture
         };
+        self.capture_indices
+            .insert(name.to_string(), self.captures.len());
         self.captures.push(LambdaCapture {
+            mutable: false,
             name: name.to_string(),
             ty: info.ty,
             declaration_span: info.declaration_span,
@@ -1681,8 +1693,8 @@ mod lambda_capture_tests {
     //! excused by its own binding, 28 match payload binding.
     //!
     //! Then the rules the environment brought with it (willow-0g8j.2.12):
-    //! 29 `self` is still E1002, 30 a write to a capture is E1009, 31 `let mut`
-    //! does not excuse it, 32 the write is reported once, 33 a capturing lambda
+    //! 29 `self` is still E1002, 30 immutable capture writes are E1009, 31 `let mut`
+    //! permits sharing, 32 the write is reported once, 33 a capturing lambda
     //! is not a `fn` value (E1011), 34 but is a `closure` one, 35 a
     //! non-capturing lambda stays a `fn` value, 36 calling a captured function
     //! value captures it, 37 repeated mentions share one slot, 38 slots follow
@@ -1717,6 +1729,7 @@ mod lambda_capture_tests {
                     checker: &mut checker,
                     scopes: crate::semantic::scopes::Scopes::with_frame([]),
                     captures: Vec::new(),
+                    capture_indices: HashMap::new(),
                     writes: Vec::new(),
                 };
                 scan.walk(AstEvent::Expr(&expr));
@@ -2090,23 +2103,21 @@ mod lambda_capture_tests {
         );
     }
 
-    /// A capture is a copy, so a write inside the body could never be seen
-    /// outside it.
+    /// An immutable outer binding cannot be assigned through a closure.
     #[test]
-    fn c30_write_to_a_capture_is_rejected() {
+    fn c30_write_to_an_immutable_capture_is_rejected() {
         err(
-            "fn main() { let mut y = 0; let f = |x: i64| { y = x; return x; }; println(f(1)); }",
+            "fn main() { let y = 0; let f = |x: i64| { y = x; return x; }; println(f(1)); }",
             "E1009",
         );
     }
 
-    /// `let mut` on the enclosing binding does not make the copy shared, so it
-    /// does not excuse the write either.
+    /// A mutable local assigned by the closure is shared through a GC cell.
     #[test]
-    fn c31_let_mut_does_not_excuse_a_capture_write() {
-        err(
+    fn c31_let_mut_allows_a_capture_write() {
+        captures_one(
             "fn main() { let mut n = 1; let f = |x: i64| { n = n + x; return n; }; println(f(2)); }",
-            "E1009",
+            &["n"],
         );
     }
 

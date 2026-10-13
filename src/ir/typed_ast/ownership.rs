@@ -122,6 +122,11 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
             op: op.clone(),
             operand: Box::new(empty_expr()),
         },
+        HirExprKind::Invoke { name, args, .. } => HirExprKind::Invoke {
+            name: *name,
+            callee: Box::new(empty_expr()),
+            args: expr_slots(args.len()),
+        },
         HirExprKind::Call { callee, args } => HirExprKind::Call {
             callee: *callee,
             args: expr_slots(args.len()),
@@ -407,6 +412,10 @@ fn expr_children_mut(source: &mut HirExpr) -> Vec<NodeMut<'_>> {
         HirExprKind::Unary { operand, .. } => {
             out.push(NodeMut::Expr(operand));
         }
+        HirExprKind::Invoke { callee, args, .. } => {
+            out.push(NodeMut::Expr(callee));
+            out.extend(args.iter_mut().map(NodeMut::Expr));
+        }
         HirExprKind::Call { args, .. } => {
             out.extend(args.iter_mut().map(NodeMut::Expr));
         }
@@ -503,6 +512,10 @@ fn expr_children(source: &HirExpr) -> Vec<NodeRef<'_>> {
         }
         HirExprKind::Unary { operand, .. } => {
             out.push(NodeRef::Expr(operand));
+        }
+        HirExprKind::Invoke { callee, args, .. } => {
+            out.push(NodeRef::Expr(callee));
+            out.extend(args.iter().map(NodeRef::Expr));
         }
         HirExprKind::Call { args, .. } => {
             out.extend(args.iter().map(NodeRef::Expr));
@@ -924,6 +937,16 @@ mod tests {
                     span,
                 }],
             },
+            24 => HirExprKind::Invoke {
+                name: "f".into(),
+                callee: Box::new(child),
+                args: vec![leaf()],
+            },
+            25 => HirExprKind::Invoke {
+                name: "f".into(),
+                callee: Box::new(leaf()),
+                args: vec![child],
+            },
             _ => unreachable!(),
         };
         HirExpr {
@@ -934,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_preserves_twenty_four_expression_and_scope_perspectives() {
+    fn clone_preserves_expression_and_scope_perspectives() {
         let perspectives = [
             "binary lhs",
             "binary rhs",
@@ -960,6 +983,8 @@ mod tests {
             "select timeout",
             "select join",
             "select deferred body",
+            "computed callee",
+            "computed call argument",
         ];
         for (index, perspective) in perspectives.into_iter().enumerate() {
             let original = wrap(wrap(leaf(), (index + 1) % 24), index);

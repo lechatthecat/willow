@@ -1593,6 +1593,22 @@ impl Builder {
         };
         let mut out = expr.clone();
         out.kind = match &expr.kind {
+            HirExprKind::Invoke { name, callee, args } => {
+                // Freeze the callable before evaluating arguments: an argument
+                // may replace the cell that supplied it. Cleanup only reads
+                // these registration-time snapshots, including their GC roots.
+                let callee = Box::new(capture(self, "callee", callee));
+                let args = args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| capture(self, &format!("arg{index}"), arg))
+                    .collect();
+                HirExprKind::Invoke {
+                    name: *name,
+                    callee,
+                    args,
+                }
+            }
             HirExprKind::Call { callee, args } => HirExprKind::Call {
                 callee: *callee,
                 args: args

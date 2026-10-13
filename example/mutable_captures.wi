@@ -1,0 +1,7 @@
+fn main() {
+    let mut count = 0;
+    let inc = || { count = count + 1; };
+    inc();
+    inc();
+    println(count);
+}

@@ -357,6 +357,9 @@ impl HirExpr {
                 then_expr,
                 else_expr,
             } => vec![condition, then_expr, else_expr],
+            HirExprKind::Invoke { callee, args, .. } => {
+                std::iter::once(&**callee).chain(args.iter()).collect()
+            }
             HirExprKind::FieldAccess { object, .. } => vec![object],
             HirExprKind::MethodCall { object, args, .. } => {
                 let mut out = vec![&**object];
@@ -530,6 +533,12 @@ pub enum HirExprKind {
     /// A free-function call; `ty` is the callee's return type.
     Call {
         callee: FunctionId,
+        args: Vec<HirExpr>,
+    },
+    /// Call a computed callable value (including a mutable capture cell load).
+    Invoke {
+        name: FunctionId,
+        callee: Box<HirExpr>,
         args: Vec<HirExpr>,
     },
     /// `print(value)` / `println(value)`; always `Void`.

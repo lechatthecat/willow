@@ -814,6 +814,27 @@ impl TypeChecker {
         require_mutable: bool,
         place: ReferencePlaceInfo,
     ) {
+        if require_mutable
+            && matches!(arg.expr, Expr::Var(..))
+            && self
+                .local
+                .current_capture_declarations
+                .contains(&place.declaration_span)
+        {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E1009,
+                    format!("cannot pass captured variable `{}` as `&mut`", place.name),
+                )
+                .with_label(Label::primary(
+                    arg.span,
+                    "mutable references to captures are not supported",
+                ))
+                .with_help("assign to a `let mut` capture directly instead"),
+            );
+            return;
+        }
         if require_mutable && let Some(reason) = place.immutable_reason {
             self.push(
                 Diagnostic::new(Severity::Error, ErrorCode::E1701, reason)

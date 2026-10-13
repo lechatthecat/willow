@@ -148,11 +148,10 @@ error_codes! {
     // Lambda E10xx
     E1001,
     E1002,
-    // E1009: assignment to a captured variable. A capture is a copy taken when
-    // the closure value is built, so `let mut` on the enclosing binding does
-    // not excuse the write either. E1011: a capturing lambda where a plain
-    // `fn(...)` pointer is required (both willow-0g8j.2.12). E1012: an async
-    // or builtin function named as a function value (willow-yf49).
+    // E1009: assignment to an immutable outer capture. Mutable outer bindings
+    // assigned by a lambda share GC-managed cells (willow-bv9.2).
+    // E1011: a capturing lambda where a plain function pointer is required.
+    // E1012: an async or builtin function named as a function value.
     E1009,
     E1011,
     E1012,

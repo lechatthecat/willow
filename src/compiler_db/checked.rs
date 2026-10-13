@@ -48,6 +48,7 @@ impl From<TypeChecker> for CheckedUnit {
 impl CheckedUnit {
     pub fn tables(&self) -> CheckerTables<'_> {
         CheckerTables {
+            mutable_capture_declarations: Default::default(),
             symbols: Some(&self.symbols),
             expr_types: Some(&self.expr_types),
             enums: Some(&self.symbols.enums),
@@ -76,6 +77,7 @@ impl CheckedDeclarations {
     /// normalize a declared type, nothing body-level.
     pub fn tables(&self) -> CheckerTables<'_> {
         CheckerTables {
+            mutable_capture_declarations: Default::default(),
             symbols: Some(&self.symbols),
             enums: Some(&self.symbols.enums),
             normalized_types: Some(&self.normalized_types),

@@ -261,6 +261,10 @@ fn argument_types(
     callables: &Callables,
 ) -> Option<Vec<Type>> {
     match &node.kind {
+        HirExprKind::Invoke { callee, .. } => match &callee.ty {
+            Type::Fn(params, _) | Type::Closure(params, _) => Some(params.clone()),
+            _ => None,
+        },
         HirExprKind::Call { callee, .. } => {
             if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
                 match &locals[local.0 as usize].ty {
@@ -373,6 +377,7 @@ fn scalar(
         HirExprKind::Print { value, .. } => matches!(value.ty, Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never),
         HirExprKind::MethodCall { object, method, args, .. } => crate::semantic::intrinsics::resolve(&object.ty, method, args.len()).is_some_and(|resolved|
             !(is_async && resolved.intrinsic.is_suspension_point()) && resolved.return_type(|i| args.get(i).map(|arg| arg.ty.clone())) == node.ty) || enum_method(&object.ty, method) || instance_method(&object.ty, method, args, callables),
+        HirExprKind::Invoke { callee, args, .. } => matches!(&callee.ty, Type::Fn(params, result) | Type::Closure(params, result) if **result == node.ty && params.len() == args.len() && !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution))),
         HirExprKind::Call { callee, args } => if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
             matches!(&locals[local.0 as usize].ty, Type::Fn(params, result) | Type::Closure(params, result) if !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && **result == node.ty && params.len() == args.len() && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution)))
         } else { callables.get(callee).is_some_and(|(params, result)| *result == node.ty
@@ -398,6 +403,7 @@ fn lower(
         expr.kind,
         HirExprKind::Unary { .. }
             | HirExprKind::Binary { .. }
+            | HirExprKind::Invoke { .. }
             | HirExprKind::Call { .. }
             | HirExprKind::Await { .. }
             | HirExprKind::New { .. }
@@ -421,6 +427,7 @@ fn lower(
         matches!(
             node.kind,
             HirExprKind::Call { .. }
+                | HirExprKind::Invoke { .. }
                 | HirExprKind::MethodCall { .. }
                 | HirExprKind::New { .. }
                 | HirExprKind::StaticCall { .. }
@@ -1084,8 +1091,11 @@ fn lower(
                     continue;
                 }
                 work.push(Work::Finish(node));
-                if let HirExprKind::Call { args, .. } | HirExprKind::StaticCall { args, .. } =
-                    &node.kind
+                if let HirExprKind::Invoke { callee, args, .. } = &node.kind {
+                    work.extend(arguments(args, targets.as_deref()));
+                    work.push(Work::Enter(callee));
+                } else if let HirExprKind::Call { args, .. }
+                | HirExprKind::StaticCall { args, .. } = &node.kind
                 {
                     work.extend(arguments(args, targets.as_deref()));
                 } else if let HirExprKind::Binary { lhs, rhs, .. } = &node.kind
@@ -1353,6 +1363,29 @@ fn lower(
                         result: node.ty.clone(),
                         super_class: *super_class,
                     }
+                };
+                LirOperand::Local(emit(
+                    value,
+                    node.ty.clone(),
+                    node.span,
+                    emitted,
+                    locals,
+                    names,
+                ))
+            }
+            HirExprKind::Invoke { name, callee, args } => {
+                let (Type::Fn(params, result) | Type::Closure(params, result)) = &callee.ty else {
+                    unreachable!()
+                };
+                let value = LirRvalue::IndirectCall {
+                    callee: values[&std::ptr::from_ref(&**callee)].clone(),
+                    name: *name,
+                    args: args
+                        .iter()
+                        .map(|arg| values[&std::ptr::from_ref(arg)].clone())
+                        .collect(),
+                    params: params.clone(),
+                    result: (**result).clone(),
                 };
                 LirOperand::Local(emit(
                     value,

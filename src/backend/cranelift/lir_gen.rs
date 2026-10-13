@@ -2618,6 +2618,7 @@ fn describe_expr(e: &HirExpr) -> String {
         HirExprKind::FnRef(name) => format!("the function value `{name}`"),
         HirExprKind::Binary { op, .. } => format!("the `{}` operator", binop_str(op)),
         HirExprKind::Unary { .. } => "a unary operator".to_string(),
+        HirExprKind::Invoke { .. } => "a computed callable invocation".to_string(),
         HirExprKind::Call { callee, .. } => format!("the call to `{callee}`"),
         HirExprKind::Print { .. } => "a `print`".to_string(),
         HirExprKind::Array { .. } => "an array literal".to_string(),
@@ -4185,6 +4186,17 @@ fn supported_expr_node<'n>(
             supported_match(e, scrutinee, arms, ctx, names, MatchPosition::Operand)
         }
         HirExprKind::Unary { operand, .. } => child_supported(operand),
+        HirExprKind::Invoke { callee, args, .. } => {
+            let (Type::Fn(params, ret) | Type::Closure(params, ret)) = &callee.ty else {
+                return false;
+            };
+            child_supported(callee)
+                && ctx.same_repr(ret, &e.ty)
+                && params.len() == args.len()
+                && params.iter().zip(args).all(|(ty, arg)| {
+                    ctx.supported_type(ty) && ctx.storable(ty, &arg.ty) && child_supported(arg)
+                })
+        }
         HirExprKind::Call { callee, args } => {
             // HIR spells direct and indirect calls with the same node, and a
             // local fn-typed binding shadows a free function (willow-bv9.1).

@@ -45,6 +45,8 @@ use super::typed_ast::{
 /// the same tables the checker already hands to the backend.
 #[derive(Default)]
 pub struct CheckerTables<'a> {
+    /// One unit-wide index, shared by all lowered functions and nested lambdas.
+    pub mutable_capture_declarations: std::sync::OnceLock<std::collections::HashSet<Span>>,
     /// Syntax-only block exit facts computed by checking.
     pub arm_leaves: Option<&'a HashMap<crate::parser::ast::BodyId, bool>>,
     /// Canonical global declarations copied into the owned HIR snapshot.
@@ -92,6 +94,7 @@ impl<'a> CheckerTables<'a> {
     /// Borrow the relevant tables from a run type checker.
     pub fn from_checker(checker: &'a crate::semantic::TypeChecker) -> Self {
         Self {
+            mutable_capture_declarations: Default::default(),
             symbols: Some(&checker.symbols),
             arm_leaves: Some(&checker.arm_leaves),
             enum_variant_resolutions: Some(&checker.enum_variant_resolutions),
@@ -102,6 +105,20 @@ impl<'a> CheckerTables<'a> {
             static_call_classes: Some(&checker.static_call_classes),
             lambda_captures: Some(&checker.lambda_captures),
         }
+    }
+
+    fn cell_declaration(&self, span: &Span) -> bool {
+        self.mutable_capture_declarations
+            .get_or_init(|| {
+                self.lambda_captures
+                    .into_iter()
+                    .flat_map(|table| table.values())
+                    .flatten()
+                    .filter(|capture| capture.mutable)
+                    .map(|capture| capture.declaration_span)
+                    .collect()
+            })
+            .contains(span)
     }
 
     /// Re-spell a written annotation as the checker's type. Bottom-up, so a
@@ -964,6 +981,7 @@ fn lower_constructor(
 /// the HIR.
 #[derive(Clone)]
 struct Binding {
+    cell: bool,
     ty: Type,
     /// The HIR name. This is the source name for the first binding of that
     /// name in a function, and `name$n` for every later one
@@ -972,6 +990,35 @@ struct Binding {
     /// `let` over a parameter, a `match` arm binding over an outer `let` —
     /// must not arrive there under one name.
     hir_name: String,
+}
+
+// A compiler-private, fixed one-element array is the GC-managed cell.
+// The source type stays in Binding; only storage and environment slots use Array<T>.
+fn cell_storage(binding: &Binding, span: Span) -> HirExpr {
+    HirExpr {
+        kind: HirExprKind::Var(binding.hir_name.clone()),
+        ty: Type::Array(Box::new(binding.ty.clone())).into(),
+        span,
+    }
+}
+
+fn cell_index(span: Span) -> HirExpr {
+    HirExpr {
+        kind: HirExprKind::Int(0),
+        ty: Type::I64,
+        span,
+    }
+}
+
+fn cell_read(binding: &Binding, span: Span) -> HirExpr {
+    HirExpr {
+        kind: HirExprKind::Index {
+            array: Box::new(cell_storage(binding, span)),
+            index: Box::new(cell_index(span)),
+        },
+        ty: binding.ty.clone().into(),
+        span,
+    }
 }
 
 /// Lowering scope: variables (innermost-last) plus the free-function
@@ -1050,6 +1097,10 @@ impl<'a> LowerCtx<'a> {
     /// it. Callers MUST build their HIR node from the returned name — it is the
     /// source name only when nothing else in this function has claimed it.
     fn bind(&mut self, name: String, ty: Type) -> String {
+        self.bind_cell(name, ty, false)
+    }
+
+    fn bind_cell(&mut self, name: String, ty: Type, cell: bool) -> String {
         let seen = self.binds_seen.entry(name.clone()).or_insert(0);
         *seen += 1;
         // A nested local function value and a free function also share the
@@ -1069,6 +1120,7 @@ impl<'a> LowerCtx<'a> {
         self.scopes.insert(
             name,
             Binding {
+                cell,
                 ty,
                 hir_name: hir_name.clone(),
             },
@@ -1186,17 +1238,40 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             // reaches HIR as an `Array<Square>` holding a `Box2` — a type the
             // checker never accepted and no consumer can reason from.
             retype_array_literal(&mut value, &binding_ty);
-            let name = ctx.bind(l.name.clone(), binding_ty.clone());
+            let cell = ctx.tables.cell_declaration(&l.span);
+            let name = ctx.bind_cell(l.name.clone(), binding_ty.clone(), cell);
+            let storage_ty = if cell {
+                Type::Array(Box::new(binding_ty))
+            } else {
+                binding_ty
+            };
+            if cell {
+                value = HirExpr {
+                    kind: HirExprKind::Array {
+                        elements: vec![value],
+                    },
+                    ty: storage_ty.clone().into(),
+                    span: l.span,
+                };
+            }
             Ok(HirStmt::Let {
                 name,
                 mutable: l.mutable,
-                ty: binding_ty.into(),
+                ty: storage_ty.into(),
                 value,
                 span: l.span,
             })
         }
         Stmt::Assign(a) => {
             let value = lower_expr(&a.value, ctx)?;
+            if let Some(binding) = ctx.lookup(&a.name).filter(|b| b.cell) {
+                return Ok(HirStmt::IndexAssign {
+                    array: cell_storage(binding, a.span),
+                    index: cell_index(a.span),
+                    value,
+                    span: a.span,
+                });
+            }
             Ok(HirStmt::Assign {
                 name: ctx.hir_name(&a.name),
                 value,
@@ -1512,6 +1587,9 @@ fn lower_var_expr(
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
     if let Some(binding) = ctx.lookup(name) {
+        if binding.cell {
+            return Ok(cell_read(binding, span));
+        }
         return Ok(HirExpr {
             kind: HirExprKind::Var(binding.hir_name.to_string()),
             ty: binding.ty.clone().into(),
@@ -1692,6 +1770,20 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
 )]
 fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     let args = lower_value_args(&c.args, ctx)?;
+    if let Some(binding) = ctx.lookup(&c.callee).filter(|binding| binding.cell) {
+        let (Type::Fn(_, ret) | Type::Closure(_, ret)) = &binding.ty else {
+            return Err(internal(c.span, "non-callable capture cell".to_string()));
+        };
+        return Ok(HirExpr {
+            kind: HirExprKind::Invoke {
+                name: c.callee.clone().into(),
+                callee: Box::new(cell_read(binding, c.span)),
+                args,
+            },
+            ty: (**ret).clone().into(),
+            span: c.span,
+        });
+    }
     // An unqualified enum-variant construction (`Ok(42)` in an
     // expected-enum position) parses as a call; the checker records
     // which enum it resolved to (willow-60o.1).
@@ -1716,7 +1808,7 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
     // indirect call typed by the variable's `fn(..) -> R`, and it is
     // named by the binding's HIR name (willow-0g8j.2.10).
     let indirect = ctx.lookup(&c.callee).and_then(|b| match &b.ty {
-        Type::Fn(_, ret) => Some((b.hir_name.clone(), (**ret).clone())),
+        Type::Fn(_, ret) | Type::Closure(_, ret) => Some((b.hir_name.clone(), (**ret).clone())),
         _ => None,
     });
     let callee = match &indirect {
@@ -2560,11 +2652,18 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
     let is_closure = matches!(ctx.tables.lambda_fn_type(&l.id), Some(Type::Closure(..)));
     // Resolve every capture in the ENCLOSING namespace first: after the
     // scope below, `n` means the lambda's own copy (willow-0g8j.2.12).
-    let capture_sources: Vec<(String, String, Type)> = ctx
+    let capture_sources: Vec<(String, String, Type, bool)> = ctx
         .tables
         .lambda_captures(&l.id)
         .iter()
-        .map(|c| (c.name.clone(), ctx.hir_name(&c.name), ctx.normalize(&c.ty)))
+        .map(|c| {
+            (
+                c.name.clone(),
+                ctx.hir_name(&c.name),
+                ctx.normalize(&c.ty),
+                ctx.tables.cell_declaration(&c.declaration_span),
+            )
+        })
         .collect();
     let mut params = Vec::with_capacity(l.params.len());
     let mut param_tys = Vec::with_capacity(l.params.len());
@@ -2584,10 +2683,14 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
     // stay distinct locals in the lifted function.
     let captures: Vec<HirCapture> = capture_sources
         .into_iter()
-        .map(|(source_name, source, ty)| HirCapture {
-            name: ctx.bind(source_name, ty.clone()),
+        .map(|(source_name, source, ty, cell)| HirCapture {
+            name: ctx.bind_cell(source_name, ty.clone(), cell),
             source,
-            ty: ty.into(),
+            ty: if cell {
+                Type::Array(Box::new(ty)).into()
+            } else {
+                ty.into()
+            },
         })
         .collect();
     for (i, p) in l.params.iter().enumerate() {

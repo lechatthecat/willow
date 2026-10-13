@@ -229,6 +229,11 @@ fn format_expr(e: &HirExpr) -> String {
         HirExprKind::Unary { op, operand } => {
             format!("{}{}", unaryop_str(op), format_expr(operand))
         }
+        HirExprKind::Invoke { callee, args, .. } => format!(
+            "({})({})",
+            format_expr(callee),
+            args.iter().map(format_expr).collect::<Vec<_>>().join(", ")
+        ),
         HirExprKind::Call { callee, args } => {
             let args = args
                 .iter()
