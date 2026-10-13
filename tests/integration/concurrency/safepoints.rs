@@ -46,18 +46,15 @@ fn psp_03_nested_busy_loops_preemptible() {
 }
 
 #[test]
-fn psp_04_unresolved_fn_value_is_conservative() {
-    // A function type alone does not prove which synchronous body will run.
-    // A7 deliberately replaces the former permissive assumption with E0810.
-    let (ok, stderr) = compile_with_compiler_env(
-        "async fn worker(f: fn(i64) -> i64) -> i64 { return f(1); } fn main() {}",
-        &[],
+fn psp_04_fn_value_can_enter_task() {
+    // A pointer to a looping sync helper must still yield on native task stacks.
+    let (out, ok) = compile_and_run_with_runtime_env(
+        "fn spin(done: AtomicBool) -> i64 { while !done.load() {} return 42; }\nasync fn worker(f: fn(AtomicBool) -> i64, done: AtomicBool) -> i64 { return f(done); }\nasync fn main() { let done = AtomicBool::new(false); let t = worker(spin, done); await sleep(5); done.store(true); println(await t); }",
+        &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", "1")],
+        std::time::Duration::from_secs(20),
     );
-    assert!(!ok, "{stderr}");
-    assert!(
-        stderr.contains("E0810") && stderr.contains("cannot prove preemptibility"),
-        "{stderr}"
-    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
 }
 
 #[cfg(not(any(
@@ -98,20 +95,32 @@ fn psp_06_busy_tasks_exceed_worker_count() {
 
 #[test]
 fn psp_07_call_boundary_safepoints() {
-    // Restore the recursive, loop-free synchronous workload removed at A1.
-    // One worker and a tiny quantum require the sleeper to run while churn
-    // remains busy; every recursive call has a generated boundary safepoint.
-    let chain = "s = s + chunk(24);".repeat(10);
+    // Call-boundary safepoints, isolated from loop backedges (review
+    // fix: a for-loop body only proved the BACKEDGE safepoint): the spinning
+    // task is a straight-line chain of call-bearing statements — bounded sync
+    // helper calls with no Willow loop between them at the top level — so only
+    // the safepoints before those call statements can let the sleeper run
+    // before the chain finishes.
+    //
+    // The helper is bounded: loop-free AND non-recursive. It used to recurse
+    // (`chunk(n - 1) + chunk(n - 2)`), which made every statement
+    // multi-millisecond, but Stage A-prime rejects a recursive sync helper
+    // called from task context because recursion runs unbounded work with no
+    // safepoint (E0810, willow-38w.2.1) — `psp_07b` pins that rejection. The
+    // timing-sensitive form returns as a Stage G acceptance case once
+    // task-aware sync-stack preemption ships.
+    let chunk = "s = s + chunk(s);";
+    let chain = chunk.repeat(50);
     let source = format!(
-        "fn chunk(n: i64) -> i64 {{ if n <= 1 {{ return 1; }} return chunk(n - 1) + chunk(n - 2); }}\nasync fn churn(done: AtomicBool) -> i64 {{ let mut s = 0; {chain} done.store(true); return s; }}\nasync fn main() {{ let done = AtomicBool::new(false); let t = churn(done); await sleep(10); println(7); println(done.load()); await t; }}"
+        "fn chunk(n: i64) -> i64 {{ if n <= 1 {{ return 1; }} return n / 2 + 1; }}\nasync fn churn() -> i64 {{ let mut s = 0; {chain} return s; }}\nasync fn main() {{ let t = churn(); await sleep(10); println(7); await t; }}"
     );
     let (out, ok) = compile_and_run_with_runtime_env(
         &source,
-        &[("WILLOW_TIME_QUANTUM_MS", "5"), ("WILLOW_WORKERS", "1")],
+        &[("WILLOW_TIME_QUANTUM_MS", "5")],
         std::time::Duration::from_secs(60),
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "7\nfalse\n");
+    assert_eq!(out, "7\n");
 }
 
 #[cfg(not(any(

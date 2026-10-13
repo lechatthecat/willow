@@ -178,6 +178,18 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/async_preemption.wi", "42\n"),
         ("example/task_sync_preemption.wi", "42\n"),
         ("example/preemption_acceptance.wi", "true\ntrue\n"),
+        (
+            "example/task_sync_cancel.wi",
+            "sync inner\nsync outer\nlock defer\nasync outer\n42\n",
+        ),
+        ("example/task_owned_shadow_roots.wi", "76\n"),
+        ("example/async_scoped_borrow.wi", "40\n80\n3\n42\n"),
+        ("example/async_borrow_unwind.wi", "41\n41\n42\n42\n"),
+        ("example/async_borrow_migration.wi", "42\n"),
+        (
+            "example/pow_bit_preserving_dispatch.wi",
+            "1.1642177654608983\n",
+        ),
         ("example/async_mut_sync_preemption.wi", "1000000\n1000000\n"),
         ("example/async_fn_pointer.wi", "42\n14\n"),
         ("example/release_fault_sites.wi", "500500\n999000\n14950\n"),

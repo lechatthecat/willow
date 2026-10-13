@@ -536,6 +536,7 @@ mod alloc_effects_tests {
         "willow_cancellation_token_cancel",
         "willow_task_scope_new",
         "willow_task_stack_enter",
+        "willow_task_stack_enter_generated",
         "willow_task_scope_child",
         "willow_task_scope_add",
         "willow_task_scope_cancel",
