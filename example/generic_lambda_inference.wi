@@ -1,0 +1,52 @@
+// Lambdas passed to generic functions take their parameter types from the
+// other arguments, and their results bind the remaining type parameters.
+import std::collections::Array;
+
+fn map<T, U>(xs: Array<T>, f: fn(T) -> U) -> Array<U> {
+    let out: Array<U> = [];
+    for x in xs { out.push(f(x)); }
+    return out;
+}
+
+fn map_with<T, U>(xs: Array<T>, f: closure(T) -> U) -> Array<U> {
+    let out: Array<U> = [];
+    for x in xs { out.push(f(x)); }
+    return out;
+}
+
+fn keep<T>(xs: Array<T>, f: fn(T) -> bool) -> Array<T> {
+    let out: Array<T> = [];
+    for x in xs { if f(x) { out.push(x); } }
+    return out;
+}
+
+fn fold<T, A>(xs: Array<T>, init: A, f: fn(A, T) -> A) -> A {
+    let mut acc = init;
+    for x in xs { acc = f(acc, x); }
+    return acc;
+}
+
+fn compose<T, U, V>(x: T, f: fn(T) -> U, g: fn(U) -> V) -> V {
+    return g(f(x));
+}
+
+fn main() {
+    let doubled = map([1, 2, 3], |x| x * 2);
+    println(doubled[2]);
+
+    let offset = 100;
+    let shifted = map_with(doubled, |x| x + offset);
+    println(shifted[0]);
+
+    let labels = map([1, -1], |x| {
+        if x > 0 { return "pos"; }
+        return "neg";
+    });
+    println(labels[1]);
+
+    let big = keep(shifted, |x| x > 103);
+    let total = fold(big, 0, |acc, x| acc + x);
+    println(total);
+
+    println(compose(4, |a| a * 2, |b| b > 7));
+}

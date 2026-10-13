@@ -1166,3 +1166,20 @@ fn p85_generic_class_imported_default_resolves_provider_scope_like_nongeneric() 
         assert_eq!(String::from_utf8_lossy(&output.stdout), "77\n", "{class}");
     }
 }
+
+#[test]
+fn generic_lambda_inference_example_runs() {
+    runs(
+        include_str!("../../example/generic_lambda_inference.wi"),
+        "6\n102\nneg\n210\ntrue\n",
+    );
+}
+
+#[test]
+fn imported_generic_function_types_lambda_arguments() {
+    custom_module_runs(
+        "import std::collections::Array; pub class Cell<T> { pub value: T; } pub fn map<T, U>(xs: Array<T>, f: fn(T) -> U) -> Array<U> { let out: Array<U> = []; for x in xs { out.push(f(x)); } return out; } pub fn apply<T, U>(c: Cell<T>, f: closure(T) -> U) -> U { return f(c.value); }",
+        "import std::collections::Array; import util; fn main() { let k = 5; let ys = util::map([1, 2], |x| x * 3); println(ys[1]); println(util::apply(new util::Cell<i64>(4), |v| v + k)); }",
+        "6\n9\n",
+    );
+}

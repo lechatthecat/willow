@@ -1136,7 +1136,10 @@ impl TypeChecker {
         Type::Named("\0diagnostic-error".into())
     }
     fn is_error_type(ty: &Type) -> bool {
-        matches!(ty, Type::Named(name) if name == "\0diagnostic-error")
+        matches!(ty, Type::Named(name) if Self::is_error_name(name))
+    }
+    fn is_error_name(name: &str) -> bool {
+        name == "\0diagnostic-error"
     }
 
     fn unknown_type_help(&self, name: &str) -> String {
@@ -1196,6 +1199,8 @@ impl TypeChecker {
 
     fn validate_type(&mut self, ty: &Type, span: Span) {
         match ty {
+            // Recovery marker: its cause has already been reported.
+            ty if Self::is_error_type(ty) => {}
             Type::Array(element) => {
                 self.check_collection_type_imported("Array", span);
                 self.validate_type(element, span);
@@ -8455,6 +8460,9 @@ mod contextual_values_tests;
 
 #[cfg(test)]
 mod diagnostic_recovery_tests;
+
+#[cfg(test)]
+mod generic_lambda_tests;
 
 #[cfg(test)]
 mod loop_exit_arms_tests;

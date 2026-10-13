@@ -136,60 +136,126 @@ fn infer_inner(
             actual_types.len()
         ));
     }
-    let mut parameters = HashMap::with_capacity(type_params.len());
-    for (index, name) in type_params.iter().enumerate() {
-        if parameters.insert(name.as_str(), index).is_some() {
-            return Err(format!("duplicate type parameter `{name}`"));
+    let mut inference = Inference::new(type_params, explicit_type_args)?;
+    for (formal, actual) in parameter_types.iter().zip(actual_types) {
+        inference.constrain(formal, actual)?;
+    }
+    inference.finish(allow_unresolved)
+}
+
+/// Incremental form of [`infer`]: constraints arrive one value argument at a
+/// time, so a caller can read what earlier arguments bound before it types a
+/// later one (a lambda whose parameter types come from `T`). Feeding every
+/// pair in order and then calling `finish(false)` is exactly `infer`; each
+/// formal and actual node is still visited once, so the total stays
+/// O(S + A + B) however the arguments are split.
+pub(crate) struct Inference<'a> {
+    type_params: &'a [String],
+    parameters: HashMap<&'a str, usize>,
+    bindings: Vec<Option<Type>>,
+}
+
+impl<'a> Inference<'a> {
+    pub(crate) fn new(
+        type_params: &'a [String],
+        explicit_type_args: &[Type],
+    ) -> Result<Self, String> {
+        let mut parameters = HashMap::with_capacity(type_params.len());
+        for (index, name) in type_params.iter().enumerate() {
+            if parameters.insert(name.as_str(), index).is_some() {
+                return Err(format!("duplicate type parameter `{name}`"));
+            }
         }
-    }
-    if !explicit_type_args.is_empty() && explicit_type_args.len() != type_params.len() {
-        return Err(format!(
-            "expected {} type arguments, got {}",
-            type_params.len(),
-            explicit_type_args.len()
-        ));
-    }
-    let mut bindings: Vec<Option<Type>> = vec![None; type_params.len()];
-    for (index, ty) in explicit_type_args.iter().enumerate() {
-        validate_argument(&type_params[index], ty)?;
-        bindings[index] = Some(ty.clone());
-    }
-    let signature = Signature::new(parameter_types, &parameters);
-    let mut actual: Vec<_> = actual_types.iter().rev().collect();
-    for node in signature.nodes {
-        let ty = actual.pop().expect("matching shapes preserve child counts");
-        if let Shape::Param(index) = node {
+        if !explicit_type_args.is_empty() && explicit_type_args.len() != type_params.len() {
+            return Err(format!(
+                "expected {} type arguments, got {}",
+                type_params.len(),
+                explicit_type_args.len()
+            ));
+        }
+        let mut bindings: Vec<Option<Type>> = vec![None; type_params.len()];
+        for (index, ty) in explicit_type_args.iter().enumerate() {
             validate_argument(&type_params[index], ty)?;
-            if let Some(previous) = &bindings[index] {
-                if previous != ty {
-                    return Err(format!(
-                        "conflicting types for type parameter `{}`",
-                        type_params[index]
-                    ));
+            bindings[index] = Some(ty.clone());
+        }
+        Ok(Self {
+            type_params,
+            parameters,
+            bindings,
+        })
+    }
+
+    /// The type bound to `name` so far, if any.
+    pub(crate) fn binding(&self, name: &str) -> Option<&Type> {
+        self.parameters
+            .get(name)
+            .and_then(|&index| self.bindings[index].as_ref())
+    }
+
+    /// Match one formal parameter type against one actual argument type.
+    pub(crate) fn constrain(&mut self, formal: &Type, actual: &Type) -> Result<(), String> {
+        let signature = Signature::new(std::slice::from_ref(formal), &self.parameters);
+        let mut pending = vec![actual];
+        for node in signature.nodes {
+            let ty = pending
+                .pop()
+                .expect("matching shapes preserve child counts");
+            if let Shape::Param(index) = node {
+                validate_argument(&self.type_params[index], ty)?;
+                if let Some(previous) = &self.bindings[index] {
+                    if previous != ty {
+                        return Err(format!(
+                            "conflicting types for type parameter `{}`",
+                            self.type_params[index]
+                        ));
+                    }
+                } else {
+                    self.bindings[index] = Some(ty.clone());
                 }
             } else {
-                bindings[index] = Some(ty.clone());
+                let found = shape(ty);
+                if node != found {
+                    return Err(mismatch_message(&node, &found));
+                }
+                push_children(ty, &mut pending);
             }
-        } else {
-            if node != shape(ty) {
-                return Err("argument type does not match generic parameter signature".into());
-            }
-            push_children(ty, &mut actual);
         }
+        debug_assert!(pending.is_empty());
+        Ok(())
     }
-    debug_assert!(actual.is_empty());
-    type_params
-        .iter()
-        .cloned()
-        .zip(bindings)
-        .map(|(name, ty)| {
-            ty.or_else(|| allow_unresolved.then_some(Type::Void))
-                .map(|ty| (name.clone(), ty))
-                .ok_or_else(|| {
-                    format!("cannot infer type parameter `{name}`; supply type arguments")
-                })
-        })
-        .collect()
+
+    /// Every parameter's binding. With `allow_unresolved`, one that no
+    /// constraint reached becomes a `Void` hole (see [`infer_partial`]).
+    pub(crate) fn finish(self, allow_unresolved: bool) -> Result<HashMap<String, Type>, String> {
+        self.type_params
+            .iter()
+            .zip(self.bindings)
+            .map(|(name, ty)| {
+                ty.or_else(|| allow_unresolved.then_some(Type::Void))
+                    .map(|ty| (name.clone(), ty))
+                    .ok_or_else(|| {
+                        format!("cannot infer type parameter `{name}`; supply type arguments")
+                    })
+            })
+            .collect()
+    }
+}
+
+/// A callable mismatch names what differs; anything else keeps the generic
+/// wording, because the concrete shapes alone do not say which side is wrong.
+fn mismatch_message(expected: &Shape<'_>, found: &Shape<'_>) -> String {
+    match (expected, found) {
+        (Shape::Function(_), Shape::Closure(_)) => "a capturing closure cannot be passed where \
+             a plain `fn` value is expected; declare the parameter `closure(...)` instead"
+            .into(),
+        (
+            Shape::Function(expected) | Shape::Closure(expected),
+            Shape::Function(found) | Shape::Closure(found),
+        ) if expected != found => {
+            format!("expected a callable taking {expected} argument(s), found one taking {found}")
+        }
+        _ => "argument type does not match generic parameter signature".into(),
+    }
 }
 
 /// Substitute bound leaves only. `Type::substitute_names` uses an explicit

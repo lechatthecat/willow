@@ -180,6 +180,36 @@ mod template_registry_tests {
         }
     }
     #[test]
+    fn nested_deferred_lambdas_check_each_generic_call_once() {
+        // Each level's lambda is typed after its sibling argument and holds the
+        // next generic call, so re-checking a deferred lambda would grow the
+        // count exponentially with depth (willow-jz15.64).
+        for depth in [1, 4, 8, 16, 32] {
+            let mut expression = format!("x{} + 1", depth - 1);
+            for level in (0..depth).rev() {
+                let input = if level == 0 {
+                    "1".to_string()
+                } else {
+                    format!("x{}", level - 1)
+                };
+                expression = format!("apply({input}, |x{level}| {expression})");
+            }
+            let source = format!(
+                "fn apply<T, U>(x: T, f: closure(T) -> U) -> U {{ return f(x); }} fn main() {{ let n: i64 = {expression}; println(n); }}"
+            );
+            let mut checker = TypeChecker::new();
+            GENERIC_CALL_CHECKS.with(|count| count.set(0));
+            checker.check_program(&parse(&source));
+            assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+            let visits = GENERIC_CALL_CHECKS.with(|count| count.get());
+            assert_eq!(visits, depth);
+            println!(
+                "WILLOW_GENERIC_AUDIT {}",
+                serde_json::json!({"case":"nested_deferred_lambda", "depth":depth, "generic_call_checks":visits})
+            );
+        }
+    }
+    #[test]
     fn nested_reference_inference_checks_each_generic_call_once() {
         for depth in [1, 4, 8, 16] {
             let mut expression = "0".to_string();
@@ -513,13 +543,18 @@ fn class_signature(class: &ClassDecl) -> ClassDecl {
 }
 
 fn uses_parameters(ty: &Type, parameters: &HashSet<&str>) -> bool {
+    mentions(ty, |name| parameters.contains(name))
+}
+
+/// Whether any name in `ty`, a generic head included, satisfies `matches`.
+fn mentions(ty: &Type, matches: impl Fn(&str) -> bool) -> bool {
     let mut pending = vec![ty];
     while let Some(ty) = pending.pop() {
         match ty {
-            Type::Named(name) if parameters.contains(name.as_str()) => return true,
+            Type::Named(name) if matches(name) => return true,
             Type::Array(element) => pending.push(element),
             Type::Generic(name, args) => {
-                if parameters.contains(name.as_str()) {
+                if matches(name) {
                     return true;
                 }
                 pending.extend(args);
@@ -698,6 +733,30 @@ impl TypeChecker {
         self.generics.imported_types.insert(alias.to_string(), info);
     }
 
+    /// A type in generic-inference form: nominal names by declaration
+    /// identity, remembering the first spelling of each so bindings can be
+    /// reported back in the caller's terms.
+    fn canonical_generic_type(&self, ty: &Type, spellings: &mut HashMap<String, String>) -> Type {
+        ty.map_names(|name| {
+            let identity = self.generic_type_identity(name);
+            spellings
+                .entry(identity.clone())
+                .or_insert_with(|| name.clone());
+            identity
+        })
+    }
+
+    /// The deferred lambdas of a call rejected before inference starts still
+    /// need their bodies checked and typed.
+    fn check_deferred_lambdas_plainly(&mut self, call_args: &[CallArg], deferred: &[bool]) {
+        for (arg, _) in call_args.iter().zip(deferred).filter(|(_, d)| **d) {
+            if let Expr::Lambda(lambda) = &arg.expr {
+                let ty = self.check_lambda(lambda);
+                self.expr_types.insert(arg.expr.id(), ty);
+            }
+        }
+    }
+
     pub(super) fn generic_error(&mut self, span: Span, message: impl Into<String>) {
         self.push(
             Diagnostic::new(Severity::Error, ErrorCode::E0201, message)
@@ -765,11 +824,32 @@ impl TypeChecker {
                     .then(|| self.normalize_type(expected, span))
             })
             .collect();
-        let mut reference_places = Vec::with_capacity(call_args.len());
-        let actual: Vec<_> = call_args
+        // A lambda whose formal still mentions a type parameter is typed after
+        // the other arguments: its parameter types come from what they bind
+        // (`map(xs, |x| x * 2)`), and its result then binds the rest.
+        let deferred: Vec<bool> = call_args
             .iter()
             .enumerate()
             .map(|(i, a)| {
+                matches!(a.expr, Expr::Lambda(_))
+                    && a.mode == CallArgMode::Value
+                    && template
+                        .params
+                        .get(i)
+                        .is_some_and(|p| p.mode == ParamMode::Value)
+                    && matches!(params.get(i), Some(Type::Fn(..) | Type::Closure(..)))
+                    && matches!(contextual_params.get(i), Some(None))
+            })
+            .collect();
+        let mut reference_places = Vec::with_capacity(call_args.len());
+        let mut actual: Vec<Option<Type>> = call_args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                if deferred[i] {
+                    reference_places.push(None);
+                    return None;
+                }
                 let is_reference = matches!(
                     template.params.get(i).map(|p| &p.mode),
                     Some(ParamMode::Reference { .. })
@@ -789,45 +869,150 @@ impl TypeChecker {
                     self.check_expr(&a.expr)
                 };
                 reference_places.push(place);
-                result.substitute_names(|n| self.generics.logical_types.get(n).cloned())
-            })
-            .collect();
-        let inference_actual: Vec<_> = actual
-            .iter()
-            .enumerate()
-            .map(|(i, ty)| {
-                if let Some(Some(expected)) = contextual_params.get(i)
-                    && template.params[i].mode == ParamMode::Value
-                {
-                    let actual = self.normalize_type(ty, span);
-                    if self.types_compatible(expected, &actual) {
-                        return expected.substitute_names(|name| {
-                            self.generics.logical_types.get(name).cloned()
-                        });
-                    }
-                }
-                ty.clone()
+                Some(result.substitute_names(|n| self.generics.logical_types.get(n).cloned()))
             })
             .collect();
         let mut spellings = HashMap::new();
-        let mut canonicalize = |ty: &Type| {
-            ty.map_names(|name| {
-                let identity = self.generic_type_identity(name);
-                spellings
-                    .entry(identity.clone())
-                    .or_insert_with(|| name.clone());
-                identity
-            })
-        };
-        let inferred_explicit: Vec<_> = explicit.iter().map(&mut canonicalize).collect();
-        let inferred_actual: Vec<_> = inference_actual.iter().map(&mut canonicalize).collect();
-        let inferred_params: Vec<_> = params.iter().map(&mut canonicalize).collect();
-        let bindings = match crate::semantic::generic_inference::infer(
+        let inferred_explicit: Vec<_> = explicit
+            .iter()
+            .map(|ty| self.canonical_generic_type(ty, &mut spellings))
+            .collect();
+        // Bindings are subtrees of the explicit and actual types only, so only
+        // their spellings are reported back; the template's own spellings of
+        // the same declarations must not displace the caller's.
+        let inferred_params: Vec<_> = params
+            .iter()
+            .map(|ty| self.canonical_generic_type(ty, &mut HashMap::new()))
+            .collect();
+        let mut inference = match crate::semantic::generic_inference::Inference::new(
             &template.type_params,
-            &inferred_params,
-            &inferred_actual,
             &inferred_explicit,
         ) {
+            Ok(inference) => inference,
+            Err(message) => {
+                self.check_deferred_lambdas_plainly(call_args, &deferred);
+                self.generic_error(span, message);
+                return Some(Self::error_type());
+            }
+        };
+        // A wrong argument count is reported first, but the arguments that do
+        // have a formal still bind, so a lambda among them is typed normally.
+        let mut failure = (params.len() != call_args.len()).then(|| {
+            format!(
+                "expected {} value arguments, got {}",
+                params.len(),
+                call_args.len()
+            )
+        });
+        let mut mismatched = false;
+        // An argument whose type already carries the recovery marker has been
+        // reported; matching it would only add a derived mismatch, and every
+        // later call fed this call's result would add another (willow-jz15.64).
+        let mut poisoned = false;
+        for (i, ty) in actual.iter().enumerate() {
+            let Some(ty) = ty else { continue };
+            let fixed = contextual_params
+                .get(i)
+                .and_then(Option::as_ref)
+                .filter(|_| template.params[i].mode == ParamMode::Value);
+            let ty = if let Some(expected) = fixed
+                && let normalized = self.normalize_type(ty, span)
+                && self.types_compatible(expected, &normalized)
+            {
+                expected.substitute_names(|name| self.generics.logical_types.get(name).cloned())
+            } else {
+                ty.clone()
+            };
+            let ty = self.canonical_generic_type(&ty, &mut spellings);
+            if mentions(&ty, Self::is_error_name) {
+                poisoned = true;
+            } else if !mismatched
+                && let Some(formal) = inferred_params.get(i)
+                && let Err(message) = inference.constrain(formal, &ty)
+            {
+                mismatched = true;
+                failure.get_or_insert(message);
+            }
+        }
+        for i in (0..call_args.len()).filter(|&i| deferred[i]) {
+            let Expr::Lambda(lambda) = &call_args[i].expr else {
+                unreachable!("deferred arguments are lambdas")
+            };
+            let (Type::Fn(formal_params, formal_ret) | Type::Closure(formal_params, formal_ret)) =
+                &params[i]
+            else {
+                unreachable!("deferred formals are callable")
+            };
+            // What the arguments so far bound, in this unit's spellings. An
+            // unbound parameter leaves its type unknown, unless a poisoned
+            // argument means it never will be bound: it is then the recovery
+            // marker, so the body is checked without a derived E1001.
+            let unbound = poisoned.then(Self::error_type);
+            let known = |ty: &Type| {
+                let ty = ty.substitute_names(|name| {
+                    if !parameter_names.contains(name.as_str()) {
+                        return None;
+                    }
+                    inference
+                        .binding(name)
+                        .map(|bound| {
+                            bound.map_names(|identity| {
+                                spellings
+                                    .get(identity)
+                                    .cloned()
+                                    .unwrap_or_else(|| identity.clone())
+                            })
+                        })
+                        .or_else(|| unbound.clone())
+                });
+                (!uses_parameters(&ty, &parameter_names)).then_some(ty)
+            };
+            let lambda_ty = if formal_params.len() == lambda.params.len() {
+                let expected_params: Option<Vec<_>> = formal_params.iter().map(known).collect();
+                let expected_ret = known(formal_ret);
+                let expected_params = expected_params.map(|types| {
+                    types
+                        .iter()
+                        .map(|ty| self.normalize_type(ty, span))
+                        .collect::<Vec<_>>()
+                });
+                let expected_ret = expected_ret.map(|ty| self.normalize_type(&ty, span));
+                // The help for a rejected capture names the declared
+                // signature, which is what the user would change.
+                self.check_lambda_for_callable(
+                    lambda,
+                    &params[i],
+                    expected_params.as_deref(),
+                    expected_ret.as_ref(),
+                )
+                .0
+            } else {
+                self.check_lambda(lambda)
+            };
+            self.expr_types
+                .insert(call_args[i].expr.id(), lambda_ty.clone());
+            let lambda_ty =
+                lambda_ty.substitute_names(|n| self.generics.logical_types.get(n).cloned());
+            let canonical = self.canonical_generic_type(&lambda_ty, &mut spellings);
+            if mentions(&canonical, Self::is_error_name) {
+                poisoned = true;
+            } else if !mismatched
+                && let Err(message) = inference.constrain(&inferred_params[i], &canonical)
+            {
+                mismatched = true;
+                failure.get_or_insert(message);
+            }
+            actual[i] = Some(lambda_ty);
+        }
+        let actual: Vec<Type> = actual.into_iter().map(Option::unwrap).collect();
+        if let Some(message) = failure {
+            self.generic_error(span, message);
+            return Some(Self::error_type());
+        }
+        if poisoned {
+            return Some(Self::error_type());
+        }
+        let bindings = match inference.finish(false) {
             Ok(bindings) => bindings
                 .into_iter()
                 .map(|(name, ty)| {

@@ -123,43 +123,64 @@ impl TypeChecker {
         if params.len() != l.params.len() {
             return self.check_lambda(l);
         }
-        let (actual, captured) = self.check_lambda_in_context(
-            l,
-            Some(params.as_slice()),
-            Some(ret.as_ref()),
-            matches!(expected, Type::Closure(..)),
-        );
+        let (actual, rejected) =
+            self.check_lambda_for_callable(l, expected, Some(params), Some(ret));
+        // Answering with the EXPECTED type after the E1011 report keeps the
+        // rest of the expression free of a second, derived mismatch.
+        if rejected { expected.clone() } else { actual }
+    }
+
+    /// Check a lambda written where `signature` (a `fn` or `closure` type) is
+    /// wanted, with whatever of its parameter and return types the context
+    /// already knows. A generic call knows only what earlier arguments bound,
+    /// so either part may be absent; `signature` itself is used for the
+    /// callable kind and, unresolved names included, for the E1011 help.
+    ///
+    /// Returns the lambda's type and whether it was rejected as a capturing
+    /// lambda where a `fn` is required. A rejected lambda is answered as the
+    /// `fn` type of the same shape, so a caller inferring from it continues
+    /// with the lambda's own parameter and result types.
+    pub(super) fn check_lambda_for_callable(
+        &mut self,
+        l: &LambdaExpr,
+        signature: &Type,
+        params: Option<&[Type]>,
+        ret: Option<&Type>,
+    ) -> (Type, bool) {
+        let (actual, captured) =
+            self.check_lambda_in_context(l, params, ret, matches!(signature, Type::Closure(..)));
         // A `fn` value is a bare code address with no room for an environment,
         // so a capturing lambda cannot be one (willow-0g8j.2.12). Reporting it
-        // here — and then answering with the EXPECTED type — keeps the message
-        // about the capture rather than about a type mismatch the user cannot
-        // act on.
-        if matches!(expected, Type::Fn(..)) && matches!(actual, Type::Closure(..)) {
-            let captured = captured
-                .iter()
-                .map(|name| format!("`{name}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E1011,
-                    "capturing lambda cannot be used as a plain function pointer".to_string(),
-                )
-                .with_label(Label::primary(l.span, format!("captures {captured}")))
-                .with_help(format!(
-                    "a `fn` value carries no environment: take what it reads as a parameter, or, where the signature can be changed, declare it `closure({}) -> {}`",
-                    params
-                        .iter()
-                        .map(type_name)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    type_name(ret)
-                )),
-            );
-            return expected.clone();
-        }
-        actual
+        // here keeps the message about the capture rather than about a type
+        // mismatch the user cannot act on.
+        let (Type::Fn(signature_params, signature_ret), Type::Closure(actual_params, actual_ret)) =
+            (signature, &actual)
+        else {
+            return (actual, false);
+        };
+        let captured = captured
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E1011,
+                "capturing lambda cannot be used as a plain function pointer".to_string(),
+            )
+            .with_label(Label::primary(l.span, format!("captures {captured}")))
+            .with_help(format!(
+                "a `fn` value carries no environment: take what it reads as a parameter, or, where the signature can be changed, declare it `closure({}) -> {}`",
+                signature_params
+                    .iter()
+                    .map(type_name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                type_name(signature_ret)
+            )),
+        );
+        (Type::Fn(actual_params.clone(), actual_ret.clone()), true)
     }
 
     /// Work out what a lambda takes from its enclosing function
