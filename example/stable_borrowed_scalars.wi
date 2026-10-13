@@ -1,0 +1,18 @@
+// Stable caller storage in an async frame. Async reference parameters remain
+// gated by E1707; this exercises the shared B2 storage with synchronous borrows.
+fn increment(value: &mut i64) { value = value + 1; }
+fn read_float(value: &f64) -> f64 { return value; }
+fn read_bool(value: &bool) -> bool { return value; }
+
+async fn main() {
+    let mut number = 40;
+    let fraction = 4.25;
+    let flag = true;
+    increment(&number);
+    await sleep(1);
+    increment(&number);
+    await sleep(1);
+    println(number);
+    println(read_float(&fraction));
+    println(read_bool(&flag));
+}

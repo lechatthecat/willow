@@ -200,6 +200,12 @@ pub const fn async_frame_slot_offset(n: usize) -> usize {
 ///
 /// The returned pointer is the GC payload pointer (past the GcHeader).
 /// All bytes are zero-initialized by the allocator.
+///
+/// Stable borrowed storage contract: a live frame never moves or resizes under
+/// the non-moving old-generation allocator (not the copying nursery). The
+/// compiler gives each address-taken caller local an exclusive fixed-offset
+/// slot, so its address remains valid until the borrow ends. The caller/borrower
+/// must keep the frame rooted for that whole interval.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_frame_alloc(slot_count: i64, gc_slot_mask: u64) -> *mut c_void {

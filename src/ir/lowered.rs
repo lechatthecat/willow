@@ -6672,6 +6672,14 @@ pub fn format_program(program: &LirProgram) -> String {
                 .join(", "),
             super::dump::type_text(&function.return_type)
         ));
+        for local in &function.locals {
+            if let Some(slot) = function.async_frame.slot(local.id) {
+                output.push_str(&format!(
+                    "  frame slot {}: local {} `{}`;\n",
+                    slot.index, local.id.0, local.name
+                ));
+            }
+        }
         for block in &function.blocks {
             output.push_str(&format!("bb{}:\n", block.id.0));
             for instruction in &block.instrs {

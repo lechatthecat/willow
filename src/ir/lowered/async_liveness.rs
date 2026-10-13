@@ -28,6 +28,11 @@ impl LirAsyncFrameLayout {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static BORROW_OPERAND_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Compute the exact set of locals live across explicit LIR suspension edges.
 #[cfg(test)]
 pub(crate) fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout {
@@ -54,6 +59,23 @@ pub(crate) fn analyze_with(
         }
         for inst in &block.instrs {
             match inst {
+                SourceInst::Compute { value, .. } => {
+                    // A reference is an address use, not just a value use.
+                    // Its borrower can outlive the last direct read of the
+                    // local. Give it an exclusive slot for the entire frame
+                    // lifetime; never rematerialize or coalesce that storage.
+                    for operand in value.operands() {
+                        #[cfg(test)]
+                        BORROW_OPERAND_VISITS.with(|visits| visits.set(visits.get() + 1));
+                        if let super::LirOperand::Reference {
+                            place: super::LirPlace::Local(local),
+                            ..
+                        } = operand
+                        {
+                            pinned.insert(*local);
+                        }
+                    }
+                }
                 SourceInst::SelectInit { operations } => {
                     for operation in operations {
                         collect_select_locals(operation, &mut pinned);
@@ -144,14 +166,15 @@ pub(crate) fn analyze_with(
     let mut slots = Vec::new();
     let mut occupants: Vec<Vec<&LirLocal>> = Vec::new();
     let mut mapping = HashMap::new();
+    let mut reusable_slots: Vec<usize> = Vec::new();
     for local in locals.iter().filter(|local| framed.contains(&local.id)) {
         // GC values and protocol/defer slots retain exclusive ownership. This
         // first tier only reuses primitive scalars with identical types.
         let reusable = !pinned.contains(&local.id) && reusable_scalar(local);
         let index = reusable
             .then(|| {
-                occupants.iter().position(|members| {
-                    members.iter().all(|other| {
+                reusable_slots.iter().copied().find(|&index| {
+                    occupants[index].iter().all(|other| {
                         !pinned.contains(&other.id)
                             && reusable_scalar(other)
                             && other.ty == local.ty
@@ -166,6 +189,9 @@ pub(crate) fn analyze_with(
             .unwrap_or_else(|| {
                 slots.push(local.id);
                 occupants.push(Vec::new());
+                if reusable {
+                    reusable_slots.push(slots.len() - 1);
+                }
                 slots.len() - 1
             });
         occupants[index].push(local);
@@ -175,6 +201,64 @@ pub(crate) fn analyze_with(
         locals: mapping,
         slots,
     }
+}
+
+/// Validate the non-moving local-slot invariant before async code generation.
+/// The runtime frame is non-moving; exclusive logical slots ensure that its
+/// fixed offsets keep denoting the same local across every poll/resume. Do not
+/// allow the backend's conservative frame-all fallback to hide a missing proof.
+pub(crate) fn stable_borrow_rejection(function: &super::LirFunction) -> Option<String> {
+    let frame = &function.async_frame;
+    let mut occupants = vec![0usize; frame.slots.len()];
+    for (local, slot) in &frame.locals {
+        if function.locals.get(local.0 as usize).is_none() || slot.index >= occupants.len() {
+            return Some("invalid async frame local or slot".into());
+        }
+        occupants[slot.index] += 1;
+    }
+    let check_local = |id: LirLocalId| {
+        let Some(local) = function.locals.get(id.0 as usize) else {
+            return Some("borrowed local has no storage identity".into());
+        };
+        let stable = frame
+            .slot(id)
+            .is_some_and(|slot| occupants[slot.index] == 1 && frame.slots[slot.index] == id);
+        (!stable).then(|| {
+            format!(
+                "borrowed local `{}` has no exclusive stable async frame slot",
+                local.name
+            )
+        })
+    };
+    for block in &function.blocks {
+        for instruction in &block.instrs {
+            match instruction {
+                super::LirInst::Compute { value, .. } => {
+                    for operand in value.operands() {
+                        if let super::LirOperand::Reference {
+                            place: super::LirPlace::Local(id),
+                            ..
+                        } = operand
+                            && let Some(reason) = check_local(*id)
+                        {
+                            return Some(reason);
+                        }
+                    }
+                }
+                // Cleanup runs in a separate region but accesses the parent's
+                // storage. Its captures are pinned by the same frame planner.
+                super::LirInst::Defer { body, .. } => {
+                    for id in &body.captures {
+                        if let Some(reason) = check_local(*id) {
+                            return Some(reason);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 fn reusable_scalar(local: &LirLocal) -> bool {
@@ -588,3 +672,7 @@ mod coalescing_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "stable_borrow_tests.rs"]
+mod stable_borrow_tests;

@@ -6115,3 +6115,63 @@ fn m2_scope_finalization_reports_owner_release_without_finish() {
     m2_wait_reclaimed(1);
     reset_stress_fixture();
 }
+
+// B2 needs only a non-moving heap frame and cooperative poll/resume, not an
+// Epic A native task stack or the future async-reference parameter ABI.
+#[test]
+fn stable_borrow_frame_address_survives_poll_resume_and_gc() {
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "C" fn poll(frame: *mut c_void) -> i32 {
+        let frame = frame.cast::<u8>();
+        // Slot 0 roots the caller frame; slots 1..3 preserve raw addresses to
+        // its i64/f64/bool storage. Raw addresses deliberately are not roots.
+        let word = |i| unsafe { frame.add(async_frame_slot_offset(i)).cast::<usize>() };
+        let owner = unsafe { *word(0) } as *mut u8;
+        let expected = [42u64, 4.25f64.to_bits(), 1];
+        for (i, expected) in expected.into_iter().enumerate() {
+            let address = unsafe { *word(i + 1) } as *mut u64;
+            assert_eq!(address, unsafe {
+                owner.add(async_frame_slot_offset(i)).cast()
+            });
+            assert_eq!(unsafe { *address }, expected);
+        }
+        // A synchronous GC between polls must preserve both the frame base
+        // and every interior address, not merely repair the rooted base.
+        crate::gc::willow_gc_minor_collect();
+        willow_gc_collect();
+        let polls = POLLS.fetch_add(1, Ordering::SeqCst) + 1;
+        if polls < 16 {
+            RUNTIME_POLL_PREEMPTED
+        } else {
+            RUNTIME_POLL_READY
+        }
+    }
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    reset_internal_for_test();
+    POLLS.store(0, Ordering::SeqCst);
+    let mut owner = willow_async_frame_alloc(3, 0).cast::<u8>();
+    crate::gc::willow_push_root(&mut owner);
+    for (i, value) in [42u64, 4.25f64.to_bits(), 1].into_iter().enumerate() {
+        unsafe {
+            *owner.add(async_frame_slot_offset(i)).cast::<u64>() = value;
+        }
+    }
+    let child = willow_async_frame_alloc(4, 1).cast::<u8>();
+    unsafe {
+        *child.add(async_frame_slot_offset(0)).cast::<*mut u8>() = owner;
+        for i in 0..3 {
+            *child.add(async_frame_slot_offset(i + 1)).cast::<*mut u8>() =
+                owner.add(async_frame_slot_offset(i));
+        }
+    }
+    let task = willow_sched_spawn_cooperative(poll, child.cast()) as u64;
+    // From here only the scheduled child's traced owner edge keeps the caller
+    // alive. There is no native activation retaining the borrowed addresses.
+    crate::gc::willow_pop_root();
+    willow_sched_run_until(task);
+    assert!(target_is_done(Some(task)));
+    assert_eq!(POLLS.load(Ordering::SeqCst), 16);
+    reset_global_scheduler_for_test();
+    reset_internal_for_test();
+}

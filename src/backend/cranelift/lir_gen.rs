@@ -2302,6 +2302,9 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
 
 /// Final LIR cannot embed expression-level suspension trees.
 pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
+    if let Some(reason) = crate::ir::lowered::async_liveness::stable_borrow_rejection(f) {
+        return Some(reason);
+    }
     f.blocks
         .iter()
         .flat_map(|block| &block.instrs)

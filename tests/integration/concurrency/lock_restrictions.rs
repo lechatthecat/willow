@@ -1365,3 +1365,19 @@ fn lock_imported_default_from_third_module() {
     let diagnostics = String::from_utf8_lossy(&output.stderr);
     assert!(diagnostics.contains("error[E2604]"), "{diagnostics}");
 }
+
+#[test]
+fn stable_borrowed_scalars_example() {
+    let source = include_str!("../../../example/stable_borrowed_scalars.wi");
+    for env in [
+        vec![("WILLOW_WORKERS", "1")],
+        vec![("WILLOW_WORKERS", "2"), ("WILLOW_GC_STRESS", "alloc")],
+    ] {
+        let (out, ok) = compile_and_run_with_env(source, &env);
+        assert!(ok, "{out}");
+        assert_eq!(out, "42\n4.25\ntrue\n");
+    }
+    let (out, ok) = compile_and_run_release(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n4.25\ntrue\n");
+}
