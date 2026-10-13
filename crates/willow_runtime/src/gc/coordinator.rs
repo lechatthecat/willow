@@ -12,6 +12,7 @@ struct State {
 struct Coordinator {
     shared: Arc<(Mutex<State>, Condvar)>,
     thread: std::thread::JoinHandle<()>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 static COORDINATOR: Mutex<Option<Coordinator>> = Mutex::new(None);
@@ -20,10 +21,16 @@ impl Coordinator {
     fn new() -> std::io::Result<Self> {
         let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let worker = shared.clone();
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completion = completed.clone();
         let thread = std::thread::Builder::new()
             .name("willow-gc-cycle".into())
-            .spawn(move || run(worker))?;
-        Ok(Self { shared, thread })
+            .spawn(move || run(worker, completion))?;
+        Ok(Self {
+            shared,
+            thread,
+            completed,
+        })
     }
 }
 
@@ -59,8 +66,15 @@ pub(super) fn request() -> bool {
     true
 }
 
-fn run(shared: Arc<(Mutex<State>, Condvar)>) {
-    crate::failure::ffi_boundary("GC coordinator", || run_loop(shared));
+fn run(shared: Arc<(Mutex<State>, Condvar)>, completion: Arc<std::sync::atomic::AtomicBool>) {
+    crate::failure::ffi_boundary("GC coordinator", || {
+        run_loop(shared);
+        // Publish under coord so completion and stop requests share the
+        // waiter's predicate lock. run_loop has released every GC owner.
+        let _coord = runtime().coord.0.lock().unwrap();
+        completion.store(true, Ordering::Relaxed);
+        runtime().budget_cv.notify_all();
+    });
 }
 
 fn run_loop(shared: Arc<(Mutex<State>, Condvar)>) {
@@ -122,12 +136,27 @@ pub(super) fn shutdown() {
     }
     // The caller may still be a registered mutator. A blocking join would
     // deadlock a coordinator awaiting its root snapshot or fallback safepoint.
-    while !coordinator.thread.is_finished() {
-        willow_gc_safepoint();
-        std::thread::sleep(std::time::Duration::from_millis(1));
+    let mut coord = runtime().coord.0.lock().unwrap();
+    while !coordinator.completed.load(Ordering::Relaxed) {
+        if coord.stop_requested {
+            drop(coord);
+            willow_gc_safepoint();
+            coord = runtime().coord.0.lock().unwrap();
+        } else {
+            #[cfg(test)]
+            SHUTDOWN_WAITS.fetch_add(1, Ordering::Release);
+            coord = runtime().budget_cv.wait(coord).unwrap();
+        }
     }
-    let _ = coordinator.thread.join();
+    drop(coord);
+    // Completion proves heap quiescence, even if OS/TLS teardown is delayed.
+    if coordinator.thread.is_finished() {
+        let _ = coordinator.thread.join();
+    }
 }
+
+#[cfg(test)]
+static SHUTDOWN_WAITS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 static PANIC_BEFORE_COLLECTION: std::sync::atomic::AtomicBool =
@@ -150,6 +179,84 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn shutdown_notification_spurious_wakes_and_stop_rounds() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let _mutator = MutatorRegistration::new();
+        SHUTDOWN_WAITS.store(0, Ordering::Relaxed);
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completion = completed.clone();
+        let caller = std::thread::current().id();
+        let thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            for round in 1..=5 {
+                while SHUTDOWN_WAITS.load(Ordering::Acquire) < round {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "shutdown did not sleep"
+                    );
+                    std::thread::yield_now();
+                }
+                // Acquiring the predicate lock proves the waiter reached wait.
+                let _coord = runtime().coord.0.lock().unwrap();
+                assert!(!completion.load(Ordering::Relaxed));
+                runtime().budget_cv.notify_all();
+            }
+            for reason in [
+                crate::gc_telemetry::stops::StopReason::Remark,
+                crate::gc_telemetry::stops::StopReason::Recovery,
+                crate::gc_telemetry::stops::StopReason::Minor,
+            ] {
+                with_stw(reason, |coord, _| assert!(coord.parked.contains(&caller)));
+            }
+            let _coord = runtime().coord.0.lock().unwrap();
+            completion.store(true, Ordering::Relaxed);
+            runtime().budget_cv.notify_all();
+        });
+        *COORDINATOR.lock().unwrap() = Some(Coordinator {
+            shared: Arc::new((Mutex::new(State::default()), Condvar::new())),
+            thread,
+            completed,
+        });
+        shutdown();
+        assert!(SHUTDOWN_WAITS.load(Ordering::Relaxed) >= 5);
+        assert_eq!(registered_mutator_count(), 1);
+        drop(_mutator);
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn shutdown_notification_idle_repeated_and_before_wait() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        shutdown(); // Absent coordinator.
+        for _ in 0..64 {
+            *COORDINATOR.lock().unwrap() = Some(Coordinator::new().unwrap());
+            shutdown();
+            assert!(COORDINATOR.lock().unwrap().is_none());
+        }
+        // Completion may be published before the shutdown waiter acquires coord.
+        // Delay OS thread teardown to ensure shutdown never joins it blindly.
+        let (release, released) = std::sync::mpsc::channel();
+        let (done, completed) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            released.recv().unwrap();
+            done.send(()).unwrap();
+        });
+        *COORDINATOR.lock().unwrap() = Some(Coordinator {
+            shared: Arc::new((Mutex::new(State::default()), Condvar::new())),
+            thread,
+            completed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+        shutdown();
+        release.send(()).unwrap();
+        completed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        reset_internal_for_test();
     }
 
     #[test]

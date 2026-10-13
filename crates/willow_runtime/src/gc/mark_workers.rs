@@ -31,6 +31,11 @@ struct State {
     job: Option<Arc<Job>>,
     remaining: usize,
     shutdown: bool,
+    remaining_workers: usize,
+    #[cfg(test)]
+    shutdown_completions: usize,
+    #[cfg(test)]
+    shutdown_notifications: usize,
 }
 
 pub(super) struct Pool {
@@ -59,6 +64,11 @@ impl Pool {
                     job: None,
                     remaining: 0,
                     shutdown: false,
+                    remaining_workers: 0,
+                    #[cfg(test)]
+                    shutdown_completions: 0,
+                    #[cfg(test)]
+                    shutdown_notifications: 0,
                 }),
                 Condvar::new(),
             )),
@@ -66,12 +76,14 @@ impl Pool {
         };
         for index in 0..count {
             let shared = pool.shared.clone();
+            shared.0.lock().unwrap().remaining_workers += 1;
             match std::thread::Builder::new()
                 .name(format!("willow-gc-mark-{index}"))
                 .spawn(move || worker_main(shared))
             {
                 Ok(thread) => pool.threads.push(thread),
                 Err(error) => {
+                    pool.shared.0.lock().unwrap().remaining_workers -= 1;
                     record_failure(Failure::Spawn);
                     return Err(error); // Drop stops all already-created threads.
                 }
@@ -118,34 +130,65 @@ impl Pool {
     }
 }
 
-impl Drop for Pool {
-    fn drop(&mut self) {
+impl Pool {
+    fn stop(&mut self, timeout: std::time::Duration) {
+        if self.threads.is_empty() {
+            return;
+        }
         let (lock, cv) = &*self.shared;
         let mut state = lock.lock().unwrap();
         // Production shutdown occurs after run() has quiesced all readers.
         assert_eq!(state.remaining, 0, "cannot shut down active heap readers");
         state.shutdown = true;
         cv.notify_all();
-        drop(state);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        for thread in self.threads.drain(..) {
-            while !thread.is_finished() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+        let deadline = std::time::Instant::now() + timeout;
+        while state.remaining_workers != 0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                // Idle workers hold no epoch. One shared deadline bounds the
+                // whole pool, including partial construction after spawn failure.
+                for _ in 0..state.remaining_workers {
+                    record_failure(Failure::JoinTimeout);
+                }
+                break;
             }
+            state = cv.wait_timeout(state, remaining).unwrap().0;
+        }
+        drop(state);
+        for thread in self.threads.drain(..) {
+            // Notification precedes Rust/OS thread teardown. Never turn a
+            // bounded completion wait into an unbounded TLS-destructor join.
             if thread.is_finished() {
                 let _ = thread.join();
-            } else {
-                // Shutdown was already requested, and remaining==0 proves this
-                // idle thread holds no heap epoch. Never block process exit
-                // indefinitely on an OS thread that is not being scheduled.
-                record_failure(Failure::JoinTimeout);
             }
         }
     }
 }
 
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.stop(std::time::Duration::from_secs(2));
+    }
+}
+
 fn worker_main(shared: Arc<(Mutex<State>, Condvar)>) {
-    crate::failure::ffi_boundary("GC marker worker", || worker_loop(shared));
+    crate::failure::ffi_boundary("GC marker worker", || {
+        worker_loop(shared.clone());
+        // worker_loop has dropped its scratch storage and all epoch owners.
+        let mut state = shared.0.lock().unwrap();
+        state.remaining_workers -= 1;
+        #[cfg(test)]
+        {
+            state.shutdown_completions += 1;
+        }
+        if state.remaining_workers == 0 {
+            #[cfg(test)]
+            {
+                state.shutdown_notifications += 1;
+            }
+            shared.1.notify_all();
+        }
+    });
 }
 
 fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
@@ -211,6 +254,111 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
 #[cfg(test)]
 mod termination_tests {
     use super::*;
+
+    #[test]
+    fn shutdown_notification_drains_idle_and_used_pools() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        for count in [0, 1, 4, 16, 64] {
+            for used in [false, true] {
+                let pool = Pool::new(count).unwrap();
+                let shared = pool.shared.clone();
+                let cycle = Arc::new(ConcurrentCycle::new(
+                    [],
+                    IdSet::default(),
+                    IdMap::default(),
+                    0,
+                ));
+                if used {
+                    pool.run(&cycle, 0);
+                }
+                assert_eq!(Arc::strong_count(&cycle), 1);
+                let start = std::time::Instant::now();
+                drop(pool);
+                let state = shared.0.lock().unwrap();
+                assert_eq!(state.remaining_workers, 0);
+                assert_eq!(state.shutdown_completions, count);
+                assert_eq!(state.shutdown_notifications, usize::from(count != 0));
+                assert_eq!(state.remaining, 0);
+                assert!(state.job.is_none());
+                assert!(start.elapsed() < std::time::Duration::from_secs(2));
+                println!(
+                    "shutdown workers={count} used={used} completions={count} elapsed_us={}",
+                    start.elapsed().as_micros()
+                );
+            }
+        }
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn shutdown_notification_timeout_detaches_only_idle_workers() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        for count in [1, 4, 16] {
+            let mut pool = Pool::new(0).unwrap();
+            let shared = pool.shared.clone();
+            let (release, released) = std::sync::mpsc::channel();
+            let released = Arc::new(Mutex::new(released));
+            let (done, completed) = std::sync::mpsc::channel();
+            shared.0.lock().unwrap().remaining_workers = count;
+            for _ in 0..count {
+                let shared = shared.clone();
+                let released = released.clone();
+                let done = done.clone();
+                pool.threads.push(std::thread::spawn(move || {
+                    // An unscheduled idle worker: no job or epoch is owned.
+                    released.lock().unwrap().recv().unwrap();
+                    let mut state = shared.0.lock().unwrap();
+                    assert!(state.shutdown);
+                    assert!(state.job.is_none());
+                    state.remaining_workers -= 1;
+                    shared.1.notify_all();
+                    done.send(()).unwrap();
+                }));
+            }
+            let before = crate::gc_telemetry::workers::snapshot().join_timeouts;
+            let start = std::time::Instant::now();
+            pool.stop(std::time::Duration::from_millis(10));
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            assert_eq!(shared.0.lock().unwrap().remaining_workers, count);
+            assert_eq!(
+                crate::gc_telemetry::workers::snapshot().join_timeouts - before,
+                count as u64
+            );
+            drop(pool);
+            for _ in 0..count {
+                release.send(()).unwrap();
+            }
+            for _ in 0..count {
+                completed
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+            }
+            assert_eq!(shared.0.lock().unwrap().remaining_workers, 0);
+        }
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn shutdown_notification_worker_infrastructure_panic_remains_fatal() {
+        use super::super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
+        if std::env::var_os(GC_FATAL_CASE).is_some() {
+            let pool = Pool::new(0).unwrap();
+            let shared = pool.shared.clone();
+            let _ = std::panic::catch_unwind(|| {
+                let _state = shared.0.lock().unwrap();
+                panic!("poison worker state");
+            });
+            worker_main(shared);
+            return;
+        }
+        assert_fatal_child(
+            "gc::mark_workers::termination_tests::shutdown_notification_worker_infrastructure_panic_remains_fatal",
+            "marker shutdown panic",
+            "runtime fatal: Rust panic in GC marker worker",
+        );
+    }
 
     #[test]
     fn termination_spurious_pool_wakes_do_not_duplicate_jobs_or_completion() {
