@@ -325,7 +325,7 @@ thread_local! {
     static FAULT_SITE: RefCell<(FaultFile, i64, i64)> = const { RefCell::new((FaultFile::NONE, 0, 0)) };
 }
 
-fn current_fault_site() -> (String, i64, i64) {
+pub(crate) fn current_fault_site() -> (String, i64, i64) {
     FAULT_SITE.with(|site| {
         let site = site.borrow();
         (site.0.to_text(), site.1, site.2)

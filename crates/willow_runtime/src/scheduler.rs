@@ -2357,7 +2357,12 @@ fn current_task_id() -> Option<RuntimeTaskId> {
     CURRENT_TASK.with(Cell::get)
 }
 
+/// Every poll boundary drops the published fault location: release synchronous
+/// code publishes none, so a site left by the previous task (or by an async
+/// poll that returned to synchronous code) must not label its faults
+/// (willow-9686).
 fn set_current_task(id: Option<RuntimeTaskId>) {
+    crate::panic_context::willow_fault_site_clear();
     CURRENT_TASK.with(|current| current.set(id));
     let context =
         id.and_then(|task_id| global_task_table().with(task_id, RuntimeTask::panic_context));
@@ -2367,6 +2372,7 @@ fn set_current_task(id: Option<RuntimeTaskId>) {
 /// Install a context already cloned while the task shard was held. Production
 /// claim paths use this to avoid a second task-table lock solely for TLS setup.
 fn set_current_task_context(id: RuntimeTaskId, context: Arc<crate::panic_context::PanicContext>) {
+    crate::panic_context::willow_fault_site_clear();
     CURRENT_TASK.with(|current| current.set(Some(id)));
     crate::panic_context::replace_current_context(Some(context));
 }

@@ -1,0 +1,54 @@
+// Synchronous hot loops publish no diagnostic site in release builds, while
+// async code keeps its own site for task diagnostics (willow-9686). Run with
+// `willow run example/release_fault_sites.wi --release` to exercise the
+// release code path; the output is identical in debug builds.
+import std::collections::Array;
+import std::collections::Map;
+
+fn table_sum(n: i64) -> i64 {
+    let mut table: Map<i64, i64> = Map::new();
+    let mut i: i64 = 0;
+    while i < n {
+        table.insert(i * 2654435761, i);
+        i = i + 1;
+    }
+    let mut sum: i64 = 0;
+    i = 0;
+    while i < 2 * n {
+        let found = match table.get(i * 2654435761) {
+            Option::Some(value) => value,
+            Option::None => 1,
+        };
+        sum = sum + found;
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn array_sum(n: i64) -> i64 {
+    let values: Array<i64> = [];
+    let mut i: i64 = 0;
+    while i < n {
+        values.push(i);
+        i = i + 1;
+    }
+    let mut sum: i64 = 0;
+    i = 0;
+    while i < n {
+        values[i] = values[i] * 2;
+        sum = sum + values[i];
+        i = i + 1;
+    }
+    return sum;
+}
+
+async fn work(n: i64) -> i64 {
+    await sleep(1);
+    return table_sum(n) + array_sum(n);
+}
+
+async fn main() {
+    println(table_sum(1000));
+    println(array_sum(1000));
+    println(await work(100));
+}

@@ -911,7 +911,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let may_panic = effects.contains(crate::backend::abi::RuntimeEffects::MAY_PANIC);
         let no_preempt = effects.contains(crate::backend::abi::RuntimeEffects::NO_PREEMPT_REGION);
         let panic_depth = if may_panic {
-            self.emit_pre_willow_call_panic_depth()
+            self.emit_pre_call_panic_depth(false)
         } else {
             None
         };
@@ -958,6 +958,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_pre_willow_call_panic_depth(
         &mut self,
     ) -> Option<cranelift_codegen::ir::Value> {
+        self.emit_pre_call_panic_depth(true)
+    }
+
+    /// [`Self::emit_pre_willow_call_panic_depth`] for either a Willow call
+    /// (`enters_willow`) or a raising runtime call.
+    fn emit_pre_call_panic_depth(
+        &mut self,
+        enters_willow: bool,
+    ) -> Option<cranelift_codegen::ir::Value> {
         let reusable = self.panic_depth_snapshot.and_then(|(block, depth)| {
             (self.builder.current_block() == Some(block)
                 && std::env::var_os("WILLOW_PANIC_SNAPSHOT_REUSE").is_none_or(|value| value != "0")
@@ -972,16 +981,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Publishing diagnostic location cannot mutate panic depth. Query the
         // proof before emitting this marker so debug metadata is not itself
         // an artificial invalidation at this call's snapshot point.
-        self.emit_fault_site();
+        self.emit_fault_site_for(enters_willow);
         Some(reusable.unwrap_or_else(|| self.emit_value_runtime_call("willow_panic_depth", &[])))
     }
 
     /// Publish the executing function and location before a call that can raise.
     /// Debug builds retain the synchronous leaf; async tasks retain their own
-    /// location in every mode. Release sync calls update only the fault location
-    /// and clear any prior leaf, so task execution cannot leak stale metadata.
+    /// location in every mode. Release synchronous code publishes nothing: its
+    /// faults are location-free (willow-s9ej.7), and a hot loop must not pay a
+    /// runtime call per raising operation (willow-9686). An async site cannot
+    /// leak into it because the runtime drops the fault location when async
+    /// code enters a Willow call and at every poll boundary.
     pub(super) fn emit_fault_site(&mut self) {
-        if self.diagnostic_function.is_empty() {
+        self.emit_fault_site_for(false);
+    }
+
+    /// [`Self::emit_fault_site`]; `enters_willow` marks a call into generated
+    /// code, which publishes its own fault location if it has one.
+    fn emit_fault_site_for(&mut self, enters_willow: bool) {
+        if self.diagnostic_function.is_empty()
+            || (self.build_mode != BuildMode::Debug && !self.diagnostic_async)
+        {
             return;
         }
         let Some(span) = self.fault_site_span else {
@@ -1000,7 +1020,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let asynchronous = self.builder.ins().iconst(
             types::I32,
             i64::from(self.diagnostic_async)
-                | (i64::from(self.build_mode == BuildMode::Debug) << 1),
+                | (i64::from(self.build_mode == BuildMode::Debug) << 1)
+                | (i64::from(enters_willow) << 2),
         );
         self.emit_void_runtime_call(
             "willow_trace_site_set",

@@ -23,6 +23,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/task_frame_lifetime.wi", "8484\ntrue\n"),
         ("example/codegen_unit_context/main.wi", "42\n"),
         ("example/interface_pairs.wi", "7\n11\n7\n11\n"),
+        ("example/leaf_closure_calls.wi", "3025\n25\ntotal=3025\n"),
         ("example/leaf_method_calls.wi", "385\n1210\n7\n"),
         ("example/map_confined.wi", "false\n128\n99\n2.5\ntrue\n"),
         ("example/map_scalar_aliases.wi", "8192\ntrue\n12288\ntrue\n"),
@@ -147,6 +148,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/async_concurrent.wi", "465\n"),
         ("example/async_preemption.wi", "42\n"),
         ("example/async_fn_pointer.wi", "42\n14\n"),
+        ("example/release_fault_sites.wi", "500500\n999000\n14950\n"),
         ("example/lock_function_values.wi", "41\n42\n100\n"),
         (
             "example/imported_function_values/main.wi",

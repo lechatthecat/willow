@@ -315,5 +315,7 @@ mod assignable_representations;
 #[path = "integration/module_generic_members.rs"]
 mod module_generic_members;
 
+#[path = "integration/release_fault_sites.rs"]
+mod release_fault_sites;
 #[path = "integration/string_concat_fusion.rs"]
 mod string_concat_fusion;

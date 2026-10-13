@@ -261,7 +261,10 @@ pub extern "C" fn willow_callstack_activate() {
 
 /// Publish the executing function separately from suspended caller frames.
 /// Keeping it in the exchanged trace also isolates native task stacks.
-/// Flags: bit 0 identifies async source code; bit 1 enables the debug call chain.
+/// Flags: bit 0 identifies async source code; bit 1 enables the debug call chain;
+/// bit 2 marks a call into generated code. Release builds publish no fault
+/// location for such a call: an async callee publishes its own, and a
+/// synchronous callee's faults stay location-free (willow-9686).
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_trace_site_set(
@@ -277,14 +280,19 @@ pub extern "C" fn willow_trace_site_set(
     let debug = flags & 2 != 0;
     if !asynchronous && !debug {
         // Release synchronous code keeps runtime faults location-free
-        // (willow-s9ej.7); drop any site an async caller published.
+        // (willow-s9ej.7); drop any site an async caller published. Current
+        // codegen does not publish release synchronous sites at all.
         crate::panic_context::willow_fault_site_clear();
         CALL_STACK.with(|slot| slot.borrow_mut().current = None);
         return;
     }
     // SAFETY: generated code passes its static string data (see the ABI doc).
     let site = unsafe { TraceSite::from_static(function, function_len, file, file_len, line, col) };
-    crate::panic_context::set_static_fault_site(site);
+    if flags & 4 != 0 && !debug {
+        crate::panic_context::willow_fault_site_clear();
+    } else {
+        crate::panic_context::set_static_fault_site(site);
+    }
     let task = if asynchronous {
         crate::scheduler::current_task()
     } else {
@@ -447,6 +455,30 @@ mod tests {
         willow_trace_site_set(b"debug".as_ptr(), 5, b"old.wi".as_ptr(), 6, 2, 1, 2);
         willow_trace_site_set(b"release".as_ptr(), 7, b"new.wi".as_ptr(), 6, 4, 1, 0);
         assert_eq!(panic_call_stack_text("new.wi", 4, 1), "");
+        replace_current(previous);
+    }
+
+    /// willow-9686: a release async call into generated code keeps the task's
+    /// own site but publishes no fault location for the callee; debug code
+    /// still publishes it; and every poll boundary drops a stale location.
+    #[test]
+    fn release_async_willow_call_drops_only_the_fault_location() {
+        use crate::panic_context::current_fault_site;
+        let previous = replace_current(Default::default());
+        willow_trace_site_set(b"stale".as_ptr(), 5, b"old.wi".as_ptr(), 6, 2, 1, 2);
+        assert_eq!(current_fault_site(), ("old.wi".to_string(), 2, 1));
+        crate::scheduler::with_current_task_for_test(41, || {
+            assert_eq!(current_fault_site(), (String::new(), 0, 0));
+            willow_trace_site_set(b"caller".as_ptr(), 6, b"a.wi".as_ptr(), 4, 7, 3, 1);
+            assert_eq!(current_fault_site(), ("a.wi".to_string(), 7, 3));
+            willow_trace_site_set(b"caller".as_ptr(), 6, b"a.wi".as_ptr(), 4, 8, 5, 1 | 4);
+            assert_eq!(current_fault_site(), (String::new(), 0, 0));
+            let site = async_trace_of(41).1.expect("task site kept");
+            assert_eq!((site.line(), site.col()), (8, 5));
+            willow_trace_site_set(b"caller".as_ptr(), 6, b"d.wi".as_ptr(), 4, 9, 2, 1 | 2 | 4);
+            assert_eq!(current_fault_site(), ("d.wi".to_string(), 9, 2));
+        });
+        assert_eq!(current_fault_site(), (String::new(), 0, 0));
         replace_current(previous);
     }
 

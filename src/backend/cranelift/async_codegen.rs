@@ -1648,6 +1648,12 @@ impl UnitCodegenContext<'_> {
             // A single order is essential here. Running all defers before all
             // locks would execute an enclosing defer while an inner lock was
             // still held, unlike every normal exit path.
+            //
+            // Cleanup runs without a poll entry, which is where the task's name
+            // is otherwise published; tag it so a cleanup panic names the task.
+            if let Some((name_ptr, name_len)) = fg.emit_static_str_bytes(diagnostic_function) {
+                fg.emit_void_runtime_call("willow_sched_tag_current_task", &[name_ptr, name_len]);
+            }
             let mut cleanup_events = Vec::with_capacity(sites.len() + lock_sites.len());
             cleanup_events.extend(
                 sites
