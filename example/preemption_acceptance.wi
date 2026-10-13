@@ -1,0 +1,22 @@
+// Run with WILLOW_WORKERS=1: the peer must run while helper is still live.
+fn helper(started: AtomicBool, done: AtomicBool) {
+    started.store(true);
+    while !done.load() {}
+}
+async fn blocked(started: AtomicBool, done: AtomicBool) {
+    helper(started, done);
+}
+async fn peer(started: AtomicBool, done: AtomicBool) {
+    while !started.load() { await yield(); }
+    done.store(true);
+}
+async fn main() {
+    let started = AtomicBool::new(false);
+    let done = AtomicBool::new(false);
+    let waiting = blocked(started, done);
+    let waking = peer(started, done);
+    await waiting;
+    await waking;
+    println(started.load());
+    println(done.load());
+}

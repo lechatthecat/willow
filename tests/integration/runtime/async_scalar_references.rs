@@ -594,6 +594,24 @@ fn async_borrow_unwind_unhandled_panic_keeps_older_defers() {
 }
 
 #[test]
+fn preemption_acceptance_example() {
+    let source = include_str!("../../../example/preemption_acceptance.wi");
+    let project = TestProject::new("preemption_acceptance", &[("main.wi", source)]);
+    for args in [vec![], vec!["--release"]] {
+        let compiled = project.compile_with_args("main.wi", &args);
+        assert!(compiled.status.success(), "{compiled:?}");
+        for (workers, budget) in [("1", "1"), ("1", "1024"), ("4", "64")] {
+            let output = project.run_with_env_timeout(
+                &[("WILLOW_WORKERS", workers), ("WILLOW_TASK_BUDGET", budget)],
+                std::time::Duration::from_secs(30),
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "true\ntrue\n");
+        }
+    }
+}
+
+#[test]
 fn async_mut_sync_preemption_example_modes() {
     let source = include_str!("../../../example/async_mut_sync_preemption.wi");
     let project = TestProject::new("mut_sync_example", &[("main.wi", source)]);
