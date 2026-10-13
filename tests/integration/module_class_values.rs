@@ -14,7 +14,7 @@
 //! name. The walker looked the bare name up, found nothing, and refused the
 //! whole body — silently, since a fallback prints the same answer. It now
 //! resolves a bare class name through the imported modules, which is how the
-//! AST emitter has always resolved it.
+//! former AST emitter resolved it.
 //!
 //! Coverage is asserted from `WILLOW_LIR_LOG=1`, which names each function the
 //! walker really compiled. The build succeeding says only that nothing in the

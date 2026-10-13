@@ -93,7 +93,7 @@ fn assert_walker_compiled(source: &str, functions: &[&str]) {
 
 // 1. The core shape. Each arm is a block that awaits and returns; before the
 //    split, the `await` had no block boundary to become and `route` went to the
-//    AST emitter, which cannot compile a `match` at all.
+//    now-retired AST emitter, which could not compile a `match` at all.
 #[test]
 fn lir_suspend_01_arm_awaits_and_returns() {
     assert_suspends(

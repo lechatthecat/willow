@@ -26,6 +26,13 @@ fn lirreq_40_ineligible_function_fails_compilation() {
         !ok,
         "a body outside the walker's subset must fail the build: {stderr}"
     );
+    assert!(
+        stderr.contains("function `unsupported` has invalid lowered IR:")
+            && stderr.contains(
+                "return type `Map<Map<String, i64>, i64>` is outside the walker's subset"
+            ),
+        "LIR refusal must reach the compile-error path, not another emitter or an unrelated error: {stderr}"
+    );
 }
 
 #[test]

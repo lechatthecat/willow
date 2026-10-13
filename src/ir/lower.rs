@@ -787,7 +787,7 @@ impl Classes {
     /// checker defines it, the runtime is the only thing that builds one, and a
     /// `recover()` handler reads its fields like any other object's. Without it
     /// here, `info.line` found no field on its receiver and the enclosing
-    /// function fell back to the AST emitter whole (willow-0g8j.3).
+    /// function historically used the now-retired AST emitter (willow-0g8j.3).
     fn with_runtime_types() -> Self {
         let panic_info = ClassInfo {
             fields: builtin_types::panic_info_fields()

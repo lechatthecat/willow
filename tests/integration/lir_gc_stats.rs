@@ -116,8 +116,8 @@ fn main() {
 }
 
 // 2. Every counter, one function each. A name missing from the walker's table
-//    is a fallback, and REQUIRE turns that into a failure here rather than into
-//    a silent AST compile years later.
+//    is an invalid-LIR compile error; no environment switch can select another
+//    function-body emitter.
 #[test]
 fn gcstat_02_every_counter_is_in_the_subset() {
     for counter in COUNTERS {

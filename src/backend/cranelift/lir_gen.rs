@@ -11757,7 +11757,7 @@ mod tests {
 
     // 35. (updated by willow-0g8j.7) `freeze` completed the array method
     // surface — `len`/`push`/`pop`/`toString`/`freeze` is all of it, so there is
-    // no longer an array method that falls back. Kept as a positive check.
+    // no longer an unsupported array method. Kept as a positive check.
     #[test]
     fn e35_array_freeze_now_eligible() {
         let src = "fn f() -> i64 { let xs = [1, 2]; let ys = xs.freeze(); return ys.len(); }";
@@ -14038,7 +14038,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         let (f, tables) = lir_fn_and_tables(src, name, fns);
         assert!(
             tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)),
-            "`{name}` must fall back to the AST emitter"
+            "`{name}` must be rejected as unsupported lowered IR"
         );
     }
 
@@ -14956,7 +14956,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         f.return_type = forged;
         assert!(
             tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)),
-            "a `get` typed over a different value type must fall back"
+            "a `get` typed over a different value type must be rejected"
         );
     }
 
@@ -15096,7 +15096,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
     // p22. an unsupported generic remains rejected, so admitting
     // `Type::Generic` for enums did not open the shape as a whole.
     #[test]
-    fn p22_non_enum_generics_still_fall_back() {
+    fn p22_non_enum_generics_are_rejected() {
         let tables = empty_tables();
         for ty in [
             // A generic CLASS instantiation: the walker admits generic enums
@@ -15423,7 +15423,7 @@ fn f(n: i64) -> Result<i64, String> {
     // are all reachable, so this is the disagreement and not the separate
     // unreachable-block rejection.
     #[test]
-    fn r11h_unbalanced_defer_scopes_across_a_join_fall_back() {
+    fn r11h_unbalanced_defer_scopes_across_a_join_are_rejected() {
         let block = |id: usize, instrs: Vec<LirInst>, terminator: Terminator| LirBlock {
             id: BlockId(id),
             instrs,

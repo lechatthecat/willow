@@ -609,13 +609,14 @@ fn main() {
 // The non-Cranelift sweep: lir_gen.rs and the downcast pattern
 // ---------------------------------------------------------------------------
 //
-// The AST emitter panics when a checked class has no runtime type id, but the
-// LIR generator used to substitute 0 — and 0 is not a class, since ids start at
+// Historically, the now-retired AST emitter panicked when a checked class had
+// no runtime type id, but the LIR generator used to substitute 0 — and 0 is
+// not a class, since ids start at
 // 1. A bogus id lands in object word 0, where nothing reads it until an `is`
 // test or a downcast pattern reads it and answers wrong. The downcast lowering
 // had the mirror-image hole: an unknown class returned "never matches", which
 // silently drops a live arm and sends the program down the wildcard instead.
-// All three now panic. These tests pin down that the front end gets there
+// The surviving paths panic. These tests pin down that the front end gets there
 // first.
 
 /// Perspective 29: an unknown class in a downcast pattern is rejected with

@@ -224,7 +224,7 @@ fn main() {
 
 // 6. The walker's eligibility probe is the same lookup the emitter uses, so a
 //    resolvable static is also a lowerable one: these bodies must come from
-//    lowered IR rather than fall back to the AST emitter.
+//    lowered IR; a rejected body is a compile error.
 #[test]
 fn msp_06_the_walker_compiles_the_module_bodies() {
     let files = counting_project(

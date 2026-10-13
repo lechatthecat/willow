@@ -5,8 +5,8 @@
 //! a push/pop pair around each `let` would grow the shadow root stack once per
 //! loop iteration. That makes the slot itself the root, and nothing freed a
 //! scope's last value before the function returned — a loop body pinned one
-//! object per call, where the AST emitter, which pops the root as the scope
-//! closes, let the collector take it.
+//! object per call, where the former AST emitter popped the root as the scope
+//! closed and let the collector take it.
 //!
 //! `LirInst::ClearScopeRoots` is the fix: lowering marks the end of each lexical
 //! scope with the source locals it declared — it cannot know which of them are

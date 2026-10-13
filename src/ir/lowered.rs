@@ -2140,12 +2140,13 @@ impl Builder {
     /// right, so every operand before the parking one is frozen into a local
     /// first — a resume must not re-run `obj` or `i`.
     ///
-    /// `None` when nothing suspends, or when a suspension sits somewhere this
-    /// cannot hoist it out of. The caller then pushes the operands as written,
-    /// and [`lir_async_rejection_reason`](crate::backend::cranelift) turns the
-    /// remaining suspension into an AST fallback — which is also why the
-    /// synthetic locals a partial split already pushed are harmless: the whole
-    /// lowered function is discarded with it.
+    /// `None` when no operand needs control-flow splitting or async suspension
+    /// hoisting; the caller then emits the original operands. Otherwise operands through
+    /// the last splitting operand are materialized left to right via
+    /// `lower_value_into`, except scalar literals and function references.
+    /// Any suspension left in an unsupported position is rejected by
+    /// `lir_async_rejection_reason`; `compile_function_named` reports invalid lowered
+    /// IR as a compile error. There is no alternative function-body emitter.
     fn lower_assign_operands(&mut self, operands: &[&HirExpr]) -> Option<Vec<HirExpr>> {
         let last = operands.iter().rposition(|operand| {
             expression_needs_cfg(operand) || (self.is_async && suspends_anywhere(operand))
