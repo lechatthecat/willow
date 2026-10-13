@@ -1,0 +1,10 @@
+// Imports used only in generic bodies must not produce W2003.
+import generic_import_usage_support::util;
+class Reader implements util::Seven<i64> {}
+fn main() {
+    println(util::seven(0));
+    let box = new util::Box<i64>();
+    println(box.seven());
+    let reader = new Reader();
+    println(reader.seven());
+}

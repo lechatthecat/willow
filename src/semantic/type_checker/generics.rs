@@ -437,6 +437,78 @@ mod template_registry_tests {
     }
 
     #[test]
+    fn iflh_default_body_visits_are_not_added_by_import_collection() {
+        use super::super::check_decls::DEFAULT_BODY_CHECKS;
+        use crate::parser::import_usage::DEFAULT_BODY_PARSES;
+        for width in [1, 8, 32] {
+            for templates in [1, 8, 32] {
+                for instantiated in [false, true] {
+                    DEFAULT_BODY_PARSES.with(|v| v.set(0));
+                    DEFAULT_BODY_CHECKS.with(|v| v.set(0));
+                    let source = format!(
+                        "import std::fs; {}",
+                        (0..templates)
+                            .map(|n| format!(
+                                "interface I{n}<T> {{ fn f(self) {{ {} }} }}",
+                                (0..width)
+                                    .map(|i| format!("let text{i} = fs::read_to_string(\"x\");"))
+                                    .collect::<String>()
+                            ))
+                            .collect::<String>()
+                    );
+                    let mut program = parse(&source);
+                    assert_eq!(DEFAULT_BODY_PARSES.with(|v| v.get()), templates);
+                    let mut checker = TypeChecker::new();
+                    checker.check_program(&program);
+                    assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                    assert_eq!(DEFAULT_BODY_CHECKS.with(|v| v.get()), 0);
+                    if instantiated {
+                        for item in &program.items {
+                            let Item::Interface(interface) = item else {
+                                unreachable!()
+                            };
+                            let interface = Rc::new(interface.clone());
+                            // Repeated equivalent requests must share existing checks.
+                            for _ in 0..8 {
+                                let instance = checker
+                                    .instantiate_interface_template(
+                                        &interface,
+                                        &[Type::I64],
+                                        interface.span,
+                                    )
+                                    .unwrap();
+                                assert!(instance.default_import_uses.is_empty());
+                            }
+                        }
+                        while let Some(instance) = checker.generics.pending.pop_front() {
+                            checker.check_generic_instance(instance);
+                        }
+                        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                    }
+                    let checks = DEFAULT_BODY_CHECKS.with(|v| v.get());
+                    assert_eq!(checks, if instantiated { templates } else { 0 });
+                    assert_eq!(DEFAULT_BODY_PARSES.with(|v| v.get()), templates);
+                    checker.expand_generics(&mut program, &mut FreshIds::default());
+                    let mut final_checker = TypeChecker::new();
+                    final_checker.source_imports_checked = true;
+                    final_checker.check_program(&program);
+                    assert!(
+                        final_checker.errors.is_empty(),
+                        "{:?}",
+                        final_checker.errors
+                    );
+                    let total = DEFAULT_BODY_CHECKS.with(|v| v.get());
+                    assert_eq!(total, 2 * checks);
+                    assert_eq!(DEFAULT_BODY_PARSES.with(|v| v.get()), templates);
+                    println!(
+                        "iflh defaults={templates} width={width} instantiated={instantiated} parses={templates} generic_body_checks={checks} total_body_checks={total}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn foreign_default_receivers_share_one_interface_instance() {
         // Every receiver of one instantiation reuses the provider's single
         // checked instance; only a new type argument adds one (willow-s71l).
@@ -1612,22 +1684,26 @@ impl TypeChecker {
         }
         let bindings = template.type_params.iter().cloned().zip(args).collect();
         let (bindings, classes) = self.instantiation_bindings(span, &bindings);
-        let mut instance = (**template).clone();
-        instance.name = symbol(&template.name, &key.2);
-        instance.type_params.clear();
-        // Inherited methods are already composed into `methods`.
-        instance.extends.clear();
-        // `self` in the instance's defaults is the written instantiation, so
-        // it converts like the receiver's declared interface (and its
-        // super-interfaces) and diagnostics never name the instance.
-        instance.instance_of = Some(Type::Generic(
-            template.name.clone(),
-            template
-                .type_params
-                .iter()
-                .map(|p| Type::Named(p.clone()))
-                .collect(),
-        ));
+        // Source import summaries belong to the template, not each concrete
+        // instance. Clone only the methods that substitution already needs.
+        let instance = InterfaceDecl {
+            default_import_uses: Vec::new(),
+            name: symbol(&template.name, &key.2),
+            public: template.public,
+            type_params: Vec::new(),
+            extends: Vec::new(), // inherited methods are already composed
+            methods: template.methods.clone(),
+            // The opaque receiver keeps the written instantiation.
+            instance_of: Some(Type::Generic(
+                template.name.clone(),
+                template
+                    .type_params
+                    .iter()
+                    .map(|p| Type::Named(p.clone()))
+                    .collect(),
+            )),
+            span: template.span,
+        };
         let mut item = Item::Interface(instance);
         substitute_item(&mut item, &bindings);
         let Item::Interface(instance) = item else {
@@ -1705,6 +1781,9 @@ impl TypeChecker {
             checker.check_class(&c);
             checker.generics.pending.clear();
         }
+        self.analysis_symbols
+            .used_imports
+            .extend(std::mem::take(&mut checker.analysis_symbols.used_imports));
         if checker.capture_call_sites {
             self.generics
                 .source_symbols

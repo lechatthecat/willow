@@ -207,6 +207,8 @@ pub struct TypeChecker {
     /// `analysis_symbols` is swapped per body.
     member_uses: HashMap<(crate::diagnostics::FileId, usize), usize>,
     capture_call_sites: bool,
+    /// Source import diagnostics were already emitted before generic expansion.
+    pub(crate) source_imports_checked: bool,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
     effect_inputs: crate::compiler_db::effects::EffectInputs,
     /// Function values and indirect calls for E2604 (willow-h4t7).
@@ -356,6 +358,7 @@ impl TypeChecker {
             analysis_symbols: Default::default(),
             member_uses: HashMap::new(),
             capture_call_sites: false,
+            source_imports_checked: false,
             task_method_calls: Vec::new(),
             effect_inputs: Default::default(),
             indirect_lock: Default::default(),

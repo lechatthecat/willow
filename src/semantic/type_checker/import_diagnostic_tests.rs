@@ -265,3 +265,109 @@ fn ticket_42_enum_alias_import_probes_scale_linearly() {
         eprintln!("enum alias functions: {count}, probes: {probes}, retained names: 1");
     }
 }
+
+#[test]
+fn iflh_generic_body_imports() {
+    // 3 template kinds × 4 source spellings × instantiated/uninstantiated = 24 cases.
+    for (import, expression) in [
+        ("import helpers;", "helpers::read_to_string(\"x\")"),
+        ("import helpers as h;", "h::read_to_string(\"x\")"),
+        ("import helpers::read_to_string;", "read_to_string(\"x\")"),
+        ("import helpers::read_to_string as read;", "read(\"x\")"),
+    ] {
+        for instantiated in [false, true] {
+            for (template, call) in [
+                (
+                    format!("fn f<T>(x: T) {{ let result = {expression}; }}"),
+                    "f(1);",
+                ),
+                (
+                    format!(
+                        "class C<T> {{ pub fn f(self, x: T) {{ let result = {expression}; }} }}"
+                    ),
+                    "let c = new C<i64>(); c.f(1);",
+                ),
+                (
+                    format!(
+                        "interface I<T> {{ fn f(self, x: T) {{ let result = {expression}; }} }} {}",
+                        if instantiated {
+                            "class C implements I<i64> {}"
+                        } else {
+                            ""
+                        }
+                    ),
+                    "let c = new C(); c.f(1);",
+                ),
+            ] {
+                let source = format!(
+                    "{import} import helpers as unused; {template} fn main() {{ {} }}",
+                    if instantiated { call } else { "" }
+                );
+                let errors = diagnostics(&source);
+                assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+                assert_eq!(errors[0].code, ErrorCode::W2003, "{source}: {errors:?}");
+                assert_eq!(errors[0].message, "unused import `unused`", "{source}");
+            }
+        }
+    }
+    for template in [
+        "fn f<T>(x: T) { let read = |s: String| s; let result = read(\"x\"); }",
+        "class C<T> { pub fn f(self, x: T) { let read = |s: String| s; let result = read(\"x\"); } }",
+        "interface I<T> { fn f(self, x: T) { let read = |s: String| s; let result = read(\"x\"); } }",
+    ] {
+        let errors = diagnostics(&format!(
+            "import helpers::read_to_string as read; {template} fn main() {{}}"
+        ));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].message, "unused import `read`");
+    }
+}
+
+#[test]
+fn iflh_generic_import_probes_scale_linearly() {
+    for kind in ["function", "class", "interface"] {
+        let mut previous = None;
+        for count in [8, 16, 32, 64] {
+            let bodies: String = (0..count).map(|i| match kind {
+                "function" => format!("fn f{i}<T>(x: T) {{ let text = fs::read_to_string(\"x\"); }}"),
+                "class" => format!("class C{i}<T> {{ pub fn f(self) {{ let text = fs::read_to_string(\"x\"); }} }}"),
+                _ => format!("interface I{i}<T> {{ fn f(self) {{ let text = fs::read_to_string(\"x\"); }} }}"),
+            }).collect();
+            let source = format!("import std::fs; {bodies}");
+            let (program, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            assert!(errors.is_empty());
+            let mut checker = TypeChecker::new();
+            IMPORT_PROBES.with(|v| v.set(0));
+            checker.check_program(&program);
+            assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+            assert_eq!(checker.analysis_symbols.used_imports.len(), 1);
+            if kind == "interface" {
+                assert_eq!(IMPORT_PROBES.with(|v| v.get()), 0);
+            }
+            assert!(checker.generics.pending.is_empty());
+            assert!(checker.generics.emitted.is_empty());
+            let probes = IMPORT_PROBES.with(|v| v.get());
+            if let Some(old) = previous {
+                assert_eq!(probes, old * 2);
+            }
+            previous = Some(probes);
+            eprintln!("{kind}: templates={count}, import_probes={probes}, retained=1, emitted=0");
+        }
+    }
+}
+
+#[test]
+fn iflh_default_implicit_collection_imports() {
+    for constructor in ["Array", "Map"] {
+        let source = format!(
+            "import std::collections; interface I<T> {{ fn f(self) {{ let x = {constructor}::new(); }} }} fn main() {{}}"
+        );
+        let errors = diagnostics(&source);
+        assert!(errors.is_empty(), "{source}: {errors:?}");
+    }
+    let errors = diagnostics(
+        "import std::collections as unused; interface I<T> { fn f(self) { let x = Array::new(); } } fn main() {}",
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].message, "unused import `unused`");
+}

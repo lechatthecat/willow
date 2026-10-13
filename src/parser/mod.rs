@@ -4,6 +4,7 @@ mod expr;
 mod flat_syntax;
 #[cfg(test)]
 mod generic_closer_tests;
+pub(crate) mod import_usage;
 pub mod iter;
 pub(crate) mod ownership;
 mod pattern;
@@ -18,6 +19,7 @@ use crate::lexer::token::{Token, TokenKind};
 use ast::*;
 
 pub struct Parser {
+    default_import_usage: import_usage::DefaultImportUsage,
     rust_namespaces: std::collections::HashSet<String>,
     rust_opaque_names: std::collections::HashSet<String>,
     tuple_arities: std::collections::HashSet<usize>,
@@ -122,6 +124,7 @@ impl Parser {
         Self {
             rust_opaque_names: rust_bridge::opaque_names(&tokens),
             rust_namespaces,
+            default_import_usage: Default::default(),
             tuple_arities: Default::default(),
             type_uses: Vec::new(),
             tokens,
@@ -168,6 +171,7 @@ impl Parser {
             }
         }
 
+        self.default_import_usage.imports(&imports);
         while !self.at_eof() {
             // A `module` declaration here is misplaced (after imports/items) or
             // a duplicate; report and skip it rather than treating it as an item.
@@ -198,6 +202,7 @@ impl Parser {
                 }
                 continue;
             }
+            self.default_import_usage.begin(false);
             match self.parse_item() {
                 Ok(item) => items.push(item),
                 Err(e) => {

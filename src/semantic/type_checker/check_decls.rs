@@ -5,6 +5,11 @@ use std::collections::HashSet;
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static DEFAULT_BODY_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[willow_continuations::checker]
 impl TypeChecker {
     /// Validate an enum's payload types once every declaration is registered
@@ -126,6 +131,8 @@ impl TypeChecker {
         let Some(body) = &m.default_body else {
             return;
         };
+        #[cfg(test)]
+        DEFAULT_BODY_CHECKS.with(|count| count.set(count.get() + 1));
         let iface_name = decl.name.as_str();
         let return_type = self.normalize_type(&m.return_type, m.span);
         let param_types = self.normalize_param_types(&m.params);

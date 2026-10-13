@@ -1,0 +1,2 @@
+module generic_import_usage_support::numbers;
+pub fn seven() -> i64 { return 7; }

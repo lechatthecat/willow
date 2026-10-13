@@ -347,7 +347,12 @@ impl TypeChecker {
                 Item::Class(c) if c.type_params.is_empty() => self.check_class(c),
                 Item::Class(_) => {}
                 Item::Enum(e) => self.check_enum(e), // validate payload types
-                Item::Interface(i) => self.check_interface(i), // validate `extends` + signatures
+                Item::Interface(i) => {
+                    self.analysis_symbols
+                        .used_imports
+                        .extend(i.default_import_uses.iter().cloned());
+                    self.check_interface(i);
+                }
             }
         }
 

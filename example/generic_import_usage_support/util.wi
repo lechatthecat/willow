@@ -1,0 +1,10 @@
+module generic_import_usage_support::util;
+import generic_import_usage_support::numbers;
+
+pub fn seven<T>(x: T) -> i64 { return numbers::seven(); }
+pub class Box<T> {
+    pub fn seven(self) -> i64 { return numbers::seven(); }
+}
+pub interface Seven<T> {
+    fn seven(self) -> i64 { return numbers::seven(); }
+}

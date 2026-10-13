@@ -1194,3 +1194,143 @@ fn match_arm_diagnostic_workarounds_run() {
     assert!(ok, "{out}");
     assert_eq!(out, "3\n7\n9\n");
 }
+
+#[test]
+fn iflh_generic_import_warnings_are_source_owned() {
+    for (kind, declaration, call) in [
+        (
+            "function",
+            "pub fn seven<T>(x: T) -> i64 { return other::seven(); }",
+            "println(util::seven(0));",
+        ),
+        (
+            "class",
+            "pub class Box<T> { pub fn seven(self) -> i64 { return other::seven(); } }",
+            "let b = new util::Box<i64>(); println(b.seven());",
+        ),
+        (
+            "interface",
+            "pub interface Seven<T> { fn seven(self) -> i64 { return other::seven(); } }",
+            "let r = new Reader(); println(r.seven());",
+        ),
+    ] {
+        for instantiated in [false, true] {
+            let receiver = if kind == "interface" && instantiated {
+                "class Reader implements util::Seven<i64> {}"
+            } else {
+                ""
+            };
+            let main = format!(
+                "import util; {receiver} fn main() {{ {} }}",
+                if instantiated { call } else { "" }
+            );
+            let util = format!("module util; import other; import other as unused; {declaration}");
+            let project = TestProject::new(
+                "iflh_imports",
+                &[
+                    ("main.wi", &main),
+                    ("util.wi", &util),
+                    (
+                        "other.wi",
+                        "module other; pub fn seven() -> i64 { return 7; }",
+                    ),
+                ],
+            );
+            let output = project.compile("main.wi");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{kind}/{instantiated}: {stderr}");
+            assert!(
+                !stderr.contains("unused import `other`"),
+                "{kind}/{instantiated}: {stderr}"
+            );
+            assert_eq!(
+                stderr.matches("unused import `unused`").count(),
+                1,
+                "{kind}/{instantiated}: {stderr}"
+            );
+            if instantiated {
+                let output = project.run();
+                assert!(output.status.success());
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+            }
+        }
+    }
+}
+
+#[test]
+fn iflh_generic_import_example_runs_without_warnings() {
+    let project = TestProject::new(
+        "iflh_example",
+        &[
+            (
+                "main.wi",
+                include_str!("../../example/generic_import_usage.wi"),
+            ),
+            (
+                "generic_import_usage_support/util.wi",
+                include_str!("../../example/generic_import_usage_support/util.wi"),
+            ),
+            (
+                "generic_import_usage_support/numbers.wi",
+                include_str!("../../example/generic_import_usage_support/numbers.wi"),
+            ),
+        ],
+    );
+    let compiled = project.compile("main.wi");
+    let stderr = String::from_utf8_lossy(&compiled.stderr);
+    assert!(compiled.status.success(), "{stderr}");
+    assert!(!stderr.contains("W2003"), "{stderr}");
+    let output = project.run();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n7\n7\n");
+}
+
+#[test]
+fn iflh_type_parameters_do_not_shadow_imported_values() {
+    for (item, body) in [
+        ("other::seven", "return T();"),
+        ("other::generic", "return T<i64>();"),
+        ("other::seven", "let f = T; return f();"),
+        ("other", "return T::generic<i64>();"),
+        ("other", "let T = 1; return T::generic<i64>();"),
+    ] {
+        for instantiated in [false, true] {
+            let util = format!(
+                "module util; import {item} as T; import other as unused; pub interface I<T> {{ fn f(self) -> i64 {{ {body} }} }}"
+            );
+            let main = if instantiated {
+                "import util; class C implements util::I<i64> {} fn main() { let c = new C(); println(c.f()); }"
+            } else {
+                "import util; fn main() {}"
+            };
+            let project = TestProject::new(
+                "iflh_namespaces",
+                &[
+                    ("main.wi", main),
+                    ("util.wi", &util),
+                    (
+                        "other.wi",
+                        "module other; pub fn seven() -> i64 { return 7; } pub fn generic<U>() -> i64 { return 7; }",
+                    ),
+                ],
+            );
+            let compiled = project.compile("main.wi");
+            let stderr = String::from_utf8_lossy(&compiled.stderr);
+            assert!(compiled.status.success(), "{body}/{instantiated}: {stderr}");
+            assert!(
+                !stderr.contains("unused import `T`"),
+                "{body}/{instantiated}: {stderr}"
+            );
+            assert_eq!(
+                stderr.matches("unused import `unused`").count(),
+                1,
+                "{body}/{instantiated}: {stderr}"
+            );
+            if instantiated {
+                let output = project.run();
+                assert!(output.status.success());
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+            }
+        }
+    }
+}

@@ -1,5 +1,6 @@
 use super::Parser;
 use super::ast::*;
+use super::import_usage::ReferenceKind;
 use crate::diagnostics::{Diagnostic, ErrorCode};
 use crate::lexer::token::TokenKind;
 
@@ -68,6 +69,8 @@ impl Parser {
                 let name = name.clone();
                 self.advance();
                 if matches!(self.peek_kind(), TokenKind::ColonColon) {
+                    self.default_import_usage
+                        .reference(&name, ReferenceKind::Type);
                     self.advance(); // consume ::
                     // Collect all `::`-separated segments; the last is the
                     // variant, the rest (joined) form the enum name. This
@@ -112,6 +115,8 @@ impl Parser {
                         })
                     }
                 } else if matches!(self.peek_kind(), TokenKind::LParen) {
+                    self.default_import_usage
+                        .reference(&name, ReferenceKind::Type);
                     // One binding remains ambiguous with a class downcast;
                     // zero or multiple bindings can only be an enum pattern.
                     self.advance();

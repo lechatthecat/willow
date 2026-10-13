@@ -443,6 +443,8 @@ impl Parser {
         }
         self.expect(TokenKind::LBrace)?;
 
+        self.default_import_usage.begin(!type_params.is_empty());
+        self.default_import_usage.type_parameters(&type_params);
         let mut methods = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
             // Interface members carry no visibility/modifier keywords: methods are
@@ -484,6 +486,7 @@ impl Parser {
         let span = start.to(end);
 
         Ok(InterfaceDecl {
+            default_import_uses: self.default_import_usage.finish(),
             name,
             public,
             type_params,
@@ -495,6 +498,13 @@ impl Parser {
     }
 
     pub(super) fn parse_interface_method(&mut self) -> Result<InterfaceMethodDecl, Diagnostic> {
+        let scope = self.default_import_usage.scope();
+        let result = self.parse_interface_method_inner();
+        self.default_import_usage.restore(scope);
+        result
+    }
+
+    fn parse_interface_method_inner(&mut self) -> Result<InterfaceMethodDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
         let name_span = self.current_span();
@@ -554,6 +564,11 @@ impl Parser {
                 .with_help(
                     "add `self` as the first parameter, or remove the body to make it required",
                 ));
+            }
+            #[cfg(test)]
+            super::import_usage::DEFAULT_BODY_PARSES.with(|count| count.set(count.get() + 1));
+            for param in &params {
+                self.default_import_usage.bind(&param.name);
             }
             let body = self.parse_block()?;
             let end = self.previous_span();

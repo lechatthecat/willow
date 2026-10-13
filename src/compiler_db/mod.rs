@@ -46,6 +46,7 @@ struct CheckedUnitRecord {
 }
 
 pub struct CompilerDb {
+    pub(crate) source_imports_checked: bool,
     pub(crate) generic_sources: std::collections::HashMap<UnitId, crate::ai::generics::Source>,
     pub rust_bridge_symbols: crate::rust_bridge::RustBridgeSymbols,
     _symbols: crate::semantic::ids::SymbolInterner,
@@ -77,6 +78,7 @@ impl CompilerDb {
         let dependencies = std::rc::Rc::new(dependencies);
         let overflow_checks = inputs.options.target.build_mode == crate::BuildMode::Debug;
         Self {
+            source_imports_checked: false,
             generic_sources: Default::default(),
             rust_bridge_symbols: Default::default(),
             _symbols: crate::semantic::ids::SymbolInterner::current(),

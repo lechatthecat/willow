@@ -141,7 +141,7 @@ impl TypeChecker {
 
     pub(super) fn warn_unused_imports(&mut self, program: &Program) {
         // Do not add speculative warnings to a unit that failed type checking.
-        if self.error_generation != 0 {
+        if self.source_imports_checked || self.error_generation != 0 {
             return;
         }
         let mut reported = HashSet::new();

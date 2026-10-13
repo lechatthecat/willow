@@ -246,6 +246,9 @@ pub enum Item {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)] // fields consumed by the interface type checker (willow-t8b)
 pub struct InterfaceDecl {
+    /// Lexically free import spellings from generic defaults, captured during parsing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_import_uses: Vec<String>,
     pub name: String,
     pub public: bool,
     /// Generic type parameter names in declaration order (`interface Foo<T, U>`).

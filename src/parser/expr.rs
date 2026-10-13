@@ -1,5 +1,6 @@
 use super::Parser;
 use super::ast::*;
+use super::import_usage::ReferenceKind;
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::lexer::token::TokenKind;
 
@@ -582,6 +583,8 @@ impl Parser {
                 if let Some(expr) = self.try_parse_generic_static_call(name.clone(), span)? {
                     Ok(expr)
                 } else if self.eat(TokenKind::ColonColon) {
+                    self.default_import_usage
+                        .reference(&name, ReferenceKind::Type);
                     let member_span = self.current_span();
                     let member = self.expect_ident()?;
                     if let Some(expr) =
@@ -684,6 +687,8 @@ impl Parser {
                         })))
                     }
                 } else if self.eat(TokenKind::LParen) {
+                    self.default_import_usage
+                        .reference(&name, ReferenceKind::Value);
                     let args = self.parse_call_args_after_lparen()?;
                     Ok(Expr::Call(Box::new(CallExpr {
                         type_args: Vec::new(),
@@ -698,6 +703,8 @@ impl Parser {
                 {
                     self.parse_object_literal_fields(name, span)
                 } else {
+                    self.default_import_usage
+                        .reference(&name, ReferenceKind::Value);
                     Ok(Expr::Var(name, span, ExprId::fresh()))
                 }
             }
@@ -865,6 +872,8 @@ impl Parser {
             return Err(self.err(ErrorCode::E0102, "type argument list must not be empty"));
         }
         if closed && self.eat(TokenKind::LParen) {
+            self.default_import_usage
+                .reference(&class, ReferenceKind::Value);
             let args = self.parse_call_args_after_lparen()?;
             return Ok(Some(Expr::Call(Box::new(CallExpr {
                 callee: class,
@@ -890,6 +899,8 @@ impl Parser {
             return Ok(None);
         }
 
+        self.default_import_usage
+            .reference(&class, ReferenceKind::Type);
         let method_span = self.current_span();
         let method = self.expect_ident()?;
         self.expect(TokenKind::LParen)?;
@@ -941,6 +952,8 @@ impl Parser {
         class: String,
         span: Span,
     ) -> Result<Expr, Diagnostic> {
+        self.default_import_usage
+            .reference(&class, ReferenceKind::Type);
         let mut fields = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
             let field_span = self.current_span();
@@ -975,6 +988,8 @@ impl Parser {
             class_name.push_str("::");
             class_name.push_str(&self.expect_ident()?);
         }
+        self.default_import_usage
+            .reference(&class_name, ReferenceKind::Type);
         // Optional generic type args: `new Box<i64>(...)`.
         let mut type_args = Vec::new();
         if self.eat(TokenKind::Lt) {
@@ -1080,7 +1095,16 @@ impl Parser {
                 }
             };
             self.expect(TokenKind::FatArrow)?;
-            let body = self.parse_block()?;
+            let scope = self.default_import_usage.scope();
+            match &kind {
+                SelectCaseKind::Recv { binding, .. } | SelectCaseKind::Join { binding, .. } => {
+                    self.default_import_usage.bind(binding)
+                }
+                _ => {}
+            }
+            let result = self.parse_block();
+            self.default_import_usage.restore(scope);
+            let body = result?;
             cases.push(SelectCase {
                 kind,
                 body,
@@ -1155,6 +1179,13 @@ impl Parser {
     }
 
     pub(super) fn parse_lambda(&mut self) -> Result<Expr, Diagnostic> {
+        let scope = self.default_import_usage.scope();
+        let result = self.parse_lambda_inner();
+        self.default_import_usage.restore(scope);
+        result
+    }
+
+    fn parse_lambda_inner(&mut self) -> Result<Expr, Diagnostic> {
         let span = self.current_span();
 
         // Consume opening delimiter. `||` = zero-param lambda, `|` = params follow.
@@ -1193,6 +1224,9 @@ impl Parser {
             None
         };
 
+        for param in &params {
+            self.default_import_usage.bind(&param.name);
+        }
         // Body: `{ block }` or expression
         let body = if self.check(TokenKind::LBrace) {
             LambdaBody::Block(self.parse_block()?)
@@ -1218,6 +1252,8 @@ impl Parser {
         while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
             let arm_start = self.current_span();
             let pattern = self.parse_pattern()?;
+            let scope = self.default_import_usage.scope();
+            self.default_import_usage.bind_pattern(&pattern);
             // `pattern if guard => body` (willow-jz15.6).
             let guard = if self.eat(TokenKind::If) {
                 Some(self.parse_expr()?)
@@ -1276,6 +1312,7 @@ impl Parser {
                 }
                 MatchBody::Expr(Box::new(expr))
             };
+            self.default_import_usage.restore(scope);
             let arm_end = self.current_span();
             let arm_span = arm_start.to(arm_end);
             arms.push(MatchArm {

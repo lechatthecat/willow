@@ -6,6 +6,13 @@ use crate::lexer::token::TokenKind;
 #[willow_continuations::parser]
 impl Parser {
     pub(super) fn parse_block(&mut self) -> Result<Block, Diagnostic> {
+        let scope = self.default_import_usage.scope();
+        let result = self.parse_block_inner();
+        self.default_import_usage.restore(scope);
+        result
+    }
+
+    fn parse_block_inner(&mut self) -> Result<Block, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::LBrace)?;
         let mut stmts = Vec::new();
@@ -48,6 +55,7 @@ impl Parser {
                     }));
                     init = Expr::Var(name, span, ExprId::fresh());
                 }
+                self.default_import_usage.bind_pattern(&pattern);
                 tuple_scopes.push((std::mem::take(&mut stmts), pattern, init, span));
                 continue;
             }
@@ -300,7 +308,11 @@ impl Parser {
 
         let binding_span = self.current_span();
         let binding = self.expect_ident()?;
-        let body = self.parse_block()?;
+        let scope = self.default_import_usage.scope();
+        self.default_import_usage.bind(&binding);
+        let result = self.parse_block();
+        self.default_import_usage.restore(scope);
+        let body = result?;
         let span = keyword_span.to(body.span);
 
         Ok(Stmt::Lock(LockStmt {
@@ -428,6 +440,7 @@ impl Parser {
         let init = self.parse_expr()?;
         let span = span.to(self.current_span());
         self.expect(TokenKind::Semicolon)?;
+        self.default_import_usage.bind(&name);
         Ok(Stmt::Let(LetStmt {
             name,
             mutable,
@@ -486,7 +499,13 @@ impl Parser {
             } else {
                 Head::Cond(self.parse_control_head()?)
             };
-            let then_block = self.parse_block()?;
+            let scope = self.default_import_usage.scope();
+            if let Head::Let(pattern, _) = &head {
+                self.default_import_usage.bind_pattern(pattern);
+            }
+            let result = self.parse_block();
+            self.default_import_usage.restore(scope);
+            let then_block = result?;
             rungs.push((span, head, then_block));
             if !self.eat(TokenKind::Else) {
                 break None;
@@ -543,7 +562,11 @@ impl Parser {
         self.expect(TokenKind::While)?;
         if self.eat(TokenKind::Let) {
             let (pattern, scrutinee) = self.parse_let_head()?;
-            let body = self.parse_block()?;
+            let scope = self.default_import_usage.scope();
+            self.default_import_usage.bind_pattern(&pattern);
+            let result = self.parse_block();
+            self.default_import_usage.restore(scope);
+            let body = result?;
             let whole = span.to(body.span);
             let exit = Block {
                 id: crate::parser::ast::BodyId::fresh(),
@@ -619,7 +642,11 @@ impl Parser {
         let name = self.expect_ident()?;
         self.expect(TokenKind::In)?;
         let iterable = self.parse_control_head()?;
-        let body = self.parse_block()?;
+        let scope = self.default_import_usage.scope();
+        self.default_import_usage.bind(&name);
+        let result = self.parse_block();
+        self.default_import_usage.restore(scope);
+        let body = result?;
         Ok(Stmt::For(ForStmt {
             name,
             name_span,
