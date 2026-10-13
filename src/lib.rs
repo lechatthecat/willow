@@ -2133,36 +2133,51 @@ type ForeignBatches = std::collections::BTreeMap<module::UnitId, ForeignBatch>;
 impl ForeignBatch {
     /// Respell the receivers' bare identities that `scope` declares or imports
     /// a name for, so the declaring unit's own item keeps that name in the
-    /// copies (willow-nvi6), and keep only those in [`Self::bare`]. Runs once
-    /// per batch, over `scope`'s top-level items and the recorded chains.
-    fn respell(&mut self, scope: &parser::ast::Program) {
-        if self.bare.is_empty() {
-            return;
-        }
-        let names: std::collections::HashSet<&str> = (scope.items.iter())
-            .map(|item| match item {
-                parser::ast::Item::Function(f) => f.name.as_str(),
-                parser::ast::Item::Class(c) => c.name.as_str(),
-                parser::ast::Item::Enum(e) => e.name.as_str(),
-                parser::ast::Item::Interface(i) => i.name.as_str(),
+    /// copies (willow-nvi6), and keep only those in [`Self::bare`]. The
+    /// chains name `scope`'s own interfaces by their identities under
+    /// `identity`, the declaring unit's namespace, while `scope` spells them
+    /// bare (willow-64gs.1), so those are respelled bare: otherwise `self`
+    /// does not convert to the interface it implements (willow-kptd). Runs
+    /// once per batch, over `scope`'s top-level items and the recorded chains.
+    fn respell(&mut self, scope: &parser::ast::Program, identity: &str) {
+        let interfaces: std::collections::HashSet<&str> = (scope.items.iter())
+            .filter_map(|item| match item {
+                parser::ast::Item::Interface(i) => Some(i.name.as_str()),
+                _ => None,
             })
-            .chain(scope.imports.iter().map(|import| {
-                (import.alias.as_deref())
-                    .unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path))
-            }))
             .collect();
-        self.bare
-            .retain(|id| names.contains(id.to_string().as_str()));
-        if self.bare.is_empty() {
+        if !self.bare.is_empty() {
+            let names: std::collections::HashSet<&str> = (scope.items.iter())
+                .map(|item| match item {
+                    parser::ast::Item::Function(f) => f.name.as_str(),
+                    parser::ast::Item::Class(c) => c.name.as_str(),
+                    parser::ast::Item::Enum(e) => e.name.as_str(),
+                    parser::ast::Item::Interface(i) => i.name.as_str(),
+                })
+                .chain(scope.imports.iter().map(|import| {
+                    (import.alias.as_deref())
+                        .unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path))
+                }))
+                .collect();
+            self.bare
+                .retain(|id| names.contains(id.to_string().as_str()));
+        }
+        if self.bare.is_empty() && interfaces.is_empty() {
             return;
         }
         let scoped = |id: &semantic::ids::TypeId| {
-            if !self.bare.contains(id) {
-                return *id;
+            let name = id.to_string();
+            if self.bare.contains(id) {
+                return semantic::ids::TypeId::from_source_name(
+                    &semantic::ids::foreign_receiver_name(&name),
+                );
             }
-            semantic::ids::TypeId::from_source_name(&semantic::ids::foreign_receiver_name(
-                &id.to_string(),
-            ))
+            match (name.strip_prefix(identity)).and_then(|name| name.strip_prefix("::")) {
+                Some(local) if interfaces.contains(local) => {
+                    semantic::ids::TypeId::from_source_name(local)
+                }
+                _ => *id,
+            }
         };
         let classes = (self.classes.iter())
             .map(|(id, info)| (scoped(id), Self::scoped_class(info, &scoped)))
@@ -2172,6 +2187,22 @@ impl ForeignBatch {
                 scoped(&semantic::ids::TypeId::from_source_name(&receiver.key)).to_string();
         }
         self.classes = classes;
+    }
+
+    /// The entry classes' methods in the recorded chains, which the copies
+    /// call with signatures that spell [`Self::bare`] identities bare; empty
+    /// when nothing was respelled (willow-kptd). Module classes are qualified
+    /// and declared with qualified signatures.
+    fn receiver_methods(&self) -> Vec<(semantic::ids::TypeId, &str)> {
+        if self.bare.is_empty() {
+            return Vec::new();
+        }
+        (self.classes.iter())
+            .filter(|(id, _)| {
+                id.foreign_receiver_target().is_some() || !id.to_string().contains("::")
+            })
+            .flat_map(|(id, info)| info.methods.keys().map(|name| (*id, name.as_str())))
+            .collect()
     }
 
     /// `info` with every type identity it names respelled by `scoped`.
@@ -2304,6 +2335,16 @@ impl ForeignBatch {
     ) -> Result<()> {
         for (receiver, class) in self.receivers.iter().zip(self.classes(index, defaults)?) {
             *current = &receiver.name;
+            // A respelled receiver is compiled under its key: its bare name
+            // could mean the declaring unit's own type here, `self` included
+            // (willow-kptd). The symbols are the same either way.
+            let name = match receiver
+                .key
+                .starts_with(semantic::ids::FOREIGN_RECEIVER_PREFIX)
+            {
+                true => &receiver.key,
+                false => &receiver.name,
+            };
             for (copy, method) in class.methods {
                 for (body, lambda) in compiler_db::lir::copied_lambdas(index, copy, &method.body)? {
                     let declared = self.lambdas.get(&body).with_context(|| {
@@ -2313,7 +2354,7 @@ impl ForeignBatch {
                         body, declared, lambda,
                     ))?;
                 }
-                backend.compile_foreign_method(&receiver.name, method, copy)?;
+                backend.compile_foreign_method(name, method, copy)?;
             }
         }
         Ok(())
@@ -2480,7 +2521,10 @@ fn run_backend(
     let declared_units: std::collections::HashMap<_, _> = modules
         .iter()
         .zip(declared_modules.iter().copied())
-        .map(|(module, artifact)| (module.id, (artifact, module.name.as_str())))
+        .map(|(module, artifact)| {
+            let names = (module.name.as_str(), module.identity_path());
+            (module.id, (artifact, names))
+        })
         .collect();
     let mut foreign = ForeignBatches::new();
     for (module, artifact) in modules.iter().zip(declared_modules) {
@@ -2600,14 +2644,14 @@ fn run_backend(
     // (willow-rvpp).
     for (provider, batch) in &mut foreign {
         query_stats::query_call("foreign_default_unit");
-        let &(artifact, name) = declared_units
+        let &(artifact, (name, identity)) = declared_units
             .get(provider)
             .with_context(|| format!("interface unit {provider:?} was not declared"))?;
         let scope: backend::cranelift::DeclaredModule = artifacts.read(artifact)?;
         let scope = artifacts.track(UnitKind::Declared, scope);
         let _lir = artifacts.live(UnitKind::Lir);
         let checked = db.checked_unit(*provider, &artifacts)?;
-        batch.respell(scope.normalized_program());
+        batch.respell(scope.normalized_program(), identity);
         let batch = &*batch;
         let defaults = batch.defaults(db.bodies(), scope.normalized_program());
         {
@@ -2617,9 +2661,11 @@ fn run_backend(
             log_hir_gaps(&gaps);
         }
         let mut receiver = "";
-        let compiled = codegen.with_foreign_bodies(&scope, &checked, &batch.bare, |backend| {
-            batch.emit(db.bodies(), &defaults, backend, &mut receiver)
-        });
+        let methods = batch.receiver_methods();
+        let compiled =
+            codegen.with_foreign_bodies(&scope, &checked, &batch.bare, &methods, |backend| {
+                batch.emit(db.bodies(), &defaults, backend, &mut receiver)
+            });
         compiled.map_err(|error| {
             let stage = errors::CodegenStage::ForeignDefault {
                 provider: name.to_owned(),
@@ -2988,7 +3034,7 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
             .module_graph
             .files
             .iter()
-            .map(|module| (module.id, &module.program))
+            .map(|module| (module.id, (&module.program, module.identity_path())))
             .collect();
         let mut receivers: std::collections::HashMap<_, _> = hir
             .classes
@@ -2997,12 +3043,12 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
             .map(|(at, class)| (class.name, at))
             .collect();
         for (&provider, batch) in &mut foreign {
-            let program = files
+            let &(program, identity) = files
                 .get(&provider)
                 .with_context(|| format!("interface unit {provider:?} is not in the graph"))?;
             let scope = artifacts.hydrate(program, provider.file_id())?;
             let checked = frontend.db.checked_unit(provider, artifacts)?;
-            batch.respell(&scope);
+            batch.respell(&scope, identity);
             let defaults = batch.defaults(bodies, &scope);
             let classes = batch.classes(bodies, &defaults)?;
             let (lowered, gaps) = ir::lower::lower_foreign_methods(
@@ -3095,15 +3141,15 @@ pub fn emit_lir_text(src: &str) -> Result<String> {
             .module_graph
             .files
             .iter()
-            .map(|module| (module.id, &module.program))
+            .map(|module| (module.id, (&module.program, module.identity_path())))
             .collect();
         for (&provider, batch) in &mut foreign {
-            let program = files
+            let &(program, identity) = files
                 .get(&provider)
                 .with_context(|| format!("interface unit {provider:?} is not in the graph"))?;
             let scope = artifacts.hydrate(program, provider.file_id())?;
             let checked = frontend.db.checked_unit(provider, artifacts)?;
-            batch.respell(&scope);
+            batch.respell(&scope, identity);
             let defaults = batch.defaults(frontend.db.bodies(), &scope);
             let (lowered_gaps, lifted) =
                 batch.lower(&frontend.db, &scope, &checked.tables(), &defaults)?;

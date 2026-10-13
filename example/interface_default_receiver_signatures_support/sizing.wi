@@ -1,0 +1,19 @@
+// The provider keeps a private interface named like the entry file's class
+// `Box`; the copied defaults use it and the receiver's `Box`-typed methods.
+interface Box {
+    fn weight(self) -> i64;
+}
+
+class Crate implements Box {
+    pub fn weight(self) -> i64 { return 100; }
+}
+
+fn weigh(b: Box) -> i64 { return b.weight(); }
+
+pub interface Sized {
+    fn grown(self) -> Self;
+    fn size(self) -> i64;
+    fn report(self) -> i64 {
+        return self.grown().size() + weigh(new Crate());
+    }
+}

@@ -33,6 +33,8 @@ mod codegen_invariants;
 mod codegen_scaling;
 #[path = "integration/cross_module_default_receiver_names.rs"]
 mod cross_module_default_receiver_names;
+#[path = "integration/cross_module_default_receiver_signatures.rs"]
+mod cross_module_default_receiver_signatures;
 #[path = "integration/cross_module_generic_interface_defaults.rs"]
 mod cross_module_generic_interface_defaults;
 #[path = "integration/cross_module_interface_defaults.rs"]

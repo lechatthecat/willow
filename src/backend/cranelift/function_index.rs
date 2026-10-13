@@ -8,6 +8,10 @@ pub struct FunctionMap<'a, V> {
     values: Storage<'a, HashMap<FunctionId, V>>,
     scope: FunctionScope,
     generated: Option<&'a mut HashMap<FunctionId, V>>,
+    /// This view's own answers for canonical functions, consulted first: a
+    /// foreign default's scope reads the receivers' signatures under the
+    /// spelling that names the entry types there (willow-kptd).
+    overlay: HashMap<FunctionId, V>,
 }
 
 impl<V> Default for FunctionMap<'_, V> {
@@ -22,6 +26,7 @@ impl<V> FunctionMap<'_, V> {
             values: Storage::default(),
             generated: None,
             scope,
+            overlay: HashMap::new(),
         }
     }
 
@@ -30,6 +35,7 @@ impl<V> FunctionMap<'_, V> {
             values: Storage::Shared(&self.values),
             scope: self.scope.clone(),
             generated: None,
+            overlay: HashMap::new(),
         }
     }
     pub(super) fn borrowed_mut(&mut self) -> FunctionMap<'_, V> {
@@ -37,6 +43,7 @@ impl<V> FunctionMap<'_, V> {
             values: Storage::Mutable(&mut self.values),
             scope: self.scope.clone(),
             generated: None,
+            overlay: HashMap::new(),
         }
     }
     pub(super) fn with_generated<'b>(
@@ -47,6 +54,7 @@ impl<V> FunctionMap<'_, V> {
             values: Storage::Shared(&self.values),
             scope: self.scope.clone(),
             generated: Some(generated),
+            overlay: HashMap::new(),
         }
     }
     #[cfg(test)]
@@ -80,7 +88,15 @@ impl<V> FunctionMap<'_, V> {
         self.get_canonical(&self.scope.resolve(id))
     }
 
+    /// Answer `id`, a canonical function, with `value` in this view only.
+    pub(super) fn overlay(&mut self, id: FunctionId, value: V) {
+        self.overlay.insert(id, value);
+    }
+
     fn get_canonical(&self, id: &FunctionId) -> Option<&V> {
+        if let Some(value) = self.overlay.get(id) {
+            return Some(value);
+        }
         self.generated
             .as_deref()
             .and_then(|map| map.get(id))

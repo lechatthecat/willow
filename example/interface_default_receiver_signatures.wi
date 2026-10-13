@@ -1,0 +1,20 @@
+// A class whose name matches an interface of the module that declares the
+// interface it implements still receives that interface's defaults, and its
+// own methods typed with its name keep their meaning there (willow-kptd).
+import interface_default_receiver_signatures_support::sizing;
+
+class Box implements sizing::Sized {
+    pub side: i64;
+    pub fn grown(self) -> Box { return new Box(self.side + 1); }
+    pub fn size(self) -> i64 { return self.side * self.side; }
+}
+
+class Sheet implements sizing::Sized {
+    pub fn grown(self) -> Sheet { return self; }
+    pub fn size(self) -> i64 { return 1; }
+}
+
+fn main() {
+    println(new Box(2).report());
+    println(new Sheet().report());
+}

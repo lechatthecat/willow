@@ -881,17 +881,65 @@ impl UnitCodegenContext<'_> {
     /// name of `unit` equal to one is unbound, so neither the receiver's type
     /// nor its `Class.method` symbols resolve to `unit`'s own declaration.
     /// The bodies name `unit`'s types by their qualified identities.
+    ///
+    /// `methods` lists the receiving classes' methods the bodies can call,
+    /// as (class, method) pairs: their declared signatures spell the entry
+    /// types bare, which here could mean `unit`'s own interface of that
+    /// name, so this scope reads them respelled too (willow-kptd).
     pub(super) fn emit_foreign_bodies(
         &mut self,
         unit: &DeclaredModule,
         bare: &std::collections::BTreeSet<TypeId>,
+        methods: &[(TypeId, &str)],
         emit: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
         self.install_module_scope(unit);
         if !bare.is_empty() {
             self.unshadow_receivers(unit, bare);
+            self.respell_receiver_signatures(bare, methods);
         }
         emit(self)
+    }
+
+    /// Overlay the signatures of `methods` in this scope with every identity
+    /// in `bare` spelled under the receiver prefix, which names the entry's
+    /// type in any unit (willow-kptd). Work is bounded by those signatures.
+    fn respell_receiver_signatures(
+        &mut self,
+        bare: &std::collections::BTreeSet<TypeId>,
+        methods: &[(TypeId, &str)],
+    ) {
+        let respell = |ty: &Type| {
+            ty.map_names(|id| {
+                if bare.contains(id) {
+                    TypeId::from_source_name(&crate::semantic::ids::foreign_receiver_name(
+                        &id.to_string(),
+                    ))
+                } else {
+                    *id
+                }
+            })
+        };
+        for (class, method) in methods {
+            let class = class.foreign_receiver_target().unwrap_or(*class);
+            let symbol = self.class_method_symbol(&class.to_string(), method);
+            let id = self.fn_types.scope().lookup_id(&symbol);
+            if let Some(ty) = self.fn_types.get_id(&id).map(respell) {
+                self.fn_types.overlay(id, ty);
+            }
+            if let Some(ty) = self.func_return_types.get_id(&id).map(respell) {
+                self.func_return_types.overlay(id, ty);
+            }
+            if let Some(params) = self.func_param_debug.get_id(&id) {
+                let params = (params.iter())
+                    .map(|param| ParamDebug {
+                        ty: respell(&param.ty),
+                        ..param.clone()
+                    })
+                    .collect();
+                self.func_param_debug.overlay(id, params);
+            }
+        }
     }
 
     /// Undo the aliases [`Self::install_module_scope`] gave `unit`'s local
@@ -2770,11 +2818,12 @@ impl UnitCodegenContext<'_> {
         m: &MethodDecl,
         body: Option<crate::parser::ast::BodyId>,
     ) -> Result<()> {
-        let diagnostic_function = format!(
-            "{}::{}",
-            class_name.strip_prefix("$local::").unwrap_or(class_name),
-            m.name
-        );
+        // A foreign default's respelled receiver is shown by its own name
+        // (willow-kptd).
+        let shown = (class_name.strip_prefix("$local::"))
+            .or_else(|| class_name.strip_prefix(crate::semantic::ids::FOREIGN_RECEIVER_PREFIX))
+            .unwrap_or(class_name);
+        let diagnostic_function = format!("{shown}::{}", m.name);
         self.declare_string_literal(&diagnostic_function)?;
         let mangled = self.class_method_symbol(class_name, &m.name);
         // LIR-walking path for a method body (willow-0g8j.2.18). `lower_program`

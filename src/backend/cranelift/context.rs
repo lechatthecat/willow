@@ -209,11 +209,12 @@ impl Codegen {
         unit: &DeclaredModule,
         checked: &'a crate::compiler_db::CheckedUnit,
         bare: &std::collections::BTreeSet<crate::semantic::ids::TypeId>,
+        methods: &[(crate::semantic::ids::TypeId, &str)],
         emit: impl FnOnce(&mut UnitCodegenContext<'_>) -> Result<()>,
     ) -> Result<()> {
         let mut context = self.emission_context();
         context.checked = Some(checked);
-        context.emit_foreign_bodies(unit, bare, emit)
+        context.emit_foreign_bodies(unit, bare, methods, emit)
     }
     pub fn with_program_bodies<'a>(
         &'a mut self,
