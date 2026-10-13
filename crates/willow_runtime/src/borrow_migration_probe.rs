@@ -81,7 +81,7 @@ fn owned_slot(frames: &HashMap<usize, Allocation>, base: usize, offset: usize) -
         .flatten()
 }
 
-pub(crate) fn claimed(frame: usize, worker: usize, task: u64) {
+pub(crate) fn claimed(frame: usize, worker: usize, task: u64, native: bool) {
     let mut frames = FRAMES.lock().unwrap();
     if !is_fixture(&frames, frame) {
         return;
@@ -111,6 +111,13 @@ pub(crate) fn claimed(frame: usize, worker: usize, task: u64) {
             "worker IDs hid reuse of one OS thread"
         );
         assert_eq!(previous.address, address, "borrow changed caller slot");
+    }
+    if native {
+        assert!(
+            previous.is_some(),
+            "native migration must follow an initial claim"
+        );
+        eprintln!("native-stack-migration task={task} worker={worker} checked=1");
     }
     let polls = previous.map_or(1, |p| p.polls + 1);
     eprintln!(

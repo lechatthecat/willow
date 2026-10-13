@@ -3950,6 +3950,8 @@ fn claim_global_ready_for_worker(
             .with_mut(id, |task| {
                 #[cfg(feature = "borrow-migration-probe")]
                 let probe_poll = std::cell::Cell::new(task.cooperative_poll);
+                #[cfg(feature = "borrow-migration-probe")]
+                let probe_native = std::cell::Cell::new(false);
                 #[cfg(any(
                     all(
                         target_os = "linux",
@@ -3963,15 +3965,31 @@ fn claim_global_ready_for_worker(
                     all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
                 ))]
                 {
-                    if let Some(owner) = task.native_stack.as_ref().map(|stack| stack.worker)
+                    if let Some(owner) = task
+                        .native_stack
+                        .as_ref()
+                        .and_then(|stack| stack.required_worker())
                         && owner != worker
                     {
                         return Claim::Reroute(owner);
                     }
-                    // A suspended synchronous call must finish on its native
-                    // stack's owner. Force migration only at stackless polls.
+                    // Native callbacks stay pinned; generated safe suspensions
+                    // participate in the same forced-migration probe as polls.
                     #[cfg(feature = "borrow-migration-probe")]
-                    probe_poll.set(task.cooperative_poll && task.native_stack.is_none());
+                    {
+                        probe_poll.set(
+                            task.cooperative_poll
+                                && task
+                                    .native_stack
+                                    .as_ref()
+                                    .is_none_or(|stack| stack.required_worker().is_none()),
+                        );
+                        probe_native.set(
+                            task.native_stack
+                                .as_ref()
+                                .is_some_and(|stack| stack.is_suspended()),
+                        );
+                    }
                 }
                 #[cfg(feature = "borrow-migration-probe")]
                 if probe_poll.get()
@@ -3989,7 +4007,12 @@ fn claim_global_ready_for_worker(
                     ClaimOutcome::Poll => {
                         #[cfg(feature = "borrow-migration-probe")]
                         if probe_poll.get() {
-                            crate::borrow_migration_probe::claimed(task.frame as usize, worker, id);
+                            crate::borrow_migration_probe::claimed(
+                                task.frame as usize,
+                                worker,
+                                id,
+                                probe_native.get(),
+                            );
                         }
                         task.yield_requested = false;
                         Claim::Work(claimed_task_work(task), task.panic_context())
@@ -4752,6 +4775,22 @@ fn replace_global_scheduler_for_test(worker_count: usize) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_task_stack_enter(callback: RuntimePollFn, frame: *mut c_void) -> i32 {
+    task_stack_enter(callback, frame, false)
+}
+
+/// Generated-helper ABI: callback frames must contain no thread-bound values.
+/// All native calls use guarded runtime entry points; foreign Rust calls are
+/// rejected inside tasks. Allocation TLS is acquired afresh at each use.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_task_stack_enter_generated(
+    callback: RuntimePollFn,
+    frame: *mut c_void,
+) -> i32 {
+    task_stack_enter(callback, frame, true)
+}
+
+fn task_stack_enter(callback: RuntimePollFn, frame: *mut c_void, generated: bool) -> i32 {
     #[cfg(any(
         all(
             target_os = "linux",
@@ -4770,6 +4809,10 @@ pub extern "C" fn willow_task_stack_enter(callback: RuntimePollFn, frame: *mut c
             .with_mut(id, |task| task.native_stack.take())
             .flatten()
             .unwrap_or_else(|| crate::native_stack::NativeStack::acquire(callback, frame));
+        if generated {
+            // SAFETY: the compiler-only entry carries the generated-helper ABI.
+            unsafe { stack.allow_generated_migration() };
+        }
         let panic_depth = stack.entry_panic_depth();
         let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
         // A recovered cleanup panic must not revoke sticky cancellation, and
@@ -4881,3 +4924,21 @@ mod run_queue_metrics_tests;
 #[cfg(test)]
 #[path = "scheduler_tests.rs"]
 mod tests;
+
+#[cfg(all(
+    test,
+    any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    )
+))]
+#[path = "scheduler_stack_migration_tests.rs"]
+mod stack_migration_tests;

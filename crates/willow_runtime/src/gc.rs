@@ -260,6 +260,7 @@ pub const GC_TLAB_MAX_OBJECT_SIZE: usize = 4 * 1024;
 mod layouts;
 #[path = "gc/runtime_tlab.rs"]
 mod runtime_tlab;
+pub use runtime_tlab::willow_gc_current_tlab;
 pub(crate) use runtime_tlab::{
     RuntimeTlabOwner, alloc_string_payload_slow, try_alloc_young_string_payload,
 };

@@ -408,6 +408,9 @@ fn lazy_task_stack_entrypoints_keep_pointer_callback_abi() {
         crate::scheduler::willow_sched_spawn_cooperative;
     let _: extern "C" fn(crate::task::RuntimePollFn, *mut c_void) -> i32 =
         crate::scheduler::willow_task_stack_enter;
+    let _: extern "C" fn(crate::task::RuntimePollFn, *mut c_void) -> i32 =
+        crate::scheduler::willow_task_stack_enter_generated;
+    let _: extern "C" fn() -> *mut crate::gc::GcTlabState = crate::gc::willow_gc_current_tlab;
     let _: extern "C" fn() = crate::scheduler::willow_task_stack_leave;
 }
 

@@ -458,18 +458,25 @@ pub extern "C" fn willow_sync_safepoint() -> i32 {
         all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     {
-        if crate::native_stack::cancelled() != 0 {
-            // Unwinding skips the charge; cleanup code restarts a full grant.
+        // These non-inlined phases compute TLS addresses on their own worker.
+        // Inlining both across the switch could let LLVM reuse the old TLS base.
+        #[inline(never)]
+        fn prepare() -> i32 {
+            if crate::native_stack::cancelled() != 0 {
+                return -1;
+            }
+            crate::gc::willow_gc_safepoint();
+            charge_safepoints(crate::native_stack::poll_consumed())
+        }
+        #[inline(never)]
+        fn finish() -> i32 {
             crate::native_stack::poll_refill(sync_poll_grant());
-            return 1;
+            crate::native_stack::cancelled()
         }
-        crate::gc::willow_gc_safepoint();
-        if charge_safepoints(crate::native_stack::poll_consumed()) != 0 {
-            crate::native_stack::suspend();
+        if prepare() > 0 {
+            crate::native_stack::suspend_generated();
         }
-        // Refill after any suspension so the grant reflects the new quantum.
-        crate::native_stack::poll_refill(sync_poll_grant());
-        crate::native_stack::cancelled()
+        finish()
     }
     #[cfg(not(any(
         all(

@@ -9551,7 +9551,7 @@ impl FuncGen<'_, '_> {
         // Explicitly handle suspension before panic propagation or observing
         // the result slot. Runtime-call wrappers cannot express this split.
         self.emit_fault_site();
-        let enter = self.func_ids["willow_task_stack_enter"];
+        let enter = self.func_ids["willow_task_stack_enter_generated"];
         let enter = self.module.declare_func_in_func(enter, self.builder.func);
         let call = self.builder.ins().call(enter, &[address, frame]);
         let status = self.builder.inst_results(call)[0];

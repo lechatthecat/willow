@@ -30,6 +30,59 @@ fn probe_runtime() -> PathBuf {
     })
 }
 
+#[test]
+fn task_owned_shadow_roots_forced_native_migration() {
+    let runtime = probe_runtime();
+    let runtime = runtime.to_str().unwrap();
+    let project = TestProject::new(
+        "task_owned_shadow_roots",
+        &[(
+            "main.wi",
+            include_str!("../../../example/task_owned_shadow_roots.wi"),
+        )],
+    );
+    for release in [false, true] {
+        let mut args = vec!["--runtime-lib", runtime];
+        if release {
+            args.push("--release");
+        }
+        let compiled = project.compile_with_args("main.wi", &args);
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        for stress in ["", "relocate"] {
+            let out = project.run_with_env_timeout(
+                &[
+                    ("WILLOW_WORKERS", "2"),
+                    ("WILLOW_TASK_BUDGET", "1"),
+                    ("WILLOW_GC_STRESS", stress),
+                ],
+                Duration::from_secs(30),
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stderr}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "76\n");
+            let migrations = stderr
+                .lines()
+                .filter(|line| line.starts_with("native-stack-migration "))
+                .count();
+            assert!(
+                migrations >= 8,
+                "missing actual native migrations: {stderr}"
+            );
+            println!("release={release} stress={stress:?} checked_native_migrations={migrations}");
+        }
+    }
+    let compiled = project.compile_with_env("main.wi", &[("WILLOW_RUNTIME_LIB", runtime)]);
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+}
+
 fn run_probe(project: &TestProject, expected: &str, tasks: usize, stress: &str) -> usize {
     let out = project.run_with_env_timeout(
         &[("WILLOW_WORKERS", "2"), ("WILLOW_GC_STRESS", stress)],

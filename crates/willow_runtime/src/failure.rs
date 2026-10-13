@@ -22,6 +22,22 @@ pub(crate) fn resource_exhausted(message: std::fmt::Arguments<'_>) -> ! {
 
 #[inline]
 pub(crate) fn ffi_boundary<R>(name: &'static str, body: impl FnOnce() -> R) -> R {
+    // All runtime frames pin a task except this audited, scalar-only bridge.
+    // Its relocation scope is explicitly transferred by NativeStack::resume.
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    let _native =
+        (name != "willow_sync_safepoint").then(crate::native_stack::NativeFrameGuard::enter);
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(value) => value,
         Err(payload) => abort_panic(name, payload),

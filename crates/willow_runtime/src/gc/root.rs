@@ -1,5 +1,15 @@
 use super::*;
 
+thread_local! {
+    static ROOT_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Generated cleanup depths are relative to the active task stack, independent
+/// of how many roots the destination worker's caller has published.
+pub(crate) fn replace_root_base(base: usize) -> usize {
+    ROOT_BASE.replace(base)
+}
+
 /// Register a root slot.  `slot` must point to a stack location that holds
 /// a GC-managed pointer.  The slot must remain valid until the matching pop.
 /// Generated code reloads the slot after every GC point, so a minor
@@ -44,14 +54,15 @@ pub extern "C" fn willow_pop_roots(count: i32) {
     release_root_stack_owner_if_empty();
 }
 
-/// Current generated-code shadow-root depth for this mutator. Panic cleanup
+/// Current generated-code root depth relative to the active task stack (or
+/// the worker stack outside native tasks). Panic cleanup
 /// records a lexical scope's entry depth and restores it on every shared
 /// unwind edge, where the number of roots pushed before the panic is otherwise
 /// path-dependent (willow-s9ej.3).
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_root_depth() -> i32 {
-    i32::try_from(ROOT_DEPTH.get()).unwrap_or_else(|_| {
+    i32::try_from(ROOT_DEPTH.get() - ROOT_BASE.get()).unwrap_or_else(|_| {
         eprintln!("runtime fatal: generated-code root depth overflow");
         std::process::abort();
     })
@@ -374,4 +385,13 @@ pub(super) fn append_parked_roots(roots: &mut MinorRoots) {
     for published in parked.values() {
         published.append_to(roots);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn parked_root_counts_for_test() -> (usize, usize) {
+    let roots = runtime().parked_stack_roots.lock().unwrap();
+    (
+        roots.len(),
+        roots.values().map(|roots| roots.slots.len()).sum(),
+    )
 }

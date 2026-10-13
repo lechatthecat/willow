@@ -322,10 +322,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         let ptr_ty = reference_type(self.module.target_config());
-        let tls_global = self
-            .module
-            .declare_data_in_func(self.gc_tlab_state, self.builder.func);
-        let tlab = self.builder.ins().tls_value(ptr_ty, tls_global);
+        let current = self.func_id("willow_gc_current_tlab");
+        let current = self.module.declare_func_in_func(current, self.builder.func);
+        let call = self.builder.ins().call(current, &[]);
+        let tlab = self.builder.inst_results(call)[0];
         let limit_addr = self
             .builder
             .ins()
@@ -432,11 +432,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_gc_alloc_slow(&mut self, layout: GcLayoutMetadata) -> Value {
-        let ptr_ty = reference_type(self.module.target_config());
-        let tls_global = self
-            .module
-            .declare_data_in_func(self.gc_tlab_state, self.builder.func);
-        let tlab = self.builder.ins().tls_value(ptr_ty, tls_global);
+        let current = self.func_id("willow_gc_current_tlab");
+        let current = self.module.declare_func_in_func(current, self.builder.func);
+        let call = self.builder.ins().call(current, &[]);
+        let tlab = self.builder.inst_results(call)[0];
         let layout_id = self
             .builder
             .ins()

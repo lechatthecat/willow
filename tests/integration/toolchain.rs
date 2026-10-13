@@ -1460,6 +1460,47 @@ fn abi_handshake_has_one_call_for_increasing_function_counts() {
 }
 
 #[test]
+fn task_migration_allocation_tls_lookup_has_linear_generated_size() {
+    let mut measurements = Vec::new();
+    for count in [1, 8, 32] {
+        let mut source = String::from("class Cell { pub value: i64; }\n");
+        for i in 0..count {
+            source.push_str(&format!(
+                "fn f{i}(x: i64) -> Cell {{ return new Cell(x); }}\n"
+            ));
+        }
+        source.push_str("async fn main() {");
+        for i in 0..count {
+            source.push_str(&format!("println(f{i}({i}).value);"));
+        }
+        source.push('}');
+        let targets = compile_and_collect_relocation_targets_all(&source, &[]);
+        let lookups = targets
+            .iter()
+            .filter(|name| *name == "willow_gc_current_tlab")
+            .count();
+        assert!(lookups > 0);
+        assert!(
+            targets
+                .iter()
+                .any(|name| name == "willow_task_stack_enter_generated")
+        );
+        assert!(!targets.iter().any(|name| name == "__willow_gc_tlab_state"));
+        assert!(
+            lookups <= 8 * count + 8,
+            "duplicated allocation lookup: {lookups}"
+        );
+        println!("functions={count} allocation_tls_lookups={lookups}");
+        measurements.push((count, lookups));
+    }
+    let slope_numerator = measurements[1].1 - measurements[0].1;
+    assert_eq!(
+        (measurements[2].1 - measurements[0].1) * 7,
+        slope_numerator * 31
+    );
+}
+
+#[test]
 fn abi_handshake_covers_empty_async_and_static_entry_paths() {
     for source in [
         "fn main() {}",

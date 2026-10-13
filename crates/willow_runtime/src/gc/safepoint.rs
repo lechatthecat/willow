@@ -42,12 +42,15 @@ std::thread_local! {
 pub(crate) struct RelocationSafeScope(bool);
 
 impl RelocationSafeScope {
+    // Keep TLS address computation on its side of a migrating suspension.
+    #[inline(never)]
     pub(crate) fn enter() -> Self {
         Self(RELOCATION_SAFE.replace(true))
     }
 }
 
 impl Drop for RelocationSafeScope {
+    #[inline(never)]
     fn drop(&mut self) {
         RELOCATION_SAFE.set(self.0);
     }
@@ -68,7 +71,7 @@ pub(super) fn relocation_safe() -> bool {
 
 /// Native stack switches carry the flag with the stack: a parked stack keeps
 /// the value it had, and the scheduler context that takes over is unsafe.
-pub(super) fn set_relocation_safe(value: bool) -> bool {
+pub(crate) fn set_relocation_safe(value: bool) -> bool {
     RELOCATION_SAFE.replace(value)
 }
 

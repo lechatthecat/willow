@@ -1,0 +1,30 @@
+// Run with WILLOW_WORKERS=2 WILLOW_TASK_BUDGET=1 WILLOW_GC_STRESS=relocate.
+// Each recursive synchronous frame retains a young object and a string while
+// safepoints let the scheduler transfer its stack between workers.
+class Token { pub value: i64; }
+
+fn rooted(depth: i64, total: &mut i64) {
+    let token = new Token(depth);
+    let label = "root-" + depth.toString();
+    if depth > 0 { rooted(depth - 1, &total); }
+    let mut i = 0;
+    while i < 4 {
+        let scratch = new Token(i);
+        gc_minor_collect();
+        total = total + scratch.value;
+        i = i + 1;
+    }
+    if label != "root-" + depth.toString() { panic("lost string root"); }
+    total = total + token.value;
+}
+
+async fn worker(marker: i64, total: &mut i64) {
+    rooted(7, &total);
+}
+
+async fn main() {
+    let mut total = 0;
+    // Marker also enables the opt-in test runtime's deterministic migration.
+    await worker(731207731, &total);
+    println(total);
+}

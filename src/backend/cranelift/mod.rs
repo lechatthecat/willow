@@ -166,7 +166,6 @@ struct EmissionState {
     interface_slot_summaries:
         std::cell::RefCell<HashMap<(TypeId, String), emit_interface::InterfaceSlotSummary>>,
     unit_static_inits: HashMap<InitUnitId, UnitStaticInit>,
-    gc_tlab_state: DataId,
     gc_bitmap_descriptors: HashMap<Vec<u64>, (DataId, u64)>,
     gc_layout_descriptors: HashMap<willow_abi::GcLayoutDescriptor, DataId>,
     async_frame_size_warnings: Vec<AsyncFrameSizeWarning>,
@@ -385,24 +384,8 @@ impl Codegen {
             ObjectBuilder::new(isa, "willow", cranelift_module::default_libcall_names())?;
         // An explicit runtime path may name a dynamic library/import library.
         // Only the built-in static-runtime link model promises direct calls.
-        let mut module = ObjectModule::new(obj_builder, opts.target.runtime_lib.is_none());
-        let gc_tlab_state =
-            module.declare_data("__willow_gc_tlab_state", Linkage::Local, true, true)?;
-        let mut tlab_data = DataDescription::new();
-        // Explicit zeroed bytes (not `define_zeroinit`, which lowers to BSS/TLS
-        // and emits an `UninitializedTls` section the object writer rejects).
-        tlab_data.define(
-            vec![
-                0u8;
-                willow_abi::tlab::state_size(reference_type(module.target_config()).bytes())
-                    as usize
-            ]
-            .into_boxed_slice(),
-        );
-        tlab_data.set_align(willow_abi::storage_word_bytes(
-            reference_type(module.target_config()).bytes(),
-        ) as u64);
-        module.define_data(gc_tlab_state, &tlab_data)?;
+        let module = ObjectModule::new(obj_builder, opts.target.runtime_lib.is_none());
+
         let type_scope = TypeScope::default();
         let function_scope = crate::semantic::ids::FunctionScope::default();
         let mut codegen = Self {
@@ -440,7 +423,6 @@ impl Codegen {
                 runtime_declared: false,
                 interface_slot_summaries: Default::default(),
                 unit_static_inits: HashMap::new(),
-                gc_tlab_state,
                 gc_bitmap_descriptors: HashMap::new(),
                 gc_layout_descriptors: HashMap::new(),
                 async_frame_size_warnings: Vec::new(),
@@ -1411,7 +1393,6 @@ struct FuncGen<'a, 'b> {
     enum_payload_layouts: &'a mut HashMap<Type, HashMap<String, std::sync::Arc<EnumPayloadLayout>>>,
     builder: &'a mut FunctionBuilder<'b>,
     module: &'a mut ObjectModule,
-    gc_tlab_state: DataId,
     gc_bitmap_descriptors: &'a mut HashMap<Vec<u64>, (DataId, u64)>,
     gc_layout_descriptors: &'a mut HashMap<willow_abi::GcLayoutDescriptor, DataId>,
     /// Lexical scope frames of registered `defer` actions: synthetic

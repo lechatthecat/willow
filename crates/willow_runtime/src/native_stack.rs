@@ -3,7 +3,8 @@
 //!
 //! Context objects and stack mappings stay at stable addresses. No TLS borrow,
 //! scheduler lock, or GC registry lock crosses a context switch. Generated code
-//! is pinned to its scheduler worker while native frames remain suspended.
+//! may migrate only at an audited generated-code safepoint, with no native
+//! callback frame live. Other suspensions retain their scheduler worker.
 
 #[cfg(unix)]
 use corosensei::stack::Stack;
@@ -109,6 +110,9 @@ pub(crate) struct NativeStack {
     pub(crate) worker: usize,
     affinity: Option<WorkerAffinity<'static>>,
     owner_thread: std::thread::ThreadId,
+    generated: bool,
+    native_frames: usize,
+    migratable: bool,
     coroutine: Coroutine<(), (), ()>,
     yielder: *const Yielder<(), ()>,
     #[cfg(unix)]
@@ -142,15 +146,23 @@ impl std::fmt::Debug for NativeStack {
     }
 }
 
-// SAFETY: the scheduler transfers exclusive ownership only while this stack is
-// suspended and dispatches it only to its owning worker. The task allocation and
-// coroutine stack retain stable addresses; user frames never migrate.
+// SAFETY: ownership transfers only while suspended, at stable addresses. Native
+// callbacks remain pinned. Generated entry opts into the ABI's migration contract:
+// no thread-bound values in generated frames, no cached TLS allocation pointer,
+// and no native frame below a migrating safepoint. ffi_boundary tracks native
+// extents; only the audited sync safepoint is transparent. A suspension outside
+// that boundary remains pinned. Roots, trace, reference state and overflow state
+// are restored before execution; the scheduler installs the task panic context.
+// Rust panics never unwind through a migrated C frame (ffi_boundary aborts).
 unsafe impl Send for NativeStack {}
 
 impl NativeStack {
     pub(crate) fn acquire(poll: RuntimePollFn, frame: *mut c_void) -> Box<Self> {
         if let Some(mut stack) = IDLE_STACKS.with(|pool| pool.borrow_mut().pop()) {
             stack.affinity = Some(WORKER_AFFINITIES.acquire(stack.worker));
+            stack.generated = false;
+            stack.native_frames = 0;
+            stack.migratable = false;
             stack.poll = poll;
             stack.cancel_entry = None;
             stack.frame = frame;
@@ -166,6 +178,15 @@ impl NativeStack {
         } else {
             Self::new(poll, frame)
         }
+    }
+
+    /// Caller guarantees the generated helper ABI, including native entry guards.
+    pub(crate) unsafe fn allow_generated_migration(&mut self) {
+        self.generated = true;
+    }
+
+    pub(crate) fn required_worker(&self) -> Option<usize> {
+        (!self.migratable).then_some(self.worker)
     }
 
     pub(crate) fn entry_panic_depth(&self) -> i32 {
@@ -206,6 +227,9 @@ impl NativeStack {
             worker: crate::scheduler::current_worker(),
             affinity: Some(WORKER_AFFINITIES.acquire(crate::scheduler::current_worker())),
             owner_thread: std::thread::current().id(),
+            generated: false,
+            native_frames: 0,
+            migratable: false,
             coroutine: Coroutine::with_stack(storage, |yielder, ()| trampoline(yielder)),
             yielder: std::ptr::null(),
             #[cfg(unix)]
@@ -243,12 +267,22 @@ impl NativeStack {
     /// spans the context switch: generated code and safepoint hooks access CURRENT via
     /// raw pointers while the scheduler's Rust activation is suspended.
     pub(crate) unsafe fn resume(stack: *mut Self) -> i32 {
+        // A migrated stack can arrive on a worker which has never allocated a
+        // native stack, including Windows' per-thread overflow protection.
+        crate::stack_overflow::protect_current_thread();
         unsafe {
-            assert_eq!(
-                (*stack).owner_thread,
-                std::thread::current().id(),
-                "native task stack resumed on a different OS worker"
-            );
+            if (*stack).migratable {
+                (*stack).worker = crate::scheduler::current_worker();
+                (*stack).owner_thread = std::thread::current().id();
+                (*stack).affinity = Some(WORKER_AFFINITIES.acquire((*stack).worker));
+                (*stack).migratable = false;
+            } else {
+                assert_eq!(
+                    (*stack).owner_thread,
+                    std::thread::current().id(),
+                    "thread-bound native task stack resumed on a different OS worker"
+                );
+            }
             // Every scheduler resume starts a fresh quantum, including a
             // return from a blocking runtime operation or an async poll. Old
             // inline debt belongs to the completed quantum, not the new one.
@@ -259,6 +293,8 @@ impl NativeStack {
             let outer_trace = crate::stack_trace::snapshot_current();
             let outer_reference = crate::reference_debug::snapshot_current();
             (*stack).root_depth = crate::gc::gc_thread_root_depth();
+            let outer_base = crate::gc::replace_root_base((*stack).root_depth);
+            let outer_relocation = crate::gc::set_relocation_safe(false);
             if (*stack).suspended {
                 crate::stack_trace::replace_current(std::mem::take(&mut (*stack).trace));
                 crate::reference_debug::replace_current(std::mem::take(
@@ -280,6 +316,8 @@ impl NativeStack {
             assert!(matches!(switched, CoroutineResult::Yield(())));
             (*stack).trace = crate::stack_trace::replace_current(outer_trace);
             (*stack).reference_context = crate::reference_debug::replace_current(outer_reference);
+            crate::gc::replace_root_base(outer_base);
+            crate::gc::set_relocation_safe(outer_relocation);
             CURRENT.with(|slot| slot.set(previous));
             (*stack).result
         }
@@ -299,9 +337,25 @@ impl Drop for NativeStack {
     }
 }
 
+// The trampoline itself can outlive many migrations and cache reuses. Keep
+// every TLS access behind a call on its current side of the migrating callback.
+#[inline(never)]
+fn trampoline_current() -> *mut NativeStack {
+    CURRENT.with(Cell::get)
+}
+
+#[inline(never)]
+fn settle_completed_quantum() {
+    let pending = poll_pending();
+    if pending != 0 {
+        crate::preempt::charge_safepoints(pending);
+        poll_refill(0);
+    }
+}
+
 fn trampoline(yielder: &Yielder<(), ()>) {
     loop {
-        let stack = CURRENT.with(Cell::get);
+        let stack = trampoline_current();
         assert!(!stack.is_null());
         unsafe {
             (*stack).yielder = yielder;
@@ -328,11 +382,7 @@ fn trampoline(yielder: &Yielder<(), ()>) {
         // resume restores CURRENT and leave recycles this stack. This is not
         // another safepoint: charge only work already executed, and do not
         // suspend a callback that has finished its result/cleanup handling.
-        let pending = poll_pending();
-        if pending != 0 {
-            crate::preempt::charge_safepoints(pending);
-            poll_refill(0);
-        }
+        settle_completed_quantum();
         unsafe {
             (*stack).result = result;
             (*stack).suspended = false;
@@ -350,6 +400,16 @@ pub(crate) fn suspend() -> bool {
 /// Suspend a synchronous runtime operation on its existing task stack. The
 /// scheduler must preserve the wait reason rather than immediately requeue it.
 pub(crate) fn suspend_with_result(result: i32) -> bool {
+    suspend_impl(result, false)
+}
+
+/// Only the generated synchronous safepoint may opt into migration. Runtime
+/// wait paths and direct native callbacks keep their original affinity.
+pub(crate) fn suspend_generated() -> bool {
+    suspend_impl(RUNTIME_POLL_PREEMPTED, true)
+}
+
+fn suspend_impl(result: i32, generated_safepoint: bool) -> bool {
     let stack = CURRENT.with(Cell::get);
     if stack.is_null() {
         return false;
@@ -358,9 +418,36 @@ pub(crate) fn suspend_with_result(result: i32) -> bool {
         (*stack).parked_roots = Some(crate::gc::park_current_roots((*stack).root_depth));
         (*stack).result = result;
         (*stack).suspended = true;
+        (*stack).migratable =
+            generated_safepoint && (*stack).generated && (*stack).native_frames == 0;
+        if (*stack).migratable {
+            (*stack).affinity = None;
+        }
         (*(*stack).yielder).suspend(());
     }
     true
+}
+
+/// Captures the stack identity, not TLS: a nested scheduler can temporarily
+/// replace CURRENT. A live guard prevents migration of the captured stack.
+pub(crate) struct NativeFrameGuard(*mut NativeStack);
+
+impl NativeFrameGuard {
+    pub(crate) fn enter() -> Self {
+        let stack = CURRENT.with(Cell::get);
+        if !stack.is_null() {
+            unsafe { (*stack).native_frames += 1 };
+        }
+        Self(stack)
+    }
+}
+
+impl Drop for NativeFrameGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { (*self.0).native_frames -= 1 };
+        }
+    }
 }
 
 /// Whether the current invocation owns a scheduler-managed native stack.
@@ -452,6 +539,51 @@ mod tests {
     use super::*;
     use crate::preempt::{PreemptConfig, begin_quantum, willow_preempt_end, willow_sync_safepoint};
     use crate::task::RUNTIME_POLL_READY;
+
+    #[test]
+    fn generated_stack_pins_native_callback_then_releases_affinity() {
+        unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
+            // A runtime entry may hold !Send state and call generated code.
+            // Its guard pins the entire extent, including nested callbacks.
+            crate::failure::ffi_boundary("native_callback", || {
+                let local = std::rc::Rc::new(17);
+                let original = std::thread::current().id();
+                crate::failure::ffi_boundary("nested_callback", || {
+                    willow_sync_safepoint();
+                    assert_eq!(std::thread::current().id(), original);
+                    assert_eq!(*local, 17);
+                });
+            });
+            willow_sync_safepoint();
+            RUNTIME_POLL_READY
+        }
+        let _guard = crate::gc::runtime_test_guard();
+        let mut stack = NativeStack::new(helper, std::ptr::null_mut());
+        // SAFETY: the fixture guards every non-migratable native frame.
+        unsafe { stack.allow_generated_migration() };
+        for expected_owner in [Some(stack.worker), None] {
+            begin_quantum(
+                PreemptConfig::from_env_values(Some("1"), Some("100000")),
+                std::ptr::null(),
+            );
+            assert_eq!(
+                unsafe { NativeStack::resume(&mut *stack) },
+                RUNTIME_POLL_PREEMPTED
+            );
+            willow_preempt_end();
+            assert_eq!(stack.required_worker(), expected_owner);
+        }
+        begin_quantum(
+            PreemptConfig::from_env_values(Some("1"), Some("100000")),
+            std::ptr::null(),
+        );
+        assert_eq!(
+            unsafe { NativeStack::resume(&mut *stack) },
+            RUNTIME_POLL_READY
+        );
+        willow_preempt_end();
+        assert_eq!(stack.native_frames, 0);
+    }
 
     #[test]
     fn blocking_work_parks_without_stalling_the_scheduler() {
