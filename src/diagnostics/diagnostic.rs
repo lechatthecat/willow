@@ -106,7 +106,7 @@ pub(crate) fn source_names(
     text: String,
     packages: &std::collections::HashMap<String, String>,
 ) -> String {
-    if !text.contains("$pkg") && !text.contains("$local") {
+    if !text.contains("$pkg") && !text.contains("$local") && !text.contains("$receiver") {
         return text;
     }
     let mut out = String::with_capacity(text.len());
@@ -121,6 +121,12 @@ pub(crate) fn source_names(
                 };
             out.push_str(&text[copied..start]);
             copied = end;
+            continue;
+        }
+        // A copied default's receiver (willow-nvi6).
+        if text[start..].starts_with(crate::semantic::ids::FOREIGN_RECEIVER_PREFIX) {
+            out.push_str(&text[copied..start]);
+            copied = start + crate::semantic::ids::FOREIGN_RECEIVER_PREFIX.len();
             continue;
         }
         if !text[start..].starts_with("$pkg") {
@@ -163,6 +169,15 @@ mod source_name_tests {
         let d = Diagnostic::error("$local::a::Cell", Span::dummy());
         assert_eq!(d.with_source_names(&Default::default()).message, "a::Cell");
         assert_eq!(d.message, "$local::a::Cell");
+    }
+
+    #[test]
+    fn copied_default_receiver_shows_its_own_name() {
+        let text = "the method `me` on a `$receiver::A`; $receiverish::B";
+        assert_eq!(
+            source_names(text.into(), &Default::default()),
+            "the method `me` on a `A`; $receiverish::B"
+        );
     }
 
     #[test]

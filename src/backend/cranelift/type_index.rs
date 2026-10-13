@@ -41,7 +41,10 @@ impl TypeScope {
             match binding {
                 Some(TypeBinding::Alias(next)) => current = *next,
                 Some(TypeBinding::Canonical(target)) => return *target,
-                None => return current,
+                // The receiver prefix names the entry file's identity in
+                // every unit: no unit's own alias may answer to it
+                // (willow-nvi6).
+                None => return current.foreign_receiver_target().unwrap_or(current),
             }
         }
         *id
@@ -692,5 +695,24 @@ mod tests {
         scope.bind_canonical("D", "shape::Draw");
         map.set_scope(scope.clone());
         assert_eq!(map.get(&("Color".into(), "Draw".into())), Some(&3));
+    }
+
+    #[test]
+    fn ti_27_receiver_spelling_names_the_entry_identity_in_any_scope() {
+        // A unit whose own `Me` shadows the entry's still reaches the entry's
+        // through the receiver prefix, bound or not (willow-nvi6).
+        let mut scope = TypeScope::default().fork_unit();
+        scope.bind_canonical("Me", "$local::util::Me");
+        let receiver = TypeId::from_source_name("$receiver::Me");
+        assert_eq!(scope.resolve(&receiver), TypeId::local("Me"));
+        assert_eq!(
+            scope.resolve(&TypeId::local("Me")),
+            TypeId::from_source_name("$local::util::Me")
+        );
+        assert_eq!(TypeId::local("Me").foreign_receiver_target(), None);
+        assert_eq!(
+            TypeId::from_source_name("$receiverish::Me").foreign_receiver_target(),
+            None
+        );
     }
 }

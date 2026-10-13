@@ -1098,6 +1098,17 @@ impl LirTypeCtx<'_> {
                         .zip(tb)
                         .all(|(x, y)| self.same_repr_inner(x, y, open))
             }
+            // A signature can name one class under two spellings, like any
+            // other position (willow-nvi6).
+            (Type::Fn(pa, ra), Type::Fn(pb, rb))
+            | (Type::Closure(pa, ra), Type::Closure(pb, rb)) => {
+                pa.len() == pb.len()
+                    && pa
+                        .iter()
+                        .zip(pb)
+                        .all(|(x, y)| self.same_repr_inner(x, y, open))
+                    && self.same_repr_inner(ra, rb, open)
+            }
             _ => assignable_repr(target, value),
         }
     }

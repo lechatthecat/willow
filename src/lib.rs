@@ -2039,32 +2039,61 @@ impl<'p> ForeignDefaults<'p> {
             });
         }
         let resolution = ir::lower::lower_resolution(program, tables);
+        // This unit's bare type identities (the entry file's), which a
+        // declaring unit's own items could shadow (willow-nvi6). Qualified
+        // module identities cannot collide.
+        let normalized = |name: &str| match tables.normalize(&Type::Named(name.to_owned())) {
+            Type::Named(ref name) => name.clone(),
+            _ => name.to_owned(),
+        };
+        let bare: std::collections::HashSet<_> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                parser::ast::Item::Class(c) => Some(&c.name),
+                parser::ast::Item::Enum(e) => Some(&e.name),
+                parser::ast::Item::Interface(i) => Some(&i.name),
+                _ => None,
+            })
+            .map(|name| normalized(name))
+            .filter(|name| !name.contains("::"))
+            .map(|name| semantic::ids::TypeId::from_source_name(&name))
+            .collect();
         for (&provider, classes) in &self.providers {
             let batch = batches.entry(provider).or_default();
+            // The bare identities the chains name, for [`ForeignBatch::respell`].
+            let used = std::cell::RefCell::new(std::mem::take(&mut batch.bare));
+            let record = |id: &semantic::ids::TypeId| {
+                if bare.contains(id) {
+                    used.borrow_mut().insert(*id);
+                }
+                *id
+            };
             for (class, methods) in classes {
-                let key = match tables.normalize(&Type::Named(class.name.clone())) {
-                    Type::Named(ref name) => name.clone(),
-                    _ => class.name.clone(),
-                };
+                let identity = semantic::ids::TypeId::from_source_name(&normalized(&class.name));
+                record(&identity);
                 // Stop at an ancestor an earlier receiver already recorded, so
                 // shared chains are copied once.
-                let mut current = Some(semantic::ids::TypeId::from_source_name(&key));
+                let mut current = Some(identity);
                 while let Some(id) = current {
                     let Some(info) = resolution.classes.get(&id) else {
                         break;
                     };
-                    if batch.classes.insert(id, info.clone()).is_some() {
+                    let std::collections::hash_map::Entry::Vacant(entry) = batch.classes.entry(id)
+                    else {
                         break;
-                    }
+                    };
+                    entry.insert(ForeignBatch::scoped_class(info, &record));
                     current = info.base;
                 }
                 batch.receivers.push(ForeignReceiver {
-                    key,
+                    key: identity.to_string(),
                     span: class.span,
                     name: class_name(class),
                     copies: methods.iter().map(|method| method.body.id).collect(),
                 });
             }
+            batch.bare = used.into_inner();
         }
     }
 }
@@ -2086,8 +2115,14 @@ struct ForeignReceiver {
 #[derive(Default)]
 struct ForeignBatch {
     receivers: Vec<ForeignReceiver>,
-    /// The receivers' class chains, from their own units' resolutions.
+    /// The receivers' class chains, from their own units' resolutions, under
+    /// the identities the declaring unit's scope spells them by.
     classes: std::collections::HashMap<semantic::ids::TypeId, ir::typed_ast::HirClassInfo>,
+    /// The receiving units' bare type identities those chains mention; after
+    /// [`Self::respell`], only those the declaring unit's own names shadow,
+    /// which the chains and keys spell under
+    /// [`semantic::ids::FOREIGN_RECEIVER_PREFIX`] (willow-nvi6).
+    bare: std::collections::BTreeSet<semantic::ids::TypeId>,
     /// The lambdas nested in the copies, under the names their receiving
     /// units declared them by.
     lambdas: std::collections::HashMap<parser::ast::BodyId, String>,
@@ -2096,6 +2131,76 @@ struct ForeignBatch {
 type ForeignBatches = std::collections::BTreeMap<module::UnitId, ForeignBatch>;
 
 impl ForeignBatch {
+    /// Respell the receivers' bare identities that `scope` declares or imports
+    /// a name for, so the declaring unit's own item keeps that name in the
+    /// copies (willow-nvi6), and keep only those in [`Self::bare`]. Runs once
+    /// per batch, over `scope`'s top-level items and the recorded chains.
+    fn respell(&mut self, scope: &parser::ast::Program) {
+        if self.bare.is_empty() {
+            return;
+        }
+        let names: std::collections::HashSet<&str> = (scope.items.iter())
+            .map(|item| match item {
+                parser::ast::Item::Function(f) => f.name.as_str(),
+                parser::ast::Item::Class(c) => c.name.as_str(),
+                parser::ast::Item::Enum(e) => e.name.as_str(),
+                parser::ast::Item::Interface(i) => i.name.as_str(),
+            })
+            .chain(scope.imports.iter().map(|import| {
+                (import.alias.as_deref())
+                    .unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path))
+            }))
+            .collect();
+        self.bare
+            .retain(|id| names.contains(id.to_string().as_str()));
+        if self.bare.is_empty() {
+            return;
+        }
+        let scoped = |id: &semantic::ids::TypeId| {
+            if !self.bare.contains(id) {
+                return *id;
+            }
+            semantic::ids::TypeId::from_source_name(&semantic::ids::foreign_receiver_name(
+                &id.to_string(),
+            ))
+        };
+        let classes = (self.classes.iter())
+            .map(|(id, info)| (scoped(id), Self::scoped_class(info, &scoped)))
+            .collect();
+        for receiver in &mut self.receivers {
+            receiver.key =
+                scoped(&semantic::ids::TypeId::from_source_name(&receiver.key)).to_string();
+        }
+        self.classes = classes;
+    }
+
+    /// `info` with every type identity it names respelled by `scoped`.
+    fn scoped_class(
+        info: &ir::typed_ast::HirClassInfo,
+        scoped: &dyn Fn(&semantic::ids::TypeId) -> semantic::ids::TypeId,
+    ) -> ir::typed_ast::HirClassInfo {
+        let ty = |ty: &semantic::ids::SemanticType| ty.map_names(scoped);
+        let signature = |signature: &ir::typed_ast::HirSignature| ir::typed_ast::HirSignature {
+            params: signature.params.iter().map(ty).collect(),
+            return_type: ty(&signature.return_type),
+            ..signature.clone()
+        };
+        ir::typed_ast::HirClassInfo {
+            base: info.base.as_ref().map(scoped),
+            implements: info.implements.iter().map(ty).collect(),
+            fields: (info.fields.iter())
+                .map(|(name, field)| (name.clone(), ty(field)))
+                .collect(),
+            static_fields: (info.static_fields.iter())
+                .map(|(name, field)| (name.clone(), ty(field)))
+                .collect(),
+            constructor: info.constructor.as_ref().map(signature),
+            methods: (info.methods.iter())
+                .map(|(name, method)| (name.clone(), signature(method)))
+                .collect(),
+        }
+    }
+
     /// The method each copy instantiates, keyed by the interface default's own
     /// body: built once from `scope`'s interface declaration, which the copies
     /// of a non-generic default share but for their body identity.
@@ -2493,7 +2598,7 @@ fn run_backend(
     // Defaults copied from other units' interfaces, once per declaring unit:
     // its program, tables and scope signatures serve every receiver
     // (willow-rvpp).
-    for (provider, batch) in &foreign {
+    for (provider, batch) in &mut foreign {
         query_stats::query_call("foreign_default_unit");
         let &(artifact, name) = declared_units
             .get(provider)
@@ -2502,6 +2607,8 @@ fn run_backend(
         let scope = artifacts.track(UnitKind::Declared, scope);
         let _lir = artifacts.live(UnitKind::Lir);
         let checked = db.checked_unit(*provider, &artifacts)?;
+        batch.respell(scope.normalized_program());
+        let batch = &*batch;
         let defaults = batch.defaults(db.bodies(), scope.normalized_program());
         {
             let mut tables = checked.tables();
@@ -2510,7 +2617,7 @@ fn run_backend(
             log_hir_gaps(&gaps);
         }
         let mut receiver = "";
-        let compiled = codegen.with_foreign_bodies(&scope, &checked, |backend| {
+        let compiled = codegen.with_foreign_bodies(&scope, &checked, &batch.bare, |backend| {
             batch.emit(db.bodies(), &defaults, backend, &mut receiver)
         });
         compiled.map_err(|error| {
@@ -2889,12 +2996,13 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
             .enumerate()
             .map(|(at, class)| (class.name, at))
             .collect();
-        for (&provider, batch) in &foreign {
+        for (&provider, batch) in &mut foreign {
             let program = files
                 .get(&provider)
                 .with_context(|| format!("interface unit {provider:?} is not in the graph"))?;
             let scope = artifacts.hydrate(program, provider.file_id())?;
             let checked = frontend.db.checked_unit(provider, artifacts)?;
+            batch.respell(&scope);
             let defaults = batch.defaults(bodies, &scope);
             let classes = batch.classes(bodies, &defaults)?;
             let (lowered, gaps) = ir::lower::lower_foreign_methods(
@@ -2904,7 +3012,13 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
                 &batch.classes,
             );
             lowering_diagnostics.extend(gaps);
-            for class in lowered.classes {
+            for mut class in lowered.classes {
+                // A respelled receiver is shown with its class (willow-nvi6).
+                if let Some(bare) =
+                    (class.name.to_string()).strip_prefix(semantic::ids::FOREIGN_RECEIVER_PREFIX)
+                {
+                    class.name = semantic::ids::TypeId::from_source_name(bare);
+                }
                 match receivers.get(&class.name) {
                     Some(&at) => hir.classes[at].methods.extend(class.methods),
                     None => {
@@ -2983,12 +3097,13 @@ pub fn emit_lir_text(src: &str) -> Result<String> {
             .iter()
             .map(|module| (module.id, &module.program))
             .collect();
-        for (&provider, batch) in &foreign {
+        for (&provider, batch) in &mut foreign {
             let program = files
                 .get(&provider)
                 .with_context(|| format!("interface unit {provider:?} is not in the graph"))?;
             let scope = artifacts.hydrate(program, provider.file_id())?;
             let checked = frontend.db.checked_unit(provider, artifacts)?;
+            batch.respell(&scope);
             let defaults = batch.defaults(frontend.db.bodies(), &scope);
             let (lowered_gaps, lifted) =
                 batch.lower(&frontend.db, &scope, &checked.tables(), &defaults)?;

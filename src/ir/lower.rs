@@ -118,6 +118,11 @@ impl<'a> CheckerTables<'a> {
         {
             return ty.clone();
         }
+        if let Type::Named(name) = ty
+            && let Some(spelled) = self.receiver_spelling(name)
+        {
+            return Type::Named(spelled);
+        }
         let ty = self.normalized_types.and_then(|m| m.get(ty)).unwrap_or(ty);
         let rebuilt = match ty {
             Type::Named(name) => self
@@ -172,6 +177,29 @@ impl<'a> CheckerTables<'a> {
             Some(normalized) => normalized.clone(),
             None => rebuilt,
         }
+    }
+
+    /// How this scope must spell the type `name` is an alias of, when that
+    /// is the entry file's bare identity and this scope's own types shadow
+    /// it: a generic instance's argument can be the entry's `Me` in a unit
+    /// that declares its own (willow-nvi6). `None` leaves `name` to the
+    /// ordinary normalization.
+    fn receiver_spelling(&self, name: &str) -> Option<String> {
+        let identity = |name: &str| {
+            let symbols = self.symbols?;
+            (self.enum_identity(name))
+                .or_else(|| symbols.lookup_class(name).map(|info| info.name.as_str()))
+                .or_else(|| {
+                    symbols
+                        .lookup_interface(name)
+                        .map(|info| info.name.as_str())
+                })
+        };
+        let target = identity(name)?;
+        if target == name || target.contains("::") || target.starts_with('$') {
+            return None;
+        }
+        (identity(target)? != target).then(|| crate::semantic::ids::foreign_receiver_name(target))
     }
 
     /// The identity this checker gave the enum written `name` here.
@@ -459,7 +487,9 @@ pub fn lower_foreign_methods(
     }
     let mut resolution = lower_resolution(scope, scope_tables);
     // The receivers' class chains are their implementing units' declarations;
-    // module class identities are qualified, so none collides with the scope's.
+    // module class identities are qualified, and a bare one the scope's own
+    // names shadow arrives under `FOREIGN_RECEIVER_PREFIX` (willow-nvi6), so
+    // none collides with the scope's.
     for (id, info) in classes {
         resolution
             .classes
@@ -479,7 +509,9 @@ pub fn lower_foreign_methods(
 /// A class that copied interface defaults from another unit, with each copy's
 /// body identity and the declaration it instantiates (willow-rvpp).
 pub struct ForeignClass<'a> {
-    /// The receiver's class identity, as its own unit's tables normalize it.
+    /// The receiver's class identity, as its own unit's tables normalize it,
+    /// or under `FOREIGN_RECEIVER_PREFIX` when that is a bare name the scope's
+    /// own items shadow (willow-nvi6).
     pub key: &'a str,
     pub span: Span,
     pub methods: Vec<(crate::parser::ast::BodyId, &'a MethodDecl)>,

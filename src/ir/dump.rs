@@ -454,7 +454,16 @@ fn type_str<N: std::fmt::Display>(ty: &Type<N>) -> String {
             Type::Never => out.push_str("never"),
             Type::Named(name) => {
                 use std::fmt::Write;
+                let at = out.len();
                 write!(out, "{name}").expect("string write");
+                // A copied default's receiver is shown by its own name
+                // (willow-nvi6).
+                if out[at..].starts_with(crate::semantic::ids::FOREIGN_RECEIVER_PREFIX) {
+                    out.replace_range(
+                        at..at + crate::semantic::ids::FOREIGN_RECEIVER_PREFIX.len(),
+                        "",
+                    );
+                }
             }
             Type::Array(inner) => {
                 out.push_str("Array<");

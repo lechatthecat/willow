@@ -42,6 +42,18 @@ pub(crate) fn has_internal_module_prefix(name: &str) -> bool {
     name.starts_with("$local::") || name.starts_with("$pkg")
 }
 
+/// Namespace that spells a receiving unit's unqualified type inside the scope
+/// of another unit whose interface defaults it copied (willow-nvi6). The
+/// entry file's classes keep bare identities (`A`), which the declaring
+/// unit's own `A` would shadow; source cannot spell this prefix.
+pub(crate) const FOREIGN_RECEIVER_PREFIX: &str = "$receiver::";
+
+/// `name` as a foreign default's scope spells it: see
+/// [`FOREIGN_RECEIVER_PREFIX`].
+pub(crate) fn foreign_receiver_name(name: &str) -> String {
+    format!("{FOREIGN_RECEIVER_PREFIX}{name}")
+}
+
 /// Session-owned module identity. Artifacts store package/path, never this handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymbolModule(Handle);
@@ -437,6 +449,18 @@ impl TypeId {
     }
     pub fn local(name: impl AsRef<str>) -> Self {
         Self::intern(None, name.as_ref())
+    }
+    /// The entry file's identity a [`FOREIGN_RECEIVER_PREFIX`] spelling
+    /// names, in whichever scope it is resolved (willow-nvi6).
+    pub(crate) fn foreign_receiver_target(&self) -> Option<Self> {
+        let prefix = FOREIGN_RECEIVER_PREFIX.trim_end_matches("::");
+        let name = self.0.with_table(|table| {
+            let spelling = &table.types[self.0.index as usize];
+            (spelling.module.is_none() && spelling.namespace.as_deref() == Some(prefix))
+                .then(|| Arc::clone(&spelling.name))
+        })?;
+        let _symbols = self.0.owner().enter();
+        Some(Self::local(&*name))
     }
     pub fn from_source_name(name: &str) -> Self {
         match name.rsplit_once("::") {

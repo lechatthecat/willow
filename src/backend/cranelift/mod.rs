@@ -873,6 +873,11 @@ impl UnitCodegenContext<'_> {
     }
 
     fn canonical_declared_id(&self, id: &TypeId) -> TypeId {
+        // Already scope-independent; resolving it would hand back the bare
+        // entry name a later unit's own type can shadow (willow-nvi6).
+        if id.foreign_receiver_target().is_some() {
+            return *id;
+        }
         if let Some(info) = self.enum_infos.get_id(id) {
             return info.name;
         }

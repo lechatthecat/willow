@@ -1,0 +1,18 @@
+// The provider keeps private items that share the names of the entry file's
+// classes: a class `Point` and a function `Label`. Copied defaults still
+// reach the receiver's own methods and the provider's own items.
+class Point {
+    pub fn area(self) -> String { return "provider point"; }
+    pub static fn origin() -> i64 { return 1000; }
+}
+
+fn Label() -> i64 { return 7; }
+
+pub interface Measured {
+    fn me(self) -> Self;
+    fn area(self) -> i64 { return 0; }
+    fn report(self) -> i64 {
+        println(new Point().area());
+        return self.me().area() + Label() + Point::origin();
+    }
+}

@@ -602,11 +602,32 @@ impl UnitCodegenContext<'_> {
             .iter()
             .map(|(alias, info)| (alias.as_str(), info.name()))
             .collect();
+        // An instance argument that is the entry file's bare identity, while
+        // this unit declares or item-imports its own type of that name, is
+        // spelled under the receiver prefix, which names it in every unit:
+        // bare, this unit's own type would answer to it (willow-nvi6). The
+        // entry's types are declared last, so any binding of the bare name in
+        // this unit's scope (item-import and enum aliases, bound above) is
+        // this unit's own.
+        let shadowed: std::collections::HashSet<&str> = (instantiation_types.values())
+            .copied()
+            .filter(|target| {
+                local_signature_type_names.contains(*target)
+                    || local_enum_names.contains(*target)
+                    || !target.contains("::") && {
+                        let id = TypeId::local(target);
+                        self.type_scope.resolve(&id) != id
+                            || (self.enum_infos.get_id(&id)).is_some_and(|info| info.name != id)
+                    }
+            })
+            .collect();
         let resolve_instantiation = |ty: &crate::parser::ast::Type| {
-            ty.map_names(|name| {
-                instantiation_types
-                    .get(name.as_str())
-                    .map_or_else(|| name.clone(), |name| (*name).to_string())
+            ty.map_names(|name| match instantiation_types.get(name.as_str()) {
+                Some(target) if shadowed.contains(target) => {
+                    crate::semantic::ids::foreign_receiver_name(target)
+                }
+                Some(target) => (*target).to_string(),
+                None => name.clone(),
             })
         };
         let qualify_class_type = |ty: &crate::parser::ast::Type| -> crate::parser::ast::Type {
@@ -852,13 +873,81 @@ impl UnitCodegenContext<'_> {
     /// `unit`'s alias scope (willow-rvpp): a default body names the items of
     /// the module that declared the interface, whichever class it was copied
     /// into. The static initializers stay with [`Self::emit_module`].
+    ///
+    /// `bare` holds the receiving units' bare type identities the bodies
+    /// spell under [`FOREIGN_RECEIVER_PREFIX`](crate::semantic::ids::FOREIGN_RECEIVER_PREFIX)
+    /// (willow-nvi6): each respelling resolves to its identity in any scope,
+    /// and a local
+    /// name of `unit` equal to one is unbound, so neither the receiver's type
+    /// nor its `Class.method` symbols resolve to `unit`'s own declaration.
+    /// The bodies name `unit`'s types by their qualified identities.
     pub(super) fn emit_foreign_bodies(
         &mut self,
         unit: &DeclaredModule,
+        bare: &std::collections::BTreeSet<TypeId>,
         emit: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
         self.install_module_scope(unit);
+        if !bare.is_empty() {
+            self.unshadow_receivers(unit, bare);
+        }
         emit(self)
+    }
+
+    /// Undo the aliases [`Self::install_module_scope`] gave `unit`'s local
+    /// spellings of the names in `bare`; the respelled receiver names
+    /// themselves resolve in every scope. Work is bounded by `bare` plus the
+    /// methods of the colliding local classes.
+    fn unshadow_receivers(
+        &mut self,
+        unit: &DeclaredModule,
+        bare: &std::collections::BTreeSet<TypeId>,
+    ) {
+        let hidden = |name: &str| bare.contains(&TypeId::from_source_name(name));
+        let mut methods = Vec::new();
+        for (local_name, qualified) in &unit.module_classes {
+            if hidden(local_name) {
+                methods.push(class_member_symbol(local_name, "init"));
+                methods.extend(
+                    (qualified.methods.iter())
+                        .map(|method| class_member_symbol(local_name, &method.name)),
+                );
+            }
+        }
+        for item in &unit.item_imports {
+            if hidden(&item.local) {
+                methods.extend(
+                    self.item_import_method_aliases(&item.local, &item.module, &item.item)
+                        .into_iter()
+                        .map(|(alias, _)| alias),
+                );
+            }
+        }
+        if !methods.is_empty() {
+            let mut scope = self.func_ids.scope().clone();
+            for alias in methods {
+                scope.restore(FunctionId::free(&alias), None);
+            }
+            self.install_function_scope(scope);
+        }
+        // `unit` spells its own interfaces bare in bodies and signatures alike
+        // (willow-64gs.1), so such a name keeps `unit`'s meaning; the bodies
+        // reach the receiver through the respelling.
+        let interfaces: std::collections::HashSet<&str> = (unit.program.items.iter())
+            .filter_map(|item| match item {
+                Item::Interface(interface) => Some(interface.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        // The respelled receivers resolve in every scope (`TypeScope::resolve`).
+        let mut scope = self.type_scope.clone();
+        for id in bare {
+            let name = id.to_string();
+            if !interfaces.contains(name.as_str()) {
+                scope.bind_canonical(&name, &name);
+            }
+        }
+        self.install_type_scope(scope);
     }
 
     fn install_module_scope(&mut self, unit: &DeclaredModule) {

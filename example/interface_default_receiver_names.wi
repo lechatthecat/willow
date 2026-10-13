@@ -1,0 +1,19 @@
+// A class whose name matches a private class of the module that declares its
+// interface still receives that interface's defaults (willow-nvi6).
+import interface_default_receiver_names_support::shapes;
+
+class Point implements shapes::Measured {
+    pub w: i64;
+    pub h: i64;
+    pub fn me(self) -> Point { return self; }
+    pub fn area(self) -> i64 { return self.w * self.h; }
+}
+
+class Label implements shapes::Measured {
+    pub fn me(self) -> Label { return self; }
+}
+
+fn main() {
+    println(new Point(3, 4).report());
+    println(new Label().report());
+}
