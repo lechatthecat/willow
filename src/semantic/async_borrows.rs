@@ -594,7 +594,11 @@ impl<'a> WalkState<'a> {
         let Some(scope) = self.scope_receiver(checker, &call.object, callable, loops) else {
             return;
         };
-        if call.method == "child"
+        if call.method == "cancel" && call.args.is_empty() {
+            // Requesting cancellation preserves membership and every loan.
+            // Only awaiting finish proves that all observing defers have run.
+            statement.scope_receiver = Some(call.object.id());
+        } else if call.method == "child"
             && call.args.is_empty()
             && let Some(name) = binding
         {
@@ -1280,6 +1284,69 @@ mod tests {
             assert_eq!(borrows.len(), 1, "{source}: {borrows:?}");
             assert_eq!(borrows[0].code, ErrorCode::E1708);
         }
+    }
+
+    #[test]
+    fn scoped_borrow_repeated_cancel_does_not_scan_loans() {
+        for n in [1, 8, 64, 128] {
+            let mut body = String::from("let s = TaskScope::new();");
+            for _ in 0..n {
+                body.push_str("s.add(borrow(&x)); s.cancel();");
+            }
+            body.push_str("await s.finish();");
+            SCOPE_WORK.with(|count| count.set(0));
+            let (borrows, errors) = analyze(&body);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(borrows.is_empty(), "{borrows:?}");
+            let work = SCOPE_WORK.with(|count| count.get());
+            assert_eq!(work, n + 1);
+            println!("cancel_requests={n} registrations={n} scope_work={work}");
+        }
+    }
+
+    #[test]
+    fn scoped_borrow_cancel_requires_finish() {
+        for (body, rejected) in [
+            (
+                "let s = TaskScope::new(); s.add(borrow(&x)); s.cancel(); await s.finish();",
+                false,
+            ),
+            (
+                "let s = TaskScope::new(); let c = s.child(); c.add(borrow(&x)); s.cancel(); await s.finish();",
+                false,
+            ),
+            (
+                "let s = TaskScope::new(); s.add(borrow(&x)); s.cancel(); s.cancel(); await s.finish();",
+                false,
+            ),
+            (
+                "let s = TaskScope::new(); s.add(borrow(&x)); s.cancel();",
+                true,
+            ),
+            (
+                "let s = TaskScope::new(); s.add(borrow(&x)); s.cancel(); return;",
+                true,
+            ),
+            (
+                "let s = TaskScope::new(); s.add(borrow(&x)); s.cancel(); if true { await s.finish(); }",
+                true,
+            ),
+        ] {
+            let (borrows, errors) = analyze(body);
+            assert!(errors.is_empty(), "{body}: {errors:?}");
+            assert_eq!(!borrows.is_empty(), rejected, "{body}: {borrows:?}");
+            assert!(borrows.iter().all(|d| d.code == ErrorCode::E1708));
+        }
+        let (borrows, errors) = analyze_source(
+            "async fn write(x: &mut i64) { await sleep(1); } async fn main() {
+                let mut x = 0; let s = TaskScope::new(); s.add(write(&x));
+                s.cancel(); await write(&x); await s.finish(); }",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            borrows.iter().any(|d| d.code == ErrorCode::E1706),
+            "{borrows:?}"
+        );
     }
 
     #[test]

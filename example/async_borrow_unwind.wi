@@ -1,0 +1,31 @@
+// Reference writes are immediate, including writes made by unwind defers.
+// Panic/cancel never roll back completed writes. The referenced storage stays
+// alive through the last observing defer; joining waits for that cleanup.
+// Cancellation requests do not discharge a borrow: join the scope first.
+async fn cancelled(x: &mut i64, ready: Channel<i64>) {
+    defer { gc_collect(); println(x); }
+    defer { x = x + 1; }
+    x = 40;
+    ready.send(1);
+    await sleep(10000);
+}
+async fn panicked(x: &mut i64) {
+    defer match recover() { Some(_) => {}, None => {} };
+    defer { gc_collect(); println(x); }
+    defer { x = x + 1; }
+    x = 41;
+    await sleep(1);
+    panic("borrow unwind");
+}
+async fn main() {
+    let mut x = 0;
+    let ready = Channel<i64>::new();
+    let scope = TaskScope::new();
+    scope.add(cancelled(&x, ready));
+    ready.recv();
+    scope.cancel();
+    await scope.finish();
+    println(x);
+    await panicked(&x);
+    println(x);
+}

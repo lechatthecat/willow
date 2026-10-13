@@ -482,3 +482,113 @@ fn async_scoped_borrow_heap_and_imported_forwarding() {
     assert!(ok, "{out}");
     assert_eq!(out, "42\n");
 }
+
+// Panic/cancel cleanup must keep the same reference cell through the last defer.
+#[test]
+fn async_borrow_unwind_scalar_matrix() {
+    for (ty, initial, updated, expected) in SCALARS {
+        for exit in ["normal", "panic", "cancel"] {
+            for mutable in [false, true] {
+                let mode = if mutable { "&mut" } else { "&" };
+                let cleanup = if mutable {
+                    format!("x = {updated}; println(x);")
+                } else {
+                    "println(x);".to_owned()
+                };
+                let trigger = match exit {
+                    "panic" => "panic(\"borrow-unwind\");",
+                    "cancel" => "ready.send(1); await sleep(10000);",
+                    _ => "await sleep(1);",
+                };
+                let join = if exit == "cancel" {
+                    "ready.recv(); scope.cancel(); let _ = await scope.finish();"
+                } else {
+                    "await scope.finish();"
+                };
+                let source = format!(
+                    "async fn worker(x: {mode} {ty}, ready: Channel<i64>) {{
+                        defer match recover() {{ Some(_) => {{}}, None => {{}} }};
+                        defer {{ gc_collect(); println(x); }}
+                        defer {{ gc_collect(); {cleanup} }}
+                        {trigger}
+                    }}
+                    async fn main() {{ let mut x = {initial}; let ready = Channel<i64>::new();
+                        let scope = TaskScope::new(); scope.add(worker(&x, ready)); {join} println(x); }}"
+                );
+                let (out, ok) = compile_and_run(&source);
+                assert!(ok, "{ty}/{exit}/{mutable}: {out}");
+                let value = if mutable {
+                    expected.to_string()
+                } else {
+                    format!("{initial}\n")
+                };
+                assert_eq!(out, value.repeat(3), "{ty}/{exit}/{mutable}");
+            }
+        }
+    }
+}
+
+const UNWIND_EXAMPLE: &str = include_str!("../../../example/async_borrow_unwind.wi");
+
+#[test]
+fn async_borrow_unwind_example_modes() {
+    for mode in ["debug", "release", "minor", "all", "relocate"] {
+        let (out, ok) = match mode {
+            "debug" => compile_and_run(UNWIND_EXAMPLE),
+            "release" => compile_and_run_release(UNWIND_EXAMPLE),
+            mode => compile_and_run_gc_stress_mode(UNWIND_EXAMPLE, mode),
+        };
+        assert!(ok, "{mode}: {out}");
+        assert_eq!(out, "41\n41\n42\n42\n", "{mode}");
+    }
+}
+
+#[test]
+fn async_borrow_unwind_heap_and_forwarding() {
+    for place in ["b.value", "values[0]"] {
+        for exit in ["panic", "cancel"] {
+            let trigger = if exit == "panic" {
+                "panic(\"unwind\");"
+            } else {
+                "ready.send(1); await sleep(10000);"
+            };
+            let join = if exit == "panic" {
+                "await s.finish();"
+            } else {
+                "ready.recv(); s.cancel(); await s.finish();"
+            };
+            let source = format!(
+                "import std::collections::Array;
+                class Box {{ pub value: i64; }}
+                fn cleanup(x: &mut i64) {{ gc_collect(); x = x + 1; }}
+                async fn worker(x: &mut i64, ready: Channel<i64>) {{
+                    defer match recover() {{ Some(_) => {{}}, None => {{}} }};
+                    defer {{ gc_collect(); println(x); }}
+                    defer {{ cleanup(&x); }}
+                    x = 40; await sleep(1); {trigger}
+                }}
+                async fn main() {{ let b = new Box(0); let values: Array<i64> = [0];
+                    let ready = Channel<i64>::new(); let s = TaskScope::new();
+                    s.add(worker(&{place}, ready)); {join} println({place}); }}"
+            );
+            let (out, ok) = compile_and_run_gc_stress_mode(&source, "relocate");
+            assert!(ok, "{place}/{exit}: {out}");
+            assert_eq!(out, "41\n41\n", "{place}/{exit}");
+        }
+    }
+}
+
+#[test]
+fn async_borrow_unwind_unhandled_panic_keeps_older_defers() {
+    let (out, ok) = compile_and_run_check_exit(
+        "async fn worker(x: &mut i64) {
+            defer { gc_collect(); println(x); }
+            defer { x = 42; panic(\"cleanup-panic\"); }
+            await sleep(1); panic(\"body-panic\");
+        }
+        async fn main() { let mut x = 0; await worker(&x); }",
+    );
+    assert!(!ok, "{out}");
+    assert!(out.lines().any(|line| line == "42"), "{out}");
+    assert!(out.contains("cleanup-panic"), "{out}");
+}
