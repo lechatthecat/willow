@@ -707,44 +707,14 @@ impl TypeChecker {
         self.symbols.resolved_method_class(class_name, method)
     }
 
-    /// E0810 for a looping method reached through a typed NON-`self` receiver in
-    /// a task context (`obj.heavy()` where `obj: Work` and `Work::heavy` loops).
-    /// `self.heavy()`, free-function, and static-method calls are handled by the
-    /// AST-level `ConcurrencyAnalyzer`; this covers the typed-receiver case it
-    /// cannot resolve, so the two never overlap (willow-0a6k.2).
-    pub(super) fn check_task_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) {
-        if self.task_sync_preemption || !self.local.current_async_context {
-            return;
-        }
-        if matches!(&m.object, Expr::Var(name, _, _) if name == "self") {
-            return;
-        }
-        let Type::Named(class) = obj_ty else {
-            return;
-        };
-        // Resolve to the class that actually DECLARES the method (walking the
-        // base chain), so an override on a subclass is judged on its own body —
-        // a loop-free override must not inherit the base's E0810, and an
-        // inherited looping method is attributed to the base that defines it.
-        let Some(declaring) = self.resolved_method_class(class, &m.method) else {
-            return;
-        };
-        let key = crate::semantic::ids::FunctionId::method(
-            crate::semantic::ids::TypeId::from_source_name(&declaring),
-            m.method.as_str(),
-        );
-        self.task_method_calls
-            .push(crate::compiler_db::effects::TaskMethodCall {
-                callee: key,
-                span: m.span,
-                diagnostic_index: self.errors.len(),
-            });
-    }
-
-    pub(super) fn report_task_method_calls(&mut self) {
+    pub(super) fn report_task_method_calls(
+        &mut self,
+        facts: &crate::semantic::effects::EffectFacts<crate::compiler_db::effects::EffectWitness>,
+    ) {
         let sites = std::mem::take(&mut self.task_method_calls);
         let original = std::mem::take(&mut self.errors);
         let mut sites = sites.into_iter().peekable();
+        let mut reported = std::collections::HashSet::new();
         for (index, diagnostic) in original
             .into_iter()
             .map(Some)
@@ -756,7 +726,13 @@ impl TypeChecker {
                 .is_some_and(|site| site.diagnostic_index == index)
             {
                 let site = sites.next().unwrap();
-                self.report_task_method_call(site.callee, site.span);
+                if !reported.contains(&site.span) {
+                    let before = self.errors.len();
+                    self.report_task_method_call(site.callee, site.span, facts);
+                    if self.errors.len() != before {
+                        reported.insert(site.span);
+                    }
+                }
             }
             if let Some(diagnostic) = diagnostic {
                 self.errors.push(diagnostic);
@@ -764,35 +740,60 @@ impl TypeChecker {
         }
     }
 
-    fn report_task_method_call(&mut self, key: FunctionId, span: Span) {
-        // Resolve the reason before building the headline: recursion and loops
-        // are reported differently so the message never claims a source loop
-        // that is not there.
-        let same_program = self.nonpreemptible_methods.get(&key).copied();
-        let imported = self.nonpreemptible_module_methods.get(&key).cloned();
-        let Some(reason) = same_program
-            .map(|helper| helper.reason)
-            .or(imported.as_ref().map(|(_, reason)| *reason))
-        else {
+    fn report_task_method_call(
+        &mut self,
+        callee: Option<FunctionId>,
+        span: Span,
+        facts: &crate::semantic::effects::EffectFacts<crate::compiler_db::effects::EffectWitness>,
+    ) {
+        use crate::compiler_db::effects::EffectWitness;
+        use crate::semantic::effects::RuntimeEffects;
+        let key = callee.unwrap_or_else(|| FunctionId::free("<indirect call>"));
+        if self.lock_callee_is_async(&key) == Some(true) {
             return;
+        }
+        let fact = callee.and_then(|id| facts.get(&id));
+        let reason = match fact {
+            Some(summary) if !summary.intersects(RuntimeEffects::NO_PREEMPT_REGION) => return,
+            Some(summary) => match summary.witness(RuntimeEffects::NO_PREEMPT_REGION) {
+                Some(EffectWitness::Helper { reason, .. }) => *reason,
+                _ => NonpreemptibleReason::Unknown,
+            },
+            None if crate::compiler_db::effects::intrinsic_effects(&key).is_some() => return,
+            None => NonpreemptibleReason::Unknown,
         };
+        let key = if key.name().starts_with("$preemption$") {
+            match fact.and_then(|summary| summary.witness(RuntimeEffects::NO_PREEMPT_REGION)) {
+                Some(EffectWitness::Helper { owner, .. }) => *owner,
+                _ => key,
+            }
+        } else {
+            key
+        };
+        if self.task_sync_preemption && reason != NonpreemptibleReason::Unknown {
+            return;
+        }
         let diagnostic =
             Diagnostic::new(Severity::Error, ErrorCode::E0810, reason.message(&key)).with_label(
                 Label::primary(span, "this call can monopolize the scheduler worker"),
             );
-        let diagnostic = match (same_program, &imported) {
-            (Some(helper), _) => {
-                diagnostic.with_label(Label::secondary(helper.span, reason.helper_label()))
-            }
-            // Defined in another file the entry map cannot render — use a note.
-            (None, Some((module, _))) => diagnostic.with_note(reason.module_note(&key, module)),
-            (None, None) => unreachable!("reason came from one of the two maps"),
+        let diagnostic = if let Some(helper) = self.nonpreemptible_methods.get(&key) {
+            diagnostic.with_label(Label::secondary(helper.span, reason.helper_label()))
+        } else if let Some((module, _)) = self.nonpreemptible_module_methods.get(&key) {
+            diagnostic.with_note(reason.module_note(&key, module))
+        } else {
+            diagnostic
         };
-        self.push(
+        let diagnostic = if reason == NonpreemptibleReason::Unknown {
+            diagnostic
+                .with_note(crate::semantic::concurrency::UNKNOWN_PREEMPTION_NOTE)
+                .with_help(crate::semantic::concurrency::UNKNOWN_PREEMPTION_HELP)
+        } else {
             diagnostic
                 .with_note(crate::semantic::concurrency::NONPREEMPTIBLE_NOTE)
-                .with_help(crate::semantic::concurrency::NONPREEMPTIBLE_HELP),
-        );
+                .with_help(crate::semantic::concurrency::NONPREEMPTIBLE_HELP)
+        };
+        self.push(diagnostic);
     }
 
     pub(super) fn check_reference_argument(

@@ -433,3 +433,75 @@ fn main() {
     );
     assert_eq!(out, "7\n");
 }
+
+#[test]
+fn a7_imported_unresolved_preemption_summary_reaches_alias_wrappers() {
+    for import in ["import worker;", "import worker as w;"] {
+        let ns = if import.contains(" as ") {
+            "w"
+        } else {
+            "worker"
+        };
+        let main = format!(
+            "{import} fn wrap(x: {ns}::I) -> i64 {{ return {ns}::helper(x); }} async fn work(x: {ns}::I) -> i64 {{ return wrap(x); }} fn main() {{}}"
+        );
+        let stderr = compile_temp_project_error_stderr(
+            &[
+                (
+                    "worker.wi",
+                    "pub interface I { fn run(self) -> i64; } pub fn helper(x: I) -> i64 { return x.run(); }",
+                ),
+                ("main.wi", &main),
+            ],
+            "main.wi",
+        );
+        assert!(
+            stderr.contains("E0810") && stderr.contains("cannot prove preemptibility"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn a7_imported_safe_summary_remains_runnable() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "worker.wi",
+                "pub fn helper(n: i64) -> i64 { if n <= 1 { return n; } return helper(n - 1) + helper(n - 2); }",
+            ),
+            (
+                "main.wi",
+                "import worker as w; fn wrap(n: i64) -> i64 { return w::helper(n); } async fn main() { println(wrap(10)); }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "55\n");
+}
+
+#[test]
+fn a7_item_import_and_multihop_unknown_summaries() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "leaf.wi",
+                "pub fn unknown(g: fn(i64) -> i64) -> i64 { return g(1); }",
+            ),
+            (
+                "worker.wi",
+                "import leaf::unknown as call; pub fn helper(g: fn(i64) -> i64) -> i64 { return call(g); }",
+            ),
+            (
+                "main.wi",
+                "import worker::helper as run; async fn task(g: fn(i64) -> i64) -> i64 { return run(g); } fn main() {}",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(
+        stderr.contains("E0810") && stderr.contains("cannot prove preemptibility"),
+        "{stderr}"
+    );
+}

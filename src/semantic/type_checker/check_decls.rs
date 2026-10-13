@@ -669,7 +669,6 @@ impl TypeChecker {
         };
         let receiver = Type::Named(base.clone());
         self.expr_types.insert(m.object.id(), receiver.clone());
-        self.check_task_method_call(&receiver, m);
         if let Some(defining) = self.resolved_method_class(&base, &m.method) {
             self.record_lock_effect_call(
                 FunctionId::method(TypeId::from_source_name(&defining), m.method.as_str()),

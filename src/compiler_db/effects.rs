@@ -82,6 +82,7 @@ impl EffectEvidence {
                     owner,
                     source,
                     match reason {
+                        NonpreemptibleReason::Unknown => "unknown",
                         NonpreemptibleReason::Loop => "loop",
                         NonpreemptibleReason::Recursion => "recursion",
                     }
@@ -302,6 +303,7 @@ impl EffectQueries {
                                 id,
                                 helper.span,
                                 match helper.reason {
+                                    NonpreemptibleReason::Unknown => "unknown",
                                     NonpreemptibleReason::Loop => "loop",
                                     NonpreemptibleReason::Recursion => "recursion",
                                 }
@@ -597,9 +599,19 @@ fn default_external(target: &FunctionId) -> RuntimeEffects {
     }
 }
 
-/// One body inventory and one fixpoint. Helper membership is intentionally
-/// narrower than lock membership; masks prevent a constructor, lambda, dispatch
-/// union, or eager async call from broadening the historical helper contract.
+fn unknown_preemption() -> EffectWitness {
+    // All unresolved facts share one witness: propagating uncertainty must not
+    // repeatedly improve a lexicographic owner along a long call chain.
+    EffectWitness::Helper {
+        reason: NonpreemptibleReason::Unknown,
+        owner: FunctionId::free("<unresolved call>"),
+        source: (0, 0, 0),
+    }
+}
+
+/// One body inventory and one fixpoint. Preemption follows every synchronous
+/// execution edge, including constructors and dispatch unions; eager async
+/// calls create tasks and do not execute the task body in the caller.
 pub(crate) fn solve_unit<N>(
     program: &Program,
     graph: &CallGraph,
@@ -615,6 +627,7 @@ pub(crate) fn solve_unit<N>(
     let mut pending = Vec::new();
     let mut helpers = HashMap::new();
     let mut foreign = Vec::new();
+    let mut implicit_leaves = HashSet::new();
     // Injected default copies the checker skipped: they have no typed body in
     // this unit and reuse their declaring interface's check (willow-rvpp).
     let mut reused = HashSet::new();
@@ -633,6 +646,9 @@ pub(crate) fn solve_unit<N>(
             }
             Item::Class(c) => {
                 let owner = TypeId::local(&c.name);
+                if c.constructors.is_empty() {
+                    implicit_leaves.insert(FunctionId::method(owner, "init"));
+                }
                 for m in &c.methods {
                     let id = FunctionId::method(owner, &m.name);
                     if m.is_default_injected {
@@ -645,6 +661,12 @@ pub(crate) fn solve_unit<N>(
                 }
                 for init in &c.constructors {
                     pending.push((FunctionId::method(owner, "init"), init.body.id, &init.body));
+                }
+            }
+            Item::Enum(e) => {
+                for variant in &e.variants {
+                    implicit_leaves
+                        .insert(FunctionId::method(TypeId::local(&e.name), &variant.name));
                 }
             }
             Item::Interface(i) if i.type_params.is_empty() => {
@@ -687,6 +709,13 @@ pub(crate) fn solve_unit<N>(
             )
         })
         .collect();
+    let std_aliases: HashMap<_, _> = imports
+        .iter()
+        .filter_map(|(alias, path)| {
+            path.strip_prefix("std::")
+                .map(|module| (alias.clone(), module.to_owned()))
+        })
+        .collect();
     let mut problem = EffectProblem::new()
         .external_callee(PANIC)
         .unknown_callee(PANIC)
@@ -694,9 +723,13 @@ pub(crate) fn solve_unit<N>(
         .default_transmit(
             ANY_PANIC
                 .union(LOCK_EFFECT_WAIT)
-                .union(RuntimeEffects::MAY_ALLOCATE),
+                .union(RuntimeEffects::MAY_ALLOCATE)
+                .union(NO_PREEMPT),
         );
-    let mut own = HashSet::new();
+    let mut own = implicit_leaves;
+    for &id in &own {
+        problem = problem.seed(id, default_external(&id), None);
+    }
     let mut loops = HashSet::new();
     let mut loop_spans = HashMap::new();
     let mut loop_body_spans = HashMap::new();
@@ -704,6 +737,7 @@ pub(crate) fn solve_unit<N>(
     let mut copies = Vec::new();
     let mut may_io = HashSet::new();
     for (id, span) in foreign {
+        problem = problem.seed(id, NO_PREEMPT, Some(unknown_preemption()));
         problem = problem.seed(
             id,
             PANIC.union(RuntimeEffects::MAY_ALLOCATE),
@@ -754,6 +788,11 @@ pub(crate) fn solve_unit<N>(
                         summary.effects().intersection(LOCK_EFFECT_WAIT),
                         summary.witness(LOCK_EFFECT_WAIT).cloned(),
                     );
+                    problem = problem.seed(
+                        id,
+                        summary.effects().intersection(NO_PREEMPT),
+                        summary.witness(NO_PREEMPT).cloned(),
+                    );
                     if *has_loop {
                         loops.insert(id);
                         loop_bodies.insert(body_id);
@@ -767,6 +806,7 @@ pub(crate) fn solve_unit<N>(
                         // Without the declaring unit's facts, assume the
                         // unscanned body may panic, perform I/O and loop.
                         problem = problem.seed(id, PANIC.union(LOCK_EFFECT_WAIT), None);
+                        problem = problem.seed(id, NO_PREEMPT, Some(unknown_preemption()));
                         may_io.insert(id);
                         loops.insert(id);
                     }
@@ -865,7 +905,13 @@ pub(crate) fn solve_unit<N>(
     crate::query_stats::add(crate::query_stats::Counter::EffectInventory, visits);
     let mut edge_visits = 0;
     let mut helper_graph = CallGraph::default();
-    for &id in helpers.keys() {
+    let synchronous: HashSet<_> = graph
+        .ids()
+        .chain(own.iter())
+        .copied()
+        .filter(|id| callables.get(id) != Some(&true))
+        .collect();
+    for &id in &synchronous {
         let targets = graph
             .get(&id)
             .map(|sites| {
@@ -874,7 +920,7 @@ pub(crate) fn solve_unit<N>(
                     .iter()
                     .filter(|id| {
                         edge_visits += 1;
-                        helpers.contains_key(id)
+                        synchronous.contains(id)
                     })
                     .copied()
                     .collect()
@@ -891,7 +937,7 @@ pub(crate) fn solve_unit<N>(
         );
     }
     let cycles = crate::semantic::effects::cycle_members(&helper_graph, std::iter::empty());
-    for &id in helpers.keys() {
+    for &id in &synchronous {
         let reason = if loops.contains(&id) {
             Some(NonpreemptibleReason::Loop)
         } else if cycles.contains(&id) {
@@ -900,14 +946,17 @@ pub(crate) fn solve_unit<N>(
             None
         };
         if let Some(reason) = reason {
-            let span = loop_spans.get(&id).unwrap_or(&helpers[&id]);
+            let source = loop_spans
+                .get(&id)
+                .or_else(|| helpers.get(&id))
+                .map_or((0, 0, 0), |span| (span.file_id.0, span.start, span.end));
             problem = problem.seed(
                 id,
                 NO_PREEMPT,
                 Some(EffectWitness::Helper {
                     reason,
                     owner: id,
-                    source: (span.file_id.0, span.start, span.end),
+                    source,
                 }),
             );
         }
@@ -928,10 +977,16 @@ pub(crate) fn solve_unit<N>(
             .union(RuntimeEffects::MAY_ALLOCATE);
         if callables.get(id) == Some(&true) {
             mask = ANY_PANIC.union(RuntimeEffects::MAY_ALLOCATE);
-        } else if helpers.contains_key(id) {
+        } else {
             mask = mask.union(NO_PREEMPT);
         }
         problem = problem.transmit(*id, mask);
+    }
+    for (id, sites) in graph.iter() {
+        if !sites.targets.is_empty() {
+            own.insert(*id);
+            problem = problem.body(*id);
+        }
     }
     let mut classified = HashSet::new();
     let incremental = origins.is_some() && consumer.is_some();
@@ -971,6 +1026,7 @@ pub(crate) fn solve_unit<N>(
     }
     for (&caller, sites) in graph.iter() {
         if sites.has_unknown {
+            problem = problem.seed(caller, NO_PREEMPT, Some(unknown_preemption()));
             may_io.insert(caller);
         }
         for target in &sites.targets {
@@ -979,6 +1035,32 @@ pub(crate) fn solve_unit<N>(
                 io_callers.entry(*target).or_default().push(caller);
             }
             if !own.contains(target) && classified.insert(*target) {
+                let imported_callable = match (origins, consumer) {
+                    (Some((_, queries)), Some(unit)) => {
+                        queries.external_lock_callable(unit, target, &imports)
+                    }
+                    _ => None,
+                };
+                let summary = imported_callable.and_then(|(declaring, id, is_async)| {
+                    if is_async {
+                        return None;
+                    }
+                    origins.and_then(|(_, queries)| queries.effect_evidence(declaring, id))
+                });
+                let known_async = imported_callable.is_some_and(|(_, _, is_async)| is_async);
+                if let Some(summary) = summary {
+                    problem = problem.seed(
+                        *target,
+                        summary.effects().intersection(NO_PREEMPT),
+                        summary.witness(NO_PREEMPT).cloned(),
+                    );
+                } else if !known_async
+                    && intrinsic_effects(target).is_none()
+                    && crate::semantic::intrinsics::builtin_static_effects(target, &std_aliases)
+                        .is_none()
+                {
+                    problem = problem.seed(*target, NO_PREEMPT, Some(unknown_preemption()));
+                }
                 // Every unproved external call is conservatively IO-capable.
                 // Known runtime/stat/math intrinsics are the only pure leaves;
                 // filesystem, networking, printing and foreign calls fail closed.
@@ -991,9 +1073,8 @@ pub(crate) fn solve_unit<N>(
                 if external_io {
                     may_io.insert(*target);
                 }
-                if let (Some((_, queries)), Some(unit)) = (origins, consumer)
-                    && let Some((declaring, id, is_async)) =
-                        queries.external_lock_callable(unit, target, &imports)
+                if let Some((_, queries)) = origins
+                    && let Some((declaring, id, is_async)) = imported_callable
                     && !is_async
                 {
                     let evidence = queries.effect_evidence(declaring, id);
@@ -1414,7 +1495,7 @@ use crate::diagnostics::Span;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct TaskMethodCall {
-    pub(crate) callee: FunctionId,
+    pub(crate) callee: Option<FunctionId>,
     pub(crate) span: Span,
     pub(crate) diagnostic_index: usize,
 }
@@ -1836,7 +1917,7 @@ mod tests {
             );
             assert_eq!(
                 effects.helpers.contains_key(&id),
-                name == "helper_only",
+                name != "async_only",
                 "{name}"
             );
         }

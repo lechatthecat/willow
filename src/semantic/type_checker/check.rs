@@ -207,7 +207,8 @@ impl TypeChecker {
         self.register_std_imports(&program.imports);
         // Looping sync helpers indexed by `Class::method`, so a call through a
         // typed non-`self` receiver (`obj.heavy()`) in a task context is flagged
-        // E0810 — the AST-only ConcurrencyAnalyzer cannot resolve the receiver
+        // E0810 — typed call sites retain source spans for the complete effect graph.
+        // The AST-only ConcurrencyAnalyzer cannot resolve the receiver
         // type (willow-0a6k.2).
         // Helper effects depend on checked call resolution. Collect their
         // diagnostic sites while checking; solve and replay them afterward.
@@ -912,12 +913,33 @@ impl TypeChecker {
                                 unsupported_initialization: [crate::semantic::call_graph::UnsupportedInitialization::InjectedDefault].into(),
                                 virtual_calls: Default::default(),
                                 targets: Default::default(),
-                                has_unknown: true,
+                                has_unknown: !self.effect_inputs.edges.contains_key(&FunctionId::method(TypeId::local(&class.name), &method.name)),
                             },
                         );
                     }
                 }
             }
+        }
+        // Interface declarations are open to implementations in importing units.
+        // A module-local union is not a closed-world proof of the target set.
+        // Preserve this uncertainty even if this unit knows some implementations.
+        let mut interfaces = HashSet::new();
+        for interface in self.symbols.interfaces.values() {
+            for method in &interface.method_order {
+                interfaces.insert(FunctionId::method(
+                    TypeId::from_source_name(&interface.name),
+                    method,
+                ));
+            }
+        }
+        for id in interfaces {
+            graph.merge(
+                id,
+                CallSites {
+                    has_unknown: true,
+                    ..Default::default()
+                },
+            );
         }
         // Interface union/default edges are declaration facts, not call sites.
         for (id, targets) in &self.effect_inputs.edges {
@@ -1027,7 +1049,7 @@ impl TypeChecker {
                 self.push(diagnostic);
             }
         }
-        self.report_task_method_calls();
+        self.report_task_method_calls(&effects.facts);
         self.report_transitive_lock_effects(&effects.facts);
         self.report_indirect_lock_effects(&graph, &effects.facts);
     }
@@ -2228,7 +2250,7 @@ impl TypeChecker {
     /// Record resolution at the checked expression, while lexical bindings and
     /// receiver types are still available. Unknown is explicit for panic safety.
     fn record_resolved_call(&mut self, expr: &Expr) {
-        let targets = match expr {
+        let mut targets = match expr {
             Expr::Var(name, _, id)
                 if self.capture_call_sites
                     && self.symbols.lookup_var(name).is_none()
@@ -2294,7 +2316,78 @@ impl TypeChecker {
             )],
             _ => return,
         };
+        // A unit-local target set cannot close an extensible virtual slot:
+        // importing units may supply another override. Inspect the already
+        // resolved declarations, without another receiver ancestry walk.
+        let extensible_dispatch = if let Expr::MethodCall(call) = expr
+            && !self.is_super_receiver(&call.object)
+            && let Some(Type::Named(receiver) | Type::Generic(receiver, _)) =
+                self.expr_types.get(&call.object.id())
+            && self
+                .symbols
+                .lookup_class(receiver)
+                .is_some_and(|class| class.is_open)
+        {
+            targets.iter().any(|target| {
+                target
+                    .owner_type()
+                    .and_then(|owner| self.symbols.lookup_class(&owner.to_string()))
+                    .and_then(|class| class.methods.get(call.method.as_str()))
+                    .is_some_and(|method| method.is_open && !method.is_static && !method.is_async)
+            })
+        } else {
+            false
+        };
+        if extensible_dispatch {
+            // One shared, deliberately unresolved target preserves uncertainty
+            // in exported summaries and task-site unions alike. Do not taint
+            // the concrete method's own summary: super/direct calls are closed.
+            targets.push(FunctionId::free("$unresolved_virtual_dispatch"));
+        }
+        if self.local.current_async_context {
+            let callee = if targets.len() > 1 {
+                // Share one dispatch equation per receiver/method instead of
+                // retaining the entire fan-out at every task call site.
+                let Expr::MethodCall(call) = expr else {
+                    unreachable!("polymorphic method");
+                };
+                let receiver = self
+                    .expr_types
+                    .get(&call.object.id())
+                    .expect("checked receiver");
+                let union = FunctionId::free(format!(
+                    "$preemption${}::{}",
+                    type_name(receiver),
+                    call.method
+                ));
+                self.effect_inputs
+                    .edges
+                    .entry(union)
+                    .or_insert_with(|| targets.iter().copied().collect());
+                Some(union)
+            } else {
+                targets.first().copied()
+            };
+            self.task_method_calls
+                .push(crate::compiler_db::effects::TaskMethodCall {
+                    callee,
+                    span: expr.span(),
+                    diagnostic_index: self.errors.len(),
+                });
+        }
+        let indirect_before = self.indirect_lock.calls.len();
         self.record_indirect_uses(expr, &targets);
+        let indirect = self.indirect_lock.calls.len() != indirect_before;
+        // Runtime adapters may invoke function-valued arguments synchronously.
+        // Their bounded runtime ABI does not prove those callback bodies safe.
+        if indirect && !targets.is_empty() && self.local.current_async_context {
+            self.task_method_calls
+                .push(crate::compiler_db::effects::TaskMethodCall {
+                    callee: None,
+                    span: expr.span(),
+                    diagnostic_index: self.errors.len(),
+                });
+        }
         // Constructors always record them: E0842 refinement looks up each
         // call's panic fact by expression id (willow-ssl7.19).
         if self.capture_call_sites || self.local.in_constructor {
@@ -2363,7 +2456,7 @@ impl TypeChecker {
         let sites = self.resolved_calls.entry(caller).or_default();
         sites.unsupported_initialization.extend(unsupported);
         sites.virtual_calls.extend(virtual_call);
-        sites.has_unknown |= targets.is_empty();
+        sites.has_unknown |= targets.is_empty() || indirect || extensible_dispatch;
         sites.targets.extend(targets);
     }
 
@@ -3174,7 +3267,6 @@ impl TypeChecker {
         if let Some(ret) = self.check_frozen_map_method_call(obj_ty, m) {
             return ret;
         }
-        self.check_task_method_call(obj_ty, m);
 
         for callee in self.method_effect_ids(obj_ty, &m.method) {
             self.record_lock_effect_call(callee, m.span);

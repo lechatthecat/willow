@@ -8542,3 +8542,6 @@ mod loop_exit_arms_tests;
 
 #[cfg(test)]
 mod import_diagnostic_tests;
+
+#[cfg(test)]
+mod preemption_tests;

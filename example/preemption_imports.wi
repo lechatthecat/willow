@@ -1,0 +1,10 @@
+// A7: a synchronous imported summary crosses an alias and a local wrapper.
+import preemption_worker as worker;
+
+fn calculate(n: i64) -> i64 {
+    return worker::fib(n);
+}
+
+async fn main() {
+    println(calculate(10));
+}

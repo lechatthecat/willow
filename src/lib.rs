@@ -1543,8 +1543,10 @@ fn check_unit_concurrency(
     let by_path = dependencies.paths_for(program);
     let bindings = ModuleImportBindings::new(program, dependencies);
     let mut analyzer = semantic::ConcurrencyAnalyzer::new();
-    if let Some((_, target)) = local_helpers {
-        analyzer = analyzer.with_sync_stack_preemption(target.sync_stack_preemption);
+    if local_helpers.is_some() {
+        // Typed call-site diagnostics consume the complete effect graph.
+        // Keep the AST pass for async-reference and suspension checks only.
+        analyzer = analyzer.with_typed_preemption_checked();
     }
     // Retain one borrowed summary for each source binding for the analyzer run.
     let mut held = Vec::new();
@@ -3452,6 +3454,90 @@ mod frontend_phase_tests {
         .unwrap();
         assert_eq!(phase.error_count, 0);
         assert!(phase.checker.errors.is_empty());
+    }
+
+    #[test]
+    fn a7_imported_open_virtual_dispatch_is_unproven() {
+        #[derive(Default)]
+        struct Capture(Vec<diagnostics::Diagnostic>);
+        impl diagnostics::DiagnosticEmitter for Capture {
+            fn emit(
+                &mut self,
+                diagnostic: &diagnostics::Diagnostic,
+                _: &dyn diagnostics::source_map::SourceLookup,
+            ) -> std::io::Result<()> {
+                self.0.push(diagnostic.clone());
+                Ok(())
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("willow-a7-open-dispatch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let library = r#"
+pub open class Base {
+    pub open fn run(self, g: fn() -> i64) -> i64 { return 0; }
+}
+pub fn helper(x: Base, g: fn() -> i64) -> i64 { return x.run(g); }
+"#;
+        std::fs::write(root.join("library.wi"), library).unwrap();
+        let source = r#"
+import library;
+class Derived extends library::Base {
+    pub override fn run(self, g: fn() -> i64) -> i64 { return g(); }
+}
+fn answer() -> i64 { return 42; }
+async fn main() { println(library::helper(new Derived(), answer)); }
+"#;
+        let path = root.join("main.wi");
+        std::fs::write(&path, source).unwrap();
+        let mut results = Vec::new();
+        for native in [true, false] {
+            let mut inputs =
+                compiler_db::inputs::CompilerInputs::native(CompilerOptions::debug(), root.clone());
+            inputs.target.sync_stack_preemption = native;
+            let map = diagnostics::SourceMap::new(path.to_string_lossy(), source);
+            let mut capture = Capture::default();
+            let failed =
+                run_frontend_with_inputs(source, &root, &map, inputs, &mut capture).is_err();
+            results.push((native, failed, capture.0));
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        let summaries =
+            semantic::concurrency::compute_nonpreemptible_helpers(&parse_source(library));
+        assert_eq!(
+            summaries
+                .get(&semantic::ids::FunctionId::free("helper"))
+                .map(|h| h.reason),
+            Some(semantic::concurrency::NonpreemptibleReason::Unknown),
+            "the library summary must retain downstream dispatch uncertainty"
+        );
+        assert!(
+            !summaries.contains_key(&semantic::ids::FunctionId::method(
+                semantic::ids::TypeId::local("Base"),
+                "run"
+            )),
+            "a concrete body must not inherit virtual-slot uncertainty"
+        );
+        for (native, failed, errors) in results {
+            assert!(
+                failed,
+                "native={native}: downstream override was silently accepted"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|d| d.code == diagnostics::ErrorCode::E0810
+                        && d.message
+                            .contains("cannot prove preemptibility of `library::helper`")),
+                "native={native}: {errors:?}"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .all(|d| d.code == diagnostics::ErrorCode::E0810),
+                "native={native}: {errors:?}"
+            );
+        }
     }
 
     #[test]

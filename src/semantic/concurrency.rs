@@ -19,18 +19,21 @@ pub struct ConcurrencyReport {
 /// Why a synchronous helper cannot yield to the scheduler when it is called
 /// from a task context.
 ///
-/// The two reasons are reported differently because claiming a source loop
+/// The reasons are reported differently because claiming a source loop
 /// exists where there is only recursion sends the programmer looking for a
 /// `while` that is not there (§2.3 of the async completion spec).
 ///
 /// The declaration order is load-bearing: this is the witness type carried
 /// through [`crate::semantic::effects`], whose witnesses join by `min`, so
-/// `Loop` sorting first is what makes a helper that both loops and reaches
+/// `Unknown` must win even on native-stack targets; otherwise a loop witness
+/// could hide an unproven call. `Loop` precedes `Recursion`, so a helper that both loops and reaches
 /// recursion report as looping. The loop is visible in the helper's own body,
 /// so it is the more concrete thing to point at, and it keeps the long-standing
 /// wording for every program that was already rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NonpreemptibleReason {
+    /// The synchronous target or its preemption contract could not be proven.
+    Unknown,
     /// Contains, or transitively reaches, a synchronous loop.
     Loop,
     /// Belongs to, or transitively reaches, a recursive call cycle: direct self
@@ -42,6 +45,9 @@ impl NonpreemptibleReason {
     /// The E0810 headline for a call to `callee`.
     pub(crate) fn message(self, callee: &FunctionId) -> String {
         match self {
+            Self::Unknown => format!(
+                "cannot prove preemptibility of `{callee}` in task context: unresolved call target or unavailable preemption summary"
+            ),
             Self::Loop => {
                 format!("sync helper `{callee}` with a loop is not preemptible in task context")
             }
@@ -54,6 +60,9 @@ impl NonpreemptibleReason {
     /// Secondary label on the helper's own definition.
     pub(crate) fn helper_label(self) -> &'static str {
         match self {
+            Self::Unknown => {
+                "this helper reaches an unresolved call target or unavailable preemption summary"
+            }
             Self::Loop => "this helper contains or reaches a synchronous loop",
             Self::Recursion => "this helper is part of, or reaches, a recursive call cycle",
         }
@@ -63,6 +72,7 @@ impl NonpreemptibleReason {
     /// that the current diagnostic source map cannot render.
     pub(crate) fn module_note(self, callee: &FunctionId, module: &str) -> String {
         let what = match self {
+            Self::Unknown => "reaches an unresolved call target or unavailable preemption summary",
             Self::Loop => "contains or reaches a synchronous loop",
             Self::Recursion => "is part of, or reaches, a recursive call cycle",
         };
@@ -78,6 +88,10 @@ pub(crate) const NONPREEMPTIBLE_HELP: &str =
 /// Note attached to every E0810, so the rejection does not read as permanent
 /// language policy (§2.2.1 of the async completion spec).
 pub(crate) const NONPREEMPTIBLE_NOTE: &str = "this rejection is temporary: it is lifted once task-aware synchronous-stack preemption is supported on this target";
+
+pub(crate) const UNKNOWN_PREEMPTION_NOTE: &str = "the virtual/indirect target set or a callee's preemption summary is unavailable; native sync-stack support does not prove an unknown callee safe";
+pub(crate) const UNKNOWN_PREEMPTION_HELP: &str =
+    "use a resolved callable with an analyzed body or an explicit runtime preemption contract";
 
 /// A synchronous helper that cannot be preempted when called from a task
 /// context, with the reason and the span of its definition.
@@ -105,6 +119,7 @@ pub struct ConcurrencyAnalyzer {
     pub report: ConcurrencyReport,
     current_async_context: bool,
     sync_stack_preemption: bool,
+    typed_preemption_checked: bool,
     current_class: Option<TypeId>,
     nonpreemptible_sync_helpers: HashMap<FunctionId, SyncHelperRef>,
 }
@@ -120,6 +135,7 @@ impl Default for ConcurrencyAnalyzer {
             current_async_context: false,
             sync_stack_preemption: crate::compiler_db::inputs::TargetCapabilities::native()
                 .sync_stack_preemption,
+            typed_preemption_checked: false,
             current_class: None,
             nonpreemptible_sync_helpers: HashMap::new(),
         }
@@ -134,6 +150,12 @@ impl ConcurrencyAnalyzer {
     /// Select the target runtime capability independently of source effects.
     pub fn with_sync_stack_preemption(mut self, supported: bool) -> Self {
         self.sync_stack_preemption = supported;
+        self
+    }
+
+    /// Production checking diagnoses all typed call sites before this AST pass.
+    pub(crate) fn with_typed_preemption_checked(mut self) -> Self {
+        self.typed_preemption_checked = true;
         self
     }
 
@@ -396,13 +418,16 @@ impl ConcurrencyAnalyzer {
     }
 
     fn check_task_sync_helper_call(&mut self, callee: &FunctionId, call_span: Span) {
-        if self.sync_stack_preemption || !self.current_async_context {
+        if self.typed_preemption_checked || !self.current_async_context {
             return;
         }
         let Some(helper) = self.nonpreemptible_sync_helpers.get(callee) else {
             return;
         };
         let reason = helper.reason;
+        if self.sync_stack_preemption && reason != NonpreemptibleReason::Unknown {
+            return;
+        }
         let diagnostic =
             Diagnostic::new(Severity::Error, ErrorCode::E0810, reason.message(callee)).with_label(
                 Label::primary(call_span, "this call can monopolize the scheduler worker"),
@@ -414,11 +439,16 @@ impl ConcurrencyAnalyzer {
             Some(module) => diagnostic.with_note(reason.module_note(callee, module)),
             None => diagnostic.with_label(Label::secondary(helper.span, reason.helper_label())),
         };
-        self.errors.push(
-            diagnostic
-                .with_note(NONPREEMPTIBLE_NOTE)
-                .with_help(NONPREEMPTIBLE_HELP),
-        );
+        self.errors
+            .push(if reason == NonpreemptibleReason::Unknown {
+                diagnostic
+                    .with_note(UNKNOWN_PREEMPTION_NOTE)
+                    .with_help(UNKNOWN_PREEMPTION_HELP)
+            } else {
+                diagnostic
+                    .with_note(NONPREEMPTIBLE_NOTE)
+                    .with_help(NONPREEMPTIBLE_HELP)
+            });
     }
 }
 
@@ -471,7 +501,10 @@ mod tests {
                     ..program
                 };
                 let helpers = compute_nonpreemptible_helpers(&program);
-                assert!(helpers.is_empty());
+                assert_eq!(
+                    helpers[&FunctionId::free("wrapper")].reason,
+                    NonpreemptibleReason::Unknown
+                );
                 let Item::Function(mut function) = program.items.into_iter().next().unwrap() else {
                     unreachable!()
                 };
@@ -874,11 +907,13 @@ async fn run() { println(wrapper()); }
 fn main() {}
 "#,
         );
+        assert_eq!(analyzer.errors.len(), 1, "{:?}", analyzer.errors);
         assert!(
-            analyzer.errors.is_empty(),
-            "the indirect local call must not create an edge to the shadowed loop helper: {:#?}",
-            analyzer.errors
+            analyzer.errors[0]
+                .message
+                .contains("cannot prove preemptibility")
         );
+        assert!(!analyzer.errors[0].message.contains("with a loop"));
     }
 
     #[test]
@@ -1930,10 +1965,19 @@ fn add_one(n: i64) -> i64 {
         let source = format!(
             "fn heavy(n: i64) -> i64 {{\n    let mut i = 0;\n    while i < n {{\n        i = i + 1;\n    }}\n    return i;\n}}\n\n{wrapper}\n\nasync fn run() -> i64 {{\n    return wrapper(10);\n}}\n"
         );
+        let graph = crate::semantic::TypeChecker::resolved_effect_graph(&parse(&source));
+        let sites = graph.get(&FunctionId::free("wrapper")).unwrap();
+        // Preserve the original scope-resolution assertion even when an
+        // indirect call adds the stronger, target-independent rejection.
+        assert!(sites.targets.contains(&FunctionId::free("heavy")));
         assert_error_contains(
             &source,
             ErrorCode::E0810,
-            "sync helper `wrapper` with a loop is not preemptible in task context",
+            if sites.has_unknown {
+                "cannot prove preemptibility of `wrapper`"
+            } else {
+                "sync helper `wrapper` with a loop is not preemptible in task context"
+            },
         );
     }
 
@@ -2234,11 +2278,13 @@ async fn run() -> i64 {
 }
 "#,
         );
+        assert_eq!(analyzer.errors.len(), 1, "{:?}", analyzer.errors);
         assert!(
-            analyzer.errors.is_empty(),
-            "the parameter makes the call indirect: {:#?}",
-            analyzer.errors
+            analyzer.errors[0]
+                .message
+                .contains("cannot prove preemptibility")
         );
+        assert!(!analyzer.errors[0].message.contains("with a loop"));
     }
 
     /// A `for` binding shadows only inside the loop, and the walk's scope stack
