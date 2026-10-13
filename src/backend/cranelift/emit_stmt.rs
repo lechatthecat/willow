@@ -83,14 +83,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Rebind the hidden frame operands: coop loop bodies restore
                 // `vars`, wiping the names between registration and a
                 // function-exit flush (willow-vynv.3).
-                for (name, offset, ty) in &entry.bindings {
-                    self.vars.insert(
-                        name.clone(),
-                        VarStorage::Frame {
-                            offset: *offset,
-                            ty: ty.clone(),
-                        },
-                    );
+                for (name, storage) in &entry.bindings {
+                    self.vars.insert(name.clone(), storage.clone());
                 }
                 // Async: leave REGISTERED before entering user cleanup code.
                 // A future recoverable panic may unwind out of that code; if
@@ -712,14 +706,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .store(MemFlagsData::new(), zero, frame, offset);
             }
             self.vars = entry.vars_at_registration.clone();
-            for (name, offset, ty) in &entry.bindings {
-                self.vars.insert(
-                    name.clone(),
-                    VarStorage::Frame {
-                        offset: *offset,
-                        ty: ty.clone(),
-                    },
-                );
+            for (name, storage) in &entry.bindings {
+                self.vars.insert(name.clone(), storage.clone());
             }
 
             self.emit_void_runtime_call("willow_panic_enter_defer", &[]);

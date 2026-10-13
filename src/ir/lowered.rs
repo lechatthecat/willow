@@ -203,6 +203,8 @@ pub enum LirStorageKind {
     #[default]
     Value,
     GcOwner,
+    /// An async borrowed parameter stores a traced owner and scalar offset.
+    ReferenceCell,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1396,6 +1398,9 @@ impl Builder {
                 false,
                 true,
             );
+            if is_async && param.by_reference {
+                builder.locals.last_mut().unwrap().storage_kind = LirStorageKind::ReferenceCell;
+            }
         }
         builder
     }

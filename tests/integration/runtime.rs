@@ -114,3 +114,6 @@ mod type_visibility;
 mod virtual_dispatch;
 #[path = "runtime/virtual_error_conversion.rs"]
 mod virtual_error_conversion;
+
+#[path = "runtime/async_scalar_references.rs"]
+mod async_scalar_references;

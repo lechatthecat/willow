@@ -7,17 +7,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         callee: crate::semantic::ids::FunctionId,
         args: &[Value],
-        params: &[Type],
         span: crate::diagnostics::Span,
     ) -> Value {
-        let mut roots = 0;
-        for (&value, ty) in args.iter().zip(params) {
-            if is_gc_managed(ty, self.enum_infos) {
-                // The task constructor alone consumes the arguments.
-                self.emit_push_call_root(value);
-                roots += 1;
-            }
-        }
         let fid = *self
             .func_ids
             .get_id(&callee)
@@ -30,8 +21,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if pushed {
             self.emit_callstack_pop();
         }
-        self.emit_pop_roots_n(roots);
-        self.gc_root_count -= roots;
         self.emit_post_willow_call_panic_check(depth);
         let id = self.builder.ins().load(
             types::I64,

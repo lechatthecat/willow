@@ -1230,7 +1230,7 @@ pub(super) struct DeferEntry {
     action: DeferredAction,
     flag_offset: Option<i32>,
     sync_flag_slot: Option<cranelift_codegen::ir::StackSlot>,
-    bindings: Vec<(String, i32, Type)>,
+    bindings: Vec<(String, VarStorage)>,
     vars_at_registration: HashMap<String, VarStorage>,
     /// The deferred body contains a direct call to the compiler-known
     /// `recover()` builtin. Calls hidden behind another function/lambda do not
@@ -1391,7 +1391,7 @@ pub(super) struct AsyncLockSite {
 pub(super) struct AsyncDeferSite {
     action: DeferredAction,
     flag_offset: i32,
-    bindings: Vec<(String, i32, Type)>,
+    bindings: Vec<(String, VarStorage)>,
     recovery_capable: bool,
     /// Position in the function's cleanup sequence, shared with
     /// [`AsyncLockSite::order`] so the cancel entry can interleave the two
@@ -1637,6 +1637,12 @@ enum VarStorage {
         var: Variable,
         ty: Type,
     },
+    /// A copied {owner, offset} cell in the stable async frame. Only the
+    /// owner word is traced; each access derives the current target address.
+    FrameReference {
+        offset: i32,
+        ty: Type,
+    },
     /// A slot inside the heap async frame (willow-lpn.5a). `offset` is the byte
     /// offset of the slot from the frame base; the frame base lives in
     /// `FuncGen.async_frame`. Used for values that must survive `await`.
@@ -1644,6 +1650,22 @@ enum VarStorage {
         offset: i32,
         ty: Type,
     },
+}
+
+impl VarStorage {
+    fn async_local(local: &crate::ir::lowered::LirLocal, offset: i32) -> Self {
+        if local.storage_kind == crate::ir::lowered::LirStorageKind::ReferenceCell {
+            Self::FrameReference {
+                offset,
+                ty: local.ty.clone(),
+            }
+        } else {
+            Self::Frame {
+                offset,
+                ty: local.ty.clone(),
+            }
+        }
+    }
 }
 
 /// Async-frame layout constants — must match `crates/willow_runtime/src/async_frame.rs`
@@ -1859,6 +1881,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     0,
                 )
             }
+            VarStorage::FrameReference { offset, ty } => {
+                let cell = self.frame_reference_cell(*offset);
+                let address = self.reference_cell_value_address(cell);
+                let clif_ty = self.clif_type(ty);
+                self.builder
+                    .ins()
+                    .load(clif_ty, MemFlagsData::new(), address, 0)
+            }
             VarStorage::Frame { offset, ty } => {
                 let base = self
                     .async_frame
@@ -1884,6 +1914,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let ptr = self.reference_cell_address(*var);
                 self.store_indirect_reference(ptr, val, ty);
             }
+            VarStorage::FrameReference { offset, ty } => {
+                let cell = self.frame_reference_cell(*offset);
+                let address = self.reference_cell_value_address(cell);
+                self.store_indirect_reference(address, val, ty);
+            }
             VarStorage::Frame { offset, ty } => {
                 let base = self
                     .async_frame
@@ -1898,8 +1933,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// base slot, so a moving collection rewrites it; deriving the address at
     /// each access means no interior pointer is held across a GC point.
     fn reference_cell_address(&mut self, cell: Variable) -> cranelift_codegen::ir::Value {
-        let ptr_ty = reference_type(self.module.target_config());
         let cell = self.builder.use_var(cell);
+        self.reference_cell_value_address(cell)
+    }
+
+    fn frame_reference_cell(&mut self, offset: i32) -> cranelift_codegen::ir::Value {
+        self.builder.ins().iadd_imm_s(
+            self.async_frame.expect("reference frame"),
+            i64::from(offset),
+        )
+    }
+
+    fn reference_cell_value_address(
+        &mut self,
+        cell: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_ty = reference_type(self.module.target_config());
         let base = self
             .builder
             .ins()
@@ -2306,8 +2355,11 @@ impl AsyncFrameLayout {
         let mut gc_payload_bitmap =
             vec![0u64; (slots.len() + ASYNC_FRAME_HEADER_WORDS).div_ceil(64)];
         for (k, slot) in slots.iter().enumerate() {
-            if slot.storage_kind == crate::ir::lowered::LirStorageKind::GcOwner
-                || (!option_repr::is_scalar_pair(&slot.ty) && is_gc_managed(&slot.ty, enum_infos))
+            if matches!(
+                slot.storage_kind,
+                crate::ir::lowered::LirStorageKind::GcOwner
+                    | crate::ir::lowered::LirStorageKind::ReferenceCell
+            ) || (!option_repr::is_scalar_pair(&slot.ty) && is_gc_managed(&slot.ty, enum_infos))
             {
                 let word = k + ASYNC_FRAME_HEADER_WORDS;
                 gc_payload_bitmap[word / 64] |= 1 << (word % 64);
@@ -2318,9 +2370,12 @@ impl AsyncFrameLayout {
             .take(ASYNC_FRAME_GC_SLOT_CAPACITY)
             .enumerate()
             .fold(0u64, |mask, (k, slot)| {
-                if slot.storage_kind == crate::ir::lowered::LirStorageKind::GcOwner
-                    || (!option_repr::is_scalar_pair(&slot.ty)
-                        && is_gc_managed(&slot.ty, enum_infos))
+                if matches!(
+                    slot.storage_kind,
+                    crate::ir::lowered::LirStorageKind::GcOwner
+                        | crate::ir::lowered::LirStorageKind::ReferenceCell
+                ) || (!option_repr::is_scalar_pair(&slot.ty)
+                    && is_gc_managed(&slot.ty, enum_infos))
                 {
                     mask | (1u64 << k)
                 } else {

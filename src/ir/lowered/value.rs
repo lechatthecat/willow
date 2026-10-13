@@ -378,6 +378,7 @@ impl LirRvalue {
                     | Self::MethodCall { .. }
                     | Self::StaticCall { .. }
                     | Self::ConstructorCall { .. }
+                    | Self::StartTask { .. }
                     | Self::ReferenceDebug { .. }
             )
         {

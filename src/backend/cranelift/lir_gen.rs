@@ -1663,6 +1663,7 @@ fn lir_reference_scope_entries(
                 LirInst::Compute {
                     value:
                         V::DirectCall { args, .. }
+                        | V::StartTask { args, .. }
                         | V::StaticCall { args, .. }
                         | V::MethodCall { args, .. }
                         | V::ConstructorCall { args, .. },
@@ -5444,13 +5445,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn bind_coop_lir_locals(&mut self, f: &LirFunction) {
         for local in &f.locals {
             if let Some(offset) = self.lir_frame_offsets.get(&local.id).copied() {
-                self.vars.insert(
-                    local.name.clone(),
-                    VarStorage::Frame {
-                        offset,
-                        ty: local.ty.clone(),
-                    },
-                );
+                self.vars
+                    .insert(local.name.clone(), VarStorage::async_local(local, offset));
             }
         }
     }
@@ -6417,8 +6413,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                 .vars
                                 .iter()
                                 .filter_map(|(name, storage)| match storage {
-                                    VarStorage::Frame { offset, ty } => {
-                                        Some((name.clone(), *offset, ty.clone()))
+                                    VarStorage::Frame { .. }
+                                    | VarStorage::FrameReference { .. } => {
+                                        Some((name.clone(), storage.clone()))
                                     }
                                     _ => None,
                                 })
@@ -6908,7 +6905,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .vars
                 .iter()
                 .filter_map(|(name, storage)| match storage {
-                    VarStorage::Frame { offset, ty } => Some((name.clone(), *offset, ty.clone())),
+                    VarStorage::Frame { .. } | VarStorage::FrameReference { .. } => {
+                        Some((name.clone(), storage.clone()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -7289,17 +7288,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     });
                 self.builder.ins().iconst(types::I8, 0)
             }
-            LirRvalue::StartTask {
-                callee,
-                args,
-                params,
-                ..
-            } => {
-                let args: Vec<_> = args
+            LirRvalue::StartTask { callee, args, .. } => {
+                let has_references = args
                     .iter()
-                    .map(|arg| self.emit_lir_operand(function, arg))
-                    .collect();
-                self.emit_flat_start_task(*callee, &args, params, span)
+                    .any(|arg| matches!(arg, crate::ir::lowered::LirOperand::Reference { .. }));
+                let (args, roots) = self.emit_flat_call_operands(function, args);
+                let result = self.emit_flat_start_task(*callee, &args, span);
+                self.emit_pop_roots_n(roots);
+                self.gc_root_count -= roots;
+                if has_references {
+                    self.emit_flat_reference_call_end();
+                }
+                result
             }
             LirRvalue::AwaitFuture { future, result } => {
                 let future = self.emit_lir_operand(function, future);
@@ -9157,11 +9157,11 @@ fn flat_rvalue_supported(
     if value.operands().iter().any(|operand| matches!(operand, crate::ir::lowered::LirOperand::Reference { place, .. } if !flat_reference_place_supported(place, locals, ctx))) { return false; }
     match value {
         V::ReferenceDebug { argument, .. } => matches!(argument, crate::ir::lowered::LirOperand::Reference { place, .. } if flat_reference_place_supported(place, locals, ctx)),
-        V::StartTask { callee, params, output, .. } => ctx.cooperative_leaves.contains(&ctx.fn_types.scope().resolve(callee))
+        V::StartTask { callee, args, params, output, .. } => ctx.cooperative_leaves.contains(&ctx.fn_types.scope().resolve(callee))
             && (ctx.known_fn_id)(callee)
             && ctx.supported_type(output) && params.iter().all(|ty| ctx.supported_type(ty))
             && ctx.fn_types.get_id(callee).is_some_and(|signature| matches!(signature, Type::Fn(declared, result) if declared.len() == params.len() && declared.iter().zip(params).all(|(expected, actual)| ctx.same_repr(expected, actual)) && builtin_types::unary_arg(result, B::Task).is_some_and(|payload| ctx.same_repr(payload, output))))
-            && ctx.func_param_modes.get_id(callee).is_none_or(|modes| modes.iter().all(|mode| matches!(mode, ParamMode::Value))),
+            && flat_argument_modes_match(args, ctx.func_param_modes.get_id(callee).map(Vec::as_slice).unwrap_or(&[])),
         V::AwaitFuture { result, .. } => ctx.supported_type(result),
         V::SelectIdleWait { .. } => true,
         V::PrepareMethod { receiver_ty, method, .. } => flat_method_signature(receiver_ty, method, ctx).is_some(),
@@ -9481,10 +9481,7 @@ impl FuncGen<'_, '_> {
             let offset = self.lir_frame_offsets[&id];
             self.vars.insert(
                 binding.name.clone(),
-                VarStorage::Frame {
-                    offset,
-                    ty: binding.ty.clone(),
-                },
+                VarStorage::async_local(binding, offset),
             );
             #[cfg(test)]
             super::async_codegen::count_callback_binding();

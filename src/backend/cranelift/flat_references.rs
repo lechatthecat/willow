@@ -74,9 +74,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                     // Forward the caller's cell; its base is rooted there.
                     VarStorage::ReferencePtr { var, .. } => return self.builder.use_var(var),
-                    // Async frames are runtime allocations the function keeps
-                    // using through its stable `async_frame` value; root the
-                    // frame like any other base so the cell has one contract.
+                    // Async reference cells already live in a traced, stable frame.
+                    VarStorage::FrameReference { offset, .. } => {
+                        return self.frame_reference_cell(offset);
+                    }
+                    // Root the frame owner when borrowing an ordinary local slot.
                     VarStorage::Frame { offset, .. } => {
                         let frame = self.async_frame.expect("frame place");
                         let offset = self.builder.ins().iconst(ptr, i64::from(offset));

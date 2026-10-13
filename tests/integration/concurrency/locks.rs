@@ -585,10 +585,10 @@ fn main() {
 }
 
 #[test]
-fn test_async_immutable_reference_parameter_reports_e1707() {
+fn test_async_nonscalar_reference_parameter_reports_e1707() {
     assert_compile_error_contains(
         r#"
-async fn read(x: & i64) -> i64 {
+async fn read(x: & String) -> String {
     return x;
 }
 

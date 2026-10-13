@@ -87,8 +87,7 @@ fn stable_borrow_parameters_shadowing_and_mutation() {
 
 #[test]
 fn stable_borrow_async_callee_planning_and_artifact() {
-    // B2 exercises lower IR directly. E1707 remains the public frontend gate
-    // until the async-reference parameter ABI lands in B3.
+    // B2/B3 retain the caller storage proof independently of native emission.
     let p = program(
         "async fn read(value: &i64) -> i64 { await sleep(0); return value; } async fn main() { let x = 42; let task = read(&x); await sleep(0); println(await task); }",
     );

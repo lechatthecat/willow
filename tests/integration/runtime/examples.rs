@@ -378,6 +378,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/lambda_context.wi", "20\n12\n12\nyes\n"),
         ("example/async_reference_escape_rejected.wi", "42\n"),
+        ("example/async_scalar_reference.wi", "42\n2.5\ntrue\n"),
+        ("example/stable_borrowed_scalars.wi", "42\n4.25\ntrue\n"),
+        ("example/generic_import_usage.wi", "7\n7\n7\n"),
+        ("example/mutable_captures.wi", "2\n"),
         ("example/lazy_task_stack.wi", "cleanup\n210\n"),
         (
             "example/reference_width.wi",
@@ -1594,4 +1598,22 @@ fn test_gc_old_cycle_example() {
     let (out, ok) = compile_file_and_run("example/gc_old_cycle.wi");
     assert!(ok, "{out}");
     assert_eq!(out, "499500\n499500\n499500\n");
+}
+
+#[test]
+fn test_async_scalar_reference_catalog_entries() {
+    for path in [
+        "example/async_scalar_reference.wi",
+        "example/stable_borrowed_scalars.wi",
+        "example/generic_import_usage.wi",
+        "example/mutable_captures.wi",
+    ] {
+        let (_, expected) = runnable_example_cases()
+            .iter()
+            .find(|(entry, _)| *entry == path)
+            .unwrap();
+        let (out, ok) = compile_file_and_run(path);
+        assert!(ok, "{path}: {out}");
+        assert_eq!(out, *expected, "{path}");
+    }
 }

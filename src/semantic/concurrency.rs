@@ -366,6 +366,9 @@ impl ConcurrencyAnalyzer {
     fn check_async_reference_params(&mut self, context: &str, owner_span: Span, params: &[Param]) {
         for param in params {
             if let ParamMode::Reference { mutable, .. } = &param.mode {
+                if !*mutable && matches!(param.ty, Type::I64 | Type::F64 | Type::Bool) {
+                    continue;
+                }
                 let mode = if *mutable { "&mut" } else { "&" };
                 self.errors.push(
                     Diagnostic::new(
@@ -644,10 +647,10 @@ async fn update(x: &mut i64) {
     }
 
     #[test]
-    fn rejects_immutable_reference_parameter_in_async_function() {
+    fn rejects_nonscalar_reference_parameter_in_async_function() {
         assert_error_contains(
             r#"
-async fn read(x: & i64) -> i64 {
+async fn read(x: & String) -> String {
     return x;
 }
 "#,

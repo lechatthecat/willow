@@ -1,6 +1,6 @@
 //! Conservative lexical discharge proof for tasks holding reference arguments.
-//! E1707 remains the declaration gate; this pass runs after it so a future
-//! relaxation cannot silently permit task escape.
+//! Shared scalar declarations are supported; this pass still rejects task
+//! escape independently of the declaration restrictions for other references.
 use std::collections::{HashMap, HashSet};
 
 use super::builtin_types::{self, BuiltinTypeId};

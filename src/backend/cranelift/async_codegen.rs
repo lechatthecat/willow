@@ -119,6 +119,16 @@ impl UnitCodegenContext<'_> {
     ) -> Result<LirAsyncLayoutPlan> {
         // Metadata records physical words. Expand once, retaining an index for
         // each logical reserved slot so parameter placement stays linear.
+        for (index, local) in lir
+            .locals
+            .iter()
+            .filter(|local| local.parameter)
+            .enumerate()
+        {
+            if local.storage_kind == crate::ir::lowered::LirStorageKind::ReferenceCell {
+                reserved[first_parameter_slot + index].storage_kind = local.storage_kind;
+            }
+        }
         let mut reserved_indices = Vec::with_capacity(reserved.len());
         let logical_reserved = std::mem::take(&mut reserved);
         let split_result = logical_reserved
@@ -133,8 +143,9 @@ impl UnitCodegenContext<'_> {
                 reserved.push(AsyncFrameSlot::scalar_padding());
             }
             reserved_indices.push(reserved.len());
-            let pair = slot.storage_kind != crate::ir::lowered::LirStorageKind::GcOwner
-                && self.is_inline_pair(&slot.ty);
+            let pair = slot.storage_kind == crate::ir::lowered::LirStorageKind::ReferenceCell
+                || (slot.storage_kind != crate::ir::lowered::LirStorageKind::GcOwner
+                    && self.is_inline_pair(&slot.ty));
             reserved.push(slot);
             if split_result && index == 0 {
                 // Slot one is fixed by the task ABI. Main has no task-id slot,
@@ -385,11 +396,17 @@ impl UnitCodegenContext<'_> {
         self.record_async_frame_size_warning(&f.name, f.span, &layout);
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
-        let param_bindings: Vec<(String, i32, Type)> = f
-            .params
+        let param_bindings: Vec<_> = lir
+            .locals
             .iter()
+            .filter(|local| local.parameter)
             .enumerate()
-            .map(|(i, p)| (p.name.clone(), parameter_offsets[i], p.ty.clone().into()))
+            .map(|(i, local)| {
+                (
+                    local.name.clone(),
+                    VarStorage::async_local(local, parameter_offsets[i]),
+                )
+            })
             .collect();
 
         self.compile_coop_main_driver(
@@ -513,11 +530,17 @@ impl UnitCodegenContext<'_> {
             FRAME_SLOT_TASK_ID,
             reference_type(self.output.module.target_config()).bytes(),
         );
-        let param_bindings: Vec<(String, i32, Type)> = f
-            .params
+        let param_bindings: Vec<_> = lir
+            .locals
             .iter()
+            .filter(|local| local.parameter)
             .enumerate()
-            .map(|(i, p)| (p.name.clone(), parameter_offsets[i], p.ty.clone().into()))
+            .map(|(i, local)| {
+                (
+                    local.name.clone(),
+                    VarStorage::async_local(local, parameter_offsets[i]),
+                )
+            })
             .collect();
 
         // Constructor = the fn's public symbol: alloc frame, store args into the
@@ -526,7 +549,11 @@ impl UnitCodegenContext<'_> {
         let mut ctx = self.output.module.make_context();
         let mut sig = self.output.module.make_signature();
         for p in &f.params {
-            sig.params.push(AbiParam::new(self.clif_type(&p.ty)));
+            sig.params.push(AbiParam::new(param_abi_type(
+                p,
+                reference_type(self.output.module.target_config()),
+                self.classes(),
+            )));
         }
         sig.returns.push(AbiParam::new(reference_type(
             self.output.module.target_config(),
@@ -552,6 +579,24 @@ impl UnitCodegenContext<'_> {
         for (i, p) in f.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i];
             let off = parameter_offsets[i];
+            if matches!(p.mode, ParamMode::Reference { .. }) {
+                let ptr_ty = reference_type(self.output.module.target_config());
+                let base = builder.ins().load(ptr_ty, MemFlagsData::new(), arg, 0);
+                let offset = builder.ins().load(ptr_ty, MemFlagsData::new(), arg, 8);
+                emit_gc_heap_store_raw(
+                    &mut builder,
+                    Some(barrier_ref),
+                    frame,
+                    off,
+                    base,
+                    GcStoreDestination::AsyncFrameSlot,
+                    MemFlagsData::trusted(),
+                );
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), offset, frame, off + 8);
+                continue;
+            }
             emit_gc_heap_store_raw(
                 &mut builder,
                 (!super::option_repr::is_scalar_pair(&p.ty)
@@ -761,21 +806,18 @@ impl UnitCodegenContext<'_> {
 
         let self_offset = self_offset.map(|_| parameter_offsets[0]);
         let param_base = usize::from(!m.is_static);
-        let mut param_bindings: Vec<(String, i32, Type)> = Vec::new();
-        if let Some(offset) = self_offset {
-            param_bindings.push((
-                "self".to_string(),
-                offset,
-                Type::Named(class_name.to_string().into()),
-            ));
-        }
-        param_bindings.extend(m.params.iter().enumerate().map(|(i, p)| {
-            (
-                p.name.clone(),
-                parameter_offsets[param_base + i],
-                p.ty.clone().into(),
-            )
-        }));
+        let param_bindings: Vec<_> = lir
+            .locals
+            .iter()
+            .filter(|local| local.parameter)
+            .enumerate()
+            .map(|(i, local)| {
+                (
+                    local.name.clone(),
+                    VarStorage::async_local(local, parameter_offsets[i]),
+                )
+            })
+            .collect();
 
         let ctor_fid = self.func_ids[mangled];
         let mut ctx = self.output.module.make_context();
@@ -823,6 +865,24 @@ impl UnitCodegenContext<'_> {
         for (i, p) in m.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i + 1];
             let off = parameter_offsets[param_base + i];
+            if matches!(p.mode, ParamMode::Reference { .. }) {
+                let ptr_ty = reference_type(self.output.module.target_config());
+                let base = builder.ins().load(ptr_ty, MemFlagsData::new(), arg, 0);
+                let offset = builder.ins().load(ptr_ty, MemFlagsData::new(), arg, 8);
+                emit_gc_heap_store_raw(
+                    &mut builder,
+                    Some(barrier_ref),
+                    frame,
+                    off,
+                    base,
+                    GcStoreDestination::AsyncFrameSlot,
+                    MemFlagsData::trusted(),
+                );
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), offset, frame, off + 8);
+                continue;
+            }
             emit_gc_heap_store_raw(
                 &mut builder,
                 (!super::option_repr::is_scalar_pair(&p.ty)
@@ -1145,7 +1205,7 @@ impl UnitCodegenContext<'_> {
         f: &FunctionDecl,
         offsets: HashMap<crate::diagnostics::Span, i32>,
         lir_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
-        param_bindings: &[(String, i32, Type)],
+        param_bindings: &[(String, VarStorage)],
         body: CoopPollBody<'_>,
     ) -> Result<(Vec<AsyncDeferSite>, Vec<AsyncLockSite>)> {
         if body.boundary.is_none() && body.cleanup.is_none() {
@@ -1223,9 +1283,9 @@ impl UnitCodegenContext<'_> {
                         .locals
                         .iter()
                         .filter_map(|local| {
-                            lir_offsets
-                                .get(&local.id)
-                                .map(|offset| (local.name.clone(), *offset, local.ty.clone()))
+                            lir_offsets.get(&local.id).map(|offset| {
+                                (local.name.clone(), VarStorage::async_local(local, *offset))
+                            })
                         })
                         .collect();
                     for recovery in [false, true] {
@@ -1416,14 +1476,8 @@ impl UnitCodegenContext<'_> {
             };
             // Bind params from their frame slots (cooperative leaf, slice 4b):
             // the constructor stored the args there before spawning.
-            for (name, offset, ty) in param_bindings {
-                fg.vars.insert(
-                    name.clone(),
-                    VarStorage::Frame {
-                        offset: *offset,
-                        ty: ty.clone(),
-                    },
-                );
+            for (name, storage) in param_bindings {
+                fg.vars.insert(name.clone(), storage.clone());
             }
             fg.builder.switch_to_block(body_start);
             fg.fault_site_span = Some(f.span);
@@ -1689,14 +1743,8 @@ impl UnitCodegenContext<'_> {
                 }
 
                 let site = &sites[index];
-                for (name, offset, ty) in &site.bindings {
-                    fg.vars.insert(
-                        name.clone(),
-                        VarStorage::Frame {
-                            offset: *offset,
-                            ty: ty.clone(),
-                        },
-                    );
+                for (name, storage) in &site.bindings {
+                    fg.vars.insert(name.clone(), storage.clone());
                 }
                 let flag =
                     fg.builder
@@ -2570,8 +2618,60 @@ mod task_boundary_callback_tests {
         let lir = crate::ir::lowered::lower_program(&hir).functions.remove(0);
         let mut backend = Codegen::for_tests(&crate::CompilerOptions::debug()).unwrap();
         let codegen = backend.declaration_context();
-        let (layout, offsets, _, _) = codegen.lir_async_layout(&lir, Vec::new(), 0).unwrap();
+        let reserved = lir
+            .locals
+            .iter()
+            .filter(|local| local.parameter)
+            .map(|local| AsyncFrameSlot {
+                storage_kind: local.storage_kind,
+                source_span: local.source_span,
+                name: local.name.clone(),
+                ty: local.ty.clone(),
+            })
+            .collect();
+        let (layout, offsets, _, _) = codegen.lir_async_layout(&lir, reserved, 0).unwrap();
         (lir, layout, offsets)
+    }
+
+    #[test]
+    fn async_scalar_reference_frame_scaling() {
+        for count in [1, 8, 64, 128] {
+            let params = (0..count)
+                .map(|i| format!("p{i}: &i64"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source = format!("async fn read({params}) -> i64 {{ await sleep(1); return p0; }}");
+            let (lir, layout, offsets) = print_frame_layout(&source);
+            let parameters: Vec<_> = lir.locals.iter().filter(|local| local.parameter).collect();
+            assert_eq!(parameters.len(), count);
+            for (i, local) in parameters.iter().enumerate() {
+                assert_eq!(
+                    local.storage_kind,
+                    crate::ir::lowered::LirStorageKind::ReferenceCell
+                );
+                assert_eq!(offsets[&local.id], async_frame_slot_offset(2 * i, 8));
+                assert!(layout.slot_is_gc_ref(2 * i));
+                assert!(!layout.slot_is_gc_ref(2 * i + 1));
+            }
+            assert_eq!(
+                layout
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.storage_kind
+                        == crate::ir::lowered::LirStorageKind::ReferenceCell)
+                    .count(),
+                count
+            );
+            println!(
+                "references={count} parameter_words={} traced_owners={count}",
+                2 * count
+            );
+            let encoded = serde_json::to_vec(&lir).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<LirFunction>(&encoded).unwrap(),
+                lir
+            );
+        }
     }
 
     #[test]
