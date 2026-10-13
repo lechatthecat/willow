@@ -268,13 +268,19 @@ struct MapData {
     /// by insertion barriers and must not extend this epoch's finite scan.
     scan_limit: usize,
     key_bytes: usize,
+    native_table_bytes: usize,
 }
 
 impl crate::native_memory::Footprint for MapData {
     fn native_bytes(&mut self) -> usize {
-        crate::native_memory::hash_bytes::<MapKey, usize>(self.entries.capacity())
-            + self.values.capacity() * size_of::<i64>()
-            + self.key_bytes
+        crate::native_memory::sum_bytes([
+            crate::native_memory::retain_capacity(
+                &mut self.native_table_bytes,
+                crate::native_memory::hash_bytes::<MapKey, usize>(self.entries.capacity()),
+            ),
+            self.values.capacity() * size_of::<i64>(),
+            self.key_bytes,
+        ])
     }
 }
 
@@ -500,6 +506,7 @@ fn map_new(key_kind: i64, value_kind: i64, value_is_ref: i64, confined: bool) ->
             values: Vec::new(),
             scan_limit: 0,
             key_bytes: 0,
+            native_table_bytes: 0,
         }))
     };
     // No GC allocation occurs between reserving the payload and initializing it.
@@ -1800,13 +1807,14 @@ mod native_accounting_tests {
             let bytes = crate::gc_telemetry::external_bytes() - baseline;
             assert!(bytes >= key_bytes);
             let stats = crate::gc_telemetry::snapshot();
-            assert!(stats.heap.reserved_bytes >= before.heap.reserved_bytes + bytes);
+            assert!(stats.heap.reserved_bytes >= before.heap.reserved_bytes);
+            assert_eq!(
+                crate::gc_telemetry::native_memory_snapshot().requested_bytes,
+                baseline + bytes
+            );
             assert_eq!(
                 stats.heap.reserved_bytes,
-                stats.heap.old_reserved_bytes
-                    + stats.heap.nursery_reserved_bytes
-                    + baseline
-                    + bytes
+                stats.heap.old_reserved_bytes + stats.heap.nursery_reserved_bytes
             );
             willow_gc_collect();
             assert_eq!(crate::gc_telemetry::external_bytes(), baseline + bytes);

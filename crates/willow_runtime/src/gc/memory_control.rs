@@ -11,7 +11,9 @@ pub(super) struct Inputs {
     /// survived the snapshot. Never infer this from a minor cycle.
     pub live: u64,
     pub occupied: u64,
-    pub committed: u64,
+    /// Managed reservations plus native requested-capacity estimates, in bytes.
+    /// A pressure proxy, NOT measured OS commit or RSS.
+    pub pressure_bytes: u64,
     pub allocated_total: u64,
     /// Only supply a value with compatible process/managed commit scopes.
     /// Process RSS minus managed reservations is NOT such a measurement.
@@ -23,7 +25,7 @@ pub(super) enum Reason {
     Unlimited,
     BelowLimit,
     HeapGoal,
-    CommitPressure,
+    StoragePressure,
     Relief,
 }
 
@@ -92,9 +94,9 @@ impl Controller {
         let goal = unlimited.min(available).max(input.live);
         // Reserve an eighth of the remaining runway for concurrent work.
         let trigger = goal.saturating_sub(goal.saturating_sub(input.live) / 8);
-        let pressure = input.committed.saturating_add(non_heap) >= self.limit;
+        let pressure = input.pressure_bytes.saturating_add(non_heap) >= self.limit;
         let overshoot = input
-            .committed
+            .pressure_bytes
             .saturating_add(non_heap)
             .saturating_sub(self.limit);
         let allocated = input
@@ -112,7 +114,7 @@ impl Controller {
         let reason = if self.relief && due {
             Reason::Relief
         } else if pressure {
-            Reason::CommitPressure
+            Reason::StoragePressure
         } else if input.occupied >= trigger {
             Reason::HeapGoal
         } else {
@@ -133,7 +135,7 @@ impl Controller {
             return;
         }
         let pressure = input
-            .committed
+            .pressure_bytes
             .saturating_add(input.non_heap_commit.unwrap_or(0))
             >= self.limit.saturating_sub(self.limit / 8);
         let reclaimed = before.saturating_sub(input.occupied);
@@ -167,7 +169,7 @@ mod tests {
             unlimited_goal: 2000,
             live: 500,
             occupied: 800,
-            committed: 1000,
+            pressure_bytes: 1000,
             allocated_total: 800,
             non_heap_commit: None,
         };
@@ -184,7 +186,7 @@ mod tests {
         });
         assert_eq!(process.goal, 800);
         assert_eq!(process.overshoot, 200);
-        assert_eq!(process.reason, Reason::CommitPressure);
+        assert_eq!(process.reason, Reason::StoragePressure);
         assert!(process.collect);
     }
 
@@ -196,7 +198,7 @@ mod tests {
             unlimited_goal: 100,
             live: 1000,
             occupied: 1000,
-            committed: 1024,
+            pressure_bytes: 1024,
             allocated_total: 1000,
             non_heap_commit: None,
         };
@@ -212,7 +214,7 @@ mod tests {
         input.allocated_total += MIN_RUNWAY;
         assert!(controller.decide(input).collect);
         input.occupied = 0;
-        input.committed = 0;
+        input.pressure_bytes = 0;
         controller.completed(1000, input);
         assert!(controller.relief);
         controller.completed(1000, input);
@@ -238,7 +240,7 @@ mod tests {
                                 unlimited_goal: occupied,
                                 live,
                                 occupied,
-                                committed: commit,
+                                pressure_bytes: commit,
                                 allocated_total: occupied,
                                 non_heap_commit: non_heap,
                             };

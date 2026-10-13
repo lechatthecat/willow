@@ -461,7 +461,11 @@ fn external_headroom(state: &GcState) -> usize {
     let mut room = below(input.unlimited_goal.max(input.live));
     if let Some(limit) = state.memory_limit_bytes {
         let watermark = (limit / 4).saturating_mul(3).max(1) as u64;
-        room = room.min(watermark.saturating_sub(input.committed).saturating_sub(1));
+        room = room.min(
+            watermark
+                .saturating_sub(input.pressure_bytes)
+                .saturating_sub(1),
+        );
     }
     if state.pacer.enabled() && input.occupied < state.pacer_trigger {
         room = room.min(below(state.pacer_trigger));
@@ -579,7 +583,11 @@ pub(crate) fn charge_external(bytes: usize) {
 }
 
 pub(crate) fn release_external(bytes: usize) {
-    EXTERNAL_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+    EXTERNAL_BYTES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_sub(bytes)
+        })
+        .expect("native byte accounting underflow");
 }
 
 fn can_reserve(state: &GcState, additional: usize) -> bool {
@@ -666,7 +674,7 @@ fn memory_inputs(state: &GcState) -> memory_control::Inputs {
             .last_major_live_bytes
             .saturating_add(external_bytes() as u64),
         occupied: state.allocated_bytes.saturating_add(external_bytes()) as u64,
-        committed: state
+        pressure_bytes: state
             .old_reserved_bytes
             .saturating_add(state.tlab_reserved_bytes)
             .saturating_add(external_bytes()) as u64,
@@ -1820,8 +1828,12 @@ fn try_collect_internal() -> bool {
         if gc_log {
             let decision = state.soft_memory.decide(memory_input);
             eprintln!(
-                "[gc] soft_memory goal={} trigger={} overshoot={} reason={:?}",
-                decision.goal, decision.trigger, decision.overshoot, decision.reason
+                "[gc] soft_memory goal={} trigger={} overshoot={} reason={:?} native_requested_bytes={} native_requested_exact=false native_committed_valid=false process_limit_coverage_complete=false",
+                decision.goal,
+                decision.trigger,
+                decision.overshoot,
+                decision.reason,
+                external_bytes()
             );
         }
         progress::record_success(state.total_allocated_bytes);

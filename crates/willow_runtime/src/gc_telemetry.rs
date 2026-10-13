@@ -92,10 +92,9 @@ pub fn survivor_snapshot() -> GcSurvivorStats {
     crate::gc::survivor_snapshot()
 }
 
-/// Managed storage plus retained native object storage (excluding allocator overhead).
-/// Hash table capacity uses a conservative estimate; `external_bytes()`
-/// exposes the native subset without changing the stable V1 snapshot layout.
-/// The current allocator commits every reservation, so committed == reserved.
+/// Managed storage only. Native requested estimates are exposed separately by
+/// `native_memory_snapshot()` and must not be reported as managed savings or OS commit.
+/// Managed committed bytes retain the allocator reservation convention (not RSS).
 /// occupied includes unreachable objects until collection, NOT measured liveness.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -753,4 +752,31 @@ mod tests;
 /// estimates; this independently sampled gauge preserves the V1 C ABI layout.
 pub fn external_bytes() -> u64 {
     crate::gc::external_bytes() as u64
+}
+
+/// Native requested storage accounting, in bytes. Hash tables use conservative
+/// capacity high-water estimates, so even `requested_bytes` is not an allocator
+/// layout measurement. Includes channel boxes/buffers/wait tables, map storage
+/// and owned keys, and boxed async lock states/wait queues (including non-GC locks).
+/// Excludes allocator overhead, transient reallocation overlap, stacks, runtime
+/// metadata and unrelated native allocations. Sampling is not a process snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeMemorySnapshot {
+    pub requested_bytes: u64,
+    /// False: std HashMap does not expose its actual requested allocation layout.
+    pub requested_is_exact: bool,
+    /// None: no compatible allocator/OS commit provider. Never substitute RSS
+    /// or the requested estimate, even when requested_bytes is zero.
+    pub committed_bytes: Option<u64>,
+    /// False until all process allocations and compatible commit are covered.
+    pub process_limit_coverage_complete: bool,
+}
+
+pub fn native_memory_snapshot() -> NativeMemorySnapshot {
+    NativeMemorySnapshot {
+        requested_bytes: external_bytes(),
+        requested_is_exact: false,
+        committed_bytes: None,
+        process_limit_coverage_complete: false,
+    }
 }

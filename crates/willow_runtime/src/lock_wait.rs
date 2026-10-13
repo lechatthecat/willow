@@ -200,25 +200,27 @@ struct LockStateInner {
 
 impl crate::native_memory::Footprint for LockStateInner {
     fn native_bytes(&mut self) -> usize {
-        self.waiters.native_bytes()
-            + crate::native_memory::retain_capacity(
+        crate::native_memory::sum_bytes([
+            self.waiters.native_bytes(),
+            crate::native_memory::retain_capacity(
                 &mut self.native_tables[0],
                 crate::native_memory::hash_bytes::<RuntimeTaskId, RegistrationToken>(
                     self.tokens.capacity(),
                 ),
-            )
-            + crate::native_memory::retain_capacity(
+            ),
+            crate::native_memory::retain_capacity(
                 &mut self.native_tables[1],
                 crate::native_memory::hash_bytes::<RuntimeTaskId, LockAccess>(
                     self.waiter_modes.capacity(),
                 ),
-            )
-            + crate::native_memory::retain_capacity(
+            ),
+            crate::native_memory::retain_capacity(
                 &mut self.native_tables[2],
                 crate::native_memory::hash_bytes::<RuntimeTaskId, RegistrationToken>(
                     self.readers.capacity(),
                 ),
-            )
+            ),
+        ])
     }
 }
 

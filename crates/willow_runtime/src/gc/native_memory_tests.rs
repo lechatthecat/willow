@@ -119,7 +119,7 @@ fn native_bytes_participate_in_reservation_and_trigger_inputs() {
         assert!(can_reserve(&state, 0));
         assert!(!can_reserve(&state, 1));
         let inputs = memory_inputs(&state);
-        assert_eq!(inputs.committed, (managed + external) as u64);
+        assert_eq!(inputs.pressure_bytes, (managed + external) as u64);
         assert_eq!(inputs.occupied, (state.allocated_bytes + external) as u64);
         assert_eq!(inputs.live, state.last_major_live_bytes + external as u64);
     }
@@ -489,7 +489,7 @@ fn native_charges_far_below_a_hard_cap_skip_the_heap_lock() {
     {
         // Near the cap (past the 3/4 watermark) every charge is exact.
         let mut state = runtime().heap.lock().unwrap();
-        let committed = memory_inputs(&state).committed as usize;
+        let committed = memory_inputs(&state).pressure_bytes as usize;
         state.memory_limit_bytes = Some(committed + committed / 4);
         assert_eq!(external_headroom(&state), 0);
         // Exactly one byte below the watermark leaves no room either.
@@ -507,4 +507,60 @@ fn native_charges_far_below_a_hard_cap_skip_the_heap_lock() {
     }
     release_external(1 + 4096);
     willow_gc_collect();
+}
+
+#[test]
+fn native_pressure_is_estimated_separately_from_managed_telemetry() {
+    let _guard = runtime_test_guard();
+    willow_gc_init();
+    let map = crate::map::willow_map_new(0, 0, 0);
+    let root = GcRootHandle::new(map);
+    let before = telemetry_heap_snapshot();
+    for key in 0..1024 {
+        crate::map::willow_map_insert(root.load(), key, 0, key, 0);
+    }
+    let native = crate::gc_telemetry::native_memory_snapshot();
+    assert!(native.requested_bytes > 0);
+    assert!(!native.requested_is_exact);
+    assert_eq!(native.committed_bytes, None);
+    assert!(!native.process_limit_coverage_complete);
+    let after = telemetry_heap_snapshot();
+    assert_eq!(before.0.allocation_bytes, after.0.allocation_bytes);
+    assert_eq!(before.1.occupied_bytes, after.1.occupied_bytes);
+    assert_eq!(before.1.committed_bytes, after.1.committed_bytes);
+    assert_eq!(before.1.reserved_bytes, after.1.reserved_bytes);
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        let limit = after.1.reserved_bytes + native.requested_bytes / 2;
+        state.soft_memory.set_limit(limit);
+        let input = memory_inputs(&state);
+        assert_eq!(input.non_heap_commit, None);
+        assert_eq!(
+            input.pressure_bytes,
+            after.1.reserved_bytes + native.requested_bytes
+        );
+        let decision = state.soft_memory.decide(input);
+        assert!(decision.collect);
+        assert_eq!(
+            decision.overshoot,
+            native.requested_bytes - native.requested_bytes / 2
+        );
+        assert_eq!(decision.reason, memory_control::Reason::StoragePressure);
+        state.soft_memory.set_limit(0);
+    }
+    drop(root);
+    willow_gc_collect();
+    let native = crate::gc_telemetry::native_memory_snapshot();
+    assert_eq!(native.requested_bytes, 0);
+    assert_eq!(native.committed_bytes, None);
+    assert!(!native.process_limit_coverage_complete);
+}
+
+#[test]
+fn native_accounting_underflow_does_not_wrap_or_change_the_gauge() {
+    let _guard = runtime_test_guard();
+    willow_gc_init();
+    let before = external_bytes();
+    assert!(std::panic::catch_unwind(|| release_external(before + 1)).is_err());
+    assert_eq!(external_bytes(), before);
 }

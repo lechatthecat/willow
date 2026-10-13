@@ -8,8 +8,25 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};
 
+#[cfg(test)]
+thread_local! {
+    static RECONCILIATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) trait Footprint {
     fn native_bytes(&mut self) -> usize;
+}
+
+/// Sum the fixed number of components in an owner's estimate without wrapping.
+/// Real buffers are bounded by address space; conservative hash estimates can
+/// still overflow when combined, so fail before publishing an invalid charge.
+pub(crate) fn sum_bytes<const N: usize>(parts: [usize; N]) -> usize {
+    parts
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .unwrap_or_else(|| {
+            crate::failure::resource_exhausted(format_args!("native capacity overflow"))
+        })
 }
 
 /// Conservative SwissTable reservation, including empty buckets/control bytes.
@@ -38,18 +55,22 @@ struct Owner<T: Footprint> {
 }
 impl<T: Footprint> Owner<T> {
     fn reconcile(&mut self) {
+        #[cfg(test)]
+        RECONCILIATIONS.set(RECONCILIATIONS.get() + 1);
         let bytes = self
             .base
             .checked_add(self.value.native_bytes())
             .unwrap_or_else(|| {
                 crate::failure::resource_exhausted(format_args!("native capacity overflow"))
             });
-        // Owned containers retain capacity on removal. A high water mark also
-        // avoids undercounting std HashMap's tombstone-dependent capacity().
+        // Hash owners retain per-table high water marks in their Footprint;
+        // exact buffers can release their charge after a real shrink.
         if bytes > self.charge.0 {
             crate::gc::charge_external(bytes - self.charge.0);
-            self.charge.0 = bytes;
+        } else if bytes < self.charge.0 {
+            crate::gc::release_external(self.charge.0 - bytes);
         }
+        self.charge.0 = bytes;
     }
 }
 #[derive(Debug)]
@@ -219,6 +240,106 @@ mod tests {
         );
         drop(owners);
         assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+    }
+
+    #[test]
+    fn capacity_arithmetic_rejects_overflow_without_wrapping() {
+        const KEY: &str = "WILLOW_NATIVE_OVERFLOW_TEST";
+        if let Ok(kind) = std::env::var(KEY) {
+            if kind == "sum" {
+                sum_bytes([usize::MAX, 1]);
+            } else {
+                hash_bytes::<u64, u64>(usize::MAX);
+            }
+            panic!("overflow accepted");
+        }
+        assert_eq!(sum_bytes([usize::MAX - 1, 1]), usize::MAX);
+        assert_eq!(hash_bytes::<u64, u64>(0), 0);
+        for kind in ["sum", "hash"] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "native_memory::tests::capacity_arithmetic_rejects_overflow_without_wrapping",
+                    "--nocapture",
+                ])
+                .env(KEY, kind)
+                .output()
+                .unwrap();
+            assert_eq!(result.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&result.stderr).contains("native capacity overflow"));
+        }
+    }
+
+    #[test]
+    fn shrink_and_unwind_release_only_freed_capacity() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        let baseline = crate::gc_telemetry::external_bytes();
+        let buffer = Mutex::with_base(
+            Buffer {
+                values: vec![0; 128],
+                visits: Arc::new(AtomicUsize::new(0)),
+            },
+            24,
+        );
+        assert_eq!(crate::gc_telemetry::external_bytes(), baseline + 24 + 1024);
+        buffer.lock().unwrap().values.clear();
+        assert_eq!(crate::gc_telemetry::external_bytes(), baseline + 24 + 1024);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut guard = buffer.lock().unwrap();
+                guard.values.shrink_to_fit();
+                panic!("injected after shrink");
+            }))
+            .is_err()
+        );
+        assert_eq!(crate::gc_telemetry::external_bytes(), baseline + 24);
+        // A live native owner is not zeroed by GC reset; its later Drop balances.
+        crate::gc::willow_gc_init();
+        assert_eq!(crate::gc_telemetry::external_bytes(), baseline + 24);
+        drop(buffer);
+        assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+    }
+
+    #[test]
+    fn increasing_channel_counts_have_linear_accounting_and_balanced_lifetimes() {
+        let _guard = crate::gc::runtime_test_guard();
+        for reset in [false, true] {
+            for count in [1, 32, 1024] {
+                crate::gc::willow_gc_init();
+                let baseline = crate::gc_telemetry::external_bytes();
+                RECONCILIATIONS.set(0);
+                let mut roots = Vec::new();
+                let mut per_channel = 0;
+                for _ in 0..count {
+                    let channel = crate::channel::willow_channel_new(0);
+                    roots.push(crate::gc::GcRootHandle::new(channel.cast()));
+                    crate::channel::willow_channel_send_i64(channel, 42);
+                    if per_channel == 0 {
+                        per_channel = crate::gc_telemetry::external_bytes() - baseline;
+                    }
+                }
+                assert!(per_channel > 0);
+                assert_eq!(
+                    crate::gc_telemetry::external_bytes() - baseline,
+                    count as u64 * per_channel
+                );
+                // Construction and one send each: no scan over prior channels.
+                assert_eq!(RECONCILIATIONS.get(), 2 * count);
+                println!(
+                    "native channels={count} reconciliations={} requested_bytes={} reset={reset}",
+                    RECONCILIATIONS.get(),
+                    count as u64 * per_channel
+                );
+                drop(roots);
+                if reset {
+                    crate::gc::willow_gc_init();
+                } else {
+                    crate::gc::willow_gc_collect();
+                }
+                assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+            }
+        }
     }
 
     #[test]

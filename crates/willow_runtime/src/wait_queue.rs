@@ -57,11 +57,13 @@ impl<T> Default for WaitQueue<T> {
 
 impl<T> WaitQueue<T> {
     pub(crate) fn native_bytes(&mut self) -> usize {
-        self.order.capacity() * size_of::<WaitEntry<T>>()
-            + crate::native_memory::retain_capacity(
+        crate::native_memory::sum_bytes([
+            self.order.capacity() * size_of::<WaitEntry<T>>(),
+            crate::native_memory::retain_capacity(
                 &mut self.native_table_bytes,
                 crate::native_memory::hash_bytes::<T, u64>(self.members.capacity()),
-            )
+            ),
+        ])
     }
 }
 

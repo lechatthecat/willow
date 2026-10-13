@@ -62,17 +62,19 @@ struct WillowChannelState {
 
 impl crate::native_memory::Footprint for WillowChannelState {
     fn native_bytes(&mut self) -> usize {
-        self.values.capacity() * size_of::<WillowChannelValue>()
-            + self.waiters.native_bytes()
-            + self.send_waiters.native_bytes()
-            + crate::native_memory::retain_capacity(
+        crate::native_memory::sum_bytes([
+            self.values.capacity() * size_of::<WillowChannelValue>(),
+            self.waiters.native_bytes(),
+            self.send_waiters.native_bytes(),
+            crate::native_memory::retain_capacity(
                 &mut self.native_tables[0],
                 crate::native_memory::hash_bytes::<u64, u64>(self.recv_claims.capacity()),
-            )
-            + crate::native_memory::retain_capacity(
+            ),
+            crate::native_memory::retain_capacity(
                 &mut self.native_tables[1],
                 crate::native_memory::hash_bytes::<u64, u64>(self.send_handoffs.capacity()),
-            )
+            ),
+        ])
     }
 }
 
