@@ -2058,7 +2058,8 @@ mod tests {
                     kinds.push("call");
                     segments.push(*local);
                 }
-                LirRvalue::StringLiteral(_) => {
+                LirRvalue::StringLiteral(text) => {
+                    assert_eq!(text, ":");
                     kinds.push("literal");
                     segments.push(*local);
                 }
@@ -2067,7 +2068,8 @@ mod tests {
                     operand_ty: Type::String,
                     ..
                 } => kinds.push("concat"),
-                LirRvalue::StringConcat { parts, .. } => {
+                LirRvalue::StringConcat { parts, part_types } => {
+                    assert_eq!(part_types, &[Type::I64, Type::String, Type::I64]);
                     kinds.push("concat");
                     let parts: Vec<_> = parts
                         .iter()
