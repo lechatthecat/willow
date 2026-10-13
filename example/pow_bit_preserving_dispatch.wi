@@ -1,0 +1,18 @@
+// Option A: literals, dynamic exponents and both captured builtins must agree.
+fn dynamic(x: f64, y: f64) -> f64 { return x ** y; }
+fn assert(condition: bool) {
+    if !condition { panic("power result changed"); }
+}
+fn main() {
+    let p: fn(f64, f64) -> f64 = pow;
+    let q: fn(f64, f64) -> f64 = powf;
+    let expected = 1.5 ** 0.375;
+    assert(dynamic(1.5, 0.375) == expected);
+    assert(pow(1.5, 0.375) == expected);
+    assert(powf(1.5, 0.375) == expected);
+    assert(p(1.5, 0.375) == expected);
+    assert(q(1.5, 0.375) == expected);
+    assert(dynamic(2.0, -1024.0) > 0.0);
+    assert(dynamic(-1.0, 3.0) == -1.0);
+    println(expected);
+}

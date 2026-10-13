@@ -8,8 +8,8 @@
 //! Permission to use, copy, modify, and distribute this software is freely
 //! granted, provided that this notice is preserved.
 //!
-//! Willow factors the original algorithm into three private functions emitted
-//! once per object: split `log2`, split-input `exp2`, and the IEEE dispatcher.
+//! Willow emits one private IEEE dispatcher per object. Its split `log2` and
+//! split-input `exp2` blocks share that function, avoiding internal ABI spills.
 //! Constants are constructed from the exact binary64 bits below. V1 always
 //! emits the specified non-FMA sequence, even on FMA-capable targets, so target
 //! feature detection cannot silently change rounding.
@@ -37,8 +37,6 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use super::{FuncGen, ParamMode, Type, UnitCodegenContext};
 
-pub(super) const LOG2_F64_SYMBOL: &str = "__willow_internal_log2_f64_v1";
-pub(super) const EXP2_F64_SYMBOL: &str = "__willow_internal_exp2_f64_v1";
 pub(super) const POW_F64_SYMBOL: &str = "__willow_internal_pow_f64_v1";
 
 // Exact fdlibm binary64 constants. Decimal spellings are deliberately absent:
@@ -93,43 +91,21 @@ fn from_i64_bits(builder: &mut FunctionBuilder<'_>, value: Value) -> Value {
 }
 
 fn clear_low_word(builder: &mut FunctionBuilder<'_>, value: Value) -> Value {
-    let bits = as_i64_bits(builder, value);
-    let mask = builder
-        .ins()
-        .iconst(types::I64, 0xffff_ffff_0000_0000_u64 as i64);
-    let high = builder.ins().band(bits, mask);
-    from_i64_bits(builder, high)
+    // This is a bitwise operation, not floating arithmetic. Keeping it in the
+    // floating register bank avoids two cross-bank moves for each split; the
+    // exact mask preserves the original high word, including NaN payload bits.
+    let mask = f64_bits(builder, 0xffff_ffff_0000_0000);
+    builder.ins().band(value, mask)
 }
 
 impl UnitCodegenContext<'_> {
-    /// Declare and define the three private numerical helpers exactly once for
-    /// this object, then expose the pow helper under the legacy builtin names so
+    /// Define the private numerical kernel exactly once for this object,
+    /// then expose the pow helper under the legacy builtin names so
     /// direct calls and function-value capture share `**` semantics.
     pub(super) fn declare_native_pow_f64(&mut self) -> Result<()> {
         if self.func_ids.contains_key(POW_F64_SYMBOL) {
             return Ok(());
         }
-
-        let mut log_sig = self.output.module.make_signature();
-        log_sig.params.push(AbiParam::new(types::F64));
-        // Keep the compensated high/low pair in one ABI return value.  The
-        // Windows x64 ABI does not support two scalar floating-point returns,
-        // and Cranelift rejects such a signature before lowering any Willow
-        // program (even one that never calls pow).
-        log_sig.returns.push(AbiParam::new(types::F64X2));
-        let log_id =
-            self.output
-                .module
-                .declare_function(LOG2_F64_SYMBOL, Linkage::Local, &log_sig)?;
-
-        let mut exp_sig = self.output.module.make_signature();
-        exp_sig.params.push(AbiParam::new(types::F64));
-        exp_sig.params.push(AbiParam::new(types::F64));
-        exp_sig.returns.push(AbiParam::new(types::F64));
-        let exp_id =
-            self.output
-                .module
-                .declare_function(EXP2_F64_SYMBOL, Linkage::Local, &exp_sig)?;
 
         let mut pow_sig = self.output.module.make_signature();
         pow_sig.params.push(AbiParam::new(types::F64));
@@ -140,9 +116,7 @@ impl UnitCodegenContext<'_> {
                 .module
                 .declare_function(POW_F64_SYMBOL, Linkage::Local, &pow_sig)?;
 
-        self.define_log2_f64(log_id, log_sig)?;
-        self.define_exp2_f64(exp_id, exp_sig)?;
-        self.define_pow_f64(pow_id, pow_sig, log_id, exp_id)?;
+        self.define_pow_f64(pow_id, pow_sig)?;
 
         let fn_ty = Type::Fn(vec![Type::F64, Type::F64], Box::new(Type::F64));
         let names = crate::semantic::intrinsics::ADDRESSABLE_BUILTINS;
@@ -157,455 +131,14 @@ impl UnitCodegenContext<'_> {
         Ok(())
     }
 
-    fn define_log2_f64(
-        &mut self,
-        func_id: FuncId,
-        sig: cranelift_codegen::ir::Signature,
-    ) -> Result<()> {
-        let mut ctx = self.output.module.make_context();
-        ctx.func.signature = sig;
-        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
-        let mut fn_ctx = FunctionBuilderContext::new();
-        {
-            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
-            let entry = b.create_block();
-            b.append_block_params_for_function_params(entry);
-            b.switch_to_block(entry);
-            b.seal_block(entry);
-            let x = b.block_params(entry)[0];
-
-            let close = b.create_block();
-            let classify = b.create_block();
-            let delta = {
-                let one = f64_bits(&mut b, 1.0f64.to_bits());
-                b.ins().fsub(x, one)
-            };
-            let abs_delta = b.ins().fabs(delta);
-            let close_limit = f64_bits(&mut b, CLOSE_TO_ONE);
-            let is_close = b
-                .ins()
-                .fcmp(FloatCC::LessThanOrEqual, abs_delta, close_limit);
-            b.ins().brif(is_close, close, &[], classify, &[]);
-
-            // Near one, fdlibm's compensated log1p polynomial avoids losing the
-            // small difference before multiplication by a large exponent.
-            b.switch_to_block(close);
-            b.seal_block(close);
-            let half = f64_bits(&mut b, 0.5f64.to_bits());
-            let third = f64_bits(&mut b, (1.0f64 / 3.0).to_bits());
-            let quarter = f64_bits(&mut b, 0.25f64.to_bits());
-            let tt = b.ins().fmul(delta, delta);
-            let tq = b.ins().fmul(delta, quarter);
-            let inner = b.ins().fsub(third, tq);
-            let ti = b.ins().fmul(delta, inner);
-            let half_minus = b.ins().fsub(half, ti);
-            let w = b.ins().fmul(tt, half_minus);
-            let ivln2_h = f64_bits(&mut b, IVLN2_H);
-            let u = b.ins().fmul(ivln2_h, delta);
-            let ivln2_l = f64_bits(&mut b, IVLN2_L);
-            let dl = b.ins().fmul(delta, ivln2_l);
-            let ivln2 = f64_bits(&mut b, IVLN2);
-            let wi = b.ins().fmul(w, ivln2);
-            let v = b.ins().fsub(dl, wi);
-            let uv = b.ins().fadd(u, v);
-            let t1 = clear_low_word(&mut b, uv);
-            let t1_minus_u = b.ins().fsub(t1, u);
-            let t2 = b.ins().fsub(v, t1_minus_u);
-            let pair = b.ins().splat(types::F64X2, t1);
-            let pair = b.ins().insertlane(pair, t2, 1);
-            b.ins().return_(&[pair]);
-
-            b.switch_to_block(classify);
-            b.seal_block(classify);
-            let bits = as_i64_bits(&mut b, x);
-            let high = b.ins().ushr_imm_u(bits, 32);
-            let high_mask = b.ins().iconst(types::I64, 0x7fff_ffff);
-            let ix = b.ins().band(high, high_mask);
-            let subnormal = b.ins().icmp_imm_u(IntCC::UnsignedLessThan, ix, 0x0010_0000);
-            let scale_subnormal = b.create_block();
-            let normalized = b.create_block();
-            for ty in [types::F64, types::I64, types::I64] {
-                b.append_block_param(normalized, ty);
-            }
-            let zero_n = b.ins().iconst(types::I64, 0);
-            b.ins().brif(
-                subnormal,
-                scale_subnormal,
-                &[],
-                normalized,
-                &[x.into(), zero_n.into(), ix.into()],
-            );
-
-            b.switch_to_block(scale_subnormal);
-            b.seal_block(scale_subnormal);
-            let two53 = f64_bits(&mut b, TWO53);
-            let scaled = b.ins().fmul(x, two53);
-            let scaled_bits = as_i64_bits(&mut b, scaled);
-            let scaled_high = b.ins().ushr_imm_u(scaled_bits, 32);
-            let scaled_ix = b.ins().band(scaled_high, high_mask);
-            let minus53 = b.ins().iconst(types::I64, -53);
-            b.ins().jump(
-                normalized,
-                &[scaled.into(), minus53.into(), scaled_ix.into()],
-            );
-
-            b.switch_to_block(normalized);
-            b.seal_block(normalized);
-            let vals = b.block_params(normalized).to_vec();
-            let ax = vals[0];
-            let n0 = vals[1];
-            let ix0 = vals[2];
-            let exponent = b.ins().sshr_imm_u(ix0, 20);
-            let exponent = b.ins().iadd_imm_s(exponent, -0x3ff);
-            let n = b.ins().iadd(n0, exponent);
-            let mant_mask = b.ins().iconst(types::I64, 0x000f_ffff);
-            let j = b.ins().band(ix0, mant_mask);
-            let normalized_ix = b.ins().bor_imm_u(j, 0x3ff0_0000);
-            let k0 = b.create_block();
-            let k1_test = b.create_block();
-            let k1 = b.create_block();
-            let k_up = b.create_block();
-            let kernel = b.create_block();
-            for ty in [types::F64, types::I64, types::I64, types::I64] {
-                b.append_block_param(kernel, ty);
-            }
-            let low_interval = b
-                .ins()
-                .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, j, 0x3988e);
-            b.ins().brif(low_interval, k0, &[], k1_test, &[]);
-
-            b.switch_to_block(k0);
-            b.seal_block(k0);
-            let zero = b.ins().iconst(types::I64, 0);
-            b.ins().jump(
-                kernel,
-                &[ax.into(), n.into(), normalized_ix.into(), zero.into()],
-            );
-
-            b.switch_to_block(k1_test);
-            b.seal_block(k1_test);
-            let middle = b.ins().icmp_imm_u(IntCC::UnsignedLessThan, j, 0xbb67a);
-            b.ins().brif(middle, k1, &[], k_up, &[]);
-
-            b.switch_to_block(k1);
-            b.seal_block(k1);
-            let one_i = b.ins().iconst(types::I64, 1);
-            b.ins().jump(
-                kernel,
-                &[ax.into(), n.into(), normalized_ix.into(), one_i.into()],
-            );
-
-            b.switch_to_block(k_up);
-            b.seal_block(k_up);
-            let n_up = b.ins().iadd_imm_u(n, 1);
-            let ix_down = b.ins().iadd_imm_s(normalized_ix, -0x0010_0000);
-            let zero = b.ins().iconst(types::I64, 0);
-            b.ins().jump(
-                kernel,
-                &[ax.into(), n_up.into(), ix_down.into(), zero.into()],
-            );
-
-            b.switch_to_block(kernel);
-            b.seal_block(kernel);
-            let args = b.block_params(kernel).to_vec();
-            let (ax0, n, ix, k) = (args[0], args[1], args[2], args[3]);
-            let k_is_one = b.ins().icmp_imm_u(IntCC::Equal, k, 1);
-            let one_f = f64_bits(&mut b, 1.0f64.to_bits());
-            let one_half = f64_bits(&mut b, BP1);
-            let bp = b.ins().select(k_is_one, one_half, one_f);
-            let dp_h1 = f64_bits(&mut b, DP_H1);
-            let zero_f = f64_bits(&mut b, 0.0f64.to_bits());
-            let dp_h = b.ins().select(k_is_one, dp_h1, zero_f);
-            let dp_l1 = f64_bits(&mut b, DP_L1);
-            let dp_l = b.ins().select(k_is_one, dp_l1, zero_f);
-
-            let ax_bits = as_i64_bits(&mut b, ax0);
-            let low_mask = b.ins().iconst(types::I64, 0xffff_ffff_u64 as i64);
-            let low = b.ins().band(ax_bits, low_mask);
-            let ix_shift = b.ins().ishl_imm_u(ix, 32);
-            let rebuilt = b.ins().bor(ix_shift, low);
-            let ax = from_i64_bits(&mut b, rebuilt);
-            let u = b.ins().fsub(ax, bp);
-            let sum = b.ins().fadd(ax, bp);
-            let v = b.ins().fdiv(one_f, sum);
-            let ss = b.ins().fmul(u, v);
-            let s_h = clear_low_word(&mut b, ss);
-
-            let half_ix = b.ins().ushr_imm_u(ix, 1);
-            let base_high = b.ins().bor_imm_u(half_ix, 0x2000_0000);
-            let plus = b.ins().iadd_imm_u(base_high, 0x0008_0000);
-            let k_shift = b.ins().ishl_imm_u(k, 18);
-            let th_high = b.ins().iadd(plus, k_shift);
-            let th_bits = b.ins().ishl_imm_u(th_high, 32);
-            let t_h0 = from_i64_bits(&mut b, th_bits);
-            let th_minus_bp = b.ins().fsub(t_h0, bp);
-            let t_l = b.ins().fsub(ax, th_minus_bp);
-            let shth = b.ins().fmul(s_h, t_h0);
-            let u_minus = b.ins().fsub(u, shth);
-            let shtl = b.ins().fmul(s_h, t_l);
-            let sl_inner = b.ins().fsub(u_minus, shtl);
-            let s_l = b.ins().fmul(v, sl_inner);
-
-            let s2 = b.ins().fmul(ss, ss);
-            let l6 = f64_bits(&mut b, L6);
-            let l5 = f64_bits(&mut b, L5);
-            let p = b.ins().fmul(s2, l6);
-            let p = b.ins().fadd(l5, p);
-            let l4 = f64_bits(&mut b, L4);
-            let p = b.ins().fmul(s2, p);
-            let p = b.ins().fadd(l4, p);
-            let l3 = f64_bits(&mut b, L3);
-            let p = b.ins().fmul(s2, p);
-            let p = b.ins().fadd(l3, p);
-            let l2 = f64_bits(&mut b, L2);
-            let p = b.ins().fmul(s2, p);
-            let p = b.ins().fadd(l2, p);
-            let l1 = f64_bits(&mut b, L1);
-            let p = b.ins().fmul(s2, p);
-            let p = b.ins().fadd(l1, p);
-            let s4 = b.ins().fmul(s2, s2);
-            let mut r = b.ins().fmul(s4, p);
-            let sh_plus_s = b.ins().fadd(s_h, ss);
-            let sl_term = b.ins().fmul(s_l, sh_plus_s);
-            r = b.ins().fadd(r, sl_term);
-            let sh2 = b.ins().fmul(s_h, s_h);
-            let three = f64_bits(&mut b, 3.0f64.to_bits());
-            let th_sum = b.ins().fadd(three, sh2);
-            let th_sum = b.ins().fadd(th_sum, r);
-            let t_h = clear_low_word(&mut b, th_sum);
-            let th_minus_three = b.ins().fsub(t_h, three);
-            let th_minus = b.ins().fsub(th_minus_three, sh2);
-            let t_l = b.ins().fsub(r, th_minus);
-            let u = b.ins().fmul(s_h, t_h);
-            let slth = b.ins().fmul(s_l, t_h);
-            let tlss = b.ins().fmul(t_l, ss);
-            let v = b.ins().fadd(slth, tlss);
-            let uv = b.ins().fadd(u, v);
-            let p_h = clear_low_word(&mut b, uv);
-            let ph_minus_u = b.ins().fsub(p_h, u);
-            let p_l = b.ins().fsub(v, ph_minus_u);
-            let cp_h = f64_bits(&mut b, CP_H);
-            let z_h = b.ins().fmul(cp_h, p_h);
-            let cp_l = f64_bits(&mut b, CP_L);
-            let zl0 = b.ins().fmul(cp_l, p_h);
-            let cp = f64_bits(&mut b, CP);
-            let plcp = b.ins().fmul(p_l, cp);
-            let z_l = b.ins().fadd(zl0, plcp);
-            let z_l = b.ins().fadd(z_l, dp_l);
-            let n_f = b.ins().fcvt_from_sint(types::F64, n);
-            let sum = b.ins().fadd(z_h, z_l);
-            let sum = b.ins().fadd(sum, dp_h);
-            let sum = b.ins().fadd(sum, n_f);
-            let out_h = clear_low_word(&mut b, sum);
-            let a = b.ins().fsub(out_h, n_f);
-            let a = b.ins().fsub(a, dp_h);
-            let a = b.ins().fsub(a, z_h);
-            let out_l = b.ins().fsub(z_l, a);
-            let pair = b.ins().splat(types::F64X2, out_h);
-            let pair = b.ins().insertlane(pair, out_l, 1);
-            b.ins().return_(&[pair]);
-
-            b.seal_all_blocks();
-            b.finalize(self.output.module.target_config());
-        }
-        self.output.module.define_function(func_id, &mut ctx)?;
-        self.output.module.clear_context(&mut ctx);
-        Ok(())
-    }
-
-    fn define_exp2_f64(
-        &mut self,
-        func_id: FuncId,
-        sig: cranelift_codegen::ir::Signature,
-    ) -> Result<()> {
-        let mut ctx = self.output.module.make_context();
-        ctx.func.signature = sig;
-        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
-        let mut fn_ctx = FunctionBuilderContext::new();
-        {
-            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
-            let entry = b.create_block();
-            b.append_block_params_for_function_params(entry);
-            b.switch_to_block(entry);
-            b.seal_block(entry);
-            let p_h = b.block_params(entry)[0];
-            let p_l = b.block_params(entry)[1];
-            let z0 = b.ins().fadd(p_h, p_l);
-
-            let nan = b.create_block();
-            let overflow = b.create_block();
-            let overflow_tie = b.create_block();
-            let underflow_test = b.create_block();
-            let underflow = b.create_block();
-            let underflow_tie = b.create_block();
-            let kernel = b.create_block();
-
-            let unordered = b.ins().fcmp(FloatCC::Unordered, z0, z0);
-            let ordered = b.create_block();
-            b.ins().brif(unordered, nan, &[], ordered, &[]);
-
-            b.switch_to_block(nan);
-            b.seal_block(nan);
-            b.ins().return_(&[z0]);
-
-            b.switch_to_block(ordered);
-            b.seal_block(ordered);
-            let upper = f64_bits(&mut b, 1024.0f64.to_bits());
-            let too_high = b.ins().fcmp(FloatCC::GreaterThan, z0, upper);
-            let upper_check = b.create_block();
-            b.ins().brif(too_high, overflow, &[], upper_check, &[]);
-
-            b.switch_to_block(upper_check);
-            b.seal_block(upper_check);
-            let at_upper = b.ins().fcmp(FloatCC::Equal, z0, upper);
-            b.ins()
-                .brif(at_upper, overflow_tie, &[], underflow_test, &[]);
-
-            b.switch_to_block(overflow_tie);
-            b.seal_block(overflow_tie);
-            let ovt = f64_bits(&mut b, OVT);
-            let left = b.ins().fadd(p_l, ovt);
-            let right = b.ins().fsub(z0, p_h);
-            let crosses = b.ins().fcmp(FloatCC::GreaterThan, left, right);
-            b.ins().brif(crosses, overflow, &[], underflow_test, &[]);
-
-            b.switch_to_block(overflow);
-            b.seal_block(overflow);
-            let huge = f64_bits(&mut b, HUGE);
-            let inf = b.ins().fmul(huge, huge);
-            b.ins().return_(&[inf]);
-
-            b.switch_to_block(underflow_test);
-            let lower = f64_bits(&mut b, (-1075.0f64).to_bits());
-            let too_low = b.ins().fcmp(FloatCC::LessThan, z0, lower);
-            let lower_check = b.create_block();
-            b.ins().brif(too_low, underflow, &[], lower_check, &[]);
-
-            b.switch_to_block(lower_check);
-            b.seal_block(lower_check);
-            let at_lower = b.ins().fcmp(FloatCC::Equal, z0, lower);
-            b.ins().brif(at_lower, underflow_tie, &[], kernel, &[]);
-
-            b.switch_to_block(underflow_tie);
-            b.seal_block(underflow_tie);
-            let left = p_l;
-            let right = b.ins().fsub(z0, p_h);
-            let crosses = b.ins().fcmp(FloatCC::LessThanOrEqual, left, right);
-            b.ins().brif(crosses, underflow, &[], kernel, &[]);
-
-            b.switch_to_block(underflow);
-            b.seal_block(underflow);
-            let tiny = f64_bits(&mut b, TINY);
-            let zero = b.ins().fmul(tiny, tiny);
-            b.ins().return_(&[zero]);
-
-            b.switch_to_block(kernel);
-            b.seal_block(kernel);
-            // `nearest` is specified as round-to-nearest, ties-to-even. The
-            // preceding finite [-1075, 1024] guards dominate the conversion.
-            let n_f = b.ins().nearest(z0);
-            let n = b.ins().fcvt_to_sint(types::I64, n_f);
-            let p_h = b.ins().fsub(p_h, n_f);
-            let sum = b.ins().fadd(p_l, p_h);
-            let t = clear_low_word(&mut b, sum);
-            let lg2_h = f64_bits(&mut b, LG2_H);
-            let u = b.ins().fmul(t, lg2_h);
-            let t_minus_ph = b.ins().fsub(t, p_h);
-            let pl_minus = b.ins().fsub(p_l, t_minus_ph);
-            let lg2 = f64_bits(&mut b, LG2);
-            let v0 = b.ins().fmul(pl_minus, lg2);
-            let lg2_l = f64_bits(&mut b, LG2_L);
-            let tl = b.ins().fmul(t, lg2_l);
-            let v = b.ins().fadd(v0, tl);
-            let z = b.ins().fadd(u, v);
-            let z_minus_u = b.ins().fsub(z, u);
-            let w = b.ins().fsub(v, z_minus_u);
-            let zz = b.ins().fmul(z, z);
-            let p5 = f64_bits(&mut b, P5);
-            let p4 = f64_bits(&mut b, P4);
-            let p = b.ins().fmul(zz, p5);
-            let p = b.ins().fadd(p4, p);
-            let p3 = f64_bits(&mut b, P3);
-            let p = b.ins().fmul(zz, p);
-            let p = b.ins().fadd(p3, p);
-            let p2 = f64_bits(&mut b, P2);
-            let p = b.ins().fmul(zz, p);
-            let p = b.ins().fadd(p2, p);
-            let p1 = f64_bits(&mut b, P1);
-            let p = b.ins().fmul(zz, p);
-            let p = b.ins().fadd(p1, p);
-            let zzp = b.ins().fmul(zz, p);
-            let t1 = b.ins().fsub(z, zzp);
-            let zt1 = b.ins().fmul(z, t1);
-            let two = f64_bits(&mut b, 2.0f64.to_bits());
-            let denom = b.ins().fsub(t1, two);
-            let quotient = b.ins().fdiv(zt1, denom);
-            let zw = b.ins().fmul(z, w);
-            let wsum = b.ins().fadd(w, zw);
-            let r = b.ins().fsub(quotient, wsum);
-            let one = f64_bits(&mut b, 1.0f64.to_bits());
-            let r_minus_z = b.ins().fsub(r, z);
-            let result = b.ins().fsub(one, r_minus_z);
-
-            let result_bits = as_i64_bits(&mut b, result);
-            let exponent = b.ins().ushr_imm_u(result_bits, 52);
-            let exp_mask = b.ins().iconst(types::I64, 0x7ff);
-            let exponent = b.ins().band(exponent, exp_mask);
-            let new_exponent = b.ins().iadd(exponent, n);
-            let subnormal_scale = b.create_block();
-            let normal_scale = b.create_block();
-            let became_subnormal =
-                b.ins()
-                    .icmp_imm_s(IntCC::SignedLessThanOrEqual, new_exponent, 0);
-            b.ins()
-                .brif(became_subnormal, subnormal_scale, &[], normal_scale, &[]);
-
-            b.switch_to_block(normal_scale);
-            b.seal_block(normal_scale);
-            let shifted_n = b.ins().ishl_imm_u(n, 52);
-            let scaled_bits = b.ins().iadd(result_bits, shifted_n);
-            let scaled = from_i64_bits(&mut b, scaled_bits);
-            b.ins().return_(&[scaled]);
-
-            b.switch_to_block(subnormal_scale);
-            b.seal_block(subnormal_scale);
-            // fdlibm scalbn's prescale keeps the final rounding single even for
-            // the smallest subnormal result.
-            let prescale = f64_bits(&mut b, TWO_NEG_969);
-            let prescaled = b.ins().fmul(result, prescale);
-            let n2 = b.ins().iadd_imm_u(n, 969);
-            let biased = b.ins().iadd_imm_u(n2, 1023);
-            let scale_bits = b.ins().ishl_imm_u(biased, 52);
-            let scale = from_i64_bits(&mut b, scale_bits);
-            let scaled = b.ins().fmul(prescaled, scale);
-            b.ins().return_(&[scaled]);
-
-            b.seal_all_blocks();
-            b.finalize(self.output.module.target_config());
-        }
-        self.output.module.define_function(func_id, &mut ctx)?;
-        self.output.module.clear_context(&mut ctx);
-        Ok(())
-    }
-
     fn define_pow_f64(
         &mut self,
         func_id: FuncId,
         sig: cranelift_codegen::ir::Signature,
-        log_id: FuncId,
-        exp_id: FuncId,
     ) -> Result<()> {
         let mut ctx = self.output.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, func_id.as_u32());
-        let log_ref = self
-            .output
-            .module
-            .declare_func_in_func(log_id, &mut ctx.func);
-        let exp_ref = self
-            .output
-            .module
-            .declare_func_in_func(exp_id, &mut ctx.func);
         let mut fn_ctx = FunctionBuilderContext::new();
         {
             let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
@@ -620,6 +153,43 @@ impl UnitCodegenContext<'_> {
             let abs_mask = b.ins().iconst(types::I64, ABS_MASK as i64);
             let ax_bits = b.ins().band(x_bits, abs_mask);
             let ay_bits = b.ins().band(y_bits, abs_mask);
+
+            // Unsigned range checks exclude both signs of zero, negative
+            // bases, infinities and NaNs before bypassing special dispatch.
+            // For 0 < |y| < 1, every exponent is nonintegral; a positive finite
+            // base needs no parity/domain checks. x == 1 also yields exactly 1
+            // through the unchanged near-one log2 and exp2 arithmetic.
+            let generic = b.create_block();
+            b.append_block_param(generic, types::I8);
+            let special_dispatch = b.create_block();
+            let positive_base_check = b.create_block();
+            let exponent_range = b.ins().iadd_imm_s(ay_bits, -1);
+            let fractional = b.ins().icmp_imm_u(
+                IntCC::UnsignedLessThan,
+                exponent_range,
+                (1.0f64.to_bits() - 1) as i64,
+            );
+            // Integral exponents skip the extra base check entirely.
+            b.ins()
+                .brif(fractional, positive_base_check, &[], special_dispatch, &[]);
+            b.switch_to_block(positive_base_check);
+            b.seal_block(positive_base_check);
+            let base_range = b.ins().iadd_imm_s(x_bits, -1);
+            let positive_finite = b.ins().icmp_imm_u(
+                IntCC::UnsignedLessThan,
+                base_range,
+                (POS_INFINITY - 1) as i64,
+            );
+            let positive_sign = b.ins().iconst(types::I8, 0);
+            b.ins().brif(
+                positive_finite,
+                generic,
+                &[positive_sign.into()],
+                special_dispatch,
+                &[],
+            );
+            b.switch_to_block(special_dispatch);
+            b.seal_block(special_dispatch);
 
             let y_zero = b.create_block();
             let x_one_test = b.create_block();
@@ -774,9 +344,14 @@ impl UnitCodegenContext<'_> {
             let integral_check = b.create_block();
             let integral = b.create_block();
             b.append_block_param(integral, types::I64);
-            let generic = b.create_block();
-            b.ins()
-                .brif(use_integral, integral_check, &[], generic, &[]);
+            let general_negative = b.ins().band(x_negative, is_odd);
+            b.ins().brif(
+                use_integral,
+                integral_check,
+                &[],
+                generic,
+                &[general_negative.into()],
+            );
 
             b.switch_to_block(integral_check);
             b.seal_block(integral_check);
@@ -787,8 +362,13 @@ impl UnitCodegenContext<'_> {
             let exponent = b.ins().fcvt_to_sint(types::I64, y);
             let round_trip = b.ins().fcvt_from_sint(types::F64, exponent);
             let exact = b.ins().fcmp(FloatCC::Equal, round_trip, y);
-            b.ins()
-                .brif(exact, integral, &[exponent.into()], generic, &[]);
+            b.ins().brif(
+                exact,
+                integral,
+                &[exponent.into()],
+                generic,
+                &[general_negative.into()],
+            );
 
             b.switch_to_block(integral);
             b.seal_block(integral);
@@ -853,8 +433,13 @@ impl UnitCodegenContext<'_> {
             let overflowed = b.ins().icmp(IntCC::Equal, magnitude_bits, inf_bits);
             let needs_range = b.ins().band(exponent_negative, overflowed);
             let integral_result = b.create_block();
-            b.ins()
-                .brif(needs_range, generic, &[], integral_result, &[]);
+            b.ins().brif(
+                needs_range,
+                generic,
+                &[general_negative.into()],
+                integral_result,
+                &[],
+            );
             b.switch_to_block(integral_result);
             b.seal_block(integral_result);
             let reciprocal = b.ins().fdiv(one, magnitude);
@@ -866,22 +451,16 @@ impl UnitCodegenContext<'_> {
 
             b.switch_to_block(generic);
             b.seal_block(generic);
+            let negative = b.block_params(generic)[0];
             let abs_x = from_i64_bits(&mut b, ax_bits);
-            let log_call = b.ins().call(log_ref, &[abs_x]);
-            let log_pair = b.inst_results(log_call)[0];
-            let log = [
-                b.ins().extractlane(log_pair, 0),
-                b.ins().extractlane(log_pair, 1),
-            ];
+            let log = emit_log2_f64(&mut b, abs_x);
             let y1 = clear_low_word(&mut b, y);
             let y_tail = b.ins().fsub(y, y1);
             let tail_hi = b.ins().fmul(y_tail, log[0]);
             let tail_lo = b.ins().fmul(y, log[1]);
             let p_l = b.ins().fadd(tail_hi, tail_lo);
             let p_h = b.ins().fmul(y1, log[0]);
-            let exp_call = b.ins().call(exp_ref, &[p_h, p_l]);
-            let magnitude = b.inst_results(exp_call)[0];
-            let negative = b.ins().band(x_negative, is_odd);
+            let magnitude = emit_exp2_f64(&mut b, p_h, p_l);
             let negated = b.ins().fneg(magnitude);
             let answer = b.ins().select(negative, negated, magnitude);
             b.ins().return_(&[answer]);
@@ -893,6 +472,402 @@ impl UnitCodegenContext<'_> {
         self.output.module.clear_context(&mut ctx);
         Ok(())
     }
+}
+
+// Emit each numerical block once inside the singleton dispatcher. Block
+// parameters replace ABI packing/spilling, preserving every floating operation.
+fn emit_log2_f64(b: &mut FunctionBuilder<'_>, x: Value) -> [Value; 2] {
+    let done = b.create_block();
+    b.append_block_param(done, types::F64);
+    b.append_block_param(done, types::F64);
+    let close = b.create_block();
+    let classify = b.create_block();
+    let delta = {
+        let one = f64_bits(b, 1.0f64.to_bits());
+        b.ins().fsub(x, one)
+    };
+    let abs_delta = b.ins().fabs(delta);
+    let close_limit = f64_bits(b, CLOSE_TO_ONE);
+    let is_close = b
+        .ins()
+        .fcmp(FloatCC::LessThanOrEqual, abs_delta, close_limit);
+    b.ins().brif(is_close, close, &[], classify, &[]);
+
+    // Near one, fdlibm's compensated log1p polynomial avoids losing the
+    // small difference before multiplication by a large exponent.
+    b.switch_to_block(close);
+    b.seal_block(close);
+    let half = f64_bits(b, 0.5f64.to_bits());
+    let third = f64_bits(b, (1.0f64 / 3.0).to_bits());
+    let quarter = f64_bits(b, 0.25f64.to_bits());
+    let tt = b.ins().fmul(delta, delta);
+    let tq = b.ins().fmul(delta, quarter);
+    let inner = b.ins().fsub(third, tq);
+    let ti = b.ins().fmul(delta, inner);
+    let half_minus = b.ins().fsub(half, ti);
+    let w = b.ins().fmul(tt, half_minus);
+    let ivln2_h = f64_bits(b, IVLN2_H);
+    let u = b.ins().fmul(ivln2_h, delta);
+    let ivln2_l = f64_bits(b, IVLN2_L);
+    let dl = b.ins().fmul(delta, ivln2_l);
+    let ivln2 = f64_bits(b, IVLN2);
+    let wi = b.ins().fmul(w, ivln2);
+    let v = b.ins().fsub(dl, wi);
+    let uv = b.ins().fadd(u, v);
+    let t1 = clear_low_word(b, uv);
+    let t1_minus_u = b.ins().fsub(t1, u);
+    let t2 = b.ins().fsub(v, t1_minus_u);
+    b.ins().jump(done, &[t1.into(), t2.into()]);
+
+    b.switch_to_block(classify);
+    b.seal_block(classify);
+    let bits = as_i64_bits(b, x);
+    let high = b.ins().ushr_imm_u(bits, 32);
+    let high_mask = b.ins().iconst(types::I64, 0x7fff_ffff);
+    let ix = b.ins().band(high, high_mask);
+    let subnormal = b.ins().icmp_imm_u(IntCC::UnsignedLessThan, ix, 0x0010_0000);
+    let scale_subnormal = b.create_block();
+    let normalized = b.create_block();
+    for ty in [types::F64, types::I64, types::I64] {
+        b.append_block_param(normalized, ty);
+    }
+    let zero_n = b.ins().iconst(types::I64, 0);
+    b.ins().brif(
+        subnormal,
+        scale_subnormal,
+        &[],
+        normalized,
+        &[x.into(), zero_n.into(), ix.into()],
+    );
+
+    b.switch_to_block(scale_subnormal);
+    b.seal_block(scale_subnormal);
+    let two53 = f64_bits(b, TWO53);
+    let scaled = b.ins().fmul(x, two53);
+    let scaled_bits = as_i64_bits(b, scaled);
+    let scaled_high = b.ins().ushr_imm_u(scaled_bits, 32);
+    let scaled_ix = b.ins().band(scaled_high, high_mask);
+    let minus53 = b.ins().iconst(types::I64, -53);
+    b.ins().jump(
+        normalized,
+        &[scaled.into(), minus53.into(), scaled_ix.into()],
+    );
+
+    b.switch_to_block(normalized);
+    b.seal_block(normalized);
+    let vals = b.block_params(normalized).to_vec();
+    let ax = vals[0];
+    let n0 = vals[1];
+    let ix0 = vals[2];
+    let exponent = b.ins().sshr_imm_u(ix0, 20);
+    let exponent = b.ins().iadd_imm_s(exponent, -0x3ff);
+    let n = b.ins().iadd(n0, exponent);
+    let mant_mask = b.ins().iconst(types::I64, 0x000f_ffff);
+    let j = b.ins().band(ix0, mant_mask);
+    let normalized_ix = b.ins().bor_imm_u(j, 0x3ff0_0000);
+    let k0 = b.create_block();
+    let k1_test = b.create_block();
+    let k1 = b.create_block();
+    let k_up = b.create_block();
+    let kernel = b.create_block();
+    for ty in [types::F64, types::I64, types::I64, types::I64] {
+        b.append_block_param(kernel, ty);
+    }
+    let low_interval = b
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, j, 0x3988e);
+    b.ins().brif(low_interval, k0, &[], k1_test, &[]);
+
+    b.switch_to_block(k0);
+    b.seal_block(k0);
+    let zero = b.ins().iconst(types::I64, 0);
+    b.ins().jump(
+        kernel,
+        &[ax.into(), n.into(), normalized_ix.into(), zero.into()],
+    );
+
+    b.switch_to_block(k1_test);
+    b.seal_block(k1_test);
+    let middle = b.ins().icmp_imm_u(IntCC::UnsignedLessThan, j, 0xbb67a);
+    b.ins().brif(middle, k1, &[], k_up, &[]);
+
+    b.switch_to_block(k1);
+    b.seal_block(k1);
+    let one_i = b.ins().iconst(types::I64, 1);
+    b.ins().jump(
+        kernel,
+        &[ax.into(), n.into(), normalized_ix.into(), one_i.into()],
+    );
+
+    b.switch_to_block(k_up);
+    b.seal_block(k_up);
+    let n_up = b.ins().iadd_imm_u(n, 1);
+    let ix_down = b.ins().iadd_imm_s(normalized_ix, -0x0010_0000);
+    let zero = b.ins().iconst(types::I64, 0);
+    b.ins().jump(
+        kernel,
+        &[ax.into(), n_up.into(), ix_down.into(), zero.into()],
+    );
+
+    b.switch_to_block(kernel);
+    b.seal_block(kernel);
+    let args = b.block_params(kernel).to_vec();
+    let (ax0, n, ix, k) = (args[0], args[1], args[2], args[3]);
+    let k_is_one = b.ins().icmp_imm_u(IntCC::Equal, k, 1);
+    let one_f = f64_bits(b, 1.0f64.to_bits());
+    let one_half = f64_bits(b, BP1);
+    let bp = b.ins().select(k_is_one, one_half, one_f);
+    let dp_h1 = f64_bits(b, DP_H1);
+    let zero_f = f64_bits(b, 0.0f64.to_bits());
+    let dp_h = b.ins().select(k_is_one, dp_h1, zero_f);
+    let dp_l1 = f64_bits(b, DP_L1);
+    let dp_l = b.ins().select(k_is_one, dp_l1, zero_f);
+
+    let ax_bits = as_i64_bits(b, ax0);
+    let low_mask = b.ins().iconst(types::I64, 0xffff_ffff_u64 as i64);
+    let low = b.ins().band(ax_bits, low_mask);
+    let ix_shift = b.ins().ishl_imm_u(ix, 32);
+    let rebuilt = b.ins().bor(ix_shift, low);
+    let ax = from_i64_bits(b, rebuilt);
+    let u = b.ins().fsub(ax, bp);
+    let sum = b.ins().fadd(ax, bp);
+    let v = b.ins().fdiv(one_f, sum);
+    let ss = b.ins().fmul(u, v);
+    let s_h = clear_low_word(b, ss);
+
+    let half_ix = b.ins().ushr_imm_u(ix, 1);
+    let base_high = b.ins().bor_imm_u(half_ix, 0x2000_0000);
+    let plus = b.ins().iadd_imm_u(base_high, 0x0008_0000);
+    let k_shift = b.ins().ishl_imm_u(k, 18);
+    let th_high = b.ins().iadd(plus, k_shift);
+    let th_bits = b.ins().ishl_imm_u(th_high, 32);
+    let t_h0 = from_i64_bits(b, th_bits);
+    let th_minus_bp = b.ins().fsub(t_h0, bp);
+    let t_l = b.ins().fsub(ax, th_minus_bp);
+    let shth = b.ins().fmul(s_h, t_h0);
+    let u_minus = b.ins().fsub(u, shth);
+    let shtl = b.ins().fmul(s_h, t_l);
+    let sl_inner = b.ins().fsub(u_minus, shtl);
+    let s_l = b.ins().fmul(v, sl_inner);
+
+    let s2 = b.ins().fmul(ss, ss);
+    let l6 = f64_bits(b, L6);
+    let l5 = f64_bits(b, L5);
+    let p = b.ins().fmul(s2, l6);
+    let p = b.ins().fadd(l5, p);
+    let l4 = f64_bits(b, L4);
+    let p = b.ins().fmul(s2, p);
+    let p = b.ins().fadd(l4, p);
+    let l3 = f64_bits(b, L3);
+    let p = b.ins().fmul(s2, p);
+    let p = b.ins().fadd(l3, p);
+    let l2 = f64_bits(b, L2);
+    let p = b.ins().fmul(s2, p);
+    let p = b.ins().fadd(l2, p);
+    let l1 = f64_bits(b, L1);
+    let p = b.ins().fmul(s2, p);
+    let p = b.ins().fadd(l1, p);
+    let s4 = b.ins().fmul(s2, s2);
+    let mut r = b.ins().fmul(s4, p);
+    let sh_plus_s = b.ins().fadd(s_h, ss);
+    let sl_term = b.ins().fmul(s_l, sh_plus_s);
+    r = b.ins().fadd(r, sl_term);
+    let sh2 = b.ins().fmul(s_h, s_h);
+    let three = f64_bits(b, 3.0f64.to_bits());
+    let th_sum = b.ins().fadd(three, sh2);
+    let th_sum = b.ins().fadd(th_sum, r);
+    let t_h = clear_low_word(b, th_sum);
+    let th_minus_three = b.ins().fsub(t_h, three);
+    let th_minus = b.ins().fsub(th_minus_three, sh2);
+    let t_l = b.ins().fsub(r, th_minus);
+    let u = b.ins().fmul(s_h, t_h);
+    let slth = b.ins().fmul(s_l, t_h);
+    let tlss = b.ins().fmul(t_l, ss);
+    let v = b.ins().fadd(slth, tlss);
+    let uv = b.ins().fadd(u, v);
+    let p_h = clear_low_word(b, uv);
+    let ph_minus_u = b.ins().fsub(p_h, u);
+    let p_l = b.ins().fsub(v, ph_minus_u);
+    let cp_h = f64_bits(b, CP_H);
+    let z_h = b.ins().fmul(cp_h, p_h);
+    let cp_l = f64_bits(b, CP_L);
+    let zl0 = b.ins().fmul(cp_l, p_h);
+    let cp = f64_bits(b, CP);
+    let plcp = b.ins().fmul(p_l, cp);
+    let z_l = b.ins().fadd(zl0, plcp);
+    let z_l = b.ins().fadd(z_l, dp_l);
+    let n_f = b.ins().fcvt_from_sint(types::F64, n);
+    let sum = b.ins().fadd(z_h, z_l);
+    let sum = b.ins().fadd(sum, dp_h);
+    let sum = b.ins().fadd(sum, n_f);
+    let out_h = clear_low_word(b, sum);
+    let a = b.ins().fsub(out_h, n_f);
+    let a = b.ins().fsub(a, dp_h);
+    let a = b.ins().fsub(a, z_h);
+    let out_l = b.ins().fsub(z_l, a);
+    b.ins().jump(done, &[out_h.into(), out_l.into()]);
+
+    b.switch_to_block(done);
+    b.seal_block(done);
+    [b.block_params(done)[0], b.block_params(done)[1]]
+}
+
+fn emit_exp2_f64(b: &mut FunctionBuilder<'_>, p_h: Value, p_l: Value) -> Value {
+    let done = b.create_block();
+    b.append_block_param(done, types::F64);
+    let z0 = b.ins().fadd(p_h, p_l);
+
+    let nan = b.create_block();
+    let overflow = b.create_block();
+    let overflow_tie = b.create_block();
+    let underflow_test = b.create_block();
+    let underflow = b.create_block();
+    let underflow_tie = b.create_block();
+    let kernel = b.create_block();
+
+    let unordered = b.ins().fcmp(FloatCC::Unordered, z0, z0);
+    let ordered = b.create_block();
+    b.ins().brif(unordered, nan, &[], ordered, &[]);
+
+    b.switch_to_block(nan);
+    b.seal_block(nan);
+    b.ins().jump(done, &[z0.into()]);
+
+    b.switch_to_block(ordered);
+    b.seal_block(ordered);
+    let upper = f64_bits(b, 1024.0f64.to_bits());
+    let too_high = b.ins().fcmp(FloatCC::GreaterThan, z0, upper);
+    let upper_check = b.create_block();
+    b.ins().brif(too_high, overflow, &[], upper_check, &[]);
+
+    b.switch_to_block(upper_check);
+    b.seal_block(upper_check);
+    let at_upper = b.ins().fcmp(FloatCC::Equal, z0, upper);
+    b.ins()
+        .brif(at_upper, overflow_tie, &[], underflow_test, &[]);
+
+    b.switch_to_block(overflow_tie);
+    b.seal_block(overflow_tie);
+    let ovt = f64_bits(b, OVT);
+    let left = b.ins().fadd(p_l, ovt);
+    let right = b.ins().fsub(z0, p_h);
+    let crosses = b.ins().fcmp(FloatCC::GreaterThan, left, right);
+    b.ins().brif(crosses, overflow, &[], underflow_test, &[]);
+
+    b.switch_to_block(overflow);
+    b.seal_block(overflow);
+    let huge = f64_bits(b, HUGE);
+    let inf = b.ins().fmul(huge, huge);
+    b.ins().jump(done, &[inf.into()]);
+
+    b.switch_to_block(underflow_test);
+    let lower = f64_bits(b, (-1075.0f64).to_bits());
+    let too_low = b.ins().fcmp(FloatCC::LessThan, z0, lower);
+    let lower_check = b.create_block();
+    b.ins().brif(too_low, underflow, &[], lower_check, &[]);
+
+    b.switch_to_block(lower_check);
+    b.seal_block(lower_check);
+    let at_lower = b.ins().fcmp(FloatCC::Equal, z0, lower);
+    b.ins().brif(at_lower, underflow_tie, &[], kernel, &[]);
+
+    b.switch_to_block(underflow_tie);
+    b.seal_block(underflow_tie);
+    let left = p_l;
+    let right = b.ins().fsub(z0, p_h);
+    let crosses = b.ins().fcmp(FloatCC::LessThanOrEqual, left, right);
+    b.ins().brif(crosses, underflow, &[], kernel, &[]);
+
+    b.switch_to_block(underflow);
+    b.seal_block(underflow);
+    let tiny = f64_bits(b, TINY);
+    let zero = b.ins().fmul(tiny, tiny);
+    b.ins().jump(done, &[zero.into()]);
+
+    b.switch_to_block(kernel);
+    b.seal_block(kernel);
+    // `nearest` is specified as round-to-nearest, ties-to-even. The
+    // preceding finite [-1075, 1024] guards dominate the conversion.
+    let n_f = b.ins().nearest(z0);
+    let n = b.ins().fcvt_to_sint(types::I64, n_f);
+    let p_h = b.ins().fsub(p_h, n_f);
+    let sum = b.ins().fadd(p_l, p_h);
+    let t = clear_low_word(b, sum);
+    let lg2_h = f64_bits(b, LG2_H);
+    let u = b.ins().fmul(t, lg2_h);
+    let t_minus_ph = b.ins().fsub(t, p_h);
+    let pl_minus = b.ins().fsub(p_l, t_minus_ph);
+    let lg2 = f64_bits(b, LG2);
+    let v0 = b.ins().fmul(pl_minus, lg2);
+    let lg2_l = f64_bits(b, LG2_L);
+    let tl = b.ins().fmul(t, lg2_l);
+    let v = b.ins().fadd(v0, tl);
+    let z = b.ins().fadd(u, v);
+    let z_minus_u = b.ins().fsub(z, u);
+    let w = b.ins().fsub(v, z_minus_u);
+    let zz = b.ins().fmul(z, z);
+    let p5 = f64_bits(b, P5);
+    let p4 = f64_bits(b, P4);
+    let p = b.ins().fmul(zz, p5);
+    let p = b.ins().fadd(p4, p);
+    let p3 = f64_bits(b, P3);
+    let p = b.ins().fmul(zz, p);
+    let p = b.ins().fadd(p3, p);
+    let p2 = f64_bits(b, P2);
+    let p = b.ins().fmul(zz, p);
+    let p = b.ins().fadd(p2, p);
+    let p1 = f64_bits(b, P1);
+    let p = b.ins().fmul(zz, p);
+    let p = b.ins().fadd(p1, p);
+    let zzp = b.ins().fmul(zz, p);
+    let t1 = b.ins().fsub(z, zzp);
+    let zt1 = b.ins().fmul(z, t1);
+    let two = f64_bits(b, 2.0f64.to_bits());
+    let denom = b.ins().fsub(t1, two);
+    let quotient = b.ins().fdiv(zt1, denom);
+    let zw = b.ins().fmul(z, w);
+    let wsum = b.ins().fadd(w, zw);
+    let r = b.ins().fsub(quotient, wsum);
+    let one = f64_bits(b, 1.0f64.to_bits());
+    let r_minus_z = b.ins().fsub(r, z);
+    let result = b.ins().fsub(one, r_minus_z);
+
+    let result_bits = as_i64_bits(b, result);
+    let exponent = b.ins().ushr_imm_u(result_bits, 52);
+    let exp_mask = b.ins().iconst(types::I64, 0x7ff);
+    let exponent = b.ins().band(exponent, exp_mask);
+    let new_exponent = b.ins().iadd(exponent, n);
+    let subnormal_scale = b.create_block();
+    let normal_scale = b.create_block();
+    let became_subnormal = b
+        .ins()
+        .icmp_imm_s(IntCC::SignedLessThanOrEqual, new_exponent, 0);
+    b.ins()
+        .brif(became_subnormal, subnormal_scale, &[], normal_scale, &[]);
+
+    b.switch_to_block(normal_scale);
+    b.seal_block(normal_scale);
+    let shifted_n = b.ins().ishl_imm_u(n, 52);
+    let scaled_bits = b.ins().iadd(result_bits, shifted_n);
+    let scaled = from_i64_bits(b, scaled_bits);
+    b.ins().jump(done, &[scaled.into()]);
+
+    b.switch_to_block(subnormal_scale);
+    b.seal_block(subnormal_scale);
+    // fdlibm scalbn's prescale keeps the final rounding single even for
+    // the smallest subnormal result.
+    let prescale = f64_bits(b, TWO_NEG_969);
+    let prescaled = b.ins().fmul(result, prescale);
+    let n2 = b.ins().iadd_imm_u(n, 969);
+    let biased = b.ins().iadd_imm_u(n2, 1023);
+    let scale_bits = b.ins().ishl_imm_u(biased, 52);
+    let scale = from_i64_bits(b, scale_bits);
+    let scaled = b.ins().fmul(prescaled, scale);
+    b.ins().jump(done, &[scaled.into()]);
+
+    b.switch_to_block(done);
+    b.seal_block(done);
+    b.block_params(done)[0]
 }
 
 fn const_f64_operand(builder: &FunctionBuilder<'_>, mut value: Value) -> Option<f64> {

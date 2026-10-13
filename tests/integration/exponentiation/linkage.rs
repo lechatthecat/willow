@@ -160,23 +160,20 @@ fn main() {
 }
 "#;
     let symbols = compile_and_collect_defined_symbols(SOURCE, &[]);
-    for helper in [
-        "willow_internal_log2_f64_v1",
-        "willow_internal_exp2_f64_v1",
-        "willow_internal_pow_f64_v1",
-    ] {
-        assert_eq!(
-            symbols
-                .iter()
-                .filter(|name| name.as_str() == helper)
-                .count(),
-            1,
-            "helper `{helper}` must have exactly one local definition: {symbols:?}"
-        );
-    }
+    let helper = "willow_internal_pow_f64_v1";
+    assert_eq!(
+        symbols
+            .iter()
+            .filter(|name| name.as_str() == helper)
+            .count(),
+        1,
+        "helper `{helper}` must have exactly one local definition: {symbols:?}"
+    );
 
     let relocations = compile_and_collect_relocation_targets(SOURCE, &[]);
     for forbidden in [
+        "willow_internal_log2_f64_v1",
+        "willow_internal_exp2_f64_v1",
         "willow_pow_f64",
         "pow",
         "powf",

@@ -424,3 +424,79 @@ fn pow_f64_36_negative_integral_range_and_path_agreement() {
         assert_eq!(actual, expected, "release={release}");
     }
 }
+
+/// Option A freezes pre-optimization output words, rather than comparing two
+/// newly changed paths only. Includes both new guard edges and log2 branches.
+#[test]
+fn pow_f64_37_option_a_preserves_bits_across_all_call_paths() {
+    const CASES: &[(u64, u64, u64)] = &[
+        (0x0000000000000001, 0x3fd8000000000000, 0x26c306fe0a31b715),
+        (0x0000000000000001, 0xbfd8000000000000, 0x591ae89f995ad3ae),
+        (0x0000000000000001, 0x3fefffffffffffff, 0x0000000000000001),
+        (0x000fffffffffffff, 0x3fd8000000000000, 0x27fae89f995ad3ad),
+        (0x000fffffffffffff, 0xbfd8000000000000, 0x57e306fe0a31b716),
+        (0x000fffffffffffff, 0x3fefffffffffffff, 0x0010000000000161),
+        (0x0010000000000000, 0x3fd8000000000000, 0x27fae89f995ad3ae),
+        (0x0010000000000000, 0xbfd8000000000000, 0x57e306fe0a31b715),
+        (0x0010000000000000, 0x3fefffffffffffff, 0x0010000000000162),
+        (0x3fe0000000000000, 0x3fd8000000000000, 0x3fe8ace5422aa0dc),
+        (0x3fe0000000000000, 0xbfd8000000000000, 0x3ff4bfdad5362a27),
+        (0x3fe0000000000000, 0x3fefffffffffffff, 0x3fe0000000000000),
+        (0x3fefffffffffffff, 0x3fd8000000000000, 0x3ff0000000000000),
+        (0x3fefffffffffffff, 0xbfd8000000000000, 0x3ff0000000000000),
+        (0x3fefffffffffffff, 0x3fefffffffffffff, 0x3fefffffffffffff),
+        (0x3ff0000000000001, 0x3fd8000000000000, 0x3ff0000000000000),
+        (0x3ff0000000000001, 0xbfd8000000000000, 0x3fefffffffffffff),
+        (0x3ff0000000000001, 0x3fefffffffffffff, 0x3ff0000000000001),
+        (0x3ff2000000000000, 0x3fd8000000000000, 0x3ff0b8f837bceb0b),
+        (0x3ff2000000000000, 0xbfd8000000000000, 0x3fee9e0b7f6ba895),
+        (0x3ff2000000000000, 0x3fefffffffffffff, 0x3ff2000000000000),
+        (0x3ff8000000000000, 0x3fd8000000000000, 0x3ff2a0a2cec13a65),
+        (0x3ff8000000000000, 0xbfd8000000000000, 0x3feb7c7bf97bc57f),
+        (0x3ff8000000000000, 0x3fefffffffffffff, 0x3ff8000000000000),
+        (0x4000000000000000, 0x3fd8000000000000, 0x3ff4bfdad5362a27),
+        (0x4000000000000000, 0xbfd8000000000000, 0x3fe8ace5422aa0dc),
+        (0x4000000000000000, 0x3fefffffffffffff, 0x3fffffffffffffff),
+        (0x7fefffffffffffff, 0x3fd8000000000000, 0x57f0000000000000),
+        (0x7fefffffffffffff, 0xbfd8000000000000, 0x27f0000000000000),
+        (0x7fefffffffffffff, 0x3fefffffffffffff, 0x7feffffffffffd39),
+        (0x0000000000000000, 0x3fd8000000000000, 0x0000000000000000),
+        (0x8000000000000000, 0x3fd8000000000000, 0x0000000000000000),
+        (0x3ff8000000000000, 0x3ff0000000000000, 0x3ff8000000000000),
+        (0x3ff8000000000000, 0x3ff0000000000001, 0x3ff8000000000000),
+        (0xbff8000000000000, 0x4008000000000000, 0xc00b000000000000),
+    ];
+    let mut source = String::from(
+        "fn dynamic(x: f64, y: f64) -> f64 { return x ** y; }\nfn main() {\nlet p: fn(f64, f64) -> f64 = pow;\nlet q: fn(f64, f64) -> f64 = powf;\n",
+    );
+    let mut expected = Vec::new();
+    for &(x, y, result) in CASES {
+        let x = willow_f64_literal(f64::from_bits(x));
+        let y = willow_f64_literal(f64::from_bits(y));
+        for expression in [
+            format!("({x}) ** ({y})"),
+            format!("dynamic({x}, {y})"),
+            format!("pow({x}, {y})"),
+            format!("powf({x}, {y})"),
+            format!("p({x}, {y})"),
+            format!("q({x}, {y})"),
+        ] {
+            source.push_str(&format!("println({expression});\n"));
+            expected.push(result);
+        }
+    }
+    source.push_str("}\n");
+    for release in [false, true] {
+        let (out, ok) = if release {
+            compile_and_run_release(&source)
+        } else {
+            compile_and_run(&source)
+        };
+        assert!(ok, "release={release}: {out}");
+        let actual: Vec<u64> = out
+            .lines()
+            .map(|line| line.parse::<f64>().unwrap().to_bits())
+            .collect();
+        assert_eq!(actual, expected, "release={release}");
+    }
+}
