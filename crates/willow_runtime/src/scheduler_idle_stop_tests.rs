@@ -846,17 +846,21 @@ fn idle_28_a_claim_behind_a_refused_decision_proceeds() {
 fn idle_29_a_moving_poll_is_always_live() {
     let _guard = fresh_scheduler();
     let state = Arc::new(ParallelRunState::default());
-    state.begin_poll();
+    let entered = Arc::new(Barrier::new(2));
+    let mover_entered = Arc::clone(&entered);
     let done = Arc::new(AtomicBool::new(false));
     let mover_state = Arc::clone(&state);
     let mover_done = Arc::clone(&done);
     let mover = std::thread::spawn(move || {
+        mover_state.begin_poll();
+        mover_entered.wait();
         for _ in 0..200_000 {
             mover_state.pause_active_poll();
             mover_state.resume_paused_poll();
         }
         mover_done.store(true, Ordering::Release);
     });
+    entered.wait();
     let mut reads = 0u64;
     while !done.load(Ordering::Acquire) {
         assert!(

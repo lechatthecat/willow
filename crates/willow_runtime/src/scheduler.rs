@@ -2122,37 +2122,61 @@ fn global_task_table() -> &'static Arc<ShardedTaskTable> {
 /// Counted globally rather than per `ParallelRunState` so a nested drive and a
 /// foreign driver thread observe each other's claims too.
 ///
-/// The low [`CLAIM_COUNT_BITS`] bits count claims in flight. The high bits are
-/// an epoch that every claim holding a popped id advances when it resolves.
-/// A stop decision reads the word before and after its snapshot and accepts
-/// only an unchanged word with a zero count, so no claim can pop, resolve and
-/// republish work between two of its reads unseen (willow-8hq4.19). All
-/// accesses are `SeqCst`: the word is one half of the store/load handshake with
+/// Each shard's low [`CLAIM_COUNT_BITS`] bits count claims in flight. The high
+/// bits are an epoch advanced by popped claims and active/paused transfers. A
+/// stop decision reads every word before and after its snapshot and accepts
+/// only unchanged words with zero counts, so no claim can pop, resolve and
+/// republish work between its reads unseen (willow-8hq4.19). All claim-word
+/// accesses are `SeqCst`: they form one half of the store/load handshake with
 /// [`ParallelRunState::stop_intent`] that lets claims skip `claim_gate`.
 ///
-/// Every claim RMWs the word twice, so it sits alone on its cache line: the
-/// adjacent read-mostly flags (`FRAME_RELEASE_DUE`, polled once per loop
-/// iteration) would otherwise miss on every claim elsewhere (willow-a6o0).
-static CLAIM_WORD: ClaimWord = ClaimWord(AtomicU64::new(0));
+/// Claims and poll accounting use fixed, cache-separated thread shards. Each
+/// hot update is O(1); only cold idle/stop snapshots visit the fixed array.
+/// Collisions after 64 registered threads preserve correctness (atomic updates).
+const ACCOUNTING_SHARDS: usize = 64;
+static NEXT_ACCOUNTING_SHARD: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static ACCOUNTING_SHARD: usize =
+        NEXT_ACCOUNTING_SHARD.fetch_add(1, Ordering::Relaxed) % ACCOUNTING_SHARDS;
+}
 
 #[repr(align(128))]
-struct ClaimWord(AtomicU64);
+#[derive(Debug)]
+struct AccountingWord(AtomicU64);
 
-impl std::ops::Deref for ClaimWord {
-    type Target = AtomicU64;
+#[derive(Debug)]
+struct AccountingWords([AccountingWord; ACCOUNTING_SHARDS]);
 
-    fn deref(&self) -> &AtomicU64 {
-        &self.0
+impl Default for AccountingWords {
+    fn default() -> Self {
+        Self::new()
     }
 }
+
+impl AccountingWords {
+    const fn new() -> Self {
+        Self([const { AccountingWord(AtomicU64::new(0)) }; ACCOUNTING_SHARDS])
+    }
+
+    fn local(&self) -> &AtomicU64 {
+        &self.0[ACCOUNTING_SHARD.with(|index| *index)].0
+    }
+
+    fn snapshot(&self) -> [u64; ACCOUNTING_SHARDS] {
+        std::array::from_fn(|index| self.0[index].0.load(Ordering::SeqCst))
+    }
+}
+
+static CLAIM_WORD: AccountingWords = AccountingWords::new();
 
 const CLAIM_COUNT_BITS: u32 = 32;
 const CLAIM_COUNT_MASK: u64 = (1 << CLAIM_COUNT_BITS) - 1;
 /// Leave the pop→claim window and advance the epoch in one step.
 const CLAIM_RESOLVE: u64 = (1 << CLAIM_COUNT_BITS) - 1;
 
+#[cfg(test)]
 fn claim_word() -> u64 {
-    CLAIM_WORD.load(Ordering::SeqCst)
+    CLAIM_WORD.snapshot().into_iter().fold(0, u64::wrapping_add)
 }
 
 /// RAII marker for the pop→claim window. Dropped only after the claim has
@@ -2160,36 +2184,63 @@ fn claim_word() -> u64 {
 /// pushed back / dropped, so idleness is never observable between the two
 /// states.
 struct ClaimInFlight {
-    popped: bool,
+    word: &'static AtomicU64,
+    advance_epoch: bool,
 }
 
 impl ClaimInFlight {
     fn enter() -> Self {
-        CLAIM_WORD.fetch_add(1, Ordering::SeqCst);
-        Self { popped: false }
+        let word = CLAIM_WORD.local();
+        word.fetch_add(1, Ordering::SeqCst);
+        Self {
+            word,
+            advance_epoch: false,
+        }
+    }
+
+    /// A paused/active transfer can invalidate a liveness scan without
+    /// popping a task. Publish the in-flight marker before changing the poll
+    /// word and advance the epoch after it, just like a resolved claim.
+    fn poll_transition() -> Self {
+        let mut transition = Self::enter();
+        transition.advance_epoch = true;
+        transition
     }
 
     /// The pop returned an id. Its resolution may publish work (a requeue, a
     /// reroute, a wake from cancellation), so leaving must advance the epoch.
     /// A claim that popped nothing changed nothing and leaves without it.
     fn popped(&mut self) {
-        self.popped = true;
+        self.advance_epoch = true;
     }
 }
 
 impl Drop for ClaimInFlight {
     fn drop(&mut self) {
-        let delta = if self.popped { CLAIM_RESOLVE } else { u64::MAX };
+        let delta = if self.advance_epoch {
+            CLAIM_RESOLVE
+        } else {
+            u64::MAX
+        };
         // `u64::MAX` wraps to a plain decrement of the count.
-        let previous = CLAIM_WORD.fetch_add(delta, Ordering::SeqCst);
+        let previous = self.word.fetch_add(delta, Ordering::SeqCst);
         debug_assert!(previous & CLAIM_COUNT_MASK > 0, "claim-in-flight underflow");
     }
 }
 
 /// True while any thread holds a popped-but-unclaimed task. Idle detection must
-/// treat this as pending work.
+/// treat this as pending work. A concurrent resolution may conservatively
+/// report work too; a subsequent quiet scan returns false.
 fn claims_in_flight() -> bool {
-    claim_word() & CLAIM_COUNT_MASK > 0
+    let before = CLAIM_WORD.snapshot();
+    claims_changed_or_in_flight(&before)
+}
+
+/// A scan may straddle a handoff from a later shard to an earlier one. A
+/// popped claim advances its epoch, so a second collect detects that handoff
+/// even if the first collect happened to see every count at zero.
+fn claims_changed_or_in_flight(before: &[u64; ACCOUNTING_SHARDS]) -> bool {
+    before.iter().any(|word| word & CLAIM_COUNT_MASK > 0) || CLAIM_WORD.snapshot() != *before
 }
 
 /// Wake-deadlines, shared with the scheduler instance the same way the run
@@ -3241,7 +3292,7 @@ pub(crate) fn scheduler_has_wake_source() -> bool {
                 // This caller may itself be a running task blocked in recv or
                 // send. Counting it would turn genuine deadlocks into spins.
                 let caller = usize::from(current_task_id().is_some());
-                state.active_polls() > caller
+                state.has_active_peer(caller)
             })
         })
         || crate::netpoll::has_waiters()
@@ -3463,11 +3514,11 @@ struct ParallelRunState {
     /// reads the word, all `SeqCst`. Either the decision sees the claim, or
     /// the claim sees the flag and waits on `claim_gate` for the decision.
     stop_intent: AtomicBool,
-    /// Polls of this run: the low [`POLL_ACTIVE_BITS`] bits count running
-    /// polls, the high bits polls paused inside a nested drive. One word, so a
-    /// pause or resume moves a poll in one step and no read can see it in
-    /// neither half (willow-8hq4.19).
-    polls: AtomicU64,
+    /// Thread-sharded polls of this run: each word's low bits count running
+    /// polls, its high bits count polls paused inside a nested drive. A poll
+    /// starts, pauses, resumes and ends on the same OS thread, even if its task
+    /// migrates between polls. Each transfer is one atomic operation.
+    polls: AccountingWords,
     /// The pool's shared view of the drive target, used by the pool workers
     /// (`stop_pool_on_exit`) only. A nested drive has its own target.
     target: SharedTargetCheck,
@@ -3511,8 +3562,14 @@ impl ParallelRunState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.stop_intent.store(true, Ordering::SeqCst);
-        let before = claim_word();
-        let stop = before & CLAIM_COUNT_MASK == 0 && quiescent(self) && claim_word() == before;
+        // A shard is read in both passes. A claim resolving between its reads
+        // changes its epoch; a claim entering after its first read sees the
+        // raised intent before claiming. Thus no coherent all-shard instant
+        // is needed. Never sum epochs here: compare each shard independently.
+        let before = CLAIM_WORD.snapshot();
+        let stop = before.iter().all(|word| word & CLAIM_COUNT_MASK == 0)
+            && quiescent(self)
+            && CLAIM_WORD.snapshot() == before;
         if stop {
             self.stop.store(true, Ordering::SeqCst);
             notify_all_idle_waiters();
@@ -3522,24 +3579,49 @@ impl ParallelRunState {
     }
 
     fn active_polls(&self) -> usize {
-        (self.polls.load(Ordering::Acquire) & POLL_ACTIVE_MASK) as usize
+        self.polls
+            .0
+            .iter()
+            .map(|word| (word.0.load(Ordering::Acquire) & POLL_ACTIVE_MASK) as usize)
+            .sum()
+    }
+
+    /// Unlike a diagnostic sum, a liveness decision must not miss an active
+    /// poll handed between shards during its scan. A new poll is published
+    /// under a claim; pause/resume transfers use the same epoch protocol.
+    /// Retain these epochs through the count scan and retry on a change.
+    /// The caller's own active poll is excluded for deadlock checks.
+    fn has_active_peer(&self, caller: usize) -> bool {
+        self.has_active_peer_during(caller, || self.active_polls())
+    }
+
+    fn has_active_peer_during(&self, caller: usize, scan: impl FnOnce() -> usize) -> bool {
+        let before = CLAIM_WORD.snapshot();
+        scan() > caller || claims_changed_or_in_flight(&before)
     }
 
     fn paused_polls(&self) -> usize {
-        (self.polls.load(Ordering::Acquire) >> POLL_ACTIVE_BITS) as usize
+        self.polls
+            .0
+            .iter()
+            .map(|word| (word.0.load(Ordering::Acquire) >> POLL_ACTIVE_BITS) as usize)
+            .sum()
     }
 
     /// Is a poll running, or paused inside a nested drive?
     fn has_live_poll(&self) -> bool {
-        self.polls.load(Ordering::Acquire) != 0
+        self.polls
+            .0
+            .iter()
+            .any(|word| word.0.load(Ordering::Acquire) != 0)
     }
 
     fn begin_poll(&self) {
-        self.polls.fetch_add(1, Ordering::AcqRel);
+        self.polls.local().fetch_add(1, Ordering::AcqRel);
     }
 
     fn end_poll(&self) {
-        let previous = self.polls.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.polls.local().fetch_sub(1, Ordering::AcqRel);
         debug_assert!(
             previous & POLL_ACTIVE_MASK > 0,
             "parallel poll depth underflow"
@@ -3548,7 +3630,8 @@ impl ParallelRunState {
 
     /// Move the current poll from active to paused for a nested drive.
     fn pause_active_poll(&self) {
-        let previous = self.polls.fetch_add(POLL_PAUSE, Ordering::AcqRel);
+        let _transition = ClaimInFlight::poll_transition();
+        let previous = self.polls.local().fetch_add(POLL_PAUSE, Ordering::AcqRel);
         debug_assert!(
             previous & POLL_ACTIVE_MASK > 0,
             "parallel poll depth underflow"
@@ -3556,7 +3639,8 @@ impl ParallelRunState {
     }
 
     fn resume_paused_poll(&self) {
-        let previous = self.polls.fetch_sub(POLL_PAUSE, Ordering::AcqRel);
+        let _transition = ClaimInFlight::poll_transition();
+        let previous = self.polls.local().fetch_sub(POLL_PAUSE, Ordering::AcqRel);
         debug_assert!(
             previous >> POLL_ACTIVE_BITS > 0,
             "parallel paused poll underflow"
@@ -3565,7 +3649,7 @@ impl ParallelRunState {
 
     #[cfg(test)]
     fn set_polls_for_test(&self, active: usize, paused: usize) {
-        self.polls.store(
+        self.polls.local().store(
             ((paused as u64) << POLL_ACTIVE_BITS) | active as u64,
             Ordering::Release,
         );
@@ -4098,7 +4182,7 @@ fn scheduler_idle_step(
     // A claim that has popped its task but not yet reached `active_polls` is
     // equally in-flight work, and is invisible in every other check
     // (willow-atth).
-    if claims_in_flight() || shared.is_some_and(|state| state.active_polls() > 0) {
+    if claims_in_flight() || shared.is_some_and(|state| state.has_active_peer(0)) {
         wait_for_wake_since(generation, idle_wait_bound(deadline));
         return true;
     }
@@ -4761,7 +4845,9 @@ pub fn reset_global_scheduler_for_test() {
     FATAL_PANIC_PENDING.store(false, Ordering::Release);
     // Claims are strictly scoped to a pop; a leftover count would make every
     // later test's idle detection report pending work.
-    CLAIM_WORD.store(0, Ordering::SeqCst);
+    for word in &CLAIM_WORD.0 {
+        word.0.store(0, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -4942,3 +5028,7 @@ mod tests;
 ))]
 #[path = "scheduler_stack_migration_tests.rs"]
 mod stack_migration_tests;
+
+#[cfg(test)]
+#[path = "scheduler_yield_accounting_tests.rs"]
+mod yield_accounting_tests;

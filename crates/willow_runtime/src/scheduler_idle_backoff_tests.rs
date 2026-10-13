@@ -111,7 +111,30 @@ unsafe extern "C" fn producer(_: *mut c_void) -> i32 {
                 .store(probe.start.elapsed().as_nanos() as u64, Ordering::Release);
             willow_sched_wake(id);
         }
+        if batch == 0 && FORCE_WINDOW.load(Ordering::Relaxed) {
+            // Small wakes coalesce notifications until a poll boundary. Flush
+            // that real pending notification before releasing the forced
+            // failed-probe gate, so this round actually changes generation.
+            global_run_queues().flush_local_wake_notification(current_worker());
+        }
         PUBLISHED_ROUND.fetch_add(1, Ordering::Release);
+        if batch == 0 && FORCE_WINDOW.load(Ordering::Relaxed) {
+            // Keep this producer active until the forced failed probe has
+            // actually retried and polled a consumer. Otherwise it can finish
+            // and drain its own local queue before the delayed thief resumes,
+            // leaving no sample on the path this test promises to exercise.
+            while !probe.samples[..ids.len()]
+                .iter()
+                .any(|sample| sample.crossed_stale_retry.load(Ordering::Acquire))
+            {
+                if Instant::now() >= deadline {
+                    probe.timed_out.store(true, Ordering::Release);
+                    break;
+                }
+                crate::gc::relocatable_safepoint();
+                std::hint::spin_loop();
+            }
+        }
     }
     PRODUCER_DONE.store(true, Ordering::Release);
     notify_all_idle_waiters();

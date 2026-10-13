@@ -212,44 +212,28 @@ static TASK_TRACE: LazyLock<bool> =
 static HOOK_ENABLED: AtomicBool = AtomicBool::new(false);
 static HOOK_STATE: LazyLock<Mutex<HookState>> = LazyLock::new(|| Mutex::new(HookState::default()));
 
-static TASK_SPAWNS: AtomicU64 = AtomicU64::new(0);
-static TASK_WAKES: AtomicU64 = AtomicU64::new(0);
-static TASK_POLLS: AtomicU64 = AtomicU64::new(0);
-static TASK_PARKS: AtomicU64 = AtomicU64::new(0);
-static TASK_YIELDS: AtomicU64 = AtomicU64::new(0);
-static TASK_PREEMPTS: AtomicU64 = AtomicU64::new(0);
-static TASK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
-static TASK_CANCEL_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static TASK_CANCELLATIONS: AtomicU64 = AtomicU64::new(0);
-static TASK_PANICS: AtomicU64 = AtomicU64::new(0);
-static TIMER_WAKES: AtomicU64 = AtomicU64::new(0);
-static NETPOLL_WAITS: AtomicU64 = AtomicU64::new(0);
-static NETPOLL_WAKES: AtomicU64 = AtomicU64::new(0);
-static CHANNEL_WAITS: AtomicU64 = AtomicU64::new(0);
-static BLOCKING_DETACHES: AtomicU64 = AtomicU64::new(0);
-static BLOCKING_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
+// Fixed thread shards keep always-on poll/park metrics off a shared hot line.
+const EVENT_SHARDS: usize = 64;
+const EVENT_KINDS: usize = RuntimeEventKind::BlockingQueueFull as usize;
+#[repr(align(128))]
+struct EventCounters([AtomicU64; EVENT_KINDS]);
+static EVENT_COUNTERS: [EventCounters; EVENT_SHARDS] =
+    [const { EventCounters([const { AtomicU64::new(0) }; EVENT_KINDS]) }; EVENT_SHARDS];
+static NEXT_EVENT_SHARD: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static EVENT_SHARD: usize = NEXT_EVENT_SHARD.fetch_add(1, Ordering::Relaxed) % EVENT_SHARDS;
+}
 #[cfg(test)]
 static BUILT_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 fn counter(kind: RuntimeEventKind) -> &'static AtomicU64 {
-    match kind {
-        RuntimeEventKind::TaskSpawn => &TASK_SPAWNS,
-        RuntimeEventKind::TaskWake => &TASK_WAKES,
-        RuntimeEventKind::TaskPoll => &TASK_POLLS,
-        RuntimeEventKind::TaskPark => &TASK_PARKS,
-        RuntimeEventKind::TaskYield => &TASK_YIELDS,
-        RuntimeEventKind::TaskPreempt => &TASK_PREEMPTS,
-        RuntimeEventKind::TaskComplete => &TASK_COMPLETIONS,
-        RuntimeEventKind::TaskCancelRequested => &TASK_CANCEL_REQUESTS,
-        RuntimeEventKind::TaskCancelled => &TASK_CANCELLATIONS,
-        RuntimeEventKind::TaskPanicked => &TASK_PANICS,
-        RuntimeEventKind::TimerWake => &TIMER_WAKES,
-        RuntimeEventKind::NetpollWait => &NETPOLL_WAITS,
-        RuntimeEventKind::NetpollWake => &NETPOLL_WAKES,
-        RuntimeEventKind::ChannelWait => &CHANNEL_WAITS,
-        RuntimeEventKind::BlockingDetach => &BLOCKING_DETACHES,
-        RuntimeEventKind::BlockingQueueFull => &BLOCKING_QUEUE_FULL,
-    }
+    &EVENT_COUNTERS[EVENT_SHARD.with(|index| *index)].0[kind as usize - 1]
+}
+
+fn counter_total(kind: RuntimeEventKind) -> u64 {
+    EVENT_COUNTERS.iter().fold(0u64, |sum, counters| {
+        sum.wrapping_add(counters.0[kind as usize - 1].load(Ordering::Relaxed))
+    })
 }
 
 pub(crate) fn record(kind: RuntimeEventKind, worker: Option<usize>, task_id: u64, value: i64) {
@@ -388,22 +372,22 @@ pub extern "C" fn willow_runtime_metrics_snapshot_v1(out: *mut WillowRuntimeMetr
     *out = WillowRuntimeMetricsV1 {
         version: RUNTIME_METRICS_VERSION,
         struct_size: std::mem::size_of::<WillowRuntimeMetricsV1>() as u32,
-        task_spawns: TASK_SPAWNS.load(Ordering::Relaxed),
-        task_wakes: TASK_WAKES.load(Ordering::Relaxed),
-        task_polls: TASK_POLLS.load(Ordering::Relaxed),
-        task_parks: TASK_PARKS.load(Ordering::Relaxed),
-        task_yields: TASK_YIELDS.load(Ordering::Relaxed),
-        task_preempts: TASK_PREEMPTS.load(Ordering::Relaxed),
-        task_completions: TASK_COMPLETIONS.load(Ordering::Relaxed),
-        task_cancel_requests: TASK_CANCEL_REQUESTS.load(Ordering::Relaxed),
-        task_cancellations: TASK_CANCELLATIONS.load(Ordering::Relaxed),
-        task_panics: TASK_PANICS.load(Ordering::Relaxed),
-        timer_wakes: TIMER_WAKES.load(Ordering::Relaxed),
-        netpoll_waits: NETPOLL_WAITS.load(Ordering::Relaxed),
-        netpoll_wakes: NETPOLL_WAKES.load(Ordering::Relaxed),
-        channel_waits: CHANNEL_WAITS.load(Ordering::Relaxed),
-        blocking_detaches: BLOCKING_DETACHES.load(Ordering::Relaxed),
-        blocking_queue_full: BLOCKING_QUEUE_FULL.load(Ordering::Relaxed),
+        task_spawns: counter_total(RuntimeEventKind::TaskSpawn),
+        task_wakes: counter_total(RuntimeEventKind::TaskWake),
+        task_polls: counter_total(RuntimeEventKind::TaskPoll),
+        task_parks: counter_total(RuntimeEventKind::TaskPark),
+        task_yields: counter_total(RuntimeEventKind::TaskYield),
+        task_preempts: counter_total(RuntimeEventKind::TaskPreempt),
+        task_completions: counter_total(RuntimeEventKind::TaskComplete),
+        task_cancel_requests: counter_total(RuntimeEventKind::TaskCancelRequested),
+        task_cancellations: counter_total(RuntimeEventKind::TaskCancelled),
+        task_panics: counter_total(RuntimeEventKind::TaskPanicked),
+        timer_wakes: counter_total(RuntimeEventKind::TimerWake),
+        netpoll_waits: counter_total(RuntimeEventKind::NetpollWait),
+        netpoll_wakes: counter_total(RuntimeEventKind::NetpollWake),
+        channel_waits: counter_total(RuntimeEventKind::ChannelWait),
+        blocking_detaches: counter_total(RuntimeEventKind::BlockingDetach),
+        blocking_queue_full: counter_total(RuntimeEventKind::BlockingQueueFull),
     };
     0
 }
@@ -521,5 +505,45 @@ mod tests {
         let before = BUILT_EVENTS.load(Ordering::Relaxed);
         record(RuntimeEventKind::TaskPoll, Some(0), 123, 0);
         assert_eq!(BUILT_EVENTS.load(Ordering::Relaxed), before);
+    }
+    #[test]
+    fn observability_shards_preserve_all_event_totals_after_thread_exit_and_collision() {
+        let _guard = crate::gc::runtime_test_guard();
+        let kinds = [
+            RuntimeEventKind::TaskSpawn,
+            RuntimeEventKind::TaskWake,
+            RuntimeEventKind::TaskPoll,
+            RuntimeEventKind::TaskPark,
+            RuntimeEventKind::TaskYield,
+            RuntimeEventKind::TaskPreempt,
+            RuntimeEventKind::TaskComplete,
+            RuntimeEventKind::TaskCancelRequested,
+            RuntimeEventKind::TaskCancelled,
+            RuntimeEventKind::TaskPanicked,
+            RuntimeEventKind::TimerWake,
+            RuntimeEventKind::NetpollWait,
+            RuntimeEventKind::NetpollWake,
+            RuntimeEventKind::ChannelWait,
+            RuntimeEventKind::BlockingDetach,
+            RuntimeEventKind::BlockingQueueFull,
+        ];
+        let before = kinds.map(counter_total);
+        std::thread::scope(|scope| {
+            for _ in 0..(EVENT_SHARDS + 8) {
+                scope.spawn(|| {
+                    for _ in 0..100 {
+                        for kind in kinds {
+                            record(kind, None, 0, 1);
+                        }
+                    }
+                });
+            }
+        });
+        for (index, kind) in kinds.into_iter().enumerate() {
+            assert_eq!(
+                counter_total(kind) - before[index],
+                (EVENT_SHARDS as u64 + 8) * 100
+            );
+        }
     }
 }
