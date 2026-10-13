@@ -249,6 +249,12 @@ impl NativeStack {
                 std::thread::current().id(),
                 "native task stack resumed on a different OS worker"
             );
+            // Every scheduler resume starts a fresh quantum, including a
+            // return from a blocking runtime operation or an async poll. Old
+            // inline debt belongs to the completed quantum, not the new one.
+            // Zero forces the next sync safepoint to obtain a current grant.
+            (*stack).poll_countdown = 0;
+            (*stack).poll_granted = 0;
             let previous = CURRENT.with(|slot| slot.replace(stack));
             let outer_trace = crate::stack_trace::snapshot_current();
             let outer_reference = crate::reference_debug::snapshot_current();
@@ -317,6 +323,16 @@ fn trampoline(yielder: &Yielder<(), ()>) {
         } else {
             unsafe { poll(frame) }
         };
+        // A completed helper can return to a cooperative poll on the worker
+        // stack in the SAME quantum. Settle its partial inline grant before
+        // resume restores CURRENT and leave recycles this stack. This is not
+        // another safepoint: charge only work already executed, and do not
+        // suspend a callback that has finished its result/cleanup handling.
+        let pending = poll_pending();
+        if pending != 0 {
+            crate::preempt::charge_safepoints(pending);
+            poll_refill(0);
+        }
         unsafe {
             (*stack).result = result;
             (*stack).suspended = false;
@@ -367,13 +383,20 @@ pub(crate) fn poll_counter() -> *mut i32 {
 /// generated caller arrives with the countdown at zero (the whole grant); a
 /// direct runtime caller leaves it untouched and accounts for one safepoint.
 pub(crate) fn poll_consumed() -> u64 {
+    poll_pending().max(1)
+}
+
+/// Uncharged generated sync safepoints, excluding the caller's own async or
+/// runtime check. Zero is significant: a new async check must not charge a
+/// phantom sync safepoint when there was no intervening generated work.
+pub(crate) fn poll_pending() -> u64 {
     let stack = CURRENT.with(Cell::get);
     if stack.is_null() {
-        return 1;
+        return 0;
     }
     unsafe {
         let consumed = i64::from((*stack).poll_granted) - i64::from((*stack).poll_countdown);
-        consumed.max(1) as u64
+        consumed.max(0) as u64
     }
 }
 
@@ -892,6 +915,389 @@ mod tests {
                 "budget {budget}, safepoints {safepoints}"
             );
             assert!(state.runtime_calls <= safepoints / SYNC_POLL_STRIDE + 2 * quanta);
+        }
+    }
+
+    struct BoundaryBudget {
+        budget: u64,
+        async_prefix: u64,
+        helpers: u64,
+        polls_per_helper: u64,
+        poll_entries: u64,
+        completed_helpers: u64,
+        async_checks_until_trip: u64,
+    }
+
+    unsafe extern "C" fn boundary_budget_helper(frame: *mut c_void) -> i32 {
+        let state = frame.cast::<BoundaryBudget>();
+        let counter = crate::preempt::willow_sync_poll_counter();
+        unsafe {
+            for _ in 0..(*state).polls_per_helper {
+                *counter -= 1;
+                if *counter <= 0 {
+                    willow_sync_safepoint();
+                }
+            }
+        }
+        RUNTIME_POLL_READY
+    }
+
+    unsafe extern "C" fn boundary_budget_cooperative_poll(frame: *mut c_void) -> i32 {
+        use crate::scheduler::{willow_task_stack_enter, willow_task_stack_leave};
+        let state = frame.cast::<BoundaryBudget>();
+        // Keep the real cooperative task/ABI boundary but use deterministic,
+        // per-test configuration instead of changing process-global env.
+        let config = PreemptConfig::from_env_values(
+            Some(&unsafe { (*state).budget }.to_string()),
+            Some("100000"),
+        );
+        begin_quantum(config, std::ptr::null());
+        assert!(crate::preempt::willow_sync_poll_counter().is_null());
+        unsafe {
+            if (*state).poll_entries == 0 {
+                for _ in 0..(*state).async_prefix {
+                    assert_eq!(crate::preempt::willow_preempt_check(), 0);
+                }
+            }
+            (*state).poll_entries += 1;
+            while (*state).completed_helpers < (*state).helpers {
+                let result = willow_task_stack_enter(boundary_budget_helper, frame);
+                // CURRENT is restored already; leave recycles only a finished
+                // helper and preserves a suspended helper for the next poll.
+                assert!(crate::preempt::willow_sync_poll_counter().is_null());
+                willow_task_stack_leave();
+                if result == RUNTIME_POLL_PREEMPTED {
+                    return result;
+                }
+                assert_eq!(result, RUNTIME_POLL_READY);
+                (*state).completed_helpers += 1;
+            }
+            for count in 1..=(*state).budget {
+                if crate::preempt::willow_preempt_check() != 0 {
+                    (*state).async_checks_until_trip = count;
+                    break;
+                }
+            }
+        }
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn cooperative_helper_return_settles_exact_sync_budget() {
+        use crate::scheduler::{
+            reset_global_scheduler_for_test, willow_sched_run_until, willow_sched_spawn_cooperative,
+        };
+        let _guard = crate::gc::runtime_test_guard();
+        for (budget, async_prefix, helpers, polls_per_helper) in [
+            (8, 0, 1, 3), // Reviewer reproducer: five checks, not seven.
+            (8, 2, 1, 3), // Async -> sync -> async in one quantum.
+            (8, 0, 2, 3), // Recycled stack must settle every invocation once.
+            (8, 0, 1, 0), // No phantom charge for a bounded helper.
+            (8, 0, 1, 1), // Already charged, no pending debt.
+            (65, 0, 1, 63),
+            (65, 0, 1, 64),
+            (1024, 2, 1, 65),  // Exactly exhausted inline batch.
+            (1024, 2, 1, 129), // Multiple charged batches, no double charge.
+            (1024, 0, 4, 3),
+            (1024, 0, 16, 3), // Repeated short helpers do not escape accounting.
+            (1024, 0, 256, 3),
+            (8, 0, 1, 8),  // Helper completes just after resuming an exhausted quantum.
+            (8, 0, 1, 11), // Partial final grant after a suspension.
+            (8, 2, 4, 3),  // Resume/recycle boundaries between short helpers.
+        ] {
+            reset_global_scheduler_for_test();
+            let mut state = BoundaryBudget {
+                budget,
+                async_prefix,
+                helpers,
+                polls_per_helper,
+                poll_entries: 0,
+                completed_helpers: 0,
+                async_checks_until_trip: 0,
+            };
+            let id = willow_sched_spawn_cooperative(
+                boundary_budget_cooperative_poll,
+                std::ptr::from_mut(&mut state).cast(),
+            ) as u64;
+            willow_sched_run_until(id);
+            assert_eq!(
+                state.async_checks_until_trip,
+                budget - (async_prefix + helpers * polls_per_helper) % budget,
+                "budget={budget} prefix={async_prefix} helpers={helpers} polls={polls_per_helper}"
+            );
+            assert_eq!(
+                state.poll_entries,
+                1 + (async_prefix + helpers * polls_per_helper) / budget
+            );
+            assert_eq!(state.completed_helpers, helpers);
+        }
+        reset_global_scheduler_for_test();
+    }
+
+    struct MixedPolls {
+        total: u64,
+        sync_run: u64,
+        trips: Vec<u64>,
+        resumes: u64,
+    }
+
+    unsafe extern "C" fn mixed_poll(frame: *mut c_void) -> i32 {
+        let state = frame.cast::<MixedPolls>();
+        let counter = crate::preempt::willow_sync_poll_counter();
+        unsafe {
+            for index in 1..=(*state).total {
+                let before = (*state).resumes;
+                if index % ((*state).sync_run + 1) == 0 {
+                    if crate::preempt::willow_preempt_check() != 0 {
+                        suspend();
+                    }
+                } else {
+                    *counter -= 1;
+                    if *counter <= 0 {
+                        willow_sync_safepoint();
+                    }
+                }
+                if before != (*state).resumes {
+                    (*state).trips.push(index);
+                }
+            }
+        }
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn mixed_sync_async_safepoints_share_exact_budget() {
+        let _guard = crate::gc::runtime_test_guard();
+        for budget in [1u64, 3, 8, 64, 65, 1024] {
+            for sync_run in [0, 1, 2, 7, 63, 64, 100] {
+                let mut state = MixedPolls {
+                    total: budget * 10,
+                    sync_run,
+                    trips: Vec::new(),
+                    resumes: 0,
+                };
+                let config =
+                    PreemptConfig::from_env_values(Some(&budget.to_string()), Some("100000"));
+                let mut stack = NativeStack::new(mixed_poll, std::ptr::from_mut(&mut state).cast());
+                loop {
+                    begin_quantum(config, std::ptr::null());
+                    let result = unsafe { NativeStack::resume(&mut *stack) };
+                    willow_preempt_end();
+                    if result == RUNTIME_POLL_READY {
+                        break;
+                    }
+                    assert_eq!(result, RUNTIME_POLL_PREEMPTED);
+                    state.resumes += 1;
+                }
+                let expected: Vec<_> = (1..=10).map(|n| n * budget).collect();
+                assert_eq!(state.trips, expected, "budget={budget} sync_run={sync_run}");
+            }
+        }
+    }
+
+    unsafe extern "C" fn partial_grant_across_wait(frame: *mut c_void) -> i32 {
+        let counter = crate::preempt::willow_sync_poll_counter();
+        unsafe {
+            // Charge one, then consume only part of a 64-poll grant.
+            *counter -= 1;
+            willow_sync_safepoint();
+            *counter -= 2;
+            suspend_with_result(crate::task::RUNTIME_POLL_PENDING);
+            // The scheduler resumes with a smaller budget. A stale grant
+            // would incorrectly let this first new safepoint keep running.
+            *counter -= 1;
+            if *counter <= 0 {
+                willow_sync_safepoint();
+            }
+            *frame.cast::<bool>() = true;
+        }
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn sync_inline_grant_is_invalidated_after_runtime_wait() {
+        let _guard = crate::gc::runtime_test_guard();
+        let mut finished = false;
+        let mut stack = NativeStack::new(
+            partial_grant_across_wait,
+            std::ptr::from_mut(&mut finished).cast(),
+        );
+        begin_quantum(
+            PreemptConfig::from_env_values(Some("1024"), Some("100000")),
+            std::ptr::null(),
+        );
+        assert_eq!(
+            unsafe { NativeStack::resume(&mut *stack) },
+            crate::task::RUNTIME_POLL_PENDING
+        );
+        willow_preempt_end();
+        quantum();
+        let result = unsafe { NativeStack::resume(&mut *stack) };
+        willow_preempt_end();
+        // Drain the stack before asserting so a regression cannot panic in
+        // NativeStack::drop while a generated activation remains suspended.
+        let finished_before_resume = finished;
+        if result == RUNTIME_POLL_PREEMPTED {
+            quantum();
+            assert_eq!(
+                unsafe { NativeStack::resume(&mut *stack) },
+                RUNTIME_POLL_READY
+            );
+            willow_preempt_end();
+        }
+        assert_eq!(result, RUNTIME_POLL_PREEMPTED);
+        assert!(!finished_before_resume);
+        assert!(finished);
+    }
+
+    unsafe extern "C" fn partial_grant_across_nested_quantum(frame: *mut c_void) -> i32 {
+        let counter = crate::preempt::willow_sync_poll_counter();
+        unsafe {
+            *counter -= 1;
+            willow_sync_safepoint();
+            *counter -= 2;
+            // SchedulerDriveGuard restores the outer task with a fresh
+            // quantum, without a NativeStack::resume for that outer task.
+            quantum();
+            *counter -= 1;
+            if *counter <= 0 {
+                willow_sync_safepoint();
+            }
+            *frame.cast::<bool>() = true;
+        }
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn sync_inline_grant_is_invalidated_after_nested_quantum() {
+        let _guard = crate::gc::runtime_test_guard();
+        let mut finished = false;
+        let mut stack = NativeStack::new(
+            partial_grant_across_nested_quantum,
+            std::ptr::from_mut(&mut finished).cast(),
+        );
+        begin_quantum(
+            PreemptConfig::from_env_values(Some("1024"), Some("100000")),
+            std::ptr::null(),
+        );
+        let result = unsafe { NativeStack::resume(&mut *stack) };
+        willow_preempt_end();
+        let finished_before_resume = finished;
+        if result == RUNTIME_POLL_PREEMPTED {
+            quantum();
+            assert_eq!(
+                unsafe { NativeStack::resume(&mut *stack) },
+                RUNTIME_POLL_READY
+            );
+            willow_preempt_end();
+        }
+        assert_eq!(result, RUNTIME_POLL_PREEMPTED);
+        assert!(!finished_before_resume);
+        assert!(finished);
+    }
+
+    unsafe extern "C" fn suppressed_mixed_poll(frame: *mut c_void) -> i32 {
+        use crate::preempt::{
+            willow_preempt_check, willow_preempt_enter_no_preempt, willow_preempt_leave_no_preempt,
+        };
+        let counter = crate::preempt::willow_sync_poll_counter();
+        willow_preempt_enter_no_preempt();
+        willow_preempt_enter_no_preempt();
+        for _ in 0..100 {
+            unsafe {
+                *counter -= 1;
+            }
+            if unsafe { *counter } <= 0 {
+                willow_sync_safepoint();
+            }
+            assert_eq!(willow_preempt_check(), 0);
+        }
+        willow_preempt_leave_no_preempt();
+        assert_eq!(willow_preempt_check(), 0);
+        willow_preempt_leave_no_preempt();
+        // The region did not consume either of the shared budget's two units.
+        unsafe {
+            *frame.cast::<[i32; 2]>() = [willow_preempt_check(), willow_preempt_check()];
+        }
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn mixed_sync_async_no_preempt_region_preserves_budget() {
+        let _guard = crate::gc::runtime_test_guard();
+        let mut checks = [-1; 2];
+        let mut stack = NativeStack::new(
+            suppressed_mixed_poll,
+            std::ptr::from_mut(&mut checks).cast(),
+        );
+        begin_quantum(
+            PreemptConfig::from_env_values(Some("2"), Some("100000")),
+            std::ptr::null(),
+        );
+        assert_eq!(
+            unsafe { NativeStack::resume(&mut *stack) },
+            RUNTIME_POLL_READY
+        );
+        willow_preempt_end();
+        assert_eq!(checks, [0, 1]);
+    }
+
+    struct MixedDeadline {
+        sync_last: bool,
+        reached_end: bool,
+    }
+
+    unsafe extern "C" fn mixed_deadline_poll(frame: *mut c_void) -> i32 {
+        let state = frame.cast::<MixedDeadline>();
+        if unsafe { (*state).sync_last } {
+            crate::preempt::willow_preempt_check();
+        } else {
+            willow_sync_safepoint();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        if unsafe { (*state).sync_last } {
+            willow_sync_safepoint();
+        } else if crate::preempt::willow_preempt_check() != 0 {
+            suspend();
+        }
+        unsafe {
+            (*state).reached_end = true;
+        }
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn mixed_sync_async_share_deadline_without_rearming() {
+        let _guard = crate::gc::runtime_test_guard();
+        for sync_last in [false, true] {
+            for quantum_ms in ["1", "100000"] {
+                let mut state = MixedDeadline {
+                    sync_last,
+                    reached_end: false,
+                };
+                let config =
+                    PreemptConfig::from_env_values(Some("1000000000000"), Some(quantum_ms));
+                let mut stack =
+                    NativeStack::new(mixed_deadline_poll, std::ptr::from_mut(&mut state).cast());
+                begin_quantum(config, std::ptr::null());
+                let result = unsafe { NativeStack::resume(&mut *stack) };
+                willow_preempt_end();
+                let reached_end = state.reached_end;
+                // Drain even an unexpected early suspension before asserting.
+                let mut resumed = result;
+                while resumed != RUNTIME_POLL_READY {
+                    begin_quantum(config, std::ptr::null());
+                    resumed = unsafe { NativeStack::resume(&mut *stack) };
+                    willow_preempt_end();
+                }
+                if quantum_ms == "1" {
+                    assert_eq!(result, RUNTIME_POLL_PREEMPTED);
+                    assert!(!reached_end);
+                } else {
+                    assert_eq!(result, RUNTIME_POLL_READY);
+                    assert!(reached_end);
+                }
+            }
         }
     }
 

@@ -489,3 +489,69 @@ async fn main() {
     assert!(ok, "{out}");
     assert_eq!(out, "cleanup start\nouter cleanup\n42\n");
 }
+
+#[test]
+fn task_sync_preemption_one_ms_sleeper_example() {
+    // Separate budget-driven and time-driven cases. A large budget cannot
+    // realistically expire during this timeout, so that case proves the clock.
+    for (budget, quantum) in [
+        ("1", "100000"),
+        ("3", "100000"),
+        ("1024", "10"),
+        ("1000000000000", "1"),
+    ] {
+        let (out, ok) = compile_and_run_with_runtime_env(
+            include_str!("../../example/task_sync_preemption.wi"),
+            &[
+                ("WILLOW_WORKERS", "1"),
+                ("WILLOW_TASK_BUDGET", budget),
+                ("WILLOW_TIME_QUANTUM_MS", quantum),
+            ],
+            Duration::from_secs(20),
+        );
+        assert!(ok, "budget={budget} quantum={quantum}: {out}");
+        assert_eq!(out, "42\n");
+    }
+}
+
+#[test]
+fn task_sync_preemption_control_flow_and_recursive_scc() {
+    for (name, helper) in [
+        (
+            "continue",
+            "fn busy(done: AtomicBool) { while true { if done.load() { break; } continue; } }",
+        ),
+        (
+            "nested loops",
+            "fn busy(done: AtomicBool) { while !done.load() { for i in 0..100 { if done.load() { return; } } } }",
+        ),
+        (
+            "self recursion",
+            "fn recurse(done: AtomicBool, n: i64) -> i64 { if done.load() || n < 2 { return n; } return recurse(done, n-1) + recurse(done, n-2); } fn busy(done: AtomicBool) { recurse(done, 45); }",
+        ),
+        (
+            "mutual recursion",
+            "fn left(done: AtomicBool, n: i64) -> i64 { if done.load() || n < 2 { return n; } return right(done, n-1) + right(done, n-2); } fn right(done: AtomicBool, n: i64) -> i64 { if done.load() || n < 2 { return n; } return left(done, n-1) + left(done, n-2); } fn busy(done: AtomicBool) { left(done, 45); }",
+        ),
+    ] {
+        let source = format!(
+            r#"{helper}
+fn start(done: AtomicBool, started: AtomicBool) {{ started.store(true); busy(done); }}
+async fn worker(done: AtomicBool, started: AtomicBool) {{ start(done, started); }}
+async fn main() {{
+    let done = AtomicBool::new(false); let started = AtomicBool::new(false);
+    let task = worker(done, started);
+    while !started.load() {{ await yield(); }}
+    await sleep(1); done.store(true); await task; println(42);
+}}
+"#
+        );
+        let (out, ok) = compile_and_run_with_runtime_env(
+            &source,
+            &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", "64")],
+            Duration::from_secs(20),
+        );
+        assert!(ok, "{name}: {out}");
+        assert_eq!(out, "42\n", "{name}");
+    }
+}

@@ -216,6 +216,21 @@ pub(crate) fn begin_quantum(config: PreemptConfig, flag: *const c_void) {
     if let Some(flag) = unsafe { flag_ref(flag) } {
         flag.store(false, Ordering::Release);
     }
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    // Nested scheduler drives rearm the enclosing task without resuming its
+    // native stack. Invalidate that task's old grant here as well as in resume.
+    crate::native_stack::poll_refill(0);
 }
 
 /// End the current quantum after a poll returns: unbind the flag and zero the
@@ -283,13 +298,36 @@ impl Drop for NoPreemptGuard {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_check() -> i32 {
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    if crate::native_stack::is_active() {
+        // A sync helper can return before consuming its entire inline grant.
+        // Settle that debt together with this async/runtime safepoint, then
+        // cap the next grant by the SAME remaining quantum budget. Otherwise
+        // alternating async/sync code can overrun or double-charge the budget.
+        let result = charge_safepoints(1 + crate::native_stack::poll_pending());
+        crate::native_stack::poll_refill(sync_poll_grant());
+        return result;
+    }
     charge_safepoints(1)
 }
 
 /// [`willow_preempt_check`] for `count` safepoints executed since the last
 /// check. The budget trips at the same safepoint count as `count` single
 /// checks would; the time quantum and flag are sampled once per batch.
-fn charge_safepoints(count: u64) -> i32 {
+/// Native callback completion also uses this to settle its remaining inline
+/// debt before returning to a cooperative poll in the same quantum.
+pub(crate) fn charge_safepoints(count: u64) -> i32 {
     QUANTUM.with(|q| {
         if q.no_preempt_depth.get() > 0 {
             return 0;

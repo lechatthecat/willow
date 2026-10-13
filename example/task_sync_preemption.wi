@@ -1,0 +1,25 @@
+// A CPU-bound synchronous frame yields to a 1 ms sleeper on one worker.
+// Run with WILLOW_WORKERS=1; both budget and time-quantum preemption work.
+fn busy(done: AtomicBool, started: AtomicBool) -> i64 {
+    started.store(true);
+    let mut iterations = 0;
+    while !done.load() {
+        iterations = iterations + 1;
+    }
+    // The local survives suspension and resumption of the synchronous frame.
+    return iterations >= 0 ? 42 : 0;
+}
+
+async fn worker(done: AtomicBool, started: AtomicBool) -> i64 {
+    return busy(done, started);
+}
+
+async fn main() {
+    let done = AtomicBool::new(false);
+    let started = AtomicBool::new(false);
+    let task = worker(done, started);
+    while !started.load() { await yield(); }
+    await sleep(1);
+    done.store(true);
+    println(await task);
+}

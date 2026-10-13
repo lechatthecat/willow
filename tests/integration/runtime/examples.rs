@@ -176,6 +176,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/async_yield.wi", "1\n2\n11\n12\n3\n"),
         ("example/async_concurrent.wi", "465\n"),
         ("example/async_preemption.wi", "42\n"),
+        ("example/task_sync_preemption.wi", "42\n"),
         ("example/async_fn_pointer.wi", "42\n14\n"),
         ("example/release_fault_sites.wi", "500500\n999000\n14950\n"),
         ("example/lock_function_values.wi", "41\n42\n100\n"),
