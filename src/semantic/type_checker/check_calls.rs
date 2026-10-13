@@ -87,8 +87,10 @@ impl TypeChecker {
             if matches!(param.mode, ParamMode::Reference { .. })
                 && matches!(arg.mode, CallArgMode::Reference { .. })
             {
-                self.reference_arg_modes
-                    .insert(arg.expr.id(), param.mode.clone());
+                // Place checking already records mutability for every call.
+                if let Some(mode) = self.reference_arg_modes.get_mut(&arg.expr.id()) {
+                    mode.retained = true;
+                }
             }
         }
     }
@@ -814,6 +816,13 @@ impl TypeChecker {
         require_mutable: bool,
         place: ReferencePlaceInfo,
     ) {
+        self.reference_arg_modes.insert(
+            arg.expr.id(),
+            ReferenceArgMode {
+                mutable: require_mutable,
+                retained: false,
+            },
+        );
         if require_mutable
             && matches!(arg.expr, Expr::Var(..))
             && self

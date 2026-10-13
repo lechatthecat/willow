@@ -2635,42 +2635,46 @@ mod task_boundary_callback_tests {
 
     #[test]
     fn async_scalar_reference_frame_scaling() {
-        for count in [1, 8, 64, 128] {
-            let params = (0..count)
-                .map(|i| format!("p{i}: &i64"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let source = format!("async fn read({params}) -> i64 {{ await sleep(1); return p0; }}");
-            let (lir, layout, offsets) = print_frame_layout(&source);
-            let parameters: Vec<_> = lir.locals.iter().filter(|local| local.parameter).collect();
-            assert_eq!(parameters.len(), count);
-            for (i, local) in parameters.iter().enumerate() {
+        for mode in ["&", "&mut"] {
+            for count in [1, 8, 64, 128] {
+                let params = (0..count)
+                    .map(|i| format!("p{i}: {mode} i64"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let source =
+                    format!("async fn read({params}) -> i64 {{ await sleep(1); return p0; }}");
+                let (lir, layout, offsets) = print_frame_layout(&source);
+                let parameters: Vec<_> =
+                    lir.locals.iter().filter(|local| local.parameter).collect();
+                assert_eq!(parameters.len(), count);
+                for (i, local) in parameters.iter().enumerate() {
+                    assert_eq!(
+                        local.storage_kind,
+                        crate::ir::lowered::LirStorageKind::ReferenceCell
+                    );
+                    assert_eq!(offsets[&local.id], async_frame_slot_offset(2 * i, 8));
+                    assert!(layout.slot_is_gc_ref(2 * i));
+                    assert!(!layout.slot_is_gc_ref(2 * i + 1));
+                }
                 assert_eq!(
-                    local.storage_kind,
-                    crate::ir::lowered::LirStorageKind::ReferenceCell
+                    layout
+                        .slots
+                        .iter()
+                        .filter(|slot| slot.storage_kind
+                            == crate::ir::lowered::LirStorageKind::ReferenceCell)
+                        .count(),
+                    count
                 );
-                assert_eq!(offsets[&local.id], async_frame_slot_offset(2 * i, 8));
-                assert!(layout.slot_is_gc_ref(2 * i));
-                assert!(!layout.slot_is_gc_ref(2 * i + 1));
+                println!(
+                    "mode={mode} references={count} parameter_words={} traced_owners={count}",
+                    2 * count
+                );
+                let encoded = serde_json::to_vec(&lir).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<LirFunction>(&encoded).unwrap(),
+                    lir
+                );
             }
-            assert_eq!(
-                layout
-                    .slots
-                    .iter()
-                    .filter(|slot| slot.storage_kind
-                        == crate::ir::lowered::LirStorageKind::ReferenceCell)
-                    .count(),
-                count
-            );
-            println!(
-                "references={count} parameter_words={} traced_owners={count}",
-                2 * count
-            );
-            let encoded = serde_json::to_vec(&lir).unwrap();
-            assert_eq!(
-                serde_json::from_slice::<LirFunction>(&encoded).unwrap(),
-                lir
-            );
         }
     }
 

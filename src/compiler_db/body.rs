@@ -737,7 +737,7 @@ impl BodyQueries {
         types: &std::collections::HashMap<crate::parser::ast::ExprId, crate::parser::ast::Type>,
         modes: &std::collections::HashMap<
             crate::parser::ast::ExprId,
-            crate::parser::ast::ParamMode,
+            crate::semantic::async_borrows::ReferenceArgMode,
         >,
     ) -> Result<Vec<crate::diagnostics::Diagnostic>> {
         use crate::semantic::async_borrows::{self, BorrowRoot};

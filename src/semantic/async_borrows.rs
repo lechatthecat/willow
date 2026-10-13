@@ -1,5 +1,5 @@
 //! Conservative lexical discharge proof for tasks holding reference arguments.
-//! Shared scalar declarations are supported; this pass still rejects task
+//! Shared and mutable scalar declarations are supported; this pass still rejects task
 //! escape independently of the declaration restrictions for other references.
 use std::collections::{HashMap, HashSet};
 
@@ -8,18 +8,27 @@ use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 
+/// Resolved reference argument facts. Task return type alone does not imply
+/// retention: a synchronous callee may return an independent task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReferenceArgMode {
+    pub mutable: bool,
+    pub retained: bool,
+}
+
 #[derive(Clone)]
 struct BorrowedTask {
     call: ExprId,
     origin: Span,
     block: Span,
     references: Vec<(Span, Option<bool>)>,
+    places: Vec<(String, bool, Span)>,
 }
 
 pub fn check(
     program: &Program,
     types: &HashMap<ExprId, Type>,
-    modes: &HashMap<ExprId, ParamMode>,
+    modes: &HashMap<ExprId, ReferenceArgMode>,
 ) -> Vec<Diagnostic> {
     check_with(program, types, modes, |_, compute| Ok(compute()))
         .expect("standalone borrow analysis is infallible")
@@ -36,16 +45,13 @@ pub(crate) enum BorrowRoot {
 pub(crate) fn check_with(
     program: &Program,
     types: &HashMap<ExprId, Type>,
-    modes: &HashMap<ExprId, ParamMode>,
+    modes: &HashMap<ExprId, ReferenceArgMode>,
     mut evaluate: impl FnMut(
         BorrowRoot,
         &mut dyn FnMut() -> BorrowReport,
     ) -> anyhow::Result<BorrowReport>,
 ) -> anyhow::Result<Vec<Diagnostic>> {
-    if !modes
-        .values()
-        .any(|mode| matches!(mode, ParamMode::Reference { .. }))
-    {
+    if !modes.values().any(|mode| mode.retained) {
         return Ok(Vec::new());
     }
     let mut blocks = Vec::new();
@@ -110,7 +116,7 @@ pub(crate) type BorrowReport = Vec<(ExprId, Diagnostic)>;
 
 struct Checker<'a> {
     types: &'a HashMap<ExprId, Type>,
-    modes: &'a HashMap<ExprId, ParamMode>,
+    modes: &'a HashMap<ExprId, ReferenceArgMode>,
     errors: BorrowReport,
     reported: HashSet<ExprId>,
 }
@@ -119,30 +125,24 @@ impl Checker<'_> {
     fn borrowed_call(&self, expr: &Expr, block: Span) -> Option<BorrowedTask> {
         let ty = self.types.get(&expr.id())?;
         builtin_types::unary_arg(ty, BuiltinTypeId::Task)?;
-        let args = match expr {
-            Expr::Call(c) => &c.args,
-            Expr::MethodCall(c) => &c.args,
-            Expr::StaticCall(c) => &c.args,
-            _ => return None,
-        };
+        let args = reference_call_args(expr)?;
         let references: Vec<_> = args
             .iter()
             .filter_map(|arg| match arg.mode {
                 CallArgMode::Reference { ampersand_span } => {
-                    let ParamMode::Reference { mutable, .. } = self.modes.get(&arg.expr.id())?
-                    else {
-                        return None;
-                    };
-                    Some((ampersand_span, Some(*mutable)))
+                    let mode = self.modes.get(&arg.expr.id())?;
+                    mode.retained
+                        .then_some((ampersand_span, Some(mode.mutable)))
                 }
                 CallArgMode::Value => None,
             })
             .collect();
-        (!references.is_empty()).then_some(BorrowedTask {
+        (!references.is_empty()).then(|| BorrowedTask {
             call: expr.id(),
             origin: expr.span(),
             block,
             references,
+            places: reference_places(args, self.modes).collect(),
         })
     }
 
@@ -211,7 +211,12 @@ impl Checker<'_> {
                     }
                 }
                 AstEvent::Bind(name) => {
-                    state.names.entry(name).or_default().push(None);
+                    state.next_binding += 1;
+                    state
+                        .names
+                        .entry(name)
+                        .or_default()
+                        .push((state.next_binding, None));
                     state.scopes.last_mut().unwrap().push(name);
                 }
                 AstEvent::Stmt(stmt) => {
@@ -230,7 +235,16 @@ impl Checker<'_> {
                         }
                         if let Some(task) = self.borrowed_call(&binding.init, block_span) {
                             statement.allowed_call = Some(task.call);
-                            statement.new_binding = Some((binding.name.as_str(), task));
+                            let keys = task
+                                .places
+                                .iter()
+                                .map(|(name, _, _)| state.place_key(name))
+                                .collect();
+                            statement.new_binding = Some(PendingBinding {
+                                name: binding.name.as_str(),
+                                task,
+                                keys,
+                            });
                         }
                     }
                     let root = match stmt {
@@ -279,16 +293,19 @@ impl Checker<'_> {
                     if matches!(stmt, Stmt::While(_) | Stmt::For(_)) {
                         loops -= 1;
                     }
-                    if let Some((name, task)) = statements.pop().unwrap().new_binding {
+                    if let Some(PendingBinding { name, task, keys }) =
+                        statements.pop().unwrap().new_binding
+                    {
                         let call = task.call;
                         state.blocks.last_mut().unwrap().pending.insert(name, call);
-                        *state.names.get_mut(name).unwrap().last_mut().unwrap() = Some(call);
+                        state.names.get_mut(name).unwrap().last_mut().unwrap().1 = Some(call);
                         state.by_callable.entry(callable).or_default().insert(call);
                         state
                             .by_loop
                             .entry((callable, loops))
                             .or_default()
                             .insert(call);
+                        state.retain_places(&task, keys);
                         state.active.insert(call, (task, callable, loops));
                     }
                 }
@@ -300,6 +317,9 @@ impl Checker<'_> {
                         _ => {}
                     }
                     let span = state.blocks.last().map_or(boundary, |b| b.span);
+                    if let Some(args) = reference_call_args(expr) {
+                        state.check_overlap(self, expr.id(), args);
+                    }
                     if Some(expr.id()) != statements.last().and_then(|s| s.allowed_call)
                         && let Some(task) = self.borrowed_call(expr, span)
                     {
@@ -313,6 +333,27 @@ impl Checker<'_> {
     }
 }
 
+fn reference_call_args(expr: &Expr) -> Option<&[CallArg]> {
+    match expr {
+        Expr::Call(call) => Some(&call.args),
+        Expr::MethodCall(call) => Some(&call.args),
+        Expr::StaticCall(call) => Some(&call.args),
+        Expr::New(call) => Some(&call.args),
+        _ => None,
+    }
+}
+
+fn reference_places<'a>(
+    args: &'a [CallArg],
+    modes: &'a HashMap<ExprId, ReferenceArgMode>,
+) -> impl Iterator<Item = (String, bool, Span)> + 'a {
+    args.iter().filter_map(|arg| {
+        let mode = modes.get(&arg.expr.id())?;
+        let key = super::type_checker::analysis::reference_place_key(&arg.expr)?;
+        Some((key, mode.mutable, arg.span))
+    })
+}
+
 struct BlockState<'a> {
     span: Span,
     scope: usize,
@@ -320,20 +361,127 @@ struct BlockState<'a> {
 }
 struct StatementState<'a> {
     allowed_call: Option<ExprId>,
-    new_binding: Option<(&'a str, BorrowedTask)>,
+    new_binding: Option<PendingBinding<'a>>,
+}
+struct PendingBinding<'a> {
+    name: &'a str,
+    task: BorrowedTask,
+    keys: Vec<(usize, String)>,
 }
 #[derive(Default)]
 struct WalkState<'a> {
     scopes: Vec<Vec<&'a str>>,
-    names: HashMap<&'a str, Vec<Option<ExprId>>>,
+    names: HashMap<&'a str, Vec<(usize, Option<ExprId>)>>,
+    next_binding: usize,
+    places: HashMap<(usize, String), PlaceLoans>,
+    task_places: HashMap<ExprId, Vec<(usize, String)>>,
     blocks: Vec<BlockState<'a>>,
     active: HashMap<ExprId, (BorrowedTask, usize, usize)>,
     by_callable: HashMap<usize, HashSet<ExprId>>,
     by_loop: HashMap<(usize, usize), HashSet<ExprId>>,
 }
+#[derive(Default)]
+struct PlaceLoans {
+    mutable: LoanSet,
+    shared: LoanSet,
+}
+
+// Dense witnesses avoid scanning a sparse hash table after partial discharge.
+#[derive(Default)]
+struct LoanSet {
+    entries: Vec<(ExprId, Span)>,
+    positions: HashMap<ExprId, usize>,
+}
+impl LoanSet {
+    fn insert(&mut self, call: ExprId, span: Span) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.positions.entry(call) {
+            entry.insert(self.entries.len());
+            self.entries.push((call, span));
+        }
+    }
+    fn remove(&mut self, call: &ExprId) {
+        if let Some(index) = self.positions.remove(call) {
+            self.entries.swap_remove(index);
+            if let Some((moved, _)) = self.entries.get(index) {
+                self.positions.insert(*moved, index);
+            }
+        }
+    }
+    fn first(&self) -> Option<&Span> {
+        self.entries.first().map(|(_, span)| span)
+    }
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 impl WalkState<'_> {
+    fn place_key(&self, name: &str) -> (usize, String) {
+        let root = name.split(['.', '[']).next().unwrap();
+        let binding = self
+            .names
+            .get(root)
+            .and_then(|stack| stack.last())
+            .map_or(0, |entry| entry.0);
+        (binding, name.to_owned())
+    }
+
+    fn check_overlap(&self, checker: &mut Checker<'_>, call: ExprId, args: &[CallArg]) {
+        for (name, mutable, span) in reference_places(args, checker.modes) {
+            count_place_lookup();
+            let Some(loans) = self.places.get(&self.place_key(&name)) else {
+                continue;
+            };
+            // One witness is enough; do not enumerate all pairs of shared loans.
+            let previous = loans
+                .mutable
+                .first()
+                .or_else(|| if mutable { loans.shared.first() } else { None });
+            if let Some(previous) = previous {
+                checker.errors.push((
+                    call,
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1706,
+                        format!("cannot pass `{name}` while it aliases a mutable reference"),
+                    )
+                    .with_label(Label::primary(
+                        span,
+                        "same place aliases an outstanding async borrow",
+                    ))
+                    .with_label(Label::secondary(
+                        *previous,
+                        "task borrowing this place has not been awaited",
+                    ))
+                    .with_help("await the earlier task before borrowing this place again"),
+                ));
+                break;
+            }
+        }
+    }
+
+    fn retain_places(&mut self, task: &BorrowedTask, keys: Vec<(usize, String)>) {
+        for ((_, mutable, span), key) in task.places.iter().zip(&keys) {
+            let loans = self.places.entry(key.clone()).or_default();
+            if *mutable {
+                loans.mutable.insert(task.call, *span);
+            } else {
+                loans.shared.insert(task.call, *span);
+            }
+        }
+        self.task_places.insert(task.call, keys);
+    }
     fn remove(&mut self, call: ExprId) -> Option<BorrowedTask> {
         let (task, callable, loops) = self.active.remove(&call)?;
+        for key in self.task_places.remove(&call).into_iter().flatten() {
+            if let Some(loans) = self.places.get_mut(&key) {
+                loans.mutable.remove(&call);
+                loans.shared.remove(&call);
+                if loans.mutable.is_empty() && loans.shared.is_empty() {
+                    self.places.remove(&key);
+                }
+            }
+        }
         remove_active_index(&mut self.by_callable, callable, call);
         remove_active_index(&mut self.by_loop, (callable, loops), call);
         Some(task)
@@ -344,7 +492,7 @@ impl WalkState<'_> {
         }
     }
     fn use_name(&mut self, checker: &mut Checker<'_>, name: &str, span: Span) {
-        if let Some(Some(call)) = self.names.get(name).and_then(|names| names.last()) {
+        if let Some((_, Some(call))) = self.names.get(name).and_then(|names| names.last()) {
             self.escape(checker, *call, span);
         }
     }
@@ -385,6 +533,13 @@ fn count_event() {
     #[cfg(test)]
     AST_EVENTS.with(|count| count.set(count.get() + 1));
 }
+#[inline]
+fn count_place_lookup() {
+    #[cfg(test)]
+    PLACE_LOOKUPS.with(|count| count.set(count.get() + 1));
+}
+#[cfg(test)]
+thread_local! { static PLACE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 #[cfg(test)]
 thread_local! { static AST_EVENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
@@ -408,6 +563,194 @@ mod tests {
         checker.check_module_program(&program);
         let borrows = check(&program, &checker.expr_types, &checker.reference_arg_modes);
         (borrows, checker.errors)
+    }
+
+    #[test]
+    fn synchronous_reference_calls_check_outstanding_async_loans() {
+        for ty in ["i64", "f64", "bool"] {
+            let initial = match ty {
+                "f64" => "1.0",
+                "bool" => "true",
+                _ => "1",
+            };
+            for (async_mode, sync_mode, conflict) in [
+                ("&mut", "&mut", true),
+                ("&mut", "&", true),
+                ("&", "&mut", true),
+                ("&", "&", false),
+            ] {
+                for (body, outstanding_same_place) in [
+                    ("let t = borrow(&x); use_ref(&x); await t;", true),
+                    ("let t = borrow(&x); await t; use_ref(&x);", false),
+                    ("let t = borrow(&x); await t.result(); use_ref(&x);", false),
+                    ("let t = borrow(&x); use_ref(&y); await t;", false),
+                    (
+                        "let t = borrow(&x); if true { use_ref(&x); } await t;",
+                        true,
+                    ),
+                ] {
+                    let source = format!(
+                        "async fn borrow(x: {async_mode} {ty}) {{ await sleep(1); }} fn use_ref(x: {sync_mode} {ty}) {{}} async fn main() {{ let mut x = {initial}; let mut y = {initial}; {body} }}"
+                    );
+                    let (borrows, errors) = analyze_source(&source);
+                    assert!(errors.is_empty(), "{source}: {errors:?}");
+                    let expected = conflict && outstanding_same_place;
+                    assert_eq!(
+                        borrows.iter().any(|d| d.code == ErrorCode::E1706),
+                        expected,
+                        "{source}: {borrows:?}"
+                    );
+                    assert!(
+                        borrows.iter().all(|d| d.code == ErrorCode::E1706),
+                        "{borrows:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn synchronous_reference_call_forms_preserve_retention() {
+        for (declaration, call) in [
+            ("fn use_ref<T>(x: &mut T) {}", "use_ref(&x);"),
+            (
+                "class C { pub fn use_ref(self, x: &mut i64) {} }",
+                "let c = new C(); c.use_ref(&x);",
+            ),
+            (
+                "class C { pub static fn use_ref(x: &mut i64) {} }",
+                "C::use_ref(&x);",
+            ),
+            (
+                "class C { pub init(self, x: &mut i64) {} }",
+                "let c = new C(&x);",
+            ),
+            (
+                "fn use_ref(x: &mut i64) -> Task<i64> { return other(); }",
+                "let independent = use_ref(&x);",
+            ),
+        ] {
+            for pending in [true, false] {
+                let body = if pending {
+                    format!("let t = borrow(&x); {call} await t;")
+                } else {
+                    format!("let t = borrow(&x); await t; {call}")
+                };
+                let source = format!(
+                    "async fn other() -> i64 {{ return 1; }} async fn borrow(x: &mut i64) {{ await sleep(1); }} {declaration} async fn main() {{ let mut x = 1; {body} }}"
+                );
+                let (borrows, errors) = analyze_source(&source);
+                assert!(errors.is_empty(), "{source}: {errors:?}");
+                assert_eq!(
+                    borrows.iter().any(|d| d.code == ErrorCode::E1706),
+                    pending,
+                    "{source}: {borrows:?}"
+                );
+                assert!(
+                    borrows.iter().all(|d| d.code == ErrorCode::E1706),
+                    "{source}: {borrows:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn synchronous_overlap_lookups_scale_with_arguments() {
+        for count in [1, 8, 64, 128] {
+            let mut source = String::from(
+                "async fn read(x: &i64) {} fn sync_read(x: &i64) {} fn sync_write(x: &mut i64) {} async fn main() { let mut x = 1;",
+            );
+            for i in 0..count {
+                source.push_str(&format!("let t{i} = read(&x);"));
+            }
+            for parity in 0..2 {
+                for i in (parity..count).step_by(2) {
+                    source.push_str(&format!("sync_read(&x); await t{i};"));
+                }
+            }
+            source.push_str("sync_write(&x); }");
+            PLACE_LOOKUPS.with(|n| n.set(0));
+            let (borrows, errors) = analyze_source(&source);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(borrows.is_empty(), "{borrows:?}");
+            let lookups = PLACE_LOOKUPS.with(|n| n.get());
+            assert_eq!(lookups, 2 * count + 1);
+            println!(
+                "async_tasks={count} synchronous_calls={} overlap_lookups={lookups}",
+                count + 1
+            );
+        }
+    }
+
+    #[test]
+    fn mutable_async_loans_conflict_until_discharge() {
+        for body in [
+            "let a = write(&x); let b = write(&x); await a; await b;",
+            "let a = read(&x); let b = write(&x); await a; await b;",
+            "let a = write(&x); let b = read(&x); await a; await b;",
+            "let a = write(&x); await write(&x); await a;",
+            "let a = write(&x); if true { await write(&x); } await a;",
+            "let a = read(&x); let b = read(&x); await a; await write(&x); await b;",
+            "let a = read(&x); let b = read(&x); await b; await write(&x); await a;",
+        ] {
+            let source = format!(
+                "async fn write(x: &mut i64) {{ await sleep(1); x = 2; }} async fn read(x: &i64) {{ await sleep(1); }} async fn main() {{ let mut x = 1; {body} }}"
+            );
+            let (borrows, errors) = analyze_source(&source);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(
+                borrows.iter().any(|d| d.code == ErrorCode::E1706),
+                "{body}: {borrows:?}"
+            );
+        }
+        for body in [
+            "let a = write(&x); await a; await write(&x);",
+            "let a = write(&x); await a.result(); await write(&x);",
+            "let a = read(&x); let b = read(&x); await a; await b; await write(&x);",
+            "let a = write(&x); if true { let mut x = 3; await write(&x); } await a;",
+            "let a = write(&x); let mut y = 3; await write(&y); await a;",
+            // Borrow identity is captured before the task binding shadows x.
+            "if true { let x = write(&x); await x; }",
+        ] {
+            let source = format!(
+                "async fn write(x: &mut i64) {{ await sleep(1); x = 2; }} async fn read(x: &i64) {{ await sleep(1); }} async fn main() {{ let mut x = 1; {body} }}"
+            );
+            let (borrows, errors) = analyze_source(&source);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(borrows.is_empty(), "{body}: {borrows:?}");
+        }
+    }
+
+    #[test]
+    fn async_loan_index_scales_with_arguments_not_live_tasks() {
+        for count in [1, 8, 64, 128] {
+            for shared in [false, true] {
+                let mut source = String::from(
+                    "async fn write(x: &mut i64) {} async fn read(x: &i64) {} async fn main() { let mut x = 1;",
+                );
+                for i in 0..count {
+                    if shared {
+                        source.push_str(&format!("let t{i} = read(&x);"));
+                    } else {
+                        source.push_str(&format!("let mut x{i} = 1; let t{i} = write(&x{i});"));
+                    }
+                }
+                // Fragment the active set, then discharge the remaining half.
+                for parity in 0..2 {
+                    for i in (parity..count).step_by(2) {
+                        source.push_str(&format!("await t{i};"));
+                    }
+                }
+                source.push_str("await write(&x); }");
+                PLACE_LOOKUPS.with(|n| n.set(0));
+                let (borrows, errors) = analyze_source(&source);
+                assert!(errors.is_empty(), "{errors:?}");
+                assert!(borrows.is_empty(), "{borrows:?}");
+                let lookups = PLACE_LOOKUPS.with(|n| n.get());
+                assert_eq!(lookups, count + 1);
+                println!("tasks={count} shared={shared} overlap_lookups={lookups}");
+            }
+        }
     }
 
     #[test]

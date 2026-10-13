@@ -10,14 +10,36 @@ async fn read_bool(value: &bool) -> bool {
     await sleep(1);
     return value;
 }
+async fn update_i64(value: &mut i64) {
+    await sleep(1);
+    value = value + 1;
+}
+async fn update_f64(value: &mut f64) {
+    await sleep(1);
+    value = 4.25;
+}
+async fn update_bool(value: &mut bool) {
+    await sleep(1);
+    value = false;
+}
+async fn forward_i64(value: &mut i64) {
+    await sleep(1);
+    await update_i64(&value);
+}
 async fn main() {
-    let number = 42;
-    let fraction = 2.5;
-    let flag = true;
+    let mut number = 42;
+    let mut fraction = 2.5;
+    let mut flag = true;
     let integer_result = await read_i64(&number);
     println(integer_result);
     let fraction_result = await read_f64(&fraction);
     println(fraction_result);
     let flag_result = await read_bool(&flag);
     println(flag_result);
+    await forward_i64(&number);
+    await update_f64(&fraction);
+    await update_bool(&flag);
+    println(number);
+    println(fraction);
+    println(flag);
 }

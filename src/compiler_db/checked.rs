@@ -1,3 +1,4 @@
+use crate::semantic::async_borrows::ReferenceArgMode;
 use crate::{
     diagnostics::Diagnostic,
     ir::lower::CheckerTables,
@@ -16,7 +17,7 @@ pub struct CheckedUnit {
     pub diagnostics: Vec<Diagnostic>,
     pub symbols: SymbolTable,
     pub expr_types: HashMap<ExprId, Type>,
-    pub reference_arg_modes: HashMap<ExprId, ParamMode>,
+    pub reference_arg_modes: HashMap<ExprId, ReferenceArgMode>,
     pub enum_variant_resolutions: HashMap<ExprId, String>,
     pub pattern_resolutions: HashMap<PatternId, Pattern>,
     pub arm_leaves: HashMap<BodyId, bool>,

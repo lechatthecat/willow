@@ -137,7 +137,7 @@ pub(super) struct LambdaChildren {
 pub(super) struct BodyOutputs {
     errors: Vec<Diagnostic>,
     expr_types: HashMap<ExprId, Type>,
-    reference_arg_modes: HashMap<ExprId, ParamMode>,
+    reference_arg_modes: HashMap<ExprId, ReferenceArgMode>,
     enum_variant_resolutions: HashMap<ExprId, String>,
     pattern_resolutions: HashMap<PatternId, Pattern>,
     arm_leaves: HashMap<BodyId, bool>,
@@ -166,7 +166,7 @@ pub(crate) struct TypedBody {
     id: BodyId,
     diagnostics: Vec<Diagnostic>,
     expr_types: HashMap<ExprId, Type>,
-    reference_arg_modes: HashMap<ExprId, ParamMode>,
+    reference_arg_modes: HashMap<ExprId, ReferenceArgMode>,
     enum_variant_resolutions: HashMap<ExprId, String>,
     pattern_resolutions: HashMap<PatternId, Pattern>,
     arm_leaves: HashMap<BodyId, bool>,
@@ -860,6 +860,43 @@ mod tests {
                 .any(|captures| !captures.is_empty())
         );
         assert!(checker.expr_types.values().any(|ty| matches!(ty, Type::Generic(name, args) if name == "Map" && args == &[Type::I64, Type::I64])));
+    }
+
+    #[test]
+    fn typed_body_preserves_reference_modes_and_retention() {
+        let (checker, queries, program) = compare(
+            "async fn read(x: &i64) {} fn mutate(x: &mut i64) {} async fn other() -> i64 { return 0; } fn make(x: &i64) -> Task<i64> { return other(); } async fn main() { let mut x = 1; let t = read(&x); mutate(&x); await t; let independent = make(&x); }",
+        );
+        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        assert_eq!(checker.reference_arg_modes.len(), 3);
+        for mode in [
+            ReferenceArgMode {
+                mutable: false,
+                retained: true,
+            },
+            ReferenceArgMode {
+                mutable: true,
+                retained: false,
+            },
+            ReferenceArgMode {
+                mutable: false,
+                retained: false,
+            },
+        ] {
+            assert!(
+                checker
+                    .reference_arg_modes
+                    .values()
+                    .any(|value| *value == mode)
+            );
+        }
+        for _ in 0..2 {
+            let errors = queries
+                .check_async_borrows(&program, &checker.expr_types, &checker.reference_arg_modes)
+                .unwrap();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].code, ErrorCode::E1706);
+        }
     }
 
     #[test]

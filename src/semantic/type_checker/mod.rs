@@ -1,3 +1,4 @@
+use crate::semantic::async_borrows::ReferenceArgMode;
 pub(crate) mod analysis;
 pub(crate) mod body;
 mod check;
@@ -165,8 +166,8 @@ pub struct TypeChecker {
     /// syntax identity rather than a source coordinate, so a pass that rebuilds
     /// a node cannot silently inherit its neighbour's type (willow-njot).
     pub expr_types: HashMap<ExprId, Type>,
-    /// Reference-parameter modes of resolved async calls, keyed by argument identity.
-    pub reference_arg_modes: HashMap<ExprId, ParamMode>,
+    /// Reference modes and async retention of resolved calls, keyed by argument identity.
+    pub reference_arg_modes: HashMap<ExprId, ReferenceArgMode>,
     /// What every type ANNOTATION the checker normalized became: the written
     /// spelling (`Arr<i64>`, `std::result::Result<i64, String>`, a module's own
     /// `Level`) mapped to the type the rest of the compiler uses for it

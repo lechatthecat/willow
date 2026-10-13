@@ -378,7 +378,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/lambda_context.wi", "20\n12\n12\nyes\n"),
         ("example/async_reference_escape_rejected.wi", "42\n"),
-        ("example/async_scalar_reference.wi", "42\n2.5\ntrue\n"),
+        (
+            "example/async_scalar_reference.wi",
+            "42\n2.5\ntrue\n43\n4.25\nfalse\n",
+        ),
         ("example/stable_borrowed_scalars.wi", "42\n4.25\ntrue\n"),
         ("example/generic_import_usage.wi", "7\n7\n7\n"),
         ("example/mutable_captures.wi", "2\n"),

@@ -366,7 +366,7 @@ impl ConcurrencyAnalyzer {
     fn check_async_reference_params(&mut self, context: &str, owner_span: Span, params: &[Param]) {
         for param in params {
             if let ParamMode::Reference { mutable, .. } = &param.mode {
-                if !*mutable && matches!(param.ty, Type::I64 | Type::F64 | Type::Bool) {
+                if matches!(param.ty, Type::I64 | Type::F64 | Type::Bool) {
                     continue;
                 }
                 let mode = if *mutable { "&mut" } else { "&" };
@@ -635,15 +635,22 @@ fn run(t: Task<i64>) {
     }
 
     #[test]
-    fn rejects_mutable_reference_parameter_in_async_function() {
-        assert_error_contains(
-            r#"
-async fn update(x: &mut i64) {
-}
-"#,
-            ErrorCode::E1707,
-            "reference parameter `x` is not supported in async function",
-        );
+    fn allows_mutable_scalar_reference_parameters_in_async_functions_and_methods() {
+        for ty in ["i64", "f64", "bool"] {
+            for source in [
+                format!("async fn update(x: &mut {ty}) {{ await sleep(1); }}"),
+                format!(
+                    "class Box {{ async fn update(self, x: &mut {ty}) {{ await sleep(1); }} }}"
+                ),
+            ] {
+                let analyzer = analyze(&source);
+                assert!(
+                    analyzer.errors.is_empty(),
+                    "{source}: {:?}",
+                    analyzer.errors
+                );
+            }
+        }
     }
 
     #[test]
@@ -660,11 +667,11 @@ async fn read(x: & String) -> String {
     }
 
     #[test]
-    fn rejects_reference_parameter_in_async_method() {
+    fn rejects_nonscalar_reference_parameter_in_async_method() {
         assert_error_contains(
             r#"
 class Box {
-    async fn update(self, x: &mut i64) {
+    async fn update(self, x: &mut String) {
     }
 }
 "#,

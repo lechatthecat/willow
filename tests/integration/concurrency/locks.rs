@@ -565,11 +565,11 @@ async fn main() {
 }
 
 #[test]
-fn test_async_mut_reference_parameter_reports_e1707() {
+fn test_async_mut_nonscalar_reference_parameter_reports_e1707() {
     assert_compile_error_contains(
         r#"
-async fn update(x: &mut i64) {
-    x = x + 1;
+async fn update(x: &mut String) {
+    x = "updated";
 }
 
 fn main() {
