@@ -234,3 +234,28 @@ fn async_borrow_migration_forced_generated_polls() {
     assert!(ok, "{out}");
     assert_eq!(out, "42\n");
 }
+
+#[test]
+fn async_mut_sync_preemption_forced_migration() {
+    let runtime = probe_runtime();
+    let source =
+        "fn heavy(x: &mut i64) { let mut i = 0; while i < 10000 { x = x + 1; i = i + 1; } }
+        async fn work(marker: i64, x: &mut i64) { heavy(&x); await sleep(10); heavy(&x); }
+        async fn main() { let mut x = 0; await work(731207731, &x); println(x); }";
+    let project = TestProject::new("mut_sync_migrate", &[("main.wi", source)]);
+    for release in [false, true] {
+        let mut args = vec!["--runtime-lib", runtime.to_str().unwrap()];
+        if release {
+            args.push("--release");
+        }
+        let out = project.compile_with_args("main.wi", &args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for stress in ["", "minor", "relocate"] {
+            run_probe(&project, "20000\n", 1, stress);
+        }
+    }
+}

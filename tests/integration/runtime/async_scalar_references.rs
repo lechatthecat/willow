@@ -592,3 +592,176 @@ fn async_borrow_unwind_unhandled_panic_keeps_older_defers() {
     assert!(out.lines().any(|line| line == "42"), "{out}");
     assert!(out.contains("cleanup-panic"), "{out}");
 }
+
+#[test]
+fn async_mut_sync_preemption_example_modes() {
+    let source = include_str!("../../../example/async_mut_sync_preemption.wi");
+    let project = TestProject::new("mut_sync_example", &[("main.wi", source)]);
+    for release in [false, true] {
+        let args = if release { vec!["--release"] } else { vec![] };
+        let compiled = project.compile_with_args("main.wi", &args);
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        for (workers, budget, stress) in
+            [("1", "3", ""), ("4", "65", ""), ("2", "1024", "relocate")]
+        {
+            let out = project.run_with_env_timeout(
+                &[
+                    ("WILLOW_WORKERS", workers),
+                    ("WILLOW_TASK_BUDGET", budget),
+                    ("WILLOW_GC_STRESS", stress),
+                ],
+                std::time::Duration::from_secs(30),
+            );
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "1000000\n1000000\n");
+        }
+    }
+}
+
+#[test]
+fn async_mut_sync_preemption_fairness_and_storage() {
+    // A sleeper is the only way out of the synchronous loop. A missing poll
+    // deterministically times out on one worker, regardless of machine speed.
+    for (ty, initial, update, expected) in [
+        ("i64", "0", "x + 1", "true"),
+        ("f64", "0.0", "x + 1.0", "true"),
+        ("bool", "false", "true", "true"),
+    ] {
+        let check = match ty {
+            "bool" => "x",
+            "f64" => "x > 0.0",
+            _ => "x > 0",
+        };
+        let source = format!("fn heavy(x: &mut {ty}, started: AtomicBool, done: AtomicBool) {{
+            x = {update}; started.store(true);
+            while !done.load() {{ x = {update}; }}
+        }}
+        async fn work(x: &mut {ty}, started: AtomicBool, done: AtomicBool) -> bool {{
+            heavy(&x, started, done); await sleep(1); return {check};
+        }}
+        async fn main() {{ let mut x = {initial}; let started = AtomicBool::new(false); let done = AtomicBool::new(false);
+            let t = work(&x, started, done); while !started.load() {{ await yield(); }}
+            await sleep(1); done.store(true); let result = await t; println(result); println({check}); }}");
+        let project = TestProject::new("mut_sync_fair", &[("main.wi", &source)]);
+        let compiled = project.compile("main.wi");
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        for (budget, quantum) in [("1", "100000"), ("65", "100000"), ("1000000000000", "1")] {
+            let out = project.run_with_env_timeout(
+                &[
+                    ("WILLOW_WORKERS", "1"),
+                    ("WILLOW_TASK_BUDGET", budget),
+                    ("WILLOW_TIME_QUANTUM_MS", quantum),
+                ],
+                std::time::Duration::from_secs(20),
+            );
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("{expected}\n{expected}\n")
+            );
+        }
+    }
+}
+
+#[test]
+fn async_mut_sync_preemption_cancel_releases_lock_and_borrow() {
+    let source = r#"
+        fn heavy(x: &mut i64, started: AtomicBool) {
+            defer { x = x + 1; println("sync defer"); }
+            x = 40; started.store(true);
+            while true {}
+        }
+        async fn work(x: &mut i64, started: AtomicBool, m: Mutex<i64>) {
+            defer { x = x + 1; println("async defer"); }
+            lock m as mut value {
+                value = 7;
+                heavy(&x, started);
+                println("unreachable");
+            }
+        }
+        async fn main() {
+            let mut x = 0; let m = Mutex::new(0); let started = AtomicBool::new(false);
+            let scope = TaskScope::new(); scope.add(work(&x, started, m));
+            while !started.load() { await yield(); }
+            await sleep(1); scope.cancel(); await scope.finish();
+            println(x); lock m as value { println(value); }
+        }
+    "#;
+    let project = TestProject::new("mut_sync_cancel", &[("main.wi", source)]);
+    for release in [false, true] {
+        let args = if release { vec!["--release"] } else { vec![] };
+        let compiled = project.compile_with_args("main.wi", &args);
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        for (workers, stress) in [("1", ""), ("4", "relocate")] {
+            let out = project.run_with_env_timeout(
+                &[
+                    ("WILLOW_WORKERS", workers),
+                    ("WILLOW_TASK_BUDGET", "3"),
+                    ("WILLOW_GC_STRESS", stress),
+                ],
+                std::time::Duration::from_secs(20),
+            );
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "sync defer\nasync defer\n42\n7\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn async_mut_sync_preemption_nested_heap_and_repeated_calls() {
+    // Increasing native depth and repeated calls retain one reference cell.
+    for count in [1, 8, 32] {
+        for place in ["x", "b.value", "values[0]"] {
+            let source = format!("import std::collections::Array;
+                class Box {{ pub value: i64; }}
+                fn heavy(x: &mut i64, depth: i64) {{
+                    if depth > 1 {{ heavy(&x, depth - 1); }}
+                    let mut i = 0; while i < 1000 {{ x = x + 1; i = i + 1; }}
+                    gc_collect();
+                }}
+                async fn work(x: &mut i64) {{
+                    let mut i = 0; while i < {count} {{ heavy(&x, {count}); await sleep(1); i = i + 1; }}
+                }}
+                async fn main() {{ let mut x = 0; let b = new Box(0); let values: Array<i64> = [0];
+                    await work(&{place}); println({place}); }}");
+            let (out, ok) = super::super::support::compile_and_run_with_runtime_env(
+                &source,
+                &[
+                    ("WILLOW_WORKERS", "2"),
+                    ("WILLOW_TASK_BUDGET", "3"),
+                    ("WILLOW_GC_STRESS", "relocate"),
+                ],
+                std::time::Duration::from_secs(30),
+            );
+            assert!(ok, "count={count} place={place}: {out}");
+            assert_eq!(out, format!("{}\n", 1000 * count * count));
+        }
+    }
+}

@@ -1,0 +1,19 @@
+// The mutable borrow survives synchronous preemption and the following await.
+fn heavy(x: &mut i64) {
+    let mut i = 0;
+    while i < 1000000 {
+        x = x + 1;
+        i = i + 1;
+    }
+}
+async fn work(x: &mut i64) -> i64 {
+    heavy(&x);
+    await sleep(1);
+    return x;
+}
+async fn main() {
+    let mut x = 0;
+    let result = await work(&x);
+    println(result);
+    println(x);
+}
