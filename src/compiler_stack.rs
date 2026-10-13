@@ -159,6 +159,15 @@ impl<T> Drop for Continuation<'_, T> {
         // Ordinary field destruction now sees only cancelled child futures.
     }
 }
+/// Run the synchronous specialization of a shared async query implementation.
+/// Its supplied computation cannot suspend, so no executor or allocation is needed.
+pub(crate) fn run_ready<T>(future: impl Future<Output = T>) -> T {
+    match std::pin::pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(value) => value,
+        Poll::Pending => unreachable!("synchronous query suspended"),
+    }
+}
+
 /// Drive a recursive compiler computation with constant native poll depth.
 pub(crate) fn run<T>(mut root: Continuation<'_, T>) -> T {
     let mut executor = Executor { child: None };

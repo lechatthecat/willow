@@ -757,17 +757,28 @@ impl BodyQueries {
         id: BodyId,
         compute: impl FnOnce() -> Result<TypedBody>,
     ) -> Result<TypedBody> {
+        crate::compiler_stack::run_ready(self.evaluate_async(id, async { compute() }))
+    }
+
+    pub(crate) async fn evaluate_async(
+        &self,
+        id: BodyId,
+        compute: impl std::future::Future<Output = Result<TypedBody>>,
+    ) -> Result<TypedBody> {
         self.mark_reused(id);
         let mut fresh = None;
-        let artifact = self.typed.query(id, || {
-            self.typechecks.set(self.typechecks.get() + 1);
-            let reads = crate::semantic::symbols::SymbolReadCapture::begin();
-            let value = compute()?;
-            self.dependencies.borrow_mut().insert(id, reads.finish());
-            let artifact = self.store.write(&value)?;
-            fresh = Some(value);
-            Ok(artifact)
-        })?;
+        let artifact = self
+            .typed
+            .query_async(id, async {
+                self.typechecks.set(self.typechecks.get() + 1);
+                let reads = crate::semantic::symbols::SymbolReadCapture::begin();
+                let value = compute.await?;
+                self.dependencies.borrow_mut().insert(id, reads.finish());
+                let artifact = self.store.write(&value)?;
+                fresh = Some(value);
+                Ok(artifact)
+            })
+            .await?;
         match fresh {
             Some(value) => Ok(value),
             None => self.store.read(*artifact),

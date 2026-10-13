@@ -1647,51 +1647,60 @@ mod tests {
 
     #[test]
     fn revision_reuse_scales_with_body_count_and_lambda_depth() {
-        for n in [16, 64, 256] {
-            let f = Fixture::new();
-            f.write(
-                "main.wi",
-                "import library; import value; fn main() { println(value::get()); }",
-            );
-            f.write(
-                "library.wi",
-                &(0..n)
-                    .map(|i| format!("pub fn body_{i}() -> i64 {{ return {i}; }}\n"))
-                    .collect::<String>(),
-            );
-            f.write("value.wi", "pub fn get() -> i64 { return 1; }");
-            let mut warm = AnalysisRevision::default();
-            let _symbols = warm.symbols.enter();
-            assert!(f.compare(&mut warm));
-            f.write("value.wi", "pub fn get() -> i64 { return 2; }");
-            assert!(f.compare(&mut warm));
-            assert_eq!((warm.typechecks, warm.reused_bodies), (1, n + 1));
-            println!(
-                "revision bodies={n} rechecked=1 reused={} retained_bytes={}",
-                warm.reused_bodies, warm.retained_artifact_bytes
-            );
-        }
-        for depth in [4, 16, 64] {
-            let f = Fixture::new();
-            let mut body = "return x;".to_owned();
-            for i in (0..depth).rev() {
-                body = format!("let f{i} = |x: i64| {{ {body} }}; return f{i}(x);");
-            }
-            f.write(
-                "main.wi",
-                &format!("fn f(x: i64) -> i64 {{ {body} }} fn main() {{ println(f(1)); }}"),
-            );
-            let mut warm = AnalysisRevision::default();
-            let _symbols = warm.symbols.enter();
-            assert!(f.compare(&mut warm));
-            assert!(f.compare(&mut warm));
-            assert_eq!((warm.typechecks, warm.reused_bodies), (0, depth + 2));
-            println!(
-                "revision lambda_depth={depth} rechecked=0 reused={} retained_bytes={}",
-                depth + 2,
-                warm.retained_artifact_bytes
-            );
-        }
+        // Exercise query-backed nested lambdas below every CI target's default
+        // test stack. Increasing depth must not nest synchronous query drivers.
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                for n in [16, 64, 256] {
+                    let f = Fixture::new();
+                    f.write(
+                        "main.wi",
+                        "import library; import value; fn main() { println(value::get()); }",
+                    );
+                    f.write(
+                        "library.wi",
+                        &(0..n)
+                            .map(|i| format!("pub fn body_{i}() -> i64 {{ return {i}; }}\n"))
+                            .collect::<String>(),
+                    );
+                    f.write("value.wi", "pub fn get() -> i64 { return 1; }");
+                    let mut warm = AnalysisRevision::default();
+                    let _symbols = warm.symbols.enter();
+                    assert!(f.compare(&mut warm));
+                    f.write("value.wi", "pub fn get() -> i64 { return 2; }");
+                    assert!(f.compare(&mut warm));
+                    assert_eq!((warm.typechecks, warm.reused_bodies), (1, n + 1));
+                    println!(
+                        "revision bodies={n} rechecked=1 reused={} retained_bytes={}",
+                        warm.reused_bodies, warm.retained_artifact_bytes
+                    );
+                }
+                for depth in [4, 16, 64] {
+                    let f = Fixture::new();
+                    let mut body = "return x;".to_owned();
+                    for i in (0..depth).rev() {
+                        body = format!("let f{i} = |x: i64| {{ {body} }}; return f{i}(x);");
+                    }
+                    f.write(
+                        "main.wi",
+                        &format!("fn f(x: i64) -> i64 {{ {body} }} fn main() {{ println(f(1)); }}"),
+                    );
+                    let mut warm = AnalysisRevision::default();
+                    let _symbols = warm.symbols.enter();
+                    assert!(f.compare(&mut warm));
+                    assert!(f.compare(&mut warm));
+                    assert_eq!((warm.typechecks, warm.reused_bodies), (0, depth + 2));
+                    println!(
+                        "revision lambda_depth={depth} rechecked=0 reused={} retained_bytes={}",
+                        depth + 2,
+                        warm.retained_artifact_bytes
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

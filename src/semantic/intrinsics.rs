@@ -445,7 +445,7 @@ pub(crate) fn adt_method_target(ty: &Type, method: &str) -> Option<FunctionId> {
         ),
         B::Result => matches!(
             method,
-            "unwrap" | "expect" | "unwrap_or" | "is_ok" | "is_err"
+            "unwrap" | "unwrap_err" | "expect" | "unwrap_or" | "is_ok" | "is_err"
         ),
         _ => false,
     };
@@ -456,8 +456,8 @@ pub(crate) fn adt_method_target(ty: &Type, method: &str) -> Option<FunctionId> {
 /// remains an independent indirect-call obligation (never a pure leaf).
 pub(crate) fn adt_callback(ty: &Type, method: &str) -> bool {
     match builtin_types::resolve(ty).map(|ty| ty.id) {
-        Some(B::Option) => matches!(method, "map" | "and_then"),
-        Some(B::Result) => matches!(method, "map" | "map_err" | "and_then"),
+        Some(B::Option) => matches!(method, "map" | "and_then" | "or_else"),
+        Some(B::Result) => matches!(method, "map" | "map_err" | "and_then" | "or_else"),
         _ => false,
     }
 }
@@ -479,7 +479,7 @@ pub(crate) fn builtin_target_effects(target: &FunctionId) -> Option<RuntimeEffec
     }
     if target.owner().as_deref() == Some("$adt") && target.namespace().is_none() {
         return match target.name().as_ref() {
-            "unwrap" | "expect" => {
+            "unwrap" | "unwrap_err" | "expect" => {
                 Some(RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_ALLOCATE))
             }
             "unwrap_or" | "is_some" | "is_none" | "is_ok" | "is_err" => Some(RuntimeEffects::NONE),

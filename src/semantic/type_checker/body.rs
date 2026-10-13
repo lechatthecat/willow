@@ -289,6 +289,7 @@ impl BodyChecker {
     }
 }
 
+#[willow_continuations::checker]
 impl TypeChecker {
     /// Start a body evaluator over this checker's frozen declarations. Sharing
     /// the resolution context and declaration symbols is O(1); only the
@@ -492,48 +493,65 @@ impl TypeChecker {
     /// fresh tables that are stored under the lambda's `BodyId`. The parent
     /// records only where the lambda's diagnostics fall among its own.
     ///
-    /// Returns `None` when the lambda has no independent identity (no body
-    /// queries, or no parent body) or was already evaluated, in which case the
-    /// caller checks it inline exactly as before.
-    pub(super) fn check_lambda_body<T, F: FnOnce(&mut TypeChecker) -> T>(
+    /// Already evaluated or identity-less lambdas retain inline checking.
+    pub(super) fn check_lambda_body(
         &mut self,
         l: &LambdaExpr,
         body: Option<BodyId>,
-        check: F,
-    ) -> Result<T, F> {
-        let (Some(id), Some(queries)) = (body, self.body_queries.clone()) else {
-            return Err(check);
-        };
-        if queries.is_typed(id) {
+        callable: Option<FunctionId>,
+        expected_params: Option<&[Type]>,
+        expected_return: Option<&Type>,
+        expected_closure: bool,
+    ) -> (Type, Vec<String>) {
+        let queries = self.body_queries.clone();
+        let query = body
+            .zip(queries.as_ref())
+            .filter(|(id, queries)| !queries.is_typed(*id));
+        let Some((id, queries)) = query else {
             #[cfg(test)]
-            {
+            if body.zip(queries.as_ref()).is_some() {
                 self.inline_lambda_rechecks += 1;
             }
-            return Err(check);
-        }
+            return self.check_lambda_scoped(
+                l,
+                body,
+                callable,
+                expected_params,
+                expected_return,
+                expected_closure,
+            );
+        };
         let mut saved = BodyOutputs::default();
         self.swap_body_outputs(&mut saved);
-        let mut check = Some(check);
         let mut value = None;
         let mut lambda_ty = None;
-        let result = queries.evaluate(id, || {
-            value = Some((check.take().expect("typed_body computes once"))(self));
-            let mut outputs = BodyOutputs::default();
-            self.swap_body_outputs(&mut outputs);
-            // The lambda's own type is an entry of the ENCLOSING body: that
-            // body writes it again after this returns, possibly with a
-            // different type.
-            lambda_ty = outputs.expr_types.remove(&l.id);
-            // A use of a map still awaiting its first insertion carries a
-            // placeholder type. Whichever body resolves the map writes the
-            // final type for every use, so the placeholder must not reach the
-            // stored record, which checked_unit merges after its parent's.
-            let pending = &self.local.pending_map_uses;
-            if !pending.is_empty() {
-                outputs.expr_types.retain(|id, _| !pending.contains(id));
-            }
-            Ok(TypedBody::new(id, outputs, HashSet::new(), HashSet::new()))
-        });
+        let result = queries
+            .evaluate_async(id, async {
+                value = Some(self.check_lambda_scoped(
+                    l,
+                    body,
+                    callable,
+                    expected_params,
+                    expected_return,
+                    expected_closure,
+                ));
+                let mut outputs = BodyOutputs::default();
+                self.swap_body_outputs(&mut outputs);
+                // The lambda's own type is an entry of the ENCLOSING body: that
+                // body writes it again after this returns, possibly with a
+                // different type.
+                lambda_ty = outputs.expr_types.remove(&l.id);
+                // A use of a map still awaiting its first insertion carries a
+                // placeholder type. Whichever body resolves the map writes the
+                // final type for every use, so the placeholder must not reach the
+                // stored record, which checked_unit merges after its parent's.
+                let pending = &self.local.pending_map_uses;
+                if !pending.is_empty() {
+                    outputs.expr_types.retain(|id, _| !pending.contains(id));
+                }
+                Ok(TypedBody::new(id, outputs, HashSet::new(), HashSet::new()))
+            })
+            .await;
         // Whatever the query did, the parent's tables come back.
         self.swap_body_outputs(&mut saved);
         let (child, value) = match (result, value) {
@@ -542,10 +560,16 @@ impl TypeChecker {
                 if let Err(error) = result {
                     self.body_query_error.get_or_insert(error);
                 }
-                return match (value, check) {
-                    (Some(value), _) => Ok(value),
-                    (None, Some(check)) => Err(check),
-                    (None, None) => unreachable!("a taken check produced a value"),
+                return match value {
+                    Some(value) => value,
+                    None => self.check_lambda_scoped(
+                        l,
+                        body,
+                        callable,
+                        expected_params,
+                        expected_return,
+                        expected_closure,
+                    ),
                 };
             }
         };
@@ -559,7 +583,7 @@ impl TypeChecker {
             task_sites: self.task_method_calls.len(),
         });
         self.lambdas.resident.push(child);
-        Ok(value)
+        value
     }
 }
 

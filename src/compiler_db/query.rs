@@ -92,6 +92,15 @@ impl<K: Clone + Eq + Hash + Debug, V> QueryTable<K, V> {
     }
 
     pub fn query(&self, key: K, compute: impl FnOnce() -> Result<V>) -> Result<Arc<V>> {
+        crate::compiler_stack::run_ready(self.query_async(key, async { compute() }))
+    }
+
+    /// Keep query guards live while a compiler continuation checks nested bodies.
+    pub(crate) async fn query_async(
+        &self,
+        key: K,
+        compute: impl std::future::Future<Output = Result<V>>,
+    ) -> Result<Arc<V>> {
         super::tracked::assert_frozen_read();
         self.stats.borrow_mut().calls += 1;
         crate::query_stats::query_call(self.name);
@@ -165,7 +174,7 @@ impl<K: Clone + Eq + Hash + Debug, V> QueryTable<K, V> {
             started: crate::query_stats::timing_enabled().then(Instant::now),
             depth,
         };
-        match compute() {
+        match compute.await {
             Ok(value) => {
                 let value = Arc::new(value);
                 self.states
@@ -186,6 +195,67 @@ impl<K: Clone + Eq + Hash + Debug, V> QueryTable<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn nested_query(
+        table: &QueryTable<usize, usize>,
+        depth: usize,
+        fail: bool,
+    ) -> crate::compiler_stack::Continuation<'_, Result<Arc<usize>>> {
+        // SAFETY: each future retains and directly awaits its child continuation.
+        unsafe {
+            crate::compiler_stack::Continuation::new(async move {
+                table
+                    .query_async(depth, async {
+                        if depth == 0 {
+                            assert!(!fail, "query leaf panic");
+                            Ok(1)
+                        } else {
+                            Ok(*nested_query(table, depth - 1, fail).await? + 1)
+                        }
+                    })
+                    .await
+            })
+        }
+    }
+
+    #[test]
+    fn continuation_queries_keep_linear_counts_and_unwind_guards() {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                for depth in [16, 64, 256] {
+                    let table = QueryTable::default();
+                    assert!(
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            crate::compiler_stack::run(nested_query(&table, depth, true))
+                        }))
+                        .is_err()
+                    );
+                    CHAIN.with(|chain| assert!(chain.borrow().is_empty()));
+                    assert!(table.states.borrow().is_empty());
+                    assert_eq!(
+                        *crate::compiler_stack::run(nested_query(&table, depth, false)).unwrap(),
+                        depth + 1
+                    );
+                    assert_eq!(
+                        *table.query(depth, || panic!("must reuse")).unwrap(),
+                        depth + 1
+                    );
+                    let stats = table.stats();
+                    assert_eq!(stats.computations, 2 * (depth + 1));
+                    assert_eq!(stats.hits, 1);
+                    assert_eq!(stats.max_depth, depth + 1);
+                    CHAIN.with(|chain| assert!(chain.borrow().is_empty()));
+                    println!(
+                        "query depth={depth} computations={} hits={} max_depth={}",
+                        stats.computations, stats.hits, stats.max_depth
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn reuses_success_failure_and_reports_cycles() {
         let table = QueryTable::default();

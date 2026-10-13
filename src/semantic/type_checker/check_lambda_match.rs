@@ -339,25 +339,19 @@ impl TypeChecker {
                 LambdaBody::Expr(_) => self.body_queries.is_none().then(BodyId::fresh),
             })
             .map(FunctionId::lambda);
-        let check = move |checker: &mut TypeChecker| {
-            checker.check_lambda_scoped(
-                l,
-                lambda_body,
-                callable,
-                expected_params,
-                expected_return,
-                expected_closure,
-            )
-        };
-        let result = match self.check_lambda_body(l, lambda_body, check) {
-            Ok(result) => result,
-            Err(check) => check(self),
-        };
+        let result = self.check_lambda_body(
+            l,
+            lambda_body,
+            callable,
+            expected_params,
+            expected_return,
+            expected_closure,
+        );
         self.record_function_value(callable, l.params.len(), l.span);
         result
     }
 
-    fn check_lambda_scoped(
+    pub(super) fn check_lambda_scoped(
         &mut self,
         l: &LambdaExpr,
         lambda_body: Option<BodyId>,

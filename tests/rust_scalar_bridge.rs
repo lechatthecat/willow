@@ -224,7 +224,8 @@ fn scheduler_task_rejects_foreign_call_before_running_rust_body() {
     let output = f.command(&["run", "--offline"]);
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(error.contains("rust_bridge_worker_blocking"), "{error}");
+    assert!(error.contains("E0810"), "{error}");
+    assert!(error.contains("unproven call in `touch`"), "{error}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("RUST_BODY_MUST_NOT_RUN"));
     assert!(!stdout.contains("987654321"));

@@ -217,3 +217,50 @@ fn a7_imported_unknown_summary_is_not_silently_dropped() {
     assert!(errors.contains("error[E0810]"), "{errors}");
     assert!(errors.contains("unresolved call target"), "{errors}");
 }
+
+#[test]
+fn a7_adt_fallback_callbacks_remain_proven() {
+    for (name, body, expected) in [
+        (
+            "option_absent",
+            "let x:Option<i64>=None; println(x.or_else(|| { let y:Option<i64>=Some(42); return y; }).unwrap());",
+            "42\n",
+        ),
+        (
+            "option_present",
+            "let x:Option<i64>=Some(7); println(x.or_else(|| { let y:Option<i64>=Some(42); return y; }).unwrap());",
+            "7\n",
+        ),
+        (
+            "result_error",
+            "let x:Result<i64,bool>=Err(false); println(x.or_else(|e| { let y:Result<i64,bool>=Ok(42); return y; }).unwrap());",
+            "42\n",
+        ),
+        (
+            "result_ok",
+            "let x:Result<i64,bool>=Ok(7); println(x.or_else(|e| { let y:Result<i64,bool>=Ok(42); return y; }).unwrap());",
+            "7\n",
+        ),
+        (
+            "unwrap_error",
+            "let x:Result<i64,bool>=Err(true); println(x.unwrap_err());",
+            "true\n",
+        ),
+    ] {
+        let (out, ok) = compile_and_run(&format!("async fn main() {{ {body} }}"));
+        assert!(ok, "{name}: {out}");
+        assert_eq!(out, expected, "{name}");
+    }
+}
+
+#[test]
+fn a7_adt_fallback_does_not_hide_an_unknown_callback() {
+    for source in [
+        "async fn run(f:fn()->Option<i64>)->Option<i64>{let x:Option<i64>=None;return x.or_else(f);} fn main(){}",
+        "async fn run(f:fn(bool)->Result<i64,bool>)->Result<i64,bool>{let x:Result<i64,bool>=Err(false);return x.or_else(f);} fn main(){}",
+    ] {
+        let (ok, errors) = compile_with_compiler_env(source, &[]);
+        assert!(!ok);
+        assert!(errors.contains("error[E0810]"), "{errors}");
+    }
+}
