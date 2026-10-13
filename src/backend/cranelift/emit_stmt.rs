@@ -460,7 +460,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.seal_block(check);
             resume
         });
-        let cancelled = self.emit_value_runtime_call("willow_sync_cancelled", &[]);
+        let reason = self.emit_value_runtime_call("willow_unwind_reason", &[]);
+        // Cancellation remains sticky even if a cleanup panic was recovered.
+        // Panic propagation still compares depth, so an outer panic does not
+        // abort a harmless helper called from a defer.
+        let cancelled = self
+            .builder
+            .ins()
+            .band_imm_s(reason, i64::from(willow_abi::unwind_reason::CANCEL));
         self.emit_sync_cancel_branch(cancelled);
         if let Some(resume) = resume {
             self.builder.ins().jump(resume, &[]);

@@ -1640,6 +1640,104 @@ mod tests {
         );
         assert_eq!(crate::gc::gc_thread_root_depth(), depth);
     }
+    #[test]
+    fn unwind_reason_distinguishes_cancel_panic_and_cleanup_suppression() {
+        use crate::panic_context::*;
+        use willow_abi::unwind_reason::{CANCEL, NONE, PANIC};
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        let saved = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(901))));
+        unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
+            assert_eq!(willow_unwind_reason(), CANCEL);
+            assert_eq!(willow_panic_active(), 0);
+            assert_eq!(willow_panic_depth(), 0);
+            willow_panic_enter_defer();
+            assert!(willow_panic_recover().is_null());
+            willow_panic_leave_defer();
+            let message = crate::string::willow_string_alloc(b"cleanup".as_ptr(), 7);
+            willow_panic_raise(message, std::ptr::null(), 0, 0);
+            assert_eq!(willow_unwind_reason(), PANIC | CANCEL);
+            assert_eq!(willow_panic_depth(), 1);
+            cleanup_enter();
+            cleanup_enter();
+            assert_eq!(willow_unwind_reason(), PANIC);
+            willow_panic_enter_defer();
+            let info = willow_panic_recover();
+            willow_panic_release_recovered(info);
+            willow_panic_leave_defer();
+            assert_eq!(willow_unwind_reason(), NONE);
+            cleanup_leave();
+            assert_eq!(willow_unwind_reason(), NONE);
+            cleanup_leave();
+            assert_eq!(willow_unwind_reason(), CANCEL);
+            assert_eq!(willow_panic_active(), 0);
+            RUNTIME_POLL_READY
+        }
+        let mut stack = NativeStack::new(poll, std::ptr::null_mut());
+        stack.cancelled = true;
+        assert_eq!(
+            unsafe { NativeStack::resume(&mut *stack) },
+            RUNTIME_POLL_READY
+        );
+        assert_eq!(willow_unwind_reason(), NONE);
+        drop(stack);
+        replace_current_context(saved);
+    }
+
+    /// Reproducible relative ABI call cost; timings are evidence, not a CI gate.
+    #[test]
+    #[ignore = "manual release microbenchmark"]
+    fn unwind_reason_fast_path_measurement() {
+        use crate::panic_context::*;
+        fn measure(label: &str) {
+            for n in [100_000, 1_000_000] {
+                for sample in 0..5 {
+                    for (name, query) in [
+                        (
+                            "panic_active",
+                            willow_panic_active as extern "C" fn() -> i32,
+                        ),
+                        ("sync_cancelled", crate::preempt::willow_sync_cancelled),
+                        ("unwind_reason", willow_unwind_reason),
+                    ] {
+                        let query = std::hint::black_box(query);
+                        let start = std::time::Instant::now();
+                        for _ in 0..n {
+                            std::hint::black_box(query());
+                        }
+                        println!(
+                            "state={label} n={n} sample={sample} query={name} ns={}",
+                            start.elapsed().as_nanos()
+                        );
+                    }
+                }
+            }
+        }
+        unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
+            measure("task-clean");
+            let stack = CURRENT.with(Cell::get);
+            unsafe {
+                (*stack).cancelled = true;
+            }
+            measure("task-cancelled");
+            cleanup_enter();
+            measure("task-cleanup");
+            cleanup_leave();
+            RUNTIME_POLL_READY
+        }
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        let saved = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(902))));
+        measure("sync-clean");
+        let mut stack = NativeStack::new(poll, std::ptr::null_mut());
+        assert_eq!(
+            unsafe { NativeStack::resume(&mut *stack) },
+            RUNTIME_POLL_READY
+        );
+        drop(stack);
+        replace_current_context(saved);
+    }
+
     static CANCEL_TARGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static DEFER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static PEER_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1655,6 +1753,11 @@ mod tests {
             }
             // Model the compiler's cancellation defer edges at every depth.
             assert_ne!(crate::preempt::willow_sync_cancelled(), 0);
+            assert_eq!(
+                crate::panic_context::willow_unwind_reason(),
+                willow_abi::unwind_reason::CANCEL
+            );
+            assert_eq!(crate::panic_context::willow_panic_active(), 0);
             crate::preempt::willow_sync_cleanup_enter();
             assert_eq!(crate::preempt::willow_sync_cancelled(), 0);
             DEFER_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

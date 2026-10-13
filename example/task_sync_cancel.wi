@@ -1,0 +1,26 @@
+// Cancellation unwinds a parked synchronous helper, then releases its lock.
+fn parked(ready: AtomicBool) {
+    defer { println("sync outer"); }
+    defer { println("sync inner"); }
+    ready.store(true);
+    while true {}
+}
+async fn worker(ready: AtomicBool, mutex: Mutex<i64>) {
+    defer { println("async outer"); }
+    lock mutex as mut value {
+        value = 42;
+        defer { println("lock defer"); }
+        parked(ready);
+        println("unreachable");
+    }
+}
+async fn main() {
+    let ready = AtomicBool::new(false);
+    let mutex = Mutex::new(0);
+    let scope = TaskScope::new();
+    scope.add(worker(ready, mutex));
+    while !ready.load() { await yield(); }
+    scope.cancel();
+    await scope.finish();
+    lock mutex as value { println(value); }
+}

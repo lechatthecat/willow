@@ -5,6 +5,14 @@
 //! when converting a descriptor to byte offsets or allocation sizes. This
 //! keeps cross-compilation independent of the host Rust process layout.
 
+/// Bits returned by `willow_unwind_reason`. Both may be set: cancellation is
+/// sticky, while a panic raised by cleanup can be recovered independently.
+pub mod unwind_reason {
+    pub const NONE: i32 = 0;
+    pub const PANIC: i32 = 1;
+    pub const CANCEL: i32 = 2;
+}
+
 pub mod ffi;
 pub mod fingerprint;
 pub mod runtime_type_ids;

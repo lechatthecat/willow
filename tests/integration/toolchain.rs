@@ -402,7 +402,12 @@ fn test_backend_runtime_symbol_table_lists_expected_symbols() {
         "expected the backend runtime symbol table to cover the full imported surface, parsed {}",
         symbols.len()
     );
-    for anchor in ["willow_alloc_typed", "willow_panic", "willow_string_alloc"] {
+    for anchor in [
+        "willow_alloc_typed",
+        "willow_panic",
+        "willow_string_alloc",
+        "willow_unwind_reason",
+    ] {
         assert!(
             symbols.iter().any(|s| s == anchor),
             "backend runtime symbol table failed to find {anchor}"

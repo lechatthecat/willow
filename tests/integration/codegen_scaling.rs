@@ -661,10 +661,23 @@ fn scaling_24_sync_cancellation_actions_do_not_multiply_by_call_sites() {
                         &PLAIN,
                         release,
                     );
+                    let reasons = relocations
+                        .iter()
+                        .filter(|(_, name)| name == "willow_unwind_reason")
+                        .count();
+                    assert!(reasons > 0, "compiler must query the combined reason");
+                    assert!(
+                        !relocations
+                            .iter()
+                            .any(|(_, name)| name == "willow_sync_cancelled")
+                    );
                     let actions = relocations
                         .iter()
                         .filter(|(section, name)| section == "text" && name == "willow_println_i64")
                         .count();
+                    println!(
+                        "release={release} branches={branches} defers={defers} sites={sites} reasons={reasons} actions={actions}"
+                    );
                     let expected = *baseline.get_or_insert(actions);
                     assert_eq!(
                         actions, expected,

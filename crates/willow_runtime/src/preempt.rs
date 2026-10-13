@@ -499,6 +499,10 @@ pub extern "C" fn willow_sync_safepoint() -> i32 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sync_cancelled() -> i32 {
+    sync_cancelled()
+}
+
+pub(crate) fn sync_cancelled() -> i32 {
     #[cfg(any(
         all(
             target_os = "linux",

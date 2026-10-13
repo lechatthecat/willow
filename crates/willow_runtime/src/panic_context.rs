@@ -396,11 +396,26 @@ pub extern "C" fn willow_panic_raise(message: *const u8, file: *const u8, line: 
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic_active() -> i32 {
+    active_reason()
+}
+
+fn active_reason() -> i32 {
     CURRENT_CONTEXT.with(|slot| {
         slot.borrow()
             .as_ref()
             .is_some_and(|context| context.active()) as i32
     })
+}
+
+/// Combined compiler unwind state. The panic bit is exactly panic_active;
+/// cancellation uses the existing task-stack state and cleanup suppression.
+/// No second cancellation flag or panic record is introduced. Neither query
+/// allocates, suspends, or changes the panic depth. Both bits can coexist.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_unwind_reason() -> i32 {
+    use willow_abi::unwind_reason::{CANCEL, PANIC};
+    (active_reason() * PANIC) | (crate::preempt::sync_cancelled() * CANCEL)
 }
 
 /// Number of active language-panic records in the current execution context.
@@ -688,6 +703,7 @@ mod tests {
         let check = |expected| {
             assert_eq!(willow_panic_depth(), expected);
             assert_eq!(willow_panic_active(), i32::from(expected != 0));
+            assert_eq!(willow_unwind_reason(), i32::from(expected != 0));
             assert_eq!(current_snapshot().unwrap().active, expected as usize);
         };
         check(0);

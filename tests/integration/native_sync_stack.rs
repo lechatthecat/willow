@@ -555,3 +555,39 @@ async fn main() {{
         assert_eq!(out, "42\n", "{name}");
     }
 }
+
+#[test]
+fn unwind_reason_sync_cancel_example_lifo_lock_and_scope() {
+    let project = TestProject::new(
+        "unwind_reason_cancel",
+        &[("main.wi", include_str!("../../example/task_sync_cancel.wi"))],
+    );
+    for release in [false, true] {
+        let args = if release { vec!["--release"] } else { vec![] };
+        let compiled = project.compile_with_args("main.wi", &args);
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        for workers in ["1", "4"] {
+            let out = project.run_with_env_timeout(
+                &[
+                    ("WILLOW_WORKERS", workers),
+                    ("WILLOW_TASK_BUDGET", "1"),
+                    ("WILLOW_GC_STRESS", "alloc,scheduler"),
+                ],
+                Duration::from_secs(30),
+            );
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "sync inner\nsync outer\nlock defer\nasync outer\n42\n"
+            );
+        }
+    }
+}
