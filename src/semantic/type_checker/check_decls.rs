@@ -1188,7 +1188,16 @@ impl TypeChecker {
             // parameter arrives as a POINTER, so a value-parameter method
             // reached through the interface's vtable would dereference an
             // integer (willow-0g8j.9).
-            let params_match = method.params == req.params
+            // Types compare by identity, not spelling: an imported interface's
+            // signature names its types as the provider resolved them
+            // (`$local::util::Get`), while the class writes its own access path
+            // (`util::Get`, or an alias of it) (willow-k6n9).
+            let params_match = method.params.len() == req.params.len()
+                && method
+                    .params
+                    .iter()
+                    .zip(&req.params)
+                    .all(|(a, b)| self.same_type_identity(b, a))
                 && method.param_infos.len() == req.param_infos.len()
                 && method
                     .param_infos
@@ -1235,7 +1244,7 @@ impl TypeChecker {
             // `async` method, that surface is `Task<T>` even though the method
             // declaration writes the awaited value `T`.
             let actual_return_type = method_call_return_type(&method);
-            if actual_return_type != req.return_type {
+            if !self.same_type_identity(&req.return_type, &actual_return_type) {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -1523,8 +1532,15 @@ impl TypeChecker {
                         method_return_type.clone()
                     };
                     let base_call_return_type = method_call_return_type(&base_method);
-                    if method_params != base_method.params
-                        || actual_call_return_type != base_call_return_type
+                    // Identity, not spelling: an imported base class's signature
+                    // names types as its provider resolved them (willow-k6n9).
+                    if method_params.len() != base_method.params.len()
+                        || !method_params
+                            .iter()
+                            .zip(&base_method.params)
+                            .all(|(a, b)| self.same_type_identity(b, a))
+                        || !self
+                            .same_type_identity(&base_call_return_type, &actual_call_return_type)
                     {
                         self.push(
                             Diagnostic::new(

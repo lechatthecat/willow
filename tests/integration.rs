@@ -39,6 +39,8 @@ mod cross_module_default_receiver_signatures;
 mod cross_module_generic_interface_defaults;
 #[path = "integration/cross_module_interface_defaults.rs"]
 mod cross_module_interface_defaults;
+#[path = "integration/cross_module_qualified_interface_conformance.rs"]
+mod cross_module_qualified_interface_conformance;
 #[path = "integration/defer_panic_termination.rs"]
 mod defer_panic_termination;
 #[path = "integration/enum_identity_aliases.rs"]

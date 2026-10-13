@@ -1,0 +1,27 @@
+// A class implementing an imported interface may name that interface by its
+// qualified path in the methods it implements and overrides; conformance
+// compares interface identities, not spellings (willow-k6n9).
+import interface_qualified_self_reference_support::shapes;
+
+class Square implements shapes::Shape {
+    pub side: i64;
+    pub fn area(self) -> i64 { return self.side * self.side; }
+    pub fn scaled(self, factor: i64) -> shapes::Shape {
+        return new Square(self.side * factor);
+    }
+    pub fn bigger(self, other: shapes::Shape) -> shapes::Shape {
+        if other.area() > self.area() { return other; }
+        return self;
+    }
+}
+
+class SquareFactory extends shapes::Factory {
+    pub override fn make(self) -> shapes::Shape { return new Square(5); }
+}
+
+fn main() {
+    let s = new Square(2);
+    println(s.scaled(3).area());
+    println(s.bigger(new Square(4)).area());
+    println(new SquareFactory().make().area());
+}

@@ -8449,6 +8449,57 @@ mod type_identity_scaling_tests {
             eprintln!("implements entries={entries} depth={depth} visits={visits}");
         }
     }
+
+    /// Interface conformance compares each required signature by identity in
+    /// one structural pass: every parameter and return node is visited once
+    /// per requirement, so checking a class is linear in its interface's
+    /// signature size, however the class spells the types (willow-k6n9).
+    #[test]
+    fn conformance_visits_each_signature_node_once() {
+        let parse = |source: &str| {
+            let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty());
+            program
+        };
+        for (methods, params) in [(4, 1), (16, 1), (64, 1), (16, 4), (16, 16)] {
+            let args = |ty: &str| {
+                (0..params)
+                    .map(|p| format!(", a{p}: {ty}"))
+                    .collect::<String>()
+            };
+            let iface = (0..methods)
+                .map(|m| format!("fn m{m}(self{}) -> I;", args("I")))
+                .collect::<String>();
+            let class = (0..methods)
+                .map(|m| {
+                    format!(
+                        "pub fn m{m}(self{}) -> Alias {{ return self; }}",
+                        args("Alias")
+                    )
+                })
+                .collect::<String>();
+            // The class spells the interface by a second registered name, as
+            // an importer spells a provider's interface by its access path.
+            let mut checker = TypeChecker::new();
+            checker.check_module_program(&parse(&format!("interface I {{ {iface} }}")));
+            let info = checker.symbols.lookup_interface("I").unwrap().clone();
+            checker
+                .symbols
+                .define_interface("Alias".into(), info.clone());
+            let program = parse(&format!("class C implements I {{ {class} }}"));
+            checker.check_module_program(&program);
+            let Item::Class(class) = &program.items[0] else {
+                panic!("expected class");
+            };
+            TYPE_IDENTITY_VISITS.with(|v| v.set(0));
+            checker.check_interface_conformance(class, &info);
+            assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+            let visits = TYPE_IDENTITY_VISITS.with(|v| v.get());
+            assert_eq!(visits, methods * (params + 1));
+            eprintln!("conformance methods={methods} params={params} visits={visits}");
+        }
+    }
 }
 
 #[cfg(test)]
