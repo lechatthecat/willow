@@ -328,6 +328,9 @@ pub enum UnsupportedInitialization {
     InjectedDefault,
     RuntimeCallback,
     UnresolvedCall,
+    /// No unit-local body, but a typed receiver is available for build-wide dispatch.
+    UnresolvedVirtualCall,
+    InlineCallback,
 }
 impl UnsupportedInitialization {
     pub(crate) fn description(self) -> &'static str {
@@ -335,7 +338,8 @@ impl UnsupportedInitialization {
             Self::IndirectCall => "an indirect call through a function value",
             Self::InjectedDefault => "an injected interface default method",
             Self::RuntimeCallback => "a runtime callback API (parallel::map)",
-            Self::UnresolvedCall => "an unresolved callable",
+            Self::InlineCallback => "an inline Option/Result callback",
+            Self::UnresolvedCall | Self::UnresolvedVirtualCall => "an unresolved callable",
         }
     }
 }

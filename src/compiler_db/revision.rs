@@ -1314,6 +1314,29 @@ mod tests {
     }
 
     #[test]
+    fn revision_preemption_obligations_follow_entry_implementations() {
+        let f = Fixture::new();
+        f.write("lib.wi", "pub interface I extends Sync { fn get(self)->i64; } pub fn read(i:I)->i64{return i.get();} pub fn apply(f:fn(i64)->i64)->i64{return f(41);}");
+        let prefix = "import lib; class Box implements lib::I { pub fn get(self)->i64{return 42;} } fn add(x:i64)->i64{return x+1;}";
+        let good = format!(
+            "{prefix} async fn main(){{println(lib::read(new Box()));println(lib::apply(add));}}"
+        );
+        f.write("main.wi", &good);
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        assert!(f.compare(&mut warm));
+        assert!(f.compare(&mut warm));
+        assert_eq!(warm.typechecks, 0);
+        f.write(
+            "main.wi",
+            "import lib; async fn run(i:lib::I)->i64{return lib::read(i);} fn main(){}",
+        );
+        assert!(!f.compare(&mut warm));
+        f.write("main.wi", &good);
+        assert!(f.compare(&mut warm));
+    }
+
+    #[test]
     fn revision_standalone_default_import_routes_match_cold() {
         // 5 source spellings x direct/inherited interface x both consumer orders.
         // Every route must receive the same canonical default, including edits.

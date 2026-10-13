@@ -1,0 +1,18 @@
+import std::collections::Array;
+import std::parallel;
+
+interface Value { fn get(self) -> i64; }
+class Box implements Value {
+    pub value: i64;
+    pub fn get(self) -> i64 { return self.value; }
+}
+fn read(value: Value) -> i64 { return value.get(); }
+fn increment(value: i64) -> i64 { return value + 1; }
+fn apply(f: fn(i64) -> i64, value: i64) -> i64 { return f(value); }
+
+async fn main() {
+    let values: Array<i64> = Array::new();
+    values.push(read(new Box(40)));
+    values.push(apply(increment, 40));
+    println((await parallel::map(values.freeze(), increment)).toString());
+}

@@ -6,6 +6,9 @@
 #[path = "integration/support.rs"]
 mod support;
 
+#[path = "integration/preemption_completeness.rs"]
+mod preemption_completeness;
+
 #[path = "integration/diagnostics.rs"]
 mod diagnostics;
 #[path = "integration/lexer.rs"]

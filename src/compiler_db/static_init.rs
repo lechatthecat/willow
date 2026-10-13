@@ -18,6 +18,8 @@ use crate::{
     },
 };
 
+mod preemption;
+
 pub(crate) fn initializer_id(class: &str, field: &str) -> FunctionId {
     FunctionId::method(
         TypeId::from_source_name(class),
@@ -40,8 +42,10 @@ struct DispatchType {
 struct Unit {
     dispatch_types: Vec<DispatchType>,
     graph: CallGraph,
+    reads: HashMap<FunctionId, HashSet<FunctionId>>,
     statics: Vec<Static>,
     imports: HashMap<String, String>,
+    preemption: Option<preemption::Inputs>,
 }
 #[derive(Default)]
 pub(crate) struct StaticInitQueries {
@@ -60,16 +64,8 @@ impl StaticInitQueries {
         index: Option<&super::ids::BodyIndex>,
     ) {
         let mut graph = calls.clone();
-        for (&caller, targets) in reads {
-            graph.merge(
-                caller,
-                crate::semantic::call_graph::CallSites {
-                    unsupported_initialization: Default::default(),
-                    virtual_calls: Default::default(),
-                    targets: targets.iter().copied().collect(),
-                    has_unknown: false,
-                },
-            );
+        for &caller in reads.keys() {
+            graph.merge(caller, Default::default());
         }
         let mut statics = Vec::new();
         let mut dispatch_types = Vec::new();
@@ -145,8 +141,10 @@ impl StaticInitQueries {
             Unit {
                 dispatch_types,
                 graph,
+                reads: reads.clone(),
                 statics,
                 imports: imports.clone(),
+                preemption: None,
             },
         );
         *self.plan.borrow_mut() = None;
@@ -190,7 +188,13 @@ impl StaticInitQueries {
                 let i = positions[&(unit, id)];
                 unknown[i] = calls.has_unknown || !calls.unsupported_initialization.is_empty();
                 unsupported[i] = calls.unsupported_initialization.first().copied();
-                for target in &calls.targets {
+                // Static reads create startup ordering edges, not synchronous
+                // task call edges. Keep them out of the shared dispatch graph.
+                for target in calls
+                    .targets
+                    .iter()
+                    .chain(facts.reads.get(&id).into_iter().flatten())
+                {
                     let local = positions.get(&(unit, *target)).copied();
                     let external = || {
                         effects
@@ -280,7 +284,9 @@ fn connect_build_dispatch(
     bodies: &HashMap<(UnitId, FunctionId), usize>,
     keys: &mut Vec<(UnitId, FunctionId)>,
     edges: &mut Vec<Vec<usize>>,
-) {
+) -> (Vec<usize>, Vec<usize>) {
+    let mut queried = Vec::new();
+    let mut unresolved = Vec::new();
     let mut types = Vec::new();
     let mut positions = HashMap::new();
     for &unit in order {
@@ -301,12 +307,15 @@ fn connect_build_dispatch(
             })
     };
     let mut children = vec![Vec::new(); types.len()];
+    let mut parent_edges = HashSet::new();
     let mut bases = vec![None; types.len()];
     let mut methods = HashMap::new();
     for (index, &(unit, declaration)) in types.iter().enumerate() {
         for &parent in &declaration.parents {
             if let Some(parent) = resolve(unit, FunctionId::method(parent, "$type")) {
-                children[parent].push(index);
+                if parent_edges.insert((parent, index)) {
+                    children[parent].push(index);
+                }
                 if !types[parent].1.is_interface && !declaration.is_interface {
                     bases[index] = Some(parent);
                 }
@@ -315,6 +324,28 @@ fn connect_build_dispatch(
         for &method in &declaration.methods {
             if let Some(&body) = bodies.get(&(unit, method)) {
                 methods.insert((index, method.name().to_string()), body);
+            }
+        }
+    }
+    // A generic default's opaque Self belongs to its checked specialization.
+    // BodyIndex copy origins identify the exact receivers of that instance;
+    // their written implements clause still names the generic template.
+    for &unit in order {
+        let Some(inputs) = units.get(&unit).and_then(|u| u.preemption.as_ref()) else {
+            continue;
+        };
+        for &(receiver, declaring, source) in &inputs.effects.preemption_copies {
+            let child = receiver
+                .owner_type()
+                .and_then(|ty| positions.get(&(unit, ty)));
+            let parent = source
+                .owner_type()
+                .and_then(|ty| positions.get(&(declaring, ty)));
+            if let (Some(&child), Some(&parent)) = (child, parent)
+                && types[parent].1.is_interface
+                && parent_edges.insert((parent, child))
+            {
+                children[parent].push(child);
             }
         }
     }
@@ -352,6 +383,9 @@ fn connect_build_dispatch(
                         edges,
                     );
                     edges[bodies[&(unit, caller)]].push(node);
+                    queried.push(node);
+                } else {
+                    unresolved.push(bodies[&(unit, caller)]);
                 }
             }
         }
@@ -367,6 +401,7 @@ fn connect_build_dispatch(
             edges[node].push(target);
         }
     }
+    (queried, unresolved)
 }
 
 fn inherited_body(
@@ -533,8 +568,10 @@ mod tests {
                     Unit {
                         dispatch_types,
                         graph,
+                        reads: HashMap::new(),
                         statics: Vec::new(),
                         imports: HashMap::new(),
+                        preemption: None,
                     },
                 )]
                 .into();

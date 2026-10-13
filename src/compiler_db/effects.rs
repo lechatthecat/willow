@@ -111,6 +111,9 @@ pub(crate) struct UnitEffects {
     loop_bodies: HashSet<BodyId>,
     callables: HashMap<FunctionId, bool>,
     may_io: HashSet<FunctionId>,
+    pub(crate) preemption_bodies: HashSet<FunctionId>,
+    pub(crate) preemption_loops: HashSet<FunctionId>,
+    pub(crate) preemption_copies: Vec<(FunctionId, UnitId, FunctionId)>,
 }
 
 pub(crate) struct EffectQueries {
@@ -698,10 +701,12 @@ pub(crate) fn solve_unit<N>(
         );
     let mut own = HashSet::new();
     let mut loops = HashSet::new();
+    let mut preemption_loops = HashSet::new();
     let mut loop_spans = HashMap::new();
     let mut loop_body_spans = HashMap::new();
     let mut loop_bodies = HashSet::new();
     let mut copies = Vec::new();
+    let mut preemption_copies = Vec::new();
     let mut may_io = HashSet::new();
     for (id, span) in foreign {
         problem = problem.seed(
@@ -760,6 +765,9 @@ pub(crate) fn solve_unit<N>(
                     }
                 }
                 if canonical_bodies.contains(&source) || reused.contains(&body_id) {
+                    if let Some((unit, _)) = index.owner(source) {
+                        preemption_copies.push((id, unit, source_callable(index, source)));
+                    }
                     // Defaults are checked only under the canonical interface
                     // identity, in the declaring unit. Do not repeat their
                     // source walk; a copy has no typed body of its own.
@@ -810,6 +818,9 @@ pub(crate) fn solve_unit<N>(
             None => scan().expect("direct effect scan is infallible"),
         };
         for direct in direct_bodies {
+            if direct.preemption_loop {
+                preemption_loops.insert(direct.id);
+            }
             own.insert(direct.id);
             problem = problem.body(direct.id);
             if let Some(span) = direct.loop_span {
@@ -1097,6 +1108,9 @@ pub(crate) fn solve_unit<N>(
         loop_bodies,
         callables: callables.clone(),
         may_io,
+        preemption_bodies: own,
+        preemption_loops,
+        preemption_copies,
     }
 }
 
@@ -1113,6 +1127,8 @@ struct DirectBodyEffects {
     panic_span: Option<crate::diagnostics::Span>,
     lock_span: Option<crate::diagnostics::Span>,
     loop_span: Option<crate::diagnostics::Span>,
+    #[serde(default)]
+    preemption_loop: bool,
     may_io: bool,
 }
 
@@ -1137,6 +1153,7 @@ fn scan_direct_effects<N>(
             overflow_checks,
         };
         let mut loop_span = None;
+        let mut preemption_loop = false;
         let mut may_io = false;
         let mut lock_span = None;
         let mut defer_depth = 0;
@@ -1154,6 +1171,7 @@ fn scan_direct_effects<N>(
                     walk.skip_children();
                 }
                 AstEvent::Stmt(stmt) => {
+                    preemption_loop |= matches!(stmt, Stmt::While(_) | Stmt::For(_));
                     hazards.visit_stmt(stmt);
                     match stmt {
                         Stmt::Lock(lock) if lock_span.is_none() => {
@@ -1185,6 +1203,7 @@ fn scan_direct_effects<N>(
             panic_span: hazards.panic_span,
             lock_span,
             loop_span,
+            preemption_loop,
             may_io,
         });
     }

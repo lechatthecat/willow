@@ -452,6 +452,16 @@ pub(crate) fn adt_method_target(ty: &Type, method: &str) -> Option<FunctionId> {
     known.then(|| FunctionId::method(TypeId::local("$adt"), method))
 }
 
+/// Inline combinators have a bounded compiler-owned dispatch; their callback
+/// remains an independent indirect-call obligation (never a pure leaf).
+pub(crate) fn adt_callback(ty: &Type, method: &str) -> bool {
+    match builtin_types::resolve(ty).map(|ty| ty.id) {
+        Some(B::Option) => matches!(method, "map" | "and_then"),
+        Some(B::Result) => matches!(method, "map" | "map_err" | "and_then"),
+        _ => false,
+    }
+}
+
 /// The builtin free functions code generation defines as ordinary
 /// Willow-ABI functions, so they can be used as `fn` values. Every other
 /// builtin is lowered inline at each call site and has no address
@@ -526,6 +536,11 @@ pub(crate) fn builtin_static_effects(
     let owner = owner.as_ref();
     let method = target.name();
     let method = method.as_ref();
+    // Array construction has its own typed lowering, but the same runtime
+    // preemption/effect contract as its allocation ABI entry.
+    if (owner, method) == ("Array", "new") {
+        return Some(symbol_effects("willow_array_new"));
+    }
     if let Some(runtime) = builtin_static_constructor(owner, method) {
         return Some(symbol_effects(runtime));
     }

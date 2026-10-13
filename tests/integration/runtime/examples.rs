@@ -1010,6 +1010,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/diagnostic_collections.wi", "2\nb\n"),
         ("example/diagnostic_workarounds.wi", "9\n6\n2\n4\n7\n"),
         ("example/effect_precision.wi", "3\n1\neffect precision\n1\n"),
+        ("example/preemption_complete.wi", "[41, 42]\n"),
         ("example/effect_witness_precision.wi", "slowly\n1\n2\n"),
         (
             "example/freeze_inference.wi",

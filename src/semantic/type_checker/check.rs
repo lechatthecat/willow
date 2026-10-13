@@ -843,6 +843,13 @@ impl TypeChecker {
             Type::Named(class) | Type::Generic(class, _) => class,
             _ => return Vec::new(),
         };
+        // Default bodies check `self` as opaque Self. Dispatch still belongs
+        // to the current (possibly instantiated) interface, not an unknown type.
+        let class = if class == "Self" && self.local.self_interface.is_some() {
+            self.local.current_class.as_ref().unwrap_or(class)
+        } else {
+            class
+        };
         if let Some(interface) = self.symbols.lookup_interface(class) {
             if interface.methods.contains_key(method) {
                 return vec![FunctionId::method(
@@ -1028,6 +1035,14 @@ impl TypeChecker {
             }
         }
         self.report_task_method_calls();
+        if let Some((queries, unit)) = &self.effect_queries {
+            queries.static_initializers.record_preemption(
+                *unit,
+                program,
+                &effects,
+                &self.indirect_lock,
+            );
+        }
         self.report_transitive_lock_effects(&effects.facts);
         self.report_indirect_lock_effects(&graph, &effects.facts);
     }
@@ -2321,6 +2336,11 @@ impl TypeChecker {
                 let (Type::Named(name) | Type::Generic(name, _)) = ty else {
                     return None;
                 };
+                let name = if name == "Self" && self.local.self_interface.is_some() {
+                    self.local.current_class.as_ref().unwrap_or(name)
+                } else {
+                    name
+                };
                 let owner = self
                     .symbols
                     .lookup_interface(name)
@@ -2352,11 +2372,21 @@ impl TypeChecker {
                 })
                 .map(|_| UnsupportedInitialization::RuntimeCallback)
         } else if targets.is_empty() {
-            Some(if matches!(expr, Expr::Call(_)) {
-                UnsupportedInitialization::IndirectCall
-            } else {
-                UnsupportedInitialization::UnresolvedCall
-            })
+            Some(
+                if let Expr::MethodCall(call) = expr
+                    && self.expr_types.get(&call.object.id()).is_some_and(|ty| {
+                        crate::semantic::intrinsics::adt_callback(ty, &call.method)
+                    })
+                {
+                    UnsupportedInitialization::InlineCallback
+                } else if matches!(expr, Expr::Call(_)) {
+                    UnsupportedInitialization::IndirectCall
+                } else if virtual_call.is_some() {
+                    UnsupportedInitialization::UnresolvedVirtualCall
+                } else {
+                    UnsupportedInitialization::UnresolvedCall
+                },
+            )
         } else {
             None
         };

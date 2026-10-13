@@ -1093,7 +1093,12 @@ fn run_frontend_revision(
             .map(|m| m.id)
             .chain(std::iter::once(module::UnitId::ENTRY))
             .collect();
-        let diagnostics = db.effects.static_initializers.solve(&order, &db.effects);
+        let mut diagnostics = db.effects.static_initializers.check_preemption(
+            &order,
+            &db.effects,
+            db.inputs().target.sync_stack_preemption,
+        );
+        diagnostics.extend(db.effects.static_initializers.solve(&order, &db.effects));
         error_count += diagnostic_error_count(&diagnostics);
         emit_frontend_diagnostics(&diagnostics, map, &graph, &diagnostic_modules, emitter)?;
     }
