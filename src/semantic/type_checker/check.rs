@@ -147,6 +147,11 @@ impl TypeChecker {
     }
 
     fn check_program_items(&mut self, program: &Program) {
+        if self.field_writes.is_none() {
+            self.field_writes = Some(std::rc::Rc::new(
+                crate::semantic::field_writes::FieldWrites::from_program(program),
+            ));
+        }
         self.register_instantiation_types(&program.instantiation_types);
         // Generic declarations are templates and never enter the ordinary
         // signature-registration pass. Index all declarations first so a

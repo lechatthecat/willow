@@ -95,6 +95,10 @@ pub struct ResolutionContext {
     /// Enforce the Send/Sync async checks (E2402-E2405). Compiler entry points
     /// always enable these; direct checker tests can isolate individual rules.
     enforce_send_sync: bool,
+    /// Whole-program instance-field reassignments (willow-jz15.78). The driver
+    /// supplies one summary for every unit; a direct `check_program` derives
+    /// it from its own program.
+    field_writes: Option<std::rc::Rc<crate::semantic::field_writes::FieldWrites>>,
     /// Synchronous helpers that contain or transitively reach a loop, or that
     /// belong to or reach a recursive call cycle, keyed by `Class::method` (and
     /// bare fn names), with the helper's definition span and the reason. Used
@@ -308,6 +312,7 @@ impl TypeChecker {
             imported_std_modules: HashMap::new(),
             imported_blocking_std_functions: HashMap::new(),
             enforce_send_sync: false,
+            field_writes: None,
             nonpreemptible_methods: Default::default(),
             nonpreemptible_module_methods: HashMap::new(),
             effect_index: Default::default(),
@@ -386,6 +391,22 @@ impl TypeChecker {
     /// execution (willow-dgwo.4/.9).
     pub fn set_enforce_send_sync(&mut self, on: bool) {
         self.enforce_send_sync = on;
+    }
+
+    /// Supply the whole-program field-write summary before registering any
+    /// class, so imported and local `FieldInfo`s agree (willow-jz15.78).
+    pub(crate) fn set_field_writes(
+        &mut self,
+        writes: std::rc::Rc<crate::semantic::field_writes::FieldWrites>,
+    ) {
+        self.field_writes = Some(writes);
+    }
+
+    /// Whether an instance field may be written after construction.
+    fn field_reassigned(&self, field: &FieldDecl) -> bool {
+        self.field_writes
+            .as_ref()
+            .is_some_and(|writes| writes.is_reassigned(&field.name, field.span))
     }
 
     /// Seed the non-preemptible methods of imported classes (keyed by receiver
@@ -691,6 +712,7 @@ impl TypeChecker {
                         public: field.public,
                         protected: field.protected,
                         declaration_span: field.span,
+                        reassigned: self.field_reassigned(field),
                     },
                 );
             }
@@ -1824,6 +1846,7 @@ fn imported_class_info_from_decl(
     class: &ClassDecl,
     registered_name: &str,
     qualify: &dyn Fn(&Type) -> Type,
+    reassigned: &dyn Fn(&FieldDecl) -> bool,
 ) -> ClassInfo {
     let qualify_params = |params: &[Param]| -> Vec<ParamInfo> {
         params
@@ -1864,6 +1887,7 @@ fn imported_class_info_from_decl(
                     public: field.public,
                     protected: field.protected,
                     declaration_span: field.span,
+                    reassigned: reassigned(field),
                 },
             );
         }

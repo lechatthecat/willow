@@ -1,0 +1,66 @@
+// sync_field_reassignment.wi — when a class may be shared by tasks
+// (willow-jz15.78).
+//
+// Willow fields have no readonly spelling, so a class is `Sync` (one object
+// may be read by several tasks at once) only when every field is `Sync` AND
+// no field is assigned after construction. Writing a field anywhere outside
+// `init` — in a method, through a binding, or via `&obj.field` — makes the
+// class non-`Sync`, and passing it to an async call is rejected (E2402):
+//
+//   class Counter { pub n: i64; }
+//   async fn bump(c: Counter) { c.n = c.n + 1; }   // E2402 at `bump(c)`:
+//                                                  // field `n` is reassigned
+//
+// The shared-state remedies are an atomic field, a lock field, or a lock
+// around the whole object. All three appear below; each total is exact
+// however the scheduler interleaves the eight tasks.
+
+import std::collections::Array;
+import std::collections::FrozenArray;
+
+// Assigned only in `init`: read-only afterwards, so `Sync`.
+class Config {
+    pub step: i64;
+    pub labels: FrozenArray<String>;
+    pub init(self, step: i64) {
+        self.step = step;
+        self.labels = ["hits", "total", "boxed"].freeze();
+    }
+}
+
+// Shared mutable state lives in atomics and locks; the fields themselves are
+// never reassigned, so `Stats` is `Sync` too.
+class Stats {
+    pub hits: AtomicI64;
+    pub total: Mutex<i64>;
+}
+
+// A plain mutable class: not `Sync`, but `Send`, so `Mutex<Tally>` is `Sync`.
+class Tally {
+    pub n: i64;
+    pub fn add(self, k: i64) { self.n = self.n + k; }
+}
+
+async fn work(cfg: Config, stats: Stats, tally: Mutex<Tally>, rounds: i64) -> i64 {
+    let mut i = 0;
+    while i < rounds {
+        stats.hits.add(1);
+        lock stats.total as mut t { t = t + cfg.step; }
+        lock tally as tl { tl.add(cfg.step); }
+        await sleep(0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+async fn main() {
+    let cfg = new Config(2);
+    let stats = new Stats(AtomicI64::new(0), Mutex::new(0));
+    let tally = Mutex::new(new Tally(0));
+    let tasks: Array<Task<i64>> = [];
+    for i in 0..8 { tasks.push(work(cfg, stats, tally, 100)); }
+    for t in tasks { await t; }
+    println(cfg.labels[0] + " " + stats.hits.load().toString());
+    lock stats.total as t { println(cfg.labels[1] + " " + t.toString()); }
+    lock tally as tl { println(cfg.labels[2] + " " + tl.n.toString()); }
+}

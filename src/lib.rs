@@ -962,6 +962,15 @@ fn run_frontend_revision(
     );
     db.generic_sources = generic_sources;
     db.source_imports_checked = source_imports_checked;
+    db.field_writes = std::rc::Rc::new(
+        artifacts.field_writes(
+            graph
+                .files
+                .iter()
+                .map(|module| &module.program)
+                .chain(std::iter::once(&program)),
+        ),
+    );
     let mut bridge_identity = None;
     for (namespace, program) in std::iter::once((String::new(), &program)).chain(
         graph
@@ -1193,6 +1202,7 @@ fn typecheck_phase_with_generics(
     }
     if let Some(db) = queries {
         checker.source_imports_checked = db.source_imports_checked;
+        checker.set_field_writes(std::rc::Rc::clone(&db.field_writes));
         checker = checker.with_sync_stack_preemption(db.inputs().target.sync_stack_preemption);
         checker.set_effect_queries(std::rc::Rc::clone(&db.effects), module::UnitId::ENTRY);
         checker.set_body_queries(std::rc::Rc::clone(&db.typed_bodies));
@@ -1280,6 +1290,7 @@ fn check_module(
     let mut checker = semantic::TypeChecker::new()
         .with_sync_stack_preemption(db.inputs().target.sync_stack_preemption);
     checker.source_imports_checked = db.source_imports_checked;
+    checker.set_field_writes(std::rc::Rc::clone(&db.field_writes));
     checker.set_effect_queries(std::rc::Rc::clone(&db.effects), module.id);
     checker.set_body_queries(std::rc::Rc::clone(&db.typed_bodies));
     checker.set_declaration_queries(std::rc::Rc::clone(&db.declarations), module.id);

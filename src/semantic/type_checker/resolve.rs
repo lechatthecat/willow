@@ -143,6 +143,8 @@ impl TypeChecker {
                     public: true,
                     protected: false,
                     declaration_span: Span::dummy(),
+                    // `PanicInfo` fields are read-only (E1701).
+                    reassigned: false,
                 },
             );
         }
@@ -783,7 +785,9 @@ impl TypeChecker {
                         self.generics.class_paths.insert(key, name.to_string());
                     }
                     let class_name = format!("{name}::{}", c.name);
-                    let info = imported_class_info_from_decl(c, &class_name, &qualify);
+                    let info = imported_class_info_from_decl(c, &class_name, &qualify, &|field| {
+                        self.field_reassigned(field)
+                    });
                     self.symbols.define_class(class_name, info);
                 }
                 Item::Enum(e) => {

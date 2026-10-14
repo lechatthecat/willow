@@ -18,7 +18,8 @@
 //! - `RwLock<T>`: Send + Sync iff T: Send + Sync
 //! - `Channel<T>`: Send + Sync iff T: Send
 //! - `Task<T>`/`JoinHandle<T>`: Send iff T: Send; not Sync
-//! - class: Send iff all fields Send; Sync iff all fields Sync
+//! - class: Send iff all fields Send; Sync iff all fields Sync and no field is
+//!   reassigned after construction (willow-jz15.78, see `field_writes`)
 //! - interface: Send iff it `extends Send` or `extends Sync`; Sync iff it
 //!   `extends Sync`
 //! - plain function pointers: Send + Sync (no environment)
@@ -31,6 +32,8 @@ use crate::parser::ast::*;
 use crate::semantic::symbols::ParamInfo;
 
 use super::*;
+
+const REASSIGNED_FIELD_HELP: &str = "assign the field only in `init`, use an atomic (`AtomicI64`/`AtomicBool`) field, or share the object through `Mutex<T>`";
 
 const ASYNC_CAPTURE_SHARING_NOTE: &str = "async calls share reference arguments with another task, even when immediately awaited; suspending the caller does not prove exclusive access to the referenced value";
 
@@ -106,7 +109,7 @@ impl TypeChecker {
                 );
                 continue;
             }
-            let (note, help) = self.marker_failure(
+            let (note, help, reassigned) = self.marker_failure_with_field(
                 ty,
                 if marker == "Send" {
                     Marker::Send
@@ -114,22 +117,31 @@ impl TypeChecker {
                     Marker::Sync
                 },
             );
+            let mut diagnostic = Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E2402,
+                format!(
+                    "cannot pass `{}` to an async call: it is not `{marker}`",
+                    type_name(ty)
+                ),
+            )
+            .with_label(Label::primary(
+                arg.expr.span(),
+                format!("`{}` crosses a task boundary here", type_name(ty)),
+            ));
+            // Labels render against one source; a field declared in another
+            // module is named by the note instead.
+            if let Some(field) = reassigned.filter(|f| f.file_id == arg.expr.span().file_id) {
+                diagnostic = diagnostic.with_label(Label::secondary(
+                    field,
+                    "this field is reassigned after construction",
+                ));
+            }
             self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E2402,
-                    format!(
-                        "cannot pass `{}` to an async call: it is not `{marker}`",
-                        type_name(ty)
-                    ),
-                )
-                .with_label(Label::primary(
-                    arg.expr.span(),
-                    format!("`{}` crosses a task boundary here", type_name(ty)),
-                ))
-                .with_note(note)
-                .with_note(ASYNC_CAPTURE_SHARING_NOTE)
-                .with_help(help),
+                diagnostic
+                    .with_note(note)
+                    .with_note(ASYNC_CAPTURE_SHARING_NOTE)
+                    .with_help(help),
             );
         }
     }
@@ -326,12 +338,23 @@ impl TypeChecker {
     }
 
     fn marker_failure(&self, ty: &Type, marker: Marker) -> (String, &'static str) {
+        let (note, help, _) = self.marker_failure_with_field(ty, marker);
+        (note, help)
+    }
+
+    /// [`Self::marker_failure`] plus the reassigned field that caused it, if any.
+    fn marker_failure_with_field(
+        &self,
+        ty: &Type,
+        marker: Marker,
+    ) -> (String, &'static str, Option<Span>) {
         let mut reasons = Some(MarkerFailure::default());
         self.marker_holds_with_reason(ty, marker, &mut MarkerWalk::default(), &mut reasons);
         let mut failure = reasons.unwrap();
         failure.notes.reverse();
         (failure.notes.join(" -> "), failure.help.unwrap_or(
-            "ensure the failing value satisfies the required Send/Sync contract before crossing a task boundary"))
+            "ensure the failing value satisfies the required Send/Sync contract before crossing a task boundary"),
+            failure.reassigned_field)
     }
 
     fn marker_holds_with_reason(
@@ -505,6 +528,22 @@ impl TypeChecker {
             base_ok
                 && class.instance_field_order.iter().all(|(name, _)| {
                     let f = &class.fields[name];
+                    // A field written after construction races when the
+                    // object is shared, whatever the field's type
+                    // (willow-jz15.78). Moving the object (Send) is fine.
+                    if f.reassigned && matches!(marker, Marker::Sync) {
+                        if let Some(reasons) = reasons {
+                            reasons.field_span.get_or_insert(f.declaration_span);
+                            reasons.reassigned_field.get_or_insert(f.declaration_span);
+                            reasons.notes.push(format!(
+                                "field `{name}: {}` is reassigned after construction, so tasks sharing a `{}` would race on it",
+                                type_name(&f.ty),
+                                class.name
+                            ));
+                            reasons.help = Some(REASSIGNED_FIELD_HELP);
+                        }
+                        return false;
+                    }
                     let ok = self.marker_holds_with_reason(&f.ty, marker, visiting, reasons);
                     if !ok && let Some(reasons) = reasons {
                         reasons.field_span.get_or_insert(f.declaration_span);
@@ -554,6 +593,8 @@ impl TypeChecker {
 #[derive(Default)]
 struct MarkerFailure {
     field_span: Option<Span>,
+    /// The field whose post-construction writes break `Sync`.
+    reassigned_field: Option<Span>,
     notes: Vec<String>,
     help: Option<&'static str>,
 }

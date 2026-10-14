@@ -3,7 +3,7 @@
 //! Desugaring can therefore compose default signatures without retaining their
 //! bodies; a copied default shell refers to the same immutable body artifact.
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -15,6 +15,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::diagnostics::FileId;
 use crate::parser::ast::{Block, BodyId, Expr, Item, Program};
+use crate::semantic::field_writes::{BodyRef, FieldWrites, RawFieldWrite, WriteContext};
 
 #[cfg(test)]
 #[path = "artifact_property_tests.rs"]
@@ -72,6 +73,9 @@ pub(crate) struct UnitArtifacts {
     metrics: Rc<RefCell<UnitMetrics>>,
     blocks: HashMap<BodyId, usize>,
     initializers: HashMap<crate::parser::ast::BodyId, usize>,
+    /// Field writes of each offloaded body or initializer, recorded while its
+    /// syntax is still resident (willow-jz15.78).
+    field_writes: HashMap<BodyId, HashSet<RawFieldWrite>>,
     sources: HashMap<FileId, usize>,
     pub(crate) bodies: Rc<crate::compiler_db::ids::BodyIndex>,
     pub(crate) revision_enabled: bool,
@@ -353,6 +357,7 @@ impl UnitArtifacts {
                         metrics: Rc::default(),
                         blocks: HashMap::new(),
                         initializers: HashMap::new(),
+                        field_writes: HashMap::new(),
                         sources: HashMap::new(),
                         bodies: Default::default(),
                         revision_enabled: false,
@@ -488,10 +493,12 @@ impl UnitArtifacts {
         self.read(*self.sources.get(&id).context("missing source snapshot")?)
     }
 
-    fn offload_block(&mut self, block: &mut Block) -> Result<()> {
+    fn offload_block(&mut self, block: &mut Block, context: WriteContext<'_>) -> Result<()> {
         if !self.blocks.contains_key(&block.id) {
             let id = self.write(block)?;
             self.blocks.insert(block.id, id);
+            self.field_writes
+                .insert(block.id, BodyRef::Block(block).collect(context));
         }
         block.stmts = Vec::new();
         Ok(())
@@ -504,13 +511,18 @@ impl UnitArtifacts {
         self.body_index_mut().register_program(program);
         for item in &mut program.items {
             match item {
-                Item::Function(function) => self.offload_block(&mut function.body)?,
+                Item::Function(function) => {
+                    self.offload_block(&mut function.body, WriteContext::Free)?
+                }
                 Item::Class(class) => {
                     for method in &mut class.methods {
-                        self.offload_block(&mut method.body)?;
+                        self.offload_block(&mut method.body, WriteContext::Method(&class.name))?;
                     }
                     for constructor in &mut class.constructors {
-                        self.offload_block(&mut constructor.body)?;
+                        self.offload_block(
+                            &mut constructor.body,
+                            WriteContext::Constructor(&class.name),
+                        )?;
                     }
                     for field in &mut class.fields {
                         if let Some(expr) = &mut field.initializer {
@@ -521,6 +533,10 @@ impl UnitArtifacts {
                             if !self.initializers.contains_key(&id) {
                                 let artifact = self.write(expr)?;
                                 self.initializers.insert(id, artifact);
+                                self.field_writes.insert(
+                                    id,
+                                    BodyRef::Initializer(expr).collect(WriteContext::Free),
+                                );
                             }
                             *expr = Expr::Bool(false, expr.span(), expr.id());
                         }
@@ -529,7 +545,7 @@ impl UnitArtifacts {
                 Item::Interface(interface) => {
                     for method in &mut interface.methods {
                         if let Some(body) = &mut method.default_body {
-                            self.offload_block(body)?;
+                            self.offload_block(body, WriteContext::Free)?;
                         }
                     }
                 }
@@ -537,6 +553,36 @@ impl UnitArtifacts {
             }
         }
         Ok(())
+    }
+
+    /// Whole-program field-write summary of the live unit shells. Each body's
+    /// writes were recorded once when it was offloaded, so this reads no body
+    /// artifact. A body that was never offloaded is still resident and is
+    /// walked directly.
+    pub(crate) fn field_writes<'a>(
+        &self,
+        programs: impl IntoIterator<Item = &'a Program> + Clone,
+    ) -> FieldWrites {
+        let mut writes: Vec<&RawFieldWrite> = Vec::new();
+        let mut resident = HashSet::new();
+        for program in programs.clone() {
+            crate::semantic::field_writes::for_each_body(program, |body, context| {
+                let key = match &body {
+                    BodyRef::Block(block) => Some(self.bodies.source_body(block.id)),
+                    BodyRef::Initializer(expr) => self.bodies.initializer_body(expr.id()),
+                };
+                match key.and_then(|key| self.field_writes.get(&key)) {
+                    Some(recorded) => writes.extend(recorded),
+                    None => resident.extend(body.collect(context)),
+                }
+            });
+        }
+        FieldWrites::resolve(
+            programs
+                .into_iter()
+                .flat_map(crate::semantic::field_writes::classes),
+            writes.into_iter().chain(&resident),
+        )
     }
 
     pub(crate) fn hydrate(&self, summary: &Program, file: FileId) -> Result<LiveUnit<Program>> {

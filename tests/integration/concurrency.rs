@@ -231,6 +231,8 @@ mod channel_suspension;
 mod channel_waiters;
 #[path = "concurrency/completion_diagnostics.rs"]
 mod completion_diagnostics;
+#[path = "concurrency/field_reassignment_sync.rs"]
+mod field_reassignment_sync;
 #[path = "concurrency/frame_reclaim.rs"]
 mod frame_reclaim;
 #[path = "concurrency/frozen_collections.rs"]

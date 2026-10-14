@@ -166,6 +166,11 @@ pub struct FieldInfo {
     pub public: bool,
     pub protected: bool,
     pub declaration_span: Span,
+    /// Written somewhere after construction (willow-jz15.78). Part of the
+    /// declaration value, so a new write elsewhere invalidates reused bodies
+    /// whose Send/Sync verdicts read this class.
+    #[serde(default)]
+    pub reassigned: bool,
 }
 
 /// An `init(...)` constructor's resolved signature (willow-scq2). MVP allows at

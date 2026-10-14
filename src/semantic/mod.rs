@@ -3,6 +3,7 @@ pub mod builtin_types;
 pub mod call_graph;
 pub mod concurrency;
 pub mod effects;
+pub mod field_writes;
 pub mod ids;
 pub mod intrinsics;
 pub mod method_slots;

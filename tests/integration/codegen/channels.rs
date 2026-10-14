@@ -479,11 +479,18 @@ import std::collections::Array;
 class Box {
     pub v: i64;
     pub fn get(self) -> i64 { return self.v; }
-    pub fn add(self, n: i64) { self.v = self.v + n; }
-    pub fn set(self, n: i64) { self.v = n; }
     pub fn copy(self) -> Box { return new Box(self.v); }
     pub static fn new(v: i64) -> Box { return new Box(v); }
 }
+// Shared objects are never written after construction (Sync, willow-jz15.78);
+// mutable state crosses tasks only inside a Mutex.
+class Acc {
+    pub total: i64;
+    pub fn add(self, n: i64) { self.total = self.total + n; }
+    pub fn set(self, n: i64) { self.total = n; }
+}
+class Note { pub body: String; }
+class Slot { pub item: Option<Box>; }
 class Holder { pub text: String; pub child: Option<Box>; }
 class Pair { pub left: Box; pub right: Box; }
 class FlagBox { pub ok: bool; }
@@ -497,14 +504,14 @@ class Dog extends Animal { pub bonus: i64; pub override fn score(self) -> i64 { 
 
 async fn read_value(b: Box) -> i64 { await sleep(1); return b.v; }
 async fn read_method(b: Box) -> i64 { await sleep(1); return b.get(); }
-async fn add_after(b: Box, n: i64) -> i64 { await sleep(1); b.add(n); return b.v; }
-async fn set_after(b: Box, n: i64) -> i64 { await sleep(1); b.set(n); return b.v; }
+async fn add_after(b: Mutex<Acc>, n: i64) -> i64 { await sleep(1); lock b as acc { acc.add(n); return acc.total; } }
+async fn set_after(b: Mutex<Acc>, n: i64) -> i64 { await sleep(1); lock b as acc { acc.set(n); return acc.total; } }
 async fn make_box(v: i64) -> Box { await sleep(1); return new Box(v); }
 async fn same_box(b: Box) -> Box { await sleep(1); return b; }
 async fn copy_after(b: Box) -> Box { await sleep(1); return b.copy(); }
 async fn plus_i64(a: i64, b: i64) -> i64 { await sleep(1); return a + b; }
 async fn holder_text(h: Holder) -> String { await sleep(1); return h.text; }
-async fn update_holder(h: Holder, suffix: String) -> String { await sleep(1); h.text = h.text + suffix; return h.text; }
+async fn update_note(note: Mutex<Note>, suffix: String) -> String { await sleep(1); lock note as n { n.body = n.body + suffix; return n.body; } }
 async fn child_value(h: Holder) -> i64 { await sleep(1); return match h.child { Some(child) => child.v, None => 0 }; }
 async fn pair_sum(p: Pair) -> i64 { await sleep(1); return p.left.v + p.right.v; }
 async fn array_sum(a: Box, b: Box, c: Box) -> i64 { let xs: Array<Box> = [a, b, c]; let mut total = 0; for x in xs { await sleep(1); total = total + x.v; } return total; }
@@ -544,22 +551,25 @@ async fn main() {
 async fn part1() {
     println(await read_value(new Box(1)));
     println(await read_method(new Box(2)));
-    let b3 = new Box(3);
+    let b3 = Mutex::new(new Acc(3));
     println(await add_after(b3, 1));
-    println(b3.v);
+    lock b3 as acc { println(acc.total); }
     let b5 = await make_box(5);
     println(b5.v);
     let b6 = await same_box(b5);
     println(b6.v);
     let alias = b3;
     println(await add_after(alias, 3));
-    println(b3.v);
+    lock b3 as acc { println(acc.total); }
     println(await set_after(b3, 9));
-    println(b3.v);
-    let h = new Holder("a", Some(b3));
+    let mut snapshot = 0;
+    lock b3 as acc { snapshot = acc.total; }
+    println(snapshot);
+    let h = new Holder("a", Some(new Box(snapshot)));
     println(await holder_text(h));
-    println(await update_holder(h, "b"));
-    println(h.text);
+    let note = Mutex::new(new Note("a"));
+    println(await update_note(note, "b"));
+    lock note as n { println(n.body); }
     println(await child_value(h));
     let empty = new Holder("empty", None);
     println(await child_value(empty));
@@ -611,12 +621,13 @@ async fn part3() {
     println(copied.v);
     let b38 = await make_from_static(38);
     println(b38.get());
-    let h39 = new Holder("h", None);
-    h39.child = Some(await make_box(39));
+    let slot = new Slot(None);
+    slot.item = Some(await make_box(39));
+    let h39 = new Holder("h", slot.item);
     println(await child_value(h39));
-    let b40 = new Box(0);
-    b40.v = await plus_i64(20, 20);
-    println(b40.v);
+    let b40 = new Acc(0);
+    b40.total = await plus_i64(20, 20);
+    println(b40.total);
     println(await flag_value(new FlagBox(true)));
     println(await float_half(new FloatBox(84.0)));
     println(await array_sum_gc(new Box(20), new Box(23)));
