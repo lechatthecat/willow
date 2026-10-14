@@ -40,35 +40,34 @@ AI agents can query compiler-resolved program structure directly instead of reco
 
 ## Performance snapshot
 
-Runtime microbenchmarks measured on 2026-10-10 on an AMD Ryzen 7 7800X3D host (Willow commit `578b16f`, clean working tree).
+Runtime microbenchmarks measured on 2026-10-14 on an AMD Ryzen 7 7800X3D host (Willow commit `f918069`, clean working tree).
 Values are wall-time medians in milliseconds across 5 trials; lower is better. The fastest result in each row is bold.
 Willow used 8 workers. Comparison runtimes were Go 1.27.0 and OpenJDK 26.0.2 using virtual threads.
 
 | Case | Willow (ms) | Go (ms) | Java (ms) |
 | --- | ---: | ---: | ---: |
-| idle_spawn | **77.786** | 113.369 | 88.782 |
-| wake_fanout | 145.554 | **13.122** | 184.807 |
-| yield_switch | 968.008 | 1507.208 | **567.020** |
-| ping_pong | 1585.254 | **166.887** | 838.658 |
-| gc_scheduler | 672.301 | **137.182** | 147.349 |
-| channel_select_fan_in | 2334.562 | **241.098** | 544.313 |
-| spawn_join_tree | 169.744 | **17.401** | 104.035 |
-| general_pow | 719.857 | 628.464 | **206.669** |
-| leibniz_reduced | **111.384** | 114.248 | 271.756 |
-| fibonacci | 242.333 | 390.820 | **228.183** |
-| array_sum | 66.493 | **52.286** | 87.602 |
-| linked_list | 339.943 | **29.670** | 46.332 |
-| array_build_only | 54.534 | **42.808** | 56.720 |
-| array_read_sum_only | 3.146 | **1.346** | 4.731 |
-| array_write_only | 4.807 | **3.161** | 7.097 |
-| array_grow_only | 28.196 | **12.385** | 29.737 |
-| object_churn | 170.887 | **55.450** | 71.699 |
-| map_lookup_insert | 132.431 | **88.026** | 208.081 |
-| virtual_dispatch | 55.577 | **34.684** | 58.267 |
+| idle_spawn | **66.816** | 116.184 | 92.215 |
+| wake_fanout | 110.744 | **12.841** | 186.666 |
+| yield_switch | 631.070 | 1,468.180 | **540.615** |
+| ping_pong | 707.318 | **163.457** | 800.639 |
+| gc_scheduler | 167.225 | **135.641** | 137.663 |
+| channel_select_fan_in | 987.712 | **235.387** | 533.961 |
+| spawn_join_tree | 146.586 | **17.212** | 99.525 |
+| general_pow | 610.789 | 623.083 | **206.046** |
+| fibonacci | 804.205 | 388.658 | **230.731** |
+| array_sum | 65.634 | **50.003** | 86.632 |
+| linked_list | 402.169 | **25.426** | 46.849 |
+| object_churn | 194.742 | **56.194** | 71.798 |
+| map_lookup_insert | 162.207 | **89.785** | 197.123 |
+| virtual_dispatch | 180.149 | **41.047** | 58.262 |
+| closure_call | 180.630 | 25.920 | **16.615** |
+| string_build | 115.624 | **80.296** | 85.934 |
 
-Scheduler cases time marked phases; `*_only` synchronous cases also time marked phases. Other synchronous cases time the whole process, including JVM startup and JIT warm-up.
+For `idle_spawn` with 100,000 parked tasks, RSS after parking was 76.57 MiB for Willow (765 B/task), 264.07 MiB for Go (2,741 B/task), and 172.04 MiB for Java (1,343 B/task).
+
+Scheduler cases time marked phases. Other synchronous cases time the whole process, including JVM startup and JIT warm-up.
 The Java `channel_select_fan_in` case uses one shared queue. CPU affinity/frequency were not pinned and background services were active.
-The nominal `leibniz_reduced` lead over Go is within observed session-to-session variation and should not be treated as a confirmed speed advantage.
+The current Willow results for `fibonacci` and `virtual_dispatch` include confirmed performance regressions tracked in `willow-gq96`; they are shown here rather than excluded.
 These are machine-local microbenchmark results, not general language rankings; workload and runtime behavior vary substantially by case.
 
 ---
