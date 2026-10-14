@@ -772,8 +772,11 @@ fn stress_region_10_runtime_root_slots_relocate_bounded_lifetimes() {
         }
         let live = live_batches.len() * CHUNKS_PER_WAVE * SURVIVOR_SIZE;
         let reserved = reserved_managed_bytes();
+        // Concurrent sweep quarantines reclaimed old spans until the next mark
+        // epoch, so promotion between collections may open one more region
+        // while the swept one waits. The bound stays constant across waves.
         assert!(
-            reserved <= compact_reserved_bound(live),
+            reserved <= compact_reserved_bound(live) + GC_OLD_REGION_SIZE,
             "wave {wave}: reserved {reserved} bytes for {live} live bytes"
         );
         assert_global_regions_valid();
