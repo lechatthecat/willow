@@ -1648,9 +1648,12 @@ mod tests {
     #[test]
     fn revision_reuse_scales_with_body_count_and_lambda_depth() {
         // Exercise query-backed nested lambdas below every CI target's default
-        // test stack. Increasing depth must not nest synchronous query drivers.
+        // test stack. Increasing depth must not nest synchronous query drivers
+        // or dependency validation: per-level native growth would exceed this
+        // bound well before the deepest case, while the fixed debug-build
+        // baseline stays far below it on every target.
         std::thread::Builder::new()
-            .stack_size(512 * 1024)
+            .stack_size(1024 * 1024)
             .spawn(|| {
                 for n in [16, 64, 256] {
                     let f = Fixture::new();
@@ -1676,11 +1679,11 @@ mod tests {
                         warm.reused_bodies, warm.retained_artifact_bytes
                     );
                 }
-                for depth in [4, 16, 64] {
+                for depth in [4, 16, 64, 256] {
                     let f = Fixture::new();
                     let mut body = "return x;".to_owned();
                     for i in (0..depth).rev() {
-                        body = format!("let f{i} = |x: i64| {{ {body} }}; return f{i}(x);");
+                        body = format!("let l{i} = |x: i64| {{ {body} }}; return l{i}(x);");
                     }
                     f.write(
                         "main.wi",

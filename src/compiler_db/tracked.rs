@@ -635,6 +635,88 @@ impl TrackedQueryTable {
         memo.result.map_err(|error| anyhow::anyhow!("{error}"))
     }
     fn validate(&self, provider: &impl QueryProvider, node: &QueryNode) -> Result<Memo> {
+        // Dependency validation walks an explicit stack: nested bodies form
+        // long dependency chains, and native recursion would make the stack
+        // grow with source nesting. Only recomputation re-enters the provider.
+        let mut frames = match self.begin(provider, node)? {
+            Begin::Done(memo) => return Ok(memo),
+            Begin::Frame(frame) => vec![frame],
+        };
+        let result = self.drive(provider, &mut frames);
+        // Guards must unwind innermost first, like the native call chain.
+        while frames.pop().is_some() {}
+        result
+    }
+    fn drive<'a>(
+        &'a self,
+        provider: &impl QueryProvider,
+        frames: &mut Vec<Frame<'a>>,
+    ) -> Result<Memo> {
+        let mut child: Option<Memo> = None;
+        loop {
+            let Frame {
+                previous,
+                next,
+                durability,
+                shortcut,
+                ..
+            } = frames.last_mut().unwrap();
+            let old = previous.as_ref().unwrap();
+            // Select an empty slice before iterating: filtering every edge would
+            // still scan the entire dependency array on a durability shortcut.
+            let dependencies = if *shortcut {
+                &[][..]
+            } else {
+                &old.dependencies[..]
+            };
+            let mut green = true;
+            if let Some(memo) = child.take() {
+                *durability = (*durability).min(memo.durability);
+                green = memo.changed_at == dependencies[*next].observed_changed_at;
+                *next += 1;
+            }
+            let mut descend = None;
+            while green && *next < dependencies.len() {
+                let dependency = &dependencies[*next];
+                self.bump(|s| s.dependency_edges_visited += 1);
+                let changed_at = match &dependency.node {
+                    DependencyNode::Input(input) => self.inputs.get(input).map(|v| {
+                        *durability = (*durability).min(v.durability);
+                        v.changed_at
+                    }),
+                    DependencyNode::Query(query) => match self.begin(provider, query)? {
+                        Begin::Done(memo) => {
+                            *durability = (*durability).min(memo.durability);
+                            Some(memo.changed_at)
+                        }
+                        Begin::Frame(frame) => {
+                            descend = Some(frame);
+                            break;
+                        }
+                    },
+                };
+                green = changed_at == Some(dependency.observed_changed_at);
+                *next += 1;
+            }
+            if let Some(frame) = descend {
+                frames.push(frame);
+                continue;
+            }
+            let frame = frames.pop().unwrap();
+            let memo = if green {
+                self.publish_green(frame)
+            } else {
+                self.recompute(provider, frame)?
+            };
+            if frames.is_empty() {
+                return Ok(memo);
+            }
+            child = Some(memo);
+        }
+    }
+    /// Enter one query: return a current memo, or a frame whose previous
+    /// dependencies still need validation. A query without a memo computes.
+    fn begin<'a>(&'a self, provider: &impl QueryProvider, node: &QueryNode) -> Result<Begin<'a>> {
         self.assert_active_owner();
         self.check_cycle()?;
         if let QueryNode::TypedBody(body) | QueryNode::LirBody(body) = node {
@@ -666,7 +748,7 @@ impl TrackedQueryTable {
                     "invalid revision in {node:?}"
                 );
                 if memo.verified_at == self.revision {
-                    return Ok(memo.clone());
+                    return Ok(Begin::Done(memo.clone()));
                 }
                 Some(memo.clone())
             }
@@ -685,103 +767,80 @@ impl TrackedQueryTable {
             recording: false,
         });
         ACTIVE.with(|n| n.set((n.get().0 + 1, self)));
-        struct Guard<'a> {
-            table: &'a TrackedQueryTable,
-            node: QueryNode,
-            depth: usize,
-            previous: Option<Memo>,
-        }
-        impl Drop for Guard<'_> {
-            fn drop(&mut self) {
-                let mut stack = self.table.stack.borrow_mut();
-                debug_assert_eq!(stack.len(), self.depth + 1, "eval-stack leak");
-                debug_assert_eq!(stack.last().map(|f| &f.node), Some(&self.node));
-                stack.pop();
-                let deferred = self.table.deferred.get();
-                if self.depth == 0 {
-                    self.table.deferred.set(false);
-                    self.table.cycle_error.borrow_mut().take();
-                }
-                ACTIVE.with(|n| {
-                    let (depth, owner) = n.get();
-                    n.set((depth - 1, if depth == 1 { std::ptr::null() } else { owner }));
-                });
-                let mut states = self.table.states.borrow_mut();
-                if matches!(states.get(&self.node), Some(State::Computing { .. })) {
-                    if let Some(previous) = self.previous.take().filter(|_| deferred) {
-                        states.insert(self.node.clone(), State::Ready(previous));
-                    } else {
-                        states.remove(&self.node);
-                    }
-                }
-            }
-        }
-        let _guard = Guard {
+        let guard = Guard {
             table: self,
             node: node.clone(),
             depth,
             previous: previous.clone(),
         };
-        if let Some(old) = &previous {
-            self.bump(|s| s.validated += 1);
-            crate::query_stats::tracked_event(node, "validate", self.revision.0);
-            let shortcut = self.last_changed[old.durability as usize] <= old.verified_at;
-            let mut green = true;
-            let mut durability = if shortcut {
-                old.durability
-            } else {
-                Durability::High
-            };
-            // Select an empty slice before iterating: filtering every edge would
-            // still scan the entire dependency array on a durability shortcut.
-            let dependencies = if shortcut {
-                &[][..]
-            } else {
-                &old.dependencies[..]
-            };
-            for dependency in dependencies {
-                self.bump(|s| s.dependency_edges_visited += 1);
-                let changed_at = match &dependency.node {
-                    DependencyNode::Input(input) => self.inputs.get(input).map(|v| {
-                        durability = durability.min(v.durability);
-                        v.changed_at
-                    }),
-                    DependencyNode::Query(query) => {
-                        let dependency = self.validate(provider, query)?;
-                        durability = durability.min(dependency.durability);
-                        Some(dependency.changed_at)
-                    }
-                };
-                if changed_at != Some(dependency.observed_changed_at) {
-                    green = false;
-                    break;
-                }
-            }
-            if green {
-                self.bump(|s| {
-                    s.green_validations += 1;
-                    s.durability_shortcuts += usize::from(shortcut);
-                });
-                crate::query_stats::tracked_event(
-                    node,
-                    if shortcut {
-                        "durability-green"
-                    } else {
-                        "green"
+        let Some(old) = &previous else {
+            return self
+                .recompute(
+                    provider,
+                    Frame {
+                        guard,
+                        previous,
+                        next: 0,
+                        durability: Durability::High,
+                        shortcut: false,
                     },
-                    self.revision.0,
-                );
-                let mut memo = old.clone();
-                memo.verified_at = self.revision;
-                // Semantic backdating does not backdate durability. A child
-                // can return the same value while gaining a less stable input.
-                memo.durability = durability;
-                self.states
-                    .borrow_mut()
-                    .insert(node.clone(), State::Ready(memo.clone()));
-                return Ok(memo);
-            }
-        }
+                )
+                .map(Begin::Done);
+        };
+        self.bump(|s| s.validated += 1);
+        crate::query_stats::tracked_event(node, "validate", self.revision.0);
+        let shortcut = self.last_changed[old.durability as usize] <= old.verified_at;
+        let durability = if shortcut {
+            old.durability
+        } else {
+            Durability::High
+        };
+        Ok(Begin::Frame(Frame {
+            guard,
+            previous,
+            next: 0,
+            durability,
+            shortcut,
+        }))
+    }
+    fn publish_green(&self, frame: Frame<'_>) -> Memo {
+        let Frame {
+            guard,
+            previous,
+            durability,
+            shortcut,
+            ..
+        } = frame;
+        let node = &guard.node;
+        let old = previous.unwrap();
+        self.bump(|s| {
+            s.green_validations += 1;
+            s.durability_shortcuts += usize::from(shortcut);
+        });
+        crate::query_stats::tracked_event(
+            node,
+            if shortcut {
+                "durability-green"
+            } else {
+                "green"
+            },
+            self.revision.0,
+        );
+        let mut memo = old;
+        memo.verified_at = self.revision;
+        // Semantic backdating does not backdate durability. A child
+        // can return the same value while gaining a less stable input.
+        memo.durability = durability;
+        self.states
+            .borrow_mut()
+            .insert(node.clone(), State::Ready(memo.clone()));
+        memo
+    }
+    fn recompute(&self, provider: &impl QueryProvider, frame: Frame<'_>) -> Result<Memo> {
+        let Frame {
+            guard, previous, ..
+        } = frame;
+        let node = &guard.node;
         self.stack.borrow_mut().last_mut().unwrap().recording = true;
         crate::query_stats::tracked_event(node, "recompute", self.revision.0);
         let result = provider.compute(self, node);
@@ -877,6 +936,51 @@ impl TrackedQueryTable {
             "cross-database read would lose a dependency at {:?}",
             self.revision
         );
+    }
+}
+
+/// A query whose previous dependencies are being validated.
+struct Frame<'a> {
+    guard: Guard<'a>,
+    previous: Option<Memo>,
+    next: usize,
+    durability: Durability,
+    shortcut: bool,
+}
+enum Begin<'a> {
+    Done(Memo),
+    Frame(Frame<'a>),
+}
+/// Restores one query's evaluation state when its validation step ends.
+struct Guard<'a> {
+    table: &'a TrackedQueryTable,
+    node: QueryNode,
+    depth: usize,
+    previous: Option<Memo>,
+}
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {
+        let mut stack = self.table.stack.borrow_mut();
+        debug_assert_eq!(stack.len(), self.depth + 1, "eval-stack leak");
+        debug_assert_eq!(stack.last().map(|f| &f.node), Some(&self.node));
+        stack.pop();
+        let deferred = self.table.deferred.get();
+        if self.depth == 0 {
+            self.table.deferred.set(false);
+            self.table.cycle_error.borrow_mut().take();
+        }
+        ACTIVE.with(|n| {
+            let (depth, owner) = n.get();
+            n.set((depth - 1, if depth == 1 { std::ptr::null() } else { owner }));
+        });
+        let mut states = self.table.states.borrow_mut();
+        if matches!(states.get(&self.node), Some(State::Computing { .. })) {
+            if let Some(previous) = self.previous.take().filter(|_| deferred) {
+                states.insert(self.node.clone(), State::Ready(previous));
+            } else {
+                states.remove(&self.node);
+            }
+        }
     }
 }
 
