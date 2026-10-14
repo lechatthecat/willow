@@ -390,12 +390,15 @@ pub(super) fn aggregate(
             locations.dedup();
         }
     }
+    let operation_spelling = |operation: &mut String| {
+        if let Some((prefix @ ("call" | "static" | "method"), name)) = operation.split_once(':') {
+            *operation = format!("{prefix}:{}", source_spelling(name));
+        }
+    };
     for e in &mut semantic.expressions {
         remap(&mut e.function);
-        if let Some(operation) = &mut e.operation
-            && let Some((prefix @ ("call" | "static" | "method"), name)) = operation.split_once(':')
-        {
-            *operation = format!("{prefix}:{}", source_spelling(name));
+        if let Some(operation) = &mut e.operation {
+            operation_spelling(operation);
         }
         if let Some(target) = &mut e.target {
             remap(target);
@@ -410,6 +413,25 @@ pub(super) fn aggregate(
         *effects.entry(id).or_default() |= bits;
     }
     semantic.compiler_effects = effects;
+    // Every instantiation reports the same source call sites; key them by the
+    // merged source function and keep one entry per site.
+    let mut unresolved = BTreeMap::<String, Vec<semantic::UnresolvedCall>>::new();
+    for (mut id, calls) in std::mem::take(&mut semantic.unresolved_calls) {
+        remap(&mut id);
+        unresolved.entry(id).or_default().extend(calls);
+    }
+    for calls in unresolved.values_mut() {
+        for call in calls.iter_mut() {
+            operation_spelling(&mut call.operation);
+        }
+        fn key(c: &semantic::UnresolvedCall) -> (&str, usize, usize, &str) {
+            let l = &c.location;
+            (&l.path, l.start, l.end, &c.operation)
+        }
+        calls.sort_by(|a, b| key(a).cmp(&key(b)));
+        calls.dedup_by(|a, b| key(a) == key(b));
+    }
+    semantic.unresolved_calls = unresolved;
     let mut witnesses = BTreeMap::<String, Vec<serde_json::Value>>::new();
     for (mut id, mut values) in std::mem::take(&mut semantic.witnesses) {
         remap(&mut id);
@@ -682,6 +704,69 @@ mod tests {
                 "unused_bodies={n} references={} sweep_visits={visits} caller_edges={n}",
                 references.len()
             );
+        }
+    }
+    #[test]
+    fn unresolved_calls_follow_merged_identities_once_per_site() {
+        for declarations in [1, 8, 64] {
+            for instances in [1, 8, 64] {
+                let sites = 4;
+                let n = declarations * instances;
+                let mut functions: Vec<Function> = (0..n).map(|i| serde_json::from_value(serde_json::json!({
+                    "id":format!("f{i}"), "module":"m.wi", "name":format!("f{}$mono${i}", i / instances),
+                    "locations":[{"path":"m.wi","start": i / instances * 10,"end": i / instances * 10+9}],
+                    "synthetic":false, "fingerprint":"same", "body_fingerprint":"same",
+                    "callees":[], "runtime_effects":0, "unknown":true, "unresolved":["indirect-or-unresolved"]
+                })).unwrap()).collect();
+                let mut semantic = SemanticFacts::default();
+                for i in 0..n {
+                    let start = i / instances * 10;
+                    let calls = (0..sites)
+                        .rev()
+                        .map(|s| {
+                            serde_json::from_value(serde_json::json!({
+                                "operation": if s == 0 { format!("call:g$mono${i}") } else { "f".to_owned() },
+                                "location":{"path":"m.wi","start":start + s,"end":start + s + 1}
+                            }))
+                            .unwrap()
+                        })
+                        .collect();
+                    semantic.unresolved_calls.insert(format!("f{i}"), calls);
+                }
+                REMAPS.with(|count| count.set(0));
+                aggregate(
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &mut functions,
+                    &mut semantic,
+                );
+                let ids: std::collections::HashSet<_> =
+                    functions.iter().map(|f| f.id.as_str()).collect();
+                assert_eq!(semantic.unresolved_calls.len(), declarations);
+                for (owner, calls) in &semantic.unresolved_calls {
+                    assert!(ids.contains(owner.as_str()));
+                    assert_eq!(calls.len(), sites);
+                    assert!(
+                        calls
+                            .windows(2)
+                            .all(|w| w[0].location.start < w[1].location.start)
+                    );
+                    assert_eq!(calls[0].operation, "call:g");
+                    assert!(calls.iter().skip(1).all(|c| c.operation == "f"));
+                }
+                // One remap per input owner; callees and other facts are empty.
+                let remaps = REMAPS.with(|count| count.get());
+                assert_eq!(remaps, n);
+                println!(
+                    "declarations={declarations} instances={instances} input_sites={} owner_remaps={remaps} output_sites={}",
+                    n * sites,
+                    semantic
+                        .unresolved_calls
+                        .values()
+                        .map(Vec::len)
+                        .sum::<usize>()
+                );
+            }
         }
     }
     #[test]

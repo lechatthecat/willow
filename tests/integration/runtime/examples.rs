@@ -49,6 +49,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "5\n5\n7\n7\nkept\n",
         ),
         ("example/semantic_generic_queries.wi", "7\ngeneric\n11\n"),
+        (
+            "example/semantic_generic_closure_calls.wi",
+            "4\nab\n12\nq!!\n",
+        ),
         ("example/task_frame_lifetime.wi", "8484\ntrue\n"),
         ("example/codegen_unit_context/main.wi", "42\n"),
         ("example/interface_pairs.wi", "7\n11\n7\n11\n"),
@@ -612,6 +616,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/self_demo.wi", "10\n10\n10\n"),
         ("example/send_sync_markers.wi", "36\n81\n"),
+        (
+            "example/sync_field_reassignment.wi",
+            "hits 800\ntotal 1600\nboxed 1600\n",
+        ),
         ("example/spawn_await.wi", "9\n16\n25\n42\n"),
         ("example/static_inheritance.wi", "base\nbase\n3\nok\n"),
         ("example/static_members.wi", "3\n25\n40\n42\n"),
@@ -1582,6 +1590,7 @@ fn test_october_ci_catalog_additions() {
                 | "example/lock_imported_effects/main.wi"
                 | "example/module_generic_members/main.wi"
                 | "example/semantic_generic_queries.wi"
+                | "example/semantic_generic_closure_calls.wi"
                 | "example/task_frame_lifetime.wi"
         ) {
             let (out, ok) = compile_file_and_run(path);

@@ -1,0 +1,17 @@
+// willow symbol semantic_generic_closure_calls::main --source example/semantic_generic_closure_calls.wi
+// willow effects semantic_generic_closure_calls::apply --source example/semantic_generic_closure_calls.wi
+// willow effects semantic_generic_closure_calls::Box::twice --source example/semantic_generic_closure_calls.wi
+// Generic bodies that call closure values keep every semantic query available.
+fn apply<T>(x: T, f: closure(T) -> T) -> T { return f(x); }
+class Box<T> {
+    pub value: T;
+    pub fn twice(self, f: closure(T) -> T) -> T { let g = f; return g(g(self.value)); }
+}
+fn main() {
+    let k = 1;
+    println(apply(3, |x: i64| x + k));
+    println(apply("a", |s: String| s + "b"));
+    let b = new Box<i64>(10);
+    println(b.twice(|x: i64| x + k));
+    println(new Box<String>("q").twice(|s: String| s + "!"));
+}

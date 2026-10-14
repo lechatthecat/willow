@@ -2335,6 +2335,102 @@ fn effect_witness_precision_shadowed_scheduler_names_stay_conservative() {
 }
 
 #[test]
+fn generic_closure_value_calls_keep_queries_available() {
+    let f = Fixture::new();
+    // Closure-value calls inside generic functions and methods, instantiated
+    // several times, from the entry module and from an imported module.
+    fs::write(
+        f.0.join("src/coll.wi"),
+        "module coll;\n\
+         pub fn apply<T>(x: T, f: closure(T) -> T) -> T { return f(x); }\n\
+         pub fn relay<T>(x: T, f: closure(T) -> T) -> T { return apply(x, f); }\n\
+         pub fn nested<T>(x: T, f: closure(T) -> T) -> T { let h = |y: T| f(y); return h(x); }\n\
+         pub class Box<T> {\n    pub value: T;\n    pub fn map(self, f: closure(T) -> T) -> T { return f(self.value); }\n    pub fn twice(self, f: closure(T) -> T) -> T { let g = f; return g(g(self.value)); }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import coll;\nimport coll::Box;\n\
+         fn local<T>(x: T, f: closure(T) -> T) -> T { return f(x); }\n\
+         fn unrelated() -> i64 { return 7; }\n\
+         fn main() {\n    let k = 1;\n    println(local(3, |x: i64| x + k));\n    println(local(\"a\", |s: String| s + \"b\"));\n    println(coll::apply(3, |x: i64| x + k));\n    println(coll::apply(\"c\", |s: String| s + \"d\"));\n    println(coll::relay(4, |x: i64| x * 2));\n    println(coll::nested(5, |x: i64| x - k));\n    let b = new Box<i64>(10);\n    println(b.map(|x: i64| x + k));\n    println(b.twice(|x: i64| x + 1));\n    let c = new Box<String>(\"q\");\n    println(c.map(|s: String| s + \"!\"));\n    println(c.twice(|s: String| s + \"?\"));\n    println(unrelated());\n}\n",
+    )
+    .unwrap();
+    let check = f.run(&["check"]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    // Unrelated symbols, the generic declarations, and the call sites all answer.
+    for selector in [
+        "main::main",
+        "main::unrelated",
+        "main::local",
+        "coll::apply",
+        "coll::relay",
+        "coll::nested",
+        "coll::Box::map",
+        "coll::Box::twice",
+    ] {
+        for command in ["symbol", "type", "refs", "impact"] {
+            let value = f.json(&[command, selector], 0);
+            let text = value.to_string();
+            assert!(!text.contains("$mono$"), "{command} {selector}: {text}");
+            assert!(!text.contains("$pkg"), "{command} {selector}: {text}");
+        }
+    }
+    let unrelated = f.json(&["effects", "main::unrelated"], 0);
+    assert_eq!(unrelated["result"]["status"], "ok", "{unrelated}");
+    // Each closure-value call site is owned by its source function and is
+    // reported once, regardless of the number of instantiations.
+    for (selector, sites) in [
+        ("main::local", 1),
+        ("coll::apply", 1),
+        ("coll::nested", 1),
+        ("coll::Box::map", 1),
+        ("coll::Box::twice", 2),
+    ] {
+        let value = f.json(&["effects", selector], 1);
+        let text = value.to_string();
+        assert_eq!(value["result"]["status"], "unknown", "{text}");
+        let causes = value["result"]["unknown_causes"].as_array().unwrap();
+        let own = causes
+            .iter()
+            .find(|c| c["function"] == value["result"]["selected"]["id"])
+            .unwrap_or_else(|| panic!("{selector}: {text}"));
+        assert_eq!(
+            own["call_sites"].as_array().unwrap().len(),
+            sites,
+            "{selector}: {text}"
+        );
+        assert!(!text.contains("$mono$"), "{selector}: {text}");
+        assert!(!text.contains("$pkg"), "{selector}: {text}");
+    }
+    // The unresolved call reaches transitive callers through the merged identity.
+    let relay = f.json(&["effects", "coll::relay"], 1);
+    assert_eq!(relay["result"]["status"], "unknown", "{relay}");
+    let main = f.json(&["effects", "main::main"], 1);
+    assert_eq!(main["result"]["status"], "unknown", "{main}");
+    let binding = f.json(&["type", "main::main::b"], 0);
+    assert_eq!(
+        binding["result"]["type_display"], "coll::Box<i64>",
+        "{binding}"
+    );
+    let position = f.json(&["type", "src/main.wi:7:13"], 0);
+    assert!(
+        position["result"]["type_display"]
+            .as_str()
+            .is_some_and(|ty| ty.starts_with("fn(")),
+        "{position}"
+    );
+    let preview = f.json(&["rename", "coll::apply", "run", "--dry-run"], 0);
+    assert!(preview.to_string().contains("run"), "{preview}");
+    let preview = f.json(&["rename", "main::local", "call", "--dry-run"], 0);
+    assert!(preview.to_string().contains("call"), "{preview}");
+}
+
+#[test]
 fn generic_source_queries() {
     let f = Fixture::new();
     fs::write(f.0.join("src/coll.wi"), "module coll;\npub fn fold<T>(value: T) -> T { return value; }\npub fn unused<T>(value: T) -> T { return value; }\npub class Ring<T> {\n    pub value: T;\n    pub fn push(self, value: T) -> T { return value; }\n}\n").unwrap();
