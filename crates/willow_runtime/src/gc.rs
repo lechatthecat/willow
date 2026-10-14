@@ -82,7 +82,7 @@ use crate::id_hash::{IdMap, IdSet};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 
 pub use willow_abi::{GcObjectKind, GcStoreDestination};
@@ -1976,7 +1976,20 @@ pub(crate) fn scheduler_start(workers: usize) {
     nursery::scheduler_start(&mut runtime().heap.lock().unwrap(), workers);
 }
 
+/// Lock a runtime mutex for `reset_internal`, recovering and clearing poison.
+/// Reset overwrites the guarded state, so a panic that poisoned it (a failed
+/// unit test asserting under the heap lock) must not turn every later reset
+/// into a panic at the `willow_gc_init` FFI boundary, which aborts the whole
+/// test process and hides the original failure.
+fn reset_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    let guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+    mutex.clear_poison();
+    guard
+}
+
 fn reset_internal() {
+    // Coordinator shutdown waits on `coord`; recover it before that wait.
+    drop(reset_lock(&runtime().coord.0));
     coordinator::shutdown();
     #[cfg(test)]
     minor::reset_pending();
@@ -1986,7 +1999,7 @@ fn reset_internal() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     GC_MARK_PHASE.store(0, Ordering::Release);
-    let mut state = runtime().heap.lock().unwrap();
+    let mut state = reset_lock(&runtime().heap);
     marking::set_concurrent_cycle(&mut state, None);
     state.sweeping = None;
     publish_collection_busy(&state);
@@ -2097,15 +2110,15 @@ fn reset_internal() {
     runtime().runtime_roots.clear();
     runtime().runtime_root_slots.clear();
     runtime().pin_lease_slots.clear();
-    runtime().parked_stack_roots.lock().unwrap().clear();
-    *runtime().root_stack_owner.lock().unwrap() = None;
+    reset_lock(&runtime().parked_stack_roots).clear();
+    *reset_lock(&runtime().root_stack_owner) = None;
     progress::reset();
     // Collectors and TLS-block unregistration take coord before heap; never
     // wait for coord while holding heap.
     drop(state);
     {
         let (lock, cv) = &runtime().coord;
-        let mut coord = lock.lock().unwrap();
+        let mut coord = reset_lock(lock);
         *coord = GcCoord::default();
         safepoint::invalidate_mutator_registrations();
         invalidate_runtime_policy_budgets();

@@ -776,7 +776,9 @@ fn async_mut_sync_preemption_nested_heap_and_repeated_calls() {
                     ("WILLOW_TASK_BUDGET", "3"),
                     ("WILLOW_GC_STRESS", "relocate"),
                 ],
-                std::time::Duration::from_secs(30),
+                // count=32 runs 1024 relocating collections: ~3.5s on a Linux
+                // host, but over 30s on a loaded macos-15-intel debug runner.
+                std::time::Duration::from_secs(120),
             );
             assert!(ok, "count={count} place={place}: {out}");
             assert_eq!(out, format!("{}\n", 1000 * count * count));

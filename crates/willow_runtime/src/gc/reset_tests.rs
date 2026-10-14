@@ -112,3 +112,35 @@ fn native_drop_panics_terminate_reset_and_collection() {
         assert!(stderr.contains("injected native destructor panic"));
     }
 }
+
+#[test]
+fn reset_recovers_runtime_locks_poisoned_by_a_failed_test() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    // A test that panics while asserting under these locks poisons them.
+    let poison = || {
+        let _ = std::panic::catch_unwind(|| {
+            let _heap = runtime().heap.lock().unwrap();
+            let _coord = runtime().coord.0.lock().unwrap();
+            let _parked = runtime().parked_stack_roots.lock().unwrap();
+            let _owner = runtime().root_stack_owner.lock().unwrap();
+            panic!("injected test failure under runtime locks");
+        });
+    };
+    for _ in 0..2 {
+        poison();
+        assert!(runtime().heap.is_poisoned());
+        // The FFI boundary aborts on a panic; reset must not raise one.
+        willow_gc_init();
+        assert!(!runtime().heap.is_poisoned());
+        assert!(!runtime().coord.0.is_poisoned());
+        assert!(!runtime().parked_stack_roots.is_poisoned());
+        assert!(!runtime().root_stack_owner.is_poisoned());
+        let mut root = willow_alloc(8);
+        assert!(!root.is_null());
+        willow_push_root(&mut root);
+        willow_gc_collect();
+        willow_pop_roots(1);
+    }
+    reset_internal_for_test();
+}

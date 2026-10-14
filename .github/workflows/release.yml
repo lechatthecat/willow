@@ -105,6 +105,9 @@ jobs:
           $text = $missing -join "`n"
           if (-not $text.Contains('willow_runtime.lib') -or -not $text.Contains('WILLOW_RUNTIME_LIB')) { throw "missing runtime diagnostic mismatch: $text" }
           if ($text -match 'Permission denied|build willow_runtime with Cargo') { throw "source fallback diagnostic: $text" }
+          # The runner ends pwsh steps with `exit $LASTEXITCODE`; the expected
+          # relocated-binary failure above must not become the step result.
+          exit 0
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
