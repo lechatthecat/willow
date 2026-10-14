@@ -640,18 +640,11 @@ impl TrackedQueryTable {
         // grow with source nesting. Only recomputation re-enters the provider.
         let mut frames = match self.begin(provider, node)? {
             Begin::Done(memo) => return Ok(memo),
-            Begin::Frame(frame) => vec![frame],
+            Begin::Frame(frame) => Frames(vec![frame]),
         };
-        let result = self.drive(provider, &mut frames);
-        // Guards must unwind innermost first, like the native call chain.
-        while frames.pop().is_some() {}
-        result
+        self.drive(provider, &mut frames)
     }
-    fn drive<'a>(
-        &'a self,
-        provider: &impl QueryProvider,
-        frames: &mut Vec<Frame<'a>>,
-    ) -> Result<Memo> {
+    fn drive<'a>(&'a self, provider: &impl QueryProvider, frames: &mut Frames<'a>) -> Result<Memo> {
         let mut child: Option<Memo> = None;
         loop {
             let Frame {
@@ -660,7 +653,7 @@ impl TrackedQueryTable {
                 durability,
                 shortcut,
                 ..
-            } = frames.last_mut().unwrap();
+            } = frames.0.last_mut().unwrap();
             let old = previous.as_ref().unwrap();
             // Select an empty slice before iterating: filtering every edge would
             // still scan the entire dependency array on a durability shortcut.
@@ -699,16 +692,16 @@ impl TrackedQueryTable {
                 *next += 1;
             }
             if let Some(frame) = descend {
-                frames.push(frame);
+                frames.0.push(frame);
                 continue;
             }
-            let frame = frames.pop().unwrap();
+            let frame = frames.0.pop().unwrap();
             let memo = if green {
                 self.publish_green(frame)
             } else {
                 self.recompute(provider, frame)?
             };
-            if frames.is_empty() {
+            if frames.0.is_empty() {
                 return Ok(memo);
             }
             child = Some(memo);
@@ -946,6 +939,14 @@ struct Frame<'a> {
     next: usize,
     durability: Durability,
     shortcut: bool,
+}
+/// Validation frames. Guards must unwind innermost first, like the native
+/// call chain, on errors and panics alike; `Vec` drops front to back.
+struct Frames<'a>(Vec<Frame<'a>>);
+impl Drop for Frames<'_> {
+    fn drop(&mut self) {
+        while self.0.pop().is_some() {}
+    }
 }
 enum Begin<'a> {
     Done(Memo),
@@ -1412,6 +1413,39 @@ mod tests {
             assert!(table.stack.borrow().is_empty());
             assert!(!table.states.borrow().contains_key(&query(8)));
             assert_frozen_read();
+        }
+    }
+    #[test]
+    fn panic_during_nested_validation_unwinds_every_frame() {
+        struct PanicsAt<'a>(&'a Graph, QueryNode);
+        impl QueryProvider for PanicsAt<'_> {
+            fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
+                assert_ne!(node, &self.1, "test");
+                self.0.compute(table, node)
+            }
+        }
+        let mut table = TrackedQueryTable::default();
+        let chain = graph(vec![(0, vec![q(1)]), (1, vec![q(2)]), (2, vec![i(0)])]);
+        for v in [1, 2] {
+            table.accept(vec![(input(0), value(v))]).unwrap();
+            assert_eq!(*table.read(&chain, query(0)).unwrap().get::<i64>(), v);
+            table.accept(vec![(input(0), value(v + 10))]).unwrap();
+            // Validation holds frames for queries 0, 1 and 2 when query 2's
+            // recomputation panics.
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || table.read(&PanicsAt(&chain, query(2)), query(0))
+                ))
+                .is_err()
+            );
+            assert!(table.stack.borrow().is_empty());
+            assert!((0..3).all(|n| !matches!(
+                table.states.borrow().get(&query(n)),
+                Some(State::Computing { .. })
+            )));
+            assert_frozen_read();
+            assert_eq!(*table.read(&chain, query(0)).unwrap().get::<i64>(), v + 10);
+            assert!(table.stack.borrow().is_empty());
         }
     }
     #[test]
