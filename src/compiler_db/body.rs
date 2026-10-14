@@ -471,9 +471,24 @@ impl BodyQueries {
     }
 
     pub(crate) fn snapshot_dependencies(&self, id: BodyId, symbols: &SymbolTable) {
+        // Nested lambdas are visited from a worklist in preorder so native
+        // stack use does not grow with lambda nesting depth.
+        let mut pending = vec![id];
+        while let Some(id) = pending.pop() {
+            if !self.snapshot_body_dependencies(id, symbols) {
+                continue;
+            }
+            let start = pending.len();
+            pending.extend(self.index.child_lambdas(id).map(|(_, child)| child));
+            pending[start..].reverse();
+        }
+    }
+
+    /// Snapshot one body's reads; false when the body is not indexed.
+    fn snapshot_body_dependencies(&self, id: BodyId, symbols: &SymbolTable) -> bool {
         use super::ids::BodyOwner;
         let Some((unit, owner)) = self.index.owner(id) else {
-            return;
+            return false;
         };
         let owner_read = match owner {
             BodyOwner::Function(function) => Some(match function.owner_type() {
@@ -501,10 +516,7 @@ impl BodyQueries {
         for read in reads {
             self.signature(unit, read, symbols);
         }
-        drop(dependencies);
-        for (_, child) in self.index.child_lambdas(id) {
-            self.snapshot_dependencies(child, symbols);
-        }
+        true
     }
 
     pub(crate) fn publish_tracked(&self, id: BodyId, symbols: &SymbolTable) -> Result<()> {

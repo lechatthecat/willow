@@ -1649,9 +1649,9 @@ mod tests {
     fn revision_reuse_scales_with_body_count_and_lambda_depth() {
         // Exercise query-backed nested lambdas below every CI target's default
         // test stack. Increasing depth must not nest synchronous query drivers
-        // or dependency validation: per-level native growth would exceed this
-        // bound well before the deepest case, while the fixed debug-build
-        // baseline stays far below it on every target.
+        // or dependency validation. On Linux debug the minimum stack is about
+        // 236 KiB at every depth up to 256, while the former per-level
+        // validation recursion overflowed this 1 MiB bound.
         std::thread::Builder::new()
             .stack_size(1024 * 1024)
             .spawn(|| {
