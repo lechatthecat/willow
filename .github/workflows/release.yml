@@ -164,8 +164,15 @@ jobs:
         run: |
           set -euo pipefail
           tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -Fxq SHA256SUMS; then
+          assets=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          if grep -Fxq SHA256SUMS <<<"$assets"; then
             echo "$tag already has SHA256SUMS"
+            exit 0
+          fi
+          # A release without archives (e.g. its tag build failed) is published
+          # with checksums by the tag build, not backfilled here.
+          if ! grep -Eq '^willow-.*\.(tar\.gz|zip)$' <<<"$assets"; then
+            echo "$tag has no released archives; nothing to backfill"
             exit 0
           fi
           mkdir -p release-assets
