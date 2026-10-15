@@ -1,0 +1,17 @@
+import base;
+pub open class Left extends base::Base {
+    pub open override fn label(self) -> i64 { return 2; }
+    pub fn name(self) -> i64 { return self.label(); }
+}
+pub class Leaf extends Left {
+    pub override fn label(self) -> i64 { return 3; }
+    pub fn name_leaf(self) -> i64 { return self.label(); }
+}
+pub class Right extends base::Base {
+    pub override fn label(self) -> i64 { return 4; }
+    pub fn name(self) -> i64 { return self.label(); }
+}
+pub class Unrelated {
+    pub fn label(self) -> i64 { return 5; }
+    pub fn name(self) -> i64 { return self.label(); }
+}

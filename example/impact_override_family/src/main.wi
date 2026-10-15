@@ -1,0 +1,4 @@
+import base; import children;
+fn call(x: base::Base) -> i64 { return x.label(); }
+fn wrapper(x: base::Base) -> i64 { return call(x); }
+fn main() { println(wrapper(new children::Leaf())); }

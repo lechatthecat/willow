@@ -745,6 +745,126 @@ fn contract_impact_and_effects_explain_bodyless_declarations() {
 }
 
 #[test]
+fn class_method_impact_includes_override_family_and_callers() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/base.wi"),
+        include_str!("../example/impact_override_family/src/base.wi"),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/children.wi"),
+        include_str!("../example/impact_override_family/src/children.wi"),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/impact_override_family/src/main.wi"),
+    )
+    .unwrap();
+    for selected in [
+        "base::Base::label",
+        "children::Left::label",
+        "children::Leaf::label",
+        "children::Right::label",
+    ] {
+        let result = f.json(&["impact", selected], 0);
+        let nodes = result["result"]["impact"]["nodes"].as_array().unwrap();
+        let names: Vec<_> = nodes
+            .iter()
+            .filter_map(|n| n["selector"].as_str())
+            .collect();
+        for expected in [
+            "base::Base::label",
+            "children::Left::label",
+            "children::Leaf::label",
+            "children::Right::label",
+            "base::Base::summary",
+            "children::Left::name",
+            "children::Leaf::name_leaf",
+            "children::Right::name",
+            "main::call",
+            "main::wrapper",
+            "main::main",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{selected}: missing {expected}: {result}"
+            );
+        }
+        assert!(!names.iter().any(|n| n.contains("Unrelated")), "{result}");
+        let unique: std::collections::HashSet<_> =
+            nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+        assert_eq!(unique.len(), nodes.len(), "{result}");
+        for node in nodes.iter().filter(|n| {
+            n["selector"]
+                .as_str()
+                .is_some_and(|s| s.ends_with("::label"))
+        }) {
+            assert_eq!(node["distance"], 0, "{result}");
+        }
+    }
+    for (selected, excluded) in [
+        ("base::Base::summary", "children::Left::label"),
+        ("children::Unrelated::label", "base::Base::label"),
+        ("main::call", "base::Base::label"),
+    ] {
+        let result = f.json(&["impact", selected], 0);
+        assert!(
+            !result["result"]["impact"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["selector"] == excluded),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn class_method_impact_scaling_preserves_each_family_member_once() {
+    for shape in ["chain", "fanout"] {
+        for n in [4, 16, 64] {
+            let f = Fixture::new();
+            let mut source =
+                String::from("open class C0 { pub open fn label(self) -> i64 { return 0; } }\n");
+            for i in 1..n {
+                let parent = if shape == "chain" { i - 1 } else { 0 };
+                source.push_str(&format!("open class C{i} extends C{parent} {{ pub open override fn label(self) -> i64 {{ return {i}; }} }}\n"));
+            }
+            source.push_str("fn main() {}\n");
+            fs::write(f.0.join("src/main.wi"), source).unwrap();
+            for selected in [
+                "main::C0::label".to_owned(),
+                format!("main::C{}::label", n - 1),
+            ] {
+                let result = f.json(&["impact", &selected], 0);
+                let impact = &result["result"]["impact"];
+                let nodes = impact["nodes"].as_array().unwrap();
+                assert_eq!(nodes.len(), n, "{shape}/{n}: {result}");
+                for i in 0..n {
+                    assert_eq!(
+                        nodes
+                            .iter()
+                            .filter(|node| node["selector"] == format!("main::C{i}::label")
+                                && node["distance"] == 0)
+                            .count(),
+                        1,
+                        "{result}"
+                    );
+                }
+                assert_eq!(impact["edge_visits"], 0, "{result}");
+                assert_eq!(impact["truncated"], false, "{result}");
+                println!(
+                    "method-family shape={shape} members={n} selected={selected} nodes={} caller_edge_visits=0",
+                    nodes.len()
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn project_check_checks_unimported_sources_without_importing_names() {
     for (label, path, source, success) in [
         (
@@ -1401,7 +1521,15 @@ fn unknown_effects_and_impact_explain_conservative_capabilities() {
     let f = Fixture::new();
     fs::write(
         f.0.join("src/main.wi"),
-        include_str!("../example/effect_explanations.wi"),
+        // Keep the candidate set empty: the runnable example takes increment's
+        // address, which the current closed-workspace analysis can resolve.
+        r#"
+fn apply(f: fn(i64) -> i64, value: i64) -> i64 { return f(value); }
+fn relay(f: fn(i64) -> i64, value: i64) -> i64 { return apply(f, value); }
+fn worker(f: fn(i64) -> i64, value: i64) -> i64 { return relay(f, value); }
+fn increment(value: i64) -> i64 { return value + 1; }
+fn main() {}
+"#,
     )
     .unwrap();
     for name in ["apply", "relay", "worker"] {

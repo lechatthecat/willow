@@ -137,7 +137,6 @@ pub struct DirectSession {
     function_names: HashMap<String, String>,
     lambda_symbols: HashMap<String, symbols::Symbol>,
     constructor_bodies: HashMap<String, String>,
-    contract_bodies: std::collections::HashSet<String>,
 }
 fn source_module(path: &str, workspace: &str) -> String {
     let path = Path::new(path)
@@ -157,7 +156,6 @@ impl DirectSession {
         let mut callable_by_owner = HashMap::new();
         let mut function_names = HashMap::new();
         let mut lambda_symbols = HashMap::new();
-        let mut contract_bodies = std::collections::HashSet::new();
         for f in &snapshot.functions {
             if f.name.starts_with("<lambda ")
                 && let Some(location) = f.locations.first()
@@ -185,13 +183,6 @@ impl DirectSession {
                 .map(|i| i.module.clone())
                 .unwrap_or_else(|| source_module(&f.module, &snapshot.workspace));
             function_names.insert(f.id.clone(), format!("{module}::{}", f.name));
-            if f.name
-                .rsplit("::")
-                .next()
-                .is_some_and(|n| n.starts_with("$default$"))
-            {
-                contract_bodies.insert(f.id.clone());
-            }
         }
         let constructor_bodies = snapshot
             .semantic
@@ -212,7 +203,6 @@ impl DirectSession {
             function_names,
             lambda_symbols,
             constructor_bodies,
-            contract_bodies,
         };
         let names: Vec<_> = session
             .snapshot()
@@ -771,11 +761,11 @@ impl DirectSession {
         }
         .to_owned();
         if command == "impact" {
-            // Contract declarations have no executable body. Traverse the shared
-            // semantic family once to seed all implementations, including defaults.
+            // Seed the shared rename family for every method, including executable
+            // class methods: overrides and their callers are affected together.
             let mut seeds = vec![function.clone()];
             if !self.function_names.contains_key(&function)
-                || self.contract_bodies.contains(&function)
+                || resolved["symbol"]["kind"] == "method"
             {
                 if resolved["symbol"]["kind"] != "method" {
                     return Ok(

@@ -1,0 +1,4 @@
+pub open class Base {
+    pub open fn label(self) -> i64 { return 1; }
+    pub fn summary(self) -> i64 { return self.label(); }
+}
