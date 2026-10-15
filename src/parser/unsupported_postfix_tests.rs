@@ -345,3 +345,60 @@ fn ticket_60_following_item_boundaries() {
         }
     }
 }
+
+#[test]
+fn closure_field_parenthesized_callee_perspectives() {
+    for expression in [
+        "(self.f)(1)",
+        "((self.f))(1)",
+        "(obj.f)()",
+        "(obj.f)(1, 2)",
+        "(obj.inner.f)(1)",
+        "(objects[0].f)(1)",
+        "(make().f)(1)",
+        "(f)(1)",
+        "((f))(1)",
+        "(f)()",
+        "(f)(1, 2)",
+        "1 + (obj.f)(1)",
+        "outer((obj.f)(1))",
+        "[(obj.f)(1)]",
+        "(obj.f)(1).value",
+        "(obj.f)(1)[0]",
+        "(obj.f)(1)?",
+        "(obj.f)(other(1))",
+        "(obj.f)(&value)",
+        "(obj.f)(1,)",
+    ] {
+        let source = format!("fn main() {{ let result = {expression}; }}");
+        assert!(
+            errors(&source).is_empty(),
+            "{source}: {:?}",
+            errors(&source)
+        );
+    }
+}
+
+#[test]
+fn closure_field_postfix_linear_ast_counts() {
+    // Each suffix owns the previous receiver; no cloning of the growing prefix.
+    for size in [16, 64, 256, 1024] {
+        let source = format!("{}obj{}", "(".repeat(size), ".f)(0)".repeat(size));
+        let tokens = Lexer::new(&source).tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let root = parser.parse_expr().unwrap();
+        let mut node = &root;
+        let mut calls = 0;
+        let mut arguments = 0;
+        while let Expr::MethodCall(call) = node {
+            calls += 1;
+            arguments += call.args.len();
+            node = &call.object;
+        }
+        assert!(matches!(node, Expr::Var(name, ..) if name == "obj"));
+        assert_eq!((calls, arguments), (size, size));
+        println!(
+            "closure-field suffixes={size} calls={calls} arguments={arguments} receiver_leaves=1"
+        );
+    }
+}

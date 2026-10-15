@@ -460,6 +460,32 @@ impl Parser {
                 self.expect(TokenKind::RBracket)?;
                 lhs = Expr::Index(Box::new(lhs), Box::new(index), span, ExprId::fresh());
             } else if matches!(self.peek_kind(), TokenKind::LParen)
+                && matches!(lhs, Expr::Var(..) | Expr::FieldAccess(..))
+            {
+                // Parentheses disappear from the AST. Reuse named-call/member
+                // resolution, including its closure-field binding diagnostic.
+                self.advance();
+                let args = self.parse_call_args_after_lparen()?;
+                lhs = match &mut lhs {
+                    Expr::Var(callee, span, _) => Expr::Call(Box::new(CallExpr {
+                        type_args: vec![],
+                        callee: std::mem::take(callee),
+                        args,
+                        span: *span,
+                        id: ExprId::fresh(),
+                    })),
+                    Expr::FieldAccess(object, method, span, _) => {
+                        Expr::MethodCall(Box::new(MethodCallExpr {
+                            object: object.take(),
+                            method: std::mem::take(method),
+                            args,
+                            span: *span,
+                            id: ExprId::fresh(),
+                        }))
+                    }
+                    _ => unreachable!(),
+                };
+            } else if matches!(self.peek_kind(), TokenKind::LParen)
                 && matches!(
                     lhs,
                     Expr::Call(_) | Expr::MethodCall(_) | Expr::StaticCall(_)

@@ -1,0 +1,23 @@
+// Callable fields currently use a local binding before invocation.
+class Plain {
+    pub f: closure(i64) -> i64;
+    pub fn run(self, x: i64) -> i64 {
+        // self.f(x) and (self.f)(x) explain this supported form.
+        let callback = self.f;
+        return (callback)(x);
+    }
+}
+class Box<T> {
+    pub f: closure(T) -> T;
+    pub fn run(self, x: T) -> T {
+        let callback = self.f;
+        return ((callback))(x);
+    }
+}
+fn main() {
+    let offset = 7;
+    let plain = new Plain(|x: i64| x + offset);
+    let boxed = new Box<i64>(|x: i64| x * offset);
+    println(plain.run(3));
+    println(boxed.run(3));
+}

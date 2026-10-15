@@ -217,3 +217,10 @@ fn test_call_result_binding_example() {
     assert!(ok, "compilation failed");
     assert_eq!(out, "5\n5.5\n");
 }
+
+#[test]
+fn test_closure_field_binding_example() {
+    let (out, ok) = compile_and_run(include_str!("../../../example/closure_field_binding.wi"));
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "10\n21\n");
+}

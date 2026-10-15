@@ -1688,6 +1688,21 @@ impl TypeChecker {
                 )
                 .with_label(Label::primary(span, "method not found"));
 
+                if let Some((_, field)) = self.lookup_field_in_hierarchy(&class_name, method_name)
+                    && matches!(field.ty, Type::Closure(..) | Type::Fn(..))
+                {
+                    diagnostic = diagnostic
+                        .with_label(Label::secondary(
+                            field.declaration_span,
+                            "callable field declared here",
+                        ))
+                        .with_help(format!(
+                            "`{method_name}` is a callable field; bind it to a local variable first: `let callback = receiver.{method_name}; callback(...)` (replace `receiver` with the object expression)"
+                        ));
+                    self.push(diagnostic);
+                    return Self::error_type();
+                }
+
                 let method_names = self.method_names_in_hierarchy(&class_name);
                 if let Some(suggestion) = suggest_similar_name(method_name, method_names.iter()) {
                     diagnostic = diagnostic

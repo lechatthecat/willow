@@ -235,3 +235,68 @@ fn ticket_52_annotation_span_preserves_file_identity() {
         assert_eq!(&source[span.start..span.end], ty);
     }
 }
+
+#[test]
+fn closure_field_call_help_perspectives() {
+    for (class, ty) in [("Plain", "i64"), ("Box<T>", "T")] {
+        for callable in ["closure", "fn"] {
+            for call in ["self.f(x)", "(self.f)(x)", "((self.f))(x)"] {
+                let source = format!(
+                    "class {class} {{ f: {callable}({ty}) -> {ty}; pub fn run(self, x: {ty}) -> {ty} {{ return {call}; }} }} fn main() {{}}"
+                );
+                let errors = check_source(&source);
+                let error = errors
+                    .iter()
+                    .find(|d| d.code == ErrorCode::E0502)
+                    .unwrap_or_else(|| panic!("{source}: {errors:?}"));
+                assert!(
+                    error
+                        .helps
+                        .iter()
+                        .any(|h| h.contains("let callback = receiver.f; callback(...)")),
+                    "{source}: {errors:?}"
+                );
+                assert!(
+                    error
+                        .labels
+                        .iter()
+                        .any(|l| l.message == "callable field declared here"),
+                    "{errors:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn closure_field_help_does_not_replace_missing_method_diagnostic() {
+    for field in ["", "f: i64;"] {
+        let errors = check_source(&format!(
+            "class Plain {{ {field} pub fn run(self) {{ self.f(); }} }} fn main() {{}}"
+        ));
+        let error = errors.iter().find(|d| d.code == ErrorCode::E0502).unwrap();
+        assert!(!error.helps.iter().any(|h| h.contains("callable field")));
+    }
+}
+
+#[test]
+fn closure_field_help_inherited_declaration() {
+    let source = "open class Base { pub f: closure(i64) -> i64; } class Child extends Base { pub fn run(self) { (self.f)(1); } } fn main() {}";
+    let errors = check_source(source);
+    let error = errors.iter().find(|d| d.code == ErrorCode::E0502).unwrap();
+    let label = error
+        .labels
+        .iter()
+        .find(|l| l.message == "callable field declared here")
+        .unwrap();
+    assert_eq!(&source[label.span.start..label.span.end], "f");
+    assert!(error.helps.iter().any(|h| h.contains("receiver.f")));
+}
+
+#[test]
+fn closure_field_parentheses_preserve_named_method_dispatch() {
+    let errors = check_source(
+        "class Plain { pub fn f(self, x: i64) -> i64 { return x; } pub fn run(self) -> i64 { return (self.f)(1); } } fn main() {}",
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+}
