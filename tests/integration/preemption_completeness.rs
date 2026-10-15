@@ -264,3 +264,211 @@ fn a7_adt_fallback_does_not_hide_an_unknown_callback() {
         assert!(errors.contains("error[E0810]"), "{errors}");
     }
 }
+
+#[test]
+fn jz15_80_imported_generic_task_repro() {
+    let project = TestProject::new(
+        "jz15_80",
+        &[
+            ("boxes.wi", "pub fn id<T>(x:T)->T{return x;}"),
+            (
+                "main.wi",
+                "import boxes::id; async fn main(){println(id(4));}",
+            ),
+        ],
+    );
+    let check = project.check("main.wi");
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let build = project.compile("main.wi");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = project.run_with_env_timeout(&[], std::time::Duration::from_secs(10));
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "4\n");
+}
+
+// Twenty explicit combinations: item/module imports and aliases, each with
+// inferred scalar/String/bool, explicit type arguments, and repeated instances.
+#[test]
+fn jz15_80_imported_generic_task_matrix() {
+    for (import, callee) in [
+        ("import boxes::id;", "id"),
+        ("import boxes::id as identity;", "identity"),
+        ("import boxes;", "boxes::id"),
+        ("import boxes as b;", "b::id"),
+    ] {
+        for (body, expected) in [
+            (format!("println({callee}(4));"), "4\n"),
+            (format!("println({callee}(\"kept\"));"), "kept\n"),
+            (format!("println({callee}(true));"), "true\n"),
+            (format!("println({callee}<i64>(7));"), "7\n"),
+            (
+                format!("println({callee}(4));println({callee}(5));println({callee}(false));"),
+                "4\n5\nfalse\n",
+            ),
+        ] {
+            let source = format!("{import} async fn main(){{{body}}}");
+            let project = TestProject::new(
+                "jz15_80_matrix",
+                &[
+                    ("boxes.wi", "pub fn id<T>(x:T)->T{return x;}"),
+                    ("main.wi", &source),
+                ],
+            );
+            let check = project.check("main.wi");
+            assert!(
+                check.status.success(),
+                "{source}: {}",
+                String::from_utf8_lossy(&check.stderr)
+            );
+            let build = project.compile("main.wi");
+            assert!(
+                build.status.success(),
+                "{source}: {}",
+                String::from_utf8_lossy(&build.stderr)
+            );
+            let run = project.run_with_env_timeout(&[], std::time::Duration::from_secs(10));
+            assert!(run.status.success(), "{source}");
+            assert_eq!(String::from_utf8_lossy(&run.stdout), expected, "{source}");
+        }
+    }
+}
+
+#[test]
+fn jz15_80_generic_unknown_has_source_name_and_call_span() {
+    let project = TestProject::new(
+        "jz15_80_diagnostic",
+        &[
+            (
+                "boxes.wi",
+                "pub fn apply<T>(x:T,f:fn(T)->T)->T{return f(x);}",
+            ),
+            (
+                "main.wi",
+                "import boxes::apply;\nasync fn run(f:fn(i64)->i64)->i64 {\n    return apply(4,f);\n}\nfn main(){}",
+            ),
+        ],
+    );
+    for output in [project.check("main.wi"), project.compile("main.wi")] {
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{error}");
+        assert!(error.contains("error[E0810]"), "{error}");
+        assert!(error.contains("main.wi:3:"), "{error}");
+        assert!(!error.contains("$mono$"), "{error}");
+    }
+}
+
+#[test]
+fn jz15_80_imported_generic_example_runs() {
+    let (out, ok) = compile_file_and_run("example/imported_generic_preemption.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, "4\nkept\n");
+}
+
+#[test]
+fn jz15_80_proven_indirect_call_does_not_hide_failing_generic() {
+    let project = TestProject::new(
+        "jz15_80_safe_indirect",
+        &[
+            (
+                "boxes.wi",
+                "pub fn apply<T>(x:T,f:fn(T)->T)->T{return f(x);}",
+            ),
+            (
+                "main.wi",
+                "import boxes::apply;\nfn safe()->i64{return 1;}\nasync fn run(f:fn(i64)->i64)->i64 {\n    let g = safe;\n    println(g());\n    return apply(4,f);\n}\nfn main(){}",
+            ),
+        ],
+    );
+    for output in [project.check("main.wi"), project.compile("main.wi")] {
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{error}");
+        assert!(error.contains("error[E0810]"), "{error}");
+        assert!(error.contains("main.wi:6:"), "{error}");
+        assert!(!error.contains("main.wi:5:"), "{error}");
+        assert!(!error.contains("$mono$"), "{error}");
+    }
+}
+
+#[test]
+fn jz15_80_virtual_spans_follow_build_wide_dispatch() {
+    for api in [
+        "pub interface I extends Sync { fn get(self)->i64; }",
+        "pub interface I extends Sync { fn get(self)->i64{return 1;} }",
+    ] {
+        for (source, expected_line, safe_line) in [
+            (
+                "import api; import impls::touch; import boxes::apply;\nasync fn run(i:api::I,f:fn(i64)->i64)->i64 {\n    println(i.get());\n    return apply(4,f);\n}\nfn main(){touch();}",
+                4,
+                Some(3),
+            ),
+            (
+                "import api;\nasync fn run(i:api::I)->i64 {\n    return i.get();\n}\nfn main(){}",
+                3,
+                None,
+            ),
+        ] {
+            let project = TestProject::new(
+                "jz15_80_virtual",
+                &[
+                    ("api.wi", api),
+                    (
+                        "impls.wi",
+                        "import api; pub class Box implements api::I { pub fn get(self)->i64{return 1;} } pub fn touch(){let b=new Box();}",
+                    ),
+                    (
+                        "boxes.wi",
+                        "pub fn apply<T>(x:T,f:fn(T)->T)->T{return f(x);}",
+                    ),
+                    ("main.wi", source),
+                ],
+            );
+            for output in [project.check("main.wi"), project.compile("main.wi")] {
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert!(!output.status.success(), "{error}");
+                assert!(error.contains("error[E0810]"), "{error}");
+                assert!(
+                    error.contains(&format!("main.wi:{expected_line}:")),
+                    "{error}"
+                );
+                if let Some(line) = safe_line {
+                    assert!(!error.contains(&format!("main.wi:{line}:")), "{error}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn jz15_80_virtual_override_hazard_uses_union_span() {
+    let project = TestProject::new(
+        "jz15_80_override",
+        &[
+            (
+                "api.wi",
+                "pub open class Base { pub open fn get(self)->i64{return 1;} }",
+            ),
+            (
+                "impls.wi",
+                "import api; extern rust {fn foreign()->i64;} pub class Box extends api::Base { pub override fn get(self)->i64{return foreign();} } pub fn touch(){let b=new Box();}",
+            ),
+            (
+                "main.wi",
+                "import api; import impls::touch;\nasync fn run(b:api::Base)->i64 {\n    return b.get();\n}\nfn main(){touch();}",
+            ),
+        ],
+    );
+    for output in [project.check("main.wi"), project.compile("main.wi")] {
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{error}");
+        assert!(error.contains("error[E0810]"), "{error}");
+        assert!(error.contains("main.wi:3:"), "{error}");
+    }
+}

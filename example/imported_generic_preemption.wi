@@ -1,0 +1,6 @@
+import imported_generic_preemption_support::boxes::id;
+
+async fn main() {
+    println(id(4));
+    println(id("kept"));
+}

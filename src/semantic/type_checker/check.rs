@@ -962,6 +962,10 @@ impl TypeChecker {
                             FunctionId::method(TypeId::local(&class.name), &method.name),
                             CallSites {
                                 unsupported_initialization: [crate::semantic::call_graph::UnsupportedInitialization::InjectedDefault].into(),
+                                call_spans: Default::default(),
+                                indirect_spans: Default::default(),
+                                unknown_span: None,
+                                virtual_spans: Default::default(),
                                 virtual_calls: Default::default(),
                                 targets: Default::default(),
                                 has_unknown: true,
@@ -977,6 +981,10 @@ impl TypeChecker {
                 *id,
                 CallSites {
                     unsupported_initialization: Default::default(),
+                    call_spans: Default::default(),
+                    indirect_spans: Default::default(),
+                    unknown_span: None,
+                    virtual_spans: Default::default(),
                     virtual_calls: Default::default(),
                     targets: targets.iter().copied().collect(),
                     has_unknown: false,
@@ -2442,6 +2450,25 @@ impl TypeChecker {
             *target = self.effect_index.local_target(*target);
         }
         let sites = self.resolved_calls.entry(caller).or_default();
+        if targets.is_empty()
+            && virtual_call.is_none()
+            && !matches!(
+                unsupported,
+                Some(
+                    UnsupportedInitialization::IndirectCall
+                        | UnsupportedInitialization::InlineCallback
+                )
+            )
+        {
+            sites.unknown_span.get_or_insert(expr.span());
+        }
+        if let Some(target) = virtual_call {
+            sites.virtual_spans.entry(target).or_insert(expr.span());
+        } else {
+            for &target in &targets {
+                sites.call_spans.entry(target).or_insert(expr.span());
+            }
+        }
         sites.unsupported_initialization.extend(unsupported);
         sites.virtual_calls.extend(virtual_call);
         sites.has_unknown |= targets.is_empty();

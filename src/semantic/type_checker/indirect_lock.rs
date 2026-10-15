@@ -34,6 +34,12 @@ impl TypeChecker {
         let bit = arity_bit(arity);
         if let Some(caller) = self.local.current_effect_callable {
             self.indirect_lock.calls.push((caller, bit));
+            self.resolved_calls
+                .entry(caller)
+                .or_default()
+                .indirect_spans
+                .entry(bit)
+                .or_insert(span);
         }
         if self.local.lock_depth > 0 {
             self.indirect_lock.lock_sites.push((span, bit));

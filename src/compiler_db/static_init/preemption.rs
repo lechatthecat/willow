@@ -208,7 +208,7 @@ impl StaticInitQueries {
             }
         }
         let bodies = keys.len();
-        let (queried, unresolved) = super::connect_build_dispatch(
+        let dispatch = super::connect_build_dispatch(
             order, &units, effects, &positions, &mut keys, &mut edges,
         );
         unknown.resize(edges.len(), false);
@@ -216,10 +216,10 @@ impl StaticInitQueries {
         let mut concrete = vec![false; edges.len()];
         concrete[..bodies].fill(true);
         let concrete = propagate(&edges, concrete).0;
-        for node in queried {
+        for &node in dispatch.targets.values() {
             unknown[node] |= !concrete[node];
         }
-        for node in unresolved {
+        for &node in &dispatch.unresolved {
             unknown[node] = true;
         }
         let arities = edges.len();
@@ -290,6 +290,13 @@ impl StaticInitQueries {
         } else {
             propagate(&edges, loops).0
         };
+        let failed_arities = (0..64).fold(0u64, |mask, bit| {
+            if unknown[arities + bit] || blocked[arities + bit] {
+                mask | (1 << bit)
+            } else {
+                mask
+            }
+        });
         tasks
             .into_iter()
             .filter_map(|(node, span)| {
@@ -311,6 +318,39 @@ impl StaticInitQueries {
                 } else {
                     keys[node].1.to_string()
                 };
+                // Point at a source call in the failing task, not its entire
+                // declaration. Inspect each root's direct sites only once.
+                let (unit, id) = keys[node];
+                let sites = units[&unit].graph.get(&id).expect("task graph node");
+                let call_span = sites
+                    .call_spans
+                    .iter()
+                    .filter_map(|(target, span)| {
+                        let failed = resolve(unit, target).map_or_else(
+                            || !leaf(unit, target),
+                            |target| {
+                                !async_nodes.contains(&target)
+                                    && (unknown[target] || blocked[target])
+                            },
+                        );
+                        failed.then_some(*span)
+                    })
+                    .chain(sites.virtual_spans.iter().filter_map(|(target, span)| {
+                        let failed = dispatch
+                            .targets
+                            .get(&(unit, *target))
+                            .is_none_or(|&node| unknown[node] || blocked[node]);
+                        failed.then_some(*span)
+                    }))
+                    .chain(
+                        sites
+                            .indirect_spans
+                            .iter()
+                            .filter_map(|(bit, span)| (failed_arities & bit != 0).then_some(*span)),
+                    )
+                    .chain(sites.unknown_span)
+                    .min_by_key(|s| (s.file_id, s.start));
+                let span = call_span.unwrap_or(span);
                 Some(
                     Diagnostic::new(
                         Severity::Error,
@@ -411,6 +451,27 @@ mod tests {
                 ));
         }
         checker.errors
+    }
+
+    #[test]
+    fn preemption_indirect_span_uses_only_failed_arity_obligations() {
+        let source = "fn safe()->i64{return 1;}\nasync fn run(f:fn(i64)->i64) {\nlet g=safe; println(g());\nprintln(f(1));\n} fn main(){}";
+        for native in [false, true] {
+            let diagnostics = errors(source, native);
+            let error = diagnostics
+                .iter()
+                .find(|e| e.code == ErrorCode::E0810)
+                .unwrap();
+            assert_eq!(error.labels[0].span.line, 4, "{diagnostics:?}");
+        }
+        let source = "fn safe()->i64{return 1;} fn looped(x:i64)->i64{let mut n=0;while n<x{n=n+1;}return n;}\nasync fn main(){\nlet g=safe; println(g());\nlet f=looped; println(f(1));\n}";
+        assert!(errors(source, true).is_empty());
+        let diagnostics = errors(source, false);
+        let error = diagnostics
+            .iter()
+            .find(|e| e.code == ErrorCode::E0810)
+            .unwrap();
+        assert_eq!(error.labels[0].span.line, 4, "{diagnostics:?}");
     }
 
     #[test]

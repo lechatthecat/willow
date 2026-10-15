@@ -458,6 +458,14 @@ impl EffectQueries {
     ) -> Option<(UnitId, FunctionId)> {
         let namespace = target.namespace();
         let owner = target.owner();
+        // Module-qualified free calls use StaticCall's owner slot. Resolve
+        // the full module path before interpreting that slot as a class.
+        if let (Some(namespace), Some(owner)) = (&namespace, &owner) {
+            let path = format!("{namespace}::{owner}");
+            if let Some(unit) = self.resolve_module(consumer, &path) {
+                return Some((unit, FunctionId::free(target.name())));
+            }
+        }
         let (path, id) = if let Some(namespace) = namespace.as_deref() {
             (
                 imports
@@ -895,6 +903,10 @@ pub(crate) fn solve_unit<N>(
             id,
             crate::semantic::call_graph::CallSites {
                 unsupported_initialization: Default::default(),
+                call_spans: Default::default(),
+                indirect_spans: Default::default(),
+                unknown_span: None,
+                virtual_spans: Default::default(),
                 virtual_calls: Default::default(),
                 targets,
                 has_unknown: false,
@@ -957,6 +969,10 @@ pub(crate) fn solve_unit<N>(
                     id,
                     crate::semantic::call_graph::CallSites {
                         unsupported_initialization: Default::default(),
+                        call_spans: Default::default(),
+                        indirect_spans: Default::default(),
+                        unknown_span: None,
+                        virtual_spans: Default::default(),
                         virtual_calls: Default::default(),
                         targets: std::iter::once(source_callable(index, source)).collect(),
                         has_unknown: false,
@@ -969,6 +985,10 @@ pub(crate) fn solve_unit<N>(
                     id,
                     crate::semantic::call_graph::CallSites {
                         unsupported_initialization: Default::default(),
+                        call_spans: Default::default(),
+                        indirect_spans: Default::default(),
+                        unknown_span: None,
+                        virtual_spans: Default::default(),
                         virtual_calls: Default::default(),
                         targets: std::iter::once(source).collect(),
                         has_unknown: false,
@@ -1532,6 +1552,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn imported_generic_targets_resolve_module_owners_without_losing_classes() {
+        for path in [
+            "boxes",
+            "$local::nested::boxes",
+            "$pkg0123456789abcdef0123456789abcdef::boxes",
+        ] {
+            let mut queries = EffectQueries::default();
+            let provider = crate::module::ModuleId(1);
+            queries.names.insert(path.into(), provider);
+            let name = "id$mono$abc";
+            let free = FunctionId::method(TypeId::from_source_name(path), name);
+            assert_eq!(
+                queries.external_target(UnitId::ENTRY, &free, &HashMap::new()),
+                Some((provider, FunctionId::free(name)))
+            );
+            let method =
+                FunctionId::method(TypeId::from_source_name(&format!("{path}::Box")), "get");
+            assert_eq!(
+                queries.external_target(UnitId::ENTRY, &method, &HashMap::new()),
+                Some((provider, FunctionId::method(TypeId::local("Box"), "get")))
+            );
+        }
+    }
+
+    #[test]
     fn deep_read_only_scans_use_a_one_megabyte_stack() {
         std::thread::Builder::new()
             .stack_size(1024 * 1024)
@@ -1650,6 +1695,10 @@ mod tests {
                     relay,
                     CallSites {
                         unsupported_initialization: Default::default(),
+                        call_spans: Default::default(),
+                        indirect_spans: Default::default(),
+                        unknown_span: None,
+                        virtual_spans: Default::default(),
                         virtual_calls: Default::default(),
                         targets: [acquire].into(),
                         has_unknown: false,
@@ -1816,6 +1865,10 @@ mod tests {
                 caller,
                 CallSites {
                     unsupported_initialization: Default::default(),
+                    call_spans: Default::default(),
+                    indirect_spans: Default::default(),
+                    unknown_span: None,
+                    virtual_spans: Default::default(),
                     virtual_calls: Default::default(),
                     targets: [target].into(),
                     has_unknown: false,

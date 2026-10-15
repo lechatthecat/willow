@@ -106,12 +106,32 @@ pub(crate) fn source_names(
     text: String,
     packages: &std::collections::HashMap<String, String>,
 ) -> String {
-    if !text.contains("$pkg") && !text.contains("$local") && !text.contains("$receiver") {
+    if !text.contains("$pkg")
+        && !text.contains("$local")
+        && !text.contains("$receiver")
+        && !text.contains("$mono$")
+    {
         return text;
     }
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     for (start, _) in text.match_indices('$') {
+        if start < copied {
+            continue;
+        }
+        if text[start..].starts_with("$mono$") {
+            let end = start
+                + 6
+                + text[start + 6..]
+                    .bytes()
+                    .take_while(u8::is_ascii_hexdigit)
+                    .count();
+            if end == start + 70 {
+                out.push_str(&text[copied..start]);
+                copied = end;
+                continue;
+            }
+        }
         if text[start..].starts_with("$local::") || text[start..].starts_with("$local.") {
             let end = start
                 + if text[start..].starts_with("$local::") {
@@ -158,6 +178,19 @@ pub(crate) fn source_names(
 #[cfg(test)]
 mod source_name_tests {
     use super::*;
+
+    #[test]
+    fn monomorph_names_hide_only_complete_hashes() {
+        let hash = "a".repeat(64);
+        let text = format!("`$local::boxes::id$mono${hash}` and Box$mono${hash}::get; 日本語");
+        assert_eq!(
+            source_names(text, &Default::default()),
+            "`boxes::id` and Box::get; 日本語"
+        );
+        for text in ["id$mono$", "id$mono$short", "id$mono$abc"] {
+            assert_eq!(source_names(text.into(), &Default::default()), text);
+        }
+    }
 
     #[test]
     fn standalone_namespace_is_display_only_and_scans_mixed_names() {

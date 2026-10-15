@@ -274,6 +274,12 @@ impl StaticInitQueries {
     }
 }
 
+struct DispatchConnections {
+    /// Source receiver/method obligations mapped to their shared union node.
+    targets: HashMap<(UnitId, FunctionId), usize>,
+    unresolved: Vec<usize>,
+}
+
 /// Shared union nodes represent (receiver type, method), rather than copying
 /// every override into every call site. Inherited bodies have a separate memo:
 /// dispatch through an interface must include a class's inherited implementation.
@@ -284,8 +290,8 @@ fn connect_build_dispatch(
     bodies: &HashMap<(UnitId, FunctionId), usize>,
     keys: &mut Vec<(UnitId, FunctionId)>,
     edges: &mut Vec<Vec<usize>>,
-) -> (Vec<usize>, Vec<usize>) {
-    let mut queried = Vec::new();
+) -> DispatchConnections {
+    let mut targets = HashMap::new();
     let mut unresolved = Vec::new();
     let mut types = Vec::new();
     let mut positions = HashMap::new();
@@ -383,7 +389,7 @@ fn connect_build_dispatch(
                         edges,
                     );
                     edges[bodies[&(unit, caller)]].push(node);
-                    queried.push(node);
+                    targets.insert((unit, call), node);
                 } else {
                     unresolved.push(bodies[&(unit, caller)]);
                 }
@@ -401,7 +407,10 @@ fn connect_build_dispatch(
             edges[node].push(target);
         }
     }
-    (queried, unresolved)
+    DispatchConnections {
+        targets,
+        unresolved,
+    }
 }
 
 fn inherited_body(
@@ -555,6 +564,9 @@ mod tests {
                         FunctionId::free(format!("caller{i}")),
                         crate::semantic::call_graph::CallSites {
                             unsupported_initialization: Default::default(),
+                            call_spans: Default::default(),
+                            indirect_spans: Default::default(),
+                            unknown_span: None,
                             virtual_calls: [FunctionId::method(owner(0), "seed")].into(),
                             ..Default::default()
                         },
@@ -575,13 +587,23 @@ mod tests {
                     },
                 )]
                 .into();
-                connect_build_dispatch(
+                let dispatch = connect_build_dispatch(
                     &[unit],
                     &units,
                     &EffectQueries::default(),
                     &positions,
                     &mut keys,
                     &mut edges,
+                );
+                assert_eq!(dispatch.targets.len(), 1);
+                let union = dispatch.targets[&(unit, FunctionId::method(owner(0), "seed"))];
+                for i in 0..n {
+                    let caller = positions[&(unit, FunctionId::free(format!("caller{i}")))];
+                    assert!(edges[caller].contains(&union));
+                }
+                println!(
+                    "dispatch evidence shape={shape} callers={n} obligations={}",
+                    dispatch.targets.len()
                 );
                 let count: usize = edges.iter().map(Vec::len).sum();
                 assert_eq!(keys.len(), 2 * n + 1);

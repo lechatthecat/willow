@@ -377,7 +377,11 @@ impl TypeChecker {
         }
         for (caller, sites) in body.resolved_calls {
             let current = self.resolved_calls.entry(caller).or_default();
+            current.unknown_span = current.unknown_span.or(sites.unknown_span);
+            current.indirect_spans.extend(sites.indirect_spans);
+            current.call_spans.extend(sites.call_spans);
             current.targets.extend(sites.targets);
+            current.virtual_spans.extend(sites.virtual_spans);
             current.virtual_calls.extend(sites.virtual_calls);
             current
                 .unsupported_initialization

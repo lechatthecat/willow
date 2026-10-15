@@ -14,6 +14,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/canonical_identity.wi", "42\n"),
         ("example/imported_interface_default.wi", "42\n"),
+        ("example/imported_generic_preemption.wi", "4\nkept\n"),
         (
             "example/interface_default_provider_signatures.wi",
             "42\n7\n",

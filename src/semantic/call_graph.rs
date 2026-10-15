@@ -351,6 +351,18 @@ pub struct CallSites {
     pub targets: BTreeSet<FunctionId>,
     /// Receiver type and method before unit-local virtual expansion.
     pub virtual_calls: BTreeSet<FunctionId>,
+    /// Source evidence keyed by the receiver/method dispatch obligation.
+    #[serde(default, with = "crate::compiler_db::map_entries")]
+    pub virtual_spans: HashMap<FunctionId, crate::diagnostics::Span>,
+    /// First unresolved non-indirect source call site.
+    #[serde(default)]
+    pub unknown_span: Option<crate::diagnostics::Span>,
+    /// One site per indirect arity obligation (at most 64 per callable).
+    #[serde(default)]
+    pub indirect_spans: BTreeMap<u64, crate::diagnostics::Span>,
+    /// One source call site per distinct target.
+    #[serde(default, with = "crate::compiler_db::map_entries")]
+    pub call_spans: HashMap<FunctionId, crate::diagnostics::Span>,
     pub unsupported_initialization: BTreeSet<UnsupportedInitialization>,
     /// At least one call site in this body has no static target. Fail-closed:
     /// consumers must treat the body as reaching something they cannot see.
@@ -369,7 +381,11 @@ impl CallGraph {
     /// hazard from being erased by a later declaration.
     pub fn merge(&mut self, id: FunctionId, sites: CallSites) {
         let node = self.nodes.entry(id).or_default();
+        node.unknown_span = node.unknown_span.or(sites.unknown_span);
+        node.indirect_spans.extend(sites.indirect_spans);
+        node.call_spans.extend(sites.call_spans);
         node.targets.extend(sites.targets);
+        node.virtual_spans.extend(sites.virtual_spans);
         node.virtual_calls.extend(sites.virtual_calls);
         node.unsupported_initialization
             .extend(sites.unsupported_initialization);
@@ -467,6 +483,56 @@ mod tests {
             .get(&FunctionId::free(name))
             .expect("node")
             .has_unknown
+    }
+
+    #[test]
+    fn call_site_evidence_roundtrips_and_scales_with_distinct_edges() {
+        for n in [32, 128, 512, 2048] {
+            let mut graph = CallGraph::default();
+            let caller = FunctionId::free("caller");
+            for i in 0..n {
+                let target = FunctionId::free(format!("callee{i}"));
+                for _ in 0..8 {
+                    graph.merge(
+                        caller,
+                        CallSites {
+                            targets: [target].into(),
+                            virtual_spans: [(
+                                target,
+                                crate::diagnostics::Span::new(i, i + 1, 1, i + 1),
+                            )]
+                            .into(),
+                            indirect_spans: [(
+                                crate::semantic::indirect_lock::arity_bit(i % 64),
+                                crate::diagnostics::Span::new(i, i + 1, 1, i + 1),
+                            )]
+                            .into(),
+                            call_spans: [(
+                                target,
+                                crate::diagnostics::Span::new(i, i + 1, 1, i + 1),
+                            )]
+                            .into(),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            let sites = graph.get(&caller).unwrap();
+            assert_eq!(sites.call_spans.len(), n);
+            assert_eq!(sites.targets.len(), n);
+            assert_eq!(sites.virtual_spans.len(), n);
+            assert_eq!(sites.indirect_spans.len(), n.min(64));
+            let encoded = serde_json::to_vec(sites).unwrap();
+            let decoded: CallSites = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(&decoded, sites);
+            println!(
+                "call spans distinct={n} observations={} retained={} indirect={} virtual={}",
+                n * 8,
+                sites.call_spans.len(),
+                sites.indirect_spans.len(),
+                sites.virtual_spans.len()
+            );
+        }
     }
 
     #[test]
@@ -797,6 +863,10 @@ mod tests {
             id,
             CallSites {
                 unsupported_initialization: Default::default(),
+                call_spans: Default::default(),
+                indirect_spans: Default::default(),
+                unknown_span: None,
+                virtual_spans: Default::default(),
                 virtual_calls: Default::default(),
                 targets: [FunctionId::free("first")].into_iter().collect(),
                 has_unknown: false,
@@ -806,6 +876,10 @@ mod tests {
             id,
             CallSites {
                 unsupported_initialization: Default::default(),
+                call_spans: Default::default(),
+                indirect_spans: Default::default(),
+                unknown_span: None,
+                virtual_spans: Default::default(),
                 virtual_calls: Default::default(),
                 targets: [FunctionId::free("second")].into_iter().collect(),
                 has_unknown: true,

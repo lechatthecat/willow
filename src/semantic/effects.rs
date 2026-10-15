@@ -629,6 +629,10 @@ mod tests {
             id(caller),
             CallSites {
                 unsupported_initialization: Default::default(),
+                call_spans: Default::default(),
+                indirect_spans: Default::default(),
+                unknown_span: None,
+                virtual_spans: Default::default(),
                 virtual_calls: Default::default(),
                 targets: targets.iter().map(|name| id(name)).collect(),
                 has_unknown: false,
@@ -641,6 +645,10 @@ mod tests {
             id(caller),
             CallSites {
                 unsupported_initialization: Default::default(),
+                call_spans: Default::default(),
+                indirect_spans: Default::default(),
+                unknown_span: None,
+                virtual_spans: Default::default(),
                 virtual_calls: Default::default(),
                 targets: BTreeSet::new(),
                 has_unknown: true,
