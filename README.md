@@ -125,5 +125,4 @@ For convenience, add `target/release` to your `PATH`.
 # License
 
 [MIT License](LICENSE)
- SHA256SUMS | shasum -a 256 --check
-```
+
