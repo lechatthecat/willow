@@ -3501,3 +3501,6 @@ mod if_expression_tests;
 
 #[cfg(test)]
 mod match_arm_diagnostic_tests;
+
+#[cfg(test)]
+mod unit_diagnostic_tests;

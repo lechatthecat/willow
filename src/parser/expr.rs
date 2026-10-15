@@ -769,6 +769,12 @@ impl Parser {
             TokenKind::LParen => {
                 let span = self.current_span();
                 self.advance();
+                if matches!(self.peek_kind(), TokenKind::RParen) {
+                    return Err(self.err(
+                        ErrorCode::E0102,
+                        "`()` is not a unit value; use `Result<void, E>` with `Result::Ok()` for payload-free success",
+                    ));
+                }
                 let expr = self.parse_expr()?;
                 if !self.eat(TokenKind::Comma) {
                     self.expect(TokenKind::RParen)?;

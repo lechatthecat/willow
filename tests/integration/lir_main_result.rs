@@ -604,3 +604,30 @@ fn lir_main_result_26_the_example_is_fully_lir() {
         ],
     );
 }
+
+#[test]
+fn unit_alternative_example_checks_and_runs() {
+    let source = include_str!("../../example/result_void.wi");
+    let project = super::support::TestProject::new("unit_alternative", &[("main.wi", source)]);
+    let checked = project.check("main.wi");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert_main(source, "validated\nunfinished\n", true);
+    assert_walker_compiled(source, &["finish", "validate", "main"]);
+}
+
+#[test]
+fn unit_alternative_parenthesized_void_type_runs() {
+    let source = include_str!("../../example/result_void.wi").replace("Result<void,", "Result<(),");
+    let project = super::support::TestProject::new("unit_alias", &[("main.wi", &source)]);
+    let checked = project.check("main.wi");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert_main(&source, "validated\nunfinished\n", true);
+}

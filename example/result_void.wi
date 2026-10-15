@@ -1,0 +1,20 @@
+// Payload-free success uses Result<void, E> and Result::Ok(), not Ok(()).
+fn finish(valid: bool) -> Result<void, String> {
+    if !valid { return Result::Err("unfinished"); }
+    return Result::Ok();
+}
+
+fn validate(valid: bool) -> Result<void, String> {
+    finish(valid)?;
+    println("validated");
+    return Result::Ok();
+}
+
+fn main() -> Result<void, String> {
+    validate(true)?;
+    match validate(false) {
+        Result::Ok(_) => { println("unexpected success"); }
+        Result::Err(message) => { println(message); }
+    }
+    return Result::Ok();
+}
