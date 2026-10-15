@@ -127,19 +127,3 @@ For convenience, add `target/release` to your `PATH`.
 [MIT License](LICENSE)
  SHA256SUMS | shasum -a 256 --check
 ```
-
-On Windows, run `Get-FileHash .\\willow-v0.0.1-windows-x86_64.zip -Algorithm SHA256` in PowerShell and compare the digest to the matching `SHA256SUMS` entry.
-
-### Build from source
-
-A Rust toolchain is required to build Willow from source.
-
-```bash
-git clone https://github.com/lechatthecat/willow.git
-cd willow
-cargo build --release
-```
-
-# License
-
-[MIT License](LICENSE)
