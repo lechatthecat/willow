@@ -861,6 +861,22 @@ struct PreparedBody {
     keys: Vec<String>,
     children: Vec<BodyId>,
 }
+// Every lambda binds to its enclosing declaration's BodySyntax. Copying that
+// entire syntax into every typed result costs O(body count * declaration size).
+// The table-local exact change stamp preserves syntax invalidation in O(1)
+// space per body, without relying on a hash for equality or retaining old trees.
+#[derive(PartialEq, Eq)]
+struct TypedBodyValue {
+    syntax_node: QueryNode,
+    syntax_revision: super::tracked::Revision,
+    result: CompactJson,
+}
+impl Retained for TypedBodyValue {
+    fn heap_bytes(&self) -> usize {
+        self.syntax_node.heap_bytes() + self.result.heap_bytes()
+    }
+}
+
 struct PreparedEffects {
     roots: Vec<BodyId>,
     imported: Vec<(UnitId, FunctionId)>,
@@ -898,15 +914,6 @@ impl CompactJson {
     }
     fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
         Ok(serde_json::from_slice(&self.bytes)?)
-    }
-    fn pair(a: &Self, b: &Self) -> Self {
-        let mut bytes = Vec::with_capacity(a.bytes.len() + b.bytes.len() + 3);
-        bytes.push(b'[');
-        bytes.extend_from_slice(&a.bytes);
-        bytes.push(b',');
-        bytes.extend_from_slice(&b.bytes);
-        bytes.push(b']');
-        Self::from_bytes(bytes)
     }
     fn into_query(self) -> QueryValue {
         let fingerprint = ResultFingerprint::bytes(&self.bytes);
@@ -1216,10 +1223,9 @@ impl QueryProvider for SyntaxProvider<'_> {
                 let Some(prepared) = self.prepared.get(body) else {
                     return Err(super::tracked::DeferredQuery(node.clone()).into());
                 };
-                let syntax = table.read(
-                    self,
-                    QueryNode::BodySyntax(binding.path.clone(), binding.owner.clone()),
-                )?;
+                let syntax_node =
+                    QueryNode::BodySyntax(binding.path.clone(), binding.owner.clone());
+                let (_, syntax_revision) = table.read_stamped(self, syntax_node.clone())?;
                 table.read(
                     self,
                     QueryNode::SyntaxSignature(binding.path.clone(), binding.owner.clone()),
@@ -1233,7 +1239,14 @@ impl QueryProvider for SyntaxProvider<'_> {
                 for child in &prepared.children {
                     table.read(self, QueryNode::TypedBody(*child))?;
                 }
-                Ok(CompactJson::pair(syntax.get::<CompactJson>(), &prepared.result).into_query())
+                Ok(QueryValue::new(
+                    TypedBodyValue {
+                        syntax_node,
+                        syntax_revision,
+                        result: prepared.result.clone(),
+                    },
+                    ResultFingerprint::bytes(&prepared.result.bytes),
+                ))
             }
             _ => anyhow::bail!("unsupported syntax query {node:?}"),
         }
@@ -1461,7 +1474,7 @@ mod tests {
         assert!(accepted > 10);
     }
     #[test]
-    fn compact_json_roundtrips_and_pairs_without_reparsing() {
+    fn compact_json_roundtrips() {
         let cases = [
             Value::Null,
             serde_json::json!(true),
@@ -1474,14 +1487,6 @@ mod tests {
         for a in &cases {
             let encoded = CompactJson::new(a).unwrap();
             assert_eq!(encoded.decode::<Value>().unwrap(), *a);
-            for b in &cases {
-                let pair = CompactJson::pair(&encoded, &CompactJson::new(b).unwrap());
-                assert_eq!(pair.decode::<Value>().unwrap(), serde_json::json!([a, b]));
-                assert_eq!(
-                    pair.bytes.len(),
-                    encoded.bytes.len() + serde_json::to_vec(b).unwrap().len() + 3
-                );
-            }
         }
     }
     #[test]
@@ -1870,6 +1875,54 @@ mod tests {
         };
         assert_eq!(function.span.line, 2);
         assert_eq!(next.stats().changed, 3); // parse, declarations, signature
+    }
+
+    #[test]
+    fn typed_syntax_stamp_is_scoped_to_its_query() {
+        let value = |owner: &str| TypedBodyValue {
+            syntax_node: QueryNode::BodySyntax("entry.wi".into(), owner.into()),
+            syntax_revision: super::super::tracked::Revision(1),
+            result: CompactJson::new(&Value::Null).unwrap(),
+        };
+        assert!(value("Function:f") == value("Function:f"));
+        assert!(value("Function:f") != value("Function:g"));
+    }
+
+    #[test]
+    fn typed_syntax_stamp_preserves_changes_with_equal_typed_results() {
+        let path = Path::new("entry.wi");
+        let body = BodyId::fresh();
+        let mut accepted = SyntaxQueries::default();
+        let mut stamps = Vec::new();
+        for (source, reuse) in [
+            ("fn f() -> i64 { return 1; }", false),
+            ("fn f() -> i64 { return 1; }", true),
+            ("\nfn f() -> i64 { return 1; }", true),
+            ("fn f() -> i64 { return 2; }", false),
+            ("fn f() -> i64 { return 1; }", false),
+        ] {
+            let mut next = accepted.candidate().unwrap();
+            next.parse(path, FileId::ENTRY, source).unwrap();
+            assert_eq!(
+                next.validate_body(UnitId::ENTRY, body, path, "Function:f", vec![])
+                    .unwrap(),
+                reuse
+            );
+            if !reuse {
+                next.publish_body(UnitId::ENTRY, body, Value::Null, vec![], vec![])
+                    .unwrap();
+            }
+            let value = next
+                .table
+                .read(&next.provider(), QueryNode::TypedBody(body))
+                .unwrap();
+            stamps.push(value.get::<TypedBodyValue>().syntax_revision);
+            accepted = next;
+        }
+        assert_eq!(stamps[0], stamps[1]);
+        assert_eq!(stamps[1], stamps[2]);
+        assert_ne!(stamps[2], stamps[3]);
+        assert_ne!(stamps[3], stamps[4]);
     }
 
     #[test]

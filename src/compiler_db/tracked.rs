@@ -629,10 +629,21 @@ impl TrackedQueryTable {
         provider: &impl QueryProvider,
         node: QueryNode,
     ) -> Result<QueryValue> {
+        self.read_stamped(provider, node).map(|(value, _)| value)
+    }
+    /// The stamp changes only when exact query-value equality detects a change.
+    /// It is meaningful within this table and its revision candidates only.
+    pub(crate) fn read_stamped(
+        &self,
+        provider: &impl QueryProvider,
+        node: QueryNode,
+    ) -> Result<(QueryValue, Revision)> {
         self.demanded.borrow_mut().insert(node.clone());
         let memo = self.validate(provider, &node)?;
         self.record(DependencyNode::Query(node), memo.changed_at);
-        memo.result.map_err(|error| anyhow::anyhow!("{error}"))
+        memo.result
+            .map(|value| (value, memo.changed_at))
+            .map_err(|error| anyhow::anyhow!("{error}"))
     }
     fn validate(&self, provider: &impl QueryProvider, node: &QueryNode) -> Result<Memo> {
         // Dependency validation walks an explicit stack: nested bodies form

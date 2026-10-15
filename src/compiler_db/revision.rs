@@ -1645,6 +1645,58 @@ mod tests {
         assert!(old.upgrade().is_none());
     }
 
+    fn assert_nested_revision_bytes(depth: usize) {
+        let f = Fixture::new();
+        use std::fmt::Write;
+        let mut source = "fn f(x: i64) -> i64 { ".to_owned();
+        for i in 0..depth {
+            write!(source, "let l{i} = |x: i64| {{ ").unwrap();
+        }
+        source.push_str("return x;");
+        for i in (0..depth).rev() {
+            write!(source, " }}; return l{i}(x);").unwrap();
+        }
+        source.push_str(" } fn main() { println(f(1)); }");
+        f.write("main.wi", &source);
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        assert!(f.compare(&mut warm));
+        assert!(f.compare(&mut warm));
+        assert_eq!((warm.typechecks, warm.reused_bodies), (0, depth + 2));
+        let bytes = warm.incremental_stats["retained_query_bytes"]
+            .as_u64()
+            .unwrap();
+        // A deterministic conservative bound, including map slack and
+        // all query families, rules out per-lambda whole-tree copies.
+        assert!(
+            bytes < 200_000 + 60_000 * depth as u64,
+            "depth={depth}: accounted {bytes} bytes"
+        );
+        println!(
+            "revision lambda_depth={depth} source_bytes={} rechecked=0 reused={} retained_bytes={} query_bytes={bytes}",
+            source.len(),
+            depth + 2,
+            warm.retained_artifact_bytes
+        );
+    }
+
+    #[test]
+    fn revision_deep_lambda_query_bytes_are_linear() {
+        // Keep the separate 1 MiB regression through depth 256. The deep
+        // end-to-end fixture exceeds that stack bound even without JSON pairs;
+        // this test isolates its byte budget from the small-stack regression.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                for depth in [512, 1024] {
+                    assert_nested_revision_bytes(depth);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn revision_reuse_scales_with_body_count_and_lambda_depth() {
         // Exercise query-backed nested lambdas below every CI target's default
@@ -1680,25 +1732,7 @@ mod tests {
                     );
                 }
                 for depth in [4, 16, 64, 256] {
-                    let f = Fixture::new();
-                    let mut body = "return x;".to_owned();
-                    for i in (0..depth).rev() {
-                        body = format!("let l{i} = |x: i64| {{ {body} }}; return l{i}(x);");
-                    }
-                    f.write(
-                        "main.wi",
-                        &format!("fn f(x: i64) -> i64 {{ {body} }} fn main() {{ println(f(1)); }}"),
-                    );
-                    let mut warm = AnalysisRevision::default();
-                    let _symbols = warm.symbols.enter();
-                    assert!(f.compare(&mut warm));
-                    assert!(f.compare(&mut warm));
-                    assert_eq!((warm.typechecks, warm.reused_bodies), (0, depth + 2));
-                    println!(
-                        "revision lambda_depth={depth} rechecked=0 reused={} retained_bytes={}",
-                        depth + 2,
-                        warm.retained_artifact_bytes
-                    );
+                    assert_nested_revision_bytes(depth);
                 }
             })
             .unwrap()

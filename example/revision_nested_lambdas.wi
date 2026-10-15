@@ -1,0 +1,12 @@
+// Nested lambda bodies share one declaration syntax in revision queries.
+fn nested(x: i64) -> i64 {
+    let outer = |a: i64| {
+        let middle = |b: i64| {
+            let inner = |c: i64| { return c + 1; };
+            return inner(b);
+        };
+        return middle(a);
+    };
+    return outer(x);
+}
+fn main() { println(nested(41)); }
