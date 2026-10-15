@@ -3100,6 +3100,7 @@ fn atomic_method(recv: &Type, method: &str, arity: usize) -> Option<(Intrinsic, 
         resolved.intrinsic,
         Intrinsic::AtomicLoad
             | Intrinsic::AtomicStore
+            | Intrinsic::AtomicCompareExchange
             | Intrinsic::AtomicSwap
             | Intrinsic::AtomicAdd
             | Intrinsic::AtomicSub
@@ -8008,7 +8009,7 @@ fn flat_intrinsic_supported(
                 _ => args.len() == 1 && ctx.same_repr(&types[0], &args[0]),
             }
         }
-        AtomicLoad | AtomicStore | AtomicSwap | AtomicAdd | AtomicSub => {
+        AtomicLoad | AtomicStore | AtomicSwap | AtomicCompareExchange | AtomicAdd | AtomicSub => {
             atomic_cell(receiver).is_some_and(|cell| args.iter().all(|arg| *arg == cell.word()))
         }
         CellGet | CellSet | RwCellRead | RwCellWrite => blocking_cell(receiver)
@@ -8276,12 +8277,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     _ => value.unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0)),
                 }
             }
-            AtomicLoad | AtomicStore | AtomicSwap | AtomicAdd | AtomicSub => {
+            AtomicLoad
+            | AtomicStore
+            | AtomicSwap
+            | AtomicCompareExchange
+            | AtomicAdd
+            | AtomicSub => {
                 let cell = atomic_cell(receiver_ty).expect("validated atomic intrinsic");
                 let operation = match intrinsic {
                     AtomicLoad => "load",
                     AtomicStore => "store",
                     AtomicSwap => "swap",
+                    AtomicCompareExchange => "compare_exchange",
                     AtomicAdd => "add",
                     AtomicSub => "sub",
                     _ => unreachable!(),

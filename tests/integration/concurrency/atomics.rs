@@ -192,3 +192,64 @@ fn test_atomic_bool_has_no_add() {
         &["error[E0806]", "no method `add`"],
     );
 }
+
+#[test]
+fn compare_exchange_rejects_invalid_arguments() {
+    for (cell, value, wrong) in [("AtomicI64", "0", "false"), ("AtomicBool", "false", "0")] {
+        for args in [
+            String::new(),
+            value.into(),
+            format!("{value}, {value}, {value}"),
+        ] {
+            assert_compile_error_contains(
+                &format!(
+                    "fn main() {{ let a = {cell}::new({value}); a.compare_exchange({args}); }}"
+                ),
+                &["error[E0201]", "expects 2 argument"],
+            );
+        }
+        for args in [format!("{wrong}, {value}"), format!("{value}, {wrong}")] {
+            assert_compile_error_contains(
+                &format!(
+                    "fn main() {{ let a = {cell}::new({value}); a.compare_exchange({args}); }}"
+                ),
+                &["error[E0201]", "wrong argument type"],
+            );
+        }
+    }
+}
+
+#[test]
+fn compare_exchange_failed_acquisition_and_nested_cleanup() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn release(a: AtomicBool) { a.store(false); }
+fn attempt(a: AtomicBool) -> bool {
+    if !a.compare_exchange(false, true) { return false; }
+    defer release(a);
+    return true;
+}
+fn nested(a: AtomicBool, b: AtomicBool) {
+    if a.compare_exchange(false, true) {
+        defer release(a);
+        if b.compare_exchange(false, true) {
+            defer release(b);
+            return;
+        }
+    }
+}
+fn main() {
+    let a = AtomicBool::new(true);
+    println(attempt(a));
+    println(a.load());
+    a.store(false);
+    let b = AtomicBool::new(false);
+    nested(a, b);
+    println(a.load());
+    println(b.load());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "false\ntrue\nfalse\nfalse\n");
+}

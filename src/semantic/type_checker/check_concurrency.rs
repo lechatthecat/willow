@@ -782,7 +782,7 @@ impl TypeChecker {
     }
 
     /// Type-check a method on `AtomicI64` / `AtomicBool` (willow-dgwo.3).
-    /// `load() -> T`, `store(T)`, `add(T)/sub(T) -> T` (i64 only), `swap(T) -> T`.
+    /// `compare_exchange(T, T) -> bool`, `load() -> T`, `store(T)`, `add(T)/sub(T) -> T` (i64 only), `swap(T) -> T`.
     pub(super) fn check_atomic_method_call(&mut self, atomic: &str, call: &MethodCallExpr) -> Type {
         let elem = if atomic == "AtomicI64" {
             Type::I64
@@ -793,6 +793,7 @@ impl TypeChecker {
         let sig: Option<(usize, Option<Type>, Type)> = match call.method.as_str() {
             "load" => Some((0, None, elem.clone())),
             "store" => Some((1, Some(elem.clone()), Type::Void)),
+            "compare_exchange" => Some((2, Some(elem.clone()), Type::Bool)),
             "swap" => Some((1, Some(elem.clone()), elem.clone())),
             "add" | "sub" if atomic == "AtomicI64" => Some((1, Some(Type::I64), Type::I64)),
             _ => None,
@@ -808,7 +809,7 @@ impl TypeChecker {
                     format!("`{atomic}` has no method `{}`", call.method),
                 )
                 .with_label(Label::primary(call.span, "unknown atomic method"))
-                .with_help("`AtomicI64`: load/store/add/sub/swap; `AtomicBool`: load/store/swap"),
+                .with_help("`AtomicI64`: load/store/add/sub/swap/compare_exchange; `AtomicBool`: load/store/swap/compare_exchange"),
             );
             return Type::Void;
         };
@@ -826,9 +827,13 @@ impl TypeChecker {
                 .with_label(Label::primary(call.span, "wrong number of arguments")),
             );
         }
-        if let (Some(expected), Some(arg)) = (arg_ty, call.args.first()) {
+        for arg in &call.args {
+            let Some(expected) = arg_ty.as_ref() else {
+                self.check_expr(&arg.expr);
+                continue;
+            };
             let got = self.check_expr(&arg.expr);
-            if got != expected && got != Type::Never {
+            if &got != expected && got != Type::Never {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -836,7 +841,7 @@ impl TypeChecker {
                         format!(
                             "`{atomic}::{}` expects `{}`, got `{}`",
                             call.method,
-                            type_name(&expected),
+                            type_name(expected),
                             type_name(&got)
                         ),
                     )

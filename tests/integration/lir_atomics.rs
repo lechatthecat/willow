@@ -553,3 +553,58 @@ fn main() {
         &["main"],
     );
 }
+
+#[test]
+fn compare_exchange_values_and_operand_lifetimes() {
+    assert_atomics(
+        r#"
+fn operand(log: AtomicI64, n: i64) -> i64 {
+    log.store(log.load() * 10 + n);
+    let garbage = AtomicI64::new(n);
+    return garbage.load();
+}
+fn receiver(log: AtomicI64) -> AtomicI64 {
+    log.store(1);
+    return AtomicI64::new(2);
+}
+fn main() {
+    let a = AtomicI64::new(-7);
+    println(a.compare_exchange(-7, 42));
+    println(a.load());
+    println(a.compare_exchange(-7, 9));
+    println(a.load());
+    println(a.compare_exchange(42, 42));
+    let lo = -9223372036854775807 - 1;
+    let hi = 9223372036854775807;
+    a.store(lo);
+    println(a.compare_exchange(lo, hi));
+    println(a.load());
+    println(a.compare_exchange(hi, lo));
+    println(a.load());
+    let b = AtomicBool::new(false);
+    println(b.compare_exchange(false, true));
+    println(b.load());
+    println(b.compare_exchange(false, false));
+    println(b.load());
+    println(b.compare_exchange(true, false));
+    println(b.compare_exchange(false, false));
+    println(b.load());
+    let log = AtomicI64::new(0);
+    println(receiver(log).compare_exchange(operand(log, 2), operand(log, 3)));
+    println(log.load());
+    println(AtomicBool::new(false).compare_exchange(operand(log, 4) == 0, operand(log, 5) == 5));
+}
+"#,
+        "true\n42\nfalse\n42\ntrue\ntrue\n9223372036854775807\ntrue\n-9223372036854775808\ntrue\ntrue\nfalse\ntrue\ntrue\ntrue\nfalse\ntrue\n123\ntrue\n",
+        &["operand", "receiver", "main"],
+    );
+}
+
+#[test]
+fn compare_exchange_permit_example() {
+    assert_atomics(
+        include_str!("../../example/atomic_permit.wi"),
+        "true\nfalse\ntrue\nfalse\ntrue\nfalse\n200\n",
+        &["release", "visit", "increment", "main"],
+    );
+}

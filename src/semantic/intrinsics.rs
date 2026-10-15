@@ -125,6 +125,8 @@ pub enum Intrinsic {
     AtomicStore,
     /// `AtomicI64::swap(v)` / `AtomicBool::swap(v)`.
     AtomicSwap,
+    /// Strong, sequentially consistent compare-and-exchange; returns success.
+    AtomicCompareExchange,
     /// `AtomicI64::add(v)` — `AtomicBool` has no arithmetic.
     AtomicAdd,
     /// `AtomicI64::sub(v)` — `AtomicBool` has no arithmetic.
@@ -276,6 +278,7 @@ impl Intrinsic {
         Intrinsic::AtomicLoad,
         Intrinsic::AtomicStore,
         Intrinsic::AtomicSwap,
+        Intrinsic::AtomicCompareExchange,
         Intrinsic::AtomicAdd,
         Intrinsic::AtomicSub,
         Intrinsic::CellGet,
@@ -356,6 +359,10 @@ impl Intrinsic {
             AtomicLoad => &["willow_atomic_i64_load", "willow_atomic_bool_load"],
             AtomicStore => &["willow_atomic_i64_store", "willow_atomic_bool_store"],
             AtomicSwap => &["willow_atomic_i64_swap", "willow_atomic_bool_swap"],
+            AtomicCompareExchange => &[
+                "willow_atomic_i64_compare_exchange",
+                "willow_atomic_bool_compare_exchange",
+            ],
             AtomicAdd => &["willow_atomic_i64_add"],
             AtomicSub => &["willow_atomic_i64_sub"],
             CellGet => &["willow_blocking_cell_get"],
@@ -650,6 +657,10 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
         && builtin.args.is_empty()
     {
         return match (builtin.id, method, arity) {
+            (B::AtomicI64 | B::AtomicBool, "compare_exchange", 2) => Some(ResolvedMethod::fixed(
+                Intrinsic::AtomicCompareExchange,
+                Type::Bool,
+            )),
             (B::AtomicI64, "load", 0) => {
                 Some(ResolvedMethod::fixed(Intrinsic::AtomicLoad, Type::I64))
             }
@@ -1417,6 +1428,7 @@ mod tests {
             "load",
             "store",
             "swap",
+            "compare_exchange",
             "add",
             "sub",
             "cancel",
@@ -1462,7 +1474,7 @@ mod tests {
         assert_eq!(unique.len(), Intrinsic::ALL.len(), "duplicate in ALL");
         assert_eq!(
             Intrinsic::ALL.len(),
-            60,
+            61,
             "Intrinsic::ALL must list every variant; update the count when adding one"
         );
     }
@@ -1711,10 +1723,12 @@ fn f() {
     let before_add = counter.add(3);
     let before_sub = counter.sub(2);
     let before_swap = counter.swap(100);
+    let changed = counter.compare_exchange(100, 101);
     let now = counter.load();
     let flag = AtomicBool::new(false);
     flag.store(true);
     let was = flag.swap(false);
+    let changed_flag = flag.compare_exchange(false, true);
     let set = flag.load();
 }
 "#;
@@ -1822,7 +1836,7 @@ async fn f() {
     /// result types: `swap` gives an i64 on one and a bool on the other.
     #[test]
     fn p40_atomics_agree() {
-        assert_agrees(ATOMICS, 8);
+        assert_agrees(ATOMICS, 10);
     }
 
     /// Perspective 41: `BlockingCell<T>` and `BlockingRwCell<T>` return their
@@ -1974,7 +1988,7 @@ fn f() {
             (STRINGS, 7),
             (ARRAYS, 6),
             (MAPS, 9),
-            (ATOMICS, 8),
+            (ATOMICS, 10),
             (CELLS, 4),
             (CHANNELS, 4),
             (TASKS, 3),

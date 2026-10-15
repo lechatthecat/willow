@@ -620,6 +620,8 @@ mod alloc_effects_tests {
             "willow_atomic_i64_add",
             "willow_atomic_bool_load",
             "willow_atomic_bool_swap",
+            "willow_atomic_i64_compare_exchange",
+            "willow_atomic_bool_compare_exchange",
         ] {
             assert!(!allocates(name), "{name} only touches an existing cell");
         }

@@ -1,0 +1,46 @@
+// AtomicI64.compare_exchange(expected: i64, desired: i64) -> bool
+// AtomicBool.compare_exchange(expected: bool, desired: bool) -> bool
+// Strong SeqCst CAS returns success, not the previous value (no spurious failure).
+// On mismatch the cell is unchanged. Both success and failure are SeqCst.
+// Expected == desired succeeds if the cell matches. Operands evaluate once,
+// receiver first, then expected, then desired. No import or async is required.
+// Register defer immediately after successful acquisition: every subsequent
+// normal/early return releases; failed acquisition must not release another owner.
+// This is an application permit, not a compiler-enforced guard or permission to
+// share ordinary mutable objects across tasks. It fails immediately when held;
+// prefer async Mutex/RwLock lock blocks when waiting is needed. CAS retries may
+// starve and do not detect ABA. Process abort/exit cannot guarantee cleanup.
+// A non-blocking single permit: register synchronous cleanup only after acquisition.
+fn release(held: AtomicBool) { held.store(false); }
+fn visit(held: AtomicBool, route: i64) -> bool {
+    if !held.compare_exchange(false, true) { return false; }
+    defer release(held);
+    if route == 0 { return true; }
+    if route == 1 { return true; }
+    return true;
+}
+
+// Optimistic counter update: retry a failed CAS without overwriting another task.
+async fn increment(counter: AtomicI64) {
+    for i in 0..100 {
+        let mut updated = false;
+        while !updated {
+            let old = counter.load();
+            updated = counter.compare_exchange(old, old + 1);
+            if !updated { await yield(); }
+        }
+    }
+}
+async fn main() {
+    let held = AtomicBool::new(false);
+    for route in 0..3 {
+        println(visit(held, route));
+        println(held.load());
+    }
+    let counter = AtomicI64::new(0);
+    let first = increment(counter);
+    let second = increment(counter);
+    await first;
+    await second;
+    println(counter.load());
+}

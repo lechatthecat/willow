@@ -115,10 +115,73 @@ pub extern "C" fn willow_atomic_bool_swap(ptr: *mut c_void, value: u8) -> u8 {
     unsafe { as_bool(ptr).swap(value != 0, SeqCst) as u8 }
 }
 
+/// Strong CAS: replace only on equality, returning 1 on success, 0 on mismatch.
+/// Both success and failure are sequentially consistent; never spuriously fails.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_atomic_i64_compare_exchange(
+    ptr: *mut c_void,
+    expected: i64,
+    desired: i64,
+) -> u8 {
+    unsafe {
+        as_i64(ptr)
+            .compare_exchange(expected, desired, SeqCst, SeqCst)
+            .is_ok() as u8
+    }
+}
+
+/// Boolean counterpart of `willow_atomic_i64_compare_exchange`.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_atomic_bool_compare_exchange(
+    ptr: *mut c_void,
+    expected: u8,
+    desired: u8,
+) -> u8 {
+    unsafe {
+        as_bool(ptr)
+            .compare_exchange(expected != 0, desired != 0, SeqCst, SeqCst)
+            .is_ok() as u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gc::{runtime_test_guard, willow_gc_init};
+
+    #[test]
+    fn compare_exchange_contention_has_exactly_one_winner() {
+        // Stack-backed Rust atomics exercise the FFI operation without involving GC.
+        let integer = AtomicI64::new(0);
+        let boolean = AtomicBool::new(false);
+        let winners = AtomicI64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    let p = &integer as *const AtomicI64 as *mut c_void;
+                    winners.fetch_add(willow_atomic_i64_compare_exchange(p, 0, 1) as i64, SeqCst);
+                    let p = &boolean as *const AtomicBool as *mut c_void;
+                    winners.fetch_add(willow_atomic_bool_compare_exchange(p, 0, 1) as i64, SeqCst);
+                });
+            }
+        });
+        assert_eq!(winners.load(SeqCst), 2);
+        assert_eq!(integer.load(SeqCst), 1);
+        assert!(boolean.load(SeqCst));
+    }
+
+    #[test]
+    fn compare_exchange_boolean_abi_normalizes_nonzero() {
+        let cell = AtomicBool::new(true);
+        let p = &cell as *const AtomicBool as *mut c_void;
+        assert_eq!(willow_atomic_bool_compare_exchange(p, 255, 0), 1);
+        assert_eq!(willow_atomic_bool_compare_exchange(p, 2, 255), 0);
+        assert!(!cell.load(SeqCst));
+        assert_eq!(willow_atomic_bool_compare_exchange(p, 0, 255), 1);
+        assert!(cell.load(SeqCst));
+    }
 
     fn failed_allocation(kind: GcObjectKind, type_id: u32, size: i64, mask: u64) -> *mut u8 {
         assert_eq!(kind, GcObjectKind::AtomicCell);
