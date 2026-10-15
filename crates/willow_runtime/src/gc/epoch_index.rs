@@ -616,17 +616,83 @@ mod tests {
         let mut state = runtime().heap.lock().unwrap();
         retire_all_tlabs_unindexed(&mut state);
         index.complete_initial(&state);
-        for (page, candidates) in old_pages {
-            assert_eq!(index.pages[&page], candidates);
-        }
+        drop(state);
+        assert_prepared_candidates_preserved(&index, &old_pages);
         // Dedicated late objects add no payload pages; only the new TLAB does.
-        assert!(index.refresh_page_visits - before <= GC_TLAB_CHUNK_SIZE / PAGE_BYTES + 1);
+        assert!(
+            index.refresh_page_visits - before <= GC_TLAB_CHUNK_SIZE / PAGE_BYTES + 1,
+            "late publication rebuilt prepared pages: before={before}, after={}",
+            index.refresh_page_visits
+        );
         let epoch = EpochIndex::regions(index);
         for pointer in [first, young, late] {
-            assert!(epoch.claim(pointer as usize));
+            assert!(
+                epoch.claim(pointer as usize),
+                "missing or already marked object {pointer:p}"
+            );
         }
-        drop(state);
         reset_internal_for_test();
+    }
+
+    fn assert_prepared_candidates_preserved(index: &RegionIndex, old: &IdMap<usize, [usize; 2]>) {
+        for (&page, candidates) in old {
+            for (slot, &id) in candidates.iter().enumerate() {
+                // A late, disjoint extent may occupy the unused slot on a
+                // shared boundary page. Only existing candidates are immutable.
+                if id != usize::MAX {
+                    assert_eq!(
+                        index.pages[&page][slot], id,
+                        "prepared page {page}, slot {slot}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_publication_preserves_candidates_on_shared_boundary_pages() {
+        for count in [1, 16, 64, 256] {
+            let mut index = empty();
+            let view = |base| {
+                let starts = Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(
+                    PAGE_BYTES / GC_REGION_MARK_GRANULE,
+                ));
+                starts.set(0);
+                RegionView {
+                    base,
+                    capacity: PAGE_BYTES,
+                    starts,
+                    marks: Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(
+                        PAGE_BYTES / GC_REGION_MARK_GRANULE,
+                    )),
+                }
+            };
+            for id in 0..count {
+                let v = view(GC_REGION_MARK_GRANULE + id * PAGE_BYTES);
+                index.add(v.base, v.capacity, &v.starts, &v.marks, false);
+            }
+            let old = index.pages.clone();
+            let before = index.refresh_page_visits;
+            index.publish_late(LatePreparation {
+                views: vec![(view(GC_REGION_MARK_GRANULE + count * PAGE_BYTES), false)],
+                new_old_regions: 0,
+                old_regions: count,
+                old_objects: count,
+                objects: count + 1,
+            });
+            // Reproduces the old equality assertion's failure deterministically.
+            assert_ne!(index.pages[&count], old[&count]);
+            assert_eq!(index.pages[&count], [count - 1, count]);
+            assert_prepared_candidates_preserved(&index, &old);
+            assert_eq!(index.refresh_page_visits - before, 2);
+            let epoch = EpochIndex::regions(index);
+            for id in 0..=count {
+                let address = GC_REGION_MARK_GRANULE + id * PAGE_BYTES + GC_HEADER_SIZE;
+                assert!(epoch.claim(address), "extent {id} of {count}");
+                assert!(!epoch.claim(address));
+            }
+            println!("late publication prepared={count} added_page_visits=2");
+        }
     }
 
     fn empty() -> RegionIndex {
