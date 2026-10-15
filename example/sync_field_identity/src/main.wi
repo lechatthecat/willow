@@ -1,0 +1,16 @@
+import std::collections::Array;
+import readonly::Record;
+import mutable;
+import stats::{Stats, work};
+async fn read(r: Record) -> i64 { return r.cell; }
+async fn main() {
+    mutable::update(new mutable::Record(0));
+    println(await read(new Record(7)));
+    let s = new Stats(AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0));
+    let tasks: Array<Task<void>> = [];
+    for i in 0..8 { tasks.push(work(s, 1000)); }
+    for t in tasks { await t; }
+    println(s.levels.load());
+    println(s.jobs.load());
+    println(s.unordered.load());
+}

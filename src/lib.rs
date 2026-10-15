@@ -967,8 +967,9 @@ fn run_frontend_revision(
             graph
                 .files
                 .iter()
-                .map(|module| &module.program)
-                .chain(std::iter::once(&program)),
+                .map(|module| (module.identity_path(), &module.program))
+                .chain(std::iter::once(("", &program))),
+            db.dependencies(),
         ),
     );
     let mut bridge_identity = None;

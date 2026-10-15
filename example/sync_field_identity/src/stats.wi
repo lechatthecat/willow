@@ -1,0 +1,12 @@
+pub class Stats {
+    pub levels: AtomicI64;
+    pub jobs: AtomicI64;
+    pub unordered: AtomicI64;
+}
+pub async fn work(stats: Stats, rounds: i64) {
+    for i in 0..rounds {
+        stats.levels.add(1);
+        stats.jobs.add(2);
+        stats.unordered.add(3);
+    }
+}

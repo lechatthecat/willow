@@ -391,6 +391,7 @@ impl TypeChecker {
     fn prepare_lock_effect_analysis(&mut self, program: &Program) {
         self.local.current_effect_callable = None;
         self.effect_index.callables.clear();
+        self.effect_index.local_methods.clear();
         self.effect_index.imports = program
             .imports
             .iter()
@@ -430,13 +431,25 @@ impl TypeChecker {
                 }
                 Item::Class(class) => {
                     let owner = TypeId::local(class.name.as_str());
+                    let canonical = self
+                        .symbols
+                        .lookup_class(&class.name)
+                        .map_or(owner, |info| TypeId::from_source_name(&info.name));
                     for method in &class.methods {
+                        self.effect_index.local_methods.insert(
+                            FunctionId::method(canonical, &method.name),
+                            FunctionId::method(owner, &method.name),
+                        );
                         self.effect_index.callables.insert(
                             FunctionId::method(owner, method.name.as_str()),
                             method.is_async,
                         );
                     }
                     if !class.constructors.is_empty() {
+                        self.effect_index.local_methods.insert(
+                            FunctionId::method(canonical, "init"),
+                            FunctionId::method(owner, "init"),
+                        );
                         self.effect_index
                             .callables
                             .insert(FunctionId::method(owner, "init"), false);
@@ -534,7 +547,12 @@ impl TypeChecker {
         classes.sort_by(|left, right| left.name.cmp(&right.name));
         classes.dedup_by(|left, right| left.name == right.name);
         for class in classes {
-            hierarchy.add_class(&class.name, class.base_class.as_deref());
+            let base = class.base_class.as_deref().map(|base| {
+                self.symbols
+                    .lookup_class(base)
+                    .map_or(base, |info| info.name.as_str())
+            });
+            hierarchy.add_class(&class.name, base);
             for (name, method) in &class.methods {
                 // A static method is not a dispatch target: an instance call
                 // can never select it, so it must not appear in the union.
@@ -629,6 +647,13 @@ impl TypeChecker {
                         // Conformance checking owns the missing-method error.
                         continue;
                     };
+                    // An inherited base spelling can be source-local even when
+                    // the receiver and interface are canonical declarations.
+                    let declaring = self
+                        .symbols
+                        .lookup_class(&declaring)
+                        .map(|info| info.name.clone())
+                        .unwrap_or(declaring);
                     let local = local_methods.get(&(declaring.clone(), method_name.clone()));
                     // Match declarations by canonical identity, while this
                     // unit's body graph keeps its source-local callable keys.
@@ -701,15 +726,28 @@ impl TypeChecker {
                                 .lookup_class(&declaring)
                                 .and_then(|info| info.methods.get(method_name))
                                 .map_or(class.declaration_span, |method| method.declaration_span);
-                            self.effect_inputs
-                                .direct
-                                .entry(implementation_id)
-                                .or_insert(LockEffectCause {
+                            let cause = self
+                                .effect_queries
+                                .as_ref()
+                                .and_then(|(queries, unit)| {
+                                    let (declaring, id) = queries.external_target(
+                                        *unit,
+                                        &implementation_id,
+                                        &self.effect_index.imports,
+                                    )?;
+                                    let evidence = queries.effect_evidence(declaring, id)?;
+                                    evidence.witness(LOCK_EFFECT_WAIT)?.lock().cloned()
+                                })
+                                .unwrap_or_else(|| LockEffectCause {
                                     span,
                                     operation: "interface dispatch to an imported implementation"
                                         .into(),
                                     kind,
                                 });
+                            self.effect_inputs
+                                .direct
+                                .entry(implementation_id)
+                                .or_insert(cause);
                         }
                     }
                 }
@@ -767,6 +805,7 @@ impl TypeChecker {
     /// graph stays complete without the wait leaking into the caller. For the
     /// same reason a bare async call is never itself a lock-held wait site.
     pub(super) fn record_lock_effect_call(&mut self, callee: FunctionId, span: Span) {
+        let callee = self.effect_index.local_target(callee);
         let Some(callee_is_async) = self.lock_callee_is_async(&callee) else {
             return;
         };
@@ -793,6 +832,7 @@ impl TypeChecker {
     /// Whether a named callable of this unit or an imported one is `async`;
     /// `None` when it is neither (a builtin, or an unresolved name).
     pub(super) fn lock_callee_is_async(&self, callee: &FunctionId) -> Option<bool> {
+        let callee = &self.effect_index.local_target(*callee);
         if let Some(is_async) = self.effect_index.callables.get(callee) {
             return Some(*is_async);
         }
@@ -2248,7 +2288,7 @@ impl TypeChecker {
     /// Record resolution at the checked expression, while lexical bindings and
     /// receiver types are still available. Unknown is explicit for panic safety.
     fn record_resolved_call(&mut self, expr: &Expr) {
-        let targets = match expr {
+        let mut targets = match expr {
             Expr::Var(name, _, id)
                 if self.capture_call_sites
                     && self.symbols.lookup_var(name).is_none()
@@ -2398,10 +2438,16 @@ impl TypeChecker {
         } else {
             None
         };
+        for target in &mut targets {
+            *target = self.effect_index.local_target(*target);
+        }
         let sites = self.resolved_calls.entry(caller).or_default();
         sites.unsupported_initialization.extend(unsupported);
         sites.virtual_calls.extend(virtual_call);
         sites.has_unknown |= targets.is_empty();
+        // Keep canonical IDs in typed call-site/dispatch metadata, but connect
+        // the unit effect graph to its source-local body IDs. Otherwise a
+        // self call in an imported module queries its own unfinished effects.
         sites.targets.extend(targets);
     }
 

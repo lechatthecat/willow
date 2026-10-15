@@ -1380,3 +1380,263 @@ fn stable_borrowed_scalars_example() {
     assert!(ok, "{out}");
     assert_eq!(out, "42\n4.25\ntrue\n");
 }
+
+#[test]
+fn lock_project_local_method_identity() {
+    let project = TestProject::new(
+        "lock_project_local_identity",
+        &[
+            (
+                "project.toml",
+                "[project]\nname=\"lock-evidence\"\nversion=\"0.1.0\"\n[willow]\nmanifest-version=1\n",
+            ),
+            (
+                "src/sheet.wi",
+                "pub class Sheet { pub n: i64; pub fn set(self, id: i64) -> i64 { if !self.ok(id) { return 0; } return id; } pub fn ok(self, id: i64) -> bool { return id >= 0; } }",
+            ),
+            (
+                "src/main.wi",
+                "import sheet::Sheet; async fn main() { let doc = Mutex::new(new Sheet(0)); lock doc as s { println(s.set(1)); } }",
+            ),
+        ],
+    );
+    let output = project.package_command("check");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = project.package_command("build");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = project.run();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1");
+}
+
+/// Ten call shapes, each checked both with a pure leaf and a blocking leaf.
+#[test]
+fn lock_project_method_evidence_matrix() {
+    let shapes = [
+        (
+            "self",
+            "",
+            "pub fn run(self) -> i64 { return self.leaf(); }",
+        ),
+        (
+            "chain",
+            "",
+            "pub fn run(self) -> i64 { return self.mid(); } pub fn mid(self) -> i64 { return self.leaf(); }",
+        ),
+        (
+            "recursive",
+            "",
+            "pub fn run(self) -> i64 { return self.recur(0); } pub fn recur(self, n: i64) -> i64 { if n > 0 { return self.recur(n - 1); } return self.leaf(); }",
+        ),
+        (
+            "mutual",
+            "",
+            "pub fn run(self) -> i64 { return self.a(0); } pub fn a(self, n: i64) -> i64 { if n > 0 { return self.b(n - 1); } return self.leaf(); } pub fn b(self, n: i64) -> i64 { return self.a(n); }",
+        ),
+        (
+            "static",
+            "",
+            "pub fn run(self) -> i64 { return C::helper(self); } pub static fn helper(c: C) -> i64 { return c.leaf(); }",
+        ),
+        (
+            "free",
+            "pub fn helper(c: C) -> i64 { return c.leaf(); }",
+            "pub fn run(self) -> i64 { return helper(self); }",
+        ),
+        (
+            "branch",
+            "",
+            "pub fn run(self) -> i64 { if self.leaf() > 0 { return self.leaf(); } return 0; }",
+        ),
+        (
+            "loop",
+            "",
+            "pub fn run(self) -> i64 { let mut n = 0; for i in 0..2 { n = self.leaf(); } return n; }",
+        ),
+        (
+            "interface",
+            "pub interface I extends Send { fn run(self) -> i64; }",
+            "pub fn run(self) -> i64 { return self.leaf(); }",
+        ),
+        (
+            "default",
+            "pub interface I extends Send { fn leaf(self) -> i64; fn run(self) -> i64 { return self.leaf(); } }",
+            "",
+        ),
+    ];
+    for (shape, prefix, methods) in shapes {
+        for blocking in [false, true] {
+            let implements = if matches!(shape, "interface" | "default") {
+                " implements I"
+            } else {
+                ""
+            };
+            let leaf = if blocking {
+                "let value = self.ch.recv(); return 7;"
+            } else {
+                "return 7;"
+            };
+            let provider = format!(
+                "{prefix} pub class C{implements} {{ pub ch: Channel<i64>; pub fn leaf(self) -> i64 {{ {leaf} }} {methods} }}"
+            );
+            let receiver = if matches!(shape, "interface" | "default") {
+                "let c: provider::I = new provider::C(ch);"
+            } else {
+                "let c = new provider::C(ch);"
+            };
+            let main = format!(
+                "import provider; async fn main() {{ let ch: Channel<i64> = Channel::new(); {receiver} let m = Mutex::new(0); lock m as n {{ println(c.run()); }} }}"
+            );
+            let project = TestProject::new(
+                "lock_project_evidence",
+                &[
+                    (
+                        "project.toml",
+                        "[project]\nname=\"lock-evidence\"\nversion=\"0.1.0\"\n[willow]\nmanifest-version=1\n",
+                    ),
+                    ("src/provider.wi", &provider),
+                    ("src/main.wi", &main),
+                ],
+            );
+            let output = project.package_command("check");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if blocking {
+                assert!(
+                    !output.status.success() && stderr.contains("E2604"),
+                    "{shape}: {stderr}"
+                );
+                assert!(stderr.contains("Channel.recv"), "{shape}: {stderr}");
+            } else {
+                assert!(output.status.success(), "{shape}: {stderr}");
+                let output = project.package_command("build");
+                assert!(
+                    output.status.success(),
+                    "{shape}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let output = project.run();
+                assert!(
+                    output.status.success(),
+                    "{shape}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    "7",
+                    "{shape}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn lock_project_inherited_interface_evidence() {
+    for blocking in [false, true] {
+        let leaf = if blocking {
+            "let value = self.ch.recv(); return 9;"
+        } else {
+            "return 9;"
+        };
+        let provider = format!(
+            "pub interface I extends Send {{ fn run(self) -> i64; }} pub open class Base implements I {{ pub ch: Channel<i64>; pub fn run(self) -> i64 {{ return self.leaf(); }} pub open fn leaf(self) -> i64 {{ return 0; }} }} pub class Child extends Base {{ pub override fn leaf(self) -> i64 {{ {leaf} }} }}"
+        );
+        for (import, receiver) in [
+            ("import provider;", "provider::Child"),
+            ("import provider::Child as Selected;", "Selected"),
+        ] {
+            let main = format!(
+                "{import} async fn main() {{ let ch: Channel<i64> = Channel::new(); let c = new {receiver}(ch); let m = Mutex::new(0); lock m as n {{ println(c.run()); }} }}"
+            );
+            let project = TestProject::new(
+                "lock_project_inherited",
+                &[
+                    (
+                        "project.toml",
+                        "[project]\nname=\"lock-evidence\"\nversion=\"0.1.0\"\n[willow]\nmanifest-version=1\n",
+                    ),
+                    ("src/provider.wi", &provider),
+                    ("src/main.wi", &main),
+                ],
+            );
+            let output = project.package_command("check");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if blocking {
+                assert!(
+                    !output.status.success()
+                        && stderr.contains("E2604")
+                        && stderr.contains("Channel.recv"),
+                    "{stderr}"
+                );
+            } else {
+                assert!(output.status.success(), "{stderr}");
+                let output = project.package_command("build");
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let output = project.run();
+                assert!(output.status.success());
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "9");
+            }
+        }
+    }
+}
+
+#[test]
+fn lock_project_super_constructor_evidence() {
+    for blocking in [false, true] {
+        let wait = if blocking {
+            "let value = ch.recv();"
+        } else {
+            ""
+        };
+        let provider = format!(
+            "pub open class Base {{ pub n: i64; pub init(self, ch: Channel<i64>) {{ self.n = 8; {wait} }} }} pub class Child extends Base {{ pub init(self, ch: Channel<i64>) {{ super.init(ch); }} pub fn get(self) -> i64 {{ return self.n; }} }} pub fn build(ch: Channel<i64>) -> i64 {{ return new Child(ch).get(); }}"
+        );
+        let project = TestProject::new(
+            "lock_project_super",
+            &[
+                (
+                    "project.toml",
+                    "[project]\nname='lock-super'\nversion='0.1.0'\n[willow]\nmanifest-version=1\n",
+                ),
+                ("src/provider.wi", &provider),
+                (
+                    "src/main.wi",
+                    "import provider; async fn main() { let ch: Channel<i64> = Channel::new(); let m = Mutex::new(0); lock m as n { println(provider::build(ch)); } }",
+                ),
+            ],
+        );
+        let output = project.package_command("check");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if blocking {
+            assert!(
+                !output.status.success()
+                    && stderr.contains("E2604")
+                    && stderr.contains("Channel.recv"),
+                "{stderr}"
+            );
+        } else {
+            assert!(output.status.success(), "{stderr}");
+            let output = project.package_command("build");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = project.run();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "8");
+        }
+    }
+}

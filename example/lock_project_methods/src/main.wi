@@ -1,0 +1,9 @@
+import sheet::{Sheet, Derived, Value};
+async fn main() {
+    let doc = Mutex::new(new Sheet(0));
+    let view: Value = new Derived(6);
+    lock doc as s {
+        println(s.set(1));
+        println(view.get());
+    }
+}

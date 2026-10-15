@@ -1,0 +1,5 @@
+[project]
+name="sync-field-identity"
+version="0.1.0"
+[willow]
+manifest-version=1

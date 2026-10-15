@@ -493,12 +493,20 @@ impl UnitArtifacts {
         self.read(*self.sources.get(&id).context("missing source snapshot")?)
     }
 
-    fn offload_block(&mut self, block: &mut Block, context: WriteContext<'_>) -> Result<()> {
+    fn offload_block(
+        &mut self,
+        block: &mut Block,
+        context: WriteContext<'_>,
+        params: &[crate::parser::ast::Param],
+        type_params: &[String],
+    ) -> Result<()> {
         if !self.blocks.contains_key(&block.id) {
             let id = self.write(block)?;
             self.blocks.insert(block.id, id);
-            self.field_writes
-                .insert(block.id, BodyRef::Block(block).collect(context));
+            self.field_writes.insert(
+                block.id,
+                BodyRef::Block(block).collect_with_bindings(context, params, type_params),
+            );
         }
         block.stmts = Vec::new();
         Ok(())
@@ -511,17 +519,27 @@ impl UnitArtifacts {
         self.body_index_mut().register_program(program);
         for item in &mut program.items {
             match item {
-                Item::Function(function) => {
-                    self.offload_block(&mut function.body, WriteContext::Free)?
-                }
+                Item::Function(function) => self.offload_block(
+                    &mut function.body,
+                    WriteContext::Free,
+                    &function.params,
+                    &function.type_params,
+                )?,
                 Item::Class(class) => {
                     for method in &mut class.methods {
-                        self.offload_block(&mut method.body, WriteContext::Method(&class.name))?;
+                        self.offload_block(
+                            &mut method.body,
+                            WriteContext::Method(&class.name),
+                            &method.params,
+                            &class.type_params,
+                        )?;
                     }
                     for constructor in &mut class.constructors {
                         self.offload_block(
                             &mut constructor.body,
                             WriteContext::Constructor(&class.name),
+                            &constructor.params,
+                            &class.type_params,
                         )?;
                     }
                     for field in &mut class.fields {
@@ -535,7 +553,11 @@ impl UnitArtifacts {
                                 self.initializers.insert(id, artifact);
                                 self.field_writes.insert(
                                     id,
-                                    BodyRef::Initializer(expr).collect(WriteContext::Free),
+                                    BodyRef::Initializer(expr).collect_with_bindings(
+                                        WriteContext::Free,
+                                        &[],
+                                        &class.type_params,
+                                    ),
                                 );
                             }
                             *expr = Expr::Bool(false, expr.span(), expr.id());
@@ -545,7 +567,12 @@ impl UnitArtifacts {
                 Item::Interface(interface) => {
                     for method in &mut interface.methods {
                         if let Some(body) = &mut method.default_body {
-                            self.offload_block(body, WriteContext::Free)?;
+                            self.offload_block(
+                                body,
+                                WriteContext::Free,
+                                &method.params,
+                                &interface.type_params,
+                            )?;
                         }
                     }
                 }
@@ -561,26 +588,33 @@ impl UnitArtifacts {
     /// walked directly.
     pub(crate) fn field_writes<'a>(
         &self,
-        programs: impl IntoIterator<Item = &'a Program> + Clone,
+        programs: impl IntoIterator<Item = (&'a str, &'a Program)> + Clone,
+        dependencies: &'a crate::compiler_db::dependencies::ModuleDependencies,
     ) -> FieldWrites {
         let mut writes: Vec<&RawFieldWrite> = Vec::new();
         let mut resident = HashSet::new();
-        for program in programs.clone() {
-            crate::semantic::field_writes::for_each_body(program, |body, context| {
-                let key = match &body {
-                    BodyRef::Block(block) => Some(self.bodies.source_body(block.id)),
-                    BodyRef::Initializer(expr) => self.bodies.initializer_body(expr.id()),
-                };
-                match key.and_then(|key| self.field_writes.get(&key)) {
-                    Some(recorded) => writes.extend(recorded),
-                    None => resident.extend(body.collect(context)),
-                }
-            });
+        for (_, program) in programs.clone() {
+            crate::semantic::field_writes::for_each_body(
+                program,
+                |body, context, params, type_params| {
+                    let key = match &body {
+                        BodyRef::Block(block) => Some(self.bodies.source_body(block.id)),
+                        BodyRef::Initializer(expr) => self.bodies.initializer_body(expr.id()),
+                    };
+                    match key.and_then(|key| self.field_writes.get(&key)) {
+                        Some(recorded) => writes.extend(recorded),
+                        None => resident.extend(body.collect_with_bindings(
+                            context,
+                            params,
+                            type_params,
+                        )),
+                    }
+                },
+            );
         }
-        FieldWrites::resolve(
-            programs
-                .into_iter()
-                .flat_map(crate::semantic::field_writes::classes),
+        FieldWrites::resolve_programs(
+            programs,
+            Some(dependencies),
             writes.into_iter().chain(&resident),
         )
     }

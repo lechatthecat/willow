@@ -562,14 +562,15 @@ impl TypeChecker {
         };
 
         if let Some(caller) = self.local.current_effect_callable {
+            let target = self.effect_index.local_target(FunctionId::method(
+                TypeId::from_source_name(&base.name),
+                "init",
+            ));
             self.resolved_calls
                 .entry(caller)
                 .or_default()
                 .targets
-                .insert(FunctionId::method(
-                    TypeId::from_source_name(&base.name),
-                    "init",
-                ));
+                .insert(target);
         }
         let param_infos: Vec<ParamInfo> = match base.constructor.clone() {
             Some(ci) => {

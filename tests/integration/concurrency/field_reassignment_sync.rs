@@ -397,13 +397,14 @@ async fn main() { println(await read(new A(1))); }
 
 #[test]
 fn test_jz15_78_unresolved_receiver_is_conservative() {
-    // Without types, `b.n = …` marks every instance field named `n`.
+    // A return-value receiver remains unknown to the pre-check inventory.
     assert_not_sync(
         r#"
 class A { pub n: i64; }
 class B { pub n: i64; }
 async fn read(a: A) -> i64 { await sleep(1); return a.n; }
-async fn main() { let b = new B(1); b.n = 2; println(await read(new A(1))); }
+fn make() -> B { return new B(1); }
+async fn main() { let b = make(); b.n = 2; println(await read(new A(1))); }
 "#,
         &["cannot pass `A`", REASSIGNED],
     );
@@ -551,4 +552,271 @@ fn test_jz15_78_runnable_example() {
     let (out, ok) = compile_and_run(include_str!("../../../example/sync_field_reassignment.wi"));
     assert!(ok, "{out}");
     assert_eq!(out, "hits 800\ntotal 1600\nboxed 1600\n");
+}
+
+// willow-jz15.81: declaration-aware receiver inventory. Every variant checks
+// both the read-only namesake and rejection of the actually written class.
+#[test]
+fn test_jz15_81_sync_receiver_matrix() {
+    let cases = [
+        ("new", "fn mutate() { let b = new B(0); b.cell = 1; }"),
+        ("parameter", "fn mutate(b: B) { b.cell = 1; }"),
+        (
+            "annotation",
+            "fn mutate() { let b: B = new B(0); b.cell = 1; }",
+        ),
+        (
+            "alias",
+            "fn mutate() { let first = new B(0); let b = first; b.cell = 1; }",
+        ),
+        (
+            "shadow",
+            "fn mutate(a: A) { if true { let a = new B(0); a.cell = 1; } }",
+        ),
+        (
+            "restore",
+            "fn mutate() { let b = new B(0); if true { let b = new A(0); println(b.cell); } b.cell = 1; }",
+        ),
+        (
+            "lambda_capture",
+            "fn mutate() { let b = new B(0); let f = || { b.cell = 1; }; f(); }",
+        ),
+        (
+            "lambda_param",
+            "fn mutate() { let f = |b: B| { b.cell = 1; }; f(new B(0)); }",
+        ),
+        (
+            "reference",
+            "fn set(x: &mut i64) { x = 1; } fn mutate(b: B) { set(&b.cell); }",
+        ),
+        ("direct_new", "fn mutate() { new B(0).cell = 1; }"),
+        ("defer", "fn mutate(b: B) { defer { b.cell = 1; } }"),
+    ];
+    for (name, mutation) in cases {
+        for (reader, accepted) in [("A", true), ("B", false)] {
+            let source = format!(
+                "class A {{ pub cell: i64; }} class B {{ pub cell: i64; }} {mutation} async fn read(x: {reader}) -> i64 {{ return x.cell; }} async fn main() {{ println(await read(new {reader}(7))); }}"
+            );
+            let project = TestProject::new(
+                "sync_receiver_matrix",
+                &[
+                    (
+                        "project.toml",
+                        "[project]\nname='sync-matrix'\nversion='0.1.0'\n[willow]\nmanifest-version=1\n",
+                    ),
+                    ("src/main.wi", &source),
+                ],
+            );
+            let output = project.package_command("check");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.success(),
+                accepted,
+                "{name} {reader}: {stderr}"
+            );
+            if !accepted {
+                assert!(stderr.contains("E2402"), "{name}: {stderr}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_jz15_81_sync_module_declarations() {
+    for (import, ty) in [
+        ("import mutable::Record;", "Record"),
+        ("import mutable::Record as Selected;", "Selected"),
+        ("import mutable as m;", "m::Record"),
+    ] {
+        for (reader, accepted) in [("readonly", true), ("mutable", false)] {
+            let writer = format!("{import} pub fn mutate(x: {ty}) {{ x.cell = 9; }}");
+            let main = format!(
+                "import readonly; import mutable; import writer; async fn read(x: {reader}::Record) -> i64 {{ return x.cell; }} async fn main() {{ println(await read(new {reader}::Record(7))); }}"
+            );
+            let project = TestProject::new(
+                "sync_module_identity",
+                &[
+                    (
+                        "project.toml",
+                        "[project]\nname='sync-modules'\nversion='0.1.0'\n[willow]\nmanifest-version=1\n",
+                    ),
+                    ("src/readonly.wi", "pub class Record { pub cell: i64; }"),
+                    ("src/mutable.wi", "pub class Record { pub cell: i64; }"),
+                    ("src/writer.wi", &writer),
+                    ("src/main.wi", &main),
+                ],
+            );
+            let output = project.package_command("check");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.success(),
+                accepted,
+                "{import} {reader}: {stderr}"
+            );
+            if !accepted {
+                assert!(stderr.contains("E2402"), "{stderr}");
+            } else {
+                let output = project.package_command("build");
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let output = project.run();
+                assert!(output.status.success());
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "7");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_jz15_81_sync_atomic_stats_and_namesake_run() {
+    let project = TestProject::new(
+        "sync_atomic_namesake",
+        &[
+            (
+                "project.toml",
+                include_str!("../../../example/sync_field_identity/project.toml"),
+            ),
+            (
+                "src/main.wi",
+                include_str!("../../../example/sync_field_identity/src/main.wi"),
+            ),
+            (
+                "src/readonly.wi",
+                include_str!("../../../example/sync_field_identity/src/readonly.wi"),
+            ),
+            (
+                "src/mutable.wi",
+                include_str!("../../../example/sync_field_identity/src/mutable.wi"),
+            ),
+            (
+                "src/stats.wi",
+                include_str!("../../../example/sync_field_identity/src/stats.wi"),
+            ),
+        ],
+    );
+    let output = project.package_command("check");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = project.package_command("build");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for workers in ["1", "4"] {
+        let output = project.run_with_env_timeout(
+            &[("WILLOW_WORKERS", workers)],
+            std::time::Duration::from_secs(20),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "7\n8000\n16000\n24000\n"
+        );
+    }
+}
+
+#[test]
+fn test_jz15_81_sync_genuine_shared_stats_rejected() {
+    let project = TestProject::new(
+        "sync_mutable_stats",
+        &[
+            (
+                "project.toml",
+                "[project]\nname='sync-mutable'\nversion='0.1.0'\n[willow]\nmanifest-version=1\n",
+            ),
+            (
+                "src/stats.wi",
+                "pub class Stats { pub levels: i64; } pub async fn work(s: Stats) { s.levels += 1; }",
+            ),
+            (
+                "src/main.wi",
+                "import stats::{Stats, work}; async fn main() { let s = new Stats(0); let a = work(s); let b = work(s); await a; await b; }",
+            ),
+        ],
+    );
+    let output = project.package_command("check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("E2402") && stderr.contains("levels"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_jz15_81_sync_inherited_import_alias() {
+    for (reader, accepted) in [("Unrelated", true), ("Base", false)] {
+        let main = format!(
+            "import base::{{Base, Unrelated}}; import sub; async fn read(x: {reader}) -> i64 {{ return x.cell; }} async fn main() {{ println(await read(new {reader}(7))); }}"
+        );
+        let project = TestProject::new(
+            "sync_inherited_alias",
+            &[
+                (
+                    "project.toml",
+                    "[project]\nname='sync-inherited'\nversion='0.1.0'\n[willow]\nmanifest-version=1\n",
+                ),
+                (
+                    "src/base.wi",
+                    "pub open class Base { pub cell: i64; } pub class Unrelated { pub cell: i64; }",
+                ),
+                (
+                    "src/sub.wi",
+                    "import base::Base as Parent; pub class Child extends Parent { pub fn update(self) { self.cell = 1; } }",
+                ),
+                ("src/main.wi", &main),
+            ],
+        );
+        let output = project.package_command("check");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), accepted, "{reader}: {stderr}");
+        if !accepted {
+            assert!(stderr.contains("E2402"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn test_jz15_81_sync_same_module_path_in_distinct_packages() {
+    for (reader, accepted) in [("b", true), ("a", false)] {
+        let main = format!(
+            "import a::types::Record as Written; import {reader}::types::Record as Read; fn mutate(x: Written) {{ x.cell = 1; }} async fn read(x: Read) -> i64 {{ return x.cell; }} async fn main() {{ println(await read(new Read(7))); }}"
+        );
+        let project = TestProject::new(
+            "sync_package_identity",
+            &[
+                (
+                    "project.toml",
+                    "[project]\nname='sync-packages'\nversion='0.1.0'\n[willow]\nmanifest-version=1\n[dependencies]\na={path='a'}\nb={path='b'}\n",
+                ),
+                (
+                    "a/project.toml",
+                    "[project]\nname='alpha'\nversion='0.1.0'\n[willow]\nmanifest-version=1\n",
+                ),
+                (
+                    "b/project.toml",
+                    "[project]\nname='beta'\nversion='0.1.0'\n[willow]\nmanifest-version=1\n",
+                ),
+                ("a/src/types.wi", "pub class Record { pub cell: i64; }"),
+                ("b/src/types.wi", "pub class Record { pub cell: i64; }"),
+                ("src/main.wi", &main),
+            ],
+        );
+        let output = project.package_command("check");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), accepted, "{reader}: {stderr}");
+        if !accepted {
+            assert!(stderr.contains("E2402"), "{stderr}");
+        }
+    }
 }

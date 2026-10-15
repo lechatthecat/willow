@@ -1,0 +1,2 @@
+pub class Record { pub cell: i64; }
+pub fn update(r: Record) { r.cell = 99; }

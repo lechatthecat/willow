@@ -18,24 +18,28 @@
 //! * a subclass `init`'s writes after `super.init` count when a constructor
 //!   on the base chain lets `self` escape; a base missing from the class
 //!   index (import alias, mangled name) is assumed to escape;
-//! * any other receiver's `.f` is unresolved without types and conservatively
-//!   marks every instance field named `f`.
+//! * parameter types, annotated locals, `new` expressions and local aliases
+//!   identify the receiver's class. Lexical shadowing is tracked. Import paths
+//!   resolve to module-scoped class declarations, including inherited fields;
+//! * other receivers remain unknown and conservatively mark every field named
+//!   `f`. Unknown/shadowed generic parameters are never treated as a class.
 //!
 //! A `&expr.f` call argument counts as a write because a reference parameter
 //! may be `&mut`. The analysis over-approximates writes (never misses one), so
 //! it can only make fewer classes `Sync`.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 
-use crate::diagnostics::Span;
+use crate::diagnostics::{FileId, Span};
 use crate::parser::ast::*;
 use crate::parser::visit::{self, AstVisitor};
+use crate::semantic::scopes::Scopes;
 
-/// One syntactic field write. `self_class` is the enclosing class when the
-/// receiver is `self`; `None` means the receiver is unresolved.
+/// One syntactic field write. `self_class` is the receiver's nominal type
+/// spelling in `file` (also used for `self`); `None` means unresolved.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RawFieldWrite {
+    pub(crate) file: FileId,
     pub(crate) self_class: Option<String>,
     pub(crate) field: String,
     pub(crate) kind: WriteKind,
@@ -69,7 +73,7 @@ pub(crate) enum WriteContext<'a> {
 pub struct FieldWrites {
     /// Field names written through an unresolved receiver.
     by_name: HashSet<String>,
-    /// Declaration spans of fields written through `self`.
+    /// Resolved field declarations, including writes through other receivers.
     declarations: HashSet<Span>,
 }
 
@@ -80,181 +84,261 @@ impl FieldWrites {
         self.by_name.contains(name) || self.declarations.contains(&span)
     }
 
-    /// Resolve raw writes against every class declaration of the program.
-    pub(crate) fn resolve<'c, 'w>(
-        classes: impl IntoIterator<Item = &'c ClassDecl>,
+    /// Resolve against declarations and import identities without hydrating bodies.
+    pub(crate) fn resolve_programs<'a, 'w>(
+        programs: impl IntoIterator<Item = (&'a str, &'a Program)>,
+        dependencies: Option<&'a crate::compiler_db::dependencies::ModuleDependencies>,
         writes: impl IntoIterator<Item = &'w RawFieldWrite>,
     ) -> Self {
-        Self::resolve_counted(classes, writes).0
+        let programs: Vec<_> = programs.into_iter().collect();
+        let mut resolver = Resolver::new(programs.iter().flat_map(|(_, p)| classes(p)));
+        resolver.dependencies = dependencies;
+        for (namespace, program) in programs {
+            for class in classes(program) {
+                let id = resolver.local[&class.span.file_id][class.name.as_str()];
+                let qualified = if namespace.is_empty() {
+                    class.name.clone()
+                } else {
+                    format!("{namespace}::{}", class.name)
+                };
+                resolver.qualified.insert(qualified, id);
+            }
+            for import in &program.imports {
+                let alias = import
+                    .alias
+                    .as_deref()
+                    .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+                resolver
+                    .imports
+                    .entry(import.span.file_id)
+                    .or_default()
+                    .insert(alias.to_owned(), import.path.clone());
+            }
+        }
+        resolver.resolve(writes).0
     }
 
-    /// [`Self::resolve`] plus the number of `(class, field)` resolutions
-    /// computed. Each pair is resolved once and shared by every subclass
-    /// that reaches it, so the count is bounded by the distinct pairs on
-    /// the written chains, not by writes × chain depth.
+    #[cfg(test)]
     pub(crate) fn resolve_counted<'c, 'w>(
         classes: impl IntoIterator<Item = &'c ClassDecl>,
         writes: impl IntoIterator<Item = &'w RawFieldWrite>,
     ) -> (Self, usize) {
-        // Names are unqualified, so same-named classes from different modules
-        // are merged: every candidate is followed (conservative).
-        let mut index: HashMap<&str, Vec<&ClassDecl>> = HashMap::new();
-        for class in classes {
-            index.entry(class.name.as_str()).or_default().push(class);
-        }
-        let writes: Vec<&RawFieldWrite> = writes.into_iter().collect();
-        let escaping: HashSet<&str> = writes
-            .iter()
-            .filter(|write| write.kind == WriteKind::InitEscapes)
-            .filter_map(|write| write.self_class.as_deref())
-            .collect();
-        let mut resolver = Resolver {
-            index,
-            memo: HashMap::new(),
-            escaping,
-            escapes: HashMap::new(),
-        };
-        let mut summary = Self::default();
-        for write in writes {
-            match write.kind {
-                WriteKind::Write => {}
-                WriteKind::InitEscapes => continue,
-                WriteKind::AfterBaseInit => {
-                    let class = write.self_class.as_deref().unwrap_or_default();
-                    if !resolver.base_init_escapes(class) {
-                        continue;
-                    }
-                }
-            }
-            let Some(class) = write.self_class.as_deref() else {
-                summary.by_name.insert(write.field.clone());
-                continue;
-            };
-            let declarations = resolver.declarations(class, &write.field);
-            if declarations.is_empty() {
-                summary.by_name.insert(write.field.clone());
-            }
-            summary.declarations.extend(declarations.iter().copied());
-        }
-        (summary, resolver.memo.len())
+        Resolver::new(classes).resolve(writes)
     }
 
-    /// Summary of one fully-bodied program (no offloaded bodies).
     pub(crate) fn from_program(program: &Program) -> Self {
         let mut writes = HashSet::new();
-        for_each_body(program, |body, context| {
-            writes.extend(body.collect(context));
+        for_each_body(program, |body, context, params, type_params| {
+            writes.extend(body.collect_with_bindings(context, params, type_params));
         });
-        Self::resolve(classes(program), &writes)
+        Self::resolve_programs(std::iter::once(("", program)), None, &writes)
     }
 }
 
-/// Memoized "nearest declaration of `field` reachable from `class`" and
-/// "some constructor on the chain from `class` lets `self` escape".
-struct Resolver<'c, 'w> {
-    index: HashMap<&'c str, Vec<&'c ClassDecl>>,
-    memo: HashMap<(&'w str, &'w str), Rc<[Span]>>,
-    /// Classes with a constructor that lets `self` escape.
-    escaping: HashSet<&'w str>,
-    /// Memo: some constructor on the chain from this class escapes.
-    escapes: HashMap<&'w str, bool>,
+/// Declaration identity is an index into the input class inventory, never a
+/// bare class or field name. Fields and lexical scopes both have indexed lookup.
+struct Resolver<'a> {
+    classes: Vec<&'a ClassDecl>,
+    dependencies: Option<&'a crate::compiler_db::dependencies::ModuleDependencies>,
+    local: HashMap<FileId, HashMap<&'a str, usize>>,
+    qualified: HashMap<String, usize>,
+    imports: HashMap<FileId, HashMap<String, String>>,
+    fields: Vec<HashMap<&'a str, Span>>,
+    bases: Vec<Option<Result<usize, ()>>>,
+    escaping: HashSet<usize>,
+    escapes: HashMap<usize, bool>,
 }
 
-impl<'c: 'w, 'w> Resolver<'c, 'w> {
-    /// Whether a base constructor run by `class`'s constructor may let `self`
-    /// escape.
-    fn base_init_escapes(&mut self, class: &'w str) -> bool {
-        let bases: Vec<&'c str> = self
-            .index
-            .get(class)
-            .into_iter()
-            .flatten()
-            .filter_map(|decl| decl.base_class.as_ref().map(|base| base.name()))
-            .collect();
-        bases.into_iter().any(|base| self.chain_escapes(base))
-    }
-
-    /// Iterative post-order like [`Self::declarations`].
-    fn chain_escapes(&mut self, class: &'w str) -> bool {
-        let mut entered = HashSet::new();
-        let mut stack = vec![(class, false)];
-        while let Some((name, expanded)) = stack.pop() {
-            if self.escapes.contains_key(name) {
-                continue;
-            }
-            // A base absent from the index (an import alias, a mangled
-            // instantiation name) is unknown: assume its constructor escapes.
-            let Some(candidates) = self.index.get(name).map(Vec::as_slice) else {
-                self.escapes.insert(name, true);
-                continue;
-            };
-            if !expanded {
-                if !entered.insert(name) {
-                    continue;
-                }
-                stack.push((name, true));
-                for decl in candidates {
-                    if let Some(base) = &decl.base_class {
-                        stack.push((base.name(), false));
-                    }
-                }
-                continue;
-            }
-            let escapes = self.escaping.contains(name)
-                || candidates.iter().any(|decl| {
-                    decl.base_class
-                        .as_ref()
-                        .is_some_and(|base| self.escapes.get(base.name()) == Some(&true))
-                });
-            self.escapes.insert(name, escapes);
+impl<'a> Resolver<'a> {
+    fn new(classes: impl IntoIterator<Item = &'a ClassDecl>) -> Self {
+        let classes: Vec<_> = classes.into_iter().collect();
+        let mut local: HashMap<FileId, HashMap<&str, usize>> = HashMap::new();
+        for (id, class) in classes.iter().enumerate() {
+            local
+                .entry(class.span.file_id)
+                .or_default()
+                .insert(&class.name, id);
         }
-        self.escapes[class]
-    }
-
-    /// Iterative post-order over the base chain, so a deep hierarchy cannot
-    /// overflow the compiler stack.
-    fn declarations(&mut self, class: &'w str, field: &'w str) -> Rc<[Span]> {
-        let mut entered = HashSet::new();
-        let mut stack = vec![(class, false)];
-        while let Some((name, expanded)) = stack.pop() {
-            if self.memo.contains_key(&(name, field)) {
-                continue;
-            }
-            let candidates = self.index.get(name).map(Vec::as_slice).unwrap_or(&[]);
-            let declared = |decl: &&'c ClassDecl| {
-                decl.fields
+        let fields = classes
+            .iter()
+            .map(|c| {
+                c.fields
                     .iter()
-                    .find(|f| !f.is_static && f.name == field)
-                    .map(|f| f.span)
-            };
-            if !expanded {
-                // A (rejected elsewhere) cyclic base chain ends here.
-                if !entered.insert(name) {
-                    continue;
-                }
-                stack.push((name, true));
-                for decl in candidates {
-                    if declared(decl).is_none()
-                        && let Some(base) = &decl.base_class
-                    {
-                        stack.push((base.name(), false));
-                    }
-                }
+                    .filter(|f| !f.is_static)
+                    .map(|f| (f.name.as_str(), f.span))
+                    .collect()
+            })
+            .collect();
+        Self {
+            classes,
+            dependencies: None,
+            local,
+            qualified: HashMap::new(),
+            imports: HashMap::new(),
+            fields,
+            bases: Vec::new(),
+            escaping: HashSet::new(),
+            escapes: HashMap::new(),
+        }
+    }
+
+    fn class(&self, file: FileId, name: &str) -> Option<usize> {
+        if let Some(id) = self.local.get(&file).and_then(|classes| classes.get(name)) {
+            return Some(*id);
+        }
+        let (head, tail) = name
+            .split_once("::")
+            .map_or((name, None), |(h, t)| (h, Some(t)));
+        if let Some(path) = self
+            .imports
+            .get(&file)
+            .and_then(|imports| imports.get(head))
+        {
+            let qualified = tail.map_or_else(|| path.clone(), |tail| format!("{path}::{tail}"));
+            return self.qualified_class(file, &qualified);
+        }
+        self.qualified_class(file, name)
+    }
+
+    fn qualified_class(&self, file: FileId, name: &str) -> Option<usize> {
+        if let Some(id) = self.qualified.get(name) {
+            return Some(*id);
+        }
+        let (module, class) = name.rsplit_once("::")?;
+        let unit = self
+            .dependencies?
+            .unit_for_path(crate::module::ModuleId(file.0), module)?;
+        self.local.get(&FileId(unit.0))?.get(class).copied()
+    }
+
+    fn resolve<'w>(
+        mut self,
+        writes: impl IntoIterator<Item = &'w RawFieldWrite>,
+    ) -> (FieldWrites, usize) {
+        self.bases = self
+            .classes
+            .iter()
+            .map(|c| {
+                c.base_class
+                    .as_ref()
+                    .map(|base| self.class(c.span.file_id, base.name()).ok_or(()))
+            })
+            .collect();
+        let writes: Vec<_> = writes.into_iter().collect();
+        for write in &writes {
+            if write.kind == WriteKind::InitEscapes
+                && let Some(id) = write
+                    .self_class
+                    .as_deref()
+                    .and_then(|name| self.class(write.file, name))
+            {
+                self.escaping.insert(id);
+            }
+        }
+        let mut summary = FieldWrites::default();
+        let mut by_owner = vec![Vec::new(); self.classes.len()];
+        for write in writes {
+            if write.kind == WriteKind::InitEscapes {
                 continue;
             }
-            let mut found = Vec::new();
-            for decl in candidates {
-                if let Some(span) = declared(decl) {
-                    found.push(span);
-                } else if let Some(base) = &decl.base_class
-                    && let Some(inherited) = self.memo.get(&(base.name(), field))
-                {
-                    found.extend(inherited.iter().copied());
+            let owner = write
+                .self_class
+                .as_deref()
+                .and_then(|name| self.class(write.file, name));
+            let Some(id) = owner else {
+                summary.by_name.insert(write.field.clone());
+                continue;
+            };
+            if write.kind == WriteKind::AfterBaseInit {
+                let escapes = match self.bases[id] {
+                    None => false,
+                    Some(Err(())) => true,
+                    Some(Ok(base)) => self.chain_escapes(base),
+                };
+                if !escapes {
+                    continue;
                 }
             }
-            self.memo.insert((name, field), found.into());
+            by_owner[id].push(write);
         }
-        Rc::clone(&self.memo[&(class, field)])
+
+        // Resolve all fields in one traversal of the inheritance forest.
+        // Indexed scope stacks provide the nearest declaring field in O(1),
+        // avoiding a separate ancestor walk for every distinct written field.
+        let mut children = vec![Vec::new(); self.classes.len()];
+        let mut stack = Vec::new();
+        for (id, base) in self.bases.iter().enumerate() {
+            match base {
+                Some(Ok(base)) => children[*base].push(id),
+                _ => stack.push((id, false)),
+            }
+        }
+        let mut fields = Scopes::default();
+        let mut visited = vec![false; self.classes.len()];
+        let mut resolutions = 0;
+        while let Some((id, exit)) = stack.pop() {
+            if exit {
+                fields.pop();
+                continue;
+            }
+            visited[id] = true;
+            fields.push();
+            for (name, span) in &self.fields[id] {
+                fields.insert((*name).to_owned(), *span);
+            }
+            for write in &by_owner[id] {
+                resolutions += 1;
+                match fields.get(&write.field) {
+                    Some(span) => {
+                        summary.declarations.insert(*span);
+                    }
+                    None => {
+                        summary.by_name.insert(write.field.clone());
+                    }
+                }
+            }
+            stack.push((id, true));
+            stack.extend(children[id].iter().map(|&child| (child, false)));
+        }
+        // Cycles (diagnosed by class checking) and their descendants cannot
+        // belong to the rooted forest. Never lose their writes on an error path.
+        for (id, writes) in by_owner.iter().enumerate() {
+            if !visited[id] {
+                for write in writes {
+                    summary.by_name.insert(write.field.clone());
+                }
+            }
+        }
+        (summary, resolutions)
+    }
+
+    /// Iterative path compression: each ancestor is computed once, including
+    /// missing bases and cycles (both conservatively escaping).
+    fn chain_escapes(&mut self, start: usize) -> bool {
+        let mut path = Vec::new();
+        let mut seen = HashSet::new();
+        let mut id = start;
+        let result = loop {
+            if let Some(result) = self.escapes.get(&id) {
+                break *result;
+            }
+            if !seen.insert(id) {
+                break true;
+            }
+            path.push(id);
+            if self.escaping.contains(&id) {
+                break true;
+            }
+            match self.bases[id] {
+                None => break false,
+                Some(Err(())) => break true,
+                Some(Ok(base)) => id = base,
+            }
+        };
+        for id in path {
+            self.escapes.insert(id, result);
+        }
+        result
     }
 }
 
@@ -274,14 +358,25 @@ pub(crate) enum BodyRef<'a> {
 }
 
 impl BodyRef<'_> {
-    pub(crate) fn collect(&self, context: WriteContext<'_>) -> HashSet<RawFieldWrite> {
+    pub(crate) fn collect_with_bindings(
+        &self,
+        context: WriteContext<'_>,
+        params: &[Param],
+        type_params: &[String],
+    ) -> HashSet<RawFieldWrite> {
         let mut collector = Collector {
             context,
+            bindings: Scopes::with_frame([]),
+            type_params: type_params.iter().map(String::as_str).collect(),
             lambda_depth: 0,
             self_escaped: false,
             after_base_init: false,
             writes: HashSet::new(),
         };
+        for param in params {
+            let ty = collector.nominal(&param.ty);
+            collector.bindings.insert(param.name.clone(), ty);
+        }
         match self {
             BodyRef::Block(block) if matches!(context, WriteContext::Constructor(_)) => {
                 collector.visit_constructor_body(block)
@@ -296,34 +391,53 @@ impl BodyRef<'_> {
 /// Visit every body slot of `program` with its write context.
 pub(crate) fn for_each_body<'a>(
     program: &'a Program,
-    mut f: impl FnMut(BodyRef<'a>, WriteContext<'a>),
+    mut f: impl FnMut(BodyRef<'a>, WriteContext<'a>, &'a [Param], &'a [String]),
 ) {
     for item in &program.items {
         match item {
-            Item::Function(function) => f(BodyRef::Block(&function.body), WriteContext::Free),
+            Item::Function(function) => f(
+                BodyRef::Block(&function.body),
+                WriteContext::Free,
+                &function.params,
+                &function.type_params,
+            ),
             Item::Class(class) => {
                 for method in &class.methods {
                     f(
                         BodyRef::Block(&method.body),
                         WriteContext::Method(&class.name),
+                        &method.params,
+                        &class.type_params,
                     );
                 }
                 for constructor in &class.constructors {
                     f(
                         BodyRef::Block(&constructor.body),
                         WriteContext::Constructor(&class.name),
+                        &constructor.params,
+                        &class.type_params,
                     );
                 }
                 for field in &class.fields {
                     if let Some(expr) = &field.initializer {
-                        f(BodyRef::Initializer(expr), WriteContext::Free);
+                        f(
+                            BodyRef::Initializer(expr),
+                            WriteContext::Free,
+                            &[],
+                            &class.type_params,
+                        );
                     }
                 }
             }
             Item::Interface(interface) => {
                 for method in &interface.methods {
                     if let Some(body) = &method.default_body {
-                        f(BodyRef::Block(body), WriteContext::Free);
+                        f(
+                            BodyRef::Block(body),
+                            WriteContext::Free,
+                            &method.params,
+                            &interface.type_params,
+                        );
                     }
                 }
             }
@@ -334,6 +448,8 @@ pub(crate) fn for_each_body<'a>(
 
 struct Collector<'a> {
     context: WriteContext<'a>,
+    bindings: Scopes<Option<String>>,
+    type_params: HashSet<&'a str>,
     lambda_depth: usize,
     /// In a constructor: `self` may already be visible outside `init`.
     self_escaped: bool,
@@ -347,6 +463,26 @@ fn is_self(expr: &Expr) -> bool {
 }
 
 impl Collector<'_> {
+    fn nominal(&self, ty: &Type) -> Option<String> {
+        match ty {
+            Type::Named(name) | Type::Generic(name, _)
+                if !self.type_params.contains(name.as_str()) =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn receiver(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::New(call) if !self.type_params.contains(call.class_name.as_str()) => {
+                Some(call.class_name.clone())
+            }
+            Expr::Var(name, ..) => self.bindings.get(name).cloned().flatten(),
+            _ => None,
+        }
+    }
     /// Top-level statements run in order and a loop is one statement, so
     /// every write in or after the first statement where `self` escapes may
     /// run while another holder can observe it. Deferred statements run at
@@ -372,6 +508,7 @@ impl Collector<'_> {
             && let WriteContext::Constructor(class) = self.context
         {
             self.writes.insert(RawFieldWrite {
+                file: block.span.file_id,
                 self_class: Some(class.to_string()),
                 field: String::new(),
                 kind: WriteKind::InitEscapes,
@@ -401,9 +538,10 @@ impl Collector<'_> {
             WriteContext::Method(class) | WriteContext::Constructor(class) if is_self => {
                 Some(class.to_string())
             }
-            _ => None,
+            _ => self.receiver(object),
         };
         self.writes.insert(RawFieldWrite {
+            file: object.span().file_id,
             self_class,
             field: field.to_string(),
             kind,
@@ -451,8 +589,27 @@ impl AstVisitor for EscapeFinder {
 }
 
 impl AstVisitor for Collector<'_> {
+    fn enter_scope(&mut self) {
+        self.bindings.push();
+    }
+    fn exit_scope(&mut self) {
+        self.bindings.pop();
+    }
+    fn bind(&mut self, name: &str) {
+        self.bindings.insert(name.to_owned(), None);
+    }
+
     fn visit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
+            Stmt::Let(binding) => {
+                self.visit_expr(&binding.init);
+                let ty = match &binding.ty {
+                    Some(ty) => self.nominal(ty),
+                    None => self.receiver(&binding.init),
+                };
+                self.bindings.insert(binding.name.clone(), ty);
+                return;
+            }
             Stmt::FieldAssign(assign) => self.record(&assign.object, &assign.field),
             Stmt::SuperInit(init) => self.record_reference_args(&init.args),
             _ => {}
@@ -473,7 +630,16 @@ impl AstVisitor for Collector<'_> {
 
     fn visit_lambda(&mut self, lambda: &LambdaExpr) {
         self.lambda_depth += 1;
-        visit::walk_lambda(self, lambda);
+        self.enter_scope();
+        for param in &lambda.params {
+            let ty = param.ty.as_ref().and_then(|ty| self.nominal(ty));
+            self.bindings.insert(param.name.clone(), ty);
+        }
+        match &lambda.body {
+            LambdaBody::Expr(expr) => self.visit_expr(expr),
+            LambdaBody::Block(block) => self.visit_block(block),
+        }
+        self.exit_scope();
         self.lambda_depth -= 1;
     }
 }
@@ -514,9 +680,9 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_receiver_marks_every_same_named_field() {
+    fn known_receiver_marks_only_its_declaration() {
         let source = "class A { pub n: i64; } class B { pub n: i64; pub m: i64; } fn main() { let b = new B(1, 2); b.n = 3; }";
-        assert!(reassigned(source, "A", "n"));
+        assert!(!reassigned(source, "A", "n"));
         assert!(reassigned(source, "B", "n"));
         assert!(!reassigned(source, "B", "m"));
     }
@@ -547,6 +713,8 @@ mod tests {
         let class = classes(&program).next().unwrap();
         let mut collector = Collector {
             context: WriteContext::Constructor(&class.name),
+            bindings: Scopes::with_frame([]),
+            type_params: HashSet::new(),
             lambda_depth: 1,
             self_escaped: false,
             after_base_init: false,
@@ -556,6 +724,7 @@ mod tests {
         assert_eq!(
             collector.writes,
             HashSet::from([RawFieldWrite {
+                file: FileId::ENTRY,
                 self_class: Some("A".into()),
                 field: "n".into(),
                 kind: WriteKind::Write,
@@ -610,8 +779,8 @@ mod tests {
         assert!(reassigned(source, "C", "y"));
         let program = parse(source);
         let mut writes = HashSet::new();
-        for_each_body(&program, |body, context| {
-            writes.extend(body.collect(context))
+        for_each_body(&program, |body, context, params, type_params| {
+            writes.extend(body.collect_with_bindings(context, params, type_params))
         });
         let (summary, _) = FieldWrites::resolve_counted(classes(&program), &writes);
         // `x` is declared outside the index: the conservative name set.
@@ -624,9 +793,8 @@ mod tests {
         assert!(!reassigned(source, "A", "n"));
     }
 
-    /// Deep chain: every class writes the root's field. Each `(class, field)`
-    /// resolves once and reuses its base's result, so the work is linear in
-    /// the chain length rather than quadratic.
+    /// Deep chain: every class writes the root's field. The shared inheritance
+    /// traversal resolves each write with an indexed scope lookup.
     #[test]
     fn deep_chain_resolution_is_linear() {
         for depth in [16usize, 64, 256, 4096] {
@@ -641,8 +809,8 @@ mod tests {
             source.push_str("fn main() {}\n");
             let program = parse(&source);
             let mut writes = HashSet::new();
-            for_each_body(&program, |body, context| {
-                writes.extend(body.collect(context))
+            for_each_body(&program, |body, context, params, type_params| {
+                writes.extend(body.collect_with_bindings(context, params, type_params))
             });
             assert_eq!(writes.len(), depth);
             let (summary, resolutions) = FieldWrites::resolve_counted(classes(&program), &writes);
@@ -662,8 +830,8 @@ mod tests {
         source.push_str(" } fn main() {}");
         let program = parse(&source);
         let mut writes = HashSet::new();
-        for_each_body(&program, |body, context| {
-            writes.extend(body.collect(context))
+        for_each_body(&program, |body, context, params, type_params| {
+            writes.extend(body.collect_with_bindings(context, params, type_params))
         });
         let (_, resolutions) = FieldWrites::resolve_counted(classes(&program), &writes);
         assert_eq!(resolutions, 1);
@@ -675,6 +843,7 @@ mod tests {
             "open class A extends B { pub fn w(self) { self.x = 1; } } open class B extends A {} fn main() {}",
         );
         let writes = HashSet::from([RawFieldWrite {
+            file: FileId::ENTRY,
             self_class: Some("A".into()),
             field: "x".into(),
             kind: WriteKind::Write,
@@ -682,5 +851,117 @@ mod tests {
         let (summary, _) = FieldWrites::resolve_counted(classes(&program), &writes);
         // Undeclared on the chain: falls back to the conservative name set.
         assert!(summary.by_name.contains("x"));
+    }
+    #[test]
+    fn unresolved_and_shadowed_receivers_stay_conservative() {
+        for source in [
+            "class A { pub n: i64; } class B { pub n: i64; } fn make() -> B { return new B(0); } fn f() { let a = new A(0); if true { let a = make(); a.n = 1; } }",
+            "class A { pub n: i64; } class B { pub n: i64; } fn f() { let a = new A(0); let write = |a| { a.n = 1; }; write(new B(0)); }",
+            "class A { pub n: i64; } class B { pub n: i64; } fn f() { let a = new A(0); for a in [new B(0)] { a.n = 1; } }",
+            "class A { pub n: i64; } class B { pub n: i64; } fn f<B>(b: B) { b.n = 1; }",
+        ] {
+            let program = parse(source);
+            let summary = FieldWrites::from_program(&program);
+            assert!(summary.by_name.contains("n"), "{source}");
+        }
+    }
+
+    #[test]
+    fn lexical_receiver_lookup_is_independent_of_scope_depth() {
+        for depth in [16, 64, 256] {
+            let mut source = String::from("class A { pub n: i64; } fn f() { let a = new A(0);");
+            for _ in 0..depth {
+                source.push_str("if true { a.n = 1;");
+            }
+            for _ in 0..=depth {
+                source.push('}');
+            }
+            let program = parse(&source);
+            crate::semantic::scopes::LOOKUP_PROBES.with(|n| n.set(0));
+            let mut writes = HashSet::new();
+            for_each_body(&program, |body, context, params, type_params| {
+                writes.extend(body.collect_with_bindings(context, params, type_params));
+            });
+            let probes = crate::semantic::scopes::LOOKUP_PROBES.with(|n| n.get());
+            assert_eq!(probes, 2 * depth);
+            assert_eq!(writes.len(), 1);
+            let (summary, resolutions) = FieldWrites::resolve_counted(classes(&program), &writes);
+            assert_eq!(resolutions, 1);
+            assert_eq!(summary.declarations.len(), 1);
+            println!(
+                "scope_depth={depth} receiver_probes={probes} distinct_writes=1 resolutions=1"
+            );
+        }
+    }
+
+    #[test]
+    fn field_inventory_and_resolution_scale_in_independent_dimensions() {
+        for (depth, fields) in [(16, 4), (64, 4), (256, 4), (64, 16), (64, 64)] {
+            let mut source = String::from("open class C0 {");
+            for f in 0..fields {
+                source.push_str(&format!("pub f{f}: i64;"));
+            }
+            source.push('}');
+            for c in 1..depth {
+                source.push_str(&format!(
+                    "open class C{c} extends C{} {{ pub fn write(self) {{",
+                    c - 1
+                ));
+                for f in 0..fields {
+                    source.push_str(&format!("self.f{f} = 1;"));
+                }
+                source.push_str("} }");
+            }
+            let program = parse(&source);
+            let mut writes = HashSet::new();
+            for_each_body(&program, |body, context, params, type_params| {
+                writes.extend(body.collect_with_bindings(context, params, type_params));
+            });
+            let resolver = Resolver::new(classes(&program));
+            let indexed_fields: usize = resolver.fields.iter().map(HashMap::len).sum();
+            assert_eq!(indexed_fields, fields);
+            let (summary, resolutions) = resolver.resolve(&writes);
+            assert_eq!(resolutions, (depth - 1) * fields);
+            assert_eq!(summary.declarations.len(), fields);
+            assert!(summary.by_name.is_empty());
+            println!(
+                "depth={depth} fields={fields} indexed_fields={indexed_fields} write_lookups={resolutions}"
+            );
+        }
+    }
+    #[test]
+    fn many_fields_at_a_deep_leaf_do_not_multiply_chain_walks() {
+        for depth in [16, 64, 256, 4096] {
+            let mut source = String::from("open class C0 {");
+            for f in 0..64 {
+                source.push_str(&format!("pub f{f}: i64;"));
+            }
+            source.push('}');
+            for c in 1..depth {
+                source.push_str(&format!("open class C{c} extends C{} {{", c - 1));
+                if c == depth - 1 {
+                    source.push_str("pub fn write(self) {");
+                    for f in 0..64 {
+                        source.push_str(&format!("self.f{f} = 1;"));
+                    }
+                    source.push('}');
+                }
+                source.push('}');
+            }
+            let program = parse(&source);
+            let mut writes = HashSet::new();
+            for_each_body(&program, |body, context, params, type_params| {
+                writes.extend(body.collect_with_bindings(context, params, type_params));
+            });
+            crate::semantic::scopes::LOOKUP_PROBES.with(|n| n.set(0));
+            let (summary, resolutions) = FieldWrites::resolve_counted(classes(&program), &writes);
+            let probes = crate::semantic::scopes::LOOKUP_PROBES.with(|n| n.get());
+            assert_eq!(resolutions, 64);
+            assert_eq!(probes, 128);
+            assert_eq!(summary.declarations.len(), 64);
+            println!(
+                "leaf_depth={depth} fields=64 write_lookups={resolutions} field_probes={probes}"
+            );
+        }
     }
 }

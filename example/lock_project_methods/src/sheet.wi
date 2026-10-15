@@ -1,0 +1,14 @@
+pub interface Value extends Send { fn get(self) -> i64; }
+pub open class Sheet implements Value {
+    pub n: i64;
+    pub fn set(self, id: i64) -> i64 {
+        if !self.ok(id) { return 0; }
+        return id;
+    }
+    pub fn ok(self, id: i64) -> bool { return id >= 0; }
+    pub fn get(self) -> i64 { return self.value(); }
+    pub open fn value(self) -> i64 { return self.n; }
+}
+pub class Derived extends Sheet {
+    pub override fn value(self) -> i64 { return self.n + 1; }
+}
