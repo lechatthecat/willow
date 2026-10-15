@@ -220,3 +220,347 @@ fn increasing_diagnostic_batches_emit_each_error_once() {
         }
     }
 }
+
+#[test]
+fn generic_diagnostics_once_per_source_location() {
+    let fixture = Fixture::new(
+        r#"
+class Heap<T> {
+    pub value: T;
+    pub fn broken(self) { self.missing(); }
+}
+fn main() {
+    let a = new Heap<i64>(1);
+    let b = new Heap<bool>(true);
+}
+"#,
+    );
+    let mut collected = Collected::default();
+    let error = fixture.check(&mut collected).unwrap_err();
+    let errors: Vec<_> = collected
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .collect();
+    assert_eq!(errors.len(), 1, "{error}: {errors:#?}");
+    assert!(errors[0].message.contains("Heap<T>"));
+    assert!(!format!("{errors:#?}").contains("$mono$"));
+    assert!(error.to_string().contains("1 errors"), "{error}");
+}
+
+#[test]
+fn generic_diagnostics_member_matrix() {
+    for (body, code, count) in [
+        ("self.missing();", "E0502", 1),
+        ("let x = self.absent;", "E0502", 1),
+        ("self.missing(); self.missing();", "E0502", 2),
+        ("let x = new Box<i64>(1);", "E0501", 1),
+        ("let x = new Box<T>(self.value);", "E0501", 1),
+    ] {
+        for imported in [false, true] {
+            let declarations = format!(
+                "class Box<T> {{ value: T; }} pub class Heap<T> {{ pub value: T; pub fn broken(self) {{ {body} }} }}"
+            );
+            let calls = "fn main() { let a = new Heap<i64>(1); let b = new Heap<bool>(true); }";
+            let fixture = if imported {
+                let fixture = Fixture::new(&format!("import helper::Heap; {calls}"));
+                fs::write(fixture.0.join("helper.wi"), &declarations).unwrap();
+                fixture
+            } else {
+                Fixture::new(&format!("{declarations} {calls}"))
+            };
+            // A fresh request must report the diagnostics again.
+            for _ in 0..2 {
+                let mut collected = Collected::default();
+                assert!(fixture.check(&mut collected).is_err());
+                let errors: Vec<_> = collected
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.code.as_str() == code)
+                    .collect();
+                assert_eq!(
+                    errors.len(),
+                    count,
+                    "{body} imported={imported}: {:#?}",
+                    collected.diagnostics
+                );
+                assert!(!format!("{:?}", collected.diagnostics).contains("$mono$"));
+                if code == "E0501" {
+                    assert!(
+                        errors[0]
+                            .helps
+                            .iter()
+                            .any(|h| h.contains("public `init`") && h.contains("Box<T>`"))
+                    );
+                }
+                if imported {
+                    assert!(collected.paths.iter().all(|p| p.ends_with("helper.wi")));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_diagnostics_function_body() {
+    let fixture =
+        Fixture::new("fn bad<T>(value: T) { missing(); } fn main() { bad(1); bad(true); }");
+    let mut collected = Collected::default();
+    assert!(fixture.check(&mut collected).is_err());
+    assert_eq!(
+        collected.diagnostics.len(),
+        1,
+        "{:?}",
+        collected.diagnostics
+    );
+}
+
+#[test]
+fn generic_diagnostics_human_output() {
+    let fixture = Fixture::new(
+        "class Heap<T> { pub value: T; pub fn broken(self) { self.missing(); } } fn main() { let a = new Heap<i64>(1); let b = new Heap<bool>(true); }",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .arg("check")
+        .arg(fixture.0.join("main.wi"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("error[E0502]").count(), 1, "{stderr}");
+    assert!(stderr.contains("class `Heap<T>`"), "{stderr}");
+    assert!(!stderr.contains("$mono$"), "{stderr}");
+    assert!(stderr.contains("1 errors"), "{stderr}");
+}
+
+#[test]
+fn generic_diagnostics_distinct_files_and_calls_survive() {
+    let declarations =
+        "pub class Heap<T> { pub value: T; pub fn broken(self) { self.missing(); } }";
+    let fixture = Fixture::new(
+        "import left; import right; fn main() { let a = new left::Heap<i64>(1); let b = new right::Heap<i64>(2); }",
+    );
+    for (module, parameter) in [("left", "Left"), ("right", "Rite")] {
+        fs::write(
+            fixture.0.join(format!("{module}.wi")),
+            declarations.replace('T', parameter),
+        )
+        .unwrap();
+    }
+    let mut collected = Collected::default();
+    assert!(fixture.check(&mut collected).is_err());
+    assert_eq!(
+        collected.diagnostics.len(),
+        2,
+        "{:?}",
+        collected.diagnostics
+    );
+    assert_ne!(
+        collected.diagnostics[0].primary_span().unwrap().file_id,
+        collected.diagnostics[1].primary_span().unwrap().file_id
+    );
+    for spelling in ["Heap<Left>", "Heap<Rite>"] {
+        assert!(
+            collected
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains(spelling)),
+            "{:?}",
+            collected.diagnostics
+        );
+    }
+
+    let fixture = Fixture::new(
+        "class Box<T> { value: T; } fn main() { let a = new Box<i64>(1); let b = new Box<bool>(true); }",
+    );
+    let mut collected = Collected::default();
+    assert!(fixture.check(&mut collected).is_err());
+    assert_eq!(
+        collected.diagnostics.len(),
+        2,
+        "{:?}",
+        collected.diagnostics
+    );
+}
+
+#[test]
+fn generic_diagnostics_declared_spelling_matrix() {
+    for (source, code, message, help, count) in [
+        (
+            "class Heap<Key, Value> { pub key: Key; pub value: Value; pub fn bad(self) { self.missing(); } } fn main() { let a = new Heap<i64, bool>(1, true); let b = new Heap<String, i64>(\"x\", 2); }",
+            "E0502",
+            "class `Heap<Key, Value>`",
+            "",
+            1,
+        ),
+        (
+            "class Heap<Element> { pub value: Element; pub fn bad(self) { self.missing(); } } fn main() {}",
+            "E0502",
+            "class `Heap<Element>`",
+            "",
+            1,
+        ),
+        (
+            "class Heap<T> { Heap: T; } fn main() { let a = new Heap<i64>(1); }",
+            "E0501",
+            "field `Heap` of class `Heap<T>`",
+            "on `Heap<T>`",
+            1,
+        ),
+        (
+            "class Heap<T> { pub value: T; fn hidden(self) {} } fn main() { new Heap<i64>(1).hidden(); }",
+            "E0501",
+            "method `hidden` of class `Heap<T>`",
+            "pub fn hidden",
+            1,
+        ),
+        (
+            "class Heap<T> { pub value: T; pub fn bad(self) { Self::missing(); } } fn main() { let a = new Heap<i64>(1); let b = new Heap<bool>(true); }",
+            "E0502",
+            "class `Heap<T>`",
+            "",
+            1,
+        ),
+        (
+            "class Heap<T> { pub value: T; pub fn bad(self) { let x = Self::missing; } } fn main() { let a = new Heap<i64>(1); let b = new Heap<bool>(true); }",
+            "E0502",
+            "`Heap<T>::missing`",
+            "",
+            1,
+        ),
+        (
+            "class Heap<T> { pub value: T; pub fn bad(self) { Self::missing = 1; } } fn main() { let a = new Heap<i64>(1); let b = new Heap<bool>(true); }",
+            "E0502",
+            "`Heap<T>::missing`",
+            "",
+            1,
+        ),
+        (
+            "class Heap<T> { pub value: T; pub fn bad(self) { self.Hep(); } pub fn Heap(self) {} } fn main() { let a = new Heap<i64>(1); }",
+            "E0502",
+            "no method `Hep` on class `Heap<T>`",
+            "similar name: `Heap`",
+            1,
+        ),
+        (
+            "class Leaf { pub value: i64; } class Heap<T> { value: T; } fn main() { let a = new Heap<Leaf>(new Leaf(1)); }",
+            "E0501",
+            "class `Heap<T>`",
+            "on `Heap<T>`",
+            1,
+        ),
+        (
+            "class Heap<T> { value: T; } fn main() { let a = new Heap<i64>(1); let b = new Heap<bool>(true); }",
+            "E0501",
+            "class `Heap<T>`",
+            "on `Heap<T>`",
+            2,
+        ),
+        (
+            "class Heap { value: i64; } fn marker<T>(value: T) {} fn main() { let a = new Heap(1); }",
+            "E0501",
+            "class `Heap`",
+            "on `Heap`",
+            1,
+        ),
+    ] {
+        let fixture = Fixture::new(source);
+        let mut collected = Collected::default();
+        assert!(fixture.check(&mut collected).is_err());
+        let errors: Vec<_> = collected
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_str() == code)
+            .collect();
+        assert_eq!(errors.len(), count, "{source}: {:?}", collected.diagnostics);
+        for error in errors {
+            assert!(error.message.contains(message), "{source}: {error:?}");
+            if !help.is_empty() {
+                assert!(
+                    error.helps.iter().any(|h| h.contains(help)),
+                    "{source}: {error:?}"
+                );
+            }
+            if source.contains("self.Hep()") {
+                assert_eq!(error.fix_suggestions[0].replacement, "Heap");
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_diagnostics_aliased_import_spelling() {
+    let fixture = Fixture::new(
+        "import helper::Heap as Renamed; fn main() { let a = new Renamed<i64>(1); let b = new Renamed<bool>(true); }",
+    );
+    fs::write(
+        fixture.0.join("helper.wi"),
+        "pub class Heap<Element> { pub value: Element; pub fn broken(self) { self.missing(); } }",
+    )
+    .unwrap();
+    let mut collected = Collected::default();
+    assert!(fixture.check(&mut collected).is_err());
+    assert_eq!(
+        collected.diagnostics.len(),
+        1,
+        "{:?}",
+        collected.diagnostics
+    );
+    assert!(
+        collected.diagnostics[0].message.contains("Heap<Element>"),
+        "{:?}",
+        collected.diagnostics
+    );
+}
+
+#[test]
+fn generic_diagnostics_alias_and_local_names_do_not_confuse_parameters() {
+    for construction in ["new Alias<T>(self.value)", "new Alias<i64>(1)"] {
+        let fixture = Fixture::new(&format!(
+            "import helper::Box as Alias; class Box<Local> {{ pub value: Local; }} class Heap<T> {{ pub value: T; pub fn broken(self) {{ let x = {construction}; }} }} fn main() {{ let a = new Heap<i64>(1); let b = new Heap<bool>(true); }}"
+        ));
+        fs::write(
+            fixture.0.join("helper.wi"),
+            "pub class Box<Imported> { value: Imported; }",
+        )
+        .unwrap();
+        let mut collected = Collected::default();
+        assert!(fixture.check(&mut collected).is_err());
+        assert_eq!(
+            collected.diagnostics.len(),
+            1,
+            "{:?}",
+            collected.diagnostics
+        );
+        let error = &collected.diagnostics[0];
+        assert!(error.message.contains("helper::Box<Imported>"), "{error:?}");
+        assert!(
+            error
+                .helps
+                .iter()
+                .any(|help| help.contains("helper::Box<Imported>")),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn generic_diagnostics_constructor_human_output() {
+    let fixture = Fixture::new(
+        "class Box<Element> { value: Element; } class Heap<T> { pub value: T; pub fn bad(self) { let x = new Box<i64>(1); } } fn main() { let a = new Heap<i64>(1); let b = new Heap<bool>(true); }",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .arg("check")
+        .arg(fixture.0.join("main.wi"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert_eq!(stderr.matches("error[E0501]").count(), 1, "{stderr}");
+    assert!(stderr.contains("class `Box<Element>`"), "{stderr}");
+    assert!(
+        stderr.contains("provide a public `init` or factory method on `Box<Element>`"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("$mono$"), "{stderr}");
+}

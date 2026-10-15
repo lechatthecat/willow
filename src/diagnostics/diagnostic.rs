@@ -2,7 +2,7 @@ use super::error_code::ErrorCode;
 use super::label::{FixSuggestion, Label};
 use super::span::Span;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Severity {
     Error,
     Warning,
@@ -17,7 +17,7 @@ impl Severity {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub code: ErrorCode,
@@ -97,6 +97,32 @@ impl Diagnostic {
             .iter()
             .find(|l| l.kind == LabelKind::Primary)
             .map(|l| l.span)
+    }
+}
+
+/// Request-local equivalence of generic diagnostics after display projection.
+/// Keep complete payloads in the key: equal locations alone must not hide
+/// distinct type-dependent errors, secondary labels, or actionable fixes.
+#[derive(Default)]
+pub(crate) struct SourceDiagnosticSet(std::collections::HashSet<Diagnostic>);
+
+impl SourceDiagnosticSet {
+    pub(crate) fn insert(
+        &mut self,
+        diagnostic: &Diagnostic,
+        packages: &std::collections::HashMap<String, String>,
+    ) -> Option<Diagnostic> {
+        let source = diagnostic.with_source_names(packages);
+        // Diagnostics without a real primary location cannot be attributed to
+        // repeated checks of the same source expression.
+        if source.primary_span().is_none_or(|span| span.line == 0) {
+            return Some(source);
+        }
+        if self.0.contains(&source) {
+            return None;
+        }
+        self.0.insert(source.clone());
+        Some(source)
     }
 }
 
@@ -271,6 +297,131 @@ mod source_name_tests {
             "日本語",
         ] {
             assert_eq!(source_names(text.into(), &Default::default()), text);
+        }
+    }
+}
+
+#[cfg(test)]
+mod generic_diagnostic_tests {
+    use super::*;
+
+    fn error() -> Diagnostic {
+        Diagnostic::new(Severity::Error, ErrorCode::E0502, "no method on Heap")
+            .with_label(Label::primary(Span::new(10, 14, 2, 1), "missing"))
+    }
+
+    #[test]
+    fn generic_diagnostic_identity_preserves_distinct_payloads() {
+        for perspective in 0..13 {
+            let first = error();
+            let mut second = first.clone();
+            match perspective {
+                0 => second.labels[0].span.file_id = super::super::FileId(1),
+                1 => second.labels[0].span.start += 1,
+                2 => second.labels[0].span.end += 1,
+                3 => second.code = ErrorCode::E0501,
+                4 => second.severity = Severity::Warning,
+                5 => second.message.push_str(" different type"),
+                6 => second.labels[0].message.push_str(" different label"),
+                7 => second
+                    .labels
+                    .push(Label::secondary(Span::new(30, 40, 3, 1), "definition")),
+                8 => second.notes.push("note".into()),
+                9 => second.helps.push("help".into()),
+                10 => second.fix_suggestions.push(FixSuggestion::new(
+                    Span::new(10, 14, 2, 1),
+                    "fix",
+                    "replace",
+                )),
+                11 => {
+                    second.labels.clear();
+                }
+                12 => second.labels[0].span = Span::dummy(),
+                _ => unreachable!(),
+            }
+            let mut seen = SourceDiagnosticSet::default();
+            assert!(seen.insert(&first, &Default::default()).is_some());
+            assert!(
+                seen.insert(&second, &Default::default()).is_some(),
+                "perspective {perspective}"
+            );
+            assert!(seen.insert(&first, &Default::default()).is_none());
+        }
+    }
+
+    #[test]
+    fn generic_diagnostic_projection_covers_all_prose_preserves_replacements() {
+        let original = error();
+        let mut first = original.clone();
+        let name = format!("Heap$mono${:064x}", 1);
+        first.message = name.clone();
+        first.labels[0].message = name.clone();
+        first.notes.push(name.clone());
+        first.helps.push(name.clone());
+        first
+            .fix_suggestions
+            .push(FixSuggestion::new(Span::dummy(), &name, &name));
+        let source = first.with_source_names(&Default::default());
+        for text in [
+            &source.message,
+            &source.labels[0].message,
+            &source.notes[0],
+            &source.helps[0],
+            &source.fix_suggestions[0].message,
+        ] {
+            assert_eq!(text, "Heap");
+        }
+        assert_eq!(source.fix_suggestions[0].replacement, name);
+        assert_eq!(first.message, name);
+        let mut seen = SourceDiagnosticSet::default();
+        assert!(seen.insert(&first, &Default::default()).is_some());
+        let mut other = first.clone();
+        other.fix_suggestions[0].replacement.push('x');
+        assert!(seen.insert(&other, &Default::default()).is_some());
+    }
+
+    #[test]
+    fn generic_diagnostic_unlocated_errors_are_not_collapsed() {
+        for dummy in [false, true] {
+            let mut diagnostic = error();
+            if dummy {
+                diagnostic.labels[0].span = Span::dummy();
+            } else {
+                diagnostic.labels.clear();
+            }
+            let mut seen = SourceDiagnosticSet::default();
+            for _ in 0..2 {
+                assert!(seen.insert(&diagnostic, &Default::default()).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn generic_diagnostic_scaling_counts() {
+        for locations in [1, 16, 64] {
+            for instances in [1, 16, 64] {
+                let mut seen = SourceDiagnosticSet::default();
+                let mut visits = 0;
+                let mut emitted = 0;
+                for instance in 0..instances {
+                    for location in 0..locations {
+                        let mut diagnostic = error();
+                        diagnostic.message = format!("no method on Heap$mono${instance:064x}");
+                        diagnostic.labels[0].span.start += location;
+                        diagnostic.labels[0].span.end += location;
+                        visits += 1;
+                        emitted +=
+                            usize::from(seen.insert(&diagnostic, &Default::default()).is_some());
+                    }
+                }
+                assert_eq!(visits, instances * locations);
+                assert_eq!(emitted, locations);
+                assert_eq!(seen.0.len(), locations);
+                eprintln!(
+                    "generic diagnostics: locations={locations} instances={instances} visits={visits} emitted={emitted} retained={}",
+                    seen.0.len()
+                );
+            }
         }
     }
 }

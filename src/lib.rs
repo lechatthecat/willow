@@ -886,9 +886,17 @@ fn run_frontend_revision(
         }
         graph.artifacts = Some(storage);
         let mut errors = 0;
+        let mut seen_diagnostics = diagnostics::diagnostic::SourceDiagnosticSet::default();
         for checker in &checkers {
-            emit_frontend_diagnostics(&checker.errors, map, &graph, &diagnostic_modules, emitter)?;
-            errors += diagnostic_error_count(&checker.errors);
+            let diagnostics: Vec<_> = checker
+                .errors
+                .iter()
+                .filter_map(|diagnostic| {
+                    seen_diagnostics.insert(diagnostic, &diagnostic_modules.package_names)
+                })
+                .collect();
+            emit_frontend_diagnostics(&diagnostics, map, &graph, &diagnostic_modules, emitter)?;
+            errors += diagnostic_error_count(&diagnostics);
         }
         anyhow::ensure!(errors == 0, "generic checking failed ({errors} errors)");
         let mut storage = graph.artifacts.take().expect("generic source artifacts");

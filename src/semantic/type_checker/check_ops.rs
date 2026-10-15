@@ -515,7 +515,11 @@ impl TypeChecker {
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0502,
-                    format!("no static property `{}::{}`", resolved, s.field),
+                    format!(
+                        "no static property `{}::{}`",
+                        self.diagnostic_class_name(&resolved),
+                        s.field
+                    ),
                 )
                 .with_label(Label::primary(s.span, "static property not found")),
             );
@@ -559,7 +563,11 @@ impl TypeChecker {
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0419,
-                        format!("static property `{}::{}` is private", owner, s.field),
+                        format!(
+                            "static property `{}::{}` is private",
+                            self.diagnostic_class_name(&owner),
+                            s.field
+                        ),
                     )
                     .with_label(Label::primary(s.span, "private static property")),
                 );

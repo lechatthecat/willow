@@ -23,7 +23,9 @@ pub(crate) struct TemplateRegistry {
     nominal_types: HashMap<String, Rc<InstantiationType>>,
     instantiated_classes: HashMap<InstantiationKey, Rc<InstantiatedClass>>,
     functions: HashMap<(crate::diagnostics::FileId, String), Rc<FunctionDecl>>,
-    classes: HashMap<(crate::diagnostics::FileId, String), Rc<ClassDecl>>,
+    // Read-only declaration identities are shared with abstract checking; its
+    // speculative instances still use a separate registry.
+    classes: Rc<HashMap<(crate::diagnostics::FileId, String), Rc<ClassDecl>>>,
     /// Generic interfaces with default bodies, by declaring file and name: a
     /// class in another unit receives their defaults (willow-s71l).
     interfaces: HashMap<(crate::diagnostics::FileId, String), Rc<InterfaceDecl>>,
@@ -77,8 +79,12 @@ impl TemplateRegistry {
     }
 
     pub(crate) fn intern_class(&mut self, declaration: &ClassDecl) -> Rc<ClassDecl> {
-        self.classes
-            .entry((declaration.span.file_id, declaration.name.clone()))
+        let key = (declaration.span.file_id, declaration.name.clone());
+        if let Some(template) = self.classes.get(&key) {
+            return Rc::clone(template);
+        }
+        Rc::make_mut(&mut self.classes)
+            .entry(key)
             .or_insert_with(|| {
                 #[cfg(test)]
                 {
@@ -157,6 +163,83 @@ mod template_registry_tests {
         let (program, diagnostics) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         program
+    }
+
+    #[test]
+    fn generic_diagnostic_class_name_index_scaling() {
+        for templates in [1, 16, 256] {
+            for parameters in [1, 4, 16] {
+                let names = (0..parameters)
+                    .map(|i| format!("P{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let program = parse(&format!("class Heap<{names}> {{}}"));
+                let Item::Class(class) = &program.items[0] else {
+                    unreachable!()
+                };
+                let mut checker = TypeChecker::new();
+                checker.register_class(class);
+                let template = checker.generics.registry.borrow_mut().intern_class(class);
+                checker.generics.classes.insert("Heap".into(), template);
+                for i in 1..templates {
+                    let mut other = class.clone();
+                    other.name = format!("Other{i}");
+                    checker.generics.registry.borrow_mut().intern_class(&other);
+                }
+                // Force the file/name index fallback for a canonical instance.
+                let canonical = format!("$local::module::Heap$mono${:064x}", 7);
+                let mut info = checker.symbols.lookup_class("Heap").unwrap().clone();
+                info.name = canonical.clone();
+                checker.symbols.define_class(canonical.clone(), info);
+                let mut queries = 0;
+                for _ in 0..64 {
+                    assert_eq!(
+                        checker.diagnostic_class_name("Heap"),
+                        format!("Heap<{names}>")
+                    );
+                    assert_eq!(
+                        checker.diagnostic_class_name(&canonical),
+                        format!("$local::module::Heap<{names}>")
+                    );
+                    queries += 2;
+                }
+                assert_eq!(queries, 128);
+                assert_eq!(checker.generics.registry.borrow().classes.len(), templates);
+                eprintln!(
+                    "generic name index: templates={templates} parameters={parameters} queries={queries} retained_templates={templates}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_diagnostic_declaration_index_is_shared_without_speculative_state() {
+        let program = parse("class Heap<T> {} class Other<U> {}");
+        let Item::Class(heap) = &program.items[0] else {
+            unreachable!()
+        };
+        let Item::Class(other) = &program.items[1] else {
+            unreachable!()
+        };
+        let mut source = TemplateRegistry::default();
+        source.intern_class(heap);
+        let mut abstract_registry = TemplateRegistry {
+            classes: Rc::clone(&source.classes),
+            ..Default::default()
+        };
+        for _ in 0..64 {
+            source.intern_class(heap);
+            assert!(Rc::ptr_eq(&source.classes, &abstract_registry.classes));
+        }
+        assert_eq!(source.class_copies, 1);
+        abstract_registry
+            .requested
+            .insert((1, "speculative".into(), vec![Type::I64]));
+        assert!(source.requested.is_empty());
+        abstract_registry.intern_class(other);
+        assert_eq!(source.classes.len(), 1);
+        assert_eq!(abstract_registry.classes.len(), 2);
+        assert!(!Rc::ptr_eq(&source.classes, &abstract_registry.classes));
     }
 
     #[test]
@@ -1338,6 +1421,31 @@ impl TypeChecker {
         })
     }
 
+    /// Display a class using its declared generic parameters, so a diagnostic
+    /// in a template body has the same spelling in every concrete instance.
+    /// Only class-name slots use this helper; member names and fix text must
+    /// retain their original spelling even when they match a generic class.
+    pub(super) fn diagnostic_class_name(&self, name: &str) -> String {
+        let source = name.split_once("$mono$").map_or(name, |(base, _)| base);
+        if let Some(template) = self.generics.classes.get(source) {
+            return format!("{source}<{}>", template.type_params.join(", "));
+        }
+        // A shared instance may carry the canonical defining-module spelling
+        // rather than this checker's import alias. Resolve by declaration file
+        // and source name, without searching every template or import.
+        if let Some(class) = self.symbols.lookup_class(name) {
+            let local = source.rsplit("::").next().unwrap_or(source);
+            let registry = self.generics.registry.borrow();
+            if let Some(template) = registry
+                .classes
+                .get(&(class.declaration_span.file_id, local.to_owned()))
+            {
+                return format!("{source}<{}>", template.type_params.join(", "));
+            }
+        }
+        name.to_owned()
+    }
+
     pub(super) fn instantiate_class(
         &mut self,
         name: &str,
@@ -1735,6 +1843,8 @@ impl TypeChecker {
         checker.generics.class_paths = self.generics.class_paths.clone();
         checker.generics.registry.borrow_mut().module_paths =
             Rc::clone(&self.generics.registry.borrow().module_paths);
+        checker.generics.registry.borrow_mut().classes =
+            Rc::clone(&self.generics.registry.borrow().classes);
         checker.generics.abstract_check = true;
         let functions: Vec<_> = self.generics.functions.values().cloned().collect();
         let classes: Vec<_> = self.generics.classes.values().cloned().collect();

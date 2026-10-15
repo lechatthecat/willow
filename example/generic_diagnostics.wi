@@ -1,0 +1,9 @@
+// Source-level names are shared, but valid concrete bodies still run separately.
+class Heap<T> {
+    pub value: T;
+    pub fn get(self) -> T { return self.value; }
+}
+fn main() {
+    println(new Heap<i64>(42).get());
+    println(new Heap<String>("ok").get());
+}

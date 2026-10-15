@@ -778,7 +778,10 @@ impl TypeChecker {
                             Diagnostic::new(
                                 Severity::Error,
                                 ErrorCode::E0846,
-                                format!("constructor of `{}` is not visible here", resolved),
+                                format!(
+                                    "constructor of `{}` is not visible here",
+                                    self.diagnostic_class_name(&resolved)
+                                ),
                             )
                             .with_label(Label::primary(n.span, "private constructor"))
                             .with_help("construct it through a visible factory method"),
@@ -822,7 +825,7 @@ impl TypeChecker {
                     ErrorCode::E0845,
                     format!(
                         "constructor `{}::init` expects {} argument(s) but got {}",
-                        resolved,
+                        self.diagnostic_class_name(&resolved),
                         params.len(),
                         arg_types.len()
                     ),
@@ -847,7 +850,7 @@ impl TypeChecker {
                                     format!(
                                         "constructor argument {} of `{}` expects `{}`, found `{}`",
                                         i + 1,
-                                        resolved,
+                                        self.diagnostic_class_name(&resolved),
                                         type_name(&param.ty),
                                         type_name(aty)
                                     ),
@@ -895,7 +898,11 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0503,
-                            format!("field `{}` of class `{}` is protected", field_name, owner),
+                            format!(
+                                "field `{}` of class `{}` is protected",
+                                field_name,
+                                self.diagnostic_class_name(owner)
+                            ),
                         )
                         .with_label(Label::primary(
                             span,
@@ -907,7 +914,7 @@ impl TypeChecker {
                         ))
                         .with_help(format!(
                             "provide a visible `init` or factory method on `{}`",
-                            owner
+                            self.diagnostic_class_name(owner)
                         )),
                     );
                 }
@@ -916,7 +923,11 @@ impl TypeChecker {
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0501,
-                        format!("field `{}` of class `{}` is private", field_name, owner),
+                        format!(
+                            "field `{}` of class `{}` is private",
+                            field_name,
+                            self.diagnostic_class_name(owner)
+                        ),
                     )
                     .with_label(Label::primary(
                         span,
@@ -928,7 +939,7 @@ impl TypeChecker {
                     ))
                     .with_help(format!(
                         "provide a public `init` or factory method on `{}`",
-                        owner
+                        self.diagnostic_class_name(owner)
                     )),
                 );
             }

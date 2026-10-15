@@ -1431,7 +1431,11 @@ impl TypeChecker {
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0502,
-                        format!("no field `{}` on class `{}`", field_name, class_name),
+                        format!(
+                            "no field `{}` on class `{}`",
+                            field_name,
+                            self.diagnostic_class_name(&class_name)
+                        ),
                     )
                     .with_label(Label::primary(span, "field not found")),
                 );
@@ -1453,13 +1457,13 @@ impl TypeChecker {
                                 Diagnostic::new(
                                     Severity::Error,
                                     ErrorCode::E0503,
-                                    format!("field `{}` of class `{}` is protected", field_name, owner),
+                                    format!("field `{}` of class `{}` is protected", field_name, self.diagnostic_class_name(&owner)),
                                 )
                                 .with_label(Label::primary(span, "protected field"))
                                 .with_label(Label::secondary(fi.declaration_span, "field defined here"))
                                 .with_help(format!(
                                     "prot members are accessible only within `{}` and its subclasses",
-                                    owner
+                                    self.diagnostic_class_name(&owner)
                                 )),
                             );
                         }
@@ -1468,7 +1472,11 @@ impl TypeChecker {
                             Diagnostic::new(
                                 Severity::Error,
                                 ErrorCode::E0501,
-                                format!("field `{}` of class `{}` is private", field_name, owner),
+                                format!(
+                                    "field `{}` of class `{}` is private",
+                                    field_name,
+                                    self.diagnostic_class_name(&owner)
+                                ),
                             )
                             .with_label(Label::primary(span, "private field"))
                             .with_label(Label::secondary(fi.declaration_span, "field defined here"))
@@ -1672,7 +1680,11 @@ impl TypeChecker {
                 let mut diagnostic = Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0502,
-                    format!("no method `{}` on class `{}`", method_name, class_name),
+                    format!(
+                        "no method `{}` on class `{}`",
+                        method_name,
+                        self.diagnostic_class_name(&class_name)
+                    ),
                 )
                 .with_label(Label::primary(span, "method not found"));
 
@@ -1717,13 +1729,13 @@ impl TypeChecker {
                                 Diagnostic::new(
                                     Severity::Error,
                                     ErrorCode::E0503,
-                                    format!("method `{}` of class `{}` is protected", method_name, owner),
+                                    format!("method `{}` of class `{}` is protected", method_name, self.diagnostic_class_name(&owner)),
                                 )
                                 .with_label(Label::primary(span, "protected method"))
                                 .with_label(Label::secondary(mi.declaration_span, "method defined here"))
                                 .with_help(format!(
                                     "prot members are accessible only within `{}` and its subclasses",
-                                    owner
+                                    self.diagnostic_class_name(&owner)
                                 )),
                             );
                         }
@@ -1732,7 +1744,11 @@ impl TypeChecker {
                             Diagnostic::new(
                                 Severity::Error,
                                 ErrorCode::E0501,
-                                format!("method `{}` of class `{}` is private", method_name, owner),
+                                format!(
+                                    "method `{}` of class `{}` is private",
+                                    method_name,
+                                    self.diagnostic_class_name(&owner)
+                                ),
                             )
                             .with_label(Label::primary(span, "private method"))
                             .with_label(Label::secondary(
@@ -2492,7 +2508,11 @@ impl TypeChecker {
                 let mut diagnostic = Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0502,
-                    format!("no method `{}` on class `{}`", method_name, class_name),
+                    format!(
+                        "no method `{}` on class `{}`",
+                        method_name,
+                        self.diagnostic_class_name(class_name)
+                    ),
                 )
                 .with_label(Label::primary(span, "method not found"));
 
@@ -2545,14 +2565,14 @@ impl TypeChecker {
                                     ErrorCode::E0503,
                                     format!(
                                         "method `{}` of class `{}` is protected",
-                                        method_name, class_name
+                                        method_name, self.diagnostic_class_name(class_name)
                                     ),
                                 )
                                 .with_label(Label::primary(span, "protected method"))
                                 .with_label(Label::secondary(mi.declaration_span, "method defined here"))
                                 .with_help(format!(
                                     "prot members are accessible only within `{}` and its subclasses",
-                                    class_name
+                                    self.diagnostic_class_name(class_name)
                                 )),
                             );
                         }
@@ -2563,7 +2583,8 @@ impl TypeChecker {
                                 ErrorCode::E0501,
                                 format!(
                                     "method `{}` of class `{}` is private",
-                                    method_name, class_name
+                                    method_name,
+                                    self.diagnostic_class_name(class_name)
                                 ),
                             )
                             .with_label(Label::primary(span, "private method"))
@@ -2829,7 +2850,11 @@ impl TypeChecker {
                                 Diagnostic::new(
                                     Severity::Error,
                                     ErrorCode::E0503,
-                                    format!("static property `{}::{}` is protected", owner, field),
+                                    format!(
+                                        "static property `{}::{}` is protected",
+                                        self.diagnostic_class_name(&owner),
+                                        field
+                                    ),
                                 )
                                 .with_label(Label::primary(span, "protected static property")),
                             );
@@ -2839,7 +2864,11 @@ impl TypeChecker {
                             Diagnostic::new(
                                 Severity::Error,
                                 ErrorCode::E0419,
-                                format!("static property `{}::{}` is private", owner, field),
+                                format!(
+                                    "static property `{}::{}` is private",
+                                    self.diagnostic_class_name(&owner),
+                                    field
+                                ),
                             )
                             .with_label(Label::primary(span, "private static property"))
                             .with_help("declare it `pub static` to expose it"),
@@ -2869,7 +2898,11 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0502,
-                            format!("no static property `{}::{}`", resolved, field),
+                            format!(
+                                "no static property `{}::{}`",
+                                self.diagnostic_class_name(&resolved),
+                                field
+                            ),
                         )
                         .with_label(Label::primary(span, "static property not found")),
                     );
