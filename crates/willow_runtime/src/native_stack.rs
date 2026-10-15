@@ -107,6 +107,7 @@ pub(crate) fn affinity_counts_for_test() -> (usize, usize) {
 }
 
 pub(crate) struct NativeStack {
+    context: crate::generated_context::Context,
     pub(crate) worker: usize,
     affinity: Option<WorkerAffinity<'static>>,
     owner_thread: std::thread::ThreadId,
@@ -160,6 +161,7 @@ impl NativeStack {
     pub(crate) fn acquire(poll: RuntimePollFn, frame: *mut c_void) -> Box<Self> {
         if let Some(mut stack) = IDLE_STACKS.with(|pool| pool.borrow_mut().pop()) {
             stack.affinity = Some(WORKER_AFFINITIES.acquire(stack.worker));
+            stack.context.clear_helper();
             stack.generated = false;
             stack.native_frames = 0;
             stack.migratable = false;
@@ -224,6 +226,7 @@ impl NativeStack {
             (lower, lower + page)
         };
         Box::new(Self {
+            context: crate::generated_context::Context::new(),
             worker: crate::scheduler::current_worker(),
             affinity: Some(WORKER_AFFINITIES.acquire(crate::scheduler::current_worker())),
             owner_thread: std::thread::current().id(),
@@ -309,8 +312,14 @@ impl NativeStack {
             let outer_helper = crate::stack_overflow::replace_task_helper((*stack).overflow_helper);
             // Borrow only the coroutine field: user code accesses the other
             // fields through CURRENT while this activation is suspended.
+            (*stack).context.refresh();
+            let context = std::ptr::addr_of!((*stack).context);
+            let outer_context = crate::generated_context::replace(context);
+            let outer_diagnostic = crate::stack_overflow::replace_generated_context(context);
             let switched = (*std::ptr::addr_of_mut!((*stack).coroutine)).resume(());
             (*stack).overflow_helper = crate::stack_overflow::replace_task_helper(outer_helper);
+            crate::stack_overflow::replace_generated_context(outer_diagnostic);
+            crate::generated_context::replace(outer_context);
             #[cfg(unix)]
             crate::stack_overflow::replace_guard(guard.0, guard.1);
             assert!(matches!(switched, CoroutineResult::Yield(())));
@@ -366,7 +375,7 @@ fn trampoline(yielder: &Yielder<(), ()>) {
             unsafe { ((*stack).poll, (*stack).cancel_entry, (*stack).frame) };
         let result = if let Some(cancel) = cancel {
             unsafe {
-                cancel(frame);
+                crate::generated_context::invoke(cancel as *const (), frame);
                 (*stack).cleanup_depth = 0;
             }
             if crate::panic_context::willow_panic_active() != 0 {
@@ -375,7 +384,7 @@ fn trampoline(yielder: &Yielder<(), ()>) {
                 crate::task::RUNTIME_POLL_READY
             }
         } else {
-            unsafe { poll(frame) }
+            unsafe { crate::generated_context::invoke(poll as *const (), frame) }
         };
         // A completed helper can return to a cooperative poll on the worker
         // stack in the SAME quantum. Settle its partial inline grant before

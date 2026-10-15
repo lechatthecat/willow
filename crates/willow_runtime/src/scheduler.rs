@@ -3982,7 +3982,7 @@ pub extern "C" fn willow_sync_poll_cancel_cleanup() {
     if let Some((cancel, frame)) = cleanup {
         crate::preempt::willow_sync_cleanup_enter();
         unsafe {
-            cancel(frame);
+            crate::generated_context::invoke(cancel as *const (), frame);
         }
         crate::preempt::willow_sync_cleanup_leave();
     }
@@ -4534,7 +4534,9 @@ fn scheduler_run_loop(
             ))]
             {
                 if work.direct_cancel {
-                    unsafe { cancel_fn(cancel_frame) };
+                    unsafe {
+                        crate::generated_context::invoke(cancel_fn as *const (), cancel_frame)
+                    };
                 } else {
                     let mut stack =
                         crate::native_stack::NativeStack::acquire_cleanup(cancel_fn, cancel_frame);
@@ -4582,7 +4584,7 @@ fn scheduler_run_loop(
                 all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             )))]
             unsafe {
-                cancel_fn(cancel_frame)
+                crate::generated_context::invoke(cancel_fn as *const (), cancel_frame)
             };
             let cleanup_panicked = crate::panic_context::willow_panic_active() != 0;
             let panic_chain = cleanup_panicked.then(async_chain_text);
@@ -4660,7 +4662,10 @@ fn scheduler_run_loop(
         ))]
         let (result, native_cancelled) = {
             if work.direct_poll {
-                (unsafe { poll(frame) }, false)
+                (
+                    unsafe { crate::generated_context::invoke(poll as *const (), frame) },
+                    false,
+                )
             } else {
                 let mut stack = global_task_table()
                     .with_mut(id, |task| task.native_stack.take())
@@ -4688,7 +4693,10 @@ fn scheduler_run_loop(
             ),
             all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
         )))]
-        let (result, native_cancelled) = (unsafe { poll(frame) }, false);
+        let (result, native_cancelled) = (
+            unsafe { crate::generated_context::invoke(poll as *const (), frame) },
+            false,
+        );
         crate::preempt::willow_preempt_end();
         // Native runtime polls (e.g. parallel-map chunks) need not implement
         // the generated async cancellation epilogue. Preserve their registered
@@ -4928,7 +4936,7 @@ fn task_stack_enter(callback: RuntimePollFn, frame: *mut c_void, generated: bool
         all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     )))]
     unsafe {
-        callback(frame)
+        crate::generated_context::invoke(callback as *const (), frame)
     }
 }
 

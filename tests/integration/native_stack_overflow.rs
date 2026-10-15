@@ -202,7 +202,7 @@ fn check_after_return_runtime(cleanup: bool) {
                 "-lm",
                 "-lpthread",
                 "-ldl",
-                "-Wl,--wrap=willow_stack_helper_set",
+                "-Wl,--wrap=willow_println_i64",
                 "-Wl,--wrap=willow_sync_safepoint",
                 "-Wl,--wrap=willow_pop_roots",
                 "-o",

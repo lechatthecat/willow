@@ -100,7 +100,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let panic_depth = if plan.may_panic {
             self.emit_pre_willow_call_panic_depth()
         } else {
-            self.emit_stack_helper();
             None
         };
         // Descriptor and vtable slots are immutable. Resolve them without an
@@ -308,7 +307,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let panic_depth = if slots.may_panic {
             self.emit_pre_willow_call_panic_depth()
         } else {
-            self.emit_stack_helper();
             None
         };
         let result_ty = (ret_type != Type::Void).then(|| self.clif_type(&ret_type));

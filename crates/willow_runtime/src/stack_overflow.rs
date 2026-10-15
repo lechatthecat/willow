@@ -19,6 +19,7 @@ const TASK_DIAGNOSTIC: &[u8] =
 
 #[derive(Default)]
 struct DiagnosticState {
+    context: std::sync::atomic::AtomicPtr<crate::generated_context::Context>,
     task: std::sync::atomic::AtomicBool,
     name: std::sync::atomic::AtomicPtr<u8>,
     len: std::sync::atomic::AtomicUsize,
@@ -48,6 +49,14 @@ impl DiagnosticState {
         if !self.task.load(SeqCst) {
             return None;
         }
+        let context = self.context.load(SeqCst);
+        if !context.is_null() {
+            // SAFETY: resume installs a stable native-stack context for only
+            // the interval in which this thread owns that stack.
+            if let Some(helper) = unsafe { &*context }.helper() {
+                return Some(helper);
+            }
+        }
         let len = self.len.load(SeqCst);
         Some(if len == 0 {
             b"<unknown>"
@@ -56,6 +65,21 @@ impl DiagnosticState {
             unsafe { std::slice::from_raw_parts(self.name.load(SeqCst), len) }
         })
     }
+}
+
+pub(crate) fn replace_generated_context(
+    context: *const crate::generated_context::Context,
+) -> *const crate::generated_context::Context {
+    PROTECTION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or(std::ptr::null(), |protection| {
+                protection
+                    .diagnostic()
+                    .context
+                    .swap(context.cast_mut(), std::sync::atomic::Ordering::SeqCst)
+            })
+    })
 }
 
 pub(crate) fn replace_task_helper(helper: TaskHelper) -> TaskHelper {
@@ -74,6 +98,10 @@ pub extern "C" fn willow_stack_helper_set(name: *const u8, len: i64) {
     PROTECTION.with(|slot| {
         if let Some(protection) = slot.borrow().as_ref() {
             let state = protection.diagnostic();
+            let context = state.context.load(std::sync::atomic::Ordering::SeqCst);
+            if !context.is_null() {
+                unsafe { &*context }.clear_helper();
+            }
             if state.task.load(std::sync::atomic::Ordering::SeqCst) {
                 let name = if name.is_null() || len <= 0 {
                     &b"<unknown>"[..]

@@ -5073,7 +5073,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// All paths are terminated by the LIR, so the caller must skip its
     /// implicit-return epilogue.
     pub(super) fn emit_lir_function(&mut self, f: &LirFunction) {
-        self.emit_stack_helper();
+        // A proven inline-only, acyclic leaf cannot consume more stack after
+        // its probed prologue. Leave the caller's name in place: a prologue
+        // fault occurs before any callee marker could execute in either case.
+        if !super::root_effect::is_safepoint_free_leaf(
+            f,
+            self.build_mode == crate::BuildMode::Debug,
+        ) {
+            self.emit_stack_helper();
+        }
         self.emit_lir_function_inner(f, None);
     }
 
@@ -8042,7 +8050,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let panic_depth = match unchecked {
             None => self.emit_pre_willow_call_panic_depth(),
             Some(unchecked) => {
-                self.emit_stack_helper();
                 let depth = crate::backend::abi::runtime_symbol("willow_panic_depth")
                     .and_then(|symbol| symbol.ret)
                     .expect("willow_panic_depth returns the depth");

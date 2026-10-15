@@ -375,7 +375,6 @@ impl FuncGen<'_, '_> {
         if self.user_function_may_panic(callee) {
             self.emit_pre_willow_call_panic_depth()
         } else {
-            self.emit_stack_helper();
             None
         }
     }

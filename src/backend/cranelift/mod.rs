@@ -339,6 +339,7 @@ impl Codegen {
         let mut flag_builder = settings::builder();
         // Scalar ADTs are I128 SSA values, lowered to two integer ABI words.
         flag_builder.set("enable_llvm_abi_extensions", "true")?;
+        flag_builder.set("enable_pinned_reg", "true")?;
         // Keep function cache-line placement stable across runtime-only link
         // changes, including async entry points and internal math helpers.
         // The shared ISA setting reaches every ObjectModule definition and

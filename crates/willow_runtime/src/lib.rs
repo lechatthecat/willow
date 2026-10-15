@@ -62,6 +62,7 @@ pub mod future;
 pub mod gc;
 pub mod gc_mark_queue;
 pub mod gc_telemetry;
+mod generated_context;
 pub(crate) mod id_hash;
 pub mod lock;
 pub mod lock_wait;
@@ -158,8 +159,8 @@ pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
     let runtime_tlab = gc::RuntimeTlabOwner::enter();
     // Static properties are initialized once, after the GC is ready and before
     // user `main` runs (willow-qsqf §11).
-    unsafe { __willow_static_init() };
-    unsafe { willow_user_main() };
+    unsafe { generated_context::invoke(__willow_static_init as *const (), std::ptr::null_mut()) };
+    unsafe { generated_context::invoke(willow_user_main as *const (), std::ptr::null_mut()) };
     drop(runtime_tlab);
     gc::shutdown_mark_workers();
     panic_context::replace_current_context(previous_panic_context);

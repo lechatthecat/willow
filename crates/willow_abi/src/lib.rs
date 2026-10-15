@@ -816,3 +816,13 @@ mod bitmap_fingerprint_tests {
         }
     }
 }
+
+/// Generated execution context, addressed by Cranelift's pinned register
+/// (r15 on x86-64, x21 on AArch64). Runtime entry bridges preserve the C ABI.
+pub mod generated_context {
+    pub const HELPER_OFFSET: i32 = 0;
+    pub const TLAB_OFFSET: i32 = 8;
+    pub const SIZE: usize = 16;
+    pub const HELPER_DESCRIPTOR_SIZE: usize = 16;
+    pub const HELPER_LENGTH_OFFSET: usize = 8;
+}

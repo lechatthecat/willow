@@ -36,9 +36,9 @@ std::thread_local! {
     static RUNTIME_TLAB_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Acquire the current worker's allocation block. Generated code must call this
-/// at each allocation site: a tls_value instruction may be commoned across a
-/// task-stack migration. This opaque call cannot be hoisted across that switch.
+/// Acquire the current worker's allocation block. The generated execution
+/// context refreshes this pointer at native-stack resume and runtime entry.
+/// Allocation sites load it through that stable context, never cached TLS.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_current_tlab() -> *mut GcTlabState {

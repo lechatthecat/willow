@@ -555,3 +555,44 @@ fn lir_parallel_20_the_example_is_fully_lir() {
         ],
     );
 }
+
+/// Nested native-to-generated mapper entry must establish its own context.
+/// Five full-width values x debug/release x plain/alloc/relocate GC = 30
+/// value/build/collection perspectives; each is checked with 1 and 4 workers.
+#[test]
+fn parallel_mapper_context_bridge_preserves_i64_and_gc_roots() {
+    use super::support::TestProject;
+    let project = TestProject::new(
+        "parallel_context_bridge",
+        &[(
+            "main.wi",
+            include_str!("../../example/parallel_context_bridge.wi"),
+        )],
+    );
+    for release in [false, true] {
+        let args: &[&str] = if release { &["--release"] } else { &[] };
+        let compiled = project.compile_with_args("main.wi", args);
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        for stress in ["", "alloc", "relocate"] {
+            for workers in ["1", "4"] {
+                let out = project.run_with_env_timeout(
+                    &[("WILLOW_WORKERS", workers), ("WILLOW_GC_STRESS", stress)],
+                    Duration::from_secs(30),
+                );
+                assert!(
+                    out.status.success(),
+                    "release={release} stress={stress} workers={workers}: {out:?}"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    "4294967297\n-4294967297\n9223372036854775807\n-9223372036854775807\n0\n",
+                    "release={release} stress={stress} workers={workers}"
+                );
+            }
+        }
+    }
+}

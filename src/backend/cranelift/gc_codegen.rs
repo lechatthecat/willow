@@ -322,10 +322,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         let ptr_ty = reference_type(self.module.target_config());
-        let current = self.func_id("willow_gc_current_tlab");
-        let current = self.module.declare_func_in_func(current, self.builder.func);
-        let call = self.builder.ins().call(current, &[]);
-        let tlab = self.builder.inst_results(call)[0];
+        let context = self
+            .builder
+            .ins()
+            .get_pinned_reg(reference_type(self.module.target_config()));
+        let tlab = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::trusted(),
+            context,
+            willow_abi::generated_context::TLAB_OFFSET,
+        );
         let limit_addr = self
             .builder
             .ins()
@@ -432,10 +438,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_gc_alloc_slow(&mut self, layout: GcLayoutMetadata) -> Value {
-        let current = self.func_id("willow_gc_current_tlab");
-        let current = self.module.declare_func_in_func(current, self.builder.func);
-        let call = self.builder.ins().call(current, &[]);
-        let tlab = self.builder.inst_results(call)[0];
+        let context = self
+            .builder
+            .ins()
+            .get_pinned_reg(reference_type(self.module.target_config()));
+        let tlab = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::trusted(),
+            context,
+            willow_abi::generated_context::TLAB_OFFSET,
+        );
         let layout_id = self
             .builder
             .ins()

@@ -1465,7 +1465,7 @@ fn abi_handshake_has_one_call_for_increasing_function_counts() {
 }
 
 #[test]
-fn task_migration_allocation_tls_lookup_has_linear_generated_size() {
+fn task_migration_allocation_context_has_linear_generated_size() {
     let mut measurements = Vec::new();
     for count in [1, 8, 32] {
         let mut source = String::from("class Cell { pub value: i64; }\n");
@@ -1484,19 +1484,21 @@ fn task_migration_allocation_tls_lookup_has_linear_generated_size() {
             .iter()
             .filter(|name| *name == "willow_gc_current_tlab")
             .count();
-        assert!(lookups > 0);
+        assert_eq!(lookups, 0, "allocation must use the pinned context");
+        assert!(!targets.iter().any(|name| name == "willow_stack_helper_set"));
         assert!(
             targets
                 .iter()
                 .any(|name| name == "willow_task_stack_enter_generated")
         );
         assert!(!targets.iter().any(|name| name == "__willow_gc_tlab_state"));
-        assert!(
-            lookups <= 8 * count + 8,
-            "duplicated allocation lookup: {lookups}"
-        );
-        println!("functions={count} allocation_tls_lookups={lookups}");
-        measurements.push((count, lookups));
+        let slow_sites = targets
+            .iter()
+            .filter(|name| *name == "willow_gc_alloc_slow")
+            .count();
+        assert!(slow_sites > 0 && slow_sites <= 8 * count + 8);
+        println!("functions={count} allocation_tls_lookups={lookups} slow_sites={slow_sites}");
+        measurements.push((count, slow_sites));
     }
     let slope_numerator = measurements[1].1 - measurements[0].1;
     assert_eq!(

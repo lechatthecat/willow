@@ -115,7 +115,9 @@ unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
             unsafe { drop_chunk_state(frame) };
             return crate::task::RUNTIME_POLL_PANICKED;
         }
-        let mapped = unsafe { (state.mapper)(input_value) };
+        // This native frame can repurpose the pinned register even when its
+        // scheduler entry installed one. Re-establish it at the mapper boundary.
+        let mapped = unsafe { crate::generated_context::invoke_i64(state.mapper, input_value) };
         // A mapper panic follows the ordinary Task policy. Stop immediately so
         // neutral ABI return values are never committed as successful output.
         if crate::panic_context::willow_panic_active() != 0 {

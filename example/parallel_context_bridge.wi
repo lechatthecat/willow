@@ -1,0 +1,24 @@
+import std::collections::Array;
+import std::parallel;
+
+class Boxed { pub value: i64; }
+
+fn helper(value: i64) -> i64 {
+    let boxed = new Boxed(value);
+    let text = value.toString();
+    gc_minor_collect();
+    if text != value.toString() { panic("lost mapper string"); }
+    return boxed.value;
+}
+
+fn mapper(value: i64) -> i64 { return helper(value); }
+
+async fn main() {
+    let values: Array<i64> = [4294967297, -4294967297, 9223372036854775807, -9223372036854775807, 0];
+    let result = await parallel::map(values.freeze(), mapper);
+    let mut i = 0;
+    while i < result.len() {
+        println(result[i]);
+        i = i + 1;
+    }
+}

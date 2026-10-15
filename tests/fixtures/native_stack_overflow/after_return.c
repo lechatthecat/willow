@@ -3,15 +3,15 @@
 #include <stddef.h>
 
 static _Thread_local int saw_bar;
-extern void __real_willow_stack_helper_set(const unsigned char *, int64_t);
+extern void __real_willow_println_i64(int64_t);
 extern int32_t __real_willow_sync_safepoint(void);
 extern void __real_willow_pop_roots(int32_t);
 
-void __wrap_willow_stack_helper_set(const unsigned char *name, int64_t len) {
-    __real_willow_stack_helper_set(name, len);
-    if (len == 3 && name[0] == 'b' && name[1] == 'a' && name[2] == 'r') {
-        saw_bar = 1;
-    }
+void __wrap_willow_println_i64(int64_t value) {
+    __real_willow_println_i64(value);
+    // bar's observable output arms the injection independently of the
+    // compiler's diagnostic publication mechanism.
+    if (value == 7) { saw_bar = 1; }
 }
 
 __attribute__((noinline)) static unsigned burn_stack(unsigned depth) {

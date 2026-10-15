@@ -994,21 +994,35 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Publish before a potentially stack-consuming call, including release
         // synchronous code. The handler consumes only static bytes.
         if !self.diagnostic_async && !self.diagnostic_function.is_empty() {
-            // Cache the literal lookup per function: long names must not be
-            // cloned/hashed again at every call or duplicated cleanup exit.
-            let data = *self
-                .overflow_helper_literal
-                .get_or_insert_with(|| self.string_literals[&self.diagnostic_function].bytes);
+            // Publish one immutable {bytes, length} descriptor atomically. The
+            // context follows the native task across worker migration.
+            let data = if let Some(data) = self.overflow_helper_literal {
+                data
+            } else {
+                let bytes = self.string_literals[&self.diagnostic_function].bytes;
+                let data = self.module.declare_anonymous_data(false, false).unwrap();
+                let mut desc = DataDescription::new();
+                let mut contents = vec![0; willow_abi::generated_context::HELPER_DESCRIPTOR_SIZE];
+                contents[willow_abi::generated_context::HELPER_LENGTH_OFFSET..]
+                    .copy_from_slice(&(self.diagnostic_function.len() as u64).to_ne_bytes());
+                desc.define(contents.into_boxed_slice());
+                desc.set_align(8);
+                let reference = self.module.declare_data_in_data(bytes, &mut desc);
+                desc.write_data_addr(0, reference, 0);
+                self.module.define_data(data, &desc).unwrap();
+                self.overflow_helper_literal = Some(data);
+                data
+            };
             let global = self.module.declare_data_in_func(data, self.builder.func);
-            let pointer = self
-                .builder
-                .ins()
-                .symbol_value(reference_type(self.module.target_config()), global);
-            let length = self
-                .builder
-                .ins()
-                .iconst(types::I64, self.diagnostic_function.len() as i64);
-            self.emit_void_runtime_call("willow_stack_helper_set", &[pointer, length]);
+            let ptr_ty = reference_type(self.module.target_config());
+            let pointer = self.builder.ins().symbol_value(ptr_ty, global);
+            let context = self.builder.ins().get_pinned_reg(ptr_ty);
+            self.builder.ins().store(
+                MemFlagsData::trusted(),
+                pointer,
+                context,
+                willow_abi::generated_context::HELPER_OFFSET,
+            );
         }
     }
 
@@ -1026,7 +1040,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// [`Self::emit_fault_site`]; `enters_willow` marks a call into generated
     /// code, which publishes its own fault location if it has one.
     fn emit_fault_site_for(&mut self, enters_willow: bool) {
-        self.emit_stack_helper();
+        // Entry and post-call restoration already name this caller. Runtime
+        // entry bridges restore names after nested generated callbacks.
+        if !enters_willow {
+            self.emit_stack_helper();
+        }
         if self.diagnostic_function.is_empty()
             || (self.build_mode != BuildMode::Debug && !self.diagnostic_async)
         {
