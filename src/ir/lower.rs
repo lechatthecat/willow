@@ -2956,14 +2956,20 @@ fn lower_match(
                         ctx,
                     )?
                 } else {
-                    let binding_ty = Type::Named(class_name.clone());
+                    // Pattern spellings are unit-local, just like annotations.
+                    // Both the runtime class test and its payload local must use
+                    // the canonical identity used by checked field/method uses.
+                    let binding_ty = ctx.tables.normalize(&Type::Named(class_name.clone()));
+                    let Type::Named(canonical_class) = &binding_ty else {
+                        return Err(unsupported(arm.span, "non-class downcast target"));
+                    };
                     let binding = if binding == "_" {
                         binding.clone()
                     } else {
                         ctx.bind(binding.clone(), binding_ty.clone())
                     };
                     HirPattern::ClassDowncast {
-                        class_name: class_name.clone().into(),
+                        class_name: canonical_class.clone().into(),
                         binding,
                         binding_ty: binding_ty.into(),
                     }

@@ -1,0 +1,10 @@
+import shapes::{C, E, defining};
+import consumer::importing;
+fn entry(c: C) -> i64 {
+    return match c { E(e) => e.id, _ => 0 };
+}
+fn main() {
+    println(entry(new E(2)));
+    println(defining(new E(2)));
+    println(importing(new E(2)));
+}

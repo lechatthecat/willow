@@ -1,0 +1,4 @@
+import shapes::{C, E};
+pub fn importing(c: C) -> i64 {
+    return match c { E(e) => e.k(), _ => 0 };
+}

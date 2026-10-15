@@ -340,3 +340,6 @@ mod interface_default_provider_signatures;
 
 #[path = "integration/generic_class_self.rs"]
 mod generic_class_self;
+
+#[path = "integration/module_downcast_payload.rs"]
+mod module_downcast_payload;
