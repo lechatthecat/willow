@@ -659,6 +659,7 @@ mod tests {
             }
             let captured = CapturedUnit {
                 graph: CallGraph::default(),
+                indirect: Default::default(),
                 semantic: semantic::Captured::default(),
                 symbols: facts,
                 symbol_owners: vec![(span, "Source".into())],
@@ -749,6 +750,7 @@ mod tests {
                 facts.reference(span, "x", facts.declarations[0].clone(), "read", false);
                 let captured = CapturedUnit {
                     graph: CallGraph::default(),
+                    indirect: Default::default(),
                     semantic: semantic::Captured::default(),
                     symbols: facts,
                     symbol_owners: owner

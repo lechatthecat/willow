@@ -6,6 +6,7 @@ mod display;
 pub mod edit;
 pub(crate) mod generics;
 mod graph;
+mod indirect;
 pub mod interop;
 pub mod overview;
 mod packages;
@@ -129,6 +130,7 @@ pub(crate) fn hash_serialized(value: &impl Serialize) -> Result<String> {
 
 pub(crate) struct CapturedUnit {
     graph: CallGraph,
+    indirect: indirect::Inputs,
     semantic: semantic::Captured,
     symbols: crate::semantic::analysis_symbols::Facts,
     symbol_owners: Vec<(Span, String)>,
@@ -143,6 +145,7 @@ pub(crate) struct CapturedUnit {
 }
 
 pub(crate) struct CaptureInputs<'a> {
+    pub indirect: &'a crate::semantic::indirect_lock::IndirectInputs,
     pub types: &'a HashMap<ExprId, Type>,
     pub calls: &'a HashMap<ExprId, Option<FunctionId>>,
     pub patterns: &'a HashMap<PatternId, Pattern>,
@@ -158,6 +161,7 @@ pub(crate) fn capture(
     index: Option<&crate::compiler_db::ids::BodyIndex>,
 ) -> CapturedUnit {
     let CaptureInputs {
+        indirect,
         types,
         calls,
         patterns,
@@ -180,6 +184,14 @@ pub(crate) fn capture(
     }
     let mut result = CapturedUnit {
         graph: unit_graph,
+        indirect: indirect::Inputs {
+            values: indirect
+                .values
+                .iter()
+                .map(|value| (value.target, value.bit))
+                .collect(),
+            calls: indirect.calls.clone(),
+        },
         semantic: semantic::Captured::default(),
         symbols: symbol_facts.clone(),
         symbol_owners: symbols::owners(program),
@@ -315,6 +327,16 @@ pub(crate) fn capture(
             },
             |f| f.effects().intersection(RuntimeEffects::ALL).bits(),
         );
+        if let Some(sites) = graph.get(&id) {
+            for &span in sites.indirect_spans.values() {
+                result.semantic.capability(
+                    id,
+                    RuntimeEffects::MAY_PANIC.bits(),
+                    span,
+                    "indirect-call",
+                );
+            }
+        }
         let mut initializer_calls = crate::semantic::call_graph::CallSites::default();
         let initializer = id.name().starts_with("$static$");
         let mut walk = AstWalk::new(body);
@@ -855,6 +877,12 @@ pub(crate) fn snapshot(
             _ => None,
         }
     };
+    let (indirect_functions, indirect_calls) = indirect::infer(&captured, &nodes, &resolve);
+    let incomplete_indirect: std::collections::HashSet<_> = indirect_functions
+        .iter()
+        .filter(|f| f.unknown)
+        .map(|f| f.id.as_str())
+        .collect();
     let mut edges = HashMap::<(UnitId, FunctionId), BTreeSet<String>>::new();
     for (&unit, capture) in &captured {
         for (&id, locations) in &capture.declarations {
@@ -901,9 +929,29 @@ pub(crate) fn snapshot(
         }
         for (&id, sites) in capture.graph.iter() {
             let key = resolve(unit, id);
-            let mut unknown = sites.has_unknown;
+            let indirect_targets = indirect_calls.get(&key);
+            // Only replace genuinely indirect obligations, never unresolved
+            // methods, virtual dispatch, or unchecked generic templates.
+            let inferred = indirect_targets.is_some_and(|targets| {
+                targets
+                    .iter()
+                    .all(|target| !incomplete_indirect.contains(target.as_str()))
+            }) && sites.unknown_span.is_none()
+                && sites.unsupported_initialization.iter().all(|reason| {
+                    matches!(
+                        reason,
+                        crate::semantic::call_graph::UnsupportedInitialization::IndirectCall
+                    )
+                });
+            if let Some(targets) = indirect_targets {
+                edges
+                    .entry(key)
+                    .or_default()
+                    .extend(targets.iter().cloned());
+            }
+            let mut unknown = sites.has_unknown && !inferred;
             let mut unresolved = BTreeSet::new();
-            if sites.has_unknown {
+            if unknown {
                 unresolved.insert("indirect-or-unresolved".to_string());
             }
             let mut bits = 0;
@@ -1033,7 +1081,11 @@ pub(crate) fn snapshot(
     for (key, targets) in edges {
         nodes.get_mut(&key).unwrap().callees = targets.into_iter().collect();
     }
-    let mut functions: Vec<_> = nodes.into_values().chain(dispatch.functions).collect();
+    let mut functions: Vec<_> = nodes
+        .into_values()
+        .chain(dispatch.functions)
+        .chain(indirect_functions)
+        .collect();
     for node in &mut functions {
         if node.synthetic && node.callees.is_empty() {
             node.unknown = true;

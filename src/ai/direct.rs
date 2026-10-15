@@ -393,6 +393,11 @@ impl DirectSession {
         if self.lambda_symbols.contains_key(&symbol.id) {
             return self.function_names[&symbol.id].clone();
         }
+        // A module names its namespace, not a member within that namespace.
+        // Prefixing it again makes `main::main` collide with the entry function.
+        if symbol.kind == "module" {
+            return symbol.name.clone();
+        }
         if symbol.kind == "method"
             && let (Some(name), Some(location)) = (&symbol.source_name, &symbol.location)
         {

@@ -2382,8 +2382,16 @@ fn generic_closure_value_calls_keep_queries_available() {
     }
     let unrelated = f.json(&["effects", "main::unrelated"], 0);
     assert_eq!(unrelated["result"]["status"], "ok", "{unrelated}");
-    // Each closure-value call site is owned by its source function and is
-    // reported once, regardless of the number of instantiations.
+    // Body-based bounds now resolve these indirect calls. Preserve the source
+    // ownership/count regression independently of effect certainty.
+    let snapshot = willow_compiler::CompilerSession::new(
+        f.0.join("src/main.wi").to_str().unwrap(),
+        "",
+        &willow_compiler::CompilerOptions::debug(),
+        None,
+    )
+    .analysis_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)
+    .unwrap();
     for (selector, sites) in [
         ("main::local", 1),
         ("coll::apply", 1),
@@ -2391,27 +2399,29 @@ fn generic_closure_value_calls_keep_queries_available() {
         ("coll::Box::map", 1),
         ("coll::Box::twice", 2),
     ] {
-        let value = f.json(&["effects", selector], 1);
+        let value = f.json(&["effects", selector], 0);
         let text = value.to_string();
-        assert_eq!(value["result"]["status"], "unknown", "{text}");
-        let causes = value["result"]["unknown_causes"].as_array().unwrap();
-        let own = causes
-            .iter()
-            .find(|c| c["function"] == value["result"]["selected"]["id"])
-            .unwrap_or_else(|| panic!("{selector}: {text}"));
+        assert_eq!(value["result"]["status"], "ok", "{text}");
         assert_eq!(
-            own["call_sites"].as_array().unwrap().len(),
+            value["result"]["runtime_effects"].as_u64().unwrap() & 6,
+            0,
+            "{text}"
+        );
+        let name = selector.split_once("::").unwrap().1;
+        let function = snapshot.functions.iter().find(|f| f.name == name).unwrap();
+        assert_eq!(
+            snapshot.semantic.unresolved_calls[&function.id].len(),
             sites,
-            "{selector}: {text}"
+            "{selector}"
         );
         assert!(!text.contains("$mono$"), "{selector}: {text}");
         assert!(!text.contains("$pkg"), "{selector}: {text}");
     }
-    // The unresolved call reaches transitive callers through the merged identity.
-    let relay = f.json(&["effects", "coll::relay"], 1);
-    assert_eq!(relay["result"]["status"], "unknown", "{relay}");
-    let main = f.json(&["effects", "main::main"], 1);
-    assert_eq!(main["result"]["status"], "unknown", "{main}");
+    // Known bounds propagate through merged generic identities to callers.
+    let relay = f.json(&["effects", "coll::relay"], 0);
+    assert_eq!(relay["result"]["status"], "ok", "{relay}");
+    let main = f.json(&["effects", "main::main"], 0);
+    assert_eq!(main["result"]["status"], "ok", "{main}");
     let binding = f.json(&["type", "main::main::b"], 0);
     assert_eq!(
         binding["result"]["type_display"], "coll::Box<i64>",
@@ -2992,5 +3002,23 @@ fn effect_unresolved_calls_name_the_exact_site() {
         String::from_utf8(out.stdout)
             .unwrap()
             .contains("Unresolved call `f` at src/main.wi:1:45")
+    );
+}
+
+#[test]
+fn module_selector_does_not_duplicate_its_own_name() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "module main;\nfn main() {}\n").unwrap();
+    let function = f.json(&["symbol", "main::main"], 0);
+    assert_eq!(
+        function["result"]["selected"]["kind"], "function",
+        "{function}"
+    );
+    let module = f.json(&["symbol", "main", "--kind", "module"], 0);
+    assert_eq!(module["result"]["selected"]["selector"], "main", "{module}");
+    let position = f.json(&["symbol", "src/main.wi:1:8"], 0);
+    assert_eq!(
+        position["result"]["selected"]["kind"], "module",
+        "{position}"
     );
 }

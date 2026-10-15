@@ -488,8 +488,8 @@ fn nested_expression_and_block_lambdas_own_their_source_positions() {
         let result = f.result(&["impact", "main.wi", "--file", "main.wi", "--byte", &byte]);
         let functions = result["functions"].as_array().unwrap();
         assert_eq!(
-            result["impact"]["unknown"], true,
-            "indirect callers must make reverse coverage incomplete"
+            result["impact"]["unknown"], false,
+            "checked function-value candidates give complete workspace coverage"
         );
         assert!(
             functions
@@ -497,7 +497,7 @@ fn nested_expression_and_block_lambdas_own_their_source_positions() {
                 .any(|f| f["name"].as_str().unwrap().contains("lambda")),
             "{result}"
         );
-        assert!(!functions.iter().any(|f| f["name"] == "main"), "{result}");
+        assert!(functions.iter().any(|f| f["name"] == "main"), "{result}");
         let first = f.analyze();
         let second = f.analyze();
         let diff = difference(&first, &second);

@@ -1059,6 +1059,7 @@ impl TypeChecker {
                     program,
                     &graph,
                     crate::ai::CaptureInputs {
+                        indirect: &self.indirect_lock,
                         types: &self.expr_types,
                         calls: &self.analysis_calls,
                         patterns: &self.pattern_resolutions,

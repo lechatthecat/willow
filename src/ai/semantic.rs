@@ -967,7 +967,7 @@ impl QuerySession {
                     json!({"status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
                         "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence.into_values().collect::<Vec<_>>(),
                         "witness":witness, "compiler_witnesses":self.snapshot.semantic.witnesses.get(&f.id),
-                        "meaning":"compiler facts and conservative runtime capability bounds; external business effects and predicate feasibility are not implied"})
+                        "meaning":"compiler facts and conservative runtime capability bounds; indirect-call bounds cover checked function values in this workspace, not arbitrary values supplied by future callers; external business effects and predicate feasibility are not implied"})
                 }
             },
         };
