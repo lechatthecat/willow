@@ -105,3 +105,72 @@ fn if_expression_deep_nesting_uses_continuations() {
         n
     );
 }
+
+#[test]
+fn if_expression_statement_branch_diagnostics() {
+    // Each branch position must give the same actionable diagnostic.
+    for body in [
+        "let z = 3; z",
+        "let mut z = 3; z",
+        "let (a, b) = pair(); a",
+        "const z = 3; z",
+        "return 3;",
+        "while true {} 3",
+        "for x in xs {} 3",
+        "break;",
+        "continue;",
+        "defer cleanup(); 3",
+        "need()?; 3",
+        "work(); 3",
+        "3;",
+        "x = 3; x",
+        "x += 3; x",
+        "obj.field = 3; 3",
+        "xs[0] = 3; 3",
+        "lock mutex as value { } 3",
+        "1 2",
+        "1 let z = 3; z",
+    ] {
+        for expression in [
+            format!("if true {{ {body} }} else {{ 4 }}"),
+            format!("if true {{ 4 }} else {{ {body} }}"),
+            format!("if true {{ 4 }} else if false {{ {body} }} else {{ 5 }}"),
+            format!("if true {{ if false {{ {body} }} else {{ 4 }} }} else {{ 5 }}"),
+        ] {
+            let source = format!("fn main() {{ let b = {expression}; }}");
+            let (_, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            let error = &errors[0];
+            assert_eq!(error.code, ErrorCode::E0102, "{source}: {errors:?}");
+            assert_eq!(
+                error.message, "if-expression branches must be a single expression",
+                "{source}: {errors:?}"
+            );
+            assert!(
+                error.helps.iter().any(
+                    |help| help.contains("statement form") && help.contains("mutable variable")
+                ),
+                "{source}: {errors:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn if_expression_preserves_expression_errors_and_statement_blocks() {
+    for (expression, expected) in [
+        ("if true {} else { 4 }", "expected expression"),
+        ("if true { 1 + } else { 4 }", "expected expression"),
+        ("if true { 1 }", "requires an `else`"),
+        ("if true { 1", "expected `}`"),
+    ] {
+        let source = format!("fn main() {{ let b = {expression}");
+        let (_, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(
+            errors.iter().any(|error| error.message.contains(expected)),
+            "{source}: {errors:?}"
+        );
+    }
+    parse("fn main() { let mut b = 0; if true { let z = 3; b = z; } else { b = 4; } }");
+    parse("fn main() { let b = if true { need()? } else { other()? }; }");
+    parse("fn main() { let b = if true { |x| { return x; } } else { |x| { return x; } }; }");
+}

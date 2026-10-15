@@ -93,7 +93,9 @@ fn if_expression_rejects_invalid_forms() {
         ("if true { 1 } else if false { 2 }", "requires an `else`"),
         ("if true { } else { 2 }", "expected expression"),
         ("if true { 1 } else { missing }", "missing"),
-        ("if true { 1; } else { 2 }", "expected"),
+        ("if true { 1; } else { 2 }", "single expression"),
+        ("if true { let z = 3; z } else { 4 }", "statement form"),
+        ("if true { need()?; 3 } else { 4 }", "single expression"),
     ] {
         let source = format!("fn main() {{ let x = {expression}; }}");
         assert_compile_error_contains(&source, &[diagnostic]);

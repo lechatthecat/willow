@@ -9,5 +9,13 @@ fn main() {
     println(classify(0));
     println(classify(7));
     let answer = if true { 6 * 7 } else { 0 };
-    println(answer);
+    // When a branch needs statements, use statement-form if and a mutable result.
+    let mut result = 0;
+    if true {
+        let computed = answer;
+        result = computed;
+    } else {
+        result = -1;
+    }
+    println(result);
 }

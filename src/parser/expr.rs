@@ -163,9 +163,41 @@ impl Parser {
 
     pub(super) fn parse_if_value(&mut self) -> Result<Expr, Diagnostic> {
         self.expect(TokenKind::LBrace)?;
+        // Statement-only prefixes cannot start a branch value. Diagnose them
+        // here before primary-expression parsing suggests renaming a keyword.
+        if matches!(
+            self.peek_kind(),
+            TokenKind::Let
+                | TokenKind::Const
+                | TokenKind::Return
+                | TokenKind::While
+                | TokenKind::For
+                | TokenKind::Break
+                | TokenKind::Continue
+                | TokenKind::Defer
+        ) || self.is_lock_stmt_ahead()
+        {
+            return Err(self.if_branch_statement_error());
+        }
         let value = self.parse_expr()?;
+        if !self.check(TokenKind::RBrace) && !self.at_eof() {
+            return Err(self.if_branch_statement_error());
+        }
         self.expect(TokenKind::RBrace)?;
         Ok(value)
+    }
+
+    fn if_branch_statement_error(&self) -> Diagnostic {
+        self.err_at(
+            ErrorCode::E0102,
+            "if-expression branches must be a single expression",
+            self.current_span(),
+        )
+        .with_help(
+            "use the statement form `if condition { statements; } else { statements; }` \
+             for branches containing statements; assign the result to a mutable variable \
+             declared before the `if`",
+        )
     }
 
     pub(super) fn parse_or(&mut self) -> Result<Expr, Diagnostic> {
