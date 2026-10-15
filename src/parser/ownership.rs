@@ -488,7 +488,7 @@ clone_shell_struct!(LambdaExpr {
     syntax: [body]
 });
 clone_shell_struct!(MatchExpr {
-    metadata: [id, span, source],
+    metadata: [id, span, source, block_arm_tail],
     syntax: [scrutinee, arms]
 });
 clone_shell_struct!(MatchArm {

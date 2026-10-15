@@ -78,6 +78,7 @@ impl Parser {
             prefix.push(Stmt::Expr(ExprStmt {
                 span: span.to(end),
                 expr: Expr::Match(Box::new(MatchExpr {
+                    block_arm_tail: false,
                     id: ExprId::fresh(),
                     scrutinee: Box::new(init),
                     span: span.to(end),
@@ -212,7 +213,13 @@ impl Parser {
             // `return`/blocks); tolerate an optional trailing `;` (willow-zvkv).
             TokenKind::Match => {
                 let span = self.current_span();
-                let expr = self.parse_match_expr()?;
+                let mut expr = self.parse_match_expr()?;
+                if self.match_arm_block_depth == Some(self.brace_depth)
+                    && self.check(TokenKind::RBrace)
+                    && let Expr::Match(m) = &mut expr
+                {
+                    m.block_arm_tail = true;
+                }
                 if self.check(TokenKind::Semicolon) {
                     self.advance();
                 }
@@ -475,6 +482,18 @@ impl Parser {
         }))
     }
 
+    // Conditional branch values inside a match-arm block need the same
+    // actionable diagnostic. Restore the context even if parsing fails.
+    fn parse_if_statement_block(&mut self) -> Result<Block, Diagnostic> {
+        let saved = self.match_arm_conditional_depth;
+        if saved == Some(self.brace_depth) || self.match_arm_block_depth == Some(self.brace_depth) {
+            self.match_arm_conditional_depth = Some(self.brace_depth + 1);
+        }
+        let result = self.parse_block();
+        self.match_arm_conditional_depth = saved;
+        result
+    }
+
     /// Parse `if c { } [else if c { }]* [else { }]`. `else if` is sugar for
     /// `else { if ... }`: each later rung becomes the only statement of a
     /// synthetic else block, so later phases see ordinary nested `IfStmt`s.
@@ -503,7 +522,7 @@ impl Parser {
             if let Head::Let(pattern, _) = &head {
                 self.default_import_usage.bind_pattern(pattern);
             }
-            let result = self.parse_block();
+            let result = self.parse_if_statement_block();
             self.default_import_usage.restore(scope);
             let then_block = result?;
             rungs.push((span, head, then_block));
@@ -511,7 +530,7 @@ impl Parser {
                 break None;
             }
             if !self.check(TokenKind::If) {
-                break Some(self.parse_block()?);
+                break Some(self.parse_if_statement_block()?);
             }
         };
         loop {
@@ -612,6 +631,7 @@ impl Parser {
         let fallback_span = fallback.span;
         Stmt::Expr(ExprStmt {
             expr: Expr::Match(Box::new(MatchExpr {
+                block_arm_tail: false,
                 id: ExprId::fresh(),
                 scrutinee: Box::new(scrutinee),
                 arms: vec![
@@ -777,7 +797,10 @@ impl Parser {
                 "assignable targets are variables, fields (`obj.field`), indexes (`arr[i]`), and static properties (`Class::prop`)",
             ));
         }
-        if self.match_arm_block_depth == Some(self.brace_depth) && self.check(TokenKind::RBrace) {
+        if (self.match_arm_block_depth == Some(self.brace_depth)
+            || self.match_arm_conditional_depth == Some(self.brace_depth))
+            && self.check(TokenKind::RBrace)
+        {
             return Err(self
                 .err_at(ErrorCode::E0101, "block arms cannot yield a value", expr.span())
                 .with_help("use a helper function or an if-expression to produce a value; add `;` if this is only a statement"));

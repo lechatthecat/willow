@@ -1191,6 +1191,9 @@ pub struct MatchArm {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MatchExpr {
+    /// Unterminated match statement at the end of a source match-arm block.
+    #[serde(default)]
+    pub block_arm_tail: bool,
     pub id: ExprId,
     pub scrutinee: Box<Expr>,
     pub arms: Vec<MatchArm>,

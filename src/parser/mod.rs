@@ -30,6 +30,7 @@ pub struct Parser {
     brace_depth: usize,
     /// Only direct expression statements in this match-arm block get tail-value help.
     match_arm_block_depth: Option<usize>,
+    match_arm_conditional_depth: Option<usize>,
     /// The current immutable `GtEq` has contributed its `>` to a type.
     /// Only its `=` remains at the cursor; advancing clears this state.
     pending_type_eq: bool,
@@ -131,6 +132,7 @@ impl Parser {
             pos: 0,
             brace_depth: 0,
             match_arm_block_depth: None,
+            match_arm_conditional_depth: None,
             pending_type_eq: false,
             last_span: None,
             allow_object_literals: true,

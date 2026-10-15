@@ -1393,6 +1393,7 @@ impl Parser {
         self.expect(TokenKind::RBrace)?;
         let span = start.to(end_span);
         Ok(Expr::Match(Box::new(MatchExpr {
+            block_arm_tail: false,
             scrutinee: Box::new(scrutinee),
             arms,
             span,

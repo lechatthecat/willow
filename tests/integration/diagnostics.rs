@@ -1334,3 +1334,95 @@ fn iflh_type_parameters_do_not_shadow_imported_values() {
         }
     }
 }
+
+// willow-jz15.73: value tails, statement boundaries, and recovery.
+#[test]
+fn block_arm_control_value_tail_diagnostics() {
+    for body in [
+        "{ match false { _ => 1 } }",
+        "{ let id = 1; match false { true => id, false => 2 } }",
+        "{ match false { _ => if true { 1 } else { 2 } } }",
+        "{ if true { 1 } else { 2 } }",
+        "{ if true { if false { 1 } else { 2 } } else { 3 } }",
+        "{ if true { 1 } else if false { 2 } else { 3 } }",
+        "{ if true { match false { _ => 1 } } else { 2 } }",
+        "{ (match false { _ => 1 }) }",
+        "{ (if true { 1 } else { 2 }) }",
+        "{ match false { _ => { match true { _ => 1 } } } }",
+        "{ let (a, b) = (1, 2); match false { _ => a + b } }",
+        "{ match false { _ => value() } }",
+        "{ if let Some(n) = Option::Some(1) { n } else { 2 } }",
+    ] {
+        for arms in [
+            format!("true => {body}, false => 0"),
+            format!("false => 0, true => {body}"),
+        ] {
+            let source = format!(
+                "fn value() -> i64 {{ return 1; }} fn main() {{ let x = match true {{ {arms} }}; }}"
+            );
+            let stderr = compile_error_stderr(&source);
+            assert!(stderr.contains("error[E0101]"), "{body}: {stderr}");
+            assert!(
+                stderr.contains("block arms cannot yield a value"),
+                "{body}: {stderr}"
+            );
+            assert!(
+                stderr.contains("helper function or an if-expression"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("error[E1201]"), "{body}: {stderr}");
+        }
+    }
+}
+
+#[test]
+fn block_arm_control_statement_workarounds_run() {
+    let (out, ok) = compile_and_run(include_str!("../../example/block_arm_control_tails.wi"));
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
+}
+
+#[test]
+fn block_arm_control_explicit_discard_keeps_type_mismatch() {
+    for body in [
+        "{ match true { _ => 1 }; }",
+        "{}",
+        "{ if true { println(1); } }",
+    ] {
+        let stderr = compile_error_stderr(&format!(
+            "fn main() {{ let x = match true {{ true => {body}, false => 0 }}; }}"
+        ));
+        assert!(stderr.contains("error[E1201]"), "{stderr}");
+        assert!(
+            !stderr.contains("block arms cannot yield a value"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn block_arm_control_enum_payload_repro() {
+    let stderr = compile_error_stderr(
+        "enum Outcome { Valid(i64), Invalid(i64, i64), Malformed(i64) }
+         fn main() {
+             let result: Result<i64, i64> = Result::Ok(1);
+             let out = match result {
+                 Ok(v) => {
+                     let id = v;
+                     let checked: Result<i64, i64> = Result::Ok(v);
+                     match checked {
+                         Ok(_) => Outcome::Valid(id),
+                         Err(e) => Outcome::Invalid(id, e),
+                     }
+                 },
+                 Err(e) => Outcome::Malformed(e),
+             };
+         }",
+    );
+    assert!(stderr.contains("error[E0101]"), "{stderr}");
+    assert!(
+        stderr.contains("block arms cannot yield a value"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("error[E1201]"), "{stderr}");
+}

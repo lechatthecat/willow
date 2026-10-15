@@ -319,6 +319,7 @@ mod tests {
         };
         let roots = [
             Expr::Match(Box::new(MatchExpr {
+                block_arm_tail: false,
                 id: ExprId::fresh(),
                 scrutinee: Box::new(leaf(0)),
                 arms: vec![

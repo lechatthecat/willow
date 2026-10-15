@@ -1206,6 +1206,7 @@ impl TypeChecker {
             if let Some(guard) = &arm.guard {
                 self.check_match_guard(guard);
             }
+            let errors_before_body = self.error_generation;
             let arm_ty = self.check_match_body(
                 &arm.body,
                 expected.as_ref().or(result_type
@@ -1215,8 +1216,10 @@ impl TypeChecker {
             );
             self.symbols.pop_scope();
 
-            // Never arms don't constrain result type
-            if arm_ty == Type::Never {
+            // Invalid bodies already have a diagnostic; do not turn their
+            // recovery type (often void) into a misleading arm mismatch.
+            // Never arms likewise do not constrain the result type.
+            if self.error_generation != errors_before_body || arm_ty == Type::Never {
                 continue;
             }
 
@@ -1356,6 +1359,17 @@ impl TypeChecker {
             }),
             &result,
         );
+        if m.block_arm_tail && !matches!(result, Type::Void | Type::Never) {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0101,
+                    "block arms cannot yield a value",
+                )
+                .with_label(Label::primary(m.span, "value in a block arm"))
+                .with_help("use a helper function or an if-expression to produce a value; add `;` if this is only a statement"),
+            );
+        }
         result
     }
 

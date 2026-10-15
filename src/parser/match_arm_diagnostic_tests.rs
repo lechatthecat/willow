@@ -265,3 +265,90 @@ fn match_arm_nested_depth_scales_and_restores_after_error() {
     assert!(parser.parse_match_expr().is_err());
     assert_eq!(parser.match_arm_block_depth, Some(42));
 }
+
+#[test]
+fn block_arm_control_tail_metadata_and_clone() {
+    use super::iter::{AstEvent, AstWalk};
+    for (body, expected) in [
+        ("{ match true { _ => 1 } }", 1),
+        ("{ match true { _ => 1 }; }", 0),
+        ("{ match true { _ => 1 } println(0); }", 0),
+        ("{ if true { match true { _ => 1 } } }", 0),
+        ("{ while true { match true { _ => 1 } } }", 0),
+        ("{ let (a, b) = (1, 2); match true { _ => a } }", 1),
+    ] {
+        let source = format!("match true {{ _ => {body} }}");
+        let mut parser = Parser::new(Lexer::new(&source).tokenize().unwrap());
+        let expr = parser.parse_match_expr().unwrap();
+        for root in [&expr, &expr.clone()] {
+            let marked: Vec<_> = AstWalk::new(AstEvent::Expr(root))
+                .filter_map(|event| match event {
+                    AstEvent::Expr(Expr::Match(m)) if m.block_arm_tail => Some(m),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(marked.len(), expected, "{source}");
+            for m in marked {
+                assert!(source[m.span.start..m.span.end].starts_with("match true"));
+                assert!(source[m.span.start..m.span.end].ends_with('}'));
+            }
+        }
+        assert_eq!(parser.match_arm_block_depth, None);
+    }
+}
+
+#[test]
+fn block_arm_control_tail_parser_work_scales_linearly() {
+    for shape in ["wide", "deep", "if"] {
+        let mut samples = Vec::new();
+        for n in [8, 16, 32, 64] {
+            let body = match shape {
+                "wide" => "match true { _ => { match true { _ => 1 } } } ".repeat(n),
+                "deep" => format!("{}1{}", "match true { _ => { ".repeat(n), " } }".repeat(n)),
+                _ => format!("{}1{}", "if true { ".repeat(n), " }".repeat(n)),
+            };
+            let source = format!("fn main() {{ match true {{ _ => {{ {body} }} }} }}");
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            PARSER_TOKEN_READS.with(|c| c.set(0));
+            let (_, diagnostics) = Parser::new(tokens).parse();
+            if shape == "wide" {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            } else {
+                assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+                assert_eq!(diagnostics[0].message, "block arms cannot yield a value");
+            }
+            samples.push((n, PARSER_TOKEN_READS.with(|c| c.get())));
+        }
+        let slope = (samples[1].1 - samples[0].1) / 8;
+        for pair in samples.windows(2) {
+            assert_eq!(pair[1].1 - pair[0].1, slope * (pair[1].0 - pair[0].0));
+        }
+        eprintln!("{shape}: {samples:?}");
+    }
+}
+
+#[test]
+fn block_arm_control_conditional_context_restores_on_failure() {
+    let mut parser = Parser::new(Lexer::new("if true { fn next() {}").tokenize().unwrap());
+    parser.match_arm_block_depth = Some(0);
+    parser.match_arm_conditional_depth = Some(42);
+    assert!(parser.parse_if().is_err());
+    assert_eq!(parser.match_arm_block_depth, Some(0));
+    assert_eq!(parser.match_arm_conditional_depth, Some(42));
+    for source in [
+        "fn main() { if true { 1 } else { 2 } }",
+        "fn main() { match true { _ => { while true { if true { 1 } } } } }",
+    ] {
+        let diagnostics = errors(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "expected `;` after statement")
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.message != "block arms cannot yield a value")
+        );
+    }
+}

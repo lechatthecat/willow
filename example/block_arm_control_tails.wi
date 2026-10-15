@@ -1,0 +1,33 @@
+// Block arms are statements; use a helper to return a nested control value.
+fn value() -> i64 {
+    let id = 1;
+    return match true { true => id, false => 0 };
+}
+fn early() -> i64 {
+    match true { _ => { match true { _ => return 8 } } }
+}
+fn main() {
+    // 1: helper value arm.
+    println(match true { true => value(), false => 0 });
+    // 2: direct if value arm.
+    println(match true { _ => if true { 2 } else { 0 } });
+    // 3: void tail match without semicolon.
+    match true { _ => { match true { _ => println(3) } } }
+    // 4: explicitly discarded value match.
+    match true { _ => { match true { _ => value() }; println(4); } }
+    // 5: value match before another statement, without semicolon.
+    match true { _ => { match true { _ => value() } println(5); } }
+    // 6: ordinary if statements in an arm.
+    match true { _ => { if true { println(6); } else { println(0); } } }
+    // A statement if may also discard a nested match value.
+    match true { _ => { if true { match true { _ => value() } } } }
+    // 7: value match in a function body may be discarded.
+    match true { _ => value() }
+    println(7);
+    // 8: nested divergent match.
+    println(early());
+    // 9: tuple binding scope with void tail.
+    match true { _ => { let (a, b) = (4, 5); match true { _ => println(a + b) } } }
+    // 10: nested loop does not inherit expression-tail restrictions.
+    match true { _ => { while true { match true { _ => value() } break; } println(10); } }
+}
