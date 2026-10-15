@@ -140,15 +140,6 @@ cd willow
 cargo build --release
 ```
 
-The user-facing tool is:
-
-```bash
-./target/release/willow
-```
-
-For convenience, add `target/release` to your `PATH`.
-
-
 # License
 
 [MIT License](LICENSE)
