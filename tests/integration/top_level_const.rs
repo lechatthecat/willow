@@ -433,3 +433,21 @@ fn main() {
         ],
     );
 }
+
+// The array literal is a literal, but not one supported by module constants.
+#[test]
+fn c28_array_const_diagnostic_and_function_alternative() {
+    assert_compile_error_contains(
+        "const WORDS: Array = [\"alpha\", \"beta\"];\nfn main() {}\n",
+        &[
+            "E0109",
+            "requires an integer, float, boolean, or string literal",
+            "unsupported constant initializer",
+            "use a function that returns the value instead",
+        ],
+    );
+    assert_output(
+        include_str!("../../example/const_array_alternative.wi"),
+        "alpha\nbeta\n",
+    );
+}

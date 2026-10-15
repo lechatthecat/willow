@@ -1,0 +1,13 @@
+// Module constants accept scalar and String literals.
+// Return an array from a function when a reusable array value is needed.
+import std::collections::Array;
+
+fn words() -> Array<String> {
+    return ["alpha", "beta"];
+}
+
+fn main() {
+    let values = words();
+    println(values[0]);
+    println(values[1]);
+}

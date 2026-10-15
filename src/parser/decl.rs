@@ -874,10 +874,11 @@ impl Parser {
             Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E0109,
-                format!("`const {name}` must be initialized with a literal"),
+                format!("`const {name}` requires an integer, float, boolean, or string literal"),
             )
-            .with_label(Label::primary(value.span(), "not a literal"))
-            .with_help("use an integer, float, `true`/`false`, or string literal")
+            .with_label(Label::primary(value.span(), "unsupported constant initializer"))
+            .with_help("use an integer, float, `true`/`false`, or string literal; numeric literals may be negative")
+            .with_help("for arrays or other computed values, use a function that returns the value instead")
         })?;
         if !matches!(
             return_type,
@@ -1020,6 +1021,67 @@ mod generic_parameter_tests {
                     "WILLOW_GENERIC_AUDIT {}",
                     serde_json::json!({"case":"parameter_list", "parameters":count, "duplicate":duplicate, "lookups":lookups})
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod const_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn const_initializer_diagnostic_perspectives() {
+        // 12 unsupported forms and 10 supported forms: no semantic expansion.
+        for (ty, value, accepted) in [
+            ("Array", "[]", false),
+            ("Array", "[1]", false),
+            ("Array", "[\"alpha\", \"beta\"]", false),
+            ("Array<i64>", "[1, 2]", false),
+            ("FrozenArray<i64>", "[1, 2]", false),
+            ("Array", "[[1], [2]]", false),
+            ("i64", "1 + 2", false),
+            ("i64", "value()", false),
+            ("i64", "OTHER", false),
+            ("bool", "!true", false),
+            ("String", "\"a\" + \"b\"", false),
+            ("i64", "-(1 + 2)", false),
+            ("i64", "0", true),
+            ("i64", "42", true),
+            ("i64", "-42", true),
+            ("f64", "0.5", true),
+            ("f64", "-0.5", true),
+            ("bool", "true", true),
+            ("bool", "false", true),
+            ("String", "\"\"", true),
+            ("String", "\"alpha\"", true),
+            ("i64", "(1)", true),
+        ] {
+            for visibility in ["", "pub "] {
+                let source = format!("{visibility}const VALUE: {ty} = {value};");
+                let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+                let (_, errors) = Parser::new(tokens).parse();
+                if accepted {
+                    assert!(errors.is_empty(), "{source}: {errors:?}");
+                } else {
+                    assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+                    let error = &errors[0];
+                    assert_eq!(error.code, ErrorCode::E0109, "{source}");
+                    assert_eq!(
+                        error.message,
+                        "`const VALUE` requires an integer, float, boolean, or string literal"
+                    );
+                    assert_eq!(error.labels[0].message, "unsupported constant initializer");
+                    assert!(
+                        error
+                            .helps
+                            .iter()
+                            .any(|help| help.contains("numeric literals may be negative"))
+                    );
+                    assert!(error.helps.iter().any(|help| {
+                        help.contains("use a function that returns the value instead")
+                    }));
+                }
             }
         }
     }
