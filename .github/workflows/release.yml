@@ -56,7 +56,8 @@ jobs:
           mkdir -p "$PACKAGE/bin" "$PACKAGE/lib"
           cp target/release/willow "$PACKAGE/bin/"
           cp target/release/libwillow_runtime.a "$PACKAGE/lib/"
-          cp README.md LICENSE "$PACKAGE/"
+          cp RELEASE_README.md "$PACKAGE/README.md"
+          cp LICENSE "$PACKAGE/"
           tar czf "$PACKAGE.tar.gz" "$PACKAGE"
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -65,7 +66,8 @@ jobs:
           New-Item -ItemType Directory "$env:PACKAGE/bin", "$env:PACKAGE/lib" | Out-Null
           Copy-Item target/release/willow.exe "$env:PACKAGE/bin/"
           Copy-Item target/release/willow_runtime.lib "$env:PACKAGE/lib/"
-          Copy-Item README.md, LICENSE "$env:PACKAGE/"
+          Copy-Item RELEASE_README.md "$env:PACKAGE/README.md"
+          Copy-Item LICENSE "$env:PACKAGE/"
           Compress-Archive -Path $env:PACKAGE -DestinationPath "$env:PACKAGE.zip"
       # Compile and run a program with the packaged runtime library only.
       - name: Smoke test bundled layout (Unix)
@@ -76,6 +78,7 @@ jobs:
         run: |
           PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '/\.cargo/bin$' | paste -sd: -)
           if command -v cargo; then echo "cargo still on PATH"; exit 1; fi
+          test "$("$PACKAGE/bin/willow" --version)" = "willow $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1) (commit $GITHUB_SHA)"
           printf 'fn main() {\n    print("hello");\n}\n' > "$RUNNER_TEMP/hello.wi"
           "$PACKAGE/bin/willow" run "$RUNNER_TEMP/hello.wi" | tee "$RUNNER_TEMP/hello.out"
           grep -qx hello "$RUNNER_TEMP/hello.out"
@@ -93,6 +96,8 @@ jobs:
         run: |
           $env:Path = ($env:Path -split ';' | Where-Object { $_ -notmatch '\\\.cargo\\bin\\?$' }) -join ';'
           if (Get-Command cargo -ErrorAction SilentlyContinue) { throw "cargo still on PATH" }
+          $version = & "$env:PACKAGE/bin/willow.exe" --version
+          if ($LASTEXITCODE -ne 0 -or $version -notlike "willow * (commit $env:GITHUB_SHA)") { throw "build identity mismatch" }
           Set-Content "$env:RUNNER_TEMP/hello.wi" "fn main() {`n    print(`"hello`");`n}"
           $out = & "$env:PACKAGE/bin/willow.exe" run "$env:RUNNER_TEMP/hello.wi"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
