@@ -1464,6 +1464,7 @@ impl UnitCodegenContext<'_> {
                 diagnostic_function: f.name.clone(),
                 diagnostic_async: true,
                 overflow_helper_literal: None,
+                stack_helper_established: false,
                 // Boundary operands already occupy address-stable parent frame
                 // slots. No parent-wide address analysis or local seeding is
                 // needed when emitting just this one call.
@@ -1696,6 +1697,7 @@ impl UnitCodegenContext<'_> {
                 diagnostic_function: diagnostic_function.to_owned(),
                 diagnostic_async: true,
                 overflow_helper_literal: None,
+                stack_helper_established: false,
                 // Cleanup operands already have their frame-backed bindings.
                 address_taken: HashSet::new(),
             };

@@ -5082,6 +5082,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.build_mode == crate::BuildMode::Debug,
         ) {
             self.emit_stack_helper();
+            // For proven runtime-only bodies, every path is dominated by this
+            // publication and no body operation changes the helper marker.
+            self.stack_helper_established = super::root_effect::preserves_stack_helper(f);
         }
         self.emit_lir_function_inner(f, None);
     }

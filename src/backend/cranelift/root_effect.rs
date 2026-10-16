@@ -13,6 +13,48 @@ fn immediate(ty: &Type) -> bool {
     )
 }
 
+/// Whether a body can only call runtime helpers that preserve the helper marker.
+/// Keep this proof deliberately narrow: generated calls (including implicit
+/// conversions), callbacks and cleanup regions retain per-call publication.
+/// One scan per function, O(instructions + blocks), with no transitive analysis.
+pub(super) fn preserves_stack_helper(function: &LirFunction) -> bool {
+    use crate::semantic::intrinsics::Intrinsic;
+    if function.is_async || function.params.iter().any(|p| p.by_reference) {
+        return false;
+    }
+    function.blocks.iter().all(|block| {
+        block.recovery.is_empty()
+            && matches!(
+                block.terminator,
+                Terminator::Jump(_) | Terminator::Branch { .. } | Terminator::Return(_)
+            )
+            && block.instrs.iter().all(|instruction| match instruction {
+                LirInst::Let { .. } | LirInst::Assign { .. } | LirInst::ClearScopeRoots { .. } => {
+                    true
+                }
+                LirInst::Compute { value, .. } => match value {
+                    LirRvalue::Use(_) | LirRvalue::StringLiteral(_) => true,
+                    LirRvalue::Unary { ty, .. } => immediate(ty),
+                    LirRvalue::Binary { operand_ty, .. } => immediate(operand_ty),
+                    LirRvalue::Print { ty, .. } => immediate(ty) || *ty == Type::String,
+                    LirRvalue::ArrayAlloc { element, .. }
+                    | LirRvalue::ArrayStore { element, .. }
+                    | LirRvalue::Index { element, .. } => immediate(element),
+                    LirRvalue::IntrinsicCall {
+                        intrinsic,
+                        receiver_ty,
+                        ..
+                    } => {
+                        matches!(intrinsic, Intrinsic::ArrayPush | Intrinsic::ArrayLen)
+                            && matches!(receiver_ty, Type::Array(element) if immediate(element))
+                    }
+                    _ => false,
+                },
+                _ => false,
+            })
+    })
+}
+
 /// Unknown operations/types fail closed. This deliberately excludes even
 /// immediate-looking reference parameters, indirect calls and cleanup regions.
 /// Callees own their roots and restore them before returning, including on
@@ -206,6 +248,54 @@ fn is_acyclic(function: &LirFunction) -> bool {
 mod tests {
     use super::*;
     use crate::ir::lowered::{BlockId, LirBlock};
+
+    #[test]
+    fn stack_helper_proof_rejects_generated_calls_and_unknown_effects() {
+        use crate::diagnostics::Span;
+        use crate::semantic::ids::{FunctionId, TypeId};
+        let mut function = LirFunction::empty_artifact_region();
+        function.blocks = vec![LirBlock {
+            id: BlockId(0),
+            instrs: Vec::new(),
+            recovery: Vec::new(),
+            terminator: Terminator::Jump(BlockId(0)),
+        }];
+        assert!(preserves_stack_helper(&function));
+        function.is_async = true;
+        assert!(!preserves_stack_helper(&function));
+        function.is_async = false;
+        for value in [
+            LirRvalue::DirectCall {
+                callee: FunctionId::free("callee"),
+                args: Vec::new(),
+                params: Vec::new(),
+                result: Type::Void,
+            },
+            LirRvalue::BuiltinCall {
+                callee: FunctionId::free("callback"),
+                args: Vec::new(),
+                params: Vec::new(),
+                result: Type::Void,
+            },
+            LirRvalue::Recover,
+            LirRvalue::Print {
+                value: LirOperand::Int(0),
+                ty: Type::Named(TypeId::local("Custom")),
+                newline: true,
+            },
+            LirRvalue::ArrayAlloc {
+                length: 0,
+                element: Type::String,
+            },
+        ] {
+            function.blocks[0].instrs = vec![LirInst::Compute {
+                local: crate::ir::lowered::LirLocalId(0),
+                value,
+                span: Span::dummy(),
+            }];
+            assert!(!preserves_stack_helper(&function));
+        }
+    }
 
     #[test]
     fn leaf_cfg_proof_handles_deep_chains_and_rejects_cycles() {

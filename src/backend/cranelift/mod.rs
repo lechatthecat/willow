@@ -1552,6 +1552,9 @@ struct FuncGen<'a, 'b> {
     diagnostic_function: String,
     diagnostic_async: bool,
     overflow_helper_literal: Option<DataId>,
+    /// A proven runtime-only body has published its marker at entry; no body
+    /// operation can replace it, so subsequent runtime calls need no store.
+    stack_helper_established: bool,
     /// Locals of this function whose address is taken by some `&place`
     /// argument. They are bound to a stack slot at their declaration instead of
     /// to an SSA variable, so the slot exists on every path and is written

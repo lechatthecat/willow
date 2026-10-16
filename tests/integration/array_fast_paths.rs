@@ -142,3 +142,75 @@ fn array_push_fast_paths_growth_pop_and_frame_gc() {
         assert_eq!(out, "true\ntrue\ntrue\ntrue\ntrue\ntrue\n");
     }
 }
+
+/// Seven capacity boundaries x three scalar encodings, in debug/release and
+/// moving-GC configurations, exercise bodies whose runtime markers are elided.
+#[test]
+fn array_runtime_marker_scalar_capacity_perspectives() {
+    let source = include_str!("../../example/array_runtime_marker.wi");
+    for (out, ok) in [
+        compile_and_run(source),
+        compile_and_run_release(source),
+        compile_and_run_gc_stress(source),
+        compile_and_run_with_runtime_env(
+            source,
+            &[("WILLOW_GC_STRESS", "relocate")],
+            Duration::from_secs(30),
+        ),
+    ] {
+        assert!(ok, "{out}");
+        assert_eq!(out, "true\n".repeat(21));
+    }
+}
+
+#[test]
+fn array_runtime_marker_bounds_faults_return_to_recovering_caller() {
+    let source = r#"
+import std::collections::Array;
+fn store(xs: Array<i64>, i: i64) { xs[i] = 7; }
+fn load(xs: Array<i64>, i: i64) -> i64 { return xs[i]; }
+fn main() {
+    let xs = [1];
+    if true { defer match recover() { Some(_) => println("caught"), None => println("missing") } store(xs, -1); }
+    if true { defer match recover() { Some(_) => println("caught"), None => println("missing") } store(xs, 1); }
+    if true { defer match recover() { Some(_) => println("caught"), None => println("missing") } println(load(xs, -1)); }
+    if true { defer match recover() { Some(_) => println("caught"), None => println("missing") } println(load(xs, 1)); }
+    println(xs[0]);
+}
+"#;
+    for (out, ok) in [compile_and_run(source), compile_and_run_release(source)] {
+        assert!(ok, "{out}");
+        assert_eq!(out, "caught\ncaught\ncaught\ncaught\n1\n");
+    }
+}
+
+#[test]
+fn array_runtime_marker_runtime_only_loop_remains_cancellable() {
+    let (out, ok) = compile_and_run_with_runtime_env(
+        r#"
+import std::collections::Array;
+fn spin() {
+    let xs = [0];
+    while true { xs[0] = 1; }
+}
+async fn worker(ready: Channel<i64>) {
+    defer println("cleanup");
+    ready.send(1);
+    spin();
+}
+async fn main() {
+    let ready = Channel<i64>::new();
+    let task = worker(ready);
+    ready.recv();
+    await sleep(10);
+    task.cancel();
+    await task.result();
+    println("done");
+}
+"#,
+        &[("WILLOW_WORKERS", "2"), ("WILLOW_TASK_BUDGET", "1")],
+        Duration::from_secs(30),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "cleanup\ndone\n");
+}

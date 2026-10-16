@@ -215,6 +215,51 @@ mod tests {
         CAPTURE.with(|capture| capture.borrow_mut().take().expect("capture active"))
     }
 
+    #[test]
+    fn stack_helper_publications_do_not_scale_with_runtime_call_sites() {
+        use cranelift_codegen::ir::{InstructionData, ValueDef};
+        let mut baseline = None;
+        for sites in [1, 8, 32, 128] {
+            let source = format!(
+                "import std::collections::Array; fn work(xs: Array<i64>, n: i64) {{
+                 let mut i: i64 = 0; while i < n {{ {} i = i + 1; }}
+                 }} fn main() {{ work([1], 1); }}",
+                "xs.push(i); xs[0] = i;".repeat(sites),
+            );
+            let functions = compiled_functions(&source);
+            let mut counts = Vec::new();
+            for function in functions {
+                let mut publications = 0;
+                for block in function.layout.blocks() {
+                    for inst in function.layout.block_insts(block) {
+                        let InstructionData::Store { args, offset, .. } = function.dfg.insts[inst]
+                        else {
+                            continue;
+                        };
+                        if i32::from(offset) != willow_abi::generated_context::HELPER_OFFSET {
+                            continue;
+                        }
+                        let ValueDef::Result(context, _) = function.dfg.value_def(args[1]) else {
+                            continue;
+                        };
+                        if function.dfg.insts[context].opcode() != Opcode::GetPinnedReg {
+                            continue;
+                        }
+                        publications += 1;
+                    }
+                }
+                counts.push(publications);
+            }
+            assert!(counts.iter().any(|&count| count > 0));
+            if let Some(baseline) = &baseline {
+                assert_eq!(&counts, baseline, "sites={sites}");
+            } else {
+                baseline = Some(counts.clone());
+            }
+            println!("sites={sites} publications_per_function={counts:?}");
+        }
+    }
+
     /// Cranelift's emission order: the CFG reverse postorder with every
     /// effectively cold block sunk to the end (`BlockLoweringOrder` and
     /// `VCode` emission). Edge-split blocks are omitted.

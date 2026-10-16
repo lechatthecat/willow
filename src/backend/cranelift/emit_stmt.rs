@@ -930,9 +930,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let args = args(self);
         // NONE does not mean stack-free: safepoints and cleanup still enter
         // Rust. Restore the executing caller after any preceding user call,
-        // including late argument evaluation. MAY_PANIC already publishes via
+        // including late argument evaluation. A proven runtime-only body keeps
+        // its entry marker throughout, so it needs no duplicate publication.
+        // MAY_PANIC already publishes via
         // its pre-call bracket. Never recursively instrument the marker itself.
-        if !may_panic && name != "willow_stack_helper_set" {
+        if !may_panic && name != "willow_stack_helper_set" && !self.stack_helper_established {
             self.emit_stack_helper();
         }
         let call = self.builder.ins().call(fref, &args);
@@ -1042,7 +1044,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_fault_site_for(&mut self, enters_willow: bool) {
         // Entry and post-call restoration already name this caller. Runtime
         // entry bridges restore names after nested generated callbacks.
-        if !enters_willow {
+        if !enters_willow && !self.stack_helper_established {
             self.emit_stack_helper();
         }
         if self.diagnostic_function.is_empty()
@@ -1090,8 +1092,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         depth_before: Option<cranelift_codegen::ir::Value>,
     ) {
         // The callee's marker must not survive its return, even if there is
-        // no panic/cancellation branch on the continuation.
-        self.emit_stack_helper();
+        // no panic/cancellation branch on the continuation. Runtime-only bodies
+        // also use this panic bracket, but their callees preserve the marker.
+        if !self.stack_helper_established {
+            self.emit_stack_helper();
+        }
         // Cancellation is sticky even through functions whose panic summary
         // is empty, and is intentionally independent of recoverable panics.
         self.emit_sync_cancel_check();
