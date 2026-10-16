@@ -430,6 +430,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/maps.wi", "2\n31\n25\n-1\ntrue\nfalse\ntwo\n"),
         ("example/module_alias_demo/main.wi", "5\n16\n"),
         (
+            "example/imported_generic_callable/main.wi",
+            "true\ntrue\ntrue\ntrue\n",
+        ),
+        (
             "example/module_interface_defaults/main.wi",
             "<hello ada>\n<hello robot>\n41\n[local]\n",
         ),

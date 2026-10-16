@@ -343,3 +343,6 @@ mod generic_class_self;
 
 #[path = "integration/module_downcast_payload.rs"]
 mod module_downcast_payload;
+
+#[path = "integration/imported_generic_callable.rs"]
+mod imported_generic_callable;

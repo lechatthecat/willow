@@ -1248,8 +1248,20 @@ impl UnitCodegenContext<'_> {
         // LIR normalizes imported type spellings to their declaration identities.
         // Keep the lifted signature in that same form while this unit's aliases
         // are installed; later units may reuse those aliases for other classes.
-        let lambda_type =
-            Self::lambda_value_type(l, expr_types).map(|ty| self.canonical_declared_type(ty));
+        // Imported generic calls can leave specialization-private nominal
+        // aliases in contextual lambda signatures. Only the owning checker
+        // knows those aliases; resolve them as HIR lowering does before using
+        // the backend's declaration scope (willow-jz15.87).
+        let checked_type = self.checked.and_then(|checked| {
+            checked
+                .expr_types
+                .get(&l.id)
+                .map(|ty| Type::from(checked.tables().normalize(ty)))
+        });
+        let lambda_type = checked_type
+            .as_ref()
+            .or_else(|| Self::lambda_value_type(l, expr_types))
+            .map(|ty| self.canonical_declared_type(ty));
         let (param_types, ast_ret) = match &lambda_type {
             Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
                 (params.clone(), *ret.clone())

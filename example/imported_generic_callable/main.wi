@@ -1,0 +1,17 @@
+import util::call;
+import util::capture;
+
+interface N { fn hit(self) -> bool; }
+class B implements N {
+    pub fn hit(self) -> bool { return true; }
+}
+
+fn main() {
+    let b = new B();
+    let n: N = b;
+    println(call(b, |x| x.hit()));
+    println(call(n, |x| x.hit()));
+    let yes = true;
+    println(capture(b, |x| x.hit() && yes));
+    println(capture(n, |x| x.hit() && yes));
+}

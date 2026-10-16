@@ -1,0 +1,2 @@
+pub fn call<T>(x: T, f: fn(T) -> bool) -> bool { return f(x); }
+pub fn capture<T>(x: T, f: closure(T) -> bool) -> bool { return f(x); }
