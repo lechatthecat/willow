@@ -35,6 +35,7 @@ struct Options {
     dry_run: bool,
     diff: bool,
     verbose: bool,
+    max_chars: Option<usize>,
 }
 impl Options {
     fn parse(args: &[String]) -> Result<Self> {
@@ -53,6 +54,7 @@ impl Options {
             dry_run: false,
             diff: false,
             verbose: false,
+            max_chars: None,
         };
         let mut seen = std::collections::HashSet::new();
         let mut i = 1;
@@ -87,7 +89,7 @@ impl Options {
                         }
                     }
                     "--format" | "--source" | "--project-dir" | "--kind" | "--module"
-                    | "--package" => {
+                    | "--package" | "--max-chars" => {
                         let value = if let Some(value) = inline {
                             value
                         } else {
@@ -99,6 +101,13 @@ impl Options {
                             "missing option value for {key}"
                         );
                         match key {
+                            "--max-chars" => {
+                                result.max_chars = Some(
+                                    value
+                                        .parse()
+                                        .context("max-chars must be a nonnegative integer")?,
+                                )
+                            }
                             "--format" => result.format = value.into(),
                             "--source" => result.source = Some(value.into()),
                             "--project-dir" => result.project = Some(value.into()),
@@ -129,6 +138,10 @@ impl Options {
         anyhow::ensure!(
             result.source.is_none() || result.project.is_none(),
             "--source and --project-dir are mutually exclusive"
+        );
+        anyhow::ensure!(
+            result.max_chars.is_none() || result.command != "rename" || result.dry_run,
+            "--max-chars requires --dry-run for rename"
         );
         Ok(result)
     }
@@ -269,6 +282,10 @@ fn counted(n: u64, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
 fn human(value: &Value, options: &Options) -> String {
+    human_items(value, options).join("\n")
+}
+
+fn human_items(value: &Value, options: &Options) -> Vec<String> {
     let result = &value["result"];
     if options.command == "rename" && options.dry_run && value["status"] == "ok" {
         let summary = format!(
@@ -278,18 +295,17 @@ fn human(value: &Value, options: &Options) -> String {
             counted(result["collisions"].as_u64().unwrap(), "collision"),
             result["unresolved"]
         );
-        let mut output = String::new();
+        let mut output = Vec::new();
         if let Some(changes) = result["changes"].as_array() {
             for change in changes {
-                if let Some(diff) = change["diff"].as_str() {
-                    output.push_str(diff);
-                    if !output.ends_with('\n') {
-                        output.push('\n');
-                    }
+                if let Some(diff) = change["diff"].as_str()
+                    && (!diff.is_empty() || output.is_empty())
+                {
+                    output.push(diff.strip_suffix('\n').unwrap_or(diff).to_owned());
                 }
             }
         }
-        output.push_str(&summary);
+        output.push(summary);
         return output;
     }
     if options.command == "rename" && result["status"] == "ok" {
@@ -315,7 +331,7 @@ fn human(value: &Value, options: &Options) -> String {
                 result["transaction"].as_str().unwrap_or("?")
             ));
         }
-        return output;
+        return vec![output];
     }
     let mut lines = vec![format!(
         "{} {}: {}",
@@ -439,7 +455,7 @@ fn human(value: &Value, options: &Options) -> String {
     if options.explain {
         lines.push(serde_json::to_string_pretty(result).unwrap());
     }
-    lines.join("\n")
+    lines
 }
 
 fn effect_names(bits: &Value) -> String {
@@ -571,6 +587,177 @@ fn effect_lines(result: &Value, all: bool, lines: &mut Vec<String>) {
     lines.push(result["meaning"].as_str().unwrap_or("").into());
 }
 
+// A boundary ends a complete human entry or JSON field/array element.
+// Offsets are bytes for slicing; budgets count Unicode scalar values.
+struct Boundary {
+    end: usize,
+    chars: usize,
+    closing: usize,
+}
+
+fn marker(json: bool, omitted: usize, has_items: bool) -> String {
+    if json {
+        format!(
+            "{}\"truncated\":true,\"omitted\":{omitted}}}\n",
+            if has_items { "," } else { "{" }
+        )
+    } else {
+        format!("... {omitted} more\n")
+    }
+}
+
+fn capped_prefix(text: &str, boundaries: &[Boundary], limit: usize, json: bool) -> Result<String> {
+    if text.chars().count() <= limit {
+        return Ok(text.to_owned());
+    }
+    let total = boundaries.len();
+    let empty = marker(json, total, false);
+    anyhow::ensure!(
+        empty.chars().count() <= limit,
+        "--max-chars {limit} cannot fit omission metadata (requires at least {} characters)",
+        empty.chars().count()
+    );
+    let mut chosen = None;
+    let marker_base = marker(json, 0, true).len() - 1;
+    for (index, boundary) in boundaries.iter().enumerate() {
+        let omitted = total - index - 1;
+        let digits = omitted.checked_ilog10().unwrap_or(0) as usize + 1;
+        // JSON's marker supplies the root closing brace; human entries include newline.
+        let needed = boundary.chars + boundary.closing.saturating_sub(1) + marker_base + digits;
+        if needed > limit {
+            break;
+        }
+        chosen = Some((index, boundary));
+    }
+    let Some((index, boundary)) = chosen else {
+        return Ok(empty);
+    };
+    let mut output = text[..boundary.end].to_owned();
+    if json {
+        // Recover only the selected prefix's open containers, without retaining
+        // a copy of the nesting stack for every item (which would cost O(items * depth)).
+        let mut closing = Vec::new();
+        let mut quoted = false;
+        let mut escaped = false;
+        for byte in output.bytes() {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+            } else {
+                match byte {
+                    b'"' => quoted = true,
+                    b'{' => closing.push('}'),
+                    b'[' => closing.push(']'),
+                    b'}' | b']' => {
+                        closing.pop();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Keep the root open for the truncation metadata.
+        for close in closing.into_iter().skip(1).rev() {
+            output.push(close);
+        }
+    }
+    output.push_str(&marker(json, total - index - 1, true));
+    Ok(output)
+}
+
+fn json_items(
+    value: &Value,
+    text: &mut String,
+    boundaries: &mut Vec<Boundary>,
+    chars: &mut usize,
+    depth: usize,
+) {
+    let start = text.len();
+    match value {
+        Value::Object(fields) if !fields.is_empty() => {
+            text.push('{');
+            *chars += 1;
+            for (index, (key, value)) in fields.iter().enumerate() {
+                let start = text.len();
+                if index > 0 {
+                    text.push(',');
+                }
+                text.push_str(&serde_json::to_string(key).unwrap());
+                text.push(':');
+                *chars += text[start..].chars().count();
+                json_items(value, text, boundaries, chars, depth + 1);
+            }
+            text.push('}');
+            *chars += 1;
+        }
+        Value::Array(items) if !items.is_empty() => {
+            text.push('[');
+            *chars += 1;
+            for (index, item) in items.iter().enumerate() {
+                let start = text.len();
+                if index > 0 {
+                    text.push(',');
+                }
+                text.push_str(&serde_json::to_string(item).unwrap());
+                *chars += text[start..].chars().count();
+                boundaries.push(Boundary {
+                    end: text.len(),
+                    chars: *chars,
+                    closing: depth + 1,
+                });
+            }
+            text.push(']');
+            *chars += 1;
+        }
+        _ => {
+            text.push_str(&serde_json::to_string(value).unwrap());
+            *chars += text[start..].chars().count();
+            boundaries.push(Boundary {
+                end: text.len(),
+                chars: *chars,
+                closing: depth,
+            });
+        }
+    }
+}
+
+fn render(value: &Value, options: &Options) -> Result<String> {
+    let Some(limit) = options.max_chars else {
+        return Ok(format!(
+            "{}\n",
+            if options.format == "human" {
+                human(value, options)
+            } else {
+                serde_json::to_string(value)?
+            }
+        ));
+    };
+    let json = options.format != "human";
+    let mut text = String::new();
+    let mut boundaries = Vec::new();
+    let mut chars = 0;
+    if json {
+        json_items(value, &mut text, &mut boundaries, &mut chars, 0);
+        text.push('\n');
+    } else {
+        for item in human_items(value, options) {
+            chars += item.chars().count() + 1;
+            text.push_str(&item);
+            text.push('\n');
+            boundaries.push(Boundary {
+                end: text.len(),
+                chars,
+                closing: 0,
+            });
+        }
+    }
+    capped_prefix(&text, &boundaries, limit, json)
+}
+
 pub(super) fn run(args: &[String]) -> Result<i32> {
     let parsed = Options::parse(args);
     let format = args
@@ -605,15 +792,23 @@ pub(super) fn run(args: &[String]) -> Result<i32> {
             2,
         ),
     };
-    if format == "human" {
-        if let Ok(options) = parsed {
-            println!("{}", human(&value, &options));
-        } else {
-            eprintln!(
-                "{}",
-                value["message"].as_str().unwrap_or("invalid arguments")
-            );
+    if let Ok(options) = &parsed {
+        match render(&value, options) {
+            Ok(output) => print!("{output}"),
+            Err(error) => {
+                eprintln!("{error:#}");
+                return Ok(2);
+            }
         }
+    } else if format == "human"
+        || args
+            .iter()
+            .any(|a| a == "--max-chars" || a.starts_with("--max-chars="))
+    {
+        eprintln!(
+            "{}",
+            value["message"].as_str().unwrap_or("invalid arguments")
+        );
     } else {
         println!("{}", serde_json::to_string(&value)?);
     }
@@ -623,6 +818,163 @@ pub(super) fn run(args: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn max_chars_all_commands_unicode_boundaries_and_compatibility() {
+        for command in ["refs", "symbol", "type", "effects", "impact", "rename"] {
+            let mut args = vec![command.into(), "α猫".into()];
+            if command == "rename" {
+                args.extend(["new".into(), "--dry-run".into(), "--diff".into()]);
+            }
+            let mut options = Options::parse(&args).unwrap();
+            let value = json!({"schema":1,"kind":command,"status":"ok","result":{
+                "files":1,"references":2,"collisions":0,"unresolved":0,
+                "changes":[{"diff":"--- α猫\n+++ β犬\n- old\n+ new\n"}],
+                "type_display":"α猫\"\\[]{}", "selected":{"selector":"α猫","kind":"function"},
+                "suggestions":["α猫","β犬"], "impact":{"nodes":[{"selector":"α猫"},{"selector":"β犬"}]}
+            }});
+            for format in ["human", "json", "ndjson"] {
+                options.format = format.into();
+                options.max_chars = None;
+                let baseline = render(&value, &options).unwrap();
+                let expected = if format == "human" {
+                    human(&value, &options)
+                } else {
+                    serde_json::to_string(&value).unwrap()
+                };
+                assert_eq!(baseline, format!("{expected}\n"));
+                let len = baseline.chars().count();
+                for cap in 0..=len + 1 {
+                    options.max_chars = Some(cap);
+                    match render(&value, &options) {
+                        Err(_) => assert!(cap < 40),
+                        Ok(output) => {
+                            assert!(
+                                output.chars().count() <= cap,
+                                "{command} {format} {cap}: {output}"
+                            );
+                            assert!(output.ends_with('\n'));
+                            if cap >= len {
+                                assert_eq!(output, baseline);
+                            } else if format == "human" {
+                                let (prefix, marker) = output.rsplit_once("... ").unwrap();
+                                assert!(baseline.starts_with(prefix));
+                                assert!(marker.ends_with(" more\n"));
+                                let omitted: usize =
+                                    marker.trim_end_matches(" more\n").parse().unwrap();
+                                assert!(omitted > 0);
+                                if command == "rename" && prefix.contains("---") {
+                                    assert!(prefix.contains("+ new\n"));
+                                }
+                            } else {
+                                let parsed: Value = serde_json::from_str(&output).unwrap();
+                                assert_eq!(parsed["truncated"], true);
+                                assert!(parsed["omitted"].as_u64().unwrap() > 0);
+                                if let Some(items) = parsed["result"]["changes"].as_array() {
+                                    assert_eq!(items[0], value["result"]["changes"][0]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn max_chars_item_counts_scale_linearly() {
+        for count in [1, 16, 64, 256, 1024] {
+            let value = json!({"result":{"items":(0..count).map(|_| json!({"text":"猫\"{}[]\\","nested":[1,2]})).collect::<Vec<_>>()}});
+            let mut text = String::new();
+            let mut boundaries = Vec::new();
+            let mut chars = 0;
+            json_items(&value, &mut text, &mut boundaries, &mut chars, 0);
+            assert_eq!(text, serde_json::to_string(&value).unwrap());
+            assert_eq!(chars, text.chars().count());
+            assert_eq!(boundaries.len(), count);
+            assert!(boundaries.iter().all(|b| b.closing == 3));
+            text.push('\n');
+            let output = capped_prefix(&text, &boundaries, 160, true).unwrap();
+            let parsed: Value = serde_json::from_str(&output).unwrap();
+            let kept = parsed["result"]["items"].as_array().map_or(0, Vec::len);
+            if count > 1 {
+                assert_eq!(parsed["omitted"].as_u64().unwrap() as usize + kept, count);
+            }
+        }
+    }
+
+    #[test]
+    fn max_chars_empty_containers_deep_objects_and_exact_marker() {
+        for depth in [1, 8, 32, 64] {
+            let mut value = json!({"a":[],"b":{},"c":[{"escaped":"\"\\[]{}猫"},{}],"d":null});
+            for _ in 0..depth {
+                value = json!({"nested":value});
+            }
+            let mut text = String::new();
+            let mut boundaries = Vec::new();
+            let mut chars = 0;
+            json_items(&value, &mut text, &mut boundaries, &mut chars, 0);
+            text.push('\n');
+            assert_eq!(boundaries.len(), 5);
+            for cap in 0..=chars + 1 {
+                let result = capped_prefix(&text, &boundaries, cap, true);
+                if cap < marker(true, 5, false).len() {
+                    assert!(result.is_err());
+                } else {
+                    let output = result.unwrap();
+                    assert!(output.chars().count() <= cap);
+                    let parsed: Value = serde_json::from_str(&output).unwrap();
+                    if cap == chars + 1 {
+                        assert_eq!(parsed, value);
+                    } else {
+                        assert_eq!(parsed["truncated"], true);
+                    }
+                }
+            }
+        }
+        let options =
+            Options::parse(&["rename", "old", "new", "--dry-run", "--diff"].map(str::to_owned))
+                .unwrap();
+        for (diffs, expected) in [
+            (vec![], ""),
+            (vec![""], "\n"),
+            (vec!["", ""], "\n"),
+            (vec!["one", "", "two\n\n"], "one\ntwo\n\n"),
+        ] {
+            let value = json!({"status":"ok","result":{"files":1,"references":2,"collisions":0,"unresolved":0,"changes":diffs.into_iter().map(|diff| json!({"diff":diff})).collect::<Vec<_>>()}});
+            assert_eq!(
+                human(&value, &options),
+                format!("{expected}1 file / 2 references / 0 collisions / 0 unresolved")
+            );
+        }
+    }
+
+    #[test]
+    fn max_chars_parser_rejects_invalid_and_mutating_rename() {
+        for extra in [
+            vec!["--max-chars"],
+            vec!["--max-chars=-1"],
+            vec!["--max-chars=abc"],
+            vec!["--max-chars=1", "--max-chars=2"],
+        ] {
+            let args: Vec<_> = [vec!["refs", "foo"], extra]
+                .concat()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            assert!(Options::parse(&args).is_err());
+        }
+        assert!(
+            Options::parse(&["rename", "foo", "bar", "--max-chars=100"].map(str::to_owned))
+                .is_err()
+        );
+        assert_eq!(
+            Options::parse(&["refs", "foo", "--max-chars", "100"].map(str::to_owned))
+                .unwrap()
+                .max_chars,
+            Some(100)
+        );
+    }
+
     #[test]
     fn type_failure_kinds_have_distinct_explanations() {
         let options = Options::parse(&["type".into(), "main.wi:1:1".into()]).unwrap();

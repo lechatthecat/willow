@@ -3485,3 +3485,126 @@ fn minor_semantic_cli_constructor_overloads_and_field_controls() {
         .contains("same hierarchy")
     );
 }
+
+fn direct_max_chars_command(command: &str) {
+    let f = Fixture::new();
+    for format in ["human", "json", "ndjson"] {
+        let selector = if command == "rename" {
+            "main::main::item"
+        } else {
+            "order::submit"
+        };
+        let mut args = vec![command, selector, "--format", format];
+        if command == "rename" {
+            args.extend(["product", "--dry-run", "--diff"]);
+        }
+        let baseline = f.run(&args);
+        assert!(
+            baseline.status.success(),
+            "{args:?}: {}\n{}",
+            String::from_utf8_lossy(&baseline.stderr),
+            String::from_utf8_lossy(&baseline.stdout)
+        );
+        let text = String::from_utf8(baseline.stdout.clone()).unwrap();
+        let length = text.chars().count();
+        for cap in [0, 1, 40, length - 1, length, length + 1000] {
+            let cap_text = cap.to_string();
+            let mut capped_args = args.clone();
+            capped_args.extend(["--max-chars", &cap_text]);
+            let output = f.run(&capped_args);
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.chars().count() <= cap, "{capped_args:?}: {stdout}");
+            if cap < 2 {
+                assert_eq!(output.status.code(), Some(2));
+                assert!(stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("cannot fit omission metadata")
+                );
+                continue;
+            }
+            assert!(
+                output.status.success(),
+                "{capped_args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stderr, baseline.stderr);
+            if cap >= length {
+                assert_eq!(stdout.as_bytes(), baseline.stdout);
+            } else if format == "human" {
+                let (prefix, marker) = stdout.rsplit_once("... ").unwrap();
+                assert!(text.starts_with(prefix));
+                assert!(marker.ends_with(" more\n"));
+                assert!(marker.trim_end_matches(" more\n").parse::<usize>().unwrap() > 0);
+            } else {
+                let value: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(value["truncated"], true);
+                assert!(value["omitted"].as_u64().unwrap() > 0);
+            }
+        }
+        assert_eq!(f.run(&args).stdout, baseline.stdout);
+    }
+}
+
+macro_rules! max_chars_command_test {
+    ($name:ident, $command:literal) => {
+        #[test]
+        fn $name() {
+            direct_max_chars_command($command);
+        }
+    };
+}
+max_chars_command_test!(direct_max_chars_refs, "refs");
+max_chars_command_test!(direct_max_chars_references, "references");
+max_chars_command_test!(direct_max_chars_symbol, "symbol");
+max_chars_command_test!(direct_max_chars_type, "type");
+max_chars_command_test!(direct_max_chars_effects, "effects");
+max_chars_command_test!(direct_max_chars_impact, "impact");
+max_chars_command_test!(direct_max_chars_rename, "rename");
+
+#[test]
+fn direct_max_chars_error_paths_and_help() {
+    let f = Fixture::new();
+    for args in [
+        vec!["refs", "missing", "--max-chars=40", "--format=json"],
+        vec![
+            "refs",
+            "order::submit",
+            "--source=missing.wi",
+            "--max-chars=40",
+            "--format=json",
+        ],
+    ] {
+        let output = f.run(&args);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stdout).chars().count() <= 40);
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["truncated"], true);
+    }
+    for args in [
+        vec!["refs", "order::submit", "--max-chars=no", "--format=json"],
+        vec![
+            "rename",
+            "order::submit",
+            "send",
+            "--max-chars=100",
+            "--format=json",
+        ],
+    ] {
+        let output = f.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+    let help = f.run(&["help"]);
+    let text = String::from_utf8(help.stdout).unwrap();
+    for command in ["refs", "symbol", "type", "effects", "impact", "rename"] {
+        assert!(
+            text.lines()
+                .any(|line| line.contains(&format!("willow {command} SELECTOR"))
+                    && line.contains("--max-chars N")),
+            "{text}"
+        );
+    }
+    assert!(text.contains("empty stdout"));
+}
