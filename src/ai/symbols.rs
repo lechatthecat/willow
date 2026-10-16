@@ -613,13 +613,21 @@ pub(super) fn finish(
         }
         for r in &facts.references {
             let target = register(&r.target);
+            // Method `member` evidence denotes calls, including receivers without
+            // a separate expression-call record. Keep other kinds unchanged:
+            // module constant reads also use `member` with a function target.
+            let role = if r.role == "member" && r.target.kind == "method" {
+                "call"
+            } else {
+                &r.role
+            };
             if let Some(location) = select(r.span, &r.written, r.last, names, paths) {
                 let key = (
                     location.path.clone(),
                     location.start,
                     location.end,
                     target.clone(),
-                    r.role.clone(),
+                    role.to_owned(),
                 );
                 references.insert(
                     key,
@@ -627,7 +635,7 @@ pub(super) fn finish(
                         identity: None,
                         target,
                         location,
-                        role: r.role.clone(),
+                        role: role.to_owned(),
                     },
                 );
             }

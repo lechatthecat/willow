@@ -1,0 +1,17 @@
+interface I { fn hook(self) -> i64; }
+open class Base implements I {
+    pub init(self) {}
+    pub open fn hook(self) -> i64 { return 1; }
+}
+class Child extends Base {
+    pub init(self) { super.init(); }
+    pub override fn hook(self) -> i64 { return 2; }
+}
+enum Choice { First, Second }
+fn via_interface(x: I) -> i64 { return x.hook(); }
+fn main() {
+    println(new Base().hook());
+    let b = new Base();
+    println(b.hook());
+    println(via_interface(new Child()));
+}

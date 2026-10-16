@@ -592,6 +592,15 @@ impl DirectSession {
                 continue;
             }
             let qualified = self.selector(symbol);
+            // Preserve reusable overload selectors, but accept and suggest the
+            // source constructor spelling rather than its internal ordinal.
+            let source_selector = if symbol.kind == "constructor" {
+                qualified
+                    .rsplit_once('#')
+                    .map_or(qualified.as_str(), |(name, _)| name)
+            } else {
+                &qualified
+            };
             let local_name = matches!(symbol.kind.as_str(), "binding" | "parameter")
                 .then(|| qualified.rsplit_once('@'))
                 .flatten()
@@ -607,12 +616,14 @@ impl DirectSession {
             };
             if located.is_some()
                 || matches_name(&qualified)
+                || (symbol.kind == "constructor" && matches_name(source_selector))
                 || local_name.is_some_and(matches_name)
                 || selector == symbol.name
             {
                 candidates.push(json!({"id":symbol.id,"selector":qualified,"name":symbol.name,"kind":symbol.kind,"location":symbol.location,"identity":symbol.identity}));
             } else {
-                let name = local_name.unwrap_or(&qualified);
+                let qualified = source_selector;
+                let name = local_name.unwrap_or(qualified);
                 let (owner, _) = name.rsplit_once("::").unwrap_or(("", name));
                 let same_scope = selector_scope.is_none_or(|scope| {
                     owner == scope || owner.strip_suffix(scope).is_some_and(|p| p.ends_with("::"))
@@ -620,10 +631,10 @@ impl DirectSession {
                 let score = selector_suggestion_score(name, &segments);
                 if local_name.is_some() && same_scope && selector_scope.is_some() {
                     scoped_locals += 1;
-                    sole_local = (scoped_locals == 1).then(|| qualified.clone());
+                    sole_local = (scoped_locals == 1).then(|| qualified.to_owned());
                 }
                 if local_name.is_none() && same_scope && selector_scope.is_some() {
-                    scope_fallback.push(qualified.clone());
+                    scope_fallback.push(qualified.to_owned());
                     scope_fallback.sort_unstable();
                     scope_fallback.dedup();
                     scope_fallback.truncate(5);
@@ -638,7 +649,12 @@ impl DirectSession {
                     // A matching declaration beats spelling similarity. Position
                     // breaks equal-score ties deterministically within a file.
                     let position = symbol.location.as_ref().map_or(usize::MAX, |loc| loc.start);
-                    suggestions.push((!previous, score.unwrap_or(usize::MAX), position, qualified));
+                    suggestions.push((
+                        !previous,
+                        score.unwrap_or(usize::MAX),
+                        position,
+                        qualified.to_owned(),
+                    ));
                     suggestions.sort_unstable();
                     suggestions.dedup();
                     suggestions.truncate(5);
@@ -827,6 +843,12 @@ impl DirectSession {
             _ => anyhow::bail!("unsupported direct command"),
         };
         let mut result = self.session.query(request)["result"].take();
+        if matches!(command, "refs" | "references") && resolved["symbol"]["kind"] == "method" {
+            let coverage = result["coverage"].as_str().unwrap_or("compiler-resolved");
+            result["coverage"] = json!(format!(
+                "{coverage}; override and implementation declarations are excluded; use impact to include their executable bodies"
+            ));
+        }
         if command == "symbol" && result["symbol"].get("type_display").is_none() {
             let location = &resolved["symbol"]["location"];
             if let (Some(file), Some(byte)) =

@@ -1665,6 +1665,14 @@ fn constants_report_their_value_type_and_references() {
     assert_eq!(symbol["result"]["type_display"], "i64", "{symbol}");
     let refs = f.json(&["refs", "limits::MAX"], 0);
     assert_eq!(refs["result"]["total"], 3, "{refs}");
+    assert!(
+        refs["result"]["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["role"] != "call"),
+        "{refs}"
+    );
     let renamed = f.run(&["rename", "limits::SPARE", "UNUSED"]);
     assert!(
         renamed.status.success(),
@@ -2107,7 +2115,7 @@ fn references_sort_source_positions_and_show_roles() {
     );
     assert_eq!(
         f.json(&["refs", "order::Order::value"], 0)["result"]["coverage"],
-        "compiler-resolved"
+        "compiler-resolved; override and implementation declarations are excluded; use impact to include their executable bodies"
     );
 }
 
@@ -2140,7 +2148,10 @@ fn method_reference_order_scales_across_files_and_callers() {
             })
             .collect();
         assert!(keys.windows(2).all(|w| w[0] < w[1]), "{result}");
-        assert_eq!(result["result"]["coverage"], "compiler-resolved");
+        assert!(result["result"]["coverage"].as_str().unwrap().starts_with(
+            "compiler-resolved; override and implementation declarations are excluded"
+        ));
+        assert!(refs.iter().all(|r| r["role"] == "call"));
         println!(
             "callers={n} references={} adjacent_checks={}",
             refs.len(),
@@ -3341,4 +3352,126 @@ fn channel_effect_imported_generic_sites_are_unique() {
     for site in sites {
         assert_eq!(site["witness"]["cause"]["location"]["path"], "src/order.wi");
     }
+}
+
+#[test]
+fn minor_semantic_cli_source_spellings_calls_and_coverage() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/semantic_cli_minor/src/main.wi"),
+    )
+    .unwrap();
+    let check = f.run(&["check"]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    for command in ["refs", "references", "symbol", "type"] {
+        let result = f.json(&[command, "main::Base::ini"], 1);
+        let suggestions = result["result"]["suggestions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{result}"));
+        assert!(!suggestions.is_empty(), "{result}");
+        assert!(
+            suggestions
+                .iter()
+                .all(|s| !s.as_str().unwrap().contains('#')),
+            "{result}"
+        );
+        assert!(
+            suggestions.iter().any(|s| s == "main::Base::init"),
+            "{result}"
+        );
+    }
+    f.json(&["symbol", "main::Base::init"], 0);
+    for command in ["refs", "references"] {
+        for selector in ["main::Base::hook", "main::I::hook", "main::Child::hook"] {
+            let result = f.json(&[command, selector], 0);
+            assert!(
+                result["result"]["coverage"]
+                    .as_str()
+                    .unwrap()
+                    .contains("declarations are excluded"),
+                "{result}"
+            );
+            for reference in result["result"]["references"].as_array().unwrap() {
+                assert_eq!(reference["role"], "call", "{result}");
+            }
+            let output = f.run(&[command, selector]);
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("declarations are excluded")
+            );
+        }
+    }
+    let refs = f.json(&["refs", "main::Base::hook"], 0);
+    assert!(
+        refs["result"]["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["location"]["line"] == 13 || r["location"]["line"] == 15)
+            .count()
+            >= 2,
+        "{refs}"
+    );
+    let collision = f.run(&["rename", "main::Choice::First", "Second", "--dry-run"]);
+    assert!(!collision.status.success());
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&collision.stdout),
+        String::from_utf8_lossy(&collision.stderr)
+    );
+    assert!(message.contains("variant in enum Choice"), "{message}");
+    assert!(!message.contains("same hierarchy"), "{message}");
+    for selector in ["main::Base::hook", "main::I::hook"] {
+        let result = f.json(&["impact", selector], 0);
+        assert!(
+            result["result"]["impact"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["selector"] == "main::Child::hook"),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn minor_semantic_cli_constructor_overloads_and_field_controls() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "class C { pub n: i64; pub init(self) { self.n = 0; } pub init(self, n: i64) { self.n = n; } pub fn get(self) -> i64 { return self.n; } } fn main() { let c = new C(); println(c.n); println(new C().get()); }").unwrap();
+    let check = f.run(&["check"]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let result = f.json(&["symbol", "main::C::init"], 1);
+    assert_eq!(result["status"], "ambiguous", "{result}");
+    assert_eq!(result["result"]["candidates"].as_array().unwrap().len(), 2);
+    let refs = f.json(&["refs", "main::C::n"], 0);
+    assert!(
+        refs["result"]["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["role"] != "call"),
+        "{refs}"
+    );
+    let refs = f.json(&["refs", "main::C::get"], 0);
+    assert_eq!(refs["result"]["references"][0]["role"], "call", "{refs}");
+    let collision = f.run(&["rename", "main::C::get", "n", "--dry-run"]);
+    assert!(!collision.status.success());
+    assert!(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&collision.stdout),
+            String::from_utf8_lossy(&collision.stderr)
+        )
+        .contains("same hierarchy")
+    );
 }

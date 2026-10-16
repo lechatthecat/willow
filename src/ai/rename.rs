@@ -593,11 +593,18 @@ impl<'a> Index<'a> {
                     .strip_prefix(root)?
                     .to_str()
                     .context("non UTF-8 source path")?;
-                return Err(reject(
-                    "rename destination conflicts with a member in the same hierarchy",
-                    path,
-                    span,
-                ));
+                let message = if selected.kind == "variant" {
+                    let owner = selected
+                        .source_name
+                        .as_deref()
+                        .unwrap_or(&selected.name)
+                        .rsplit_once("::")
+                        .map_or("selected enum", |(owner, _)| owner);
+                    format!("rename destination conflicts with a variant in enum {owner}")
+                } else {
+                    "rename destination conflicts with a member in the same hierarchy".to_owned()
+                };
+                return Err(reject(&message, path, span));
             }
         }
         self.renamed.extend(&family);
