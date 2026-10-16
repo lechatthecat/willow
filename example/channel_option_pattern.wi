@@ -1,0 +1,12 @@
+// recv_opt returns Option<T>, so a while-let loop stops after close and drain.
+async fn main() {
+    let jobs = Channel<i64>::with_capacity(2);
+    jobs.send(10);
+    jobs.send(20);
+    jobs.close();
+    let mut total = 0;
+    while let Some(job) = jobs.recv_opt() {
+        total = total + job;
+    }
+    println(total);
+}

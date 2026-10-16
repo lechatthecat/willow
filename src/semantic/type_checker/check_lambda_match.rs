@@ -892,8 +892,53 @@ impl TypeChecker {
                     *span,
                 );
             }
+            // Resolve real enum variants and classes before diagnosing the common
+            // Option spelling on a non-Option value. Do not steal user variants.
+            let option_pattern = match pattern {
+                Pattern::ClassDowncast { class_name, .. } => {
+                    class_name == "Some" && self.symbols.lookup_class(class_name).is_none()
+                }
+                Pattern::EnumVariant {
+                    enum_name, variant, ..
+                }
+                | Pattern::EnumVariantTuple {
+                    enum_name, variant, ..
+                } => {
+                    (enum_name == "Option" || enum_name.is_empty())
+                        && matches!(variant.as_str(), "Some" | "None")
+                }
+                _ => false,
+            };
             // Validate pattern and track coverage
             match pattern {
+                _ if option_pattern
+                    && builtin_types::unary_arg(&scrutinee_ty, B::Option).is_none() =>
+                {
+                    let mut diagnostic = Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1205,
+                        format!(
+                            "pattern type mismatch: expected `Option`, found `{}`",
+                            type_name(&scrutinee_ty)
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        pattern.span(),
+                        "expected an Option scrutinee",
+                    ));
+                    if let Expr::MethodCall(call) = &*m.scrutinee
+                        && call.method == "recv"
+                        && self
+                            .expr_types
+                            .get(&call.object.id())
+                            .is_some_and(|ty| builtin_types::unary_arg(ty, B::Channel).is_some())
+                    {
+                        diagnostic = diagnostic.with_help(
+                            "Channel::recv() returns T; use `recv_opt()` to receive an Option<T>",
+                        );
+                    }
+                    self.push(diagnostic);
+                }
                 Pattern::Wildcard(_, _) => {
                     has_wildcard |= covers;
                 }

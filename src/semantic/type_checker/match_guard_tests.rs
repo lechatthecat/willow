@@ -167,3 +167,90 @@ fn if_let_pattern_type_errors_are_reported() {
         );
     }
 }
+
+#[test]
+fn option_pattern_mismatch_diagnostics() {
+    // 36 negative perspectives: each control-flow form, qualified/unqualified
+    // payload and qualified unit patterns, primitive and channel expressions.
+    for expression in ["42", "ch.recv()"] {
+        for pattern in [
+            "Some(x)",
+            "Option::Some(x)",
+            "Option::None",
+            "Option::Some(a, b)",
+            "Some(a, b)",
+            "None()",
+        ] {
+            for form in ["if", "while", "match"] {
+                let body = match form {
+                    "if" => format!("if let {pattern} = {expression} {{ }}"),
+                    "while" => format!("while let {pattern} = {expression} {{ break; }}"),
+                    _ => format!("match {expression} {{ {pattern} => {{}}, _ => {{}} }}"),
+                };
+                let source =
+                    format!("{OPTION} fn main() {{ let ch = Channel<i64>::new(); {body} }}");
+                let errors = check_source(&source);
+                assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+                assert_eq!(errors[0].code, ErrorCode::E1205);
+                assert!(
+                    errors[0].message.contains("expected `Option`, found `i64`"),
+                    "{errors:?}"
+                );
+                assert_eq!(
+                    errors[0]
+                        .helps
+                        .iter()
+                        .any(|help| help.contains("recv_opt()")),
+                    expression == "ch.recv()",
+                    "{errors:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn option_pattern_preserves_valid_and_unrelated_patterns() {
+    for source in [
+        "fn main() { let ch = Channel<i64>::new(); while let Some(x) = ch.recv_opt() { println(x); } }",
+        "fn f(ch: Channel<Option<i64>>) { if let Some(x) = ch.recv() { println(x); } } fn main() {}",
+        "enum Other { Some(i64), None } fn f(o: Other) { if let Some(x) = o { println(x); } } fn main() {}",
+        "fn main() { let n = 2; if let value = n { println(value); } }",
+    ] {
+        let errors = check_source(&format!("{OPTION}{source}"));
+        assert!(
+            errors.iter().all(|d| d.severity != Severity::Error),
+            "{source}: {errors:?}"
+        );
+    }
+    // Keep real class patterns and bare identifier bindings intact.
+    for source in [
+        "interface I { fn value(self) -> i64; } class Some implements I { pub fn value(self) -> i64 { return 1; } } fn f(i: I) { if let Some(x) = i { println(x.value()); } } fn main() {}",
+        "fn main() { if let None = 1 { println(None); } }",
+    ] {
+        let errors = check_source(source);
+        assert!(
+            errors.iter().all(|d| d.severity != Severity::Error),
+            "{errors:?}"
+        );
+    }
+    let errors = check_source(&format!(
+        "{OPTION} class Receiver {{ pub fn recv(self) -> i64 {{ return 1; }} }} fn f(r: Receiver) {{ if let Some(x) = r.recv() {{ println(x); }} }} fn main() {{}}"
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("expected `Option`"));
+    assert!(errors[0].helps.is_empty());
+}
+
+#[test]
+fn option_pattern_repeated_mismatch_counts() {
+    for count in [1, 8, 64] {
+        let body = "if let Some(x) = ch.recv() { println(x); }".repeat(count);
+        let source = format!("{OPTION} fn f(ch: Channel<i64>) {{ {body} }} fn main() {{}}");
+        let errors = check_source(&source);
+        assert_eq!(errors.len(), count);
+        assert!(errors.iter().all(|d| d.code == ErrorCode::E1205
+            && d.message.contains("expected `Option`")
+            && d.helps.len() == 1));
+    }
+}
