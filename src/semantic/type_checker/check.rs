@@ -2522,8 +2522,13 @@ impl TypeChecker {
             return Self::error_type();
         }
 
+        // Reject obsolete syntax before specialization can replace the source
+        // class name with a monomorphized name or a recovery-only error marker.
+        if let Expr::ObjectLiteral(literal) = expr {
+            return self.check_object_literal(literal);
+        }
+
         let generic_class = match expr {
-            Expr::ObjectLiteral(o) => Some((&o.class, &o.type_args)),
             Expr::New(n) => Some((&n.class_name, &n.type_args)),
             Expr::StaticCall(c)
                 if c.type_args.is_empty() && self.enclosing_static_receiver(&c.class).is_some() =>
@@ -2542,10 +2547,6 @@ impl TypeChecker {
             self.generics.objects.insert(expr.id(), name.clone());
             let mut concrete = expr.clone();
             match &mut concrete {
-                Expr::ObjectLiteral(o) => {
-                    o.class = name.clone();
-                    o.type_args.clear();
-                }
                 Expr::New(n) => {
                     n.class_name = name.clone();
                     n.type_args.clear();
@@ -2560,7 +2561,7 @@ impl TypeChecker {
         }
         if let Some((name, args)) = generic_class
             && !args.is_empty()
-            && matches!(expr, Expr::New(_) | Expr::ObjectLiteral(_))
+            && matches!(expr, Expr::New(_))
         {
             self.generic_error(
                 expr.span(),

@@ -898,7 +898,7 @@ fn run_frontend_revision(
             emit_frontend_diagnostics(&diagnostics, map, &graph, &diagnostic_modules, emitter)?;
             errors += diagnostic_error_count(&diagnostics);
         }
-        anyhow::ensure!(errors == 0, "generic checking failed ({errors} errors)");
+        anyhow::ensure!(errors == 0, "aborting due to {errors} error(s)");
         let mut storage = graph.artifacts.take().expect("generic source artifacts");
         let mut fresh_ids = semantic::type_checker::generics::FreshIds::default();
         for (index, module) in graph.files.iter_mut().enumerate() {

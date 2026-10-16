@@ -729,6 +729,7 @@ impl TypeChecker {
         // `match` nested anywhere inside an arm gets its own context or none,
         // never this one by accident.
         let expected = self.local.match_expected.take();
+        let errors_before_match = self.error_generation;
         let scrutinee_ty = self.check_expr(&m.scrutinee);
         if Self::is_error_type(&scrutinee_ty) {
             // The failed scrutinee cannot constrain patterns. Keep checking arm
@@ -1350,6 +1351,12 @@ impl TypeChecker {
             }
         }
 
+        // A surviving arm cannot supply the missing constraints of an invalid
+        // sibling (e.g. Err alone leaves Result's success payload unresolved).
+        // All arms have been checked, so independent diagnostics are retained.
+        if self.error_generation != errors_before_match {
+            return Self::error_type();
+        }
         let result = result_type.unwrap_or(Type::Void);
         self.resolve_empty_array_values(&m.arms, &result);
         self.resolve_generic_values(

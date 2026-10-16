@@ -177,11 +177,11 @@ fn p10_class_object_payload() {
 
 #[test]
 fn p11_class_object_literal() {
-    runs(
+    rejects(
         &format!(
             "{BOX} fn main() {{ let b = Box<String> {{ value: \"literal\" }}; println(b.get()); }}"
         ),
-        "literal\n",
+        "error[E0847]",
     );
 }
 
@@ -909,7 +909,7 @@ fn p65_non_generic_class_constructor_rejects_type_arguments() {
 fn p66_non_generic_class_literal_rejects_type_arguments() {
     rejects(
         "class C { pub value: i64; } fn main() { let c = C<i64> { value: 1 }; }",
-        "does not accept type arguments",
+        "error[E0847]",
     );
 }
 
@@ -1182,4 +1182,184 @@ fn imported_generic_function_types_lambda_arguments() {
         "import std::collections::Array; import util; fn main() { let k = 5; let ys = util::map([1, 2], |x| x * 3); println(ys[1]); println(util::apply(new util::Cell<i64>(4), |v| v + k)); }",
         "6\n9\n",
     );
+}
+
+#[test]
+fn literal_policy_diagnostics_regression() {
+    let stderr = compile_error_stderr(
+        "class Box<T> { pub value: T; } fn main() { let b = Box { value: 3 }; }",
+    );
+    assert!(!stderr.contains("diagnostic-error"), "{stderr}");
+    assert!(
+        stderr.contains("object literal construction for `Box`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("aborting due to 1 error(s)"), "{stderr}");
+}
+
+#[track_caller]
+fn assert_literal_diagnostic(stderr: &str, name: &str, count: usize) {
+    assert_eq!(stderr.matches("error[E0847]").count(), count, "{stderr}");
+    assert!(
+        stderr.contains(&format!("object literal construction for `{name}`")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("use `new {name}(...)`")),
+        "{stderr}"
+    );
+    for internal in [
+        "diagnostic-error",
+        "$mono$",
+        "generic checking failed",
+        "internal compiler error",
+        "panicked at",
+    ] {
+        assert!(!stderr.contains(internal), "{stderr}");
+    }
+}
+
+#[test]
+fn literal_policy_source_shapes() {
+    // Each case is an independent diagnostic/recovery perspective.
+    let cases = [
+        ("plain", "class Box { pub value: i64; }", "Box { value: 1 }"),
+        ("generic explicit", BOX, "Box<i64> { value: 1 }"),
+        ("generic missing args", BOX, "Box { value: 1 }"),
+        ("generic extra args", BOX, "Box<i64, String> { value: 1 }"),
+        ("unknown type arg", BOX, "Box<Missing> { value: 1 }"),
+        (
+            "plain extra args",
+            "class Box { pub value: i64; }",
+            "Box<i64> { value: 1 }",
+        ),
+        ("empty plain", "class Box {}", "Box {}"),
+        ("empty generic", "class Box<T> {}", "Box<i64> {}"),
+        (
+            "explicit constructor",
+            "class Box<T> { pub value: T; pub init(self, value: T) { self.value = value; } }",
+            "Box<i64> { value: 1 }",
+        ),
+        (
+            "private field",
+            "class Box<T> { value: T; }",
+            "Box<i64> { value: 1 }",
+        ),
+        ("missing field", BOX, "Box<i64> {}"),
+        ("unknown field", BOX, "Box<i64> { other: 1 }"),
+        ("duplicate field", BOX, "Box<i64> { value: 1, value: 2 }"),
+        ("wrong field type", BOX, "Box<i64> { value: true }"),
+        ("member recovery", BOX, "Box<i64> { value: 1 }.missing"),
+        ("method recovery", BOX, "Box<i64> { value: 1 }.missing()"),
+    ];
+    for (perspective, declaration, expression) in cases {
+        let stderr = compile_error_stderr(&format!(
+            "{declaration} fn main() {{ let b = {expression}; }}"
+        ));
+        assert_literal_diagnostic(&stderr, "Box", 1);
+        assert!(
+            stderr.contains("aborting due to 1 error(s)"),
+            "{perspective}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn literal_policy_imported_classes_and_module_bodies() {
+    for (declaration, ty) in [
+        ("pub class Box { pub value: i64; }", ""),
+        ("pub class Box<T> { pub value: T; }", "<i64>"),
+    ] {
+        for (import, name) in [
+            ("import util;", "util::Box"),
+            ("import util::Box as Holder;", "Holder"),
+        ] {
+            let source = format!("{import} fn main() {{ let b = {name}{ty} {{ value: 1 }}; }}");
+            let stderr = compile_temp_project_error_stderr(
+                &[("util.wi", declaration), ("main.wi", &source)],
+                "main.wi",
+            );
+            // Import resolution may canonicalize the public alias; neither
+            // specialization names nor recovery markers may be displayed.
+            assert_eq!(stderr.matches("error[E0847]").count(), 1, "{stderr}");
+            assert!(
+                !stderr.contains("diagnostic-error") && !stderr.contains("$mono$"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("aborting due to 1 error(s)"), "{stderr}");
+        }
+    }
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "util.wi",
+                "pub class Box<T> { pub value: T; } pub fn bad() { let b = Box<i64> { value: 1 }; }",
+            ),
+            ("main.wi", "import util; fn main() { util::bad(); }"),
+        ],
+        "main.wi",
+    );
+    assert_literal_diagnostic(&stderr, "Box", 1);
+    assert!(stderr.contains("aborting due to 1 error(s)"), "{stderr}");
+}
+
+#[test]
+fn literal_policy_nested_fields_and_generic_bodies() {
+    let stderr = compile_error_stderr(
+        "class Box<T> { pub value: T; } fn main() { let b = Box<i64> { value: Box<i64> { value: unknown } }; }",
+    );
+    assert_literal_diagnostic(&stderr, "Box", 2);
+    assert!(stderr.contains("unknown"), "{stderr}");
+    assert!(stderr.contains("aborting due to 3 error(s)"), "{stderr}");
+    for call in ["", "bad<i64>(1);"] {
+        let stderr = compile_error_stderr(&format!(
+            "{BOX} fn bad<T>(v: T) {{ let b = Box<T> {{ value: v }}; }} fn main() {{ {call} }}"
+        ));
+        assert_literal_diagnostic(&stderr, "Box", 1);
+        assert!(stderr.contains("aborting due to 1 error(s)"), "{stderr}");
+    }
+}
+
+#[test]
+fn literal_policy_summary_counts_and_linear_diagnostics() {
+    for count in [1, 8, 32] {
+        let mut source = format!("{BOX} fn main() {{");
+        for i in 0..count {
+            source.push_str(&format!("let b{i} = Box<i64> {{ value: {i} }};"));
+        }
+        source.push('}');
+        let stderr = compile_error_stderr(&source);
+        assert_literal_diagnostic(&stderr, "Box", count);
+        assert!(
+            stderr.contains(&format!("aborting due to {count} error(s)")),
+            "{stderr}"
+        );
+    }
+    for source in [
+        "fn main() { let n: i64 = true; }",
+        "fn id<T>(v: T) -> T { return v; } fn main() { id<i64>(true); }",
+    ] {
+        let stderr = compile_error_stderr(source);
+        assert!(stderr.contains("aborting due to 1 error(s)"), "{stderr}");
+        assert!(!stderr.contains("generic checking failed"), "{stderr}");
+    }
+}
+
+#[test]
+fn literal_policy_failed_match_does_not_infer_from_surviving_arm() {
+    for tail in ["0", "other()"] {
+        let stderr = compile_error_stderr(&format!(
+            "{BOX} fn main() {{ let r = match true {{ true => Ok(Box<i64> {{ value: 1 }}), false => Err(\"bad\") }}; println(match r {{ Ok(n) => n, Err(e) => {tail} }}); }}"
+        ));
+        assert_literal_diagnostic(&stderr, "Box", 1);
+        let count = if tail == "0" { 1 } else { 2 };
+        assert!(
+            stderr.contains(&format!("aborting due to {count} error(s)")),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("E1201"), "{stderr}");
+        if tail == "other()" {
+            assert!(stderr.contains("cannot find function `other`"), "{stderr}");
+        }
+    }
 }
