@@ -1,0 +1,25 @@
+// Supported spellings corresponding to willow-jz15.69 diagnostics.
+import std::collections::{Map, FrozenArray, FrozenMap};
+
+fn show(values: FrozenArray<i64>, snapshot: FrozenMap<String, i64>) {
+    println(values[0]);
+    println(snapshot.get("answer").unwrap());
+}
+
+fn main() {
+    let values = [7].freeze();
+    let map = Map<String, i64>::new();
+    map.insert("answer", 42);
+    show(values, map.freeze());
+    let loop = true;
+    if loop {
+        match loop { true => {}, false => {} }
+    }
+    while loop {
+        match f64::parse("2.5") {
+            Ok(value) => println(value),
+            Err(_) => println("parse failed")
+        }
+        break;
+    }
+}

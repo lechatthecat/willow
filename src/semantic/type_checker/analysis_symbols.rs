@@ -160,6 +160,13 @@ impl TypeChecker {
                 .alias
                 .as_deref()
                 .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+            // Invalid std imports are diagnosed by the import phase and never
+            // registered here. Do not warn about a declaration that failed.
+            if crate::module::std_registry::is_std_path(&import.path)
+                && self.imported_names.get(local) != Some(&Some(import.span))
+            {
+                continue;
+            }
             if !self.analysis_symbols.used_imports.contains(local) && reported.insert(local) {
                 self.push(
                     Diagnostic::new(

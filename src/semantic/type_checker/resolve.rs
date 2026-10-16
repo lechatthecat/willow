@@ -966,7 +966,11 @@ impl TypeChecker {
                         self.imported_collection_types.insert("Map".to_string());
                     }
                 }
-                ["std", "collections", item @ ("Array" | "Map")] => {
+                [
+                    "std",
+                    "collections",
+                    item @ ("Array" | "Map" | "FrozenArray" | "FrozenMap"),
+                ] => {
                     let local = import.alias.as_deref().unwrap_or(item);
                     self.imported_names
                         .insert(local.to_string(), Some(import.span));

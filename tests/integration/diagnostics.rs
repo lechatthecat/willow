@@ -1474,3 +1474,32 @@ fn jz15_86_misplaced_import_check_has_actionable_help() {
     );
     assert_eq!(stderr.matches("error[").count(), 1, "{stderr}");
 }
+
+#[test]
+fn ticket_69_diagnostic_recovery_end_to_end() {
+    for (source, expected) in [
+        ("fn main() { loop { break; } }", "use `while true { ... }`"),
+        (
+            "fn main() { match f64::parse(\"1\") { Option::Some(x) => println(x), Option::None => println(0) } }",
+            "error[E1205]",
+        ),
+        (
+            "import std::collections::Missing; fn main() {}",
+            "error[E2006]",
+        ),
+    ] {
+        let errors = compile_error_stderr(source);
+        assert!(errors.contains(expected), "{errors}");
+        for cascade in ["error[E0350]", "error[E1202]", "warning[W2003]"] {
+            assert!(!errors.contains(cascade), "{errors}");
+        }
+    }
+}
+
+#[test]
+fn ticket_69_supported_example_runs() {
+    let (output, success) =
+        compile_and_run(include_str!("../../example/match_import_diagnostics.wi"));
+    assert!(success, "{output}");
+    assert_eq!(output, "7\n42\n2.5\n");
+}

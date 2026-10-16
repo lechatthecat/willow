@@ -634,6 +634,17 @@ impl Parser {
                     ))
                 }
             }
+            TokenKind::Ident(name)
+                if name == "loop"
+                    && self.allow_object_literals
+                    && self.peek_kind_at(1) == &TokenKind::LBrace =>
+            {
+                // In a control head, this brace belongs to the enclosing
+                // if/while/match/for; `loop` remains an ordinary identifier.
+                Err(self
+                    .err(ErrorCode::E0102, "`loop { ... }` is not supported")
+                    .with_help("use `while true { ... }` for an unconditional loop"))
+            }
             TokenKind::Ident(name) if name == "std" => self.parse_std_qualified_expr(),
             TokenKind::Ident(name) => {
                 let span = self.current_span();

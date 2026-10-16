@@ -163,6 +163,7 @@ const COLLECTIONS: &[StdItemSchema] = &[
     std_type!("Array", 1, "Array"),
     std_type!("Map", 2, "Map"),
     std_type!("FrozenArray", 1, "FrozenArray"),
+    std_type!("FrozenMap", 2, "FrozenMap"),
 ];
 const OPTION: &[StdItemSchema] = &[std_type!("Option", 1, "Option")];
 const RESULT: &[StdItemSchema] = &[std_type!("Result", 2, "Result")];
@@ -730,7 +731,7 @@ mod recursive_schema_tests {
             ]
         );
         for (name, count) in [
-            ("collections", 3),
+            ("collections", 4),
             ("option", 1),
             ("result", 1),
             ("io", 3),

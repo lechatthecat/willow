@@ -7,6 +7,11 @@ use std::collections::HashSet;
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static INVALID_PATTERN_BINDINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[willow_continuations::checker]
 impl TypeChecker {
     pub(super) fn check_try_propagate(&mut self, inner: &Expr, span: Span) -> Type {
@@ -723,6 +728,31 @@ impl TypeChecker {
         }
     }
 
+    /// Bind each failed pattern payload once so body diagnostics remain local.
+    fn bind_invalid_pattern(&mut self, pattern: &Pattern) {
+        let names: &[String] = match pattern {
+            Pattern::Binding { name, .. } => std::slice::from_ref(name),
+            Pattern::ClassDowncast { binding, .. } => std::slice::from_ref(binding),
+            Pattern::EnumVariantTuple { bindings, .. } => bindings,
+            _ => &[],
+        };
+        for name in names {
+            #[cfg(test)]
+            INVALID_PATTERN_BINDINGS.with(|count| count.set(count.get() + 1));
+            if name != "_" {
+                self.define_var(
+                    name.clone(),
+                    VarInfo {
+                        ty: Self::error_type(),
+                        mutable: false,
+                        is_param: false,
+                        declaration_span: pattern.span(),
+                    },
+                );
+            }
+        }
+    }
+
     pub(super) fn check_match_expr(&mut self, m: &MatchExpr) -> Type {
         // The type this `match` flows into, when it was reached through
         // `check_expr_expecting` (willow-0g8j.3). Taken, not borrowed: a
@@ -736,25 +766,7 @@ impl TypeChecker {
             // bodies for independent errors with poisoned payload bindings.
             for arm in &m.arms {
                 self.symbols.push_scope();
-                let names: &[String] = match &arm.pattern {
-                    Pattern::Binding { name, .. } => std::slice::from_ref(name),
-                    Pattern::ClassDowncast { binding, .. } => std::slice::from_ref(binding),
-                    Pattern::EnumVariantTuple { bindings, .. } => bindings,
-                    _ => &[],
-                };
-                for name in names {
-                    if name != "_" {
-                        self.define_var(
-                            name.to_string(),
-                            VarInfo {
-                                ty: Self::error_type(),
-                                mutable: false,
-                                is_param: false,
-                                declaration_span: arm.span,
-                            },
-                        );
-                    }
-                }
+                self.bind_invalid_pattern(&arm.pattern);
                 if let Some(guard) = &arm.guard {
                     self.check_match_guard(guard);
                 }
@@ -782,6 +794,7 @@ impl TypeChecker {
         let mut has_false = false;
         let mut result_type: Option<Type> = None;
         let mut found_unreachable = false;
+        let mut invalid_patterns = false;
 
         for arm in &m.arms {
             // Check if arm is unreachable (after a wildcard/binding)
@@ -824,6 +837,8 @@ impl TypeChecker {
             // A guarded arm may decline a value its pattern matches, so it
             // covers nothing for exhaustiveness (willow-jz15.6).
             let covers = arm.guard.is_none();
+
+            let errors_before_pattern = self.error_generation;
 
             // Reinterpret `Ok(v)` / `Closed` as enum-variant patterns when the
             // scrutinee is an enum, and record the reinterpretation for the
@@ -1142,8 +1157,15 @@ impl TypeChecker {
                 }
             }
 
-            // Check arm body in a new scope
+            let invalid_pattern = self.error_generation != errors_before_pattern;
+            invalid_patterns |= invalid_pattern;
+
+            // Check invalid arms too, but their bindings cannot constrain types.
             self.symbols.push_scope();
+            if invalid_pattern {
+                self.bind_invalid_pattern(pattern);
+            }
+
             // For EnumVariantTuple: bind payload variables in arm scope
             if let Pattern::EnumVariantTuple {
                 enum_name,
@@ -1151,6 +1173,7 @@ impl TypeChecker {
                 bindings,
                 ..
             } = pattern
+                && !invalid_pattern
             {
                 // Resolve payload types: first check built-in generic types
                 // Resolve concrete payload types: use generic instantiation when available.
@@ -1177,6 +1200,7 @@ impl TypeChecker {
                 span: bspan,
                 ..
             } = pattern
+                && !invalid_pattern
                 && binding != "_"
             {
                 self.define_var(
@@ -1193,6 +1217,7 @@ impl TypeChecker {
             if let Pattern::Binding {
                 name, span: bspan, ..
             } = pattern
+                && !invalid_pattern
             {
                 self.define_var(
                     name.clone(),
@@ -1220,7 +1245,10 @@ impl TypeChecker {
             // Invalid bodies already have a diagnostic; do not turn their
             // recovery type (often void) into a misleading arm mismatch.
             // Never arms likewise do not constrain the result type.
-            if self.error_generation != errors_before_body || arm_ty == Type::Never {
+            if invalid_pattern
+                || self.error_generation != errors_before_body
+                || arm_ty == Type::Never
+            {
                 continue;
             }
 
@@ -1283,7 +1311,7 @@ impl TypeChecker {
         }
 
         // Exhaustiveness check
-        if !has_wildcard {
+        if !invalid_patterns && !has_wildcard {
             match &scrutinee_ty {
                 Type::Bool if (!has_true || !has_false) => {
                     self.push(
