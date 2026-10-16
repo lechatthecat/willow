@@ -325,6 +325,11 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
             "Renamed {} -> {new_name}\n{files} changed\n{edits}\nValidation: passed",
             options.selector
         );
+        if let Some(warnings) = result["warnings"].as_array() {
+            for warning in warnings.iter().filter_map(Value::as_str) {
+                output.push_str(&format!("\nWarning: {warning}"));
+            }
+        }
         if options.verbose {
             output.push_str(&format!(
                 "\nTransaction: {}",

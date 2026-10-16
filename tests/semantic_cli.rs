@@ -1930,6 +1930,86 @@ fn stale_parameter_suggestion_beats_similar_spelling_and_respects_scope() {
 }
 
 #[test]
+fn stale_rename_history_tracks_sequential_members_and_locals() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/order.wi"), "module order; pub enum Node { Alt, Apple, Banana, Cherry } pub class Order { pub qty: i64; pub apple: i64; pub init(self, qty: i64) { self.qty = qty; self.apple = 0; } pub fn value(self) -> i64 { return self.qty; } pub fn alpha(self) -> i64 { return 0; } }\n").unwrap();
+    fs::write(f.0.join("src/main.wi"), "import order; fn serve(pred: i64) { let split = pred; let other = 2; println(split + other); } fn main() { let item = new order::Order(2); let node = order::Node::Alt; serve(item.value()); }\n").unwrap();
+    let initial = fs::read_to_string(f.0.join("src/main.wi")).unwrap();
+    let old_offset = format!("main::serve::split@{}", initial.find("split").unwrap());
+    let renames = [
+        (
+            "main::serve::split",
+            "disagreements",
+            "main::serve::disagreements",
+        ),
+        ("order::Node::Alt", "Either", "order::Node::Either"),
+        ("order::Order::qty", "built", "order::Order::built"),
+        ("order::Order::value", "find", "order::Order::find"),
+        (
+            "main::serve::pred",
+            "long_parameter",
+            "main::serve::long_parameter",
+        ),
+        ("main::serve::other", "x", "main::serve::x"),
+    ];
+    for (i, (old, new, _)) in renames.iter().enumerate() {
+        f.json(&["rename", old, new], 0);
+        for (stale, _, expected) in &renames[..=i] {
+            let result = f.json(&["symbol", stale], 1);
+            assert_eq!(result["status"], "unknown", "{result}");
+            assert_eq!(
+                result["result"]["suggestions"][0], *expected,
+                "{stale}: {result}"
+            );
+        }
+    }
+    for selector in [old_offset.as_str(), "serve::split", "split"] {
+        let result = f.json(&["symbol", selector], 1);
+        assert_eq!(
+            result["result"]["suggestions"][0], "main::serve::disagreements",
+            "{result}"
+        );
+    }
+    // Chained renames keep all earlier spellings aimed at the current declaration.
+    f.json(&["rename", "main::serve::disagreements", "result"], 0);
+    for stale in ["main::serve::split", "main::serve::disagreements"] {
+        let result = f.json(&["symbol", stale], 1);
+        assert_eq!(
+            result["result"]["suggestions"][0], "main::serve::result",
+            "{result}"
+        );
+    }
+    let history = f.0.join(".willow-edits/last-local-rename.json");
+    let before = fs::read(&history).unwrap();
+    f.json(&["rename", "main::serve::result", "x"], 1);
+    f.json(
+        &["rename", "main::serve::result", "preview", "--dry-run"],
+        0,
+    );
+    assert_eq!(fs::read(&history).unwrap(), before);
+    let filtered = f.json(&["symbol", "order::Order::qty", "--kind", "method"], 1);
+    assert!(
+        !filtered["result"]["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "order::Order::built")
+    );
+    // A real reused name still resolves normally, rather than following history.
+    let path = f.0.join("src/main.wi");
+    let source = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        source
+            .replace("let x =", "let split =")
+            .replace("+ x", "+ split"),
+    )
+    .unwrap();
+    let result = f.json(&["symbol", "main::serve::split"], 0);
+    assert_eq!(result["result"]["symbol"]["name"], "split");
+}
+
+#[test]
 fn effect_precision_arithmetic_select_concat_and_allocation() {
     use willow_compiler::semantic::effects::RuntimeEffects as E;
     let f = Fixture::new();

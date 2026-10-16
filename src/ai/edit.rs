@@ -35,6 +35,8 @@ struct Change {
     path: String,
     before: String,
     after: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    offsets: Vec<(usize, usize, usize, usize)>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,26 +75,36 @@ pub struct Workspace {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(super) struct LocalRenameHint {
+pub(super) struct RenameHint {
     pub selector: String,
     pub path: String,
     pub start: usize,
     pub digest: String,
 }
-impl LocalRenameHint {
-    pub fn read(snapshot: &Snapshot) -> Option<Self> {
+impl RenameHint {
+    fn read_all(root: &Path) -> Vec<Self> {
         // Advisory metadata must never make an otherwise valid query fail.
-        use std::io::Read;
-        let file =
-            File::open(Path::new(&snapshot.workspace).join(".willow-edits/last-local-rename.json"))
-                .ok()?;
-        let mut bytes = Vec::new();
-        file.take(65537).read_to_end(&mut bytes).ok()?;
-        if bytes.len() > 65536 {
-            return None;
+        // Accept the original single-record format for existing workspaces.
+        let Ok(file) = File::open(root.join(".willow-edits/last-local-rename.json")) else {
+            return Vec::new();
+        };
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Records {
+            Many(Vec<RenameHint>),
+            One(RenameHint),
         }
-        let hint: Self = serde_json::from_slice(&bytes).ok()?;
-        (snapshot.sources.get(&hint.path) == Some(&hint.digest)).then_some(hint)
+        match serde_json::from_reader(std::io::BufReader::new(file)) {
+            Ok(Records::Many(hints)) => hints,
+            Ok(Records::One(hint)) => vec![hint],
+            Err(_) => Vec::new(),
+        }
+    }
+    pub fn read(snapshot: &Snapshot) -> Vec<Self> {
+        Self::read_all(Path::new(&snapshot.workspace))
+            .into_iter()
+            .filter(|hint| snapshot.sources.get(&hint.path) == Some(&hint.digest))
+            .collect()
     }
 }
 
@@ -196,31 +208,68 @@ impl Workspace {
             _transaction: transaction,
         })
     }
-    /// A bounded advisory record, never an alias used for resolution. Its source
-    /// digest prevents an interrupted/failed edit or later source edit from
-    /// redirecting suggestions to a different declaration.
-    pub(super) fn remember_local_rename(
+    /// Advisory history, never an alias used for resolution. Refresh locations
+    /// only across verified edits; unrelated source changes invalidate hints.
+    pub(super) fn remember_rename(
         &self,
         transaction: &str,
         selector: &str,
         location: &super::Location,
     ) -> Result<()> {
         let plan = self.load(transaction)?;
-        let relative = Path::new(&location.path).strip_prefix(&self.root)?;
-        let change = plan
+        let mut hints = RenameHint::read_all(&self.root);
+        let changes: BTreeMap<_, _> = plan
             .changes
             .iter()
-            .find(|change| Path::new(&change.path) == relative)
-            .context("renamed local source is absent from edit")?;
-        let hint = LocalRenameHint {
+            .map(|change| {
+                (
+                    self.root.join(&change.path).to_string_lossy().into_owned(),
+                    (change, hash(&change.before), hash(&change.after)),
+                )
+            })
+            .collect();
+        let (_, before, _) = changes
+            .get(&location.path)
+            .context("renamed source is absent from edit")?;
+        hints.push(RenameHint {
             selector: selector.into(),
             path: location.path.clone(),
             start: location.start,
-            digest: hash(&change.after),
-        };
+            digest: before.clone(),
+        });
+        hints.retain_mut(|hint| {
+            let Some((change, before, after)) = changes.get(&hint.path) else {
+                return plan.inputs.get(
+                    Path::new(&hint.path)
+                        .strip_prefix(&self.root)
+                        .ok()
+                        .and_then(Path::to_str)
+                        .unwrap_or(""),
+                ) == Some(&hint.digest);
+            };
+            if &hint.digest != before {
+                return false;
+            }
+            let index = change
+                .offsets
+                .partition_point(|&(start, _, _, _)| start <= hint.start);
+            if let Some(&(start, end, new_start, new_end)) =
+                index.checked_sub(1).map(|i| &change.offsets[i])
+            {
+                if hint.start == start {
+                    hint.start = new_start;
+                } else if hint.start >= end {
+                    hint.start = new_end + (hint.start - end);
+                } else {
+                    return false;
+                }
+            }
+            hint.digest.clone_from(after);
+            true
+        });
         durable_write(
             &self.directory.join("last-local-rename.json"),
-            &serde_json::to_vec(&hint)?,
+            &serde_json::to_vec(&hints)?,
         )
     }
 
@@ -1446,6 +1495,7 @@ fn structured_changes(
         let mut after = String::new();
         let mut cursor = 0;
         work.patches += edits.len();
+        let mut offsets = Vec::with_capacity(edits.len());
         for edit in edits {
             ensure!(
                 edit.start >= cursor && edit.end <= before.len(),
@@ -1456,7 +1506,9 @@ fn structured_changes(
                     .get(cursor..edit.start)
                     .context("invalid edit boundary")?,
             );
+            let new_start = after.len();
             after.push_str(&edit.text);
+            offsets.push((edit.start, edit.end, new_start, after.len()));
             cursor = edit.end;
         }
         after.push_str(&before[cursor..]);
@@ -1466,6 +1518,7 @@ fn structured_changes(
                 path,
                 before: before.clone(),
                 after,
+                offsets,
             });
         }
     }
@@ -1475,6 +1528,28 @@ fn structured_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rename_history_reads_legacy_and_ignores_invalid_metadata() {
+        let f = Fixture::new();
+        let w = f.workspace();
+        let path = w.directory.join("last-local-rename.json");
+        let hint = RenameHint {
+            selector: "main::old".into(),
+            path: "main.wi".into(),
+            start: 17,
+            digest: "digest".into(),
+        };
+        durable_write(&path, &serde_json::to_vec(&hint).unwrap()).unwrap();
+        let hints = RenameHint::read_all(&f.0);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].selector, "main::old");
+        assert_eq!(hints[0].start, 17);
+        for invalid in ["invalid", "{}", "[{}]", "null"] {
+            durable_write(&path, invalid.as_bytes()).unwrap();
+            assert!(RenameHint::read_all(&f.0).is_empty());
+        }
+    }
+
     #[test]
     fn direct_apply_rolls_back_own_writes_on_late_failure_or_race() {
         for race in [0, 1, 2, 3] {
@@ -1838,6 +1913,7 @@ mod tests {
             path: "second.wi".into(),
             before: "before".into(),
             after: "after".into(),
+            offsets: Vec::new(),
         });
         plan.state = "validated".into();
         plan.candidate = candidate(&plan).unwrap();
@@ -2392,7 +2468,7 @@ mod tests {
 
     #[test]
     fn edit_scaling_indexes_tokens_once_and_visits_only_target_references() {
-        for n in [16, 64, 256] {
+        for n in [16, 64, 256, 512] {
             let f = Fixture::new();
             fs::write(
                 f.0.join("main.wi"),
@@ -2432,7 +2508,57 @@ mod tests {
             assert_eq!(result["work"]["patches"], n + 1);
             assert_eq!(result["work"]["references_visited"], n);
             assert_eq!(result["work"]["tokens_indexed"], 7 * n + 18);
-            println!("edit calls={n} work={}", result["work"]);
+            let id = result["transaction"].as_str().unwrap();
+            let plan = w.load(id).unwrap();
+            let change = &plan.changes[0];
+            assert_eq!(change.offsets.len(), n + 1);
+            let path = f.0.join("main.wi").to_string_lossy().into_owned();
+            let starts: Vec<_> = change
+                .before
+                .match_indices("value")
+                .map(|(i, _)| i)
+                .collect();
+            let before_digest = hash(&change.before);
+            let after_digest = hash(&change.after);
+            let hints: Vec<_> = starts
+                .iter()
+                .enumerate()
+                .map(|(i, &start)| RenameHint {
+                    selector: format!("main::old_{i}"),
+                    path: path.clone(),
+                    start,
+                    digest: before_digest.clone(),
+                })
+                .collect();
+            durable_write(
+                &w.directory.join("last-local-rename.json"),
+                &serde_json::to_vec(&hints).unwrap(),
+            )
+            .unwrap();
+            let location = super::super::Location {
+                path,
+                start: starts[0],
+                end: starts[0] + 5,
+            };
+            w.remember_rename(id, "main::value", &location).unwrap();
+            let updated = RenameHint::read_all(&f.0);
+            assert_eq!(updated.len(), n + 2);
+            let expected: Vec<_> = change
+                .after
+                .match_indices("answer")
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                updated[..n + 1].iter().map(|h| h.start).collect::<Vec<_>>(),
+                expected
+            );
+            assert!(updated.iter().all(|h| h.digest == after_digest));
+            println!(
+                "edit calls={n} offsets={} hints={} work={}",
+                change.offsets.len(),
+                updated.len(),
+                result["work"]
+            );
         }
     }
     #[test]

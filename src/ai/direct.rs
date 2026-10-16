@@ -301,7 +301,7 @@ impl DirectSession {
         };
         // Keep the selected declaration's pre-edit canonical identity in both
         // results, matching refs. Display conversion must not alter the raw
-        // source location used by local rename hints below.
+        // source location used by rename history below.
         let mut displayed = resolved.clone();
         self.display_locations(&mut displayed, false)?;
         let selected = displayed["symbol"].take();
@@ -319,20 +319,12 @@ impl DirectSession {
             preview["selected"] = selected;
             return Ok(preview);
         }
-        let local_hint = matches!(
-            resolved["symbol"]["kind"].as_str(),
-            Some("binding" | "parameter")
-        )
-        .then(|| -> Result<_> {
-            Ok((
-                resolved["symbol"]["selector"]
-                    .as_str()
-                    .context("local selector")?
-                    .to_owned(),
-                serde_json::from_value::<super::Location>(resolved["symbol"]["location"].clone())?,
-            ))
-        })
-        .transpose()?;
+        let rename_selector = resolved["symbol"]["selector"]
+            .as_str()
+            .context("rename selector")?
+            .to_owned();
+        let rename_location =
+            serde_json::from_value::<super::Location>(resolved["symbol"]["location"].clone())?;
         let workspace = edit::Workspace::open(Path::new(self.workspace()))?;
         let preview = workspace.prepare_analyzed(
             entry,
@@ -344,13 +336,19 @@ impl DirectSession {
         let transaction = preview["transaction"]
             .as_str()
             .context("missing transaction identity")?;
-        if let Some((selector, location)) = local_hint {
-            workspace.remember_local_rename(transaction, &selector, &location)?;
-        }
         let mut emitter = crate::diagnostics::HumanEmitter;
         workspace.validate(transaction, &mut emitter)?;
         workspace.apply_with_rollback(transaction, &mut emitter)?;
         let mut result = json!({"status":"ok","old":selector,"new":name,"validation":"passed","transaction":transaction,"selected":selected});
+        // Source publication has committed. Advisory history failure must not
+        // make callers believe the rename failed or invite an unsafe retry.
+        if let Err(error) =
+            workspace.remember_rename(transaction, &rename_selector, &rename_location)
+        {
+            result["warnings"] = json!([format!(
+                "Rename succeeded, but rename history could not be saved; stale-selector suggestions may be unavailable: {error:#}"
+            )]);
+        }
         result
             .as_object_mut()
             .unwrap()
@@ -548,18 +546,24 @@ impl DirectSession {
         let mut scope_fallback = Vec::new();
         let mut sole_local = None;
         let mut scoped_locals = 0;
-        let hint = edit::LocalRenameHint::read(&self.session.snapshot).filter(|hint| {
-            let plain = hint
-                .selector
-                .rsplit_once('@')
-                .map_or(hint.selector.as_str(), |(name, _)| name);
-            [hint.selector.as_str(), plain].iter().any(|name| {
-                *name == selector
-                    || name
-                        .strip_suffix(selector)
-                        .is_some_and(|p| p.ends_with("::"))
+        let mut hints: HashMap<String, std::collections::HashSet<usize>> = HashMap::new();
+        for hint in edit::RenameHint::read(&self.session.snapshot)
+            .into_iter()
+            .filter(|hint| {
+                let plain = hint
+                    .selector
+                    .rsplit_once('@')
+                    .map_or(hint.selector.as_str(), |(name, _)| name);
+                [hint.selector.as_str(), plain].iter().any(|name| {
+                    *name == selector
+                        || name
+                            .strip_suffix(selector)
+                            .is_some_and(|p| p.ends_with("::"))
+                })
             })
-        });
+        {
+            hints.entry(hint.path).or_default().insert(hint.start);
+        }
         let segments: Vec<_> = selector
             .split("::")
             .map(|s| (s, s.chars().collect::<Vec<_>>()))
@@ -656,12 +660,11 @@ impl DirectSession {
                     scope_fallback.dedup();
                     scope_fallback.truncate(5);
                 }
-                let previous = hint.as_ref().is_some_and(|hint| {
-                    symbol
-                        .location
-                        .as_ref()
-                        .is_some_and(|loc| loc.path == hint.path && loc.start == hint.start)
-                }) && local_name.is_some();
+                let previous = symbol.location.as_ref().is_some_and(|loc| {
+                    hints
+                        .get(&loc.path)
+                        .is_some_and(|starts| starts.contains(&loc.start))
+                });
                 if previous || score.is_some() {
                     // A matching declaration beats spelling similarity. Position
                     // breaks equal-score ties deterministically within a file.

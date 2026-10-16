@@ -99,6 +99,56 @@ fn direct_rename_previews_without_metadata_and_applies_cross_file_imports() {
 }
 
 #[test]
+fn direct_rename_history_publication_failure_warns_after_success() {
+    for human in [false, true] {
+        let f = Fixture::new("fn main() { let old = 1; println(old); }");
+        let history = f.0.join(".willow-edits/last-local-rename.json");
+        fs::create_dir_all(&history).unwrap();
+        let args = ["rename", "main::main::old", "renamed"];
+        if human {
+            let text = f.human(&args, 0);
+            assert!(
+                text.contains("Renamed main::main::old -> renamed"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Warning: Rename succeeded, but rename history could not be saved"),
+                "{text}"
+            );
+        } else {
+            let result = f.run(&args, 0);
+            assert_eq!(result["status"], "ok", "{result}");
+            assert_eq!(result["result"]["status"], "ok", "{result}");
+            assert_eq!(result["result"]["validation"], "passed", "{result}");
+            let warnings = result["result"]["warnings"].as_array().unwrap();
+            assert_eq!(warnings.len(), 1);
+            assert!(
+                warnings[0]
+                    .as_str()
+                    .unwrap()
+                    .contains("Rename succeeded, but rename history could not be saved"),
+                "{result}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(f.0.join("main.wi")).unwrap(),
+            "fn main() { let renamed = 1; println(renamed); }"
+        );
+        assert!(history.is_dir());
+        assert!(!f.0.join(".willow-edits/active").exists());
+        // Removing the advisory-file obstruction permits the next rename normally.
+        fs::remove_dir(&history).unwrap();
+        let next = f.run(&["rename", "main::main::renamed", "final_name"], 0);
+        assert!(next["result"].get("warnings").is_none(), "{next}");
+        assert_eq!(
+            fs::read_to_string(f.0.join("main.wi")).unwrap(),
+            "fn main() { let final_name = 1; println(final_name); }"
+        );
+        assert!(history.is_file());
+    }
+}
+
+#[test]
 fn rename_rejections_preserve_sources_and_report_collision_location() {
     for (selector, name) in [
         ("missing", "new_name"),
