@@ -560,6 +560,7 @@ fn lower_env(program: &Program, tables: &CheckerTables) -> LowerEnv {
         ("sched_global_pushes".to_string(), Type::I64),
         ("sched_local_pushes".to_string(), Type::I64),
         ("gc_allocated_bytes".to_string(), Type::I64),
+        ("gc_total_allocated_bytes".to_string(), Type::I64),
         ("gc_tlab_fast_allocations".to_string(), Type::I64),
         ("gc_tlab_slow_allocations".to_string(), Type::I64),
         ("gc_tlab_refills".to_string(), Type::I64),
@@ -4629,6 +4630,10 @@ mod tests {
     fn p67_builtin_call_typed() {
         assert_eq!(
             return_ty("fn f() -> i64 { return gc_allocated_bytes(); }"),
+            Type::I64
+        );
+        assert_eq!(
+            return_ty("fn f() -> i64 { return gc_total_allocated_bytes(); }"),
             Type::I64
         );
     }

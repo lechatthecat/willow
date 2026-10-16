@@ -2064,6 +2064,7 @@ pub(crate) fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
         "sched_local_pushes" => Some("willow_sched_local_pushes"),
         "gc_task_frame_diagnostics" => Some("willow_gc_task_frame_diagnostics"),
         "gc_allocated_bytes" => Some("willow_gc_allocated_bytes"),
+        "gc_total_allocated_bytes" => Some("willow_gc_total_allocated_bytes"),
         "gc_tlab_fast_allocations" => Some("willow_gc_tlab_fast_allocations"),
         "gc_tlab_slow_allocations" => Some("willow_gc_tlab_slow_allocations"),
         "gc_tlab_refills" => Some("willow_gc_tlab_refills"),

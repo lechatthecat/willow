@@ -517,3 +517,20 @@ fn main() {
     assert!(ok, "None Option field should be ignored safely by GC");
     assert_eq!(out, "1\ntrue\n");
 }
+
+#[test]
+fn cumulative_allocation_bytes_builtin_runs_example() {
+    let (out, ok) = compile_and_run(include_str!("../../../example/gc_allocation_counters.wi"));
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "true\ntrue\ntrue\ntrue\ntrue\n");
+}
+
+#[test]
+fn cumulative_allocation_bytes_builtin_rejects_arguments_and_wrong_result_type() {
+    for source in [
+        "fn main() { gc_total_allocated_bytes(1); }",
+        "fn main() { let value: bool = gc_total_allocated_bytes(); println(value); }",
+    ] {
+        assert!(!compile_error_stderr(source).is_empty());
+    }
+}

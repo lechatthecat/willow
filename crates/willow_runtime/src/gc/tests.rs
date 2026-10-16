@@ -4107,3 +4107,76 @@ mod root_handle_tests;
 
 #[path = "foreign_owner_tests.rs"]
 mod foreign_owner_tests;
+
+#[test]
+fn cumulative_allocation_bytes_survive_collection_and_repeated_reads() {
+    let _guard = gc_test_guard();
+    for count in [1, 8, 64, 512] {
+        reset_gc();
+        assert_eq!(willow_gc_total_allocated_bytes(), 0);
+        for _ in 0..count {
+            assert!(!willow_alloc(8).is_null());
+        }
+        let expected = count * (GC_HEADER_SIZE + 8) as i64;
+        assert_eq!(willow_gc_total_allocated_bytes(), expected);
+        assert_eq!(willow_gc_allocated_bytes(), expected);
+        assert_eq!(willow_gc_total_allocated_bytes(), expected);
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        assert_eq!(willow_gc_total_allocated_bytes(), expected);
+        willow_gc_minor_collect();
+        assert_eq!(willow_gc_total_allocated_bytes(), expected);
+        willow_alloc(8);
+        assert_eq!(willow_gc_total_allocated_bytes(), expected + obj_size(8));
+        println!("cumulative count={count} bytes={expected}");
+    }
+    reset_gc();
+}
+
+#[test]
+fn cumulative_allocation_bytes_merge_fast_path_once_and_scale_by_tlabs() {
+    let _guard = gc_test_guard();
+    for count in [1, 8, 64] {
+        reset_gc();
+        willow_gc_register_mutator();
+        let mut states: Vec<_> = (0..count).map(|_| new_tlab_state()).collect();
+        for tls in &mut states {
+            willow_gc_alloc_slow(tls, 1, 0, 8, 0);
+            fast_alloc_for_test(tls, GC_HEADER_SIZE + 8);
+        }
+        TLAB_ACCOUNTING_RECORD_VISITS.store(0, Ordering::Relaxed);
+        let expected = (count * 2 * (GC_HEADER_SIZE + 8)) as i64;
+        for _ in 0..3 {
+            assert_eq!(willow_gc_total_allocated_bytes(), expected);
+        }
+        assert_eq!(
+            TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed),
+            3 * count
+        );
+        assert_eq!(willow_gc_allocated_bytes(), expected);
+        willow_gc_unregister_mutator();
+        assert_eq!(willow_gc_total_allocated_bytes(), expected);
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        assert_eq!(willow_gc_total_allocated_bytes(), expected);
+        println!(
+            "cumulative tlabs={count} reads={} bytes={expected}",
+            3 * count
+        );
+        reset_gc();
+    }
+}
+
+#[test]
+fn cumulative_allocation_bytes_clamp_without_wrapping() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    for total in [i64::MAX as u64 - 1, i64::MAX as u64, u64::MAX] {
+        runtime().heap.lock().unwrap().total_allocated_bytes = total;
+        assert_eq!(
+            willow_gc_total_allocated_bytes(),
+            total.min(i64::MAX as u64) as i64
+        );
+    }
+    reset_gc();
+}

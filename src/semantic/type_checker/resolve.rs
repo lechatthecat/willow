@@ -249,6 +249,7 @@ impl TypeChecker {
             "sched_global_pushes",
             "sched_local_pushes",
             "gc_allocated_bytes",
+            "gc_total_allocated_bytes",
             "gc_tlab_fast_allocations",
             "gc_tlab_slow_allocations",
             "gc_tlab_refills",

@@ -102,6 +102,18 @@ pub extern "C" fn willow_gc_survivor_space_live() -> i64 {
     survivor_snapshot().survivor_space_live as i64
 }
 
+/// Cumulative GC allocation bytes (headers and payloads), including fast paths.
+/// Collection never subtracts from this counter. Clamp at the public i64 limit.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_gc_total_allocated_bytes() -> i64 {
+    let mut state = runtime().heap.lock().unwrap();
+    sync_tlab_bytes(&mut state);
+    state.total_allocated_bytes.min(i64::MAX as u64) as i64
+}
+
+/// Currently occupied GC bytes (headers and payloads); decreases on collection.
+/// Includes unreachable objects until they are reclaimed, not cumulative traffic.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_allocated_bytes() -> i64 {

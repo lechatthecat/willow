@@ -758,6 +758,7 @@ mod alloc_effects_tests {
         // They report on the heap; they do not touch it.
         for name in [
             "willow_gc_allocated_bytes",
+            "willow_gc_total_allocated_bytes",
             "willow_gc_minor_collections",
             "willow_gc_major_collections",
             "willow_gc_promoted_objects",

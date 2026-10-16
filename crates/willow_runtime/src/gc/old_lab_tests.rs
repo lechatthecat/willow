@@ -514,3 +514,33 @@ fn foreign_owner_progress_sampling_does_not_index_pending_objects() {
         reset_internal_for_test();
     }
 }
+
+#[test]
+fn cumulative_allocation_bytes_merge_old_lab_without_indexing() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let _labs = LabsOn::new();
+    for count in [1, 8, 64, 512] {
+        let before = willow_gc_total_allocated_bytes();
+        for _ in 0..count {
+            willow_alloc(8);
+        }
+        let pending = local_pending_for_test();
+        let expected = before + count * (GC_HEADER_SIZE + 8) as i64;
+        assert_eq!(willow_gc_total_allocated_bytes(), expected);
+        assert_eq!(willow_gc_total_allocated_bytes(), expected);
+        assert_eq!(
+            local_pending_for_test(),
+            pending,
+            "bytes reader must not index objects"
+        );
+        assert_eq!(
+            crate::gc_telemetry::snapshot().counters.allocation_bytes,
+            expected as u64
+        );
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        assert_eq!(willow_gc_total_allocated_bytes(), expected);
+    }
+    reset_internal_for_test();
+}
