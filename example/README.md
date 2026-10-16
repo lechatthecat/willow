@@ -21,6 +21,21 @@ Interactive or intentionally non-terminating examples should contain:
 
 Manual examples remain runnable, but the automated example catalog does not execute them.
 
+## Synchronous helpers in tasks
+
+A task can call an ordinary synchronous helper, including loops and recursion,
+on GNU/Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64 MSVC.
+Compiler-inserted safepoints let other tasks run while preserving the helper's
+stack. See `parallel_tasks.wi`, `task_sync_preemption.wi`, and
+`task_aware_imported_helper.wi`. The historical filename
+`task_recursion_rejected.wi` now demonstrates accepted recursive calls.
+
+E0810 still rejects calls whose preemptibility cannot be proven (for example,
+unresolved callbacks or foreign functions without a preemption contract).
+Targets without native sync-stack support also reject synchronous loops and
+recursion from tasks. Making a known looping helper async is a remedy for that
+target limitation; it does not prove an unknown foreign call safe.
+
 ## Optional values
 
 `Option<T>` is Willow's only absence type. Construct it explicitly with

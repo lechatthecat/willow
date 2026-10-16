@@ -70,14 +70,12 @@ impl NonpreemptibleReason {
     }
 }
 
-/// Help text shared by every E0810. It names both remedies: the one available
-/// today, and the pending toolchain work that retires the rejection.
+/// Help for known loops/recursion on targets without native sync stacks.
 pub(crate) const NONPREEMPTIBLE_HELP: &str =
-    "make the helper async, or wait for task-aware sync-stack preemption support on this target";
+    "make the helper async, or use a target with task-aware sync-stack preemption";
 
-/// Note attached to every E0810, so the rejection does not read as permanent
-/// language policy (§2.2.1 of the async completion spec).
-pub(crate) const NONPREEMPTIBLE_NOTE: &str = "this rejection is temporary: it is lifted once task-aware synchronous-stack preemption is supported on this target";
+/// Target limitation, not a general prohibition on synchronous task helpers.
+pub(crate) const NONPREEMPTIBLE_NOTE: &str = "this target lacks task-aware synchronous-stack preemption; supported targets allow analyzed synchronous loops and recursion";
 
 /// A synchronous helper that cannot be preempted when called from a task
 /// context, with the reason and the span of its definition.
@@ -1310,7 +1308,7 @@ async fn run() -> i64 {
     // 20. cross-module reach-into-SCC is rejected
     // 21. item-imported recursion is rejected
     // 22. an aliased item-imported recursive helper is rejected
-    // 23. the diagnostic carries the temporary note, both remedies, and the
+    // 23. the diagnostic carries the target-capability note, both remedies, and the
     //     recursion secondary label
     // 24. two independent cycles are both flagged, deterministically
     // 25. the primary label points at the sole task-context entry into the
@@ -1834,8 +1832,8 @@ async fn run() -> i64 {
         assert_e0810_with_module_note(&analyzer, "f", "worker");
     }
 
-    /// Perspective 23: §2.2.1 requires the diagnostic to say the rejection is temporary
-    /// and to name both remedies, and the secondary label must describe the
+    /// Perspective 23: the diagnostic names the target limitation and both
+    /// remedies, and the secondary label must describe the
     /// cycle rather than a loop.
     #[test]
     fn recursion_diagnostic_carries_note_help_and_cycle_label() {
@@ -1853,7 +1851,7 @@ async fn run() -> i64 {{
             .expect("expected an E0810");
         assert!(
             error.notes.iter().any(|n| n == NONPREEMPTIBLE_NOTE),
-            "missing the temporary-rejection note: {error:#?}"
+            "missing the target-capability note: {error:#?}"
         );
         assert!(
             error.helps.iter().any(|h| h == NONPREEMPTIBLE_HELP),

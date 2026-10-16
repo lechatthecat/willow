@@ -38,16 +38,15 @@ async fn squares(values: FrozenArray<i64>) -> String {
 }
 
 // A `Task<Array<i64>>` is an ordinary value: a sync helper may start the work
-// and hand the handle back for someone else to await. The helper is sync
-// because it contains no loop — a sync helper that loops is refused in task
-// context (E0810), which is why the array builders below are async.
+// and hand the handle back for someone else to await. Synchronous helpers,
+// including the looping array builder below, are preemptible in task context.
 fn start(values: FrozenArray<i64>) -> Task<Array<i64>> {
     return parallel::map(values, plus_ten);
 }
 
 // The input is built here rather than passed in: an `Array<T>` is not `Sync`
 // and so cannot cross a task boundary, but the frozen view can.
-async fn counting(n: i64) -> FrozenArray<i64> {
+fn counting(n: i64) -> FrozenArray<i64> {
     let mut xs: Array<i64> = [];
     let mut i = 0;
     while i < n {
@@ -119,6 +118,6 @@ async fn main() {
     println((await parallel::map(empty.freeze(), square)).toString());
 
     // Large enough that the cancel lands before the mapping finishes.
-    let big = await counting(50000);
+    let big = counting(50000);
     println(await cancelled(big));
 }

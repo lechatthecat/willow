@@ -101,15 +101,13 @@ fn shadowed_scopes() {
     println("after the shadowed scopes");
 }
 
-// E0810 rejects a *synchronous* helper that loops or recurses when it is called
-// from task context, because nothing can preempt its stack. Recursion is its
-// own seed: unbounded work needs no `while`. The remedy the diagnostic names is
-// exactly this — make the helper async, so every step is a scheduler safepoint.
-async fn sum_to(n: i64) -> i64 {
+// Ordinary synchronous recursion remains preemptible in task context on
+// supported targets. There is no need to turn each recursive step into a Task.
+fn sum_to(n: i64) -> i64 {
     if n <= 0 {
         return 0;
     }
-    return n + await sum_to(n - 1);
+    return n + sum_to(n - 1);
 }
 
 class Meter {
@@ -150,7 +148,7 @@ async fn main() {
 
     shadowed_scopes();
 
-    println(await sum_to(10));       // 55
+    println(sum_to(10));             // 55
 
     let ch: Channel<i64> = Channel::new();
     ch.send(7);

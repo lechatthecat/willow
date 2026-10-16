@@ -31,9 +31,9 @@ class Note {
 
 // Queue every value first, allocate hard, then drain. Nothing else refers to
 // the queued strings while the padding runs, so the channel's buffer is the
-// only thing keeping them alive. These are `async` only because a synchronous
-// helper containing a loop cannot be called from a task (E0810).
-async fn buffered_strings(count: i64) -> String {
+// only thing keeping them alive. Task-aware stacks allow these ordinary
+// synchronous helpers to be called directly from the task below.
+fn buffered_strings(count: i64) -> String {
     let ch: Channel<String> = Channel::new();
     let mut i = 0;
     while i < count {
@@ -59,7 +59,7 @@ async fn buffered_strings(count: i64) -> String {
 
 // The same for a channel of objects: the buffer holds class references, and
 // each one owns a String of its own that has to survive with it.
-async fn buffered_notes(count: i64) -> String {
+fn buffered_notes(count: i64) -> String {
     let ch: Channel<Note> = Channel::new();
     let mut i = 0;
     while i < count {
@@ -88,7 +88,7 @@ async fn buffered_notes(count: i64) -> String {
 
 // A scalar element takes the other path: the buffer holds plain words, so the
 // collector must NOT walk it. Same annotation, different answer.
-async fn buffered_numbers(count: i64) -> i64 {
+fn buffered_numbers(count: i64) -> i64 {
     let ch: Channel<i64> = Channel::new();
     let mut i = 0;
     while i < count {
@@ -106,7 +106,7 @@ async fn buffered_numbers(count: i64) -> i64 {
 
 // The call-site spelling, which always carried its element, has to keep
 // producing exactly the same channel.
-async fn buffered_strings_explicit(count: i64) -> String {
+fn buffered_strings_explicit(count: i64) -> String {
     let ch = Channel<String>::new();
     let mut i = 0;
     while i < count {
@@ -135,7 +135,7 @@ async fn buffered_strings_explicit(count: i64) -> String {
 // the annotation exactly as it does for `new`. The capacity is larger than
 // `count` on purpose — a send that blocks would order this differently and the
 // point here is the buffer's contents, not its back pressure.
-async fn buffered_strings_bounded(count: i64) -> String {
+fn buffered_strings_bounded(count: i64) -> String {
     let ch: Channel<String> = Channel::with_capacity(64);
     let mut i = 0;
     while i < count {
@@ -173,11 +173,11 @@ async fn consume(ch: Channel<String>, count: i64) -> String {
 }
 
 async fn main() {
-    println(await buffered_strings(4));
-    println(await buffered_notes(4));
-    println((await buffered_numbers(5)).toString());
-    println(await buffered_strings_explicit(4));
-    println(await buffered_strings_bounded(4));
+    println(buffered_strings(4));
+    println(buffered_notes(4));
+    println((buffered_numbers(5)).toString());
+    println(buffered_strings_explicit(4));
+    println(buffered_strings_bounded(4));
 
     let ch: Channel<String> = Channel::new();
     ch.send("a");

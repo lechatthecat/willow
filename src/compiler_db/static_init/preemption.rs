@@ -362,11 +362,17 @@ impl StaticInitQueries {
                     )
                     .with_label(Label::primary(
                         span,
-                        "this task reaches an unproven synchronous call",
+                        if unknown[node] {
+                            "this task reaches an unproven synchronous call"
+                        } else {
+                            "this target cannot preempt synchronous loops or recursion"
+                        },
                     ))
-                    .with_help(
-                        "use a callable with an analyzed body and a resolved dispatch target set",
-                    )
+                    .with_help(if unknown[node] {
+                        "use a callable with an analyzed body and a resolved dispatch target set"
+                    } else {
+                        crate::semantic::concurrency::NONPREEMPTIBLE_HELP
+                    })
                     .with_note(format!("unproven call in `{witness}`")),
                 )
             })
@@ -488,6 +494,48 @@ mod tests {
                     "native={native}: {errors:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a9_diagnostic_remedies_match_the_remaining_obligation() {
+        // Indirect dispatch reaches the build-wide proof on both capabilities.
+        let source = "fn looped(x:i64)->i64 {let mut n=0;while n<x{n=n+1;}return n;} fn apply(f:fn(i64)->i64)->i64{return f(42);} async fn main(){println(apply(looped));}";
+        assert!(errors(source, true).is_empty());
+        let diagnostics = errors(source, false);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|e| e.code == ErrorCode::E0810)
+            .unwrap();
+        assert!(
+            diagnostic
+                .message
+                .contains("requires native sync-stack preemption")
+        );
+        assert!(
+            diagnostic.labels[0]
+                .message
+                .contains("this target cannot preempt")
+        );
+        assert_eq!(
+            diagnostic.helps,
+            [crate::semantic::concurrency::NONPREEMPTIBLE_HELP]
+        );
+        for native in [false, true] {
+            let diagnostics = errors(
+                "async fn run(f:fn(i64)->i64)->i64{return f(1);} fn main(){}",
+                native,
+            );
+            let diagnostic = diagnostics
+                .iter()
+                .find(|e| e.code == ErrorCode::E0810)
+                .unwrap();
+            assert!(diagnostic.message.contains("unresolved call target"));
+            assert_eq!(
+                diagnostic.helps,
+                ["use a callable with an analyzed body and a resolved dispatch target set"]
+            );
+            assert!(diagnostic.notes.iter().all(|n| !n.contains("temporary")));
         }
     }
 

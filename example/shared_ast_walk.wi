@@ -15,8 +15,8 @@
 //   * `wrapper` binds a local with the same name as the looping top-level
 //     `looper` and calls it. That is an indirect call through a function value,
 //     not a static edge, so `wrapper` is preemptible and `task` may call it. A
-//     call graph that missed the shadowing rule would reject this file with
-//     E0810 instead of compiling it.
+//     call graph must preserve that distinction even though native sync-stack
+//     targets now also allow the top-level looping helper.
 //
 // Building this with WILLOW_PANIC_EFFECTS=0 turns the summary off and restores
 // the unconditional checks; it must print exactly the same thing.
@@ -185,8 +185,8 @@ fn run_control() {
 
 // ── The shadowing rule, proved by compiling ──
 
-// Never called from a task: it loops, so a call from any async context is a
-// real E0810. It exists to be the name `wrapper` shadows.
+// A synchronous looping helper, callable from tasks on supported targets.
+// It exists to be the name `wrapper` shadows.
 fn looper(n: i64) -> i64 {
     let mut total = 0;
     let mut i = 0;

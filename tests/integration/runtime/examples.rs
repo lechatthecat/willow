@@ -880,6 +880,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         // The recursive helpers the example documents are deliberately not
         // called from its async `main` — that is the point of the example.
         ("example/task_recursion_rejected.wi", "55\n610\n1000\n"),
+        ("example/task_aware_imported_helper.wi", "4950\n"),
         ("example/task_fan_in.wi", "125250\n9\n900\ntrue\n11\n"),
         (
             "example/collections_display.wi",
@@ -1648,5 +1649,31 @@ fn test_async_scalar_reference_catalog_entries() {
         let (out, ok) = compile_file_and_run(path);
         assert!(ok, "{path}: {out}");
         assert_eq!(out, *expected, "{path}");
+    }
+}
+
+// Stage G: run only the examples restored from the general E0810 workaround.
+#[test]
+fn a9_restored_sync_helper_examples() {
+    let restored = [
+        "example/parallel_tasks.wi",
+        "example/task_recursion_rejected.wi",
+        "example/task_aware_imported_helper.wi",
+        "example/lir_atomics.wi",
+        "example/lir_class_methods.wi",
+        "example/lir_parallel_map.wi",
+        "example/channel_element_inference.wi",
+        "example/shared_effect_fixpoint.wi",
+        "example/shared_ast_walk.wi",
+    ];
+    for path in restored {
+        let expected = runnable_example_cases()
+            .iter()
+            .find(|(p, _)| *p == path)
+            .unwrap()
+            .1;
+        let (out, ok) = compile_file_and_run(path);
+        assert!(ok, "{path}: {out}");
+        assert_eq!(out, expected, "{path}");
     }
 }

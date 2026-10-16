@@ -57,9 +57,8 @@ fn computed_operand() -> i64 {
 }
 
 // The only path to the cells is through the object, so they survive the
-// allocations in this loop only if the collector traces the fields. Async
-// because a synchronous loop cannot be called from a task (E0810).
-async fn through_fields() -> i64 {
+// allocations in this synchronous loop only if the collector traces the fields.
+fn through_fields() -> i64 {
     let m = new Meter(AtomicI64::new(0), AtomicBool::new(false));
     let mut i = 0;
     while i < 16 {
@@ -72,7 +71,7 @@ async fn through_fields() -> i64 {
     return m.hits.load();             // 48
 }
 
-async fn in_an_array() -> i64 {
+fn in_an_array() -> i64 {
     let cells: Array<AtomicI64> = [AtomicI64::new(1), AtomicI64::new(2)];
     let mut i = 0;
     while i < cells.len() {
@@ -101,8 +100,8 @@ async fn tick(c: AtomicI64, times: i64, done: AtomicBool) -> i64 {
 async fn main() {
     println(previous_values());       // 12
     println(computed_operand());      // 19
-    println(await through_fields());  // true, then 48
-    println(await in_an_array());     // 11 + 12 = 23
+    println(through_fields());        // true, then 48
+    println(in_an_array());           // 11 + 12 = 23
 
     let handed = fresh(7);
     bump(handed, 5);

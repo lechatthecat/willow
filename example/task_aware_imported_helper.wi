@@ -1,0 +1,6 @@
+// Imported synchronous loops are preemptible on supported targets.
+import task_aware_imported_helper_support::work::sum;
+
+async fn main() {
+    println(sum(100));
+}

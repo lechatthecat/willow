@@ -722,7 +722,7 @@ async fn main() {
             "error[E0810]",
             "sync helper `heavy` with a loop is not preemptible in task context",
             "this call can monopolize the scheduler worker",
-            "help: make the helper async, or wait for task-aware sync-stack preemption support",
+            "help: make the helper async, or use a target with task-aware sync-stack preemption",
         ],
     );
 }

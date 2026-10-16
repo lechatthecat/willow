@@ -182,7 +182,7 @@ async fn main() {
         "sync helper `worker::heavy` with a loop is not preemptible in task context",
         // Cross-module helper described via a note, not a secondary source label.
         "imported module `worker`",
-        "help: make the helper async, or wait for task-aware sync-stack preemption support",
+        "help: make the helper async, or use a target with task-aware sync-stack preemption",
     ] {
         assert!(
             stderr.contains(expected),
