@@ -1426,3 +1426,51 @@ fn block_arm_control_enum_payload_repro() {
     );
     assert!(!stderr.contains("error[E1201]"), "{stderr}");
 }
+
+#[test]
+fn jz15_86_missing_constructor_check_has_one_help_and_no_arity_cascade() {
+    for imported in [false, true] {
+        let base = "open class Base { pub x: i64; pub init(self) { self.x = 42; } }";
+        let main = format!(
+            "{} open class Missing extends {}Base {{}}
+             class Leaf extends Missing {{ pub init(self) {{ super.init(); }} }}
+             fn main() {{ let x = new Missing(); }}",
+            if imported { "import base;" } else { base },
+            if imported { "base::" } else { "" },
+        );
+        let base_module = format!("module base; pub {base}");
+        let project = TestProject::new("jz15_86", &[("main.wi", &main), ("base.wi", &base_module)]);
+        let output = project.check("main.wi");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert_eq!(stderr.matches("error[E0848]").count(), 1, "{stderr}");
+        assert_eq!(
+            stderr.matches("help: declare `init(self, ...)`").count(),
+            1,
+            "{stderr}"
+        );
+        assert!(!stderr.contains("argument(s)"), "{stderr}");
+        assert_eq!(stderr.matches("error[").count(), 1, "{stderr}");
+    }
+}
+
+#[test]
+fn jz15_86_misplaced_import_check_has_actionable_help() {
+    let project = TestProject::new(
+        "jz15_86_import",
+        &[(
+            "main.wi",
+            "class C {} import std::io::println; fn main() {}",
+        )],
+    );
+    let output = project.check("main.wi");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("imports must appear before"), "{stderr}");
+    assert_eq!(
+        stderr.matches("help: move this import").count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("error[").count(), 1, "{stderr}");
+}

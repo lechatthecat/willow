@@ -599,7 +599,14 @@ impl TypeChecker {
                 ci.param_infos
             }
             None => {
-                let fields = self.implicit_constructor_field_infos(&base_name);
+                let Some(fields) = self.implicit_constructor_field_infos(&base_name) else {
+                    // E0848 owns the missing initializer. Keep independent
+                    // argument diagnostics without inventing a signature.
+                    for arg in &s.args {
+                        self.check_expr(&arg.expr);
+                    }
+                    return;
+                };
                 self.check_implicit_constructor_field_visibility(&fields, &s.args, s.span);
                 let params = fields
                     .iter()
@@ -791,7 +798,12 @@ impl TypeChecker {
                 ci.param_infos.clone()
             }
             None => {
-                let fields = self.implicit_constructor_field_infos(&resolved);
+                let Some(fields) = self.implicit_constructor_field_infos(&resolved) else {
+                    for arg in &n.args {
+                        self.check_expr(&arg.expr);
+                    }
+                    return Type::Named(resolved);
+                };
                 self.check_implicit_constructor_field_visibility(&fields, &n.args, n.span);
                 // A memberwise constructor stores every field by value: there is
                 // no declaration that could mark one `&`/`&mut`.

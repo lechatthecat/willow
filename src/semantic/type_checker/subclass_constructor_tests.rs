@@ -43,6 +43,7 @@ fn subclass_constructor_visibility_and_arguments() {
             );
             let errors = check(&src, false);
             assert_eq!(missing(&errors), 1, "{visibility}: {body}: {errors:?}");
+            assert_eq!(errors.len(), 1, "{visibility}: {body}: {errors:?}");
             let d = errors
                 .iter()
                 .find(|d| d.message.contains("must declare `init`"))
@@ -105,4 +106,98 @@ fn subclass_constructor_cycle_keeps_primary_diagnostic() {
     );
     assert_eq!(missing(&errors), 0, "{errors:?}");
     assert!(errors.iter().any(|d| d.code == ErrorCode::E0426));
+}
+
+#[test]
+fn subclass_constructor_recovery_delegation_and_descendants() {
+    for arg in ["", "1", "true", "1, 2", "&value"] {
+        let errors = check(
+            &format!(
+                "open class Base {{ pub x: i64; pub init(self) {{ self.x = 1; }} }}
+             open class Missing extends Base {{}}
+             open class Middle extends Missing {{}}
+             class Leaf extends Middle {{ pub init(self, value: i64) {{ super.init({arg}); }} }}
+             fn main() {{ let value = 1; let a = new Missing({arg}); let b = new Middle({arg}); }}"
+            ),
+            false,
+        );
+        assert_eq!(missing(&errors), 1, "{errors:?}");
+        assert_eq!(errors.len(), 1, "{arg}: {errors:?}");
+    }
+}
+
+#[test]
+fn subclass_constructor_recovery_keeps_independent_errors() {
+    let errors = check(
+        "open class Base { pub x: i64; pub init(self) { self.x = 1; } }
+         open class Missing extends Base {}
+         class Leaf extends Missing { pub init(self) { super.init(unknown_super); } }
+         fn main() { let x = new Missing(unknown_new); let y: bool = x; }",
+        false,
+    );
+    assert_eq!(missing(&errors), 1, "{errors:?}");
+    for name in ["unknown_super", "unknown_new"] {
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.code == ErrorCode::E0350 && d.message.contains(name)),
+            "{errors:?}"
+        );
+    }
+    assert!(
+        errors.iter().any(|d| d.message.contains("expected `bool`")),
+        "{errors:?}"
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|d| d.code == ErrorCode::E0845 || d.message.contains("argument(s)")),
+        "{errors:?}"
+    );
+}
+
+thread_local! {
+    pub(super) static FIELD_CHAIN_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[test]
+fn subclass_constructor_recovery_counts_existing_field_walk() {
+    for depth in [1, 8, 32] {
+        for calls in [1, 8, 32] {
+            let mut src = String::from("open class C0 { pub init(self) {} }");
+            for i in 1..=depth {
+                src.push_str(&format!("open class C{i} extends C{} {{}}", i - 1));
+            }
+            src.push_str("fn main() {");
+            for i in 0..calls {
+                src.push_str(&format!("let c{i} = new C{depth}();"));
+            }
+            src.push('}');
+            FIELD_CHAIN_VISITS.with(|n| n.set(0));
+            let errors = check(&src, false);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            let visits = FIELD_CHAIN_VISITS.with(|n| n.get());
+            assert_eq!(visits, calls * (depth + 1));
+            eprintln!(
+                "constructor recovery depth={depth} calls={calls} field_walk_visits={visits}"
+            );
+        }
+    }
+}
+
+#[test]
+fn subclass_constructor_recovery_preserves_real_arity_errors() {
+    for src in [
+        "class C { pub x: i64; } fn main() { let c = new C(); }",
+        "class C { pub init(self, x: i64) {} } fn main() { let c = new C(); }",
+        "open class B { pub x: i64; } class C extends B { pub init(self) { super.init(); } } fn main() {}",
+        "open class B { pub init(self, x: i64) {} } class C extends B { pub init(self) { super.init(); } } fn main() {}",
+    ] {
+        let errors = check(src, false);
+        assert!(
+            errors.iter().any(|d| d.message.contains("argument(s)")),
+            "{errors:?}"
+        );
+        assert_eq!(missing(&errors), 0, "{errors:?}");
+    }
 }

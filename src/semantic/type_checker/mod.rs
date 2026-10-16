@@ -834,10 +834,12 @@ impl TypeChecker {
         None
     }
 
+    /// No memberwise signature exists when an ancestor declares `init`: an
+    /// intermediate subclass must supply its own initializer (E0848).
     fn implicit_constructor_field_infos(
         &self,
         class_name: &str,
-    ) -> Vec<(String, String, FieldInfo)> {
+    ) -> Option<Vec<(String, String, FieldInfo)>> {
         let mut chain = Vec::new();
         let mut current = Some(class_name.to_string());
         let mut seen = HashSet::new();
@@ -848,6 +850,11 @@ impl TypeChecker {
             let Some(class) = self.symbols.lookup_class(&name) else {
                 break;
             };
+            #[cfg(test)]
+            subclass_constructor_tests::FIELD_CHAIN_VISITS.with(|n| n.set(n.get() + 1));
+            if class.constructor.is_some() {
+                return None;
+            }
             let class_fields = class
                 .instance_field_order
                 .iter()
@@ -872,7 +879,7 @@ impl TypeChecker {
                 }
             }
         }
-        fields
+        Some(fields)
     }
 
     /// Element type `T` of a `Channel<T>` used in a select case, or `Void` with a
