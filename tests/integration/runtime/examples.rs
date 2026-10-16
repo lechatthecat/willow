@@ -402,6 +402,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/async_scalar_reference.wi",
             "42\n2.5\ntrue\n43\n4.25\nfalse\n",
         ),
+        (
+            "example/async_string_reference.wi",
+            "moved string\nmoved string\nreplacement\nold alias\n",
+        ),
         ("example/stable_borrowed_scalars.wi", "42\n4.25\ntrue\n"),
         ("example/generic_import_usage.wi", "7\n7\n7\n"),
         ("example/mutable_captures.wi", "2\n"),

@@ -1530,6 +1530,7 @@ impl TypeChecker {
         method_name: &str,
         args: &[CallArg],
         span: Span,
+        virtual_dispatch: bool,
     ) -> Type {
         if *obj_ty == Type::String {
             let params: Option<&[Type]> = match method_name {
@@ -1791,7 +1792,13 @@ impl TypeChecker {
                     );
                 }
                 self.check_call_args_against_param_infos(&mi.param_infos, args);
-                self.check_async_call_captures(&mi.param_infos, args, mi.is_async);
+                let retains = mi.is_async
+                    || (virtual_dispatch
+                        && matches!(&mi.return_type, Type::Generic(name, _) if name == "Task")
+                        && self
+                            .symbols
+                            .dispatch_may_start_task(&class_name, method_name));
+                self.check_async_call_captures(&mi.param_infos, args, retains);
                 method_call_return_type(&mi)
             }
         }
@@ -1889,6 +1896,11 @@ impl TypeChecker {
         // Two `&mut` arguments naming the same place alias through the call,
         // exactly as they would on a direct call.
         self.check_mut_reference_aliases(&m.param_infos, args);
+        let retains = matches!(&m.return_type, Type::Generic(name, _) if name == "Task")
+            && self
+                .symbols
+                .dispatch_may_start_task(&iface.name, method_name);
+        self.check_async_call_captures(&m.param_infos, args, retains);
         m.return_type.clone()
     }
 

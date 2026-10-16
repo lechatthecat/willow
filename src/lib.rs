@@ -1571,6 +1571,35 @@ fn check_unit_concurrency(
     if let Some((_, target)) = local_helpers {
         analyzer = analyzer.with_sync_stack_preemption(target.sync_stack_preemption);
     }
+    // Class references borrow the variable slot; interfaces/enums remain gated.
+    for (id, spellings) in &bindings.imported {
+        for item in &modules[*id].program.items {
+            if let parser::ast::Item::Class(class) = item {
+                for access in spellings {
+                    analyzer = analyzer.with_reference_class(format!("{access}::{}", class.name));
+                }
+            }
+        }
+    }
+    let mut reference_classes = std::collections::HashMap::new();
+    for &(local, path, item, _) in &bindings.items {
+        if let Some(&id) = by_path.get(path) {
+            let classes = reference_classes.entry(id).or_insert_with(|| {
+                modules[id]
+                    .program
+                    .items
+                    .iter()
+                    .filter_map(|decl| match decl {
+                        parser::ast::Item::Class(class) => Some(class.name.as_str()),
+                        _ => None,
+                    })
+                    .collect::<std::collections::HashSet<_>>()
+            });
+            if classes.contains(item) {
+                analyzer = analyzer.with_reference_class(local.to_owned());
+            }
+        }
+    }
     // Retain one borrowed summary for each source binding for the analyzer run.
     let mut held = Vec::new();
     for (id, spellings) in &bindings.imported {

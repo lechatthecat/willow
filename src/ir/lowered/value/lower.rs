@@ -1137,6 +1137,7 @@ fn lower(
                 LirRvalue::StaticCall {
                     class: *class,
                     method: method.clone(),
+                    is_async: false,
                     args: args
                         .iter()
                         .map(|arg| values[&std::ptr::from_ref(arg)].clone())
@@ -1358,6 +1359,8 @@ fn lower(
                         receiver,
                         receiver_ty: object.ty.clone(),
                         method: method.clone(),
+                        // Filled in the common final call walk below.
+                        is_async: false,
                         args: operands,
                         arg_types,
                         result: node.ty.clone(),
@@ -1621,6 +1624,25 @@ pub(in crate::ir::lowered) fn lower_calls(
             ),
         );
     }
+    let mut method_effects = HashMap::new();
+    // Index descendants once, then resolve only virtual effects actually queried.
+    let mut children: HashMap<TypeId, Vec<TypeId>> = HashMap::new();
+    for (&class, info) in &resolution.classes {
+        if let Some(base) = info.base {
+            children.entry(base).or_default().push(class);
+        }
+        for implemented in &info.implements {
+            if let Type::Named(interface) | Type::Generic(interface, _) = implemented {
+                children.entry(*interface).or_default().push(class);
+            }
+        }
+    }
+    for (&interface, info) in &resolution.interfaces {
+        for &base in &info.extends {
+            children.entry(base).or_default().push(interface);
+        }
+    }
+    let mut dispatch_effects = HashMap::new();
     let mut pending: Vec<_> = functions
         .iter_mut()
         .chain(lambdas.iter_mut().map(|lambda| &mut lambda.function))
@@ -1629,6 +1651,60 @@ pub(in crate::ir::lowered) fn lower_calls(
         lower_blocks_with(&mut f.blocks, &mut f.locals, &callables, f.is_async);
         for block in &mut f.blocks {
             for inst in &mut block.instrs {
+                if let SourceInst::Compute {
+                    value:
+                        LirRvalue::MethodCall {
+                            receiver_ty,
+                            method,
+                            is_async,
+                            super_class,
+                            result,
+                            ..
+                        },
+                    ..
+                } = inst
+                {
+                    let receiver = super_class.map(Type::Named);
+                    let receiver = receiver.as_ref().unwrap_or(receiver_ty);
+                    *is_async = super::super::method_is_async(
+                        resolution,
+                        receiver,
+                        method,
+                        &mut method_effects,
+                    ) || (super_class.is_none()
+                        && matches!(result, Type::Generic(name, _) if *name == TypeId::local("Task"))
+                        && matches!(receiver, Type::Named(class) | Type::Generic(class, _)
+                        if super::super::dispatch_may_start_task(
+                            resolution, &children, *class, method.as_str(), &mut dispatch_effects, &mut method_effects,
+                        )));
+                }
+                if let SourceInst::Compute {
+                    value:
+                        LirRvalue::StaticCall {
+                            class,
+                            method,
+                            is_async,
+                            ..
+                        },
+                    ..
+                } = inst
+                {
+                    *is_async = resolution
+                        .modules
+                        .get(class)
+                        .and_then(|module| module.get(method))
+                        .map_or_else(
+                            || {
+                                super::super::method_is_async(
+                                    resolution,
+                                    &Type::Named(*class),
+                                    method,
+                                    &mut method_effects,
+                                )
+                            },
+                            |signature| signature.is_async,
+                        );
+                }
                 if let SourceInst::Defer { body, .. } = inst {
                     pending.push(&mut body.function);
                 }

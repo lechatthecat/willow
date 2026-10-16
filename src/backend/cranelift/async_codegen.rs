@@ -2679,6 +2679,59 @@ mod task_boundary_callback_tests {
     }
 
     #[test]
+    fn async_gc_reference_frame_scaling() {
+        for ty in ["String", "Array<String>", "Box"] {
+            let import = if ty.starts_with("Array") {
+                "import std::collections::Array;"
+            } else {
+                ""
+            };
+            for mode in ["&", "&mut"] {
+                for count in [1, 8, 64, 128] {
+                    let params = (0..count)
+                        .map(|i| format!("p{i}: {mode} {ty}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let source = format!(
+                        "{import} class Box {{ pub value: String; }} async fn read({params}) {{ await sleep(1); }}"
+                    );
+                    let (lir, layout, offsets) = print_frame_layout(&source);
+                    let parameters: Vec<_> =
+                        lir.locals.iter().filter(|local| local.parameter).collect();
+                    assert_eq!(parameters.len(), count);
+                    for (i, local) in parameters.iter().enumerate() {
+                        assert_eq!(
+                            local.storage_kind,
+                            crate::ir::lowered::LirStorageKind::ReferenceCell
+                        );
+                        assert_eq!(offsets[&local.id], async_frame_slot_offset(2 * i, 8));
+                        assert!(layout.slot_is_gc_ref(2 * i));
+                        assert!(!layout.slot_is_gc_ref(2 * i + 1));
+                    }
+                    assert_eq!(
+                        layout
+                            .slots
+                            .iter()
+                            .filter(|slot| slot.storage_kind
+                                == crate::ir::lowered::LirStorageKind::ReferenceCell)
+                            .count(),
+                        count
+                    );
+                    println!(
+                        "type={ty} mode={mode} references={count} parameter_words={} traced_owners={count}",
+                        2 * count
+                    );
+                    let encoded = serde_json::to_vec(&lir).unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<LirFunction>(&encoded).unwrap(),
+                        lir
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn scalar_pair_send_scratch_grows_once_per_send_site() {
         for count in [1, 16, 128] {
             let mut source =

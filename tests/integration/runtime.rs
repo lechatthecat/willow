@@ -120,3 +120,6 @@ mod async_scalar_references;
 
 #[path = "runtime/async_borrow_migration.rs"]
 mod async_borrow_migration;
+
+#[path = "runtime/async_gc_references.rs"]
+mod async_gc_references;

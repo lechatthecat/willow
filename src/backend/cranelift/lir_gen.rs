@@ -7444,6 +7444,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 args,
                 arg_types,
                 result,
+                ..
             } => {
                 // The relocatable operand roots stay valid: on every static
                 // call path the operands reach the callee without an
@@ -9209,7 +9210,7 @@ fn flat_rvalue_supported(
             let Some((_, params)) = params.split_first() else { return false; };
             **result == Type::Void && params.len() == arg_types.len() && params.iter().zip(arg_types).all(|(param, arg)| ctx.supported_type(param) && ctx.same_repr(param, arg))
         }
-        V::StaticCall { class, method, args, arg_types, result } => {
+        V::StaticCall { class, method, args, arg_types, result, .. } => {
             if args.iter().any(|arg| matches!(arg, crate::ir::lowered::LirOperand::Reference { .. })) { flat_static_reference_call_supported(&class.to_string(), method, args, arg_types, result, ctx) }
             else { flat_static_call_supported(&class.to_string(), method, arg_types, result, ctx) }
         },
@@ -10297,6 +10298,7 @@ mod tests {
                     receiver: O::Int(0),
                     receiver_ty: point.clone(),
                     method: "get".into(),
+                    is_async: false,
                     args: vec![],
                     arg_types: vec![],
                     result: Type::String,

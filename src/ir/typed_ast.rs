@@ -35,6 +35,9 @@ pub struct HirResolution {
     pub classes: std::collections::HashMap<TypeId, HirClassInfo>,
     pub interfaces: std::collections::HashMap<TypeId, HirInterfaceInfo>,
     pub functions: std::collections::HashMap<FunctionId, HirSignature>,
+    /// Exported interfaces/open classes may acquire async implementations in
+    /// importing units absent from this unit's declaration snapshot.
+    pub open_dispatch_types: std::collections::HashSet<TypeId>,
     /// Unit access spelling to canonical builtin namespace; user imports win
     /// over a canonical spelling without displacing an explicit std alias.
     pub namespaces: std::collections::HashMap<TypeId, String>,

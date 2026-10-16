@@ -1,4 +1,5 @@
 mod method_owners;
+mod task_dispatch;
 
 use crate::diagnostics::Span;
 use crate::module::ModuleId;
@@ -13,6 +14,7 @@ pub(crate) enum SymbolRead {
     Function(String),
     Class(String),
     MethodOwner(String, String),
+    TaskDispatch(String, String),
     Enum(String),
     EnumBare(String),
     Interface(String),
@@ -361,6 +363,8 @@ pub struct SymbolTable {
     #[serde(skip)]
     method_owners: Rc<std::cell::RefCell<method_owners::MethodOwners>>,
     #[serde(skip)]
+    task_dispatch: Rc<std::cell::RefCell<task_dispatch::TaskDispatch>>,
+    #[serde(skip)]
     bare_enum_names: Rc<std::cell::RefCell<Option<std::collections::HashSet<String>>>>,
     #[serde(with = "declaration_rc")]
     declarations: Rc<DeclarationSymbols>,
@@ -377,6 +381,7 @@ impl std::ops::DerefMut for SymbolTable {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.bare_enum_names = Default::default();
         self.method_owners = Default::default();
+        self.task_dispatch = Default::default();
         Rc::make_mut(&mut self.declarations)
     }
 }
@@ -407,6 +412,9 @@ impl SymbolTable {
             SymbolRead::MethodOwner(class, method) => {
                 serde_json::to_value(self.resolved_method_class(class, method))
             }
+            SymbolRead::TaskDispatch(class, method) => {
+                serde_json::to_value(self.dispatch_may_start_task(class, method))
+            }
             SymbolRead::Enum(name) => serde_json::to_value(self.lookup_enum(name)),
             SymbolRead::EnumBare(name) => serde_json::to_value(self.enum_nameable_bare(name)),
             SymbolRead::Interface(name) => serde_json::to_value(self.lookup_interface(name)),
@@ -426,6 +434,7 @@ impl SymbolTable {
             scopes: Default::default(),
             bare_enum_names: Rc::clone(&self.bare_enum_names),
             method_owners: Rc::clone(&self.method_owners),
+            task_dispatch: Rc::clone(&self.task_dispatch),
             declarations: Rc::clone(&self.declarations),
         }
     }
@@ -437,6 +446,7 @@ impl SymbolTable {
             scopes: Default::default(),
             bare_enum_names: Default::default(),
             method_owners: Default::default(),
+            task_dispatch: Default::default(),
             declarations: Rc::new(DeclarationSymbols {
                 modules: self
                     .modules

@@ -565,11 +565,10 @@ async fn main() {
 }
 
 #[test]
-fn test_async_mut_nonscalar_reference_parameter_reports_e1707() {
+fn test_async_mut_function_pointer_reference_parameter_reports_e1707() {
     assert_compile_error_contains(
         r#"
-async fn update(x: &mut String) {
-    x = "updated";
+async fn update(x: &mut fn(i64) -> i64) {
 }
 
 fn main() {
@@ -585,11 +584,10 @@ fn main() {
 }
 
 #[test]
-fn test_async_nonscalar_reference_parameter_reports_e1707() {
+fn test_async_function_pointer_reference_parameter_reports_e1707() {
     assert_compile_error_contains(
         r#"
-async fn read(x: & String) -> String {
-    return x;
+async fn read(x: & fn(i64) -> i64) {
 }
 
 fn main() {

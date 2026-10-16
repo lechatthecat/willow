@@ -68,7 +68,8 @@ impl TypeChecker {
     }
 
     /// Check value sharing and record reference retention for resolved calls.
-    /// Only async callees retain reference arguments after this call returns.
+    /// A call that may dispatch to an async callee retains reference arguments
+    /// after returning, even when its static declaration is synchronous.
     /// A synchronous function may return an independent Task without borrowing
     /// its caller's storage for the lifetime of that Task.
     pub(super) fn check_async_call_captures(

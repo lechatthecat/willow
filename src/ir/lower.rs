@@ -3332,6 +3332,9 @@ pub(crate) fn lower_resolution(
                 );
             }
             Item::Class(c) => {
+                if c.public && c.is_open {
+                    out.open_dispatch_types.insert(canonical(&c.name));
+                }
                 let mut info = HirClassInfo {
                     implements: c
                         .implements
@@ -3373,6 +3376,9 @@ pub(crate) fn lower_resolution(
                 out.classes.insert(canonical(&c.name), info);
             }
             Item::Interface(interface) => {
+                if interface.public {
+                    out.open_dispatch_types.insert(canonical(&interface.name));
+                }
                 out.interfaces.insert(
                     canonical(&interface.name),
                     HirInterfaceInfo {
@@ -3520,6 +3526,11 @@ pub(crate) fn lower_resolution(
             );
         }
         for (key, interface) in &symbols.interfaces {
+            if interface.public {
+                out.open_dispatch_types.insert(*key);
+                out.open_dispatch_types
+                    .insert(TypeId::from_source_name(&interface.name));
+            }
             insert_declared(
                 &mut out.interfaces,
                 key,
@@ -3561,6 +3572,11 @@ pub(crate) fn lower_resolution(
             );
         }
         for (key, class) in &symbols.classes {
+            if class.public && class.is_open {
+                out.open_dispatch_types.insert(*key);
+                out.open_dispatch_types
+                    .insert(TypeId::from_source_name(&class.name));
+            }
             insert_declared(
                 &mut out.classes,
                 key,

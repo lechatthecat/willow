@@ -178,6 +178,7 @@ pub enum LirRvalue {
     StaticCall {
         class: TypeId,
         method: String,
+        is_async: bool,
         args: Vec<LirOperand>,
         arg_types: Vec<Type>,
         result: Type,
@@ -253,6 +254,9 @@ pub enum LirRvalue {
         receiver: LirOperand,
         receiver_ty: Type,
         method: String,
+        /// Can dispatch to an async declaration (including an override).
+        /// A synchronous Task-returning method alone does not set this bit.
+        is_async: bool,
         args: Vec<LirOperand>,
         arg_types: Vec<Type>,
         result: Type,

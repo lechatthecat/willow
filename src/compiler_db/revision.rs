@@ -828,6 +828,70 @@ mod tests {
     }
 
     #[test]
+    fn revision_importer_async_dispatch_matches_cold() {
+        for interface in [false, true] {
+            let f = Fixture::new();
+            let mut warm = AnalysisRevision::default();
+            for (asynchronous, joined) in [
+                (false, true),
+                (true, true),
+                (true, false),
+                (false, false),
+                (false, true),
+            ] {
+                let declaration = if interface {
+                    "pub interface Reading extends Sync { fn read(self, x: &mut String) -> Task<String>; }"
+                } else {
+                    "pub open class Reading { pub open fn read(self, x: &mut String) -> Task<String> { return value(); } }"
+                };
+                let join = if joined { "await task;" } else { "" };
+                f.write("api.wi", &format!("module api; async fn value() -> String {{ return \"v\"; }} {declaration} pub async fn use_reader(reader: Reading) {{ let mut text = \"local\"; let task = reader.read(&text); {join} }}"));
+                let relation = if interface { "implements" } else { "extends" };
+                let modifier = if interface { "" } else { "override" };
+                let method = if asynchronous {
+                    "async fn read(self, x: &mut String) -> String { return x; }"
+                } else {
+                    "fn read(self, x: &mut String) -> Task<String> { return value(); }"
+                };
+                f.write("main.wi", &format!("import api::Reading; import api::use_reader; async fn value() -> String {{ return \"v\"; }} class Reader {relation} Reading {{ pub {modifier} {method} }} async fn main() {{ await use_reader(new Reader()); }}"));
+                assert_eq!(
+                    f.compare(&mut warm),
+                    joined,
+                    "interface={interface} async={asynchronous} joined={joined}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn revision_async_dispatch_capture_edits_match_cold() {
+        for interface in [false, true] {
+            let f = Fixture::new();
+            let mut warm = AnalysisRevision::default();
+            for asynchronous in [false, true, false, true] {
+                let declaration = if interface {
+                    "interface Base extends Sync { fn read(self, x: &mut String) -> Task<String>; }"
+                } else {
+                    "open class Base { pub open fn read(self, x: &mut String) -> Task<String> { return value(); } }"
+                };
+                let relation = if interface { "implements" } else { "extends" };
+                let override_kw = if interface { "" } else { "override" };
+                let signature = if asynchronous {
+                    "async fn read(self, x: &mut String) -> String { return x; }"
+                } else {
+                    "fn read(self, x: &mut String) -> Task<String> { return value(); }"
+                };
+                f.write("main.wi", &format!("async fn value() -> String {{ return \"v\"; }} {declaration} class Child {relation} Base {{ pub {override_kw} {signature} }} fn use_base(c: Base) {{ let mut text = \"local\"; let task = c.read(&text); }} fn main() {{ use_base(new Child()); }}"));
+                assert_eq!(
+                    f.compare(&mut warm),
+                    !asynchronous,
+                    "interface={interface} async={asynchronous}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn revision_dispatch_override_edits_track_actual_body_consumers() {
         use super::super::{ids::BodyOwner, tracked::QueryNode};
         use crate::semantic::ids::{FunctionId, TypeId};

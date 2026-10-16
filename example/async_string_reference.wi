@@ -1,0 +1,33 @@
+import std::collections::Array;
+
+class Box {
+    pub value: String;
+}
+
+async fn update(text: &mut String) {
+    await sleep(1);
+    text = "moved " + "string";
+    gc_minor_collect();
+    await sleep(1);
+    gc_collect();
+}
+
+async fn replace(box: &mut Box) {
+    await sleep(1);
+    box = new Box("replacement");
+    gc_collect();
+}
+
+async fn main() {
+    let mut text = "original";
+    await update(&text);
+    println(text);
+    let values: Array<String> = ["element"];
+    await update(&values[0]);
+    println(values[0]);
+    let mut box = new Box("old alias");
+    let alias = box;
+    await replace(&box);
+    println(box.value);
+    println(alias.value);
+}

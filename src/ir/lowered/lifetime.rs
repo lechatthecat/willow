@@ -47,6 +47,39 @@ fn clear_function(function: &mut SourceFunction) -> Liveness {
         .copied()
         .collect();
     for instruction in function.blocks.iter().flat_map(|block| &block.instrs) {
+        // Address uses outlive the last direct value use. A child task owns
+        // the reference cell, not a copy of the value, so clearing this slot
+        // would change what it reads. Keep task-borrowed locals until lexical
+        // scope exit (E1708 requires borrowed tasks to discharge before then).
+        // Synchronous reference calls finish before their last-use clear and
+        // need no extension. Inspect the task's argument slice without making
+        // an operand vector for every computation.
+        if let SourceInst::Compute {
+            value:
+                super::LirRvalue::StartTask { args, .. }
+                | super::LirRvalue::MethodCall {
+                    args,
+                    is_async: true,
+                    ..
+                }
+                | super::LirRvalue::StaticCall {
+                    args,
+                    is_async: true,
+                    ..
+                },
+            ..
+        } = instruction
+        {
+            for operand in args {
+                if let super::LirOperand::Reference {
+                    place: super::LirPlace::Local(local),
+                    ..
+                } = operand
+                {
+                    captured.insert(*local);
+                }
+            }
+        }
         if let SourceInst::EnterDeferScope {
             lock: Some(slots), ..
         } = instruction
@@ -165,6 +198,278 @@ fn clear_function(function: &mut SourceFunction) -> Liveness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_method_effect_cache_scales_with_inherited_calls() {
+        use crate::ir::typed_ast::{HirClassInfo, HirResolution, HirSignature};
+        use crate::semantic::ids::{SemanticType as Type, TypeId};
+        for depth in [1, 8, 64, 128] {
+            let mut resolution = HirResolution::default();
+            let classes: Vec<_> = (0..depth).map(|i| TypeId::local(format!("C{i}"))).collect();
+            for (i, &class) in classes.iter().enumerate() {
+                let mut info = HirClassInfo::default();
+                if i == 0 {
+                    info.methods.insert(
+                        "read".into(),
+                        HirSignature {
+                            params: vec![],
+                            param_modes: vec![],
+                            return_type: Type::String,
+                            is_static: false,
+                            is_async: true,
+                        },
+                    );
+                } else {
+                    info.base = Some(classes[i - 1]);
+                }
+                resolution.classes.insert(class, info);
+            }
+            let mut cache = HashMap::new();
+            super::super::METHOD_EFFECT_PROBES.with(|count| count.set(0));
+            assert!(super::super::method_is_async(
+                &resolution,
+                &Type::Named(classes[depth - 1]),
+                "read",
+                &mut cache
+            ));
+            for _ in 0..8 {
+                for &class in &classes {
+                    assert!(super::super::method_is_async(
+                        &resolution,
+                        &Type::Named(class),
+                        "read",
+                        &mut cache
+                    ));
+                }
+            }
+            assert_eq!(cache.len(), depth);
+            let probes = super::super::METHOD_EFFECT_PROBES.with(|count| count.get());
+            assert_eq!(probes, 9 * depth);
+            println!(
+                "inheritance depth={depth} repeated calls={} cached pairs={} probes={probes}",
+                8 * depth,
+                cache.len()
+            );
+            for fan_out in [false, true] {
+                for async_leaf in [false, true] {
+                    let mut resolution = resolution.clone();
+                    resolution
+                        .classes
+                        .get_mut(&classes[0])
+                        .unwrap()
+                        .methods
+                        .get_mut("read")
+                        .unwrap()
+                        .is_async = false;
+                    if async_leaf {
+                        let mut signature = resolution.classes[&classes[0]].methods["read"].clone();
+                        signature.is_async = true;
+                        resolution
+                            .classes
+                            .get_mut(&classes[depth - 1])
+                            .unwrap()
+                            .methods
+                            .insert("read".into(), signature);
+                    }
+                    let mut children: HashMap<_, Vec<_>> = HashMap::new();
+                    for i in 1..depth {
+                        children
+                            .entry(classes[if fan_out { 0 } else { i - 1 }])
+                            .or_default()
+                            .push(classes[i]);
+                    }
+                    let mut effects = HashMap::new();
+                    let mut declarations = HashMap::new();
+                    super::super::DISPATCH_EFFECT_VISITS.with(|count| count.set(0));
+                    assert_eq!(
+                        super::super::dispatch_may_start_task(
+                            &resolution,
+                            &children,
+                            classes[0],
+                            "read",
+                            &mut effects,
+                            &mut declarations
+                        ),
+                        async_leaf
+                    );
+                    for _ in 0..8 {
+                        for &class in &classes {
+                            super::super::dispatch_may_start_task(
+                                &resolution,
+                                &children,
+                                class,
+                                "read",
+                                &mut effects,
+                                &mut declarations,
+                            );
+                        }
+                    }
+                    let visits = super::super::DISPATCH_EFFECT_VISITS.with(|count| count.get());
+                    assert_eq!(visits, depth);
+                    assert_eq!(effects.len(), depth);
+                    println!(
+                        "dispatch nodes={depth} fan_out={fan_out} async_leaf={async_leaf} repeated calls={} expanded pairs={visits}",
+                        8 * depth
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn async_method_gc_borrow_clear_counts() {
+        for flavor in [
+            "sync",
+            "async",
+            "sync_task",
+            "public_closed_task",
+            "public_open_task",
+        ] {
+            let asynchronous = flavor == "async";
+            for count in [1, 8, 64, 128] {
+                let modifier = if asynchronous { "async " } else { "" };
+                let return_ty = if flavor.ends_with("_task") {
+                    "Task<String>"
+                } else {
+                    "String"
+                };
+                let returned = if flavor.ends_with("_task") {
+                    "value(x)"
+                } else {
+                    "x"
+                };
+                let class_modifier = match flavor {
+                    "public_closed_task" => "pub ",
+                    "public_open_task" => "pub open ",
+                    _ => "",
+                };
+                let mut source = format!(
+                    "async fn value(x: String) -> String {{ return x; }} {class_modifier}class Reader {{ pub {modifier}fn read(self, x: &String) -> {return_ty} {{ return {returned}; }} }} async fn main() {{ let reader = new Reader();"
+                );
+                for i in 0..count {
+                    source.push_str(&format!(
+                        "let p{i}: String = \"value\"; let t{i} = reader.read(&p{i});"
+                    ));
+                }
+                for i in 0..count {
+                    let await_op = if flavor != "sync" { "await " } else { "" };
+                    source.push_str(&format!("let r{i} = {await_op}t{i}; println(r{i});"));
+                }
+                source.push('}');
+                let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+                let (ast, errors) = crate::parser::Parser::new(tokens).parse();
+                assert!(errors.is_empty(), "{errors:?}");
+                let (hir, errors) = crate::ir::lower::lower_program(&ast);
+                assert!(errors.is_empty(), "{errors:?}");
+                let program = super::super::lower_source_program(&hir);
+                let main = program
+                    .functions
+                    .iter()
+                    .find(|f| f.name.to_string() == "main")
+                    .unwrap();
+                let slots: HashSet<_> = main
+                    .locals
+                    .iter()
+                    .filter(|local| !local.synthetic && local.name.starts_with('p'))
+                    .map(|local| local.id)
+                    .collect();
+                assert_eq!(slots.len(), count);
+                let mut clears = HashMap::new();
+                for inst in main.blocks.iter().flat_map(|block| &block.instrs) {
+                    if let SourceInst::ClearScopeRoots { locals } = inst {
+                        for local in locals.iter().filter(|id| slots.contains(id)) {
+                            *clears.entry(*local).or_insert(0) += 1;
+                        }
+                    }
+                }
+                assert_eq!(clears.len(), count);
+                let expected = if asynchronous || flavor == "public_open_task" {
+                    1
+                } else {
+                    2
+                };
+                assert!(
+                    clears.values().all(|&n| n == expected),
+                    "async={asynchronous}: {clears:?}"
+                );
+                println!(
+                    "method={flavor} borrowed slots={count} clear stores={}",
+                    count * expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn async_borrowed_gc_slots_clear_only_at_lexical_exit() {
+        for count in [1, 8, 64, 128] {
+            let mut source = String::from(
+                "async fn read(x: &String) -> String { await sleep(1); return x; } async fn main() {",
+            );
+            for i in 0..count {
+                source.push_str(&format!(
+                    "let p{i}: String = \"value\"; let t{i} = read(&p{i});"
+                ));
+            }
+            for i in 0..count {
+                source.push_str(&format!("let r{i} = await t{i}; println(r{i});"));
+            }
+            source.push('}');
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (ast, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            let (hir, errors) = crate::ir::lower::lower_program(&ast);
+            assert!(errors.is_empty(), "{errors:?}");
+            let program = super::super::lower_source_program(&hir);
+            let main = program
+                .functions
+                .iter()
+                .find(|f| f.name.to_string() == "main")
+                .unwrap();
+            let slots: HashSet<_> = main
+                .locals
+                .iter()
+                .filter(|local| !local.synthetic && local.name.starts_with('p'))
+                .map(|local| local.id)
+                .collect();
+            assert_eq!(slots.len(), count);
+            let mut clears = HashMap::new();
+            for inst in main.blocks.iter().flat_map(|block| &block.instrs) {
+                if let SourceInst::ClearScopeRoots { locals } = inst {
+                    for local in locals.iter().filter(|id| slots.contains(id)) {
+                        *clears.entry(*local).or_insert(0) += 1;
+                    }
+                }
+            }
+            assert_eq!(clears.len(), count);
+            assert!(clears.values().all(|&count| count == 1), "{clears:?}");
+            println!("borrowed GC slots={count} lexical clears={count} premature clears=0");
+        }
+    }
+
+    #[test]
+    fn synchronous_gc_borrow_keeps_last_use_clearing() {
+        let source = "fn read(x: &String) -> String { return x; } async fn main() { let p: String = \"value\"; let r = read(&p); println(r); await sleep(1); }";
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (ast, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let (hir, errors) = crate::ir::lower::lower_program(&ast);
+        assert!(errors.is_empty(), "{errors:?}");
+        let program = super::super::lower_source_program(&hir);
+        let main = program
+            .functions
+            .iter()
+            .find(|f| f.name.to_string() == "main")
+            .unwrap();
+        let p = main
+            .locals
+            .iter()
+            .find(|local| local.name == "p")
+            .unwrap()
+            .id;
+        let clears = main.blocks.iter().flat_map(|block| &block.instrs).filter(|inst| matches!(inst, SourceInst::ClearScopeRoots { locals } if locals.contains(&p))).count();
+        assert_eq!(clears, 2, "synchronous call must not extend root lifetime");
+    }
 
     #[test]
     fn async_source_root_clear_count_scales_with_last_uses() {

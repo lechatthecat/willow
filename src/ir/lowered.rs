@@ -946,6 +946,118 @@ fn static_signature(
         .or_else(|| method_signature(resolution, &Type::Named(*class), method))
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static METHOD_EFFECT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DISPATCH_EFFECT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Resolve declaration effects once per (class, method), sharing inherited
+/// answers across call sites. Generic arguments cannot change this effect.
+fn method_is_async(
+    resolution: &super::typed_ast::HirResolution,
+    receiver: &Type,
+    method: &str,
+    cache: &mut std::collections::HashMap<FunctionId, bool>,
+) -> bool {
+    let (Type::Named(class) | Type::Generic(class, _)) = receiver else {
+        return false;
+    };
+    let mut class = *class;
+    let mut path = Vec::new();
+    let mut result = false;
+    // Valid inheritance is acyclic. Bound malformed input as well.
+    for _ in 0..=resolution.classes.len() {
+        #[cfg(test)]
+        METHOD_EFFECT_PROBES.with(|count| count.set(count.get() + 1));
+        let key = FunctionId::method(class, method);
+        if let Some(&cached) = cache.get(&key) {
+            result = cached;
+            break;
+        }
+        path.push(key);
+        if let Some(interface) = resolution.interfaces.get(&class) {
+            result = interface
+                .methods
+                .get(method)
+                .is_some_and(|sig| sig.is_async);
+            break;
+        }
+        let Some(info) = resolution.classes.get(&class) else {
+            break;
+        };
+        if let Some(signature) = info.methods.get(method) {
+            result = signature.is_async;
+            break;
+        }
+        let Some(base) = info.base else { break };
+        class = base;
+    }
+    for key in path {
+        cache.insert(key, result);
+    }
+    result
+}
+
+/// Query descendant effects lazily. Memoize each visited (type, method) pair,
+/// including negative answers, so overlapping virtual-call queries share work.
+fn dispatch_may_start_task(
+    resolution: &super::typed_ast::HirResolution,
+    children: &std::collections::HashMap<TypeId, Vec<TypeId>>,
+    class: TypeId,
+    method: &str,
+    cache: &mut std::collections::HashMap<FunctionId, bool>,
+    declarations: &mut std::collections::HashMap<FunctionId, bool>,
+) -> bool {
+    let key = FunctionId::method(class, method);
+    if let Some(&result) = cache.get(&key) {
+        return result;
+    }
+    let mut work = vec![(class, false)];
+    let mut active = std::collections::HashSet::new();
+    while let Some((class, exiting)) = work.pop() {
+        let key = FunctionId::method(class, method);
+        if cache.contains_key(&key) {
+            continue;
+        }
+        if exiting {
+            let result = children.get(&class).is_some_and(|children| {
+                children.iter().any(|&child| {
+                    cache
+                        .get(&FunctionId::method(child, method))
+                        .copied()
+                        .unwrap_or(false)
+                })
+            });
+            cache.insert(key, result);
+            active.remove(&class);
+            continue;
+        }
+        #[cfg(test)]
+        DISPATCH_EFFECT_VISITS.with(|count| count.set(count.get() + 1));
+        // Interface implementers may inherit their async body from a class
+        // outside this descendant walk. Reuse exact declaration resolution.
+        if resolution.open_dispatch_types.contains(&class)
+            || method_is_async(resolution, &Type::Named(class), method, declarations)
+        {
+            cache.insert(key, true);
+            continue;
+        }
+        // Invalid cyclic declarations are rejected earlier; remain bounded here.
+        if !active.insert(class) {
+            continue;
+        }
+        work.push((class, true));
+        if let Some(children) = children.get(&class) {
+            work.extend(children.iter().map(|&child| (child, false)));
+        }
+    }
+    cache
+        .get(&FunctionId::method(class, method))
+        .copied()
+        .unwrap_or(false)
+}
+
 fn method_signature(
     resolution: &super::typed_ast::HirResolution,
     receiver: &Type,
@@ -2821,6 +2933,7 @@ impl Builder {
                         LirRvalue::StaticCall {
                             class: *class,
                             method: method.clone(),
+                            is_async: false,
                             args: operands,
                             arg_types: children.iter().map(|arg| arg.ty.clone()).collect(),
                             result: expr.ty.clone(),
@@ -2960,6 +3073,8 @@ impl Builder {
                             receiver: LirOperand::Local(receiver),
                             receiver_ty: object.ty.clone(),
                             method: method.clone(),
+                            // Filled once all method calls have been lowered.
+                            is_async: false,
                             args,
                             arg_types,
                             result: expr.ty.clone(),

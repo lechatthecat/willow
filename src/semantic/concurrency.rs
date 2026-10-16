@@ -2,7 +2,7 @@ use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::ids::{FunctionId, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConcurrencyReport {
@@ -106,6 +106,7 @@ pub struct ConcurrencyAnalyzer {
     current_async_context: bool,
     sync_stack_preemption: bool,
     current_class: Option<TypeId>,
+    reference_classes: HashSet<String>,
     nonpreemptible_sync_helpers: HashMap<FunctionId, SyncHelperRef>,
 }
 
@@ -121,12 +122,18 @@ impl Default for ConcurrencyAnalyzer {
             sync_stack_preemption: crate::compiler_db::inputs::TargetCapabilities::native()
                 .sync_stack_preemption,
             current_class: None,
+            reference_classes: HashSet::new(),
             nonpreemptible_sync_helpers: HashMap::new(),
         }
     }
 }
 
 impl ConcurrencyAnalyzer {
+    pub(crate) fn with_reference_class(mut self, name: String) -> Self {
+        self.reference_classes.insert(name);
+        self
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -221,6 +228,11 @@ impl ConcurrencyAnalyzer {
         helpers: &crate::compiler_db::HelperSummary,
     ) -> Self {
         self.index_nonpreemptible_sync_helpers(helpers);
+        for item in &program.items {
+            if let Item::Class(class) = item {
+                self.reference_classes.insert(class.name.clone());
+            }
+        }
         for item in &program.items {
             match item {
                 Item::Function(function) => self.check_function(function),
@@ -366,7 +378,12 @@ impl ConcurrencyAnalyzer {
     fn check_async_reference_params(&mut self, context: &str, owner_span: Span, params: &[Param]) {
         for param in params {
             if let ParamMode::Reference { mutable, .. } = &param.mode {
-                if matches!(param.ty, Type::I64 | Type::F64 | Type::Bool) {
+                if matches!(
+                    param.ty,
+                    Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Array(_)
+                ) || matches!(&param.ty, Type::Named(name) if self.reference_classes.contains(name))
+                    || matches!(&param.ty, Type::Generic(name, _) if name == "Array" || self.reference_classes.contains(name))
+                {
                     continue;
                 }
                 let mode = if *mutable { "&mut" } else { "&" };
@@ -654,11 +671,45 @@ fn run(t: Task<i64>) {
     }
 
     #[test]
-    fn rejects_nonscalar_reference_parameter_in_async_function() {
+    fn allows_gc_slot_reference_parameters_in_async_functions_and_methods() {
+        for ty in ["String", "Array<String>", "Box", "GenericBox<String>"] {
+            for mode in ["&", "&mut"] {
+                let source = format!(
+                    "class Box {{}} class GenericBox<T> {{}} async fn read(x: {mode} {ty}) {{ await sleep(1); }} class Reader {{ async fn read(self, x: {mode} {ty}) {{ await sleep(1); }} }}"
+                );
+                let analyzer = analyze(&source);
+                assert!(
+                    analyzer.errors.is_empty(),
+                    "{source}: {:?}",
+                    analyzer.errors
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gc_slot_support_keeps_other_async_reference_types_gated() {
+        for ty in ["Choice", "Readable", "Option<String>", "fn(i64) -> i64"] {
+            let source = format!(
+                "enum Choice {{ A, B }} interface Readable {{ fn read(self); }} async fn read(x: &mut {ty}) {{ await sleep(1); }}"
+            );
+            let analyzer = analyze(&source);
+            assert!(
+                analyzer
+                    .errors
+                    .iter()
+                    .any(|error| error.code == ErrorCode::E1707),
+                "{source}: {:?}",
+                analyzer.errors
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_function_pointer_reference_parameter_in_async_function() {
         assert_error_contains(
             r#"
-async fn read(x: & String) -> String {
-    return x;
+async fn read(x: & fn(i64) -> i64) {
 }
 "#,
             ErrorCode::E1707,
@@ -667,11 +718,11 @@ async fn read(x: & String) -> String {
     }
 
     #[test]
-    fn rejects_nonscalar_reference_parameter_in_async_method() {
+    fn rejects_function_pointer_reference_parameter_in_async_method() {
         assert_error_contains(
             r#"
 class Box {
-    async fn update(self, x: &mut String) {
+    async fn update(self, x: &mut fn(i64) -> i64) {
     }
 }
 "#,
