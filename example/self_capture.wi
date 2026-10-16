@@ -1,0 +1,29 @@
+// A receiver capture retains the same object as `let me = self`.
+class Counter {
+    pub value: i64;
+    pub fn direct(self) -> closure() -> i64 {
+        return || { self.value = self.value + 1; return self.value; };
+    }
+    pub fn alias(self) -> closure() -> i64 {
+        let me = self;
+        return || { me.value = me.value + 1; return me.value; };
+    }
+    pub fn nested(self) -> closure() -> closure() -> i64 {
+        return || { return || self.value; };
+    }
+}
+fn main() {
+    let counter = new Counter(10);
+    let direct = counter.direct();
+    let alias = counter.alias();
+    println(direct());
+    println(alias());
+    let outer = new Counter(42).nested();
+    gc_collect();
+    let inner = outer();
+    gc_collect();
+    println(inner());
+    let escaped_alias = new Counter(50).alias();
+    gc_collect();
+    println(escaped_alias());
+}

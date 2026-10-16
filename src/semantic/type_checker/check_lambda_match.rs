@@ -255,24 +255,6 @@ impl TypeChecker {
         self.push(diagnostic);
     }
 
-    /// `self` is the one name a lambda still cannot take: the receiver is bound
-    /// by the method's own calling convention rather than by a local slot, so
-    /// there is nothing for the environment to copy (willow-0g8j.2.12).
-    fn push_self_capture_error(&mut self, span: Span) {
-        self.push(
-            Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E1002,
-                "lambda cannot capture `self` from the enclosing method".to_string(),
-            )
-            .with_label(Label::primary(
-                span,
-                "`self` is not capturable; capture the fields it reads instead",
-            ))
-            .with_help("bind what you need first, e.g. `let n = self.count;` and capture `n`"),
-        );
-    }
-
     pub(super) fn check_lambda_with_param_context(
         &mut self,
         l: &LambdaExpr,
@@ -1636,24 +1618,17 @@ impl CaptureScan<'_> {
         self.scopes.get(name).is_some()
     }
 
-    fn note_use(&mut self, name: &str, span: Span) {
-        if name == "self" {
-            // The receiver has no local slot to copy from.
-            if !self.bound_inside("self") && self.checker.symbols.lookup_var("self").is_some() {
-                self.checker.push_self_capture_error(span);
-            }
-            return;
-        }
-        // `super.method()` calls through `self`, so it captures the receiver too.
-        if name == "super"
+    fn note_use(&mut self, name: &str) {
+        // `super.method()` uses the same receiver value, while dispatch remains
+        // statically resolved against the enclosing class's parent.
+        let name = if name == "super"
             && !self.bound_inside("super")
             && self.checker.symbols.lookup_var("super").is_none()
         {
-            if self.checker.symbols.lookup_var("self").is_some() {
-                self.checker.push_self_capture_error(span);
-            }
-            return;
-        }
+            "self"
+        } else {
+            name
+        };
         if self.bound_inside(name) {
             return; // bound inside the lambda
         }
@@ -1713,19 +1688,19 @@ impl CaptureScan<'_> {
         // Writing an enclosing local captures it too, and an assignment target
         // is a name on the statement rather than a `Var` the walk can reach.
         if let Stmt::Assign(assign) = stmt {
-            self.note_use(&assign.name, assign.span);
+            self.note_use(&assign.name);
             self.note_write(&assign.name, assign.span);
         }
     }
 
     fn visit_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Var(name, span, _) => self.note_use(name, *span),
+            Expr::Var(name, _, _) => self.note_use(name),
             // Calling a local function VALUE captures it: the callee is a name
             // on the call node, not a `Var` the walk reaches, exactly as an
             // assignment target is. A free function's name resolves to no
             // variable, so `note_use` ignores it.
-            Expr::Call(call) => self.note_use(&call.callee, call.span),
+            Expr::Call(call) => self.note_use(&call.callee),
             _ => {}
         }
     }
@@ -1781,7 +1756,7 @@ mod lambda_capture_tests {
     //! excused by its own binding, 28 match payload binding.
     //!
     //! Then the rules the environment brought with it (willow-0g8j.2.12):
-    //! 29 `self` is still E1002, 30 immutable capture writes are E1009, 31 `let mut`
+    //! 29 `self` is a reference capture, 30 immutable capture writes are E1009, 31 `let mut`
     //! permits sharing, 32 the write is reported once, 33 a capturing lambda
     //! is not a `fn` value (E1011), 34 but is a `closure` one, 35 a
     //! non-capturing lambda stays a `fn` value, 36 calling a captured function
@@ -2180,15 +2155,142 @@ mod lambda_capture_tests {
 
     // --- What an environment does and does not allow (willow-0g8j.2.12) ---
 
-    /// `self` is bound by the method's calling convention, not by a local slot,
-    /// so there is nothing for the environment to copy.
+    /// The receiver is a normal reference capture, just like an alias.
     #[test]
-    fn c29_self_capture_in_a_method_is_rejected() {
-        err(
+    fn c29_self_capture_in_a_method_is_allowed() {
+        captures_one(
             "class C { pub v: i64; pub fn m(self) -> i64 { let f = |x: i64| x + self.v; return f(1); } } \
              fn main() { }",
-            "E1002",
+            &["self"],
         );
+    }
+
+    #[test]
+    fn receiver_capture_forms_and_scopes() {
+        // Each row asserts the actual environment slots, not just acceptance.
+        for (body, expected) in [
+            ("let f = || self.v;", vec![vec!["self"]]),
+            ("let me = self; let f = || me.v;", vec![vec!["me"]]),
+            (
+                "let me = self; let other = me; let f = || other.v;",
+                vec![vec!["other"]],
+            ),
+            ("let f = || self.v + self.v;", vec![vec!["self"]]),
+            ("let n = 2; let f = || n + self.v;", vec![vec!["n", "self"]]),
+            ("let n = 2; let f = || self.v + n;", vec![vec!["self", "n"]]),
+            ("let f = || self;", vec![vec!["self"]]),
+            ("let f = || self.get();", vec![vec!["self"]]),
+            (
+                "let f = || { self.v = 4; return self.v; };",
+                vec![vec!["self"]],
+            ),
+            (
+                "let f = || { let me = self; return me.v; };",
+                vec![vec!["self"]],
+            ),
+            (
+                "let f = || { let g = || self.v; return g(); };",
+                vec![vec!["self"], vec!["self"]],
+            ),
+            (
+                "let me = self; let f = || { let g = || me.v; return g(); };",
+                vec![vec!["me"], vec!["me"]],
+            ),
+            (
+                "let f = || { let me = self; let g = || me.v; return g(); };",
+                vec![vec!["self"], vec!["me"]],
+            ),
+            ("let me = self; let f = |me: i64| me + 1;", vec![vec![]]),
+            (
+                "let me = self; let f = || { let me = 2; return me; };",
+                vec![vec![]],
+            ),
+            (
+                "let me = self; let f = || { let me = me.v; return me; };",
+                vec![vec!["me"]],
+            ),
+            ("let f: closure() -> i64 = || self.v;", vec![vec!["self"]]),
+            (
+                "let f = || { if true { return self.v; } return 0; };",
+                vec![vec!["self"]],
+            ),
+            ("let f = || true ? self.v : self.v;", vec![vec!["self"]]),
+            ("let f = || 1;", vec![vec![]]),
+        ] {
+            let src = format!(
+                "class C {{ pub v: i64; pub fn get(self) -> i64 {{ return self.v; }} pub fn m(self) {{ {body} }} }} fn main() {{}}"
+            );
+            let refs: Vec<&[&str]> = expected.iter().map(Vec::as_slice).collect();
+            captures(&src, &refs);
+        }
+        captures_one(
+            "class C { pub v: i64; pub fn m() { let f = || self.v; } } fn main() {}",
+            &["self"],
+        );
+    }
+
+    #[test]
+    fn receiver_capture_fn_diagnostic_explains_supported_pattern() {
+        for receiver in ["self", "me"] {
+            let diagnostics = check(&format!(
+                "class C {{ pub v: i64; pub fn m(self) {{ let me = self; let f: fn() -> i64 = || {receiver}.v; }} }} fn main() {{}}"
+            ));
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert_eq!(diagnostics[0].code, crate::diagnostics::ErrorCode::E1011);
+            let rendered = format!("{:?}", diagnostics[0]);
+            assert!(
+                rendered.contains(&format!("captures `{receiver}`")),
+                "{rendered}"
+            );
+            assert!(rendered.contains("closure() -> i64"), "{rendered}");
+        }
+        err(
+            "class C { pub v: i64; pub fn m(self) { let f = || { self = new C(2); }; } } fn main() {}",
+            "E1009",
+        );
+    }
+
+    #[test]
+    fn receiver_capture_super_uses_one_receiver_slot() {
+        captures_one(
+            "open class A { pub fn value(self) -> i64 { return 1; } } class B extends A { pub fn m(self) { let f = || super.value() + self.value() + super.value(); } } fn main() {}",
+            &["self"],
+        );
+        captures_one("fn main() { let super = 3; let f = || super; }", &["super"]);
+    }
+
+    #[test]
+    fn receiver_capture_slot_count_is_constant_for_repeated_uses() {
+        for uses in [1, 8, 64, 256] {
+            let expression = std::iter::repeat_n("self.v", uses)
+                .collect::<Vec<_>>()
+                .join(" + ");
+            captures_one(
+                &format!(
+                    "class C {{ pub v: i64; pub fn m(self) {{ let f = || {expression}; }} }} fn main() {{}}"
+                ),
+                &["self"],
+            );
+        }
+    }
+
+    #[test]
+    fn receiver_capture_nested_and_sibling_slot_counts() {
+        for count in [1, 4, 16, 32] {
+            let mut nested = "|| self.v".to_string();
+            for _ in 1..count {
+                nested = format!("|| {{ let inner = {nested}; return inner(); }}");
+            }
+            let siblings = (0..count)
+                .map(|i| format!("let f{i} = || self.v;"))
+                .collect::<String>();
+            for body in [format!("let f = {nested};"), siblings] {
+                let src =
+                    format!("class C {{ pub v: i64; pub fn m(self) {{ {body} }} }} fn main() {{}}");
+                let expected: Vec<&[&str]> = vec![&["self"]; count];
+                captures(&src, &expected);
+            }
+        }
     }
 
     /// An immutable outer binding cannot be assigned through a closure.

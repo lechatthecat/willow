@@ -24,7 +24,7 @@ use super::*;
 //  10 an element write is shared    24 a captured array, iterated
 //  11 a field write is shared       25 E1011: not a `fn` value
 //  12 a closure parameter           26 E1009: no write to a capture
-//  13 a closure over closures       27 E1002: no capture of `self`
+//  13 a closure over closures       27 direct receiver capture
 //  14 (see 13)
 
 #[test]
@@ -405,16 +405,11 @@ fn clo_26_a_write_to_a_capture_is_refused() {
 }
 
 #[test]
-fn clo_27_a_capture_of_self_is_refused() {
-    let (ok, stderr) = compile_with_compiler_env(
+fn clo_27_a_capture_of_self_is_allowed() {
+    assert_program_output(
         "class C { pub v: i64; pub fn m(self) -> i64 { let f = |x: i64| x + self.v; return f(1); } }\n\
          fn main() { println(new C(1).m()); }",
-        &PLAIN,
-    );
-    assert!(!ok, "`self` must stay uncapturable");
-    assert!(
-        stderr.contains("E1002") && stderr.contains("cannot capture `self`"),
-        "the refusal must name `self`: {stderr}"
+        "2\n",
     );
 }
 
@@ -790,4 +785,56 @@ fn main() {
 "#,
         "registered\nold value!\n",
     );
+}
+
+#[test]
+fn receiver_capture_example_retains_objects_under_gc_stress() {
+    assert_output_under_gc_stress(
+        include_str!("../../../example/self_capture.wi"),
+        "11\n12\n42\n51\n",
+    );
+}
+
+#[test]
+fn receiver_capture_example_release() {
+    let (out, ok) = compile_and_run_release(include_str!("../../../example/self_capture.wi"));
+    assert!(ok, "{out}");
+    assert_eq!(out, "11\n12\n42\n51\n");
+}
+
+#[test]
+fn receiver_capture_super_preserves_static_dispatch_and_deduplicates_self() {
+    assert_program_output(
+        r#"
+open class A {
+    pub n: i64;
+    pub open fn value(self) -> i64 { return self.n; }
+}
+class B extends A {
+    pub override fn value(self) -> i64 { return self.n + 100; }
+    pub fn make(self) -> closure() -> i64 {
+        return || super.value() + self.value();
+    }
+}
+fn main() { let f = new B(3).make(); gc_collect(); println(f()); }
+"#,
+        "106\n",
+    );
+}
+
+#[test]
+fn receiver_capture_fn_help_for_direct_and_alias() {
+    for receiver in ["self", "me"] {
+        let (ok, stderr) = compile_with_compiler_env(
+            &format!(
+                "class C {{ pub v: i64; pub fn m(self) {{ let me = self; let f: fn() -> i64 = || {receiver}.v; }} }} fn main() {{}}"
+            ),
+            &PLAIN,
+        );
+        assert!(!ok);
+        assert!(
+            stderr.contains("E1011") && stderr.contains("closure() -> i64"),
+            "{stderr}"
+        );
+    }
 }

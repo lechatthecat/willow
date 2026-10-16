@@ -9,7 +9,7 @@
 //!   6. `super.field` is E0851: fields are read through `self`
 //!   7. a missing base method is a single E0502
 //!   8. a private base method is E0501
-//!   9. `super` inside a lambda is a `self` capture (E1002)
+//!   9. `super` inside a lambda is an allowed `self` capture
 //!  10. an argument mismatch on a super call is a single E0201
 //!  11. a super call's result type is the base's return type
 //!  12. a local named `super` is an ordinary value
@@ -94,7 +94,7 @@ fn super_inside_a_lambda_is_a_self_capture() {
     let found = codes(&format!(
         "{BASE} class B extends A {{ pub fn f(self) {{ let g = || super.value(1); }} }} fn main() {{}}"
     ));
-    assert_eq!(found, vec![ErrorCode::E1002]);
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[test]
