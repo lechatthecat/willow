@@ -901,7 +901,11 @@ impl std::fmt::Display for Rejection {
 impl std::error::Error for Rejection {}
 
 /// Preview semantic changes without creating transaction metadata or candidates.
-pub(super) fn preview_analyzed(snapshot: &Snapshot, request: Request) -> Result<serde_json::Value> {
+pub(super) fn preview_analyzed(
+    snapshot: &Snapshot,
+    request: Request,
+    diff: bool,
+) -> Result<serde_json::Value> {
     ensure!(request.revision == snapshot.revision, "stale revision");
     let root = Path::new(&snapshot.workspace);
     let context = snapshot
@@ -932,10 +936,13 @@ pub(super) fn preview_analyzed(snapshot: &Snapshot, request: Request) -> Result<
         );
     }
     context.verify_files()?;
-    let changes:Vec<_>=changes.iter().map(|c|serde_json::json!({"path":c.path,"diff":super::diff::unified(&c.path,&c.before,&c.after)})).collect();
-    Ok(
-        serde_json::json!({"status":"ok","changes":changes,"work":work,"dry_run":true,"revision":snapshot.revision}),
-    )
+    let mut preview = serde_json::json!({"status":"ok","files_changed":changes.len(),"work":work,"dry_run":true,"revision":snapshot.revision});
+    if diff {
+        preview["changes"] = changes.iter().map(|c| {
+            serde_json::json!({"path":c.path,"diff":super::diff::unified(&c.path,&c.before,&c.after)})
+        }).collect();
+    }
+    Ok(preview)
 }
 
 /// Member-call tokens the type checker proved to be builtin methods

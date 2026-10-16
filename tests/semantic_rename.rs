@@ -72,7 +72,10 @@ fn direct_rename_previews_without_metadata_and_applies_cross_file_imports() {
         let f = Fixture::new(&format!("{import} fn main() {{ println({call}); }}"));
         f.write("helper.wi", "pub fn value() -> i64 { return 2; }");
         let before = fs::read(f.0.join("main.wi")).unwrap();
-        let preview = f.run(&["rename", "helper::value", "answer", "--dry-run"], 0);
+        let preview = f.run(
+            &["rename", "helper::value", "answer", "--dry-run", "--diff"],
+            0,
+        );
         assert!(preview["result"]["changes"].as_array().unwrap().len() == 2);
         assert_eq!(fs::read(f.0.join("main.wi")).unwrap(), before);
         assert!(!f.0.join(".willow-edits").exists());
@@ -414,7 +417,7 @@ fn semantic_member_rename_covers_declarations_references_and_dispatch() {
         } else {
             "renamed"
         };
-        let preview = f.run(&["rename", selector, new_name, "--dry-run"], 0);
+        let preview = f.run(&["rename", selector, new_name, "--dry-run", "--diff"], 0);
         assert!(
             preview["result"]["changes"]
                 .as_array()
@@ -878,7 +881,7 @@ fn user_methods_named_like_builtins_rename_without_touching_builtin_calls() {
     ] {
         let f = Fixture::new(BUILTIN_NAMED_MAIN);
         f.write("vec.wi", BUILTIN_NAMED_VEC);
-        let preview = f.run(&["rename", selector, new, "--dry-run"], 0);
+        let preview = f.run(&["rename", selector, new, "--dry-run", "--diff"], 0);
         assert_eq!(preview["result"]["edits"], edits, "{selector}: {preview}");
         assert_eq!(
             fs::read_to_string(f.0.join("main.wi")).unwrap(),
@@ -961,23 +964,20 @@ fn rename_collision_cites_conflicting_declaration_not_import() {
 #[test]
 fn rename_dry_run_reports_counts_with_singular_and_plural_nouns() {
     let f = Fixture::new("fn value() -> i64 { return 1; } fn main() { println(value()); }");
-    let preview = f.run(&["rename", "value", "answer", "--dry-run"], 0);
-    for (key, expected) in [
-        ("files_changed", 1),
-        ("edits", 2),
-        ("declarations_updated", 1),
-        ("references_updated", 1),
-    ] {
-        assert_eq!(preview["result"][key], expected, "{key}");
-    }
+    let preview = f.run(&["rename", "value", "answer", "--dry-run", "--diff"], 0);
+    assert_eq!(preview["result"]["files"], 1);
+    assert_eq!(preview["result"]["references"], 1);
     let text = f.human(&["rename", "value", "answer", "--dry-run"], 0);
-    assert!(text.contains("-fn value()"), "{text}");
-    assert!(
-        text.ends_with(
-            "Dry run: rename value -> answer would change 1 file\n2 edits (1 declaration, 1 reference)\nNo files changed\n"
-        ),
-        "{text}"
+    assert_eq!(text, "1 file / 1 reference / 0 collisions / 0 unresolved\n");
+    let summary = f.run(&["rename", "value", "answer", "--dry-run"], 0);
+    assert_eq!(
+        summary["result"],
+        serde_json::json!({"files":1,"references":1,"collisions":0,"unresolved":0})
     );
+    let text = f.human(&["rename", "value", "answer", "--dry-run", "--diff"], 0);
+    assert!(text.contains("-fn value()"), "{text}");
+    assert!(text.contains("+fn answer()"), "{text}");
+    assert!(text.ends_with("1 file / 1 reference / 0 collisions / 0 unresolved\n"));
     let text = f.human(&["rename", "value", "answer"], 0);
     assert!(
         text.starts_with("Renamed value -> answer\n1 file changed\n2 edits (1 declaration, 1 reference)\nValidation: passed"),
@@ -985,9 +985,18 @@ fn rename_dry_run_reports_counts_with_singular_and_plural_nouns() {
     );
     let f = Fixture::new(BUILTIN_NAMED_MAIN);
     f.write("vec.wi", BUILTIN_NAMED_VEC);
-    let text = f.human(&["rename", "vec::Sized::len", "measure", "--dry-run"], 0);
+    let text = f.human(
+        &[
+            "rename",
+            "vec::Sized::len",
+            "measure",
+            "--dry-run",
+            "--diff",
+        ],
+        0,
+    );
     assert!(
-        text.contains("would change 2 files\n3 edits (2 declarations, 1 reference)\n"),
+        text.ends_with("2 files / 1 reference / 0 collisions / 0 unresolved\n"),
         "{text}"
     );
 }
@@ -1029,7 +1038,10 @@ fn referenced_constant_rename_preserves_aliases_and_shadowed_locals() {
     let source = "import helper; import helper::{value, value as v}; fn main() { println(value + helper::value + v); if true { let value = 9; println(value); } }";
     let f = Fixture::new(source);
     f.write("helper.wi", "pub const value: i64 = 7;");
-    let preview = f.run(&["rename", "helper::value", "answer", "--dry-run"], 0);
+    let preview = f.run(
+        &["rename", "helper::value", "answer", "--dry-run", "--diff"],
+        0,
+    );
     assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 2);
     assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
     let applied = f.run(&["rename", "helper::value", "answer"], 0);
@@ -1083,7 +1095,7 @@ fn refs_and_rename_share_canonical_ids_across_import_order() {
             ("base::Parcel::read", "renamed_read"),
         ] {
             let refs = fixture.run(&["refs", selector], 0);
-            let rename = fixture.run(&["rename", selector, new_name, "--dry-run"], 0);
+            let rename = fixture.run(&["rename", selector, new_name, "--dry-run", "--diff"], 0);
             let id = refs["result"]["selected"]["id"].clone();
             assert!(id.is_string(), "{refs}");
             assert_eq!(rename["result"]["selected"]["id"], id, "{rename}");
@@ -1096,4 +1108,78 @@ fn refs_and_rename_share_canonical_ids_across_import_order() {
     }
     let applied = fixture.run(&["rename", "base::value", "renamed_value"], 0);
     assert_eq!(applied["result"]["selected"]["id"], previous.unwrap()[0]);
+}
+
+#[test]
+fn rename_summary_modes_scale_and_preserve_sources() {
+    for references in [0, 1, 8, 32] {
+        let source = format!(
+            "fn value() {{}}\nfn main() {{ {} }}\n",
+            "value(); ".repeat(references)
+        );
+        let f = Fixture::new(&source);
+        let expected =
+            serde_json::json!({"files":1,"references":references,"collisions":0,"unresolved":0});
+        for extra in [vec![], vec!["--verbose"], vec!["--diff"]] {
+            let mut args = vec!["rename", "value", "answer", "--dry-run"];
+            args.extend(extra);
+            let result = f.run(&args, 0);
+            for key in ["files", "references", "collisions", "unresolved"] {
+                assert_eq!(result["result"][key], expected[key]);
+            }
+            if args.contains(&"--diff") {
+                let diff = result["result"]["changes"][0]["diff"].as_str().unwrap();
+                assert!(diff.contains("--- a/main.wi"), "{diff}");
+                assert!(diff.contains("+++ b/main.wi"), "{diff}");
+                assert!(diff.contains("@@"), "{diff}");
+            } else {
+                assert_eq!(result["result"], expected);
+            }
+            assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+            assert!(!f.0.join(".willow-edits").exists());
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .current_dir(&f.0)
+            .args([
+                "rename",
+                "value",
+                "answer",
+                "--dry-run",
+                "--source",
+                "main.wi",
+                "--format=ndjson",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap()["result"],
+            expected
+        );
+    }
+}
+
+#[test]
+fn rename_diff_option_validation_and_help() {
+    let f = Fixture::new("fn value() {} fn main() { value(); }");
+    for args in [
+        vec!["rename", "value", "answer", "--diff"],
+        vec!["rename", "value", "answer", "--dry-run", "--diff", "--diff"],
+        vec!["rename", "value", "answer", "--dry-run", "--diff=true"],
+        vec!["refs", "value", "--diff"],
+    ] {
+        assert_eq!(f.run(&args, 2)["status"], "invalid-arguments");
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8(out.stdout).unwrap();
+    assert!(help.contains("--dry-run [--diff]"), "{help}");
+    assert!(
+        help.contains("files / references / collisions / unresolved"),
+        "{help}"
+    );
 }

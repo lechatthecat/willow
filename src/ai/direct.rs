@@ -149,6 +149,18 @@ fn source_module(path: &str, workspace: &str) -> String {
     }
     parts.join("::")
 }
+/// Presentation mode for direct rename. Boolean callers retain legacy previews.
+pub enum RenameMode {
+    Apply,
+    Summary,
+    Diff,
+}
+impl From<bool> for RenameMode {
+    fn from(dry_run: bool) -> Self {
+        if dry_run { Self::Diff } else { Self::Apply }
+    }
+}
+
 impl DirectSession {
     pub fn new(snapshot: Snapshot) -> Result<Self> {
         // Constructor overloads have distinct declaration IDs, while the
@@ -228,8 +240,9 @@ impl DirectSession {
         selector: &str,
         filter: &SelectorFilter,
         name: &str,
-        dry_run: bool,
+        mode: impl Into<RenameMode>,
     ) -> Result<Value> {
+        let mode = mode.into();
         self.session
             .snapshot
             .edit_context
@@ -292,8 +305,12 @@ impl DirectSession {
         let mut displayed = resolved.clone();
         self.display_locations(&mut displayed, false)?;
         let selected = displayed["symbol"].take();
-        if dry_run {
-            let mut preview = edit::preview_analyzed(&self.session.snapshot, request)?;
+        if !matches!(mode, RenameMode::Apply) {
+            let mut preview = edit::preview_analyzed(
+                &self.session.snapshot,
+                request,
+                matches!(mode, RenameMode::Diff),
+            )?;
             let summary = rename_summary(&preview);
             preview
                 .as_object_mut()
@@ -1242,7 +1259,9 @@ fn selector_typo_distance(a: &str, b: &[char]) -> Option<usize> {
 
 /// File and edit counts shared by rename dry-run previews and applied renames.
 fn rename_summary(preview: &Value) -> serde_json::Map<String, Value> {
-    let changes = preview["changes"].as_array().map_or(0, Vec::len);
+    let changes = preview["files_changed"]
+        .as_u64()
+        .unwrap_or_else(|| preview["changes"].as_array().map_or(0, Vec::len) as u64);
     let edits = preview["work"]["patches"].as_u64().unwrap_or(0);
     let declarations = preview["work"]["declarations"].as_u64().unwrap_or(0);
     let references = edits.saturating_sub(declarations);

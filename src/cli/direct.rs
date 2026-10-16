@@ -1,7 +1,7 @@
 //! Human-oriented semantic commands; compiler APIs own resolution and queries.
 use super::*;
 use serde_json::{Value, json};
-use willow_compiler::ai::direct::{DirectSession, SelectorFilter};
+use willow_compiler::ai::direct::{DirectSession, RenameMode, SelectorFilter};
 
 pub(super) fn requested(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
@@ -33,6 +33,7 @@ struct Options {
     show_id: bool,
     new_name: Option<String>,
     dry_run: bool,
+    diff: bool,
     verbose: bool,
 }
 impl Options {
@@ -50,6 +51,7 @@ impl Options {
             show_id: false,
             new_name: None,
             dry_run: false,
+            diff: false,
             verbose: false,
         };
         let mut seen = std::collections::HashSet::new();
@@ -72,12 +74,13 @@ impl Options {
                 anyhow::ensure!(seen.insert(key), "duplicate option {key}");
                 match key {
                     "--all" | "--absolute-paths" | "--explain" | "--show-id" | "--dry-run"
-                    | "--verbose" => {
+                    | "--verbose" | "--diff" => {
                         anyhow::ensure!(inline.is_none(), "unexpected value for {key}");
                         match key {
                             "--all" => result.all = true,
                             "--absolute-paths" => result.absolute = true,
                             "--explain" => result.explain = true,
+                            "--diff" => result.diff = true,
                             "--dry-run" => result.dry_run = true,
                             "--verbose" => result.verbose = true,
                             _ => result.show_id = true,
@@ -115,9 +118,10 @@ impl Options {
             "rename requires a new name"
         );
         anyhow::ensure!(
-            result.command == "rename" || (!result.dry_run && !result.verbose),
+            result.command == "rename" || (!result.dry_run && !result.verbose && !result.diff),
             "rename-only option"
         );
+        anyhow::ensure!(!result.diff || result.dry_run, "--diff requires --dry-run");
         anyhow::ensure!(
             matches!(result.format.as_str(), "human" | "json" | "ndjson"),
             "format must be human, json or ndjson"
@@ -177,8 +181,30 @@ impl Options {
                 &self.selector,
                 &self.filter,
                 self.new_name.as_deref().unwrap(),
-                self.dry_run,
+                if !self.dry_run {
+                    RenameMode::Apply
+                } else if self.diff {
+                    RenameMode::Diff
+                } else {
+                    RenameMode::Summary
+                },
             )?;
+            if self.dry_run && result["status"] == "ok" {
+                let mut summary = json!({
+                    "files": result["files_changed"],
+                    "references": result["references_updated"],
+                    "collisions": 0,
+                    "unresolved": 0,
+                });
+                if self.diff {
+                    result
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(summary.as_object().unwrap().clone());
+                    summary = result;
+                }
+                return Ok(json!({"schema":1,"kind":"rename","status":"ok","result":summary}));
+            }
             if !self.verbose {
                 result.as_object_mut().unwrap().remove("transaction");
             }
@@ -239,8 +265,33 @@ fn location(value: &Value) -> String {
         value["column"]
     )
 }
+fn counted(n: u64, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
 fn human(value: &Value, options: &Options) -> String {
     let result = &value["result"];
+    if options.command == "rename" && options.dry_run && value["status"] == "ok" {
+        let summary = format!(
+            "{} / {} / {} / {} unresolved",
+            counted(result["files"].as_u64().unwrap(), "file"),
+            counted(result["references"].as_u64().unwrap(), "reference"),
+            counted(result["collisions"].as_u64().unwrap(), "collision"),
+            result["unresolved"]
+        );
+        let mut output = String::new();
+        if let Some(changes) = result["changes"].as_array() {
+            for change in changes {
+                if let Some(diff) = change["diff"].as_str() {
+                    output.push_str(diff);
+                    if !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
+            }
+        }
+        output.push_str(&summary);
+        return output;
+    }
     if options.command == "rename" && result["status"] == "ok" {
         let count = |key: &str, noun: &str| {
             let n = result[key].as_u64().unwrap_or(0);
@@ -254,20 +305,6 @@ fn human(value: &Value, options: &Options) -> String {
             count("references_updated", "reference")
         );
         let new_name = options.new_name.as_deref().unwrap();
-        if result["dry_run"] == true {
-            let mut output: Vec<_> = result["changes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|c| c["diff"].as_str())
-                .collect();
-            let summary = format!(
-                "Dry run: rename {} -> {new_name} would change {files}\n{edits}\nNo files changed",
-                options.selector
-            );
-            output.push(&summary);
-            return output.join("\n");
-        }
         let mut output = format!(
             "Renamed {} -> {new_name}\n{files} changed\n{edits}\nValidation: passed",
             options.selector

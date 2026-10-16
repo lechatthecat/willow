@@ -2207,6 +2207,7 @@ fn select_bindings_support_direct_queries_and_rename() {
                     selectors[rename_selector],
                     "response",
                     "--dry-run",
+                    "--diff",
                 ],
                 0,
             );
@@ -2573,9 +2574,9 @@ fn generic_closure_value_calls_keep_queries_available() {
             .is_some_and(|ty| ty.starts_with("fn(")),
         "{position}"
     );
-    let preview = f.json(&["rename", "coll::apply", "run", "--dry-run"], 0);
+    let preview = f.json(&["rename", "coll::apply", "run", "--dry-run", "--diff"], 0);
     assert!(preview.to_string().contains("run"), "{preview}");
-    let preview = f.json(&["rename", "main::local", "call", "--dry-run"], 0);
+    let preview = f.json(&["rename", "main::local", "call", "--dry-run", "--diff"], 0);
     assert!(preview.to_string().contains("call"), "{preview}");
 }
 
@@ -2659,10 +2660,16 @@ fn generic_source_queries() {
     }
     let refs = f.json(&["refs", "coll::fold"], 0);
     assert!(refs.to_string().contains("main.wi"), "{refs}");
-    let preview = f.json(&["rename", "coll::fold", "reduce", "--dry-run"], 0);
+    let preview = f.json(
+        &["rename", "coll::fold", "reduce", "--dry-run", "--diff"],
+        0,
+    );
     assert!(preview.to_string().contains("reduce"), "{preview}");
     assert_eq!(preview["result"]["edits"], 4, "{preview}");
-    let method = f.json(&["rename", "coll::Ring::push", "put", "--dry-run"], 0);
+    let method = f.json(
+        &["rename", "coll::Ring::push", "put", "--dry-run", "--diff"],
+        0,
+    );
     assert_eq!(method["result"]["edits"], 2, "{method}");
     for format in ["human", "ndjson"] {
         for args in [
@@ -2731,7 +2738,10 @@ fn generic_source_queries() {
         5,
         "{refs}"
     );
-    let preview = f.json(&["rename", "coll::reduce", "combine", "--dry-run"], 0);
+    let preview = f.json(
+        &["rename", "coll::reduce", "combine", "--dry-run", "--diff"],
+        0,
+    );
     assert_eq!(preview["result"]["edits"], 5, "{preview}");
     f.json(&["rename", "coll::reduce", "combine"], 0);
     let other = fs::read_to_string(f.0.join("src/other.wi")).unwrap();
@@ -2816,7 +2826,7 @@ fn uninstantiated_generic_body_refs_and_rename() {
             )
             .unwrap();
         }
-        let preview = f.json(&["rename", selector, "reduce", "--dry-run"], 0);
+        let preview = f.json(&["rename", selector, "reduce", "--dry-run", "--diff"], 0);
         assert_eq!(
             preview["result"]["edits"],
             2 + usize::from(instantiated_target),
