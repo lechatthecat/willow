@@ -577,8 +577,8 @@ fn main() {
 "#,
         &[
             "error[E1707]",
-            "reference parameter `x` is not supported in async function",
-            "`&mut` parameter may live across suspension points",
+            "reference parameter `x` has an unsupported type for async function",
+            "`&mut` parameter type has no supported async borrow representation",
         ],
     );
 }
@@ -596,8 +596,8 @@ fn main() {
 "#,
         &[
             "error[E1707]",
-            "reference parameter `x` is not supported in async function",
-            "`&` parameter may live across suspension points",
+            "reference parameter `x` has an unsupported type for async function",
+            "`&` parameter type has no supported async borrow representation",
         ],
     );
 }

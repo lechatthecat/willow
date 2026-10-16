@@ -785,3 +785,31 @@ fn async_mut_sync_preemption_nested_heap_and_repeated_calls() {
         }
     }
 }
+
+#[test]
+fn async_reference_gate_b9_example_and_unsupported_types() {
+    let (out, ok) = compile_and_run(include_str!(
+        "../../../example/async_reference_escape_rejected.wi"
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+    for ty in ["Choice", "Readable", "Option<String>", "fn(i64) -> i64"] {
+        for mode in ["&", "&mut"] {
+            for declaration in [
+                format!("async fn read(x: {mode} {ty}) {{}}"),
+                format!("class Reader {{ async fn read(self, x: {mode} {ty}) {{}} }}"),
+            ] {
+                let source = format!(
+                    "enum Choice {{ A, B }} interface Readable {{ fn read(self); }} {declaration} fn main() {{}}"
+                );
+                let errors = compile_error_stderr(&source);
+                assert!(errors.contains("E1707"), "{source}: {errors}");
+                assert!(errors.contains("unsupported type"), "{source}: {errors}");
+                assert!(
+                    errors.contains("no supported async borrow representation"),
+                    "{source}: {errors}"
+                );
+            }
+        }
+    }
+}

@@ -392,20 +392,20 @@ impl ConcurrencyAnalyzer {
                         Severity::Error,
                         ErrorCode::E1707,
                         format!(
-                            "reference parameter `{}` is not supported in {context}",
+                            "reference parameter `{}` has an unsupported type for {context}",
                             param.name
                         ),
                     )
                     .with_label(Label::primary(
                         param.span,
-                        format!("`{mode}` parameter may live across suspension points"),
+                        format!("`{mode}` parameter type has no supported async borrow representation"),
                     ))
                     .with_label(Label::secondary(
                         owner_span,
                         format!("{context} parsed here"),
                     ))
                     .with_help(
-                        "pass by value or use Mutex<T>, AtomicI64, or channels for shared state",
+                        "async borrows support i64, f64, bool, String, array slots, and class slots; the caller must keep storage alive until task discharge, and Send/Sync checks still apply; pass other types by value",
                     ),
                 );
             }
@@ -706,6 +706,52 @@ fn run(t: Task<i64>) {
     }
 
     #[test]
+    fn async_reference_gate_matrix_and_diagnostic_counts() {
+        // Each parameter is visited once; rejected parameters emit one diagnostic.
+        for count in [1, 16, 64] {
+            for mode in ["&", "&mut"] {
+                for (ty, supported) in [
+                    ("i64", true),
+                    ("f64", true),
+                    ("bool", true),
+                    ("String", true),
+                    ("Array<String>", true),
+                    ("Box", true),
+                    ("GenericBox<String>", true),
+                    ("Choice", false),
+                    ("Readable", false),
+                    ("Option<String>", false),
+                    ("fn(i64) -> i64", false),
+                ] {
+                    let params = (0..count)
+                        .map(|i| format!("x{i}: {mode} {ty}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    for declaration in [
+                        format!("async fn read({params}) {{}}"),
+                        format!("class Reader {{ async fn read(self, {params}) {{}} }}"),
+                    ] {
+                        let source = format!(
+                            "class Box {{}} class GenericBox<T> {{}} enum Choice {{ A, B }} interface Readable {{ fn read(self); }} {declaration}"
+                        );
+                        let analyzer = analyze(&source);
+                        assert_eq!(
+                            analyzer.errors.len(),
+                            if supported { 0 } else { count },
+                            "{source}: {:?}",
+                            analyzer.errors
+                        );
+                        for error in &analyzer.errors {
+                            assert_eq!(error.code, ErrorCode::E1707);
+                            assert!(error.message.contains("unsupported type"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rejects_function_pointer_reference_parameter_in_async_function() {
         assert_error_contains(
             r#"
@@ -713,7 +759,7 @@ async fn read(x: & fn(i64) -> i64) {
 }
 "#,
             ErrorCode::E1707,
-            "reference parameter `x` is not supported in async function",
+            "reference parameter `x` has an unsupported type for async function",
         );
     }
 
@@ -727,7 +773,7 @@ class Box {
 }
 "#,
             ErrorCode::E1707,
-            "reference parameter `x` is not supported in async method",
+            "reference parameter `x` has an unsupported type for async method",
         );
     }
 

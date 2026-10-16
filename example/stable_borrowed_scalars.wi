@@ -1,5 +1,5 @@
-// Stable caller storage in an async frame. Async reference parameters remain
-// gated by E1707; this exercises the shared B2 storage with synchronous borrows.
+// Stable caller storage in an async frame. Async reference parameters are
+// supported too; this example exercises stable storage with synchronous borrows.
 fn increment(value: &mut i64) { value = value + 1; }
 fn read_float(value: &f64) -> f64 { return value; }
 fn read_bool(value: &bool) -> bool { return value; }
