@@ -78,6 +78,8 @@ pub(super) struct Captured {
     pub call_sites: Vec<(FunctionId, Span, Option<FunctionId>, String)>,
     pub witnesses: HashMap<FunctionId, Vec<Value>>,
     pub compiler_effects: HashMap<FunctionId, u8>,
+    // Keep operation sites separate so capability replacement scans stay bounded.
+    suspension_sites: HashMap<FunctionId, Vec<Value>>,
 }
 #[path = "flow.rs"]
 mod flow;
@@ -110,6 +112,14 @@ impl Captured {
                 }
             }
         }
+    }
+    pub fn channel_site(&mut self, function: FunctionId, span: Span, operation: &str) {
+        self.suspension_sites.entry(function).or_default().push(json!({
+            "effect": RuntimeEffects::MAY_SUSPEND.bits(),
+            "witness": {"kind":"runtime-capability", "certainty":"conservative-bound",
+                "cause":{"span":span,"operation":operation},
+                "reason":"May park the task when the channel cannot proceed; this is not evidence of blocking an OS thread."}
+        }));
     }
     pub fn capability(&mut self, function: FunctionId, bits: u8, span: Span, operation: &str) {
         let witnesses = self.witnesses.entry(function).or_default();
@@ -223,7 +233,12 @@ pub(super) fn finish(
                     .or_default() |= effects;
             }
         }
-        for (id, witnesses) in &captures[&unit].semantic.witnesses {
+        for (id, witnesses) in captures[&unit]
+            .semantic
+            .witnesses
+            .iter()
+            .chain(&captures[&unit].semantic.suspension_sites)
+        {
             let function = &functions[&resolve(unit, *id)].id;
             let mut witnesses = witnesses.clone();
             for witness in &mut witnesses {
@@ -250,7 +265,11 @@ pub(super) fn finish(
                     );
                 }
             }
-            result.witnesses.insert(function.clone(), witnesses);
+            result
+                .witnesses
+                .entry(function.clone())
+                .or_default()
+                .extend(witnesses);
         }
         for body in &captures[&unit].semantic.bodies {
             let function = functions
@@ -895,6 +914,7 @@ impl QuerySession {
                     ];
                     let mut evidence = BTreeMap::new();
                     let mut unknown_causes = Vec::new();
+                    let mut suspension_sites = Vec::new();
                     while let Some((j, via)) = queue.pop_front() {
                         let cause = &self.snapshot.functions[j];
                         if cause.unknown
@@ -923,6 +943,15 @@ impl QuerySession {
                                 {
                                     continue;
                                 }
+                                if effect == u64::from(RuntimeEffects::MAY_SUSPEND.bits())
+                                    && fact["witness"]["cause"]["operation"]
+                                        .as_str()
+                                        .is_some_and(|op| op.starts_with("channel-"))
+                                {
+                                    suspension_sites.push(json!({"effect":effect,"status":if fact["witness"]["cause"]["location"].is_object() {"conservative-bound"} else {"missing-source"},
+                                        "via_function":self.snapshot.functions[j].id,"witness":fact["witness"]}));
+                                    continue;
+                                }
                                 let entry = evidence.entry(effect).or_insert(Value::Null);
                                 if !entry.is_null()
                                     && !prefer_allocation(
@@ -948,10 +977,16 @@ impl QuerySession {
                             }
                         }
                     }
-                    let mut missing = evidence.values().any(|e| e["status"] == "missing-source");
+                    let mut missing = evidence
+                        .values()
+                        .chain(&suspension_sites)
+                        .any(|e| e["status"] == "missing-source");
                     for bit in 0..RuntimeEffects::BIT_COUNT {
                         let effect = RuntimeEffects::from_bit(bit).bits();
-                        if f.runtime_effects & effect == 0 {
+                        if f.runtime_effects & effect == 0
+                            || (effect == RuntimeEffects::MAY_SUSPEND.bits()
+                                && !suspension_sites.is_empty())
+                        {
                             continue;
                         }
                         evidence.entry(effect as u64).or_insert_with(|| {
@@ -964,8 +999,10 @@ impl QuerySession {
                                 }})
                         });
                     }
+                    let mut evidence: Vec<_> = evidence.into_values().collect();
+                    evidence.extend(suspension_sites);
                     json!({"status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
-                        "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence.into_values().collect::<Vec<_>>(),
+                        "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence,
                         "witness":witness, "compiler_witnesses":self.snapshot.semantic.witnesses.get(&f.id),
                         "meaning":"compiler facts and conservative runtime capability bounds; indirect-call bounds cover checked function values in this workspace, not arbitrary values supplied by future callers; external business effects and predicate feasibility are not implied"})
                 }
@@ -1372,6 +1409,35 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn channel_capture_keeps_summary_scans_bounded() {
+        for n in [1, 8, 64, 512] {
+            let mut captured = Captured::default();
+            let function = FunctionId::free("worker");
+            for _ in 0..n {
+                for operation in ["channel-send", "channel-recv"] {
+                    captured.channel_site(function, Span::dummy(), operation);
+                    captured.capability(
+                        function,
+                        RuntimeEffects::ALL.bits(),
+                        Span::dummy(),
+                        "builtin-method-call",
+                    );
+                }
+            }
+            assert_eq!(captured.suspension_sites[&function].len(), 2 * n);
+            assert_eq!(
+                captured.witnesses[&function].len(),
+                RuntimeEffects::BIT_COUNT as usize
+            );
+            println!(
+                "pairs={n}, stored sites={}, summary scan bound={}",
+                2 * n,
+                RuntimeEffects::BIT_COUNT
+            );
+        }
+    }
+
     #[test]
     fn unresolved_call_evidence_scales_with_sites_and_reachable_edges() {
         let directory =

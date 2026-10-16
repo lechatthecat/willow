@@ -3150,3 +3150,195 @@ fn module_selector_does_not_duplicate_its_own_name() {
         "{position}"
     );
 }
+
+#[test]
+fn channel_effect_sites_and_unresolved_callee_locations() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/channel_effect_witnesses.wi"),
+    )
+    .unwrap();
+    for name in ["exchange", "relay", "optional"] {
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+        assert_eq!(value["result"]["status"], "ok", "{value}");
+        assert!(
+            value["result"]["unknown_causes"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            value["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
+            0
+        );
+        let sites: Vec<_> = value["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e["witness"]["cause"]["operation"]
+                    .as_str()
+                    .is_some_and(|op| op.starts_with("channel-"))
+            })
+            .collect();
+        let expected = if name == "optional" {
+            vec![("channel-recv-opt", 7)]
+        } else {
+            vec![("channel-recv", 3), ("channel-send", 4)]
+        };
+        assert_eq!(sites.len(), expected.len(), "{value}");
+        for (site, (operation, line)) in sites.iter().zip(expected) {
+            assert_eq!(site["effect"], E::MAY_SUSPEND.bits());
+            assert_eq!(site["witness"]["cause"]["operation"], operation);
+            assert_eq!(site["witness"]["cause"]["location"]["path"], "src/main.wi");
+            assert_eq!(site["witness"]["cause"]["location"]["line"], line);
+            assert!(
+                site["witness"]["cause"]["location"]["column"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            let text =
+                String::from_utf8(f.run(&["effects", &format!("main::{name}")]).stdout).unwrap();
+            assert!(text.contains(operation), "{text}");
+            assert!(text.contains(&format!("src/main.wi:{line}:")), "{text}");
+        }
+    }
+    // With no supplied function value, this obligation remains unresolved.
+    fs::write(f.0.join("src/main.wi"), "fn apply(f: fn(i64) -> i64) -> i64 { return f(1); }\nfn unresolved_relay(f: fn(i64) -> i64) -> i64 { return apply(f); }\nfn main() {}\n").unwrap();
+    let value = f.json(&["effects", "main::unresolved_relay", "--explain"], 1);
+    let causes = value["result"]["unknown_causes"].as_array().unwrap();
+    assert!(
+        causes
+            .iter()
+            .all(|cause| cause["name"] != "unresolved_relay")
+    );
+    let cause = causes
+        .iter()
+        .find(|cause| cause["name"] == "apply")
+        .unwrap();
+    assert_eq!(cause["call_sites"][0]["operation"], "f");
+    assert_eq!(cause["call_sites"][0]["location"]["line"], 1);
+    assert_eq!(cause["call_sites"][0]["location"]["column"], 45);
+    let text = String::from_utf8(f.run(&["effects", "main::unresolved_relay"]).stdout).unwrap();
+    assert!(
+        text.contains("Unresolved call `f` at src/main.wi:1:45"),
+        "{text}"
+    );
+}
+
+#[test]
+fn channel_effect_site_counts_scale_linearly() {
+    let f = Fixture::new();
+    for n in [1, 8, 64] {
+        let body = "ch.send(1); ch.recv();".repeat(n);
+        fs::write(
+            f.0.join("src/main.wi"),
+            format!("fn worker(ch: Channel<i64>) {{ {body} }}\nfn main() {{}}\n"),
+        )
+        .unwrap();
+        let value = f.json(&["effects", "main::worker", "--all", "--explain"], 0);
+        let sites: Vec<_> = value["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e["witness"]["cause"]["operation"]
+                    .as_str()
+                    .is_some_and(|op| op.starts_with("channel-"))
+            })
+            .collect();
+        assert_eq!(sites.len(), 2 * n, "{value}");
+        let unique: std::collections::HashSet<_> = sites
+            .iter()
+            .map(|e| e["witness"]["cause"]["location"].to_string())
+            .collect();
+        assert_eq!(unique.len(), 2 * n);
+        println!(
+            "channel pairs={n}, witnesses={}, unique={}",
+            sites.len(),
+            unique.len()
+        );
+    }
+}
+
+#[test]
+fn channel_effect_types_async_and_nonchannel_controls() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        r#"
+fn boolean(ch: Channel<bool>) { ch.send(true); let v = ch.recv(); }
+fn floating(ch: Channel<f64>) { ch.send(1.0); let v = ch.recv(); }
+fn pointer(ch: Channel<String>, v: String) { ch.send(v); let x = ch.recv(); }
+async fn asynchronous(ch: Channel<i64>) { ch.send(1); let x = ch.recv_opt(); }
+fn closed(ch: Channel<i64>) { ch.close(); }
+class Custom { pub fn recv(self) -> i64 { return 1; } }
+fn custom(c: Custom) -> i64 { return c.recv(); }
+fn main() {}
+"#,
+    )
+    .unwrap();
+    for name in [
+        "boolean",
+        "floating",
+        "pointer",
+        "asynchronous",
+        "closed",
+        "custom",
+    ] {
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+        let sites: Vec<_> = value["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e["witness"]["cause"]["operation"]
+                    .as_str()
+                    .is_some_and(|op| op.starts_with("channel-"))
+            })
+            .collect();
+        assert_eq!(
+            sites.len(),
+            if matches!(name, "closed" | "custom") {
+                0
+            } else {
+                2
+            },
+            "{value}"
+        );
+        assert_eq!(
+            value["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
+            0,
+            "{value}"
+        );
+        for site in sites {
+            assert_eq!(site["effect"], E::MAY_SUSPEND.bits());
+        }
+    }
+}
+
+#[test]
+fn channel_effect_imported_generic_sites_are_unique() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/order.wi"), "module order;\npub fn exchange<T>(ch: Channel<i64>, tag: T) { ch.send(1); let x = ch.recv(); }\n").unwrap();
+    fs::write(f.0.join("src/main.wi"), "import order;\nfn main() { let a = Channel<i64>::new(); order::exchange(a, 1); order::exchange(a, true); }\n").unwrap();
+    let value = f.json(&["effects", "order::exchange", "--explain"], 0);
+    let sites: Vec<_> = value["result"]["effect_evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e["witness"]["cause"]["operation"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("channel-"))
+        })
+        .collect();
+    assert_eq!(sites.len(), 2, "{value}");
+    for site in sites {
+        assert_eq!(site["witness"]["cause"]["location"]["path"], "src/order.wi");
+    }
+}

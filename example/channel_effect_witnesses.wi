@@ -1,0 +1,21 @@
+// Channel sites remain visible together, including across a caller edge.
+fn exchange(inbox: Channel<i64>, reply: Channel<i64>) -> i64 {
+    let value = inbox.recv();
+    reply.send(value);
+    return value;
+}
+fn optional(inbox: Channel<i64>) { let value = inbox.recv_opt(); }
+fn relay(inbox: Channel<i64>, reply: Channel<i64>) -> i64 { return exchange(inbox, reply); }
+fn apply(f: fn(i64) -> i64) -> i64 { return f(1); }
+fn unresolved_relay(f: fn(i64) -> i64) -> i64 { return apply(f); }
+fn increment(n: i64) -> i64 { return n + 1; }
+fn main() {
+    let inbox = Channel<i64>::new();
+    let reply = Channel<i64>::new();
+    inbox.send(7);
+    println(relay(inbox, reply));
+    println(reply.recv());
+    inbox.close();
+    optional(inbox);
+    println(unresolved_relay(increment));
+}

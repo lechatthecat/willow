@@ -457,6 +457,21 @@ pub(crate) fn capture(
                         }
                         _ => 0,
                     };
+                    if let Some(intrinsic) = calls
+                        .get(&e.id())
+                        .and_then(|target| target.as_ref())
+                        .and_then(Intrinsic::from_function_id)
+                    {
+                        let operation = match intrinsic {
+                            Intrinsic::ChannelSend => Some("channel-send"),
+                            Intrinsic::ChannelRecv => Some("channel-recv"),
+                            Intrinsic::ChannelRecvOpt => Some("channel-recv-opt"),
+                            _ => None,
+                        };
+                        if let Some(operation) = operation {
+                            result.semantic.channel_site(id, e.span(), operation);
+                        }
+                    }
                     let operation = match e {
                         Expr::New(_) => "object-allocation",
                         Expr::ArrayLiteral(..) => "array-allocation",

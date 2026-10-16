@@ -445,6 +445,21 @@ pub(super) fn aggregate(
         }
         witnesses.entry(id).or_default().extend(values);
     }
+    // Channel operations are source sites, not one observation per generic
+    // instantiation. Preserve source order with an expected-linear hash pass.
+    for values in witnesses.values_mut() {
+        let mut seen = std::collections::HashSet::new();
+        values.retain(|value| {
+            let cause = &value["witness"]["cause"];
+            if !cause["operation"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("channel-"))
+            {
+                return true;
+            }
+            seen.insert(cause.to_string())
+        });
+    }
     semantic.witnesses = witnesses;
 }
 
