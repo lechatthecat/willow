@@ -543,14 +543,25 @@ fn effects_human_decodes_masks_and_retains_source_evidence() {
     );
     for extra in [vec![], vec!["--all"], vec!["--explain"]] {
         let mut args = vec!["effects", "main::main"];
-        args.extend(extra);
+        args.extend(extra.clone());
         let out = f.run(&args);
         let text = String::from_utf8(out.stdout).unwrap();
         assert!(text.contains("may-allocate"), "{text}");
         assert!(text.contains("may-panic"), "{text}");
         assert!(text.contains("src/main.wi:2:"), "{text}");
-        assert!(text.contains("Runtime evidence for main::main"), "{text}");
-        assert!(text.contains("conservative"), "{text}");
+        assert!(
+            text.contains(if extra.contains(&"--explain") {
+                "Runtime evidence for main::main"
+            } else {
+                "Evidence for main::main"
+            }),
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("external business effects"),
+            extra.contains(&"--explain"),
+            "{text}"
+        );
     }
     let out = f.run(&["effects", "main::main", "--format=json"]);
     let value: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -3607,4 +3618,38 @@ fn direct_max_chars_error_paths_and_help() {
         );
     }
     assert!(text.contains("empty stdout"));
+}
+
+#[test]
+fn effects_compact_worker_is_smaller_than_source_and_explain_keeps_details() {
+    let f = Fixture::new();
+    let source = include_str!("fixtures/semantic_cli_effects_pool.wi");
+    fs::write(f.0.join("src/pool.wi"), source).unwrap();
+    fs::write(f.0.join("src/main.wi"), "import pool; fn main() {}\n").unwrap();
+    let out = f.run(&["effects", "pool::worker"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    let detailed = f.run(&["effects", "pool::worker", "--explain"]);
+    assert!(detailed.status.success());
+    let detailed = String::from_utf8(detailed.stdout).unwrap();
+    eprintln!(
+        "worker source={}B compact={}B explain={}B",
+        source.len(),
+        text.len(),
+        detailed.len()
+    );
+    assert!(text.len() < source.len(), "{text}");
+    assert_eq!(text.matches("operation=channel-send").count(), 5, "{text}");
+    assert_eq!(text.matches("May park the task").count(), 1, "{text}");
+    assert!(!text.contains("external business effects"));
+    assert!(detailed.contains("Local evidence"));
+    assert!(detailed.contains("external business effects"));
+    assert!(detailed.matches("May park the task").count() > 1);
+    let json = f.json(&["effects", "pool::worker", "--explain"], 0);
+    assert!(json["result"]["compiler_witnesses"].is_array());
+    assert!(json["result"]["effect_evidence"].is_array());
 }

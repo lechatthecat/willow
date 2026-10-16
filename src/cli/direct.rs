@@ -427,7 +427,7 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
         }
     }
     if result["runtime_effects"].is_number() {
-        effect_lines(result, options.all, &mut lines);
+        effect_lines(result, options.all, options.explain, &mut lines);
     }
     if let Some(nodes) = result["impact"]["nodes"].as_array() {
         lines.push(format!("Affected functions: {}", nodes.len()));
@@ -481,7 +481,7 @@ fn effect_names(bits: &Value) -> String {
     }
 }
 
-fn effect_lines(result: &Value, all: bool, lines: &mut Vec<String>) {
+fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String>) {
     if let Some(causes) = result["unknown_causes"].as_array() {
         for cause in causes.iter().take(if all { usize::MAX } else { 50 }) {
             lines.push(format!(
@@ -527,16 +527,22 @@ fn effect_lines(result: &Value, all: bool, lines: &mut Vec<String>) {
         "Compiler effects: {}",
         effect_names(&result["compiler_effects"])
     ));
-    if ["runtime_effects", "compiler_effects"].iter().any(|key| {
-        result[key].as_u64().is_some_and(|bits| {
-            bits & u64::from(willow_abi::RuntimeEffects::NO_PREEMPT_REGION.bits()) != 0
+    if explain
+        && ["runtime_effects", "compiler_effects"].iter().any(|key| {
+            result[key].as_u64().is_some_and(|bits| {
+                bits & u64::from(willow_abi::RuntimeEffects::NO_PREEMPT_REGION.bits()) != 0
+            })
         })
-    }) {
+    {
         lines.push("Preemption evidence is conservative (for example, a loop or recursion); it does not mean the entire function disables preemption.".into());
     }
     let target = result["selected"]["selector"]
         .as_str()
         .unwrap_or("selected function");
+    if !explain {
+        compact_effect_evidence(result, target, all, lines);
+        return;
+    }
     for (label, key) in [
         ("Runtime evidence", "effect_evidence"),
         (
@@ -585,6 +591,103 @@ fn effect_lines(result: &Value, all: bool, lines: &mut Vec<String>) {
         }
     }
     lines.push(result["meaning"].as_str().unwrap_or("").into());
+}
+
+// Preserve input order while indexing identities and reasons: expected O(input bytes).
+fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut Vec<String>) {
+    use std::collections::{HashMap, HashSet};
+    #[derive(Default)]
+    struct Entry {
+        bits: u64,
+        details: Vec<String>,
+        seen: HashSet<String>,
+    }
+    let mut identities = HashMap::new();
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut reason_ids = HashMap::new();
+    let mut reasons = Vec::new();
+    for fact in ["effect_evidence", "compiler_witnesses"]
+        .into_iter()
+        .flat_map(|key| result[key].as_array().into_iter().flatten())
+    {
+        let witness = &fact["witness"];
+        let cause = &witness["cause"];
+        let index = if let (Some(operation), true) =
+            (cause["operation"].as_str(), cause["location"].is_object())
+        {
+            *identities
+                .entry((operation, cause["location"].to_string()))
+                .or_insert_with(|| {
+                    entries.push(Entry::default());
+                    entries.len() - 1
+                })
+        } else {
+            // Missing locations must not merge independent transitive/unknown evidence.
+            entries.push(Entry::default());
+            entries.len() - 1
+        };
+        if !all && index >= 50 {
+            continue;
+        }
+        let entry = &mut entries[index];
+        entry.bits |= fact["effect"].as_u64().unwrap_or(0);
+        for (name, value) in [
+            ("status", &fact["status"]),
+            ("kind", &witness["kind"]),
+            ("via", &fact["via_function"]),
+            ("target", &witness["target"]),
+            ("owner", &witness["owner"]),
+            ("operation", &cause["operation"]),
+        ] {
+            if let Some(value) = value.as_str() {
+                let detail = format!("{name}={value}");
+                if entry.seen.insert(detail.clone()) {
+                    entry.details.push(detail);
+                }
+            }
+        }
+        if cause["location"].is_object() {
+            let detail = format!("at {}", location(&cause["location"]));
+            if entry.seen.insert(detail.clone()) {
+                entry.details.push(detail);
+            }
+        }
+        for reason in [fact["reason"].as_str(), witness["reason"].as_str()]
+            .into_iter()
+            .flatten()
+        {
+            let id = *reason_ids.entry(reason).or_insert_with(|| {
+                reasons.push(reason);
+                reasons.len()
+            });
+            let detail = format!("reason=[{id}]");
+            if entry.seen.insert(detail.clone()) {
+                entry.details.push(detail);
+            }
+        }
+    }
+    lines.push(format!("Evidence for {target}: {}", entries.len()));
+    let shown = if all {
+        entries.len()
+    } else {
+        entries.len().min(50)
+    };
+    for entry in &entries[..shown] {
+        lines.push(format!(
+            "  {}: {}",
+            effect_names(&Value::from(entry.bits)),
+            entry.details.join("; ")
+        ));
+    }
+    if shown < entries.len() {
+        lines.push(format!(
+            "{} omitted; use --all to show all evidence",
+            entries.len() - shown
+        ));
+    }
+    for (index, reason) in reasons.iter().enumerate() {
+        lines.push(format!("  [{}] {reason}", index + 1));
+    }
 }
 
 // A boundary ends a complete human entry or JSON field/array element.
@@ -1001,7 +1104,7 @@ mod tests {
                 .collect();
             for all in [false, true] {
                 let mut lines = Vec::new();
-                effect_lines(&json!({"unknown_causes":causes}), all, &mut lines);
+                effect_lines(&json!({"unknown_causes":causes}), all, false, &mut lines);
                 let shown = if all { count } else { count.min(50) };
                 assert_eq!(
                     lines
@@ -1034,6 +1137,57 @@ mod tests {
         }
     }
     #[test]
+    fn compact_effect_evidence_merges_sites_and_interns_reasons() {
+        for count in [1, 16, 64, 256, 1024] {
+            let facts: Vec<_> = (0..count).map(|i| json!({"effect":1,
+                "witness":{"kind":"runtime-capability","reason":"shared reason",
+                    "cause":{"operation":"send","location":{"path":"pool.wi","line":i+1,"column":1}}}})).collect();
+            let mut runtime = facts.clone();
+            for fact in &mut runtime {
+                fact["effect"] = json!(4);
+            }
+            let value = json!({"effect_evidence":runtime,"compiler_witnesses":facts});
+            for all in [false, true] {
+                let mut lines = Vec::new();
+                compact_effect_evidence(&value, "pool::worker", all, &mut lines);
+                let text = lines.join("\n");
+                let shown = if all { count } else { count.min(50) };
+                assert_eq!(text.matches("operation=send").count(), shown);
+                assert_eq!(text.matches("may-allocate, may-suspend").count(), shown);
+                assert_eq!(text.matches("shared reason").count(), 1);
+                assert_eq!(text.matches("reason=[1]").count(), shown);
+                assert_eq!(lines.len(), shown + 2 + usize::from(shown < count));
+            }
+        }
+        let fact = json!({"effect":1,"reason":"outer","witness":{"reason":"inner",
+            "cause":{"operation":"send","location":{"path":"a.wi","line":1,"column":1}}}});
+        for count in [1, 16, 64, 256, 1024] {
+            let repeated = vec![fact.clone(); count];
+            let value = json!({"effect_evidence":repeated,"compiler_witnesses":repeated});
+            let mut lines = Vec::new();
+            compact_effect_evidence(&value, "worker", true, &mut lines);
+            assert_eq!(lines.len(), 4); // header, one site, two distinct reasons
+            assert_eq!(lines[0], "Evidence for worker: 1");
+        }
+        let mut other = fact.clone();
+        other["witness"]["cause"]["operation"] = json!("recv");
+        let mut file = fact.clone();
+        file["witness"]["cause"]["location"]["path"] = json!("b.wi");
+        let mut column = fact.clone();
+        column["witness"]["cause"]["location"]["column"] = json!(2);
+        let value = json!({"effect_evidence":[fact,other,file,column,
+            {"effect":1,"status":"missing-witness"},{"effect":4,"status":"missing-witness"}]});
+        let mut lines = Vec::new();
+        compact_effect_evidence(&value, "worker", true, &mut lines);
+        assert_eq!(lines[0], "Evidence for worker: 6");
+        let text = lines.join("\n");
+        assert_eq!(text.matches("outer").count(), 1);
+        assert_eq!(text.matches("inner").count(), 1);
+        assert_eq!(text.matches("reason=[1]; reason=[2]").count(), 4);
+        assert_eq!(text.matches("missing-witness").count(), 2);
+    }
+
+    #[test]
     fn effect_evidence_output_is_bounded_and_all_is_linear() {
         for count in [0, 1, 16, 64, 256, 1024] {
             let facts: Vec<_> = (0..count).map(|i| json!({"effect":1,"witness":{"kind":"runtime-capability","cause":{"operation":format!("op-{i}"),"location":{"path":"main.wi","line":i+1,"column":1}}}})).collect();
@@ -1041,7 +1195,7 @@ mod tests {
                 json!({"runtime_effects":1,"compiler_effects":0,"compiler_witnesses":facts});
             for all in [false, true] {
                 let mut lines = Vec::new();
-                effect_lines(&value, all, &mut lines);
+                effect_lines(&value, all, false, &mut lines);
                 let shown = if all { count } else { count.min(50) };
                 assert_eq!(
                     lines
@@ -1054,7 +1208,7 @@ mod tests {
                     lines.iter().any(|l| l.contains("omitted; use --all")),
                     !all && count > 50
                 );
-                assert_eq!(lines.len(), 5 + shown + usize::from(!all && count > 50));
+                assert_eq!(lines.len(), 3 + shown + usize::from(!all && count > 50));
             }
         }
         let bits = willow_abi::RuntimeEffects::NO_PREEMPT_REGION.bits();
@@ -1063,6 +1217,7 @@ mod tests {
         effect_lines(
             &json!({"runtime_effects":bits,"compiler_effects":0}),
             false,
+            true,
             &mut lines,
         );
         assert!(

@@ -1,0 +1,50 @@
+import std::collections::Array;
+// Worker classifies a batch and reports each result through a channel.
+// The arithmetic stages deliberately have no runtime effects of their own.
+pub fn worker(jobs: Array<i64>, output: Channel<i64>) {
+    for job in jobs {
+        let magnitude = if job < 0 { -job } else { job };
+        let hundreds = magnitude / 100;
+        let remainder = magnitude - hundreds * 100;
+        let tens = remainder / 10;
+        let units = remainder - tens * 10;
+        let digit_sum = hundreds + tens + units;
+        let weighted = hundreds * 3 + tens * 2 + units;
+        let checksum = weighted - (weighted / 7) * 7;
+        let lower = magnitude / 2;
+        let upper = magnitude - lower;
+        let spread = upper - lower;
+        let score = digit_sum * 10 + checksum + spread;
+        if job < 0 {
+            let penalty = score + magnitude;
+            let normalized = penalty / 2;
+            let adjusted = normalized + checksum;
+            let result = -adjusted;
+            output.send(result);
+        } else if magnitude == 0 {
+            let baseline = score + 100;
+            let normalized = baseline / 2;
+            let adjusted = normalized + digit_sum;
+            let result = adjusted + 1;
+            output.send(result);
+        } else if checksum == 0 {
+            let bonus = score + hundreds;
+            let normalized = bonus * 2;
+            let adjusted = normalized + tens;
+            let result = adjusted + units;
+            output.send(result);
+        } else if digit_sum > 10 {
+            let bonus = score + units;
+            let normalized = bonus * 3;
+            let adjusted = normalized - hundreds;
+            let result = adjusted + checksum;
+            output.send(result);
+        } else {
+            let baseline = score + tens;
+            let normalized = baseline / 3;
+            let adjusted = normalized + hundreds;
+            let result = adjusted + spread;
+            output.send(result);
+        }
+    }
+}
