@@ -1080,8 +1080,18 @@ mod tests {
                     let expression = format!("{}1{}", prefix.repeat(5_000), suffix.repeat(5_000));
                     drop(parse(&format!("fn main() {{ let x = {expression}; }}")));
                 }
-                let body = format!("{}return;{}", "if true {".repeat(5_000), "}".repeat(5_000));
-                drop(parse(&format!("fn main() {{{body}}}")));
+                // willow-w1tl: every statement block nesting shape, including
+                // `if let` scrutinees that recurse through parse_let_head.
+                for (prefix, suffix) in [
+                    ("if true {", "}"),
+                    ("if true {} else {", "}"),
+                    ("if let x = 1 {", "}"),
+                    ("while let x = 1 {", "}"),
+                    ("if let x = match 1 { _ => { ", "} } {}"),
+                ] {
+                    let body = format!("{}return;{}", prefix.repeat(5_000), suffix.repeat(5_000));
+                    drop(parse(&format!("fn main() {{{body}}}")));
+                }
                 for (prefix, suffix) in [("Array<", ">"), ("fn() -> ", ""), ("closure(", ")")] {
                     let ty = format!("{}i64{}", prefix.repeat(10_000), suffix.repeat(10_000));
                     drop(parse(&format!("fn f(x: {ty}) {{}}")));

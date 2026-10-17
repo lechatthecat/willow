@@ -294,14 +294,244 @@ pub fn function(arguments: TokenStream, input: TokenStream) -> TokenStream {
     quote!(#function #continuation).into()
 }
 
+/// Parser methods lowered to continuations. Every method on a `Parser` call
+/// cycle must be listed: an unlisted one re-enters the synchronous wrapper, so
+/// each nesting level starts a fresh executor on the native stack.
+const PARSER_METHODS: &str = "parse, parse_add, parse_and, parse_assign, parse_await, parse_bitwise, parse_block, parse_block_inner, parse_call_arg, parse_call_args_after_lparen, parse_class, parse_cmp, parse_constructor, parse_control_head, parse_enum_decl, parse_expr, parse_expr_before_as, parse_expr_stmt, parse_field, parse_field_assign, parse_fn, parse_for, parse_grouped_import, parse_if, parse_if_expr, parse_if_statement_block, parse_if_value, parse_import, parse_interface, parse_interface_method, parse_item, parse_lambda, parse_lambda_inner, parse_let, parse_let_head, parse_lock, parse_match_expr, parse_method, parse_module_decl, parse_module_path, parse_mul, parse_new, parse_object_literal_fields, parse_or, parse_param, parse_pattern, parse_postfix, parse_pow, parse_primary, parse_range, parse_receiver_direct_assign, parse_return, parse_select, parse_static_call, parse_std_qualified_expr, parse_stmt, parse_super_init, parse_ternary, parse_tuple_binding, parse_type, parse_type_path, parse_unary, parse_while, try_parse_generic_static_call";
+
 /// Shared continuation boundary for the parser call graph.
 #[proc_macro_attribute]
 pub fn parser(_: TokenStream, input: TokenStream) -> TokenStream {
-    methods("parse, parse_add, parse_and, parse_assign, parse_await, parse_bitwise, parse_block, parse_block_inner, parse_call_arg, parse_call_args_after_lparen, parse_class, parse_cmp, parse_constructor, parse_control_head, parse_enum_decl, parse_expr, parse_expr_before_as, parse_expr_stmt, parse_field, parse_field_assign, parse_fn, parse_for, parse_grouped_import, parse_if, parse_if_expr, parse_if_value, parse_import, parse_interface, parse_interface_method, parse_item, parse_lambda, parse_lambda_inner, parse_let, parse_lock, parse_match_expr, parse_method, parse_module_decl, parse_module_path, parse_mul, parse_new, parse_object_literal_fields, parse_or, parse_param, parse_pattern, parse_postfix, parse_pow, parse_primary, parse_range, parse_receiver_direct_assign, parse_return, parse_select, parse_static_call, parse_std_qualified_expr, parse_stmt, parse_super_init, parse_ternary, parse_tuple_binding, parse_type, parse_type_path, parse_unary, parse_while, try_parse_generic_static_call".parse().expect("static continuation names"), input)
+    methods(
+        PARSER_METHODS.parse().expect("static continuation names"),
+        input,
+    )
 }
+
+/// Type checker methods lowered to continuations.
+const CHECKER_METHODS: &str = "absorb_body, block_diverges, check_all_paths_return, check_array_literal, check_array_literal_expecting, check_array_literal_type, check_array_method_call, check_async_capture, check_async_task_send, check_atomic_method_call, check_block, check_block_scope, check_call_arg_against_param, check_call_args_against_param_infos, check_class, check_class_implements, check_class_inheritance, check_concurrency_method_call, check_constructor, check_expr, check_expr_expecting, check_expr_expecting_inner, check_expr_inner, check_fn_arg_with_param_context, check_format_call, check_frozen_map_method_call, check_function, check_index, check_interface, check_interface_default_body, check_interpolation, check_lambda, check_lambda_body, check_lambda_in_context, check_lambda_scoped, check_lambda_expecting, check_lambda_with_context, check_lambda_with_context_inner, check_lambda_with_param_context, check_lock_method_call, check_lock_stmt, check_map_method_call, check_match_body, check_match_body_inner, check_match_expr, check_method, check_method_call_expecting, check_module_program, check_new, check_object_literal, check_operator_tree, check_option_result_method_call, check_panic_interpolation, check_program, check_program_items, check_range, check_receiver_method_call, check_reference_argument, check_select, check_source_type_access, check_static_field_assign, check_static_forward_references, check_static_property_initializers, check_stmt, check_super_init, check_super_method_call, check_ternary_expecting, check_try_propagate, check_value_arg_type, check_value_call_args, class_info_from_decl, construct_static_variant_call, construct_variant_call, expr_diverges, is_send, is_sync, is_task_send, marker_holds, named_marker_holds, normalize_decl_param_infos, normalize_decl_type, normalize_param_infos, normalize_param_types, normalize_type, normalize_type_inner, reference_place_info, register_class, register_enum, register_interface, register_module, register_module_impl, register_module_type_signatures, register_module_with_id, register_prelude_enum, register_prelude_interface, resolve_fully_qualified_std_module_call, resolve_interface_method, resolve_method, resolve_static_call, stmt_diverges, validate_type";
 
 /// Shared continuation boundary for the checker call graph.
 #[proc_macro_attribute]
 pub fn checker(_: TokenStream, input: TokenStream) -> TokenStream {
-    methods("absorb_body, block_diverges, check_all_paths_return, check_array_literal, check_array_literal_expecting, check_array_literal_type, check_array_method_call, check_async_capture, check_async_task_send, check_atomic_method_call, check_block, check_block_scope, check_call_arg_against_param, check_call_args_against_param_infos, check_class, check_class_implements, check_class_inheritance, check_concurrency_method_call, check_constructor, check_expr, check_expr_expecting, check_expr_expecting_inner, check_expr_inner, check_fn_arg_with_param_context, check_format_call, check_frozen_map_method_call, check_function, check_index, check_interface, check_interface_default_body, check_interpolation, check_lambda, check_lambda_body, check_lambda_in_context, check_lambda_scoped, check_lambda_expecting, check_lambda_with_context, check_lambda_with_context_inner, check_lambda_with_param_context, check_lock_method_call, check_lock_stmt, check_map_method_call, check_match_body, check_match_body_inner, check_match_expr, check_method, check_method_call_expecting, check_module_program, check_new, check_object_literal, check_operator_tree, check_option_result_method_call, check_panic_interpolation, check_program, check_program_items, check_range, check_receiver_method_call, check_reference_argument, check_select, check_source_type_access, check_static_field_assign, check_static_forward_references, check_static_property_initializers, check_stmt, check_super_init, check_super_method_call, check_ternary_expecting, check_try_propagate, check_value_arg_type, check_value_call_args, class_info_from_decl, construct_static_variant_call, construct_variant_call, expr_diverges, is_send, is_sync, is_task_send, marker_holds, named_marker_holds, normalize_decl_param_infos, normalize_decl_type, normalize_param_infos, normalize_param_types, normalize_type, normalize_type_inner, reference_place_info, register_class, register_enum, register_interface, register_module, register_module_impl, register_module_type_signatures, register_module_with_id, register_prelude_enum, register_prelude_interface, resolve_fully_qualified_std_module_call, resolve_interface_method, resolve_method, resolve_static_call, stmt_diverges, validate_type".parse().expect("static continuation names"), input)
+    methods(
+        CHECKER_METHODS.parse().expect("static continuation names"),
+        input,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    //! Guard the continuation name lists against the call graphs they lower.
+    use super::{CHECKER_METHODS, PARSER_METHODS};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use syn::parse::Parser as _;
+    use syn::visit_mut::{self, VisitMut};
+    use syn::{Expr, ImplItem};
+
+    /// `self.m(..)` and `Self::m(..)` callees, including inside macro
+    /// arguments that parse as expressions (a superset of the macros the
+    /// lowering rewrites, so the graph never misses a call edge).
+    struct Callees(BTreeSet<String>);
+    impl VisitMut for Callees {
+        fn visit_expr_method_call_mut(&mut self, call: &mut syn::ExprMethodCall) {
+            if matches!(&*call.receiver, Expr::Path(p) if p.path.is_ident("self")) {
+                self.0.insert(call.method.to_string());
+            }
+            visit_mut::visit_expr_method_call_mut(self, call);
+        }
+        fn visit_expr_call_mut(&mut self, call: &mut syn::ExprCall) {
+            if let Expr::Path(p) = &*call.func
+                && let [owner, method] = &p.path.segments.iter().collect::<Vec<_>>()[..]
+                && owner.ident == "Self"
+            {
+                self.0.insert(method.ident.to_string());
+            }
+            visit_mut::visit_expr_call_mut(self, call);
+        }
+        fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
+            let parser = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated;
+            if let Ok(arguments) = parser.parse2(mac.tokens.clone()) {
+                for mut argument in arguments {
+                    self.visit_expr_mut(&mut argument);
+                }
+            }
+        }
+    }
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Method -> callees over every `impl <ty>` block below `dir`.
+    fn call_graph(dir: &str, ty: &str) -> BTreeMap<String, BTreeSet<String>> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(dir);
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        let mut graph = BTreeMap::<String, BTreeSet<String>>::new();
+        for path in files {
+            let file = syn::parse_file(&std::fs::read_to_string(&path).unwrap())
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            for item in file.items {
+                let syn::Item::Impl(implementation) = item else {
+                    continue;
+                };
+                if !matches!(&*implementation.self_ty, syn::Type::Path(p) if p.path.is_ident(ty)) {
+                    continue;
+                }
+                for item in implementation.items {
+                    let ImplItem::Fn(mut method) = item else {
+                        continue;
+                    };
+                    let mut callees = Callees(BTreeSet::new());
+                    callees.visit_block_mut(&mut method.block);
+                    graph
+                        .entry(method.sig.ident.to_string())
+                        .or_default()
+                        .extend(callees.0);
+                }
+            }
+        }
+        graph
+    }
+
+    /// Unlisted methods sharing a strongly connected component with a listed
+    /// one. Such a method calls a listed method's synchronous wrapper, so each
+    /// trip around the cycle nests another executor on the native stack.
+    /// Tarjan's algorithm keeps this O(methods + calls).
+    fn boundary_leaks(
+        graph: &BTreeMap<String, BTreeSet<String>>,
+        listed: &str,
+    ) -> BTreeSet<String> {
+        let listed: BTreeSet<&str> = listed.split(',').map(str::trim).collect();
+        let names: Vec<&String> = graph.keys().collect();
+        let index_of: BTreeMap<&str, usize> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), i))
+            .collect();
+        let edges: Vec<Vec<usize>> = names
+            .iter()
+            .map(|n| {
+                graph[*n]
+                    .iter()
+                    .filter_map(|c| index_of.get(c.as_str()).copied())
+                    .collect()
+            })
+            .collect();
+        let (mut index, mut low, mut on_stack) = (
+            vec![usize::MAX; names.len()],
+            vec![0; names.len()],
+            vec![false; names.len()],
+        );
+        let (mut next, mut stack, mut leaks) = (0, Vec::new(), BTreeSet::new());
+        for start in 0..names.len() {
+            if index[start] != usize::MAX {
+                continue;
+            }
+            // Explicit (node, next edge) frames instead of recursion.
+            let mut frames = vec![(start, 0)];
+            index[start] = next;
+            low[start] = next;
+            next += 1;
+            stack.push(start);
+            on_stack[start] = true;
+            while let Some(&mut (node, ref mut edge)) = frames.last_mut() {
+                if let Some(&child) = edges[node].get(*edge) {
+                    *edge += 1;
+                    if index[child] == usize::MAX {
+                        index[child] = next;
+                        low[child] = next;
+                        next += 1;
+                        stack.push(child);
+                        on_stack[child] = true;
+                        frames.push((child, 0));
+                    } else if on_stack[child] {
+                        low[node] = low[node].min(index[child]);
+                    }
+                    continue;
+                }
+                frames.pop();
+                if let Some(&(parent, _)) = frames.last() {
+                    low[parent] = low[parent].min(low[node]);
+                }
+                if low[node] == index[node] {
+                    let mut component = Vec::new();
+                    loop {
+                        let member = stack.pop().unwrap();
+                        on_stack[member] = false;
+                        component.push(names[member].as_str());
+                        if member == node {
+                            break;
+                        }
+                    }
+                    if component.iter().any(|m| listed.contains(m)) {
+                        leaks.extend(
+                            component
+                                .into_iter()
+                                .filter(|m| !listed.contains(m))
+                                .map(str::to_owned),
+                        );
+                    }
+                }
+            }
+        }
+        leaks
+    }
+
+    #[test]
+    fn parser_call_cycles_are_fully_lowered() {
+        // willow-w1tl: parse_if_statement_block and parse_let_head were
+        // missing, costing a fresh executor per nested `if` level.
+        let leaks = boundary_leaks(&call_graph("src/parser", "Parser"), PARSER_METHODS);
+        assert!(leaks.is_empty(), "add to PARSER_METHODS: {leaks:?}");
+    }
+
+    #[test]
+    fn checker_call_cycle_leaks_are_only_the_known_ones() {
+        // Tracked by willow-5gke; remove names here as they are lowered.
+        let known: BTreeSet<String> = [
+            "check_deferred_lambdas_plainly",
+            "check_generic_call",
+            "check_generic_call_parts",
+            "check_lambda_for_callable",
+            "check_match_guard",
+            "instantiate_class",
+            "instantiation_bindings",
+            "marker_holds_with_reason",
+            "reject_constant_call",
+            "resolve_i64_overflow_method",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let leaks = boundary_leaks(&call_graph("src/semantic", "TypeChecker"), CHECKER_METHODS);
+        assert_eq!(leaks, known);
+    }
+
+    #[test]
+    fn boundary_leaks_reports_only_unlisted_members_of_listed_cycles() {
+        let graph: BTreeMap<String, BTreeSet<String>> = [
+            ("a", vec!["helper"]),
+            ("helper", vec!["a"]),
+            ("b", vec!["b"]),
+            ("x", vec!["y"]),
+            ("y", vec!["x", "a"]),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.into_iter().map(str::to_owned).collect()))
+        .collect();
+        let leaks = boundary_leaks(&graph, "a, b");
+        assert_eq!(leaks, BTreeSet::from(["helper".to_owned()]));
+    }
 }
