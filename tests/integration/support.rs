@@ -970,6 +970,71 @@ impl TestProject {
         output
     }
 
+    /// Run the compiled binary `runs` times with `env`, `lanes` processes at a
+    /// time, and require every run to exit within `timeout` printing exactly
+    /// `expected`.
+    ///
+    /// The concurrency is part of the perspective rather than a speed-up: a
+    /// process-exit stall needs the machine contended before it shows up at
+    /// all, which is why it reached CI and not a developer's single run
+    /// (willow-ihr5). Reports the failing run's index and output.
+    pub(super) fn run_repeatedly_with_env_timeout(
+        &self,
+        env: &[(&str, &str)],
+        expected: &str,
+        runs: usize,
+        lanes: usize,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let binary = self.bin_path.clone();
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let lanes: Vec<_> = (0..lanes.max(1))
+                .map(|_| {
+                    let (binary, env, next) = (&binary, &env, &next);
+                    scope.spawn(move || {
+                        loop {
+                            let run = next.fetch_add(1, Ordering::Relaxed);
+                            if run >= runs {
+                                return Ok(());
+                            }
+                            let child = Command::new(binary)
+                                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .spawn()
+                                .expect("failed to run binary");
+                            let (output, timed_out) = wait_with_timeout(child, timeout);
+                            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                            if timed_out {
+                                return Err(format!(
+                                    "run {run} of {runs} did not exit within {timeout:?} \
+                                     with {env:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                                ));
+                            }
+                            if !output.status.success() || stdout != expected {
+                                return Err(format!(
+                                    "run {run} of {runs} exited {:?} with {env:?}\n\
+                                     stdout:\n{stdout}\nstderr:\n{stderr}",
+                                    output.status.code()
+                                ));
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for lane in lanes {
+                lane.join().expect("run lane panicked")?;
+            }
+            Ok(())
+        })
+    }
+
     /// [`Self::compile`] with extra COMPILER environment variables, so a
     /// multi-file project can be built twice under different backend settings.
     pub(super) fn compile_with_env(

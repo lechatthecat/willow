@@ -54,6 +54,7 @@ pub mod blocking;
 mod borrow_migration_probe;
 pub mod cancellation;
 pub mod channel;
+pub(crate) mod exit;
 pub(crate) mod failure;
 pub mod frame_lifetime;
 pub(crate) mod frame_reclaim;
@@ -171,7 +172,11 @@ pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn main(argc: i32, argv: *mut *mut c_char) -> i32 {
     runtime_start(argc, argv);
-    0
+    // Returning here would hand the exit to the CRT, which terminates every
+    // still-running runtime thread and then takes teardown locks those
+    // threads may have been holding — a deadlock that stranded two Windows CI
+    // jobs (willow-ihr5). The runtime owns its own exit instead.
+    exit::terminate_without_teardown(0)
 }
 
 #[cfg(test)]

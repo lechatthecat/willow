@@ -17,7 +17,10 @@ pub(crate) fn fatal_invariant(message: &str) -> ! {
 #[cold]
 pub(crate) fn resource_exhausted(message: std::fmt::Arguments<'_>) -> ! {
     diagnostic("resource exhausted", message);
-    std::process::exit(1);
+    // Thread exhaustion is reported from a running runtime, so this cannot
+    // hand the exit to a teardown that other runtime threads can block
+    // (willow-ihr5).
+    crate::exit::terminate_without_teardown(1);
 }
 
 #[inline]

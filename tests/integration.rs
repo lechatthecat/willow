@@ -190,6 +190,8 @@ mod panic_recover_matrix;
 mod panic_recover_review;
 #[path = "integration/panic_recover_stress.rs"]
 mod panic_recover_stress;
+#[path = "integration/process_exit_teardown.rs"]
+mod process_exit_teardown;
 #[path = "integration/runtime.rs"]
 mod runtime;
 #[path = "integration/runtime_safety_matrix.rs"]
