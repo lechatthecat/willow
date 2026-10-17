@@ -1,13 +1,12 @@
 // Module constants accept scalar and String literals.
-// Return an array from a function when a reusable array value is needed.
-import std::collections::Array;
-
-fn words() -> Array<String> {
-    return ["alpha", "beta"];
+// Build a constant array once as a frozen class static property: a function
+// returning an array literal would allocate a new array on every call.
+class Words {
+    pub static values: FrozenArray<String> = ["alpha", "beta"].freeze();
 }
 
 fn main() {
-    let values = words();
+    let values = Words::values;
     println(values[0]);
-    println(values[1]);
+    println(Words::values[1]);
 }

@@ -134,14 +134,16 @@ impl Parser {
         }
     }
 
-    pub(super) fn parse_item(&mut self) -> Result<Item, Diagnostic> {
+    /// `Ok(None)`: the item was consumed but rejected, with its diagnostic
+    /// already recorded in `recovered_errors` (see [`Self::parse_const`]).
+    pub(super) fn parse_item(&mut self) -> Result<Option<Item>, Diagnostic> {
         let public = self.eat(TokenKind::Pub);
         let is_open = self.eat(TokenKind::Open);
         let is_async = self.eat(TokenKind::Async);
         match self.peek_kind() {
-            TokenKind::Fn => Ok(Item::Function(self.parse_fn(public, is_async)?)),
-            TokenKind::Class => Ok(Item::Class(self.parse_class(public, is_open)?)),
-            TokenKind::Enum => Ok(Item::Enum(self.parse_enum_decl(public)?)),
+            TokenKind::Fn => Ok(Some(Item::Function(self.parse_fn(public, is_async)?))),
+            TokenKind::Class => Ok(Some(Item::Class(self.parse_class(public, is_open)?))),
+            TokenKind::Enum => Ok(Some(Item::Enum(self.parse_enum_decl(public)?))),
             TokenKind::Const if is_open => Err(self.err(
                 ErrorCode::E0105,
                 "`open` cannot be used on a `const` declaration",
@@ -150,7 +152,7 @@ impl Parser {
                 ErrorCode::E0105,
                 "`async` cannot be used on a `const` declaration",
             )),
-            TokenKind::Const => Ok(Item::Function(self.parse_const(public)?)),
+            TokenKind::Const => Ok(self.parse_const(public)?.map(Item::Function)),
             TokenKind::Interface if is_open => Err(self.err(
                 ErrorCode::E0105,
                 "`open` cannot be used on an interface declaration",
@@ -159,7 +161,7 @@ impl Parser {
                 ErrorCode::E0105,
                 "`async` cannot be used on an interface declaration",
             )),
-            TokenKind::Interface => Ok(Item::Interface(self.parse_interface(public)?)),
+            TokenKind::Interface => Ok(Some(Item::Interface(self.parse_interface(public)?))),
             _ if is_async => Err(self.err(ErrorCode::E0105, "`async` can only be used on `fn`")),
             _ => Err(self.err(
                 ErrorCode::E0105,
@@ -857,7 +859,12 @@ impl Parser {
     /// `[pub] const NAME: T = literal;` (willow-jz15.10). The constant is
     /// represented as a zero-parameter function returning the literal and
     /// carrying the value in [`FunctionDecl::constant`]; see there.
-    pub(super) fn parse_const(&mut self, public: bool) -> Result<FunctionDecl, Diagnostic> {
+    ///
+    /// A syntactically complete declaration whose initializer or type is not a
+    /// supported constant yields `Ok(None)` with its diagnostic recorded in
+    /// `recovered_errors`: the whole declaration, `;` included, is consumed, so
+    /// item recovery must not run and skip the following item (willow-jz15.93).
+    pub(super) fn parse_const(&mut self, public: bool) -> Result<Option<FunctionDecl>, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Const)?;
         let name = self.expect_ident()?;
@@ -870,45 +877,13 @@ impl Parser {
         let end = self.current_span();
         self.expect(TokenKind::Semicolon)?;
         let span = start.to(end);
-        let constant = const_literal(&value).ok_or_else(|| {
-            Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0109,
-                format!("`const {name}` requires an integer, float, boolean, or string literal"),
-            )
-            .with_label(Label::primary(value.span(), "unsupported constant initializer"))
-            .with_help("use an integer, float, `true`/`false`, or string literal; numeric literals may be negative")
-            .with_help("for arrays or other computed values, use a function that returns the value instead")
-        })?;
-        if !matches!(
-            return_type,
-            Type::I64 | Type::F64 | Type::Bool | Type::String
-        ) {
-            return Err(Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0110,
-                format!(
-                    "`const {name}` cannot have type `{}`",
-                    crate::semantic::type_checker::types::type_name(&return_type)
-                ),
-            )
-            .with_label(Label::primary(type_span, "unsupported constant type"))
-            .with_help("a constant's type must be `i64`, `f64`, `bool`, or `String`"));
-        }
-        if constant.ty() != return_type {
-            let type_name = crate::semantic::type_checker::types::type_name::<String>;
-            let declared = type_name(&return_type);
-            return Err(Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0110,
-                format!(
-                    "mismatched types: `const {name}` is declared `{declared}`, but its value is `{}`",
-                    type_name(&constant.ty())
-                ),
-            )
-            .with_label(Label::primary(value.span(), format!("expected `{declared}`")))
-            .with_label(Label::secondary(type_span, "declared type")));
-        }
+        let constant = match const_value(&name, &return_type, type_span, &value) {
+            Ok(constant) => constant,
+            Err(error) => {
+                self.recovered_errors.push(error);
+                return Ok(None);
+            }
+        };
         let return_span = value.span();
         let body = Block {
             id: BodyId::fresh(),
@@ -918,7 +893,7 @@ impl Parser {
             })],
             span,
         };
-        Ok(FunctionDecl {
+        Ok(Some(FunctionDecl {
             type_params: Vec::new(),
             name,
             public,
@@ -929,7 +904,7 @@ impl Parser {
             span,
             rust_bridge: None,
             constant: Some(constant),
-        })
+        }))
     }
 
     pub(super) fn parse_param(&mut self) -> Result<Param, Diagnostic> {
@@ -966,6 +941,92 @@ impl Parser {
             type_span,
         })
     }
+}
+
+/// Validate a `const` declaration and return its value, or the E0109/E0110
+/// diagnostic rejecting it.
+fn const_value(
+    name: &str,
+    declared: &Type,
+    type_span: crate::parser::Span,
+    value: &Expr,
+) -> Result<ConstValue, Diagnostic> {
+    let type_name = crate::semantic::type_checker::types::type_name::<String>;
+    let Some(constant) = const_literal(value) else {
+        let error = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0109,
+            format!("`const {name}` requires an integer, float, boolean, or string literal"),
+        )
+        .with_label(Label::primary(value.span(), "unsupported constant initializer"))
+        .with_help("use an integer, float, `true`/`false`, or string literal; numeric literals may be negative");
+        return Err(if is_array_const(declared, value) {
+            error.with_help(frozen_array_static_help(declared))
+        } else {
+            error.with_help("for computed values, use a function that returns the value instead")
+        });
+    };
+    if !matches!(declared, Type::I64 | Type::F64 | Type::Bool | Type::String) {
+        let error = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0110,
+            format!("`const {name}` cannot have type `{}`", type_name(declared)),
+        )
+        .with_label(Label::primary(type_span, "unsupported constant type"))
+        .with_help("a constant's type must be `i64`, `f64`, `bool`, or `String`");
+        return Err(if is_array_const(declared, value) {
+            error.with_help(frozen_array_static_help(declared))
+        } else {
+            error
+        });
+    }
+    if constant.ty() != *declared {
+        let declared = type_name(declared);
+        return Err(Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0110,
+            format!(
+                "mismatched types: `const {name}` is declared `{declared}`, but its value is `{}`",
+                type_name(&constant.ty())
+            ),
+        )
+        .with_label(Label::primary(
+            value.span(),
+            format!("expected `{declared}`"),
+        ))
+        .with_label(Label::secondary(type_span, "declared type")));
+    }
+    Ok(constant)
+}
+
+/// A rejected `const` meant to hold an array: an array type or an array literal.
+fn is_array_const(declared: &Type, value: &Expr) -> bool {
+    matches!(value, Expr::ArrayLiteral(..))
+        || match declared {
+            Type::Array(_) => true,
+            Type::Named(name) => name == "Array" || name == "FrozenArray",
+            Type::Generic(name, _) => name == "FrozenArray",
+            _ => false,
+        }
+}
+
+/// The replacement for a constant array: a frozen array built once in a class
+/// static property. A function returning an array literal would rebuild the
+/// array on every call (willow-jz15.93).
+fn frozen_array_static_help(declared: &Type) -> String {
+    let element = match declared {
+        Type::Array(element) => crate::semantic::type_checker::types::type_name::<String>(element),
+        Type::Generic(_, args) if args.len() == 1 => {
+            crate::semantic::type_checker::types::type_name::<String>(&args[0])
+        }
+        _ => "T".to_string(),
+    };
+    format!(
+        "build a constant array once as a frozen class static property, e.g. \
+         `class Tables {{ pub static values: FrozenArray<{element}> = [...].freeze(); }}`, \
+         and read it as `Tables::values`; a function returning an array literal \
+         allocates a new array on every call"
+    )
 }
 
 /// The value of a `const` initializer: a literal, or a negated numeric literal.
@@ -1078,11 +1139,206 @@ mod const_diagnostic_tests {
                             .iter()
                             .any(|help| help.contains("numeric literals may be negative"))
                     );
-                    assert!(error.helps.iter().any(|help| {
-                        help.contains("use a function that returns the value instead")
-                    }));
+                    let array = ty.contains("Array") || value.starts_with('[');
+                    let expected = if array {
+                        "frozen class static property"
+                    } else {
+                        "use a function that returns the value instead"
+                    };
+                    assert!(
+                        error.helps.iter().any(|help| help.contains(expected)),
+                        "{source}: {:?}",
+                        error.helps
+                    );
+                    if array {
+                        assert!(
+                            !error
+                                .helps
+                                .iter()
+                                .any(|help| help.contains("use a function")),
+                            "{source}: array help must not recommend a function"
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    fn parse_errors(source: &str) -> (Program, Vec<Diagnostic>) {
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        Parser::new(tokens).parse()
+    }
+
+    fn item_names(program: &Program) -> Vec<&str> {
+        program
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::Function(f) => f.name.as_str(),
+                Item::Class(c) => c.name.as_str(),
+                Item::Enum(e) => e.name.as_str(),
+                Item::Interface(i) => i.name.as_str(),
+            })
+            .collect()
+    }
+
+    // willow-jz15.93: a rejected `const` is fully consumed, so recovery must not
+    // skip the next item. Every rejected const is reported once, in source
+    // order, and every following valid item is kept.
+    #[test]
+    fn rejected_consts_do_not_swallow_the_next_item() {
+        // (source, expected codes in order, kept item names)
+        let cases: &[(&str, &[ErrorCode], &[&str])] = &[
+            // The ticket's reproducer: four consecutive const arrays.
+            (
+                "const KNIGHT: Array<i64> = [6, 10]; const KING: Array<i64> = [1, 7]; \
+                 const DIAG: Array<i64> = [7, 9]; const ORTHO: Array<i64> = [1, 8]; fn main() {}",
+                &[ErrorCode::E0109; 4],
+                &["main"],
+            ),
+            (
+                "const A: Array<i64> = [1]; const B: Array<i64> = [2];",
+                &[ErrorCode::E0109; 2],
+                &[],
+            ),
+            (
+                "const A: Array<i64> = [1]; fn main() {}",
+                &[ErrorCode::E0109],
+                &["main"],
+            ),
+            (
+                "const A: Array<i64> = [1]; pub fn f() {}",
+                &[ErrorCode::E0109],
+                &["f"],
+            ),
+            (
+                "const A: Array<i64> = [1]; async fn f() {}",
+                &[ErrorCode::E0109],
+                &["f"],
+            ),
+            (
+                "const A: Array<i64> = [1]; class C {}",
+                &[ErrorCode::E0109],
+                &["C"],
+            ),
+            (
+                "const A: Array<i64> = [1]; open class C {}",
+                &[ErrorCode::E0109],
+                &["C"],
+            ),
+            (
+                "const A: Array<i64> = [1]; enum E { X }",
+                &[ErrorCode::E0109],
+                &["E"],
+            ),
+            (
+                "const A: Array<i64> = [1]; interface I {}",
+                &[ErrorCode::E0109],
+                &["I"],
+            ),
+            (
+                "const A: Array<i64> = [1]; const B: i64 = 2;",
+                &[ErrorCode::E0109],
+                &["B"],
+            ),
+            (
+                "const A: Array<i64> = [1]; pub const B: i64 = 2;",
+                &[ErrorCode::E0109],
+                &["B"],
+            ),
+            (
+                "pub const A: Array<i64> = [1]; const B: i64 = 2;",
+                &[ErrorCode::E0109],
+                &["B"],
+            ),
+            (
+                "const A: i64 = 1 + 2; const B: i64 = f(); fn main() {}",
+                &[ErrorCode::E0109; 2],
+                &["main"],
+            ),
+            (
+                "const A: f64 = 1; const B: i64 = 2;",
+                &[ErrorCode::E0110],
+                &["B"],
+            ),
+            (
+                "const A: i32 = 1; const B: i64 = 2;",
+                &[ErrorCode::E0110],
+                &["B"],
+            ),
+            (
+                "const A: Array<i64> = 1; fn main() {}",
+                &[ErrorCode::E0110],
+                &["main"],
+            ),
+            (
+                "const A: f64 = 1; const B: Array<i64> = [1]; const C: i32 = 1; const D: bool = 1;",
+                &[
+                    ErrorCode::E0110,
+                    ErrorCode::E0109,
+                    ErrorCode::E0110,
+                    ErrorCode::E0110,
+                ],
+                &[],
+            ),
+            (
+                "const A: i64 = 1; const B: Array<i64> = [1]; const C: i64 = 3; const D: FrozenArray<i64> = [2]; const E: i64 = 5;",
+                &[ErrorCode::E0109; 2],
+                &["A", "C", "E"],
+            ),
+            (
+                "fn main() {} const A: Array<i64> = [1];",
+                &[ErrorCode::E0109],
+                &["main"],
+            ),
+            (
+                "const A: Array<i64> = [[1], [2]]; fn main() {}",
+                &[ErrorCode::E0109],
+                &["main"],
+            ),
+            // A syntax error inside a const still recovers to the next item.
+            (
+                "const A: i64 = ; const B: i64 = 2;",
+                &[ErrorCode::E0102],
+                &["B"],
+            ),
+            // A missing `;` fails on the next item's first token, which is kept.
+            (
+                "const A: i64 = 1 const B: i64 = 2;",
+                &[ErrorCode::E0101],
+                &["B"],
+            ),
+            (
+                "const A: i64 = 1 fn main() {}",
+                &[ErrorCode::E0101],
+                &["main"],
+            ),
+            (
+                "const A: i64 = 1 pub fn f() {} const B: Array<i64> = [1] class C {}",
+                &[ErrorCode::E0101, ErrorCode::E0101],
+                &["f", "C"],
+            ),
+        ];
+        for (source, codes, kept) in cases {
+            let (program, errors) = parse_errors(source);
+            let actual: Vec<_> = errors.iter().map(|error| error.code).collect();
+            assert_eq!(&actual, codes, "{source}: {errors:#?}");
+            assert_eq!(&item_names(&program), kept, "{source}");
+        }
+    }
+
+    // Recovery work stays linear: n rejected consts yield n diagnostics and keep
+    // every interleaved valid item.
+    #[test]
+    fn rejected_const_recovery_scales_linearly() {
+        for count in [1, 16, 256] {
+            let source = (0..count)
+                .map(|i| format!("const A{i}: Array<i64> = [{i}]; const B{i}: i64 = {i};"))
+                .collect::<String>();
+            let (program, errors) = parse_errors(&source);
+            assert_eq!(errors.len(), count);
+            assert!(errors.iter().all(|error| error.code == ErrorCode::E0109));
+            assert_eq!(program.items.len(), count);
         }
     }
 }

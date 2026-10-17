@@ -220,11 +220,12 @@ impl Parser {
                 continue;
             }
             self.default_import_usage.begin(false);
+            let item_start = self.pos;
             match self.parse_item() {
-                Ok(item) => items.push(item),
+                Ok(item) => items.extend(item),
                 Err(e) => {
                     errors.push(e);
-                    self.recover_to_next_item();
+                    self.recover_after_item_error(item_start);
                 }
             }
         }
@@ -526,24 +527,38 @@ impl Parser {
             self.advance();
         }
 
-        while !self.at_eof() {
-            if matches!(
-                self.peek_kind(),
-                TokenKind::Fn
-                    | TokenKind::Async
-                    | TokenKind::Class
-                    | TokenKind::Open
-                    | TokenKind::Const
-                    | TokenKind::Interface
-                    | TokenKind::Pub
-                    | TokenKind::Prot
-                    | TokenKind::Import
-                    | TokenKind::Enum
-            ) {
-                break;
-            }
+        while !self.at_eof() && !self.at_item_start() {
             self.advance();
         }
+    }
+
+    /// Recovery after a failed top-level item that began at token `item_start`.
+    /// When the item consumed tokens and failed at module level (outside any
+    /// brace) on the start of the next item — `const A: i64 = 1 const B ...` —
+    /// that item is kept instead of skipped (willow-jz15.93). Otherwise, e.g.
+    /// on an error inside a class body or on the item's own first token, the
+    /// first token is skipped as before so recovery always makes progress.
+    fn recover_after_item_error(&mut self, item_start: usize) {
+        if self.pos > item_start && self.brace_depth == 0 && self.at_item_start() {
+            return;
+        }
+        self.recover_to_next_item();
+    }
+
+    fn at_item_start(&self) -> bool {
+        matches!(
+            self.peek_kind(),
+            TokenKind::Fn
+                | TokenKind::Async
+                | TokenKind::Class
+                | TokenKind::Open
+                | TokenKind::Const
+                | TokenKind::Interface
+                | TokenKind::Pub
+                | TokenKind::Prot
+                | TokenKind::Import
+                | TokenKind::Enum
+        )
     }
 }
 

@@ -435,19 +435,75 @@ fn main() {
 }
 
 // The array literal is a literal, but not one supported by module constants.
+// The help points at a frozen class static property, built once, instead of a
+// function that would allocate the array on every call (willow-jz15.93).
 #[test]
-fn c28_array_const_diagnostic_and_function_alternative() {
-    assert_compile_error_contains(
-        "const WORDS: Array = [\"alpha\", \"beta\"];\nfn main() {}\n",
-        &[
-            "E0109",
-            "requires an integer, float, boolean, or string literal",
-            "unsupported constant initializer",
-            "use a function that returns the value instead",
-        ],
+fn c28_array_const_diagnostic_and_frozen_static_alternative() {
+    let stderr =
+        compile_error_stderr("const WORDS: Array = [\"alpha\", \"beta\"];\nfn main() {}\n");
+    for part in [
+        "E0109",
+        "requires an integer, float, boolean, or string literal",
+        "unsupported constant initializer",
+        "frozen class static property",
+        "FrozenArray<",
+        ".freeze()",
+    ] {
+        assert!(
+            stderr.contains(part),
+            "stderr did not contain `{part}`:\n{stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("use a function that returns the value instead"),
+        "array help must not recommend a function:\n{stderr}"
     );
     assert_output(
         include_str!("../../example/const_array_alternative.wi"),
         "alpha\nbeta\n",
+    );
+}
+
+// 29. Every rejected const is reported: four consecutive const arrays yield
+//     four diagnostics, not every other one (willow-jz15.93).
+#[test]
+fn c29_every_rejected_const_array_is_reported() {
+    let stderr = compile_error_stderr(
+        "const KNIGHT: Array<i64> = [6, 10, 15, 17];\n\
+         const KING: Array<i64> = [1, 7, 8, 9];\n\
+         const DIAG: Array<i64> = [7, 9];\n\
+         const ORTHO: Array<i64> = [1, 8];\n\
+         fn main() { println(KNIGHT.len()); }\n",
+    );
+    assert_eq!(stderr.matches("error[E0109]").count(), 4, "{stderr}");
+    for name in ["KNIGHT", "KING", "DIAG", "ORTHO"] {
+        assert!(
+            stderr.contains(&format!("`const {name}` requires")),
+            "{stderr}"
+        );
+    }
+    assert!(stderr.contains("aborting due to 4 error(s)"), "{stderr}");
+}
+
+// 30. The recommended replacement, including its typed element, compiles and
+//     reads back through iteration and indexing.
+#[test]
+fn c30_frozen_static_array_replacement_runs() {
+    assert_output(
+        r#"
+class Tables {
+    pub static knight: FrozenArray<i64> = [6, 10, 15, 17].freeze();
+}
+fn main() {
+    let mut sum = 0;
+    for d in Tables::knight {
+        sum = sum + d;
+    }
+    println(sum);
+    println(Tables::knight[1]);
+    println(Tables::knight.len());
+}
+"#,
+        "48\n10\n4\n",
     );
 }
