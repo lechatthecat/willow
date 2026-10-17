@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "willow"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cc",
@@ -759,11 +759,11 @@ dependencies = [
 
 [[package]]
 name = "willow_abi"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "willow_continuations"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -772,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "willow_runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "corosensei",
  "crossbeam-deque",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "willow_runtime_macros"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "quote",
  "syn",
