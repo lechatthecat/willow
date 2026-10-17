@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{FileId, Span};
 use crate::parser::ast::*;
-use crate::parser::visit::{self, AstVisitor};
+use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::scopes::Scopes;
 
 /// One syntactic field write. `self_class` is the receiver's nominal type
@@ -369,6 +369,8 @@ impl BodyRef<'_> {
             bindings: Scopes::with_frame([]),
             type_params: type_params.iter().map(String::as_str).collect(),
             lambda_depth: 0,
+            scope_kinds: Vec::new(),
+            let_types: Vec::new(),
             self_escaped: false,
             after_base_init: false,
             writes: HashSet::new(),
@@ -381,8 +383,8 @@ impl BodyRef<'_> {
             BodyRef::Block(block) if matches!(context, WriteContext::Constructor(_)) => {
                 collector.visit_constructor_body(block)
             }
-            BodyRef::Block(block) => collector.visit_block(block),
-            BodyRef::Initializer(expr) => collector.visit_expr(expr),
+            BodyRef::Block(block) => collector.walk(AstEvent::Block(block)),
+            BodyRef::Initializer(expr) => collector.walk(AstEvent::Expr(expr)),
         }
         collector.writes
     }
@@ -451,6 +453,10 @@ struct Collector<'a> {
     bindings: Scopes<Option<String>>,
     type_params: HashSet<&'a str>,
     lambda_depth: usize,
+    /// One entry per open walker scope: whether it is a lambda's scope.
+    scope_kinds: Vec<bool>,
+    /// Receiver types of the `let`s whose initializer is being walked.
+    let_types: Vec<Option<String>>,
     /// In a constructor: `self` may already be visible outside `init`.
     self_escaped: bool,
     /// In a constructor: the base constructor has already run.
@@ -492,15 +498,7 @@ impl Collector<'_> {
     /// escape; writes from that statement on are recorded as
     /// [`WriteKind::AfterBaseInit`] and resolved against the base chain.
     fn visit_constructor_body(&mut self, block: &Block) {
-        let scans: Vec<EscapeFinder> = block
-            .stmts
-            .iter()
-            .map(|stmt| {
-                let mut finder = EscapeFinder::default();
-                finder.visit_stmt(stmt);
-                finder
-            })
-            .collect();
+        let scans: Vec<EscapeScan> = block.stmts.iter().map(EscapeScan::of).collect();
         let first_escape = scans.iter().position(|scan| scan.escaped);
         // Without an explicit call the base constructor runs first.
         let base_init = scans.iter().position(|scan| scan.super_init).unwrap_or(0);
@@ -518,7 +516,7 @@ impl Collector<'_> {
             let deferred = matches!(stmt, Stmt::Defer(_));
             self.self_escaped = first_escape.is_some_and(|first| index >= first || deferred);
             self.after_base_init = index >= base_init || deferred;
-            self.visit_stmt(stmt);
+            self.walk(AstEvent::Stmt(stmt));
         }
     }
 
@@ -559,88 +557,99 @@ impl Collector<'_> {
     }
 }
 
-/// Finds a use of `self` other than a direct `self.f` read or write, and a
-/// `super.init(…)` call.
+/// Whether one top-level constructor statement uses `self` other than as a
+/// direct `self.f` read or write, and whether it calls `super.init(…)`.
 #[derive(Default)]
-struct EscapeFinder {
+struct EscapeScan {
     escaped: bool,
     super_init: bool,
 }
 
-impl AstVisitor for EscapeFinder {
-    fn visit_stmt(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::FieldAssign(assign) if is_self(&assign.object) => self.visit_expr(&assign.value),
-            Stmt::SuperInit(_) => {
-                self.super_init = true;
-                visit::walk_stmt(self, stmt);
+impl EscapeScan {
+    /// Explicit-stack walk: O(1) native stack in nesting depth.
+    fn of(stmt: &Stmt) -> Self {
+        let mut scan = Self::default();
+        let mut walk = AstWalk::new(AstEvent::Stmt(stmt));
+        while let Some(event) = walk.next() {
+            match event {
+                AstEvent::Stmt(Stmt::FieldAssign(assign)) if is_self(&assign.object) => {
+                    walk.skip_children();
+                    walk.push(AstEvent::Expr(&assign.value));
+                }
+                AstEvent::Stmt(Stmt::SuperInit(_)) => scan.super_init = true,
+                AstEvent::Expr(Expr::FieldAccess(object, ..)) if is_self(object) => {
+                    walk.skip_children()
+                }
+                AstEvent::Expr(expr) if is_self(expr) => scan.escaped = true,
+                _ => {}
             }
-            _ => visit::walk_stmt(self, stmt),
         }
-    }
-
-    fn visit_expr(&mut self, expr: &Expr) {
-        match expr {
-            Expr::FieldAccess(object, ..) if is_self(object) => {}
-            _ if is_self(expr) => self.escaped = true,
-            _ => visit::walk_expr(self, expr),
-        }
+        scan
     }
 }
 
-impl AstVisitor for Collector<'_> {
-    fn enter_scope(&mut self) {
-        self.bindings.push();
-    }
-    fn exit_scope(&mut self) {
-        self.bindings.pop();
-    }
-    fn bind(&mut self, name: &str) {
-        self.bindings.insert(name.to_owned(), None);
-    }
-
-    fn visit_stmt(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Let(binding) => {
-                self.visit_expr(&binding.init);
-                let ty = match &binding.ty {
-                    Some(ty) => self.nominal(ty),
-                    None => self.receiver(&binding.init),
-                };
-                self.bindings.insert(binding.name.clone(), ty);
-                return;
+impl Collector<'_> {
+    /// Explicit-stack walk of one body slot: O(1) native stack in nesting
+    /// depth, so deeply nested blocks cannot overflow the checker thread.
+    fn walk(&mut self, root: AstEvent<'_>) {
+        let mut walk = AstWalk::new(root);
+        while let Some(event) = walk.next() {
+            match event {
+                AstEvent::EnterScope => {
+                    self.bindings.push();
+                    self.scope_kinds.push(false);
+                }
+                AstEvent::ExitScope => {
+                    self.bindings.pop();
+                    if self.scope_kinds.pop() == Some(true) {
+                        self.lambda_depth -= 1;
+                    }
+                }
+                AstEvent::Bind(name) => self.bindings.insert(name.to_owned(), None),
+                AstEvent::Stmt(Stmt::Let(binding)) => {
+                    // An initializer cannot change the bindings it sees from
+                    // outside (every nested binder is scoped), so the
+                    // receiver type is the same before and after it is walked.
+                    let ty = match &binding.ty {
+                        Some(ty) => self.nominal(ty),
+                        None => self.receiver(&binding.init),
+                    };
+                    self.let_types.push(ty);
+                }
+                AstEvent::ExitStmt(Stmt::Let(binding)) => {
+                    // Replaces the untyped binding the walker just made.
+                    let ty = self.let_types.pop().expect("let entered");
+                    self.bindings.insert(binding.name.clone(), ty);
+                }
+                AstEvent::Stmt(Stmt::FieldAssign(assign)) => {
+                    self.record(&assign.object, &assign.field)
+                }
+                AstEvent::Stmt(Stmt::SuperInit(init)) => self.record_reference_args(&init.args),
+                AstEvent::Expr(Expr::Call(call)) => self.record_reference_args(&call.args),
+                AstEvent::Expr(Expr::MethodCall(call)) => self.record_reference_args(&call.args),
+                AstEvent::Expr(Expr::StaticCall(call)) => self.record_reference_args(&call.args),
+                AstEvent::Expr(Expr::New(new)) => self.record_reference_args(&new.args),
+                AstEvent::Lambda(lambda) => {
+                    // Parameters bind with their annotated types instead of
+                    // the walker's untyped bindings; the scope's exit closes
+                    // the lambda.
+                    walk.skip_children();
+                    self.lambda_depth += 1;
+                    self.bindings.push();
+                    self.scope_kinds.push(true);
+                    for param in &lambda.params {
+                        let ty = param.ty.as_ref().and_then(|ty| self.nominal(ty));
+                        self.bindings.insert(param.name.clone(), ty);
+                    }
+                    walk.push(AstEvent::ExitScope);
+                    walk.push(match &lambda.body {
+                        LambdaBody::Expr(expr) => AstEvent::Expr(expr),
+                        LambdaBody::Block(block) => AstEvent::Block(block),
+                    });
+                }
+                _ => {}
             }
-            Stmt::FieldAssign(assign) => self.record(&assign.object, &assign.field),
-            Stmt::SuperInit(init) => self.record_reference_args(&init.args),
-            _ => {}
         }
-        visit::walk_stmt(self, stmt);
-    }
-
-    fn visit_expr(&mut self, expr: &Expr) {
-        match expr {
-            Expr::Call(call) => self.record_reference_args(&call.args),
-            Expr::MethodCall(call) => self.record_reference_args(&call.args),
-            Expr::StaticCall(call) => self.record_reference_args(&call.args),
-            Expr::New(new) => self.record_reference_args(&new.args),
-            _ => {}
-        }
-        visit::walk_expr(self, expr);
-    }
-
-    fn visit_lambda(&mut self, lambda: &LambdaExpr) {
-        self.lambda_depth += 1;
-        self.enter_scope();
-        for param in &lambda.params {
-            let ty = param.ty.as_ref().and_then(|ty| self.nominal(ty));
-            self.bindings.insert(param.name.clone(), ty);
-        }
-        match &lambda.body {
-            LambdaBody::Expr(expr) => self.visit_expr(expr),
-            LambdaBody::Block(block) => self.visit_block(block),
-        }
-        self.exit_scope();
-        self.lambda_depth -= 1;
     }
 }
 
@@ -716,11 +725,13 @@ mod tests {
             bindings: Scopes::with_frame([]),
             type_params: HashSet::new(),
             lambda_depth: 1,
+            scope_kinds: Vec::new(),
+            let_types: Vec::new(),
             self_escaped: false,
             after_base_init: false,
             writes: HashSet::new(),
         };
-        collector.visit_block(&class.constructors[0].body);
+        collector.walk(AstEvent::Block(&class.constructors[0].body));
         assert_eq!(
             collector.writes,
             HashSet::from([RawFieldWrite {
@@ -962,6 +973,74 @@ mod tests {
             println!(
                 "leaf_depth={depth} fields=64 write_lookups={resolutions} field_probes={probes}"
             );
+        }
+    }
+
+    #[test]
+    fn iterative_walk_keeps_typed_bindings_and_lambda_scopes() {
+        let classes_ab = "class A { pub n: i64; pub m: i64; } class B { pub n: i64; }";
+        // `let a = a;` takes the receiver type the initializer saw.
+        let alias = format!("{classes_ab} fn f(a: A) {{ let a = a; a.n = 1; }} fn main() {{}}");
+        assert!(reassigned(&alias, "A", "n"));
+        assert!(!reassigned(&alias, "B", "n"));
+        // Annotated lambda parameters bind their type; the outer binding
+        // returns when the lambda's scope closes.
+        let lambda = format!(
+            "{classes_ab} fn f(a: A) {{ let w = |a: B| {{ a.n = 1; }}; a.m = 2; }} fn main() {{}}"
+        );
+        assert!(reassigned(&lambda, "B", "n"));
+        assert!(!reassigned(&lambda, "A", "n"));
+        assert!(reassigned(&lambda, "A", "m"));
+        // A `let` inside a lambda inside an initializer pairs with its own type.
+        let nested = format!(
+            "{classes_ab} fn f() {{ let a = new A(0, 0); let w = || {{ let a = new B(0); a.n = 1; }}; a.m = 2; }} fn main() {{}}"
+        );
+        assert!(reassigned(&nested, "B", "n"));
+        assert!(!reassigned(&nested, "A", "n"));
+        assert!(reassigned(&nested, "A", "m"));
+        // A constructor lambda's write counts; the write after the lambda
+        // closes is construction again.
+        let ctor = "class A { pub n: i64; pub m: i64; pub init(self) { let w = || { self.n = 1; }; self.m = 2; } } fn main() {}";
+        assert!(reassigned(ctor, "A", "n"));
+        assert!(!reassigned(ctor, "A", "m"));
+    }
+
+    #[test]
+    fn deep_nesting_collects_on_a_small_stack() {
+        // Collector and escape scan both use an explicit work stack, so the
+        // native stack does not grow with nesting depth (willow-xcrf).
+        for depth in [64, 1024, 4096] {
+            let source = format!(
+                "class A {{ pub n: i64; pub m: i64; pub init(self) {{ {open} self.m = 1; keep(self); {close} self.n = 2; }} }} \
+                 class B {{ pub n: i64; }} fn keep(a: A) {{}} \
+                 fn f(a: A) {{ {open} let b = a; b.n = 1; {close} }} fn main() {{}}",
+                open = "if true {".repeat(depth),
+                close = "}".repeat(depth),
+            );
+            let program = parse(&source);
+            let summary = std::thread::Builder::new()
+                .stack_size(64 * 1024)
+                .spawn(move || {
+                    let summary = FieldWrites::from_program(&program);
+                    (summary, program)
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            let (summary, program) = summary;
+            let field = |class: &str, name: &str| {
+                let decl = classes(&program)
+                    .find(|c| c.name == class)
+                    .and_then(|c| c.fields.iter().find(|f| f.name == name))
+                    .unwrap();
+                summary.is_reassigned(&decl.name, decl.span)
+            };
+            // `self.n = 2` follows the statement where `self` escapes.
+            assert!(field("A", "n"), "depth {depth}");
+            // `self.m = 1` precedes the escape inside the same statement.
+            assert!(field("A", "m"), "depth {depth}");
+            assert!(!field("B", "n"), "depth {depth}");
+            assert!(summary.by_name.is_empty(), "depth {depth}");
         }
     }
 }
