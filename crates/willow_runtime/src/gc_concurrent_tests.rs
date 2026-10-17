@@ -2955,6 +2955,9 @@ fn concurrent_closure_paces_contention_and_retains_work_until_release() {
     let _guard = runtime_test_guard();
     for waits_before_release in [1usize, 4, 16, 64] {
         reset_internal_for_test();
+        // The remark stop's 1ms wall-clock budget can expire on a preempted CI
+        // runner, which correctly takes the stopped fallback this test excludes.
+        old_cycle::REMARK_WORK_NS_FOR_TEST.store(100_000_000, Ordering::Relaxed);
         BUDGET_RETRY_CALLS.store(0, Ordering::Relaxed);
         // Finite on the old spin loop too, so regression fails without hanging.
         BUDGET_RETRY_LIMIT.store(waits_before_release * 1024, Ordering::Relaxed);

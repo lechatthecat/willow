@@ -2159,6 +2159,7 @@ pub fn header_size_for_test() -> usize {
 pub fn reset_internal_for_test() {
     reset_internal();
     crate::frame_lifetime::reset();
+    old_cycle::REMARK_WORK_NS_FOR_TEST.store(0, Ordering::Relaxed);
 }
 
 /// A fresh, empty generated-TLS block for tests in sibling modules that need a

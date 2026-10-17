@@ -154,7 +154,10 @@ impl RemarkBudget {
         Self::new(
             positive("WILLOW_GC_REMARK_MAX_SLOTS", 4096, 1_000_000),
             positive("WILLOW_GC_REMARK_MAX_BYTES", 1024 * 1024, 16 * 1024 * 1024),
-            positive("WILLOW_GC_REMARK_MAX_WORK_NS", 1_000_000, 100_000_000),
+            match remark_work_ns_for_test() {
+                0 => positive("WILLOW_GC_REMARK_MAX_WORK_NS", 1_000_000, 100_000_000),
+                ns => ns,
+            },
             now,
         )
     }
@@ -253,6 +256,18 @@ pub(super) static BUDGET_CHECKS: std::sync::atomic::AtomicU64 =
 #[cfg(test)]
 pub(super) static BUDGET_YIELDS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Nonzero replaces the wall-clock remark limit for in-process tests whose
+/// assertions are about pacing, not about a preempted runner overrunning 1ms.
+#[cfg(test)]
+pub(super) static REMARK_WORK_NS_FOR_TEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn remark_work_ns_for_test() -> u64 {
+    #[cfg(test)]
+    return REMARK_WORK_NS_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    0
+}
 
 #[cfg(test)]
 mod integration_tests {
