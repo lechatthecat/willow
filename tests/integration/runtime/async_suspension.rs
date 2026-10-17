@@ -392,5 +392,9 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run_with_env(source, &[]);
     assert!(ok, "survivor program failed: {out}");
-    assert_eq!(out, "32\n0\ntrue\n32\n31\n0\n0\n");
+    // Counts include the young array literals (willow-jz15.94): `values`
+    // copies and tenures its handle and buffer with the 32 payloads, and the
+    // still-live `temporary` handle and buffer are promoted while its 32
+    // drained payloads are not.
+    assert_eq!(out, "34\n0\ntrue\n34\n31\n2\n0\n");
 }

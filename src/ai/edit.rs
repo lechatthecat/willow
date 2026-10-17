@@ -2512,7 +2512,7 @@ mod tests {
             let plan = w.load(id).unwrap();
             let change = &plan.changes[0];
             assert_eq!(change.offsets.len(), n + 1);
-            let path = f.0.join("main.wi").to_string_lossy().into_owned();
+            let path = w.root.join("main.wi").to_string_lossy().into_owned();
             let starts: Vec<_> = change
                 .before
                 .match_indices("value")

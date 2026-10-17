@@ -786,10 +786,26 @@ mod tests {
             edges
         };
         assert_eq!(named_edges(&cached), named_edges(&standalone));
-        assert_map_eq(
-            &cached.effect_inputs.direct,
-            &standalone.effect_inputs.direct,
-            "lock_direct_effects",
+        // Direct causes: named callables by key, lambdas as a multiset.
+        let split_direct = |checker: &TypeChecker| {
+            let mut named = checker.effect_inputs.direct.clone();
+            named.retain(|caller, _| !caller.is_lambda());
+            let mut lambdas: Vec<_> = checker
+                .effect_inputs
+                .direct
+                .iter()
+                .filter(|(caller, _)| caller.is_lambda())
+                .map(|(_, cause)| serde_json::to_string(cause).unwrap())
+                .collect();
+            lambdas.sort();
+            (named, lambdas)
+        };
+        let (cached_direct, cached_lambdas) = split_direct(&cached);
+        let (standalone_direct, standalone_lambdas) = split_direct(&standalone);
+        assert_map_eq(&cached_direct, &standalone_direct, "lock_direct_effects");
+        assert_eq!(
+            cached_lambdas, standalone_lambdas,
+            "lambda lock_direct_effects"
         );
         assert_eq!(
             serde_json::to_value(&cached.effect_inputs.sites).unwrap(),

@@ -165,7 +165,10 @@ class Box {
     pub value: i64;
 }
 fn main() {
+    // Tenure the young array literal so the young Box store is old-to-young.
     let xs: Array<Box> = [];
+    gc_minor_collect();
+    gc_minor_collect();
     xs.push(new Box(77));
     let moved = gc_moved_objects();
     println(gc_remembered_set_size() > 0);
@@ -307,7 +310,11 @@ fn gc_region_01_runtime_old_allocations_expose_region_metadata() {
     let src = r#"
 import std::collections::Array;
 fn main() {
+    // Array literals start young (willow-jz15.94); two minor collections
+    // tenure this one into an old region.
     let xs: Array<i64> = [];
+    gc_minor_collect();
+    gc_minor_collect();
     println(xs.len());
     println(gc_old_region_count() > 0);
     println(gc_old_region_reserved_bytes() > 0);
