@@ -978,6 +978,11 @@ impl TestProject {
     /// process-exit stall needs the machine contended before it shows up at
     /// all, which is why it reached CI and not a developer's single run
     /// (willow-ihr5). Reports the failing run's index and output.
+    ///
+    /// Windows-only, like its only caller: the stall it guards against is
+    /// specific to a platform that terminates threads before running
+    /// user-mode process teardown.
+    #[cfg(windows)]
     pub(super) fn run_repeatedly_with_env_timeout(
         &self,
         env: &[(&str, &str)],
