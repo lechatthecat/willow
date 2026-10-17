@@ -1251,6 +1251,31 @@ pub(super) fn compile_temp_project_release_run_stderr(
     (true, String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
+/// Build a project (debug or `--release`) and run it with `run_env` on the
+/// child, returning `(ran_ok, the program's STDERR)`. For diagnostics whose
+/// content depends on scheduling, such as an async chain that pins
+/// `WILLOW_WORKERS=1` so the awaiter registers before the awaitee resumes.
+pub(super) fn compile_temp_project_run_stderr_under(
+    files: &[(&str, &str)],
+    entry: &str,
+    release: bool,
+    run_env: &[(&str, &str)],
+) -> (bool, String) {
+    let project = TestProject::new("project_run_err_env_test", files);
+    let output = if release {
+        project.compile_release(entry)
+    } else {
+        project.compile(entry)
+    };
+    if !output.status.success() {
+        return (false, String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+
+    let out = project.run_with_env(run_env);
+
+    (true, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
 pub(super) fn compile_temp_project_error_stderr(files: &[(&str, &str)], entry: &str) -> String {
     let project = TestProject::new("project_error_test", files);
     let output = project.compile(entry);

@@ -4,14 +4,16 @@
 //! Coverage includes cleanup, recovery, references, async tasks and GC stress.
 
 use super::support::{
-    compile_temp_project_release_run_stderr, compile_temp_project_with_env_and_run,
-    compile_temp_project_with_env_run_stderr, compile_temp_project_with_env_stderr,
+    compile_temp_project_release_run_stderr, compile_temp_project_run_stderr_under,
+    compile_temp_project_with_env_and_run, compile_temp_project_with_env_run_stderr,
+    compile_temp_project_with_env_stderr,
 };
 
 /// No extra compiler environment: the ordinary build.
 const PLAIN: [(&str, &str); 0] = [];
 const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
+const ONE_WORKER: [(&str, &str); 1] = [("WILLOW_WORKERS", "1")];
 
 /// The module every test imports. `checked` and `empty` panic; `safe` does not,
 /// so a test can prove a frame was popped by panicking somewhere else after it.
@@ -798,12 +800,13 @@ fn panic_frames_async_method_locations_debug_and_release() {
             "import worker::Worker;\nasync fn middle(w: Worker) -> i64 {\n    return await w.fail();\n}\nasync fn main() {\n    let w = new Worker();\n    println(await middle(w));\n}\n",
         ),
     ];
+    // `await w.fail()` publishes the callee task before `middle` registers as
+    // its awaiter, and `yield()` requeues it at once: with several workers it
+    // can resume and panic on another thread first, legitimately rendering a
+    // one-frame chain. One worker makes the awaiter links deterministic.
     for release in [false, true] {
-        let (ok, report) = if release {
-            compile_temp_project_release_run_stderr(&files, "main.wi")
-        } else {
-            compile_temp_project_with_env_run_stderr(&files, "main.wi", &PLAIN)
-        };
+        let (ok, report) =
+            compile_temp_project_run_stderr_under(&files, "main.wi", release, &ONE_WORKER);
         assert!(ok, "{report}");
         let normalized = report
             .split_whitespace()
