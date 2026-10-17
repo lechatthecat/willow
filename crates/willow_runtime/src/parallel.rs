@@ -259,7 +259,7 @@ pub extern "C" fn willow_parallel_map_i64(
         return std::ptr::null_mut();
     }
     let input = crate::gc::GcRootHandle::new(input);
-    let output = crate::array::willow_array_new(len, 0);
+    let output = crate::array::new_old_array(len, 0);
     if output.is_null() {
         return std::ptr::null_mut();
     }

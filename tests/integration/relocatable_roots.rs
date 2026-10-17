@@ -995,3 +995,13 @@ fn main() {
         "37\n46\n52\n4\ntrue\n73\n82\n7\n8\n109\n10\n127\n12\n13\n-1\n140\ntrue\n",
     );
 }
+
+#[test]
+fn young_array_literals_and_push_buffers_move_in_every_mode() {
+    // willow-jz15.94: literals and grown push buffers are young TLAB objects;
+    // relocate stress moves them at every allocation without pinning.
+    let source = include_str!("../../example/array_literal_churn.wi");
+    let expected = "50005000\n43\n6\nalphabetagamma\n10\n5050\n2555840\n87\n1999000\n";
+    let project = assert_relocating_modes("young_array_literals", source, expected);
+    assert_runs(&project, &[ALLOC_NO_PIN], expected);
+}

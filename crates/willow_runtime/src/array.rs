@@ -172,14 +172,71 @@ unsafe fn handle_buffer(arr: *mut u8) -> *mut u8 {
 
 /// Allocate an array of `len` elements (all zero). `elem_is_ref` marks
 /// GC-managed element types. Returns the handle, or aborts on a negative length.
+///
+/// Called directly by generated code (array literals, `[]`). A handle and a
+/// buffer that fit a TLAB are bump-allocated young together, with no lock,
+/// root registration or old-region work (willow-jz15.94). Only a TLAB miss
+/// reaches a GC point, which may move this thread's root-slot referents like
+/// any generated allocation; generated code reloads its values after the call.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
     if len < 0 {
-        raise_with(&format!(
-            "cannot create an array with negative length {len}"
-        ));
-        return std::ptr::null_mut();
+        return raise_negative_length(len);
+    }
+    let Some(buffer_layout) = young_buffer_layout(len, elem_is_ref != 0) else {
+        return new_old_array(len, elem_is_ref);
+    };
+    let handle_layout = crate::gc::array_handle_layout();
+    let (handle, buffer) = match crate::gc::try_alloc_young([handle_layout, buffer_layout]) {
+        Some([handle, buffer]) => (handle, buffer),
+        None => {
+            let mut handle = crate::gc::alloc_young_layout_slow(handle_layout);
+            if handle.is_null() {
+                return handle;
+            }
+            // The handle's slot is null, so a collection here traces it safely.
+            crate::gc::willow_push_root(&mut handle);
+            let buffer = match crate::gc::try_alloc_young([buffer_layout]) {
+                Some([buffer]) => buffer,
+                None => crate::gc::alloc_young_layout_slow(buffer_layout),
+            };
+            crate::gc::willow_pop_roots(1);
+            if buffer.is_null() {
+                return buffer;
+            }
+            (handle, buffer)
+        }
+    };
+    unsafe { init_array(handle, buffer, len, elem_is_ref) };
+    handle
+}
+
+/// TLAB layout of a buffer with `cap` slots, or `None` when it is too large
+/// for a TLAB object. Registers the reference-buffer trace hook first.
+fn young_buffer_layout(cap: i64, is_ref: bool) -> Option<crate::gc::YoungLayout> {
+    let payload = usize::try_from(cap)
+        .ok()?
+        .checked_add(BUFFER_HEADER_WORDS)?
+        .checked_mul(WORD_BYTES as usize)?;
+    if is_ref {
+        ensure_trace_registered();
+    }
+    crate::gc::array_buffer_layout(payload, is_ref)
+}
+
+fn raise_negative_length(len: i64) -> *mut u8 {
+    raise_with(&format!(
+        "cannot create an array with negative length {len}"
+    ));
+    std::ptr::null_mut()
+}
+
+/// Allocate an array in the old generation. Runtime-internal callers use this:
+/// it never moves root-slot referents, so their raw managed pointers stay valid.
+pub(crate) fn new_old_array(len: i64, elem_is_ref: i64) -> *mut u8 {
+    if len < 0 {
+        return raise_negative_length(len);
     }
     let is_ref = elem_is_ref != 0;
     // Allocate the handle first (zero-filled, buffer slot null), root it, then
@@ -200,6 +257,15 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
         return std::ptr::null_mut();
     }
     let handle = handle_root.load();
+    unsafe { init_array(handle, buffer, len, elem_is_ref) };
+    handle
+}
+
+/// Fill a fresh zeroed handle with its length, capacity and zeroed buffer.
+///
+/// # Safety
+/// `handle` and `buffer` are fresh allocations with `len` buffer slots.
+unsafe fn init_array(handle: *mut u8, buffer: *mut u8, len: i64, elem_is_ref: i64) {
     unsafe {
         set_buffer_len(buffer, len);
         set_handle_word(handle, H_LEN, len);
@@ -213,7 +279,6 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
         );
         set_handle_word(handle, H_BUF, buffer as i64);
     }
-    handle
 }
 
 /// Allocate an independent copy of `arr` (same length, element ref-ness, and
@@ -231,7 +296,7 @@ pub extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
     let len = willow_array_len(arr);
     let is_ref = unsafe { handle_word(arr, H_IS_REF) };
     let arr = crate::gc::GcRootHandle::new(arr);
-    let copy = willow_array_new(len, is_ref);
+    let copy = new_old_array(len, is_ref);
     if copy.is_null() {
         return copy;
     }
@@ -255,7 +320,7 @@ pub extern "C" fn willow_array_copy_scalar_pairs(arr: *mut u8) -> *mut u8 {
     }
     let len = willow_array_len(arr);
     let arr = crate::gc::GcRootHandle::new(arr);
-    let copy = willow_array_new(len, 1);
+    let copy = new_old_array(len, 1);
     if copy.is_null() {
         return copy;
     }
@@ -405,6 +470,61 @@ pub extern "C" fn willow_array_push_scalar_pairs(arr: *mut u8, value: i64) {
     array_push(arr, value, true);
 }
 
+/// Allocate the grown buffer of `array_push` on the old-generation path,
+/// which may collect. Returns the reloaded handle and value with the buffer,
+/// or `None` after raising.
+fn grow_rooted(
+    mut arr: *mut u8,
+    mut value: i64,
+    len: i64,
+    new_cap: i64,
+    is_ref: bool,
+    copy_pairs: bool,
+) -> Option<(*mut u8, i64, *mut u8)> {
+    // Root the handle and the (possibly reference) value across the buffer
+    // allocation, which may trigger a collection. The old buffer stays
+    // reachable through the rooted handle. Only root the pushed value when
+    // it is a GC pointer — rooting a scalar word (e.g. an i64 like 42) would
+    // make the collector treat it as an object pointer and crash. Use the
+    // updated root slots after allocation in case the collector moves them.
+    let arr_root = crate::gc::GcRootHandle::new(arr);
+    let value_root = is_ref.then(|| crate::gc::GcRootHandle::new(value as *mut u8));
+    let mut new_buf = alloc_buffer(new_cap, is_ref);
+    if new_buf.is_null() {
+        return None;
+    }
+    arr = arr_root.load();
+    if copy_pairs {
+        let buffer_root = crate::gc::GcRootHandle::new(new_buf);
+        for index in 0..len {
+            // Reload through the rooted handle on every iteration: cloning
+            // can move both buffers and all still-live boxes.
+            let source = unsafe { *buf_slot(handle_buffer(arr), index) };
+            let pair = if source == 0 {
+                std::ptr::null_mut()
+            } else {
+                let pair = unsafe { copy_scalar_pair(source as *const i64) };
+                if pair.is_null() {
+                    return None;
+                }
+                pair
+            };
+            arr = arr_root.load();
+            new_buf = buffer_root.load();
+            unsafe {
+                store_buffer_slot(new_buf, index, pair as i64, true);
+                // Keep each initialized pair visible to GC during the next
+                // allocation, while leaving the old buffer unchanged.
+                set_buffer_len(new_buf, index + 1);
+            }
+        }
+    }
+    if let Some(root) = value_root {
+        value = root.load() as i64;
+    }
+    Some((arr, value, new_buf))
+}
+
 fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
     if arr.is_null() {
         raise_with("cannot push to a null array");
@@ -416,47 +536,25 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
 
     if len == cap {
         let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
-        // Root the handle and the (possibly reference) value across the buffer
-        // allocation, which may trigger a collection. The old buffer stays
-        // reachable through the rooted handle. Only root the pushed value when
-        // it is a GC pointer — rooting a scalar word (e.g. an i64 like 42) would
-        // make the collector treat it as an object pointer and crash. Use the
-        // updated root slots after allocation in case the collector moves them.
-        let arr_root = crate::gc::GcRootHandle::new(arr);
-        let value_root = is_ref.then(|| crate::gc::GcRootHandle::new(value as *mut u8));
-        let mut new_buf = alloc_buffer(new_cap, is_ref);
-        if new_buf.is_null() {
-            return;
-        }
-        arr = arr_root.load();
-        if copy_pairs {
-            let buffer_root = crate::gc::GcRootHandle::new(new_buf);
-            for index in 0..len {
-                // Reload through the rooted handle on every iteration: cloning
-                // can move both buffers and all still-live boxes.
-                let source = unsafe { *buf_slot(handle_buffer(arr), index) };
-                let pair = if source == 0 {
-                    std::ptr::null_mut()
-                } else {
-                    let pair = unsafe { copy_scalar_pair(source as *const i64) };
-                    if pair.is_null() {
-                        return;
-                    }
-                    pair
+        // A buffer that fits the TLAB is bump-allocated young without a GC
+        // point, so `arr` and `value` stay valid and need no roots. Pair
+        // arrays allocate per element and keep the rooted path.
+        let young = (!copy_pairs)
+            .then(|| young_buffer_layout(new_cap, is_ref))
+            .flatten()
+            .and_then(|layout| crate::gc::try_alloc_young([layout]));
+        let new_buf = match young {
+            Some([buffer]) => buffer,
+            None => {
+                let Some((moved_arr, moved_value, buffer)) =
+                    grow_rooted(arr, value, len, new_cap, is_ref, copy_pairs)
+                else {
+                    return;
                 };
-                arr = arr_root.load();
-                new_buf = buffer_root.load();
-                unsafe {
-                    store_buffer_slot(new_buf, index, pair as i64, true);
-                    // Keep each initialized pair visible to GC during the next
-                    // allocation, while leaving the old buffer unchanged.
-                    set_buffer_len(new_buf, index + 1);
-                }
+                (arr, value) = (moved_arr, moved_value);
+                buffer
             }
-        }
-        if let Some(root) = value_root {
-            value = root.load() as i64;
-        }
+        };
         unsafe {
             let old_buf = handle_buffer(arr);
             if is_ref && !copy_pairs {

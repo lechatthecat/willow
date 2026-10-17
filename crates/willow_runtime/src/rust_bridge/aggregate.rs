@@ -96,7 +96,7 @@ pub extern "C" fn willow_rust_bridge_buffer(
     let object = if is_string != 0 {
         string::willow_string_alloc(bytes, length)
     } else {
-        array::willow_array_new(length, 0)
+        array::new_old_array(length, 0)
     };
     willow_rust_bridge_root(frame, object as u64);
     if is_string == 0 {

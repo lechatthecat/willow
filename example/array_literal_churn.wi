@@ -1,0 +1,102 @@
+// Short-lived array literals (willow-jz15.94).
+//
+// A small array literal and a pushed array's grown buffer are bump-allocated
+// in the young generation, the same way objects are, so a loop that builds
+// millions of temporary arrays is no slower than one building objects. Arrays
+// that survive are copied by minor collections like any other young object.
+// Run with `WILLOW_GC_STRESS=relocate` to move objects at every allocation;
+// moved payloads are poisoned, so a stale pre-move address prints garbage.
+import std::collections::Array;
+
+class Node {
+    pub value: i64;
+}
+
+fn triple(i: i64) -> Array<i64> {
+    return [i, i + 1, i + 2];
+}
+
+fn sum(values: Array<i64>) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < values.len() {
+        total = total + values[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() {
+    // Non-escaping scalar literals.
+    let mut acc = 0;
+    let mut i = 0;
+    while i < 10000 {
+        let a = [i, i + 1, i + 2];
+        acc = acc + a[1];
+        i = i + 1;
+    }
+    println(acc); // 50005000
+
+    // Literals returned from and passed to functions.
+    println(sum(triple(10)) + sum([1, 2, 3, 4])); // 43
+
+    // Reference-element literals: objects, strings and nested arrays.
+    let nodes = [new Node(1), new Node(2), new Node(3)];
+    let words = ["al" + "pha", "beta", "gam" + "ma"];
+    let grid = [[1, 2], [3, 4, 5], []];
+    gc_minor_collect();
+    println(nodes[0].value + nodes[1].value + nodes[2].value); // 6
+    println(words[0] + words[1] + words[2]); // alphabetagamma
+    println(grid[0].len() + grid[1].len() + grid[2].len() + grid[1][2]); // 10
+
+    // Push from empty grows through young buffers.
+    let pushed: Array<i64> = [];
+    let mut j = 0;
+    while j < 100 {
+        pushed.push(j);
+        j = j + 1;
+    }
+    println(pushed.len() + sum(pushed)); // 5050
+
+    // Escaping literals kept in a ring survive and move between collections.
+    let ring: Array<Array<i64>> = [];
+    let mut k = 0;
+    while k < 64 {
+        ring.push([]);
+        k = k + 1;
+    }
+    let mut n = 0;
+    while n < 20000 {
+        ring[n % 64] = [n, n * 2];
+        n = n + 1;
+    }
+    let mut ring_sum = 0;
+    let mut r = 0;
+    while r < 64 {
+        ring_sum = ring_sum + ring[r][1];
+        r = r + 1;
+    }
+    println(ring_sum); // 2555840
+
+    // A tenured array that grows afterwards gets a young buffer.
+    let old: Array<Node> = [new Node(7)];
+    gc_minor_collect();
+    gc_minor_collect();
+    gc_minor_collect();
+    let mut m = 0;
+    while m < 40 {
+        old.push(new Node(m));
+        m = m + 1;
+    }
+    gc_minor_collect();
+    println(old.len() + old[0].value + old[40].value); // 87
+
+    // Big buffers (beyond the young size limit) still work.
+    let big: Array<i64> = [];
+    let mut b = 0;
+    while b < 2000 {
+        big.push(b);
+        b = b + 1;
+    }
+    println(sum(big)); // 1999000
+}

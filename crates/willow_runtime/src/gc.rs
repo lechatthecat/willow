@@ -262,7 +262,8 @@ mod layouts;
 mod runtime_tlab;
 pub use runtime_tlab::willow_gc_current_tlab;
 pub(crate) use runtime_tlab::{
-    RuntimeTlabOwner, alloc_string_payload_slow, try_alloc_young_string_payload,
+    RuntimeTlabOwner, YoungLayout, alloc_string_payload_slow, alloc_young_layout_slow,
+    array_buffer_layout, array_handle_layout, try_alloc_young, try_alloc_young_string_payload,
 };
 
 /// Raw allocation and pointer arithmetic boundary for the collector. The rest

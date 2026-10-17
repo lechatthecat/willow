@@ -160,6 +160,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/array_fast_paths.wi", "42\ntrue\ntrue\n42\n7\n"),
         ("example/array_growth.wi", "5\n55\n25\n16\n3\n"),
         (
+            "example/array_literal_churn.wi",
+            "50005000\n43\n6\nalphabetagamma\n10\n5050\n2555840\n87\n1999000\n",
+        ),
+        (
             "example/array_loop_safepoints.wi",
             "499500\nsummed\n499500\n3\n5\n16\n6\n31415\n8\n12\ntrue\n3\ntrue\n12\n180\n460\n6765\n",
         ),
@@ -1078,6 +1082,45 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "5\n5\n5\n5\n5\n5\n5\n5\n5\n5\nfive\n2.5\ntrue\n5\n5\n5\n5\n5\n5\n5\n",
         ),
         ("example/rename_values/main.wi", "14\n7\n9\n"),
+        // Examples added without a catalog entry (found by willow-jz15.94).
+        (
+            "example/array_runtime_marker.wi",
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        ),
+        (
+            "example/atomic_permit.wi",
+            "true\nfalse\ntrue\nfalse\ntrue\nfalse\n200\n",
+        ),
+        (
+            "example/block_arm_control_tails.wi",
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+        ),
+        ("example/channel_effect_witnesses.wi", "7\n7\n2\n"),
+        ("example/channel_option_pattern.wi", "30\n"),
+        ("example/closure_effects.wi", "true\nfalse\n"),
+        ("example/closure_field_binding.wi", "10\n21\n"),
+        ("example/const_array_alternative.wi", "alpha\nbeta\n"),
+        (
+            "example/gc_allocation_counters.wi",
+            "true\ntrue\ntrue\ntrue\ntrue\n",
+        ),
+        ("example/generic_diagnostics.wi", "42\nok\n"),
+        ("example/match_import_diagnostics.wi", "7\n42\n2.5\n"),
+        (
+            "example/parallel_context_bridge.wi",
+            "4294967297\n-4294967297\n9223372036854775807\n-9223372036854775807\n0\n",
+        ),
+        ("example/result_void.wi", "validated\nunfinished\n"),
+        ("example/revision_nested_lambdas.wi", "42\n"),
+        ("example/self_capture.wi", "11\n12\n42\n51\n"),
+        ("example/module_downcast_payload/main.wi", "2\n2\n2\n"),
+        ("example/impact_override_family/src/main.wi", "3\n"),
+        ("example/lock_project_methods/src/main.wi", "1\n7\n"),
+        ("example/semantic_cli_minor/src/main.wi", "1\n1\n2\n"),
+        (
+            "example/sync_field_identity/src/main.wi",
+            "7\n8000\n16000\n24000\n",
+        ),
     ]
 }
 

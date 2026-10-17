@@ -1,7 +1,7 @@
 use std::ffi::c_char;
 use std::sync::Mutex;
 
-use crate::array::{willow_array_new, willow_array_set};
+use crate::array::willow_array_set;
 use crate::gc::{willow_pop_roots, willow_push_root};
 #[cfg(not(test))]
 use crate::string::willow_string_from_str;
@@ -90,7 +90,7 @@ pub extern "C" fn willow_runtime_args_array() -> *mut u8 {
     };
     let len = user_argc.max(0) as i64;
     // Reference-element array (each slot holds a WillowString pointer).
-    let mut arr = willow_array_new(len, 1);
+    let mut arr = crate::array::new_old_array(len, 1);
     if arr.is_null() {
         return std::ptr::null_mut();
     }
