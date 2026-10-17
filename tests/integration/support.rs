@@ -961,7 +961,12 @@ impl TestProject {
             .spawn()
             .expect("failed to run binary");
         let (output, timed_out) = wait_with_timeout(child, timeout);
-        assert!(!timed_out, "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            !timed_out,
+            "timed out after {timeout:?} with {env:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         output
     }
 

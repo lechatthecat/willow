@@ -632,7 +632,10 @@ fn async_mut_sync_preemption_example_modes() {
                     ("WILLOW_TASK_BUDGET", budget),
                     ("WILLOW_GC_STRESS", stress),
                 ],
-                std::time::Duration::from_secs(30),
+                // A hang guard, not a speed bound: budget 3 preempts ~333k
+                // times, 2.5s in a Linux debug build and over 30s on a loaded
+                // macOS Intel runner.
+                std::time::Duration::from_secs(180),
             );
             assert!(
                 out.status.success(),
