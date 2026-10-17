@@ -611,11 +611,24 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
     let mut entries: Vec<Entry> = Vec::new();
     let mut reason_ids = HashMap::new();
     let mut reasons = Vec::new();
+    // An unavailable compiler witness adds nothing for a bit the evidence explains.
+    let explained = result["effect_evidence"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .fold(0, |bits, fact| bits | fact["effect"].as_u64().unwrap_or(0));
     for fact in ["effect_evidence", "compiler_witnesses"]
         .into_iter()
         .flat_map(|key| result[key].as_array().into_iter().flatten())
     {
         let witness = &fact["witness"];
+        if witness["kind"] == "unavailable"
+            && fact["effect"]
+                .as_u64()
+                .is_some_and(|bits| bits & !explained == 0)
+        {
+            continue;
+        }
         let cause = &witness["cause"];
         let index = if let (Some(operation), true) =
             (cause["operation"].as_str(), cause["location"].is_object())
@@ -1190,6 +1203,35 @@ mod tests {
         assert_eq!(text.matches("inner").count(), 1);
         assert_eq!(text.matches("reason=[1]; reason=[2]").count(), 4);
         assert_eq!(text.matches("missing-witness").count(), 2);
+    }
+
+    #[test]
+    fn unavailable_compiler_witness_is_shown_only_for_unexplained_bits() {
+        let site = json!({"effect":32,"status":"conservative-bound","witness":{"kind":"runtime-capability",
+            "cause":{"operation":"indirect-call","location":{"path":"main.wi","line":16,"column":45}}}});
+        let unavailable = |effect: u64| json!({"effect":effect,"witness":{"kind":"unavailable"}});
+        for (compiler, entries) in [
+            (vec![unavailable(32)], 1),
+            (vec![unavailable(32 | 4)], 2),
+            (vec![unavailable(4)], 2),
+            (vec![unavailable(32), unavailable(4)], 2),
+        ] {
+            let value = json!({"effect_evidence":[site.clone()],"compiler_witnesses":compiler});
+            let mut lines = Vec::new();
+            compact_effect_evidence(&value, "main::relay", true, &mut lines);
+            assert_eq!(lines[0], format!("Evidence for main::relay: {entries}"));
+            assert_eq!(lines.len(), entries + 1);
+        }
+        let value = json!({"compiler_witnesses":[unavailable(32)]});
+        let mut lines = Vec::new();
+        compact_effect_evidence(&value, "main::relay", true, &mut lines);
+        assert_eq!(
+            lines,
+            [
+                "Evidence for main::relay: 1",
+                "  may-panic: kind=unavailable"
+            ]
+        );
     }
 
     #[test]

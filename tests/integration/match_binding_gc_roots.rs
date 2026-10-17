@@ -355,7 +355,10 @@ fn main() { println(drop_tail(Boxed::One(new Node(1)))); }
 #[test]
 fn binding_roots_11_a_binding_held_across_two_awaits() {
     assert_binding(
-        r#"async fn later(x: Boxed) -> i64 {
+        r#"async fn later(v: i64) -> i64 {
+    // Built inside the task: a mutable `Node` is not `Sync`, so it cannot be
+    // passed into an async call.
+    let x = Boxed::One(new Node(v));
     match x {
         Boxed::One(n) => {
             await yield();
@@ -368,7 +371,7 @@ fn binding_roots_11_a_binding_held_across_two_awaits() {
         Boxed::Empty => { return -1; }
     }
 }
-async fn main() { println(await later(Boxed::One(new Node(4)))); }
+async fn main() { println(await later(4)); }
 "#,
         "88\n",
         &["later", "main"],

@@ -1,4 +1,4 @@
-// Runnable evidence regression: interned strings, scheduler awaits, unknown callee.
+// Runnable evidence regression: interned strings, scheduler awaits, bounded indirect callee.
 class Response { pub value: i64; pub init(self) { self.value = 1; } }
 fn literal() -> String { return "slowly"; }
 fn literal_relay() -> String { return literal(); }

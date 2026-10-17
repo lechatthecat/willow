@@ -1488,18 +1488,20 @@ mod tests {
             let revision = snapshot.revision.clone();
             let mut session = QuerySession::new(snapshot).unwrap();
             let value = session.query(QueryRequest::Effects { revision, function });
-            assert_eq!(
-                value["result"]["unknown_causes"].as_array().unwrap().len(),
-                1
-            );
-            assert_eq!(
-                value["result"]["unknown_causes"][0]["call_sites"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                n
-            );
-            assert_eq!(session.effect_edge_visits, n);
+            // `apply` owns the unresolved sites; the arity bucket reports that no
+            // function value of that arity is known.
+            let causes = value["result"]["unknown_causes"].as_array().unwrap();
+            assert_eq!(causes.len(), 2, "{causes:#?}");
+            assert!(causes.iter().any(|cause| cause["unresolved"][0]
+                == "incomplete-function-value-candidates"
+                && cause["call_sites"].is_null()));
+            let apply = causes
+                .iter()
+                .find(|cause| cause["name"] == "apply")
+                .unwrap();
+            assert_eq!(apply["call_sites"].as_array().unwrap().len(), n);
+            // n relay/apply edges plus apply's edge into the arity bucket.
+            assert_eq!(session.effect_edge_visits, n + 1);
             println!(
                 "sites={n}, chain_edges={n}, stored_sites={n}, reported_sites={n}, visited_edges={}",
                 session.effect_edge_visits

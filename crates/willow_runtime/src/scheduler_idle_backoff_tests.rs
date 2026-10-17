@@ -93,6 +93,8 @@ unsafe extern "C" fn producer(_: *mut c_void) -> i32 {
     let probe = PROBE.lock().unwrap().as_ref().unwrap().clone();
     let mut previous_probes = 0;
     let deadline = Instant::now() + Duration::from_secs(10);
+    let forced = FORCE_WINDOW.load(Ordering::Relaxed);
+    let mut crossed = false;
     for (batch, ids) in probe.ids.chunks(probe.burst).enumerate() {
         // Give empty thieves an opportunity to race a new publication rather
         // than measuring only an already-full queue's drain throughput.
@@ -111,22 +113,36 @@ unsafe extern "C" fn producer(_: *mut c_void) -> i32 {
                 .store(probe.start.elapsed().as_nanos() as u64, Ordering::Release);
             willow_sched_wake(id);
         }
-        if batch == 0 && FORCE_WINDOW.load(Ordering::Relaxed) {
+        let force_round = forced && !crossed;
+        if force_round {
             // Small wakes coalesce notifications until a poll boundary. Flush
             // that real pending notification before releasing the forced
             // failed-probe gate, so this round actually changes generation.
             global_run_queues().flush_local_wake_notification(current_worker());
         }
         PUBLISHED_ROUND.fetch_add(1, Ordering::Release);
-        if batch == 0 && FORCE_WINDOW.load(Ordering::Relaxed) {
+        if force_round {
             // Keep this producer active until the forced failed probe has
             // actually retried and polled a consumer. Otherwise it can finish
             // and drain its own local queue before the delayed thief resumes,
             // leaving no sample on the path this test promises to exercise.
-            while !probe.samples[..ids.len()]
-                .iter()
-                .any(|sample| sample.crossed_stale_retry.load(Ordering::Acquire))
-            {
+            // A worker that never failed a probe may instead poll the whole
+            // round first; then force the next round rather than wait forever.
+            let round = &probe.samples[batch * probe.burst..][..ids.len()];
+            loop {
+                if round
+                    .iter()
+                    .any(|sample| sample.crossed_stale_retry.load(Ordering::Acquire))
+                {
+                    crossed = true;
+                    break;
+                }
+                if round
+                    .iter()
+                    .all(|sample| sample.latency.load(Ordering::Acquire) != 0)
+                {
+                    break;
+                }
                 if Instant::now() >= deadline {
                     probe.timed_out.store(true, Ordering::Release);
                     break;

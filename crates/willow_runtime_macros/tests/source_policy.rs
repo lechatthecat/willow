@@ -18,6 +18,7 @@ struct Scan {
     failures: Vec<String>,
     guarded: usize,
     handlers: usize,
+    bridges: usize,
     raw_unwraps: usize,
 }
 impl<'ast> Visit<'ast> for Scan {
@@ -49,6 +50,11 @@ impl<'ast> Visit<'ast> for Scan {
                 let handler = self.path.ends_with("stack_overflow.rs")
                     && ((abi == "C" && name == "signal_handler")
                         || (abi == "system" && name == "exception_handler"));
+                // Generated-code entry bridges: a catch boundary would add a
+                // NativeFrameGuard around task polls, so they stay panic-free.
+                let bridge = self.path.ends_with("generated_context.rs")
+                    && abi == "C"
+                    && (name == "invoke" || name == "invoke_word");
                 let mut risky = Risky::default();
                 risky.visit_block(&function.block);
                 self.raw_unwraps += risky.unwraps;
@@ -56,6 +62,8 @@ impl<'ast> Visit<'ast> for Scan {
                     self.guarded += 1;
                 } else if handler && risky.unwraps == 0 && risky.panic_macros == 0 {
                     self.handlers += 1;
+                } else if bridge && risky.unwraps == 0 && risky.panic_macros == 0 {
+                    self.bridges += 1;
                 } else {
                     self.failures.push(format!(
                         "{}::{name}: unguarded {abi} function ({} unwrap/expect, {} panic macros)",
@@ -155,6 +163,10 @@ fn runtime_c_boundaries_are_guarded_including_unwrap_and_expect() {
     assert_eq!(
         scan.handlers, 2,
         "only the two audited native handlers are exempt"
+    );
+    assert_eq!(
+        scan.bridges, 2,
+        "only the two audited generated-code bridges are exempt"
     );
     println!(
         "guarded_functions={} native_handlers={} contained_unwrap_expect={}",

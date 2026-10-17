@@ -245,7 +245,7 @@ fn main() {
     assert_eq!(errors.len(), 1, "{error}: {errors:#?}");
     assert!(errors[0].message.contains("Heap<T>"));
     assert!(!format!("{errors:#?}").contains("$mono$"));
-    assert!(error.to_string().contains("1 errors"), "{error}");
+    assert!(error.to_string().contains("1 error(s)"), "{error}");
 }
 
 #[test]
@@ -330,7 +330,7 @@ fn generic_diagnostics_human_output() {
     assert_eq!(stderr.matches("error[E0502]").count(), 1, "{stderr}");
     assert!(stderr.contains("class `Heap<T>`"), "{stderr}");
     assert!(!stderr.contains("$mono$"), "{stderr}");
-    assert!(stderr.contains("1 errors"), "{stderr}");
+    assert!(stderr.contains("1 error(s)"), "{stderr}");
 }
 
 #[test]

@@ -2527,22 +2527,37 @@ fn effect_witness_precision_literals_scheduler_and_unknown_origins() {
         );
         assert_ne!(bits & u64::from(E::MAY_SUSPEND.bits()), 0, "{value}");
     }
+    // `increment` is the only checked arity-1 function value, so the indirect
+    // call in `apply` is bounded rather than unknown.
     for name in ["apply", "relay", "dispatch"] {
-        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 1);
-        let causes = value["result"]["unknown_causes"].as_array().unwrap();
-        let cause = causes.iter().find(|c| c["name"] == "apply").unwrap();
-        assert!(
-            !cause["unresolved"].as_array().unwrap().is_empty(),
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+        assert_eq!(
+            value["result"]["unknown_causes"],
+            serde_json::json!([]),
             "{value}"
         );
-        assert_eq!(cause["locations"][0]["line"], 16, "{value}");
+        let panic = value["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["effect"] == E::MAY_PANIC.bits())
+            .unwrap();
+        assert_eq!(panic["status"], "conservative-bound", "{value}");
+        assert_eq!(
+            panic["witness"]["cause"]["operation"], "indirect-call",
+            "{value}"
+        );
+        assert_eq!(panic["witness"]["cause"]["location"]["line"], 16, "{value}");
         let output = f.run(&["effects", &format!("main::{name}")]);
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(
-            text.contains("Incomplete effect summary: main::apply"),
+            text.contains("operation=indirect-call; at src/main.wi:16:45"),
             "{text}"
         );
-        assert!(text.contains("src/main.wi:16:"), "{text}");
+        assert!(!text.contains("Incomplete effect summary"), "{text}");
+        assert!(!text.contains("kind=unavailable"), "{text}");
+        assert!(text.contains("Evidence for main::"), "{text}");
+        assert!(text.contains(": 1\n"), "{text}");
     }
 }
 

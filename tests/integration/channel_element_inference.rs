@@ -619,15 +619,16 @@ fn channel_element_20_example_is_fully_lir() {
     );
     let (ok, stderr) = compile_with_compiler_env(&source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "the example fell back to the AST backend: {stderr}");
-    for function in [
-        "buffered_strings",
-        "buffered_notes",
-        "buffered_numbers",
-        "buffered_strings_explicit",
-        "consume",
-        "main",
+    for (function, prefix) in [
+        ("buffered_strings", ""),
+        ("buffered_notes", ""),
+        ("buffered_numbers", ""),
+        ("buffered_strings_explicit", ""),
+        ("buffered_strings_bounded", ""),
+        ("consume", "async "),
+        ("main", "async "),
     ] {
-        let line = format!("[lir] compiling async `{function}` from lowered IR");
+        let line = format!("[lir] compiling {prefix}`{function}` from lowered IR");
         assert!(
             stderr.contains(&line),
             "`{function}` did not use the LIR walker: {stderr}"
