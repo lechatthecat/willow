@@ -8416,6 +8416,72 @@ mod continuation_depth_tests {
             .join()
             .unwrap();
     }
+
+    fn nested_checker_sources(depth: usize) -> [String; 3] {
+        let nested = |prefix: &str, leaf: &str, suffix: &str| {
+            format!("{}{leaf}{}", prefix.repeat(depth), suffix.repeat(depth))
+        };
+        [
+            format!(
+                "fn gid<T>(x: T) -> T {{ return x; }} fn f() -> i64 {{ return {}; }}",
+                nested("gid(", "7", ")")
+            ),
+            format!(
+                "fn f() -> bool {{ return {}; }}",
+                nested("match 1 { x if ", "true", " => true, _ => false }")
+            ),
+            format!(
+                "fn apply<T>(x: T, f: fn(T) -> T) -> T {{ return f(x); }} fn f() -> i64 {{ return {}; }}",
+                nested("apply(1, |a: i64| ", "a", ")")
+            ),
+        ]
+    }
+
+    /// Deepest executor nesting while checking `source`.
+    fn checker_run_nesting(source: &str) -> usize {
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut checker = TypeChecker::new();
+        crate::compiler_stack::take_max_run_nesting();
+        checker.check_program(&program);
+        let nesting = crate::compiler_stack::take_max_run_nesting();
+        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        drop(checker);
+        drop(program);
+        nesting
+    }
+
+    /// willow-5gke: generic calls, match guards and callable lambdas each
+    /// re-entered a synchronous checker wrapper per nesting level.
+    #[test]
+    fn generic_calls_guards_and_callable_lambdas_deep_on_one_mib() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                for source in nested_checker_sources(2_000) {
+                    checker_run_nesting(&source);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Executor nesting is independent of source nesting depth for every
+    /// shape: each level is a heap child, not a fresh `compiler_stack::run`.
+    #[test]
+    fn nested_checker_shapes_keep_constant_executor_nesting() {
+        for (shape, (one, many)) in nested_checker_sources(1)
+            .iter()
+            .zip(nested_checker_sources(64))
+            .enumerate()
+        {
+            let (one, many) = (checker_run_nesting(one), checker_run_nesting(&many));
+            println!("WILLOW_CHECKER_RUN_NESTING shape={shape} depth1={one} depth64={many}");
+            assert_eq!(one, many, "shape {shape}");
+        }
+    }
 }
 
 mod analysis_symbols;

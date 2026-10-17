@@ -114,6 +114,15 @@ impl VisitMut for Calls<'_> {
                         parse_quote!(match #receiver {Some(#pattern)=>Some(#body),None=>None});
                     return;
                 }
+                "then" => {
+                    // `(!cond).then(..)` must not keep its now-redundant parentheses.
+                    let condition = match &**receiver {
+                        Expr::Paren(inner) => &*inner.expr,
+                        condition => condition,
+                    };
+                    *expression = parse_quote!(if #condition {Some(#body)} else {None});
+                    return;
+                }
                 "is_some_and" => {
                     *expression = parse_quote!(match #receiver {Some(#pattern)=>#body,None=>false});
                     return;
@@ -309,7 +318,7 @@ pub fn parser(_: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 /// Type checker methods lowered to continuations.
-const CHECKER_METHODS: &str = "absorb_body, block_diverges, check_all_paths_return, check_array_literal, check_array_literal_expecting, check_array_literal_type, check_array_method_call, check_async_capture, check_async_task_send, check_atomic_method_call, check_block, check_block_scope, check_call_arg_against_param, check_call_args_against_param_infos, check_class, check_class_implements, check_class_inheritance, check_concurrency_method_call, check_constructor, check_expr, check_expr_expecting, check_expr_expecting_inner, check_expr_inner, check_fn_arg_with_param_context, check_format_call, check_frozen_map_method_call, check_function, check_index, check_interface, check_interface_default_body, check_interpolation, check_lambda, check_lambda_body, check_lambda_in_context, check_lambda_scoped, check_lambda_expecting, check_lambda_with_context, check_lambda_with_context_inner, check_lambda_with_param_context, check_lock_method_call, check_lock_stmt, check_map_method_call, check_match_body, check_match_body_inner, check_match_expr, check_method, check_method_call_expecting, check_module_program, check_new, check_object_literal, check_operator_tree, check_option_result_method_call, check_panic_interpolation, check_program, check_program_items, check_range, check_receiver_method_call, check_reference_argument, check_select, check_source_type_access, check_static_field_assign, check_static_forward_references, check_static_property_initializers, check_stmt, check_super_init, check_super_method_call, check_ternary_expecting, check_try_propagate, check_value_arg_type, check_value_call_args, class_info_from_decl, construct_static_variant_call, construct_variant_call, expr_diverges, is_send, is_sync, is_task_send, marker_holds, named_marker_holds, normalize_decl_param_infos, normalize_decl_type, normalize_param_infos, normalize_param_types, normalize_type, normalize_type_inner, reference_place_info, register_class, register_enum, register_interface, register_module, register_module_impl, register_module_type_signatures, register_module_with_id, register_prelude_enum, register_prelude_interface, resolve_fully_qualified_std_module_call, resolve_interface_method, resolve_method, resolve_static_call, stmt_diverges, validate_type";
+const CHECKER_METHODS: &str = "absorb_body, block_diverges, check_all_paths_return, check_array_literal, check_array_literal_expecting, check_array_literal_type, check_array_method_call, check_async_capture, check_async_task_send, check_atomic_method_call, check_block, check_block_scope, check_call_arg_against_param, check_call_args_against_param_infos, check_class, check_class_implements, check_class_inheritance, check_concurrency_method_call, check_constructor, check_deferred_lambdas_plainly, check_expr, check_expr_expecting, check_expr_expecting_inner, check_expr_inner, check_fn_arg_with_param_context, check_format_call, check_frozen_map_method_call, check_function, check_generic_call, check_generic_call_parts, check_index, check_interface, check_interface_default_body, check_interpolation, check_lambda, check_lambda_body, check_lambda_expecting, check_lambda_for_callable, check_lambda_in_context, check_lambda_scoped, check_lambda_with_context, check_lambda_with_context_inner, check_lambda_with_param_context, check_lock_method_call, check_lock_stmt, check_map_method_call, check_match_body, check_match_body_inner, check_match_expr, check_match_guard, check_method, check_method_call_expecting, check_module_program, check_new, check_object_literal, check_operator_tree, check_option_result_method_call, check_panic_interpolation, check_program, check_program_items, check_range, check_receiver_method_call, check_reference_argument, check_select, check_source_type_access, check_static_field_assign, check_static_forward_references, check_static_property_initializers, check_stmt, check_super_init, check_super_method_call, check_ternary_expecting, check_try_propagate, check_value_arg_type, check_value_call_args, class_info_from_decl, construct_static_variant_call, construct_variant_call, expr_diverges, instantiate_class, instantiation_bindings, is_send, is_sync, is_task_send, marker_holds, marker_holds_with_reason, named_marker_holds, normalize_decl_param_infos, normalize_decl_type, normalize_param_infos, normalize_param_types, normalize_type, normalize_type_inner, reference_place_info, register_class, register_enum, register_interface, register_module, register_module_impl, register_module_type_signatures, register_module_with_id, register_prelude_enum, register_prelude_interface, reject_constant_call, resolve_fully_qualified_std_module_call, resolve_i64_overflow_method, resolve_interface_method, resolve_method, resolve_static_call, stmt_diverges, validate_type";
 
 /// Shared continuation boundary for the checker call graph.
 #[proc_macro_attribute]
@@ -498,25 +507,11 @@ mod tests {
     }
 
     #[test]
-    fn checker_call_cycle_leaks_are_only_the_known_ones() {
-        // Tracked by willow-5gke; remove names here as they are lowered.
-        let known: BTreeSet<String> = [
-            "check_deferred_lambdas_plainly",
-            "check_generic_call",
-            "check_generic_call_parts",
-            "check_lambda_for_callable",
-            "check_match_guard",
-            "instantiate_class",
-            "instantiation_bindings",
-            "marker_holds_with_reason",
-            "reject_constant_call",
-            "resolve_i64_overflow_method",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    fn checker_call_cycles_are_fully_lowered() {
+        // willow-5gke: generic calls, match guards, callable lambdas and
+        // their helpers each re-entered a synchronous wrapper per level.
         let leaks = boundary_leaks(&call_graph("src/semantic", "TypeChecker"), CHECKER_METHODS);
-        assert_eq!(leaks, known);
+        assert!(leaks.is_empty(), "add to CHECKER_METHODS: {leaks:?}");
     }
 
     #[test]

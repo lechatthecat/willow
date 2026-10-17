@@ -801,6 +801,7 @@ fn symbol(name: &str, args: &[Type]) -> String {
     format!("{name}$mono${:x}", crate::hex::Hex(&digest.finalize()))
 }
 
+#[willow_continuations::checker]
 impl TypeChecker {
     fn check_instantiation_size(&mut self, args: &[Type], span: Span) -> bool {
         let mut nodes = 0usize;

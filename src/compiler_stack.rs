@@ -21,6 +21,22 @@ struct Executor {
 thread_local! {
     static EXECUTOR: Cell<*mut Executor> = const { Cell::new(std::ptr::null_mut()) };
 }
+#[cfg(test)]
+thread_local! {
+    /// (live, deepest) nesting of [`run`] executors on this thread.
+    static RUN_NESTING: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+}
+/// Deepest [`run`] nesting since the last call. A continuation boundary leak
+/// makes it grow with input nesting depth; a fully lowered call graph keeps
+/// it constant.
+#[cfg(test)]
+pub(crate) fn take_max_run_nesting() -> usize {
+    RUN_NESTING.with(|n| {
+        let (live, deepest) = n.get();
+        n.set((live, live));
+        deepest
+    })
+}
 struct State<'a, T> {
     future: Option<Pin<Box<dyn Future<Output = T> + 'a>>>,
     result: Option<T>,
@@ -175,8 +191,15 @@ pub(crate) fn run<T>(mut root: Continuation<'_, T>) -> T {
     impl Drop for Restore {
         fn drop(&mut self) {
             EXECUTOR.with(|slot| slot.set(self.0));
+            #[cfg(test)]
+            RUN_NESTING.with(|n| n.set((n.get().0 - 1, n.get().1)));
         }
     }
+    #[cfg(test)]
+    RUN_NESTING.with(|n| {
+        let live = n.get().0 + 1;
+        n.set((live, live.max(n.get().1)));
+    });
     let _restore = Restore(EXECUTOR.with(|slot| slot.replace(&mut executor)));
     let state = root.state.as_mut().unwrap();
     let mut work = vec![Task {
