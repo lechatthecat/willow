@@ -172,11 +172,19 @@ impl Drop for MarkBatch<'_> {
                 .append(&mut self.deferred);
         }
         if !self.unindexed.is_empty() {
-            self.cycle
-                .unindexed
-                .lock()
-                .unwrap()
-                .extend(self.unindexed.drain());
+            let mut unindexed = self.cycle.unindexed.lock().unwrap();
+            let pending = std::mem::take(&mut self.unindexed);
+            if self.cycle.late_published.load(Ordering::Relaxed) && !std::thread::panicking() {
+                // Late publication already took the shared set: recheck these
+                // with the complete index. No reader is held here. On unwind,
+                // worker failure forces authoritative stopped tracing instead.
+                drop(unindexed);
+                for address in pending {
+                    self.cycle.enqueue(address as *mut u8);
+                }
+            } else {
+                unindexed.extend(pending);
+            }
         }
         // A bounded drain owns termination until its claimed continuation is
         // visible again, including on unwind and before a minor safepoint.
@@ -491,7 +499,13 @@ impl ConcurrentCycle {
             }
             None => {
                 batch.discovery_counts[2] += 1;
-                if index.needs_start_publication(child as usize) {
+                // The held reader excludes late publication, so a published
+                // flag here means `index` already contains late extents.
+                // Otherwise a captured object may name a late-extent child
+                // stored before the stop: retain it like roots and SATB.
+                if index.needs_start_publication(child as usize)
+                    || !self.late_published.load(Ordering::Acquire)
+                {
                     batch.unindexed.insert(child as usize);
                 }
                 return;
