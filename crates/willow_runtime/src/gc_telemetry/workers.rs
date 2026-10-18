@@ -128,6 +128,7 @@ pub(crate) struct JobMeasurement {
 }
 impl JobMeasurement {
     pub(crate) fn begin() -> Self {
+        super::measurement::worker_busy();
         Self {
             start: Instant::now(),
             cpu: thread_cpu_ns(),
@@ -155,6 +156,7 @@ impl Drop for JobMeasurement {
         if saturated {
             stats.flags |= SATURATED;
         }
+        super::measurement::worker_idle();
     }
 }
 

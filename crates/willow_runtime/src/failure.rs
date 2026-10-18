@@ -10,6 +10,7 @@ fn diagnostic(class: &str, message: std::fmt::Arguments<'_>) {
 
 #[cold]
 pub(crate) fn fatal_invariant(message: &str) -> ! {
+    crate::gc_telemetry::failure_record::emit("invariant", message);
     diagnostic("fatal", format_args!("{message}"));
     std::process::abort();
 }
@@ -50,6 +51,7 @@ pub(crate) fn ffi_boundary<R>(name: &'static str, body: impl FnOnce() -> R) -> R
 #[cold]
 #[inline(never)]
 fn abort_panic(name: &str, payload: Box<dyn std::any::Any + Send>) -> ! {
+    crate::gc_telemetry::failure_record::emit("ffi_panic", name);
     // Share the fatal path across all closure instantiations. A user-defined
     // payload may panic in Drop; do not run it while terminating the process.
     std::mem::forget(payload);

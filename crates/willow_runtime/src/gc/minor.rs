@@ -470,6 +470,10 @@ impl<'a> MinorCollector<'a> {
                 self.pin_root(payload, PinSource::MemoryBudget);
                 return payload;
             }
+            crate::gc_telemetry::failure_record::emit(
+                "evacuation_allocation",
+                "minor evacuation allocation failed without a region budget",
+            );
             std::process::abort();
         };
         // SAFETY: source and target are distinct allocations with identical
@@ -746,6 +750,13 @@ impl<'a> MinorCollector<'a> {
     ) -> (usize, crate::gc_telemetry::MarkWork) {
         let started = std::time::Instant::now();
         self.work.remembered_owners = remembered.len() as u64;
+        let cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
+        let evacuation = crate::gc_telemetry::measurement::Span::new(
+            crate::gc_telemetry::measurement::Phase::Evacuation,
+        );
+        let root_scan = crate::gc_telemetry::measurement::Span::new(
+            crate::gc_telemetry::measurement::Phase::Roots,
+        );
         let count = roots.slots.len() + roots.values.len();
         self.work.root_scan_bytes = crate::gc_telemetry::MarkWork::roots(count).root_scan_bytes;
         self.stop_work.root_values += count as u64;
@@ -773,6 +784,7 @@ impl<'a> MinorCollector<'a> {
         for slot in roots.slots {
             self.scan_root_slot(slot);
         }
+        drop(root_scan);
         while let Some((object, root)) = self.worklist.pop() {
             // Evacuation queues each new destination once. A repeated root slot
             // may also pin a promoted destination; the root entry owns its scan.
@@ -813,8 +825,15 @@ impl<'a> MinorCollector<'a> {
             *unindexed = unindexed.iter().copied().filter_map(remap).collect();
             self.already_queued = already_queued;
         }
+        drop(evacuation);
+        let cpu = cpu_start
+            .zip(crate::gc_telemetry::workers::thread_cpu_ns())
+            .and_then(|(a, b)| b.checked_sub(a));
+        self.work.cpu_ns = cpu.unwrap_or(0);
+        self.work.cpu_incomplete = cpu.is_none();
 
         self.work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
+        crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::MarkComplete);
         let mut reclaimed_bytes = 0usize;
         let mut reclaimed_young = 0u64;
         // Nursery runs are usually one type; skip the registry probe for them.
@@ -1056,6 +1075,7 @@ impl<'a> MinorCollector<'a> {
             }
             cycle.termination.restart();
         }
+        crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::SweepComplete);
         (reclaimed_bytes, std::mem::take(&mut self.work))
     }
 
@@ -1194,6 +1214,8 @@ fn minor_collect_with_roots(
     mut roots: MinorRoots,
     stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
 ) -> Option<(u64, u64, crate::gc_telemetry::MarkWork)> {
+    let root_scan =
+        crate::gc_telemetry::measurement::Span::new(crate::gc_telemetry::measurement::Phase::Roots);
     append_parked_roots(&mut roots);
     roots.slots.extend(runtime_root_slots());
     roots.values.extend(
@@ -1210,6 +1232,7 @@ fn minor_collect_with_roots(
     // Address runtime roots are old. Their initial children are remembered at
     // registration and subsequent stores use the old-to-young barrier. Scanning
     // the complete registry here would revisit every suspended task each minor.
+    drop(root_scan);
     let registry = minor_registry_snapshot();
     let mut state = runtime().heap.lock().unwrap();
     // Promotion raises `occupied` per object; drop the lock-free headrooms
@@ -1234,6 +1257,7 @@ fn minor_collect_with_roots(
     if std::env::var("WILLOW_GC_VERIFY_BARRIER").is_ok()
         && let Err(message) = verify_remembered_set(&state, &registry.trace)
     {
+        crate::gc_telemetry::failure_record::emit("invariant", &message);
         panic!("willow gc: write barrier verification failed: {message}");
     }
     let remembered = std::mem::take(&mut state.remembered_set);
@@ -1397,7 +1421,10 @@ fn collect_stopped(
         super::flush_satb_all_locked(coord, &mut state);
         retire_all_tlabs_unindexed(&mut state);
     }
+    let root_scan =
+        crate::gc_telemetry::measurement::Span::new(crate::gc_telemetry::measurement::Phase::Roots);
     let roots = minor_stack_roots(coord);
+    drop(root_scan);
     let result = minor_collect_with_roots(roots, stop_work);
     if let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref()
         && !cycle.closing.load(std::sync::atomic::Ordering::Acquire)

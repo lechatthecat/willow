@@ -1,5 +1,28 @@
 use super::*;
 
+static DESTINATIONS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+static DELETIONS: AtomicU64 = AtomicU64::new(0);
+static VERIFY_COUNTS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("WILLOW_GC_VERIFY_BARRIER").is_some());
+pub fn barrier_variant_counts() -> ([u64; 13], u64, bool) {
+    (
+        std::array::from_fn(|i| DESTINATIONS[i].load(Ordering::Relaxed)),
+        DELETIONS.load(Ordering::Relaxed),
+        cfg!(test) || *VERIFY_COUNTS,
+    )
+}
+pub(super) fn reset_barrier_variant_counts() {
+    for counter in &DESTINATIONS {
+        counter.store(0, Ordering::Relaxed);
+    }
+    DELETIONS.store(0, Ordering::Relaxed);
+}
+fn count(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_add(1))
+    });
+}
+
 pub(super) fn payload_generation(state: &GcState, payload: *mut u8) -> Option<u8> {
     if payload.is_null() {
         return None;
@@ -135,6 +158,9 @@ fn publish_marking_unlocked(old: *mut u8, value: *mut u8, phase: u8) -> bool {
 /// reach a safepoint or trace payloads, so callers may hold a container lock.
 pub(crate) fn satb_delete(old: *mut u8) {
     let phase = GC_MARK_PHASE.load(Ordering::Acquire);
+    if !old.is_null() && phase != 0 && (cfg!(test) || *VERIFY_COUNTS) {
+        count(&DELETIONS);
+    }
     if !old.is_null() && phase != 0 && !publish_marking_unlocked(old, std::ptr::null_mut(), phase) {
         record_satb_locked(&mut runtime().heap.lock().unwrap(), old);
     }
@@ -241,6 +267,14 @@ pub extern "C" fn willow_gc_write_barrier(
     // no-op and is excluded from the processed-barrier telemetry counter.
     if value.is_null() && (old_value.is_null() || !marking_active) {
         return;
+    }
+    if (cfg!(test) || *VERIFY_COUNTS)
+        && let Some(counter) = destination_kind
+            .checked_sub(1)
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| DESTINATIONS.get(i))
+    {
+        count(counter);
     }
     count_barrier_call();
     // With no nursery ever published there are no old-to-young edges. A value

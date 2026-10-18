@@ -221,6 +221,7 @@ pub(super) fn finish_with_hooks(
                         }
                         if let Some(message) = error {
                             drop(state); // Invalid user roots must not poison the heap.
+                            crate::gc_telemetry::failure_record::emit("invariant", &message);
                             panic!(
                                 "willow gc: invalid GC pointer in concurrent closure: {message}"
                             );
@@ -255,6 +256,9 @@ pub(super) fn finish_with_hooks(
                         .lock()
                         .unwrap()
                         .transition(old_cycle::Phase::Sweep);
+                    crate::gc_telemetry::milestones::reached(
+                        crate::gc_telemetry::GcStage::MarkComplete,
+                    );
                     return Some((work, plan));
                 }
                 cycle.termination.restart();
@@ -310,6 +314,9 @@ pub(super) fn finish_stopped(
             flush_satb_all_locked(coord, &mut state);
             retire_tlabs_with_work(&mut state, stop_work);
             drop(state);
+            let root_scan = crate::gc_telemetry::measurement::Span::new(
+                crate::gc_telemetry::measurement::Phase::Roots,
+            );
             let root_job = marking.termination.enter();
             let mut roots = all_registered_stack_roots(coord);
             roots.extend(runtime_roots_snapshot());
@@ -319,6 +326,7 @@ pub(super) fn finish_stopped(
                 marking.enqueue(root);
             }
             drop(root_job);
+            drop(root_scan);
             let mut fallback = marking.worker_failed.load(Ordering::Acquire)
                 || marking.stopped_completion_required.load(Ordering::Acquire)
                 // Deferred STW-only hooks can coexist with indefinitely retrying
@@ -389,6 +397,9 @@ pub(super) fn finish_stopped(
             work.root_scan_bytes = work
                 .root_scan_bytes
                 .saturating_add(roots.len() as u64 * std::mem::size_of::<usize>() as u64);
+            work.cpu_ns = work.cpu_ns.saturating_add(legacy.cpu_ns);
+            work.collector_mark_cpu_ns = work.collector_mark_cpu_ns.saturating_add(legacy.cpu_ns);
+            work.cpu_incomplete |= legacy.cpu_incomplete;
             work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
             let mut state = runtime().heap.lock().unwrap();
             // No buffer may allocate white between phase 0 and sweep_pending.
@@ -406,8 +417,12 @@ pub(super) fn finish_stopped(
                 .lock()
                 .unwrap()
                 .transition(old_cycle::Phase::Sweep);
+            crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::MarkComplete);
             if fallback {
                 let freed = sweep_with_work(stop_work);
+                crate::gc_telemetry::milestones::reached(
+                    crate::gc_telemetry::GcStage::SweepComplete,
+                );
                 marking
                     .phase
                     .lock()

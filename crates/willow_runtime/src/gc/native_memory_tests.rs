@@ -52,13 +52,22 @@ fn short_lived_string_churn_bounds_reservations_and_rss() {
         drop(source);
         let before = telemetry_heap_snapshot().0;
         let mut peak_reserved = 0;
+        let mut peak_sample = crate::gc_telemetry::measurement::GcMemoryV3::default();
         let mut total = 0u64;
         for i in 0..n {
             let rest = crate::string::willow_string_substring(base.load(), i as i64, size as i64);
             total += crate::string::willow_string_len(rest) as u64;
             // Sampling heap counters does not allocate managed objects or GC.
-            let (_, heap) = telemetry_heap_snapshot();
-            peak_reserved = peak_reserved.max(heap.reserved_bytes);
+            let mut state = runtime().heap.lock().unwrap();
+            sync_tlab_accounting(&mut state);
+            let sample = telemetry::accounting_from_state(&state);
+            let reserved = sample
+                .old_reserved_bytes
+                .saturating_add(sample.young_reserved_bytes);
+            if reserved >= peak_reserved {
+                peak_reserved = reserved;
+                peak_sample = sample;
+            }
         }
         let expected = (n * size - n * (n - 1) / 2) as u64;
         assert_eq!(total, expected);
@@ -70,7 +79,12 @@ fn short_lived_string_churn_bounds_reservations_and_rss() {
         );
         assert!(after.freed_objects > before.freed_objects);
         assert!(after.released_bytes > before.released_bytes);
-        assert!(peak_reserved < 16 * 1024 * 1024, "reserved={peak_reserved}");
+        crate::gc_telemetry::failure_record::assert_sample_below(
+            "reserved_memory_threshold",
+            peak_sample,
+            peak_reserved,
+            16 * 1024 * 1024,
+        );
         willow_gc_collect();
         let (counters, heap) = telemetry_heap_snapshot();
         assert_eq!(heap.occupied_bytes, (size + GC_HEADER_SIZE + 9) as u64);
@@ -96,7 +110,12 @@ fn short_lived_string_churn_bounds_reservations_and_rss() {
             .and_then(|value| value.trim().strip_suffix("kB"))
             .and_then(|value| value.trim().parse().ok())
             .expect("VmHWM in /proc/self/status");
-        assert!(peak_kib < 64 * 1024, "peak RSS KiB={peak_kib}");
+        crate::gc_telemetry::failure_record::assert_sample_below(
+            "rss_memory_threshold",
+            telemetry::accounting_from_state(&runtime().heap.lock().unwrap()),
+            peak_kib.saturating_mul(1024),
+            64 * 1024 * 1024,
+        );
         println!("string_churn peak_rss_kib={peak_kib}");
     }
 }
@@ -315,7 +334,13 @@ fn unchanged_high_reservations_do_not_collect_per_managed_allocation() {
         let state = runtime().heap.lock().unwrap();
         assert_eq!(state.old_reserved_bytes, 256 * 1024);
         assert_eq!(state.tlab_reserved_bytes, 0);
-        assert!(state.allocated_bytes < 225 * 1024);
+        let sample = telemetry::accounting_from_state(&state);
+        crate::gc_telemetry::failure_record::assert_sample_below(
+            "managed_memory_threshold",
+            sample,
+            sample.managed_bytes,
+            225 * 1024,
+        );
         assert_eq!(
             state.major_collections, 1,
             "unchanged reservations caused repeated full collections"
@@ -563,4 +588,46 @@ fn native_accounting_underflow_does_not_wrap_or_change_the_gauge() {
     let before = external_bytes();
     assert!(std::panic::catch_unwind(|| release_external(before + 1)).is_err());
     assert_eq!(external_bytes(), before);
+}
+
+#[test]
+fn m0_threshold_locked_sample_reports_actual_limit_and_categories() {
+    const CHILD: &str = "WILLOW_TEST_CAPTURED_THRESHOLD";
+    if std::env::var_os(CHILD).is_some() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        std::panic::set_hook(Box::new(|_| {}));
+        willow_alloc(8);
+        charge_external(123);
+        let state = runtime().heap.lock().unwrap();
+        let sample = telemetry::accounting_from_state(&state);
+        // Equality must fail: the original bound is strict, not inclusive.
+        crate::gc_telemetry::failure_record::assert_sample_below(
+            "managed_memory_threshold",
+            sample,
+            sample.managed_bytes,
+            sample.managed_bytes,
+        );
+        unreachable!();
+    }
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "gc::native_memory_tests::m0_threshold_locked_sample_reports_actual_limit_and_categories", "--nocapture"])
+        .env(CHILD, "1").output().unwrap();
+    assert!(!child.status.success());
+    let stderr = String::from_utf8(child.stderr).unwrap();
+    let records: Vec<_> = stderr.lines().filter(|s| s.starts_with('{')).collect();
+    assert_eq!(records.len(), 1, "{stderr}");
+    let record = records[0];
+    assert!(record.len() < crate::gc_telemetry::failure_record::FAILURE_RECORD_LIMIT);
+    for field in ["actual_bytes", "limit_bytes", "managed_bytes"] {
+        assert!(
+            record.contains(&format!("\"{field}\":{}", GC_HEADER_SIZE + 8)),
+            "{record}"
+        );
+    }
+    assert!(record.contains("\"external_bytes\":123"), "{record}");
+    assert!(record.contains("\"old_reserved_bytes\":262144"), "{record}");
+    assert!(record.contains("\"young_reserved_bytes\":0"), "{record}");
+    assert!(record.contains("\"kind\":\"managed_memory_threshold\""));
+    println!("{record}");
 }

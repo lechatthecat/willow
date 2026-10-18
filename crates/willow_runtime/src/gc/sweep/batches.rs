@@ -180,6 +180,7 @@ pub(super) fn execute(plan: SweepPlan) -> usize {
             cursor.report
         );
     }
+    crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::SweepComplete);
     freed
 }
 
@@ -594,6 +595,7 @@ impl Cursor {
         if chunk.owner_state.is_some() {
             self.dead_chunks.push(false);
             self.chunks += 1;
+            state.pending_sweep_chunks.start = self.chunks;
             self.report.objects += 1;
             return Action::Progress;
         }
@@ -633,6 +635,7 @@ impl Cursor {
             }
             self.dead_chunks.push(!self.chunk_live);
             self.chunks += 1;
+            state.pending_sweep_chunks.start = self.chunks;
             self.offset = 0;
             self.chunk_started = false;
             self.report.objects += 1;
@@ -790,6 +793,7 @@ impl Cursor {
             return Action::Progress;
         }
         state.sweeping = None;
+        state.pending_sweep_chunks = 0..0;
         publish_collection_busy(state);
         self.done = true;
         Action::Progress

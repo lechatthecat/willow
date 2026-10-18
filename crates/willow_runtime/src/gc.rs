@@ -283,6 +283,7 @@ use raw_heap::{Object as HeapObject, Payload as GcPayload, RootSlot};
 struct GcState {
     concurrent_cycle: Option<Arc<ConcurrentCycle>>,
     sweeping: Option<ThreadId>,
+    pending_sweep_chunks: std::ops::Range<usize>,
     satb: satb::SatbBuffers,
     /// Bump-allocation chunks. Active chunks are owned by one TLS state;
     /// collection retires them before walking their object headers. Collector-only
@@ -627,6 +628,19 @@ fn collect_for_budget() {
 
 fn allocation_failure(state: &GcState) -> *mut u8 {
     if let Some(limit) = state.memory_limit_bytes {
+        let memory = telemetry::accounting_from_state(state);
+        crate::gc_telemetry::failure_record::emit_with(
+            "reservation_threshold",
+            "reservation admission failed",
+            Some(memory),
+            Some(
+                memory
+                    .old_reserved_bytes
+                    .saturating_add(memory.young_reserved_bytes)
+                    .saturating_add(memory.external_bytes),
+            ),
+            Some(limit as u64),
+        );
         crate::failure::resource_exhausted(format_args!(
             "GC memory limit exceeded ({limit} bytes of managed and native reservations)"
         ));
@@ -698,6 +712,7 @@ impl Default for GcState {
         Self {
             concurrent_cycle: None,
             sweeping: None,
+            pending_sweep_chunks: 0..0,
             satb: satb::SatbBuffers::default(),
             tlab_chunks: Vec::new(),
             tlab_addresses: address_index::AddressIndex::default(),
@@ -875,6 +890,7 @@ static GC_RUNTIME: LazyLock<GcRuntime> = LazyLock::new(|| {
     progress::initialize();
     GcRuntime::default()
 });
+static DIAGNOSTIC_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn runtime() -> &'static GcRuntime {
     &GC_RUNTIME
@@ -1017,6 +1033,7 @@ pub extern "C" fn willow_gc_set_memory_limit(bytes: u64) -> u64 {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_init() {
     reset_internal();
+    DIAGNOSTIC_READY.store(true, Ordering::Release);
 }
 
 /// Allocate a GC-managed object of `payload_size` bytes with the given
@@ -1704,6 +1721,12 @@ struct GcStressTestScope(Option<Vec<String>>);
 
 #[cfg(test)]
 impl GcStressTestScope {
+    fn with_modes(value: &str) -> Self {
+        let mut modes = gc_stress_override()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        Self(modes.replace(parse_gc_stress_modes(value)))
+    }
     fn normal() -> Self {
         let mut modes = gc_stress_override()
             .lock()
@@ -1999,6 +2022,7 @@ fn payload_to_header(payload: *mut u8) -> *mut GcHeader {
 #[cfg(debug_assertions)]
 fn checked_payload_to_header(payload: *mut u8, context: &str) -> *mut GcHeader {
     validate_payload_pointer(payload, context).unwrap_or_else(|message| {
+        crate::gc_telemetry::failure_record::emit("invariant", &message);
         panic!("willow gc: invalid GC pointer in {context}: {message}");
     })
 }
@@ -2088,6 +2112,7 @@ fn reset_internal() {
     let mut state = reset_lock(&runtime().heap);
     marking::set_concurrent_cycle(&mut state, None);
     state.sweeping = None;
+    state.pending_sweep_chunks = 0..0;
     publish_collection_busy(&state);
     state.satb = satb::SatbBuffers::default();
     {
@@ -2183,6 +2208,7 @@ fn reset_internal() {
     state.remembered_set.clear();
     state.dirty_cards.clear();
     runtime().write_barrier_calls.store(0, Ordering::Relaxed);
+    reset_barrier_variant_counts();
     runtime()
         .tlab_ever_allocated
         .store(false, Ordering::Release);
@@ -2246,6 +2272,7 @@ pub fn header_size_for_test() -> usize {
 #[cfg(test)]
 pub fn reset_internal_for_test() {
     reset_internal();
+    DIAGNOSTIC_READY.store(true, Ordering::Release);
     crate::frame_lifetime::reset();
     old_cycle::REMARK_WORK_NS_FOR_TEST.store(0, Ordering::Relaxed);
 }
@@ -2303,6 +2330,7 @@ pub fn total_frees_for_test() -> u64 {
 /// another test is still using pointers allocated from that heap.
 #[cfg(test)]
 pub fn runtime_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    crate::gc_telemetry::failure_record::install_test_panic_hook();
     RUNTIME_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2329,6 +2357,9 @@ mod contract_viewpoint_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod m0_reference_tests;
 
 #[cfg(test)]
 #[path = "gc_concurrent_tests.rs"]

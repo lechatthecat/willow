@@ -83,8 +83,7 @@ pub extern "C" fn willow_pop_roots(count: i32) {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_root_depth() -> i32 {
     i32::try_from(crate::generated_context::depth() - ROOT_BASE.get()).unwrap_or_else(|_| {
-        eprintln!("runtime fatal: generated-code root depth overflow");
-        std::process::abort();
+        crate::failure::fatal_invariant("generated-code root depth overflow");
     })
 }
 
@@ -326,7 +325,7 @@ pub(super) fn claim_legacy_owner_locked(coord: &GcCoord, already_unregistered: b
     match *owner {
         Some(existing) if existing != current => {
             eprintln!("willow gc: explicit root stacks are single-mutator in the current runtime");
-            std::process::abort();
+            crate::failure::fatal_invariant("multiple unregistered root-stack owners");
         }
         _ => *owner = Some(current),
     }

@@ -115,6 +115,27 @@ fn allocation_failures_terminate_before_returning_to_callers() {
             assert_eq!(result.status.code(), Some(1), "{case}: {stderr}");
         }
         assert!(stderr.contains(diagnostic), "{case}: {stderr}");
+        if case.starts_with("limit") {
+            let record = stderr
+                .lines()
+                .find(|line| line.starts_with("{\"version\":3"))
+                .expect("bounded reservation failure record");
+            assert!(record.len() < crate::gc_telemetry::failure_record::FAILURE_RECORD_LIMIT);
+            assert!(
+                record.contains("\"kind\":\"reservation_threshold\""),
+                "{record}"
+            );
+            assert!(record.contains("\"actual_bytes\":0"), "{record}");
+            assert!(record.contains("\"limit_bytes\":1"), "{record}");
+            for category in [
+                "managed_bytes",
+                "external_bytes",
+                "old_reserved_bytes",
+                "young_reserved_bytes",
+            ] {
+                assert!(record.contains(&format!("\"{category}\":0")), "{record}");
+            }
+        }
         assert!(
             !stderr.contains("FAILURE_RETURNED_TO_CALLER"),
             "{case}: {stderr}"

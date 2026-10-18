@@ -626,7 +626,13 @@ impl ConcurrentCycle {
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(drain)) {
             Ok(work) => work,
-            Err(_) => {
+            Err(payload) => {
+                let reason = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("marker panicked with a non-string payload");
+                crate::gc_telemetry::failure_record::emit("marker_panic", reason);
                 self.worker_failed.store(true, Ordering::Release);
                 crate::gc_telemetry::workers::record_failure(
                     crate::gc_telemetry::workers::Failure::MarkerPanic,
@@ -992,6 +998,9 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
         // A scheduling budget, not a hard callback-duration guarantee: legacy
         // native hooks can overrun it. Bitmap/array/map slices have bounded work.
         let deadline = std::time::Instant::now() + std::time::Duration::from_micros(250);
+        let _assist = crate::gc_telemetry::measurement::Span::new(
+            crate::gc_telemetry::measurement::Phase::Assist,
+        );
         let work = cycle.drain_checked_until(8, Some(deadline));
         assist::credit(cycle.assist_epoch, work);
     }
@@ -1005,6 +1014,7 @@ pub(super) fn mark_worklist(
     let mut work = crate::gc_telemetry::MarkWork::roots(worklist.len());
     let mut hooks = IdMap::default();
     let mut native_counts = crate::gc_telemetry::native_trace::Counts::default();
+    let cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
     while let Some(obj_ptr) = worklist.pop() {
         let header = checked_payload_to_header(obj_ptr, "GC root graph");
         let object = HeapObject::from_raw(header).expect("validated payload has a header");
@@ -1067,5 +1077,10 @@ pub(super) fn mark_worklist(
         work.object(object.size(), scanned_slots);
     }
     work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
+    let cpu = cpu_start
+        .zip(crate::gc_telemetry::workers::thread_cpu_ns())
+        .and_then(|(a, b)| b.checked_sub(a));
+    work.cpu_ns = cpu.unwrap_or(0);
+    work.cpu_incomplete = cpu.is_none();
     work
 }

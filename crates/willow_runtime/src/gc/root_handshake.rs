@@ -64,6 +64,9 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                 GC_MARK_PHASE.store(1, Ordering::Release);
                 (before, cycle)
             };
+            let root_scan = crate::gc_telemetry::measurement::Span::new(
+                crate::gc_telemetry::measurement::Phase::Roots,
+            );
             let root_job = cycle.termination.enter();
             let mut roots = all_registered_stack_roots(coord);
             roots.extend(runtime_roots_snapshot());
@@ -78,6 +81,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                     .saturating_add(roots.len() as u64 * std::mem::size_of::<usize>() as u64);
             }
             drop(root_job);
+            drop(root_scan);
             cycle
                 .phase
                 .lock()

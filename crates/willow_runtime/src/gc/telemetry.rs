@@ -1,5 +1,15 @@
 use super::*;
 
+pub(crate) fn telemetry_wait_is_mutator() -> bool {
+    current_thread_is_registered()
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_locked_panic_for_test() {
+    let _heap = runtime().heap.lock().unwrap();
+    panic!("injected panic while heap is locked");
+}
+
 /// Return the total bytes currently on the GC heap (header + payload).
 pub(crate) fn telemetry_heap_snapshot() -> (
     crate::gc_telemetry::GcCountersV1,
@@ -48,6 +58,94 @@ pub(crate) fn survivor_snapshot() -> crate::gc_telemetry::GcSurvivorStats {
     stats.minor_deferral_age_bytes = minor_deferral_age(&state);
     stats.minor_retry_target_bytes = state.minor_retry_bytes;
     stats
+}
+
+pub(super) fn accounting_from_state(
+    state: &GcState,
+) -> crate::gc_telemetry::measurement::GcMemoryV3 {
+    use crate::gc_telemetry::measurement::GcMemoryV3;
+    GcMemoryV3 {
+        managed_bytes: state.allocated_bytes as u64,
+        external_bytes: external_bytes() as u64,
+        old_reserved_bytes: state.old_reserved_bytes as u64,
+        young_reserved_bytes: state.tlab_reserved_bytes as u64,
+        last_major_retained_bytes: state.last_major_live_bytes,
+        ..Default::default()
+    }
+}
+
+fn memory_from_state(state: &GcState) -> crate::gc_telemetry::measurement::GcMemoryV3 {
+    let mut m = accounting_from_state(state);
+    for region in &state.old_regions {
+        let free = region.free_spans.bytes() as u64;
+        m.fragmentation_bytes = m
+            .fragmentation_bytes
+            .saturating_add(region.fragmentation_bytes() as u64);
+        if region.sweep_pending {
+            m.pending_sweep_bytes = m
+                .pending_sweep_bytes
+                .saturating_add(region.live_bytes as u64);
+        }
+        if region.sweep_quarantined {
+            m.quarantined_bytes = m
+                .quarantined_bytes
+                .saturating_add(free)
+                .saturating_add((region.capacity - region.used) as u64);
+        } else if !region.sweep_pending && region.kind == RegionKind::Old {
+            m.reusable_bytes = m
+                .reusable_bytes
+                .saturating_add(free)
+                .saturating_add((region.capacity - region.used) as u64);
+        }
+    }
+    for (index, chunk) in state.tlab_chunks.iter().enumerate() {
+        if chunk.kind == RegionKind::Pinned {
+            m.pinned_bytes = m.pinned_bytes.saturating_add(chunk.live_bytes as u64);
+        }
+        m.fragmentation_bytes = m
+            .fragmentation_bytes
+            .saturating_add(chunk.used.saturating_sub(chunk.live_bytes) as u64);
+        if state.pending_sweep_chunks.contains(&index) && chunk.owner_state.is_none() {
+            m.pending_sweep_bytes = m
+                .pending_sweep_bytes
+                .saturating_add(chunk.live_bytes as u64);
+        }
+    }
+    m
+}
+
+pub(crate) fn telemetry_memory_snapshot() -> (
+    crate::gc_telemetry::measurement::GcMemoryV3,
+    crate::gc_telemetry::GcSurvivorStats,
+) {
+    let state = runtime().heap.lock().unwrap_or_else(|p| p.into_inner());
+    let mut survivors = state.survivor_stats;
+    survivors.minor_deferral_age_bytes = minor_deferral_age(&state);
+    survivors.minor_retry_target_bytes = state.minor_retry_bytes;
+    (memory_from_state(&state), survivors)
+}
+
+/// A threshold decision and its category record must use the same sample.
+pub(crate) fn telemetry_memory_threshold_snapshot() -> crate::gc_telemetry::measurement::GcMemoryV3
+{
+    let mut state = runtime().heap.lock().unwrap_or_else(|p| p.into_inner());
+    sync_tlab_accounting(&mut state);
+    accounting_from_state(&state)
+}
+
+/// Failure path never merges LABs, follows native locks, or waits for heap.
+/// None explicitly marks an unavailable sample, never fabricated zero bytes.
+pub(crate) fn diagnostic_memory_snapshot() -> Option<crate::gc_telemetry::measurement::GcMemoryV3> {
+    if !DIAGNOSTIC_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let state = match runtime().heap.try_lock() {
+        Ok(s) => s,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    // A bounded record must also have bounded sampling work: no region walk.
+    Some(accounting_from_state(&state))
 }
 
 #[unsafe(no_mangle)]
@@ -352,4 +450,31 @@ pub(crate) fn pin_snapshot() -> Vec<crate::gc_telemetry::GcPinRecord> {
         .values()
         .cloned()
         .collect()
+}
+
+/// Failure-only scalar samples: try-locks never wait or traverse root storage.
+pub(crate) fn diagnostic_coordination() -> Option<(u64, u64, u64)> {
+    if !DIAGNOSTIC_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let coord = runtime().coord.0.try_lock().ok()?;
+    Some((
+        coord.mutators.len() as u64,
+        coord.parked.len() as u64,
+        coord.stw_pending.len() as u64,
+    ))
+}
+pub(crate) fn diagnostic_survivors() -> Option<crate::gc_telemetry::GcSurvivorStats> {
+    if !DIAGNOSTIC_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let state = runtime().heap.try_lock().ok()?;
+    let mut stats = state.survivor_stats;
+    stats.minor_deferral_age_bytes = minor_deferral_age(&state);
+    Some(stats)
+}
+
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn diagnostic_invalid_pointer_for_test() {
+    checked_payload_to_header(8usize as *mut u8, "diagnostic regression");
 }
