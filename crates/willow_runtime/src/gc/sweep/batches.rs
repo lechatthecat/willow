@@ -817,6 +817,7 @@ fn reclaim(state: &mut GcState, object: HeapObject, size: usize, permit: raw_hea
     if object.generation() == GC_GENERATION_YOUNG {
         state.young_allocated_bytes = state.young_allocated_bytes.saturating_sub(size);
     }
+    release_pin(&mut state.pin_records, &mut state.survivor_stats, payload);
     object.reclaim_with_permit(permit);
     state.allocated_bytes = state.allocated_bytes.saturating_sub(size);
     state.total_frees = state.total_frees.saturating_add(1);

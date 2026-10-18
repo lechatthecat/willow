@@ -84,8 +84,33 @@ pub struct GcSurvivorStats {
     /// Minor collections skipped because a thread parked inside runtime code
     /// published a young referent it may still hold as a raw copy.
     pub deferred_minor_collections: u64,
+    pub minor_deferral_age_bytes: u64,
+    pub minor_retry_target_bytes: u64,
+    pub minor_blockers: u64,
+    pub pin_fallback_count: u64,
+    pub pinned_bytes: u64,
+    /// Runtime stack, remembered owner, old/foreign, memory budget, scoped loan.
+    pub pin_reasons: [u64; 5],
+    pub active_pins: u64,
+    pub active_pin_bytes: u64,
+    pub released_pins: u64,
     pub survivor_space_reserved: u64,
     pub survivor_space_live: u64,
+}
+
+/// An in-place promoted allocation owns its diagnostic record until reclamation.
+/// Addresses are identities only, never roots or dereferenceable handles.
+#[derive(Clone, Debug)]
+pub struct GcPinRecord {
+    pub owner_allocation: usize,
+    pub reason: &'static str,
+    pub minor_epoch: u64,
+    pub major_epoch: u64,
+    pub bytes: u64,
+}
+
+pub fn pin_snapshot() -> Vec<GcPinRecord> {
+    crate::gc::pin_snapshot()
 }
 
 pub fn survivor_snapshot() -> GcSurvivorStats {

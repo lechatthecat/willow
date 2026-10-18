@@ -111,6 +111,10 @@ fn scoped_loan_park_resume_cancel_panic_and_stack_alias() {
                 assert_eq!(stack_alias, original);
                 assert_eq!(unsafe { original.cast::<i64>().read() }, 37);
                 assert_eq!(willow_gc_pinned_promotions(), 1);
+                let pins = crate::gc_telemetry::pin_snapshot();
+                assert_eq!(pins.len(), 1);
+                assert_eq!(pins[0].reason, "scoped fixed-address loan");
+                assert_eq!(pins[0].owner_allocation, original as usize);
                 assert_eq!(deferred_minor_collections_for_test(), 0);
                 if exit == "panic" {
                     panic!("scoped loan unwind");
@@ -138,6 +142,10 @@ fn scoped_loan_park_resume_cancel_panic_and_stack_alias() {
             }
             willow_gc_collect();
             assert_eq!(willow_gc_allocated_bytes(), 0);
+            let stats = crate::gc_telemetry::survivor_snapshot();
+            assert_eq!(stats.active_pins, 0);
+            assert_eq!(stats.active_pin_bytes, 0);
+            assert_eq!(stats.released_pins, 1);
             reset_gc();
         }
     }

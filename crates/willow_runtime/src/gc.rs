@@ -320,12 +320,13 @@ struct GcState {
     /// Trigger a minor collection at the next TLAB refill after this threshold.
     nursery_threshold_bytes: usize,
     scheduler_runway_initialized: bool,
-    /// Young bytes when the current run of deferred minor collections began
-    /// (willow-9tls.9); `None` when the last minor attempt collected.
-    minor_deferral_start_bytes: Option<usize>,
-    /// The allocation path retries a deferred minor collection only once the
-    /// young bytes reach this mark, one TLAB chunk past the deferral.
-    minor_retry_bytes: usize,
+    /// Saturating young-mutator byte clock. Reclamation and copying never alter it.
+    young_allocation_clock: u64,
+    /// Clock at the first deferral; budget is captured once for that epoch.
+    minor_deferral_start_bytes: Option<u64>,
+    minor_deferral_budget_bytes: u64,
+    minor_retry_bytes: u64,
+    pin_records: HashMap<usize, crate::gc_telemetry::GcPinRecord>,
     nursery_policy: nursery::Policy,
     tenuring: nursery::Tenuring,
     /// Total objects allocated lifetime.
@@ -719,6 +720,9 @@ impl Default for GcState {
             young_allocated_bytes: 0,
             nursery_threshold_bytes: nursery_policy.initial(memory_limit_bytes),
             scheduler_runway_initialized: false,
+            young_allocation_clock: 0,
+            minor_deferral_budget_bytes: 0,
+            pin_records: HashMap::new(),
             minor_deferral_start_bytes: None,
             minor_retry_bytes: 0,
             nursery_policy,
@@ -963,9 +967,27 @@ fn allocation_should_minor_collect() -> bool {
     let stress = gc_stress_enabled("minor") || gc_stress_enabled("relocate");
     let mut state = runtime().heap.lock().unwrap();
     sync_tlab_bytes(&mut state);
-    stress
-        || (state.young_allocated_bytes >= state.nursery_threshold_bytes
-            && state.young_allocated_bytes >= state.minor_retry_bytes)
+    stress || minor_allocation_due(&state)
+}
+
+/// Debt retries remain enabled even when a major sweep lowers occupancy.
+fn minor_allocation_due(state: &GcState) -> bool {
+    if state.minor_deferral_start_bytes.is_some() {
+        state.memory_limit_bytes.is_some()
+            || state.young_allocation_clock >= state.minor_retry_bytes
+    } else {
+        state.young_allocated_bytes >= state.nursery_threshold_bytes
+    }
+}
+
+fn minor_deferral_age(state: &GcState) -> u64 {
+    state.minor_deferral_start_bytes.map_or(0, |start| {
+        debug_assert!(
+            state.young_allocation_clock >= start,
+            "young allocation clock regressed"
+        );
+        state.young_allocation_clock - start
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,6 +1150,20 @@ fn tlab_alloc_slow(
 
     if !stress && allocation_should_minor_collect() {
         minor_collect_internal();
+        // A busy major owner may only have queued the request. Before its first
+        // root scan there is no deferral epoch yet: join the owner before any
+        // further refill. An established epoch may use its remaining budget.
+        while small
+            && {
+                let state = runtime().heap.lock().unwrap();
+                state.minor_deferral_start_bytes.is_none()
+                    || state.young_allocation_clock == u64::MAX
+                    || minor_deferral_age(&state) >= state.minor_deferral_budget_bytes
+            }
+            && cycle_wait::wait_for_minor_budget()
+        {
+            minor_collect_internal();
+        }
     }
 
     if stress || allocation_should_collect() {
@@ -1180,6 +1216,9 @@ fn tlab_alloc_slow(
     consume_headrooms(total_size);
     state.allocated_bytes = state.allocated_bytes.saturating_add(total_size);
     state.young_allocated_bytes = state.young_allocated_bytes.saturating_add(total_size);
+    state.young_allocation_clock = state
+        .young_allocation_clock
+        .saturating_add(total_size as u64);
     state.total_allocs = state.total_allocs.saturating_add(1);
     state.total_allocated_bytes = state
         .total_allocated_bytes
@@ -2121,6 +2160,9 @@ fn reset_internal() {
     state.pacer = pacer::Sampler::default();
     assist::reset();
     state.young_allocated_bytes = 0;
+    state.young_allocation_clock = 0;
+    state.minor_deferral_budget_bytes = 0;
+    state.pin_records.clear();
     state.nursery_policy = nursery::Policy::from_env();
     state.tenuring = Default::default();
     state.nursery_threshold_bytes = state.nursery_policy.initial(state.memory_limit_bytes);

@@ -82,6 +82,22 @@ pub(super) fn wait_for_current_cycle() {
     wait_for_cycle(coord, generation);
 }
 
+/// Unassessed or debt-exhausted young refills join an elected owner instead of
+/// growing the nursery while their pending minor waits behind its sweep. Native collector
+/// callbacks must retain the existing non-waiting/reentrant behavior.
+pub(super) fn wait_for_minor_budget() -> bool {
+    if IS_COLLECTOR.get() {
+        return false;
+    }
+    let coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    if coord.cycle_collector.is_none() {
+        return false;
+    }
+    let generation = coord.cycle_generation;
+    wait_for_cycle(coord, generation);
+    true
+}
+
 /// Explicit requests finish an active epoch through classified stopped
 /// recovery, wait for its sweep publication, then request a full collection.
 /// Reentrant native hooks on the elected collector never wait on themselves.

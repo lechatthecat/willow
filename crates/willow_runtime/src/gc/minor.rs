@@ -25,6 +25,10 @@ type AddressSet = HashSet<usize, BuildHasherDefault<AddressHasher>>;
 mod tests;
 
 #[cfg(test)]
+#[path = "minor_deferral_tests.rs"]
+mod deferral_tests;
+
+#[cfg(test)]
 #[path = "minor_overlap_tests.rs"]
 mod overlap_tests;
 
@@ -224,6 +228,21 @@ impl<'a> MinorCollector<'a> {
             }
             self.state.survivor_stats.pinned_promotions += 1;
             let size = object.size();
+            let stats = &mut self.state.survivor_stats;
+            stats.pinned_bytes = stats.pinned_bytes.saturating_add(size as u64);
+            stats.active_pin_bytes += size as u64;
+            stats.active_pins += 1;
+            stats.pin_reasons[source as usize] += 1;
+            self.state.pin_records.insert(
+                address,
+                crate::gc_telemetry::GcPinRecord {
+                    owner_allocation: address,
+                    reason: source.describe(),
+                    minor_epoch: self.state.minor_collections,
+                    major_epoch: self.state.major_collections,
+                    bytes: size as u64,
+                },
+            );
             self.state.young_allocated_bytes =
                 self.state.young_allocated_bytes.saturating_sub(size);
             self.state.promoted_objects = self.state.promoted_objects.saturating_add(1);
@@ -733,8 +752,16 @@ impl<'a> MinorCollector<'a> {
         // Value roots cannot be rewritten, so retain them in place before any
         // slot evacuates: a slot aliasing one of them then observes an old
         // object and keeps its value.
+        // Explicit loans take attribution precedence over runtime-stack aliases.
+        for &(root, source) in &roots.values {
+            if source == PinSource::ScopedLoan {
+                self.pin_root(root, source);
+            }
+        }
         for (root, source) in roots.values {
-            self.pin_root(root, source);
+            if source != PinSource::ScopedLoan {
+                self.pin_root(root, source);
+            }
         }
         for owner in remembered {
             // The set was taken; `scan_object` re-remembers owners that keep
@@ -1159,8 +1186,8 @@ fn verify_no_pin_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 /// normally transient: the frame resumes after this stop and a later
 /// allocation slow path retries, one TLAB chunk later (`minor_retry_bytes`).
 /// Deferring instead of pinning keeps every nursery object movable. The
-/// deferral is bounded: once the young bytes have grown by one nursery
-/// threshold since the first consecutive deferral, or under a hard memory
+/// deferral is bounded: once young mutator allocation reaches the captured nursery
+/// byte budget since the first consecutive deferral, or under a hard memory
 /// budget that cannot grow the nursery, the collection runs and promotes only
 /// those runtime-held referents in place.
 fn minor_collect_with_roots(
@@ -1190,12 +1217,19 @@ fn minor_collect_with_roots(
     super::invalidate_external_headroom();
     if should_defer_minor(&mut state, &roots) {
         state.survivor_stats.deferred_minor_collections += 1;
+        let end = state
+            .minor_deferral_start_bytes
+            .unwrap()
+            .saturating_add(state.minor_deferral_budget_bytes);
         state.minor_retry_bytes = state
-            .young_allocated_bytes
-            .saturating_add(super::GC_TLAB_CHUNK_SIZE);
+            .young_allocation_clock
+            .saturating_add(super::GC_TLAB_CHUNK_SIZE as u64)
+            .min(end);
         return None;
     }
     state.minor_deferral_start_bytes = None;
+    state.minor_deferral_budget_bytes = 0;
+    state.survivor_stats.minor_blockers = 0;
     state.minor_retry_bytes = 0;
     if std::env::var("WILLOW_GC_VERIFY_BARRIER").is_ok()
         && let Err(message) = verify_remembered_set(&state, &registry.trace)
@@ -1209,12 +1243,16 @@ fn minor_collect_with_roots(
     let young_before = state.young_allocated_bytes;
     let promoted_before = state.promoted_bytes;
     let copied_before = state.survivor_stats.survivor_bytes;
+    let pinned_before = state.survivor_stats.pinned_promotions;
     let collector = MinorCollector::new(&mut state, registry, stop_work);
     let mut mark_roots = collector.snapshot_roots();
     roots
         .slots
         .extend(mark_roots.iter_mut().map(|p| p as *mut *mut u8));
     let (_, work) = collector.run(roots, remembered);
+    if state.survivor_stats.pinned_promotions != pinned_before {
+        state.survivor_stats.pin_fallback_count += 1;
+    }
     let survived = state.promoted_bytes.saturating_sub(promoted_before)
         + state
             .survivor_stats
@@ -1242,9 +1280,10 @@ fn minor_collect_with_roots(
 
 /// Whether a runtime frame parked outside a relocation-safe scope holds a
 /// young value root and the collection may still wait for it to resume. The
-/// wait is bounded by one nursery threshold of young growth (measured from the
-/// first consecutive deferral), so a park that never ends costs at most one
-/// extra nursery's worth of memory before the in-place fallback.
+/// wait is bounded by one captured nursery threshold of young allocation,
+/// measured from the first consecutive deferral. Collection is requested at a
+/// refill boundary; concurrent active TLABs can overshoot by their bump runway.
+/// Reservation caps remain independently enforced by the allocation paths.
 fn should_defer_minor(state: &mut super::GcState, roots: &MinorRoots) -> bool {
     #[cfg(test)]
     LEASE_POLICY_VISITS.set(0);
@@ -1261,21 +1300,27 @@ fn should_defer_minor(state: &mut super::GcState, roots: &MinorRoots) -> bool {
             (source == PinSource::ScopedLoan).then_some(value as usize)
         })
         .collect();
-    if state.memory_limit_bytes.is_some()
-        || force_pin_fallback()
-        || !roots.values.iter().any(|&(value, source)| {
+    let blockers = roots
+        .values
+        .iter()
+        .filter(|&&(value, source)| {
             #[cfg(test)]
             LEASE_POLICY_VISITS.set(LEASE_POLICY_VISITS.get() + 1);
             source == PinSource::RuntimeCodeStack
                 && !leased.contains(&(value as usize))
                 && tlab_payload_generation(state, value as usize) == Some(GC_GENERATION_YOUNG)
         })
-    {
+        .count();
+    state.survivor_stats.minor_blockers = blockers as u64;
+    if state.memory_limit_bytes.is_some() || force_pin_fallback() || blockers == 0 {
         return false;
     }
-    let young = state.young_allocated_bytes;
-    let start = *state.minor_deferral_start_bytes.get_or_insert(young);
-    young.saturating_sub(start) < state.nursery_threshold_bytes
+    if state.minor_deferral_start_bytes.is_none() {
+        state.minor_deferral_start_bytes = Some(state.young_allocation_clock);
+        state.minor_deferral_budget_bytes = state.nursery_threshold_bytes as u64;
+    }
+    let age = super::minor_deferral_age(state);
+    state.young_allocation_clock != u64::MAX && age < state.minor_deferral_budget_bytes
 }
 
 #[cfg(test)]

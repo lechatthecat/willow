@@ -69,6 +69,7 @@ fn read_tlab_allocations_delta(
 pub(super) fn add_tlab_accounting(state: &mut GcState, allocations: u64, bytes: u64) {
     state.total_allocs = state.total_allocs.saturating_add(allocations);
     state.total_allocated_bytes = state.total_allocated_bytes.saturating_add(bytes);
+    state.young_allocation_clock = state.young_allocation_clock.saturating_add(bytes);
     state.tlab_fast_allocations = state.tlab_fast_allocations.saturating_add(allocations);
     state.tlab_fast_allocated_bytes = state.tlab_fast_allocated_bytes.saturating_add(bytes);
     consume_headrooms(bytes as usize);

@@ -336,6 +336,19 @@ fn survivor_direct_root_and_budget_fallback_promote_in_place() {
         if limit {
             assert_eq!(survivor, child);
             assert_eq!(willow_gc_survivor_copies(), 0);
+            let state = runtime().heap.lock().unwrap();
+            assert_eq!(
+                state.survivor_stats.pin_reasons[PinSource::MemoryBudget as usize],
+                1
+            );
+            assert_eq!(
+                state.survivor_stats.active_pin_bytes,
+                (GC_HEADER_SIZE + 8) as u64
+            );
+            assert!(
+                state.tlab_reserved_bytes + state.old_reserved_bytes
+                    <= state.memory_limit_bytes.unwrap()
+            );
         } else {
             collect(vec![survivor]);
             assert_eq!(unsafe { *owner.cast::<*mut u8>() }, survivor);

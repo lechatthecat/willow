@@ -785,6 +785,10 @@ fn derived_fast_tlab_counts_survive_refills_retirement_and_unregister() {
     assert_eq!(counters.tlab_fast_allocations, fast);
     assert_eq!(counters.allocation_count, fast + slow);
     assert_eq!(counters.allocation_bytes, (fast + slow) * bytes as u64);
+    assert_eq!(
+        runtime().heap.lock().unwrap().young_allocation_clock,
+        counters.allocation_bytes
+    );
     reset_gc();
 }
 
@@ -1296,17 +1300,6 @@ fn test_gc_minor_collection_defers_roots_parked_from_runtime_code() {
 fn test_gc_minor_deferral_backs_off_and_is_bounded_by_an_indefinite_park() {
     let _guard = gc_test_guard();
     reset_gc();
-    // The test measures young-heap growth across deferred minor attempts.
-    // Concurrent major sweeping can independently reclaim young allocations,
-    // resetting that growth and leaving the indefinite park unexercised.
-    // Disable major-GC pacing for this isolated minor-policy regression.
-    {
-        let mut state = runtime().heap.lock().unwrap();
-        state.pacer.disable_for_test();
-        state.threshold_bytes = 64 * 1024 * 1024;
-        state.pacer_trigger = state.threshold_bytes as u64;
-    }
-    invalidate_runtime_policy_budgets();
     let mut tls = new_tlab_state();
     let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
     unsafe { *(original as *mut i64) = 81 };

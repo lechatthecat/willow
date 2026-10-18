@@ -42,7 +42,12 @@ pub(crate) fn telemetry_heap_snapshot() -> (
 }
 
 pub(crate) fn survivor_snapshot() -> crate::gc_telemetry::GcSurvivorStats {
-    runtime().heap.lock().unwrap().survivor_stats
+    let mut state = runtime().heap.lock().unwrap();
+    sync_tlab_bytes(&mut state);
+    let mut stats = state.survivor_stats;
+    stats.minor_deferral_age_bytes = minor_deferral_age(&state);
+    stats.minor_retry_target_bytes = state.minor_retry_bytes;
+    stats
 }
 
 #[unsafe(no_mangle)]
@@ -93,13 +98,23 @@ pub extern "C" fn willow_gc_pinned_promotions() -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_survivor_space_reserved() -> i64 {
-    survivor_snapshot().survivor_space_reserved as i64
+    runtime()
+        .heap
+        .lock()
+        .unwrap()
+        .survivor_stats
+        .survivor_space_reserved as i64
 }
 
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_survivor_space_live() -> i64 {
-    survivor_snapshot().survivor_space_live as i64
+    runtime()
+        .heap
+        .lock()
+        .unwrap()
+        .survivor_stats
+        .survivor_space_live as i64
 }
 
 /// Cumulative GC allocation bytes (headers and payloads), including fast paths.
@@ -326,4 +341,15 @@ pub extern "C" fn willow_gc_skipped_collections() -> i64 {
 pub(crate) fn registered_mutator_count() -> usize {
     let (lock, _) = &runtime().coord;
     lock.lock().unwrap().mutators.len()
+}
+
+pub(crate) fn pin_snapshot() -> Vec<crate::gc_telemetry::GcPinRecord> {
+    runtime()
+        .heap
+        .lock()
+        .unwrap()
+        .pin_records
+        .values()
+        .cloned()
+        .collect()
 }

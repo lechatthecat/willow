@@ -228,6 +228,19 @@ fn between_regions(_index: usize) {
 #[cfg(test)]
 pub(super) static SWEEP_TEST_HOOK: Mutex<Option<fn(usize)>> = Mutex::new(None);
 
+/// Shared by stopped and bounded concurrent sweep, before storage reuse.
+fn release_pin(
+    records: &mut HashMap<usize, crate::gc_telemetry::GcPinRecord>,
+    stats: &mut crate::gc_telemetry::GcSurvivorStats,
+    payload: usize,
+) {
+    if let Some(record) = records.remove(&payload) {
+        stats.active_pins -= 1;
+        stats.active_pin_bytes -= record.bytes;
+        stats.released_pins += 1;
+    }
+}
+
 fn sweep_region(
     state: &mut GcState,
     index: usize,
@@ -246,6 +259,8 @@ fn sweep_region(
             young_allocated_bytes,
             allocated_bytes,
             total_frees,
+            pin_records,
+            survivor_stats,
             ..
         } = &mut *state;
         let region = &mut old_regions[index];
@@ -295,6 +310,11 @@ fn sweep_region(
                     if object.generation() == GC_GENERATION_YOUNG {
                         *young_allocated_bytes = young_allocated_bytes.saturating_sub(size);
                     }
+                    release_pin(
+                        pin_records,
+                        survivor_stats,
+                        object.payload().as_ptr() as usize,
+                    );
                     note_dead_frame(object, sweep_epoch);
                     object.reclaim_in_place();
                     region.live_bytes = region.live_bytes.saturating_sub(size);
@@ -392,6 +412,7 @@ fn sweep_chunk(
                 );
                 drops.push((drop_fn, object.payload().as_ptr()));
             }
+            release_pin(&mut state.pin_records, &mut state.survivor_stats, payload);
             note_dead_frame(object, state.major_collections);
             object.reclaim_in_place();
             if object.generation() == GC_GENERATION_YOUNG {
