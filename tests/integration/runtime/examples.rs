@@ -20,6 +20,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/indirect_call_preemption.wi",
             "fn resumed\nclosure resumed\n",
         ),
+        (
+            "example/gc_barrier_variants.wi",
+            "7\n1\n14\n2\n21\n3\n28\n4\n35\n5\n42\n6\n49\n7\n56\n8\n",
+        ),
         ("example/inline_panic_depth.wi", "inner\nouter\n"),
         ("example/inline_shadow_roots.wi", "true\ntrue\ntrue\n"),
         ("example/interface_effect_evidence/main.wi", "7\n"),
@@ -1410,7 +1414,10 @@ fn test_constructor_flow_example() {
 fn test_runnable_example_files_compile_and_run() {
     run_rust_project_examples();
     for &(path, expected) in runnable_example_cases() {
-        let (out, ok) = if path == "example/lir_self_statics.wi" {
+        let (out, ok) = if matches!(
+            path,
+            "example/lir_self_statics.wi" | "example/gc_barrier_variants.wi"
+        ) {
             // `static mut` state with task execution requires one worker.
             let source = fs::read_to_string(path).unwrap();
             compile_and_run_with_env(&source, &[("WILLOW_WORKERS", "1")])
