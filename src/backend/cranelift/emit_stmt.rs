@@ -850,6 +850,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         name: &str,
         args: &[cranelift_codegen::ir::Value],
     ) {
+        if name == "willow_pop_roots" && self.root_reservation.is_some() {
+            if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+                eprintln!("[inline-root-pop]");
+            }
+            let ty = reference_type(self.module.target_config());
+            let context = self.builder.ins().get_pinned_reg(ty);
+            let top = self.builder.ins().load(
+                ty,
+                MemFlagsData::trusted(),
+                context,
+                willow_abi::generated_context::ROOT_TOP_OFFSET,
+            );
+            let count = self.builder.ins().uextend(ty, args[0]);
+            let count = self.builder.ins().umin(count, top);
+            let next = self.builder.ins().isub(top, count);
+            self.builder.ins().store(
+                MemFlagsData::trusted(),
+                next,
+                context,
+                willow_abi::generated_context::ROOT_TOP_OFFSET,
+            );
+            return;
+        }
         assert!(
             self.emit_runtime_call_with_cleanup(name, args, |_| {})
                 .is_none(),
@@ -862,6 +885,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         name: &str,
         args: &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Value {
+        if name == "willow_root_depth" && self.root_reservation.is_some() {
+            if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+                eprintln!("[inline-root-depth]");
+            }
+            let ty = reference_type(self.module.target_config());
+            let context = self.builder.ins().get_pinned_reg(ty);
+            let top = self.builder.ins().load(
+                ty,
+                MemFlagsData::trusted(),
+                context,
+                willow_abi::generated_context::ROOT_TOP_OFFSET,
+            );
+            return self.builder.ins().ireduce(types::I32, top);
+        }
         // These ABI queries are compiler intrinsics: the stable execution
         // context points at the Arc-owned atomic, never at worker TLS. Keep
         // the load atomic (also on AArch64) and preserve i32 saturation.

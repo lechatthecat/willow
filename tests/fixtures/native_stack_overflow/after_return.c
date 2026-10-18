@@ -5,7 +5,7 @@
 static _Thread_local int saw_bar;
 extern void __real_willow_println_i64(int64_t);
 extern int32_t __real_willow_sync_safepoint(void);
-extern void __real_willow_pop_roots(int32_t);
+extern void __real_willow_gc_collect(void);
 
 void __wrap_willow_println_i64(int64_t value) {
     __real_willow_println_i64(value);
@@ -33,10 +33,11 @@ int32_t __wrap_willow_sync_safepoint(void) {
     return __real_willow_sync_safepoint();
 }
 
-void __wrap_willow_pop_roots(int32_t count) {
+void __wrap_willow_gc_collect(void) {
 #ifdef OVERFLOW_CLEANUP
-    // bar has no GC roots; foo must pop its String root after bar returns.
+    // foo collects in its deferred cleanup after bar returns. Root pops
+    // are inline and no longer have a runtime stack to exhaust.
     if (saw_bar) { (void)burn_stack(1000000); }
 #endif
-    __real_willow_pop_roots(count);
+    __real_willow_gc_collect();
 }

@@ -120,9 +120,8 @@ fn array_fast_paths_do_not_add_temporary_root_pairs_per_access() {
         let names = compile_and_collect_relocation_targets_mode(&source, &[], true);
         names.iter().filter(|name| name.as_str() == "willow_pop_roots").count()
     }).collect();
-    // Function-level and unwind roots remain, but adding access sites must
-    // not add a per-store or per-length push/pop pair.
-    assert!(counts[0] > 0);
+    // Synchronous roots are inline, including unwind cleanup.
+    assert_eq!(counts[0], 0);
     assert!(counts.iter().all(|count| *count == counts[0]), "{counts:?}");
 }
 

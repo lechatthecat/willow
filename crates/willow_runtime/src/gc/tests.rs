@@ -2460,7 +2460,9 @@ fn test_gc_root_depth_mirror_tracks_mutations_and_stack_transfers() {
 fn test_gc_root_depth_mirror_overflow_is_fatal() {
     const CHILD: &str = "WILLOW_ROOT_DEPTH_OVERFLOW_TEST_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        ROOT_DEPTH.set(i32::MAX as usize + 1);
+        crate::generated_context::with_roots(|roots| {
+            roots.set_depth_for_test(i32::MAX as usize + 1)
+        });
         willow_root_depth();
         panic!("root depth overflow unexpectedly returned");
     }

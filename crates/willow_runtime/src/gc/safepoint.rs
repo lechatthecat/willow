@@ -3,22 +3,20 @@ use super::*;
 /// Snapshot this thread's live root object pointers (as addresses) from its
 /// thread-local stack. Reads only this thread's TLS, so it is race-free.
 pub(super) fn snapshot_local_roots() -> Vec<usize> {
-    ROOT_STACK.with(|rs| {
-        rs.borrow()
-            .iter()
-            .filter(|&&slot| !slot.is_null())
-            .filter_map(|&slot| {
-                RootSlot::from_raw(slot)
-                    .and_then(RootSlot::load)
-                    .map(|payload| payload.as_ptr() as usize)
-            })
-            .collect()
-    })
+    let mut result = Vec::new();
+    crate::generated_context::visit_roots(|slots| {
+        result.extend(slots.iter().filter_map(|&slot| {
+            RootSlot::from_raw(slot)
+                .and_then(RootSlot::load)
+                .map(|payload| payload.as_ptr() as usize)
+        }));
+    });
+    result
 }
 
 /// Registration epoch; `reset_internal` advances it when it clears the
 /// mutator registry, invalidating every thread's cached registration.
-static MUTATOR_EPOCH: AtomicU64 = AtomicU64::new(1);
+pub(super) static MUTATOR_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 std::thread_local! {
     /// `MUTATOR_EPOCH` at this thread's registration, or zero when it is not
@@ -112,15 +110,17 @@ impl PublishedRoots {
 /// need no rewrite; omitting them avoids retaining a snapshot entry for every
 /// dead local. The owning stack cannot mutate until STW ends.
 pub(super) fn snapshot_local_root_slots() -> Vec<usize> {
-    ROOT_STACK.with(|roots| {
-        roots
-            .borrow()
-            .iter()
-            .copied()
-            .filter(|&slot| RootSlot::from_raw(slot).and_then(RootSlot::load).is_some())
-            .map(|slot| slot as usize)
-            .collect()
-    })
+    let mut result = Vec::new();
+    crate::generated_context::visit_roots(|slots| {
+        result.extend(
+            slots
+                .iter()
+                .copied()
+                .filter(|&slot| RootSlot::from_raw(slot).and_then(RootSlot::load).is_some())
+                .map(|slot| slot as usize),
+        );
+    });
+    result
 }
 
 /// Registered mutators each legitimately own their own thread-local root stack;
@@ -200,7 +200,7 @@ pub extern "C" fn willow_gc_unregister_mutator() {
     // finish a foreign epoch while still registered (its roots stay published
     // through the safepoint protocol), then take legacy ownership under the
     // same lock that elects the next collector.
-    if ROOT_DEPTH.get() != 0 {
+    if crate::generated_context::depth() != 0 || crate::generated_context::has_active_bridge() {
         while coord
             .cycle_collector
             .is_some_and(|collector| collector != id)
@@ -293,7 +293,7 @@ impl NativeGcScope {
     pub fn enter() -> Self {
         let registration = MutatorRegistration::new();
         Self {
-            depth: ROOT_DEPTH.get(),
+            depth: crate::generated_context::depth(),
             _registration: registration,
         }
     }
@@ -303,8 +303,7 @@ impl Drop for NativeGcScope {
     fn drop(&mut self) {
         ROOT_STACK.with(|roots| {
             let mut roots = roots.borrow_mut();
-            roots.truncate(self.depth);
-            ROOT_DEPTH.set(roots.len());
+            roots.truncate(self.depth - crate::generated_context::parent_depth());
         });
         clear_root_stack_owner_if_empty();
     }

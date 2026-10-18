@@ -6,7 +6,7 @@
 // The GcHeader is immediately before the payload.  `willow_alloc_object`
 // returns a pointer to the payload start, just like malloc.
 //
-// Root stack: a thread-local Vec of *mut *mut u8.  Each entry points to a
+// Root stack: context-owned storage of *mut *mut u8.  Each entry points to a
 // stack slot that holds a GC-managed pointer.  Generated code pushes a slot
 // on entry and pops it on exit.  The mark phase reads through each slot to
 // reach the live object.
@@ -752,21 +752,19 @@ unsafe impl Send for GcState {}
 #[cfg(test)]
 static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-// Root stack — per-thread explicit shadow stack.
-std::thread_local! {
-    static ROOT_STACK: std::cell::RefCell<Vec<*mut *mut u8>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    // Only this mutator changes its shadow stack. Keep the hot depth query
-    // independent of the Vec's destructor-bearing TLS and RefCell borrow.
-    // Stack parking/resumption must publish the transferred depth as well.
-    static ROOT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+// Compatibility facade: runtime roots and generated roots share context storage.
+struct RootStackAccess;
+impl RootStackAccess {
+    fn with<R>(&self, f: impl FnOnce(&crate::generated_context::ShadowRoots) -> R) -> R {
+        crate::generated_context::with_roots(f)
+    }
 }
-
+static ROOT_STACK: RootStackAccess = RootStackAccess;
 // ---------------------------------------------------------------------------
 // Multi-mutator coordination: registration + stop-the-world safepoints
 // (willow-6fv.5.6).
 //
-// The single-mutator runtime keeps using the thread-local ROOT_STACK directly.
+// The single-mutator runtime reads the current context through ROOT_STACK.
 // When more than one mutator thread is registered (for example, a
 // `WILLOW_WORKERS=N` worker pool), a collection stops the world: it asks every
 // other registered mutator to reach a safepoint, where the mutator publishes a
@@ -2134,7 +2132,6 @@ fn reset_internal() {
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     ROOT_STACK.with(|rs| rs.borrow_mut().clear());
     runtime().poll_requested.store(false, Ordering::Release);
-    ROOT_DEPTH.set(0);
     HAS_REGISTERED_TLAB.set(false);
     // Clear compiler-owned literal slots: their pointers are into the
     // heap that was just freed above and must not be returned again.

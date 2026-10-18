@@ -1,0 +1,33 @@
+// Context-owned shadow roots: recursive growth, repeated scopes and shared cleanup.
+class Root { pub n: i64; }
+fn sum(depth: i64) -> i64 {
+    let keep = new Root(depth);
+    if depth == 0 { gc_minor_collect(); return keep.n; }
+    let rest = sum(depth - 1);
+    return keep.n + rest;
+}
+fn branch(n: i64) -> i64 {
+    let keep = new Root(n);
+    if n % 2 == 0 {
+        let other = new Root(2);
+        gc_minor_collect();
+        return keep.n + other.n;
+    }
+    let other = new Root(3);
+    gc_minor_collect();
+    return keep.n + other.n;
+}
+fn main() {
+    let deferred = new Root(7);
+    defer { gc_minor_collect(); println(deferred.n == 7); }
+    let mut total = 0;
+    let mut choices = 0;
+    let mut i = 0;
+    while i < 32 {
+        total = total + sum(24);
+        choices = choices + branch(i);
+        i = i + 1;
+    }
+    println(total == 9600);
+    println(choices == 576);
+}

@@ -204,7 +204,7 @@ fn check_after_return_runtime(cleanup: bool) {
                 "-ldl",
                 "-Wl,--wrap=willow_println_i64",
                 "-Wl,--wrap=willow_sync_safepoint",
-                "-Wl,--wrap=willow_pop_roots",
+                "-Wl,--wrap=willow_gc_collect",
                 "-o",
                 &binary,
             ])

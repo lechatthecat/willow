@@ -2,6 +2,7 @@ fn bar() { println(7); }
 
 fn foo() -> String {
     let value = "value";
+    defer { gc_collect(); }
     bar();
     return value;
 }

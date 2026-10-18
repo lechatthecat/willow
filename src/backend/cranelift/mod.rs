@@ -1536,6 +1536,8 @@ struct FuncGen<'a, 'b> {
     terminated: bool,
     /// Number of GC roots currently on the root stack for this function invocation.
     gc_root_count: usize,
+    root_reservation: Option<(cranelift_codegen::ir::Inst, cranelift_codegen::ir::Inst)>,
+    root_peak_count: usize,
     /// Temporary roots indexed by live root depth and spill width.
     temporary_root_slots: HashMap<(usize, u32), cranelift_codegen::ir::StackSlot>,
     /// Cooperative poll functions may keep a GC local in a native stack slot
@@ -1775,12 +1777,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     0,
                 ));
                 self.stack_store(val, slot);
-                let ptr_ty = reference_type(self.module.target_config());
-                let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-                let push_id = self.func_id("willow_push_root");
-                let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
-                self.builder.ins().call(push_ref, &[addr]);
-                self.gc_root_count += 1;
+                self.emit_push_root_slot(slot);
                 self.vars.insert(
                     name.to_string(),
                     VarStorage::Stack {

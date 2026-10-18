@@ -330,6 +330,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_sleep_until_monotonic" => ([I64] -> None);
     NONE; "willow_sched_unregister_task_waiter" => ([I64] -> None);
     // --- GC roots ---
+    NONE; "willow_reserve_roots" => ([I64] -> None);
     NONE; "willow_push_root" => ([Ptr] -> None);
     NONE; "willow_pop_roots" => ([I32] -> None);
     NONE; "willow_root_depth" => ([] -> Some(I32));

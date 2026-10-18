@@ -298,6 +298,8 @@ impl NativeStack {
             (*stack).root_depth = crate::gc::gc_thread_root_depth();
             let outer_base = crate::gc::replace_root_base((*stack).root_depth);
             let outer_relocation = crate::gc::set_relocation_safe(false);
+            let context = std::ptr::addr_of!((*stack).context);
+            let outer_context = crate::generated_context::replace(context);
             if (*stack).suspended {
                 crate::stack_trace::replace_current(std::mem::take(&mut (*stack).trace));
                 crate::reference_debug::replace_current(std::mem::take(
@@ -313,8 +315,6 @@ impl NativeStack {
             // Borrow only the coroutine field: user code accesses the other
             // fields through CURRENT while this activation is suspended.
             (*stack).context.refresh();
-            let context = std::ptr::addr_of!((*stack).context);
-            let outer_context = crate::generated_context::replace(context);
             let outer_diagnostic = crate::stack_overflow::replace_generated_context(context);
             let switched = (*std::ptr::addr_of_mut!((*stack).coroutine)).resume(());
             (*stack).overflow_helper = crate::stack_overflow::replace_task_helper(outer_helper);

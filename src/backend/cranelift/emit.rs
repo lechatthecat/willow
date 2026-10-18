@@ -42,6 +42,71 @@ pub(super) fn resolve_vtable_id(
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// One cold capacity/ownership path per synchronous function. The final
+    /// count is the maximum live lexical root depth across all emitted paths,
+    /// including cleanup. Loop scopes pop before their next iteration.
+    pub(super) fn begin_root_reservation(&mut self) {
+        let ty = reference_type(self.module.target_config());
+        let count = self.builder.ins().iconst(ty, 0);
+        let count_inst = self.builder.func.dfg.value_def(count).inst().unwrap();
+        let context = self.builder.ins().get_pinned_reg(ty);
+        let top = self.builder.ins().load(
+            ty,
+            MemFlagsData::trusted(),
+            context,
+            willow_abi::generated_context::ROOT_TOP_OFFSET,
+        );
+        let limit = self.builder.ins().load(
+            ty,
+            MemFlagsData::trusted(),
+            context,
+            willow_abi::generated_context::ROOT_LIMIT_OFFSET,
+        );
+        let needed = self.builder.ins().iadd(top, count);
+        let fits = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, needed, limit);
+        self.root_reservation = Some((
+            count_inst,
+            self.builder.func.dfg.value_def(fits).inst().unwrap(),
+        ));
+        let cold = self.builder.create_block();
+        let ready = self.builder.create_block();
+        self.builder.set_cold_block(cold);
+        self.builder.ins().brif(fits, ready, &[], cold, &[]);
+        self.builder.switch_to_block(cold);
+        self.builder.seal_block(cold);
+        let id = self.func_id("willow_reserve_roots");
+        let callee = self.module.declare_func_in_func(id, self.builder.func);
+        self.builder.ins().call(callee, &[count]);
+        self.builder.ins().jump(ready, &[]);
+        self.builder.switch_to_block(ready);
+        self.builder.seal_block(ready);
+    }
+
+    pub(super) fn finish_root_reservation(&mut self) {
+        if let Some((inst, check)) = self.root_reservation {
+            if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+                eprintln!("[root-reservation:{}]", self.root_peak_count);
+            }
+            if let cranelift_codegen::ir::InstructionData::UnaryImm { imm, .. } =
+                &mut self.builder.func.dfg.insts[inst]
+            {
+                *imm = (self.root_peak_count as i64).into();
+            } else {
+                unreachable!("root reservation constant");
+            }
+            if self.root_peak_count == 0 {
+                self.builder.func.dfg.insts[check] =
+                    cranelift_codegen::ir::InstructionData::UnaryImm {
+                        opcode: cranelift_codegen::ir::Opcode::Iconst,
+                        imm: 1.into(),
+                    };
+            }
+        }
+    }
+
     /// Root a value that is only passed to the immediately following call.
     /// The callee roots its own copy before its first safepoint, and the
     /// caller does not use `val` after the call, so the referent may move.
@@ -95,9 +160,40 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_push_root_entry(&mut self, slot: cranelift_codegen::ir::StackSlot, symbol: &str) {
         let ptr_ty = reference_type(self.module.target_config());
         let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-        let push_id = self.func_id(symbol);
-        let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
-        self.builder.ins().call(push_ref, &[addr]);
+        if self.root_reservation.is_some() {
+            let context = self.builder.ins().get_pinned_reg(ptr_ty);
+            let flags = MemFlagsData::trusted();
+            let top = self.builder.ins().load(
+                ptr_ty,
+                flags,
+                context,
+                willow_abi::generated_context::ROOT_TOP_OFFSET,
+            );
+            let base = self.builder.ins().load(
+                ptr_ty,
+                flags,
+                context,
+                willow_abi::generated_context::ROOT_BASE_OFFSET,
+            );
+            let offset = self.builder.ins().ishl_imm_u(top, 3);
+            let entry = self.builder.ins().iadd(base, offset);
+            self.builder.ins().store(flags, addr, entry, 0);
+            let next = self.builder.ins().iadd_imm_u(top, 1);
+            self.builder.ins().store(
+                flags,
+                next,
+                context,
+                willow_abi::generated_context::ROOT_TOP_OFFSET,
+            );
+            if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+                eprintln!("[inline-root-push]");
+            }
+            self.root_peak_count = self.root_peak_count.max(self.gc_root_count + 1);
+        } else {
+            let push_id = self.func_id(symbol);
+            let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
+            self.builder.ins().call(push_ref, &[addr]);
+        }
         self.gc_root_count += 1;
     }
 

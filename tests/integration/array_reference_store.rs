@@ -232,8 +232,8 @@ fn array_reference_store_sites_match_scalar_store_runtime_calls() {
     // Scalar stores form one GC-free run, so their array temporaries need no
     // root at all (willow-ijui.10).
     const TRACKED: [&str; 6] = [
-        "willow_push_root",
-        "willow_pop_roots",
+        "root_push",
+        "root_pop",
         "inline_panic_depth",
         "willow_array_set",
         "willow_gc_write_barrier",

@@ -218,8 +218,8 @@ fn object_field_store_sites_add_one_cold_barrier_and_phase_load_each() {
     // static (global) store keeps one unconditional barrier call and never
     // reads the mark phase.
     const TRACKED: [&str; 5] = [
-        "willow_push_root",
-        "willow_pop_roots",
+        "root_push",
+        "root_pop",
         "inline_panic_depth",
         "willow_gc_write_barrier",
         "willow_gc_mark_phase",

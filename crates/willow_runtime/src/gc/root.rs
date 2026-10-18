@@ -1,6 +1,9 @@
 use super::*;
 
 thread_local! {
+    #[cfg(test)]
+    static OWNER_SLOW_PATHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static OWNER_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ROOT_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -8,6 +11,26 @@ thread_local! {
 /// of how many roots the destination worker's caller has published.
 pub(crate) fn replace_root_base(base: usize) -> usize {
     ROOT_BASE.replace(base)
+}
+
+/// Cold generated-code capacity path. It cannot collect or suspend: callers
+/// may still hold unregistered incoming references.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_reserve_roots(count: usize) {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    claim_root_stack_owner();
+    ROOT_STACK.with(|roots| {
+        let mut roots = roots.borrow_mut();
+        if roots
+            .len()
+            .checked_add(count)
+            .is_none_or(|n| n > i32::MAX as usize)
+        {
+            crate::failure::fatal_invariant("generated-code root depth overflow");
+        }
+        roots.reserve(count);
+    });
 }
 
 /// Register a root slot.  `slot` must point to a stack location that holds
@@ -22,7 +45,6 @@ pub extern "C" fn willow_push_root(slot: *mut *mut u8) {
     ROOT_STACK.with(|rs| {
         let mut stack = rs.borrow_mut();
         stack.push(slot);
-        ROOT_DEPTH.set(stack.len());
     });
 }
 
@@ -34,7 +56,6 @@ pub extern "C" fn willow_pop_root() {
     ROOT_STACK.with(|rs| {
         let mut stack = rs.borrow_mut();
         stack.pop();
-        ROOT_DEPTH.set(stack.len());
     });
     release_root_stack_owner_if_empty();
 }
@@ -49,7 +70,6 @@ pub extern "C" fn willow_pop_roots(count: i32) {
         let remove = (count as usize).min(stack.len());
         let new_len = stack.len() - remove;
         stack.truncate(new_len);
-        ROOT_DEPTH.set(stack.len());
     });
     release_root_stack_owner_if_empty();
 }
@@ -62,7 +82,7 @@ pub extern "C" fn willow_pop_roots(count: i32) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_root_depth() -> i32 {
-    i32::try_from(ROOT_DEPTH.get() - ROOT_BASE.get()).unwrap_or_else(|_| {
+    i32::try_from(crate::generated_context::depth() - ROOT_BASE.get()).unwrap_or_else(|_| {
         eprintln!("runtime fatal: generated-code root depth overflow");
         std::process::abort();
     })
@@ -70,7 +90,7 @@ pub extern "C" fn willow_root_depth() -> i32 {
 
 /// Number of shadow roots on the running native stack.
 pub(crate) fn gc_thread_root_depth() -> usize {
-    ROOT_DEPTH.get()
+    crate::generated_context::depth()
 }
 
 // The caller owns live local slots or holds the suspended-stack registry lock.
@@ -99,6 +119,9 @@ pub(crate) unsafe fn park_current_roots(depth: usize) -> u64 {
     let token = runtime().next_parked_stack.fetch_add(1, Ordering::Relaxed);
     assert_ne!(token, 0, "parked native stack token exhausted");
     let mut parked = runtime().parked_stack_roots.lock().unwrap();
+    let depth = depth
+        .checked_sub(crate::generated_context::parent_depth())
+        .expect("root depth below parent context");
     ROOT_STACK.with(|roots| {
         let mut roots = roots.borrow_mut();
         assert!(depth <= roots.len(), "native stack root depth mismatch");
@@ -110,7 +133,6 @@ pub(crate) unsafe fn park_current_roots(depth: usize) -> u64 {
         // The scheduler context that takes over this thread is runtime code.
         set_relocation_safe(false);
         roots.truncate(depth);
-        ROOT_DEPTH.set(roots.len());
     });
     release_root_stack_owner_if_empty();
     token
@@ -147,7 +169,6 @@ pub(crate) unsafe fn resume_parked_roots(token: u64) {
     ROOT_STACK.with(|roots| {
         let mut roots = roots.borrow_mut();
         roots.extend(slots.into_iter().map(|slot| slot as *mut *mut u8));
-        ROOT_DEPTH.set(roots.len());
     });
 }
 
@@ -259,6 +280,14 @@ pub extern "C" fn willow_gc_remove_runtime_root_slot(slot: *mut *mut u8) {
     runtime().runtime_root_slots.remove(slot.cast());
 }
 
+pub(crate) fn generated_roots_admitted() -> bool {
+    current_thread_is_registered()
+        || OWNER_EPOCH.get() == safepoint::MUTATOR_EPOCH.load(Ordering::Acquire)
+}
+pub(crate) fn leave_generated_roots() {
+    release_root_stack_owner_if_empty();
+}
+
 pub(super) fn claim_root_stack_owner() {
     // Registered mutators are coordinated via the registry + STW, not the
     // single-owner guard (willow-6fv.5.6).
@@ -267,8 +296,7 @@ pub(super) fn claim_root_stack_owner() {
     }
     // Only the owning thread clears its own claim, so an existing claim stays
     // valid without coord; collectors already defer to it.
-    let current = std::thread::current().id();
-    if *runtime().root_stack_owner.lock().unwrap() == Some(current) {
+    if OWNER_EPOCH.get() == safepoint::MUTATOR_EPOCH.load(Ordering::Acquire) {
         return;
     }
     let coord = runtime().coord.0.lock().unwrap();
@@ -278,10 +306,13 @@ pub(super) fn claim_root_stack_owner() {
 // Admission and collector election share coord. A raw, unpublished reference
 // cannot safely wait across a collection; reject misuse before publishing it.
 pub(super) fn claim_legacy_owner_locked(coord: &GcCoord, already_unregistered: bool) {
+    #[cfg(test)]
+    OWNER_SLOW_PATHS.set(OWNER_SLOW_PATHS.get() + 1);
     let current = std::thread::current().id();
     let mut owner = runtime().root_stack_owner.lock().unwrap();
     // Existing legacy ownership already requires a foreign collector to defer.
     if already_unregistered && *owner == Some(current) {
+        OWNER_EPOCH.set(safepoint::MUTATOR_EPOCH.load(Ordering::Acquire));
         return;
     }
     if coord
@@ -299,6 +330,7 @@ pub(super) fn claim_legacy_owner_locked(coord: &GcCoord, already_unregistered: b
         }
         _ => *owner = Some(current),
     }
+    OWNER_EPOCH.set(safepoint::MUTATOR_EPOCH.load(Ordering::Acquire));
 }
 
 pub(super) fn release_root_stack_owner_if_empty() {
@@ -310,15 +342,20 @@ pub(super) fn release_root_stack_owner_if_empty() {
 
 // Does not reacquire coord: unregister calls this while holding that lock.
 pub(super) fn clear_root_stack_owner_if_empty() {
-    let is_empty = ROOT_STACK.with(|rs| rs.borrow().is_empty());
-    if !is_empty {
+    if crate::generated_context::has_active_bridge()
+        || gc_thread_root_depth() != 0
+        || OWNER_EPOCH.get() != safepoint::MUTATOR_EPOCH.load(Ordering::Acquire)
+    {
         return;
     }
+    #[cfg(test)]
+    OWNER_SLOW_PATHS.set(OWNER_SLOW_PATHS.get() + 1);
     let current = std::thread::current().id();
     let mut owner = runtime().root_stack_owner.lock().unwrap();
     if owner.as_ref().is_some_and(|existing| *existing == current) {
         *owner = None;
     }
+    OWNER_EPOCH.set(0);
 }
 
 pub(super) fn foreign_root_stack_owner_active() -> bool {
@@ -394,4 +431,73 @@ pub(crate) fn parked_root_counts_for_test() -> (usize, usize) {
         roots.len(),
         roots.values().map(|roots| roots.slots.len()).sum(),
     )
+}
+
+#[cfg(test)]
+mod inline_root_tests {
+    use super::*;
+
+    #[test]
+    fn owner_cached_push_pop_has_two_slow_paths_per_live_stack() {
+        let _guard = runtime_test_guard();
+        for count in [1, 16, 256, 4096] {
+            reset_internal_for_test();
+            OWNER_SLOW_PATHS.set(0);
+            let mut slots = vec![std::ptr::null_mut(); count];
+            for slot in &mut slots {
+                willow_push_root(slot);
+            }
+            assert_eq!(OWNER_SLOW_PATHS.get(), 1, "first claim only: {count}");
+            for _ in 1..count {
+                willow_pop_root();
+            }
+            assert_eq!(OWNER_SLOW_PATHS.get(), 1, "nonfinal pops: {count}");
+            willow_pop_root();
+            assert_eq!(OWNER_SLOW_PATHS.get(), 2, "final release: {count}");
+        }
+        reset_internal_for_test();
+    }
+
+    unsafe extern "C" fn empty_scope_loop(_: *mut std::ffi::c_void) -> i32 {
+        let mut slot = std::ptr::null_mut();
+        for _ in 0..4096 {
+            willow_push_root(&mut slot);
+            willow_pop_root();
+            assert_eq!(OWNER_SLOW_PATHS.get(), 1);
+        }
+        1
+    }
+
+    #[test]
+    fn owner_bridge_retains_one_claim_across_empty_scopes() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        OWNER_SLOW_PATHS.set(0);
+        assert_eq!(
+            unsafe {
+                crate::generated_context::invoke(
+                    empty_scope_loop as *const (),
+                    std::ptr::null_mut(),
+                )
+            },
+            1
+        );
+        assert_eq!(OWNER_SLOW_PATHS.get(), 2);
+        assert!(!generated_roots_admitted());
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn owner_registered_push_pop_never_enters_owner_slow_path() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let _registration = MutatorRegistration::new();
+        OWNER_SLOW_PATHS.set(0);
+        let mut slot = std::ptr::null_mut();
+        for _ in 0..4096 {
+            willow_push_root(&mut slot);
+            willow_pop_root();
+        }
+        assert_eq!(OWNER_SLOW_PATHS.get(), 0);
+    }
 }

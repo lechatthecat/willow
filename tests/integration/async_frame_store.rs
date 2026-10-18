@@ -70,8 +70,8 @@ fn async_frame_store_sites_add_one_cold_barrier_and_phase_load_each() {
     // Reference stores add a constant number of filtered barrier sites per
     // source site relative to an i64 store, and no root or panic bracket.
     const TRACKED: [&str; 5] = [
-        "willow_push_root",
-        "willow_pop_roots",
+        "root_push",
+        "root_pop",
         "inline_panic_depth",
         "willow_gc_write_barrier",
         "willow_gc_mark_phase",

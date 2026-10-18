@@ -1941,6 +1941,8 @@ impl UnitCodegenContext<'_> {
             is_async: false,
             terminated: false,
             gc_root_count: 0,
+            root_reservation: None,
+            root_peak_count: 0,
             temporary_root_slots: HashMap::new(),
             enum_payload_layouts: &mut self.output.enum_payload_layouts,
             coop_shadow_roots: None,
@@ -1959,6 +1961,9 @@ impl UnitCodegenContext<'_> {
                 &lir_fn,
                 self.build_mode == BuildMode::Debug,
             );
+        if !unrooted {
+            fg.begin_root_reservation();
+        }
         if panic_return_block.is_some()
             && !unrooted
             && super::root_effect::may_push_gc_roots(&lir_fn)
@@ -2062,6 +2067,7 @@ impl UnitCodegenContext<'_> {
             }
         }
         fg.emit_panic_return(&call_return_type, force_void_main);
+        fg.finish_root_reservation();
         fg.builder.seal_all_blocks();
 
         builder.finalize(self.output.module.target_config());
@@ -2379,6 +2385,8 @@ impl UnitCodegenContext<'_> {
             is_async: false,
             terminated: false,
             gc_root_count: 0,
+            root_reservation: None,
+            root_peak_count: 0,
             temporary_root_slots: HashMap::new(),
             enum_payload_layouts: &mut self.output.enum_payload_layouts,
             coop_shadow_roots: None,
@@ -2982,6 +2990,8 @@ impl UnitCodegenContext<'_> {
             is_async: false,
             terminated: false,
             gc_root_count: 0,
+            root_reservation: None,
+            root_peak_count: 0,
             temporary_root_slots: HashMap::new(),
             enum_payload_layouts: &mut self.output.enum_payload_layouts,
             coop_shadow_roots: None,
@@ -2999,6 +3009,9 @@ impl UnitCodegenContext<'_> {
             &lir_fn,
             self.build_mode == BuildMode::Debug,
         );
+        if !unrooted {
+            fg.begin_root_reservation();
+        }
         if panic_return_block.is_some()
             && !unrooted
             && (!m.is_static || super::root_effect::may_push_gc_roots(&lir_fn))
@@ -3028,14 +3041,7 @@ impl UnitCodegenContext<'_> {
                 0,
             ));
             fg.stack_store(self_val, self_slot);
-            {
-                let ptr_ty = reference_type(fg.module.target_config());
-                let addr = fg.builder.ins().stack_addr(ptr_ty, self_slot, 0);
-                let push_id = fg.func_id("willow_push_root");
-                let push_ref = fg.module.declare_func_in_func(push_id, fg.builder.func);
-                fg.builder.ins().call(push_ref, &[addr]);
-                fg.gc_root_count += 1;
-            }
+            fg.emit_push_root_slot(self_slot);
             let receiver_ty = Type::Named(class_name.to_owned().into());
             let receiver_storage = VarStorage::Stack {
                 slot: self_slot,
@@ -3083,6 +3089,7 @@ impl UnitCodegenContext<'_> {
             }
         }
         fg.emit_panic_return(&call_return_type, false);
+        fg.finish_root_reservation();
         fg.builder.seal_all_blocks();
 
         builder.finalize(self.output.module.target_config());

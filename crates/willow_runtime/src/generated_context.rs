@@ -1,9 +1,103 @@
 //! Stable generated-code state. Native task contexts move between workers by
 //! ownership transfer; their addresses never change. No TLS address is cached
 //! in generated code. Runtime-to-generated calls establish the pinned register.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell, RefMut};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+/// Storage belongs to the execution context, never to a worker TLS address.
+/// Only the running owner mutates it. Collectors consume parked snapshots.
+#[repr(C)]
+pub(crate) struct ShadowRoots {
+    base: Cell<*mut *mut *mut u8>,
+    top: Cell<usize>,
+    limit: Cell<usize>,
+    storage: RefCell<Vec<*mut *mut u8>>,
+}
+
+impl ShadowRoots {
+    const fn new() -> Self {
+        Self {
+            base: Cell::new(std::ptr::null_mut()),
+            top: Cell::new(0),
+            limit: Cell::new(0),
+            storage: RefCell::new(Vec::new()),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn set_depth_for_test(&self, depth: usize) {
+        self.top.set(depth);
+    }
+
+    pub(crate) fn borrow(&self) -> RootBorrow<'_> {
+        self.borrow_mut()
+    }
+    pub(crate) fn borrow_mut(&self) -> RootBorrow<'_> {
+        let mut storage = self.storage.borrow_mut();
+        // Generated pushes initialize each slot before publishing top.
+        assert!(self.top.get() <= storage.capacity());
+        unsafe {
+            storage.set_len(self.top.get());
+        }
+        RootBorrow {
+            roots: self,
+            storage,
+        }
+    }
+}
+
+pub(crate) struct RootBorrow<'a> {
+    roots: &'a ShadowRoots,
+    storage: RefMut<'a, Vec<*mut *mut u8>>,
+}
+impl std::ops::Deref for RootBorrow<'_> {
+    type Target = Vec<*mut *mut u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+impl std::ops::DerefMut for RootBorrow<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage
+    }
+}
+impl Drop for RootBorrow<'_> {
+    fn drop(&mut self) {
+        self.roots.base.set(self.storage.as_mut_ptr());
+        self.roots.top.set(self.storage.len());
+        self.roots
+            .limit
+            .set(if crate::gc::generated_roots_admitted() {
+                self.storage.capacity()
+            } else {
+                0
+            });
+    }
+}
+
+pub(crate) fn with_roots<R>(f: impl FnOnce(&ShadowRoots) -> R) -> R {
+    f(&unsafe { &*active() }.roots)
+}
+pub(crate) fn depth() -> usize {
+    let context = unsafe { &*active() };
+    context.parent_depth.get() + context.roots.top.get()
+}
+pub(crate) fn parent_depth() -> usize {
+    unsafe { &*active() }.parent_depth.get()
+}
+pub(crate) fn has_active_bridge() -> bool {
+    let context = unsafe { &*active() };
+    context.bridge_depth.get() != 0 || context.parent_bridge_active.get()
+}
+
+pub(crate) fn visit_roots(mut visit: impl FnMut(&[*mut *mut u8])) {
+    let mut context = active();
+    while !context.is_null() {
+        let current = unsafe { &*context };
+        visit(&current.roots.borrow());
+        context = current.parent.get();
+    }
+}
 
 #[repr(C)]
 pub(crate) struct Helper {
@@ -18,6 +112,11 @@ pub(crate) struct Context {
     helper: AtomicPtr<Helper>,
     tlab: AtomicPtr<crate::gc::GcTlabState>,
     panic_depth: AtomicPtr<AtomicUsize>,
+    pub(crate) roots: ShadowRoots,
+    parent: Cell<*const Context>,
+    parent_depth: Cell<usize>,
+    parent_bridge_active: Cell<bool>,
+    bridge_depth: Cell<usize>,
 }
 
 impl Context {
@@ -26,6 +125,11 @@ impl Context {
             helper: AtomicPtr::new(std::ptr::null_mut()),
             tlab: AtomicPtr::new(std::ptr::null_mut()),
             panic_depth: AtomicPtr::new((&raw const NO_PANIC).cast_mut()),
+            roots: ShadowRoots::new(),
+            parent: Cell::new(std::ptr::null()),
+            parent_depth: Cell::new(0),
+            parent_bridge_active: Cell::new(false),
+            bridge_depth: Cell::new(0),
         }
     }
 
@@ -38,6 +142,9 @@ impl Context {
 
     pub(crate) fn refresh(&self) {
         self.refresh_panic_depth();
+        if !crate::gc::generated_roots_admitted() {
+            self.roots.limit.set(0);
+        }
         self.tlab
             .store(crate::gc::willow_gc_current_tlab(), Ordering::Relaxed);
     }
@@ -78,7 +185,22 @@ const _: () = {
         std::mem::offset_of!(Context, panic_depth)
             == willow_abi::generated_context::PANIC_DEPTH_OFFSET as usize
     );
-    assert!(std::mem::size_of::<Context>() == willow_abi::generated_context::SIZE);
+    assert!(
+        std::mem::offset_of!(Context, roots)
+            == willow_abi::generated_context::ROOT_BASE_OFFSET as usize
+    );
+    assert!(
+        std::mem::offset_of!(Context, roots) + std::mem::offset_of!(ShadowRoots, top)
+            == willow_abi::generated_context::ROOT_TOP_OFFSET as usize
+    );
+    assert!(
+        std::mem::offset_of!(Context, roots) + std::mem::offset_of!(ShadowRoots, limit)
+            == willow_abi::generated_context::ROOT_LIMIT_OFFSET as usize
+    );
+    assert!(
+        std::mem::offset_of!(Context, roots) + std::mem::offset_of!(ShadowRoots, storage)
+            == willow_abi::generated_context::SIZE
+    );
 };
 
 thread_local! {
@@ -99,18 +221,25 @@ pub(crate) fn refresh_panic_depth() {
 }
 
 pub(crate) fn replace(context: *const Context) -> *const Context {
+    let previous = active();
+    if !context.is_null() && context != previous {
+        let target = unsafe { &*context };
+        // Returning to an ancestor must not introduce a cycle.
+        if unsafe { &*previous }.parent.get() != context {
+            target.parent.set(previous);
+            target.parent_depth.set(depth());
+            target.parent_bridge_active.set(has_active_bridge());
+        }
+    }
     ACTIVE.replace(context)
 }
 
-fn current() -> *const Context {
+pub(crate) fn active() -> *const Context {
     let context = ACTIVE.get();
     if !context.is_null() {
         return context;
     }
-    THREAD.with(|context| {
-        context.refresh();
-        context as *const Context
-    })
+    THREAD.with(|context| context as *const Context)
 }
 
 /// Test the exact published pointer, without borrowing panic TLS.
@@ -156,10 +285,13 @@ pub(crate) unsafe fn invoke_i64(entry: unsafe extern "C" fn(i64) -> i64, value: 
 /// one ABI word, and never unwind. Float/aggregate callbacks are not supported.
 #[inline(never)]
 unsafe extern "C" fn invoke_word(entry: *const (), argument: usize) -> usize {
-    let context = current();
+    let context = active();
+    unsafe { &*context }.refresh();
     // Runtime callbacks must not leak a nested generated callee's name into
     // their generated caller. The pointer is stable even if the callback migrates.
-    let helper = unsafe { &*context }.helper.load(Ordering::Relaxed);
+    let state = unsafe { &*context };
+    state.bridge_depth.set(state.bridge_depth.get() + 1);
+    let helper = state.helper.load(Ordering::Relaxed);
     let result: usize;
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     unsafe {
@@ -182,12 +314,117 @@ unsafe extern "C" fn invoke_word(entry: *const (), argument: usize) -> usize {
             in("x21") context, clobber_abi("C"));
     }
     unsafe { &*context }.helper.store(helper, Ordering::Relaxed);
+    state.bridge_depth.set(state.bridge_depth.get() - 1);
+    crate::gc::leave_generated_roots();
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exact store/bump protocol emitted by the compiler, without a Rust Vec borrow.
+    unsafe fn inline_push(roots: &ShadowRoots, slot: *mut *mut u8) {
+        let top = roots.top.get();
+        assert!(top < roots.limit.get());
+        unsafe {
+            roots.base.get().add(top).write(slot);
+        }
+        roots.top.set(top + 1);
+    }
+
+    #[test]
+    fn shadow_roots_inline_and_runtime_mutations_share_storage() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        for count in [1, 16, 256, 4096] {
+            let mut slots = vec![std::ptr::null_mut(); count + 1];
+            crate::gc::willow_reserve_roots(count);
+            with_roots(|roots| {
+                for slot in &mut slots[..count] {
+                    unsafe {
+                        inline_push(roots, slot);
+                    }
+                }
+            });
+            crate::gc::willow_push_root(&mut slots[count]);
+            assert_eq!(depth(), count + 1);
+            with_roots(|roots| {
+                assert_eq!(roots.borrow()[count], &raw mut slots[count]);
+                roots.top.set(1);
+            });
+            crate::gc::willow_pop_root();
+            assert_eq!(depth(), 0);
+        }
+        crate::gc::reset_internal_for_test();
+    }
+
+    #[test]
+    fn shadow_roots_nested_contexts_preserve_parent_slots() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let mut outer_slot = std::ptr::null_mut();
+        crate::gc::willow_push_root(&mut outer_slot);
+        let context = Context::new();
+        let outer = replace(&context);
+        assert_eq!(depth(), 1);
+        let mut child_slot = std::ptr::null_mut();
+        crate::gc::willow_push_root(&mut child_slot);
+        assert_eq!(depth(), 2);
+        let mut slots = Vec::new();
+        visit_roots(|roots| slots.extend_from_slice(roots));
+        assert_eq!(slots, [&raw mut child_slot, &raw mut outer_slot]);
+        crate::gc::willow_pop_root();
+        replace(outer);
+        assert_eq!(depth(), 1);
+        crate::gc::willow_pop_root();
+        assert_eq!(depth(), 0);
+        crate::gc::reset_internal_for_test();
+    }
+
+    unsafe extern "C" fn unregister_then_push(_: *mut c_void) -> i32 {
+        crate::gc::willow_reserve_roots(8);
+        crate::gc::willow_gc_unregister_mutator();
+        assert!(crate::gc::generated_roots_admitted());
+        let mut slot = std::ptr::null_mut();
+        with_roots(|roots| unsafe {
+            inline_push(roots, &mut slot);
+        });
+        assert_eq!(depth(), 1);
+        with_roots(|roots| roots.top.set(0));
+        1
+    }
+
+    #[test]
+    fn shadow_roots_unregister_empty_bridge_keeps_admission() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::gc::willow_gc_register_mutator();
+        assert_eq!(
+            unsafe { invoke(unregister_then_push as *const (), std::ptr::null_mut()) },
+            1
+        );
+        assert!(!crate::gc::generated_roots_admitted());
+        assert_eq!(depth(), 0);
+        crate::gc::reset_internal_for_test();
+    }
+
+    #[test]
+    fn shadow_roots_refresh_requires_new_legacy_admission() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::gc::willow_reserve_roots(8);
+        crate::gc::leave_generated_roots();
+        unsafe { &*active() }.refresh();
+        with_roots(|roots| assert_eq!(roots.limit.get(), 0));
+        // An empty collector snapshot must not accidentally grant admission.
+        visit_roots(|_| {});
+        with_roots(|roots| assert_eq!(roots.limit.get(), 0));
+        crate::gc::willow_reserve_roots(8);
+        assert!(crate::gc::generated_roots_admitted());
+        crate::gc::leave_generated_roots();
+        crate::gc::reset_internal_for_test();
+    }
 
     #[unsafe(naked)]
     unsafe extern "C" fn check_register(_: *mut c_void) -> i32 {
@@ -222,7 +459,7 @@ mod tests {
     fn bridge_preserves_native_callers_register() {
         assert_eq!(
             unsafe {
-                check_preserved_register(check_register as *const (), current().cast_mut().cast())
+                check_preserved_register(check_register as *const (), active().cast_mut().cast())
             },
             1
         );
@@ -230,7 +467,7 @@ mod tests {
 
     #[test]
     fn bridge_installs_thread_and_nested_stable_contexts() {
-        let thread = current();
+        let thread = active();
         assert_eq!(
             unsafe { invoke(check_register as *const (), thread.cast_mut().cast()) },
             1
@@ -263,7 +500,7 @@ mod tests {
         );
         assert_eq!(replace(outer), &raw const nested);
         assert_eq!(replace(old), &raw const context);
-        assert_eq!(current(), thread);
+        assert_eq!(active(), thread);
     }
 
     #[unsafe(naked)]

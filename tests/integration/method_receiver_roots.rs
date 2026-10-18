@@ -1,6 +1,6 @@
 //! Receiver-root reuse (willow-dcre): stack snapshots pin SSA receivers;
 //! async-frame snapshots must retain their additional direct root.
-use super::support::{compile_and_collect_relocation_targets_mode, compile_and_run_gc_stress_all};
+use super::support::{compile_and_collect_panic_events_mode, compile_and_run_gc_stress_all};
 
 const CLASSES: &str = r#"
 class Item {
@@ -150,9 +150,9 @@ fn repeated_stack_calls_add_only_entry_roots() {
             let source = format!(
                 "class C {{ pub n: i64; pub fn step(self) -> i64 {{ return self.n; }} }} fn main() {{ let x = new C(1); let mut total = 0; {body} println(total); }}"
             );
-            compile_and_collect_relocation_targets_mode(&source, &[], release)
+            compile_and_collect_panic_events_mode(&source, &[], release)
                 .iter()
-                .filter(|name| name.as_str() == "willow_push_root")
+                .filter(|name| name.as_str() == "root_push")
                 .count()
         };
         // Lowering keeps both the operand and prepared receiver snapshots in

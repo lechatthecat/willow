@@ -289,7 +289,7 @@ fn pe_04_analysis_off_restores_conservative_depth_checks() {
         compile_and_collect_panic_events(PURE_RECURSION, &[("WILLOW_PANIC_EFFECTS", "0")]);
     assert!(has_target(&targets, "inline_panic_depth"), "{targets:?}");
     // Disabling panic effects must not disable the independent zero-root proof.
-    assert!(!has_target(&targets, "willow_root_depth"), "{targets:?}");
+    assert!(!has_target(&targets, "root_depth"), "{targets:?}");
 }
 
 #[test]
@@ -307,7 +307,7 @@ fn main() { println(Math::calculate(2)); }
         for env in [&[][..], &[("WILLOW_PANIC_EFFECTS", "0")][..]] {
             let targets = compile_and_collect_panic_events_mode(source, env, release);
             assert!(has_target(&targets, "inline_panic_depth"), "{targets:?}");
-            for name in ["willow_root_depth", "willow_pop_roots", "willow_push_root"] {
+            for name in ["root_depth", "root_pop", "root_push"] {
                 assert!(
                     !has_target(&targets, name),
                     "unexpected {name}: {targets:?}"
@@ -345,7 +345,7 @@ fn pe_zero_root_proof_keeps_reference_and_unknown_cleanup() {
                 &[("WILLOW_PANIC_EFFECTS", "0")],
                 release,
             );
-            for name in ["willow_root_depth", "willow_pop_roots"] {
+            for name in ["root_depth", "root_pop"] {
                 assert!(
                     has_target(&targets, name),
                     "missing {name} for {fixture}: {targets:?}"

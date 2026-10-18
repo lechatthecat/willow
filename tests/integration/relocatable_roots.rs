@@ -454,7 +454,7 @@ fn main() {
 "#;
     let names = compile_and_collect_relocation_targets_all(source, &[]);
     assert!(
-        names.iter().any(|name| name == "willow_push_root"),
+        names.iter().any(|name| name == "willow_reserve_roots"),
         "{names:?}"
     );
     assert_no_pinned_entries(source);
@@ -1004,4 +1004,84 @@ fn young_array_literals_and_push_buffers_move_in_every_mode() {
     let expected = "50005000\n43\n6\nalphabetagamma\n10\n5050\n2555840\n87\n1999000\n";
     let project = assert_relocating_modes("young_array_literals", source, expected);
     assert_runs(&project, &[ALLOC_NO_PIN], expected);
+}
+
+#[test]
+fn inline_shadow_roots_have_no_push_pop_depth_calls_and_one_cold_path() {
+    for release in [false, true] {
+        let mut previous = None;
+        for count in [1, 8, 32, 128] {
+            let mut source = String::from("class Root { pub n: i64; } fn work() -> i64 {");
+            for i in 0..count {
+                source.push_str(&format!("let r{i} = new Root({i});"));
+            }
+            source.push_str("gc_minor_collect(); return ");
+            source.push_str(
+                &(0..count)
+                    .map(|i| format!("r{i}.n"))
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+            );
+            source.push_str(";} fn main() { println(work()); }");
+            let names = compile_and_collect_relocation_targets_mode(&source, &[], release);
+            for old in ["willow_push_root", "willow_pop_roots", "willow_root_depth"] {
+                assert!(
+                    !names.iter().any(|name| name == old),
+                    "{release} {count}: {old}"
+                );
+            }
+            let cold = names
+                .iter()
+                .filter(|name| name.as_str() == "willow_reserve_roots")
+                .count();
+            assert!(cold > 0);
+            if let Some(before) = previous {
+                assert_eq!(cold, before, "one cold path per function");
+            }
+            previous = Some(cold);
+            let bytes = compile_and_measure_text_bytes(&source, release);
+            assert!(
+                bytes < 8192 + 2048 * count as u64,
+                "bounded code per root: {bytes}"
+            );
+            eprintln!(
+                "inline-root-scaling release={release} roots={count} reserve_calls={cold} text_bytes={bytes}"
+            );
+        }
+    }
+}
+
+#[test]
+fn inline_shadow_roots_example_in_relocation_modes() {
+    assert_relocating_modes(
+        "inline_shadow_roots",
+        include_str!("../../example/inline_shadow_roots.wi"),
+        "true\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn inline_shadow_roots_reserve_peak_depth_not_total_sites() {
+    for release in [false, true] {
+        let mut previous = None;
+        for sites in [1, 8, 32, 128] {
+            let source = format!(
+                "class Root {{ pub n: i64; }} fn work() -> i64 {{ let mut total = 0; {} return total; }} fn main() {{ println(work()); }}",
+                "if total >= 0 { let r = new Root(1); gc_minor_collect(); total = total + r.n; }"
+                    .repeat(sites)
+            );
+            let events = compile_and_collect_panic_events_mode(&source, &[], release);
+            let peak = events
+                .iter()
+                .filter_map(|event| event.strip_prefix("root_capacity_")?.parse::<usize>().ok())
+                .max()
+                .unwrap();
+            assert!(peak > 0);
+            if let Some(before) = previous {
+                assert_eq!(peak, before, "sequential scopes reuse capacity");
+            }
+            previous = Some(peak);
+            eprintln!("inline-root-peak release={release} sites={sites} capacity={peak}");
+        }
+    }
 }

@@ -630,6 +630,39 @@ fn collect_codegen_events(
                 .filter(|line| *line == "[panic-depth-load]")
                 .map(|_| ("inline-read".to_string(), "inline_panic_depth".to_string())),
         );
+        names.extend(
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter_map(|line| {
+                    let count = line.strip_prefix("[root-reservation:")?.strip_suffix(']')?;
+                    Some(("inline-root".to_string(), format!("root_capacity_{count}")))
+                }),
+        );
+        // Root-effect tests count operations regardless of lowering strategy.
+        for (_, name) in &mut names {
+            let normalized = match name.as_str() {
+                "willow_push_root" => Some("root_push"),
+                "willow_pop_roots" => Some("root_pop"),
+                "willow_root_depth" => Some("root_depth"),
+                _ => None,
+            };
+            if let Some(normalized) = normalized {
+                *name = normalized.to_string();
+            }
+        }
+        names.extend(
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter_map(|line| {
+                    let event = match line {
+                        "[inline-root-push]" => "root_push",
+                        "[inline-root-pop]" => "root_pop",
+                        "[inline-root-depth]" => "root_depth",
+                        _ => return None,
+                    };
+                    Some(("inline-root".to_string(), event.to_string()))
+                }),
+        );
     }
     names.sort();
     assert!(
