@@ -121,22 +121,6 @@ The user-facing tool is:
 ./target/release/willow
 ```
 
-For convenience, add `target/release` to your `PATH`.
-
-
-
-### Payload-free results
-
-Use `Result<void, E>` with `Result::Ok()` for a function that reports only
-success or an error. Propagate errors with `finish()?;` and match with
-`Result::Ok(_)` / `Result::Err(error)`. See the runnable
-[payload-free result example](example/result_void.wi).
-
-`()` is a type alias for `void`, so `Result<(), E>` also accepts
-`Result::Ok()`. There is no `()` expression: write `Result::Ok()` instead of
-`Ok(())` or `Result::Ok(())`.
-
-
 # License
 
 [MIT License](LICENSE)
