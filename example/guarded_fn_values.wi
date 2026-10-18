@@ -1,0 +1,35 @@
+// A scalar target is expanded only after its function address matches.
+// A faulting target with the same signature must retain checked dispatch.
+fn leaf(x: i64) -> i64 { return (x & 1023) * 3 + 1; }
+fn faulting(x: i64) -> i64 { return 12 / x; }
+fn apply(op: fn(i64) -> i64, x: i64) -> i64 { return op(x); }
+fn guarded(op: fn(i64) -> i64) -> i64 {
+    let mut result = -1;
+    if true {
+        defer match recover() { Some(info) => println("recovered"), None => {} }
+        result = apply(op, 0);
+    }
+    return result;
+}
+fn floating(x: f64) -> f64 { return -x * 2.0 + 1.0; }
+fn apply_float(op: fn(f64) -> f64, x: f64) -> f64 { return op(x); }
+fn boolean(x: bool) -> bool { return !x; }
+fn apply_bool(op: fn(bool) -> bool, x: bool) -> bool { return op(x); }
+class Counter {
+    pub value: i64;
+    pub fn next(self) -> i64 { self.value = self.value + 1; return self.value; }
+}
+fn main() {
+    let mut op: fn(i64) -> i64 = leaf;
+    let counter = new Counter(0);
+    println(apply(op, counter.next()));
+    println(counter.value);
+    op = faulting;
+    println(apply(op, counter.next()));
+    println(counter.value);
+    println(guarded(op));
+    op = leaf;
+    println(guarded(op));
+    println(apply_float(floating, 2.0));
+    println(apply_bool(boolean, true));
+}

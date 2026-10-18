@@ -627,8 +627,12 @@ fn collect_codegen_events(
         names.extend(
             String::from_utf8_lossy(&output.stderr)
                 .lines()
-                .filter(|line| *line == "[panic-depth-load]")
-                .map(|_| ("inline-read".to_string(), "inline_panic_depth".to_string())),
+                .filter_map(|line| match line {
+                    "[panic-depth-load]" => Some("inline_panic_depth"),
+                    "[indirect-leaf-expand]" => Some("indirect_leaf_expand"),
+                    _ => None,
+                })
+                .map(|event| ("inline-read".to_string(), event.to_string())),
         );
         names.extend(
             String::from_utf8_lossy(&output.stderr)

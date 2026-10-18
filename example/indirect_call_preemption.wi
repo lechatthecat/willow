@@ -1,0 +1,44 @@
+// With one worker, both loops must yield while inside the indirect callee.
+fn call_fn(op: fn(AtomicBool, AtomicBool) -> void, done: AtomicBool, started: AtomicBool) {
+    op(done, started);
+}
+fn call_closure(op: closure() -> String) -> String {
+    return op();
+}
+async fn fn_worker(done: AtomicBool, started: AtomicBool) {
+    let op: fn(AtomicBool, AtomicBool) -> void = |done: AtomicBool, started: AtomicBool| {
+        started.store(true);
+        while !done.load() {}
+    };
+    call_fn(op, done, started);
+}
+fn run_closure(done: AtomicBool, started: AtomicBool, message: String) -> String {
+    let op = || {
+        started.store(true);
+        while !done.load() {}
+        gc_minor_collect();
+        return message;
+    };
+    return call_closure(op);
+}
+async fn closure_worker(done: AtomicBool, started: AtomicBool, message: String) -> String {
+    return run_closure(done, started, message);
+}
+async fn main() {
+    let done = AtomicBool::new(false);
+    let started = AtomicBool::new(false);
+    let first = fn_worker(done, started);
+    while !started.load() { await yield(); }
+    await sleep(1);
+    done.store(true);
+    await first;
+    println("fn resumed");
+
+    let done2 = AtomicBool::new(false);
+    let started2 = AtomicBool::new(false);
+    let second = closure_worker(done2, started2, "closure " + "resumed");
+    while !started2.load() { await yield(); }
+    await sleep(1);
+    done2.store(true);
+    println(await second);
+}

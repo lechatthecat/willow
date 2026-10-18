@@ -14,7 +14,7 @@
 //!      give it a panic path, so debug keeps the roots
 //!   03 debug overflow inside an expression lambda still panics; release wraps
 //!   04 a closure call site pushes no caller root
-//!   05 a `fn` value call keeps its panic bracket on every site
+//!   05 a `fn` value call retains a checked fallback on every site
 //!   06 an allocating closure body keeps its roots
 //!   07 a looping closure body keeps its poll
 //!   08 a calling closure body keeps its root and poll
@@ -145,10 +145,8 @@ fn closure_call_site_pushes_no_root() {
 
 #[test]
 fn function_value_call_keeps_panic_bracket() {
-    // A `fn` value carries no tag, so each site keeps the full protocol: the
-    // same references as a closure site's checked path.
-    // Release reuses one depth snapshot across adjacent `fn` sites in a block;
-    // a closure's checked path is a block of its own and takes a fresh one.
+    // Every unknown function target retains a checked fallback. Capturing
+    // closures independently use their existing code-word no-panic tag.
     let function = call_site_delta("fn(i64) -> i64", "double", PANIC_DEPTH);
     let closure = call_site_delta("closure(i64) -> i64", "|x| x + n", PANIC_DEPTH);
     assert!(function.iter().all(|&d| d >= 4), "{function:?}");
@@ -500,3 +498,139 @@ fn runnable_example() {
 }
 
 const EXAMPLE_OUTPUT: &str = "3025\n25\ntotal=3025\n";
+
+#[test]
+fn indirect_callee_loops_preempt_with_one_worker() {
+    // The controller waits until the indirect callee has entered its loop.
+    // With one worker it can set done only if that callee yields execution.
+    // Exercise noncapturing fn values and a closure retaining GC captures.
+    for budget in ["1", "1024"] {
+        let (out, ok) = super::support::compile_and_run_with_runtime_env(
+            include_str!("../../example/indirect_call_preemption.wi"),
+            &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", budget)],
+            std::time::Duration::from_secs(20),
+        );
+        assert!(ok, "budget={budget}: {out}");
+        assert_eq!(out, "fn resumed\nclosure resumed\n", "budget={budget}");
+    }
+}
+
+// willow-8hq4.44: guarded scalar expansion preserves all other call paths.
+#[test]
+fn promoted_function_values_cover_storage_and_combinators() {
+    let source = include_str!("../../example/lir_function_values.wi");
+    let expected = "42\n49\n42\n102\n81\n10\n-20\n5\n100\n-10\n17\nhi!!\n[[core]]\nsay hello\n<there>\n40\n-1\nbig\n?\n5\n-1\n4\n99\n40\n-1\n4\ne:odd\n2\nodd\n4\n0\n4\n8\n";
+    for (out, ok) in both(source) {
+        assert!(ok, "{out}");
+        assert_eq!(out, expected);
+    }
+}
+
+#[test]
+fn promoted_function_values_preserve_checked_targets_and_recovery() {
+    let source = r#"
+import std::collections::Array;
+fn safe(x: i64) -> i64 { return x & 7; }
+fn risky(x: i64) -> i64 { return 8 / x; }
+fn guarded(f: fn(i64) -> i64, x: i64) -> i64 {
+    let mut result = -1;
+    if true {
+        defer match recover() { Some(info) => println("recovered"), None => {} }
+        result = f(x);
+    }
+    return result;
+}
+fn main() {
+    let fs: Array<fn(i64) -> i64> = [safe, risky, |x: i64| 12 / x];
+    let mut i = 0;
+    while i < 3 { let f = fs[i]; println(guarded(f, 0)); i = i + 1; }
+    println("after");
+}
+"#;
+    for (out, ok) in both(source) {
+        assert!(ok, "{out}");
+        assert_eq!(out, "0\nrecovered\n-1\nrecovered\n-1\nafter\n");
+    }
+}
+
+#[test]
+fn promoted_function_values_preserve_debug_overflow_and_release_wrap() {
+    let source = "fn run(f: fn(i64) -> i64) -> i64 { return f(9223372036854775807); } fn main() { println(run(|x: i64| x + 1)); println(\"after\"); }";
+    let (out, ok) = compile_and_run(source);
+    assert!(!ok, "{out}");
+    assert!(!out.contains("after"), "{out}");
+    let (out, ok) = compile_and_run_release(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "-9223372036854775808\nafter\n");
+}
+
+#[test]
+fn promoted_function_values_keep_linear_generated_code() {
+    let source = |sites: usize| {
+        let body = "total = total + f(total);".repeat(sites);
+        format!(
+            "fn run(f: fn(i64) -> i64) -> i64 {{ let mut total = 1; {body} return total; }} fn main() {{ println(run(|x: i64| x + 1)); }}"
+        )
+    };
+    for release in [false, true] {
+        let expansions =
+            [1, 2, 8].map(|sites| count(&source(sites), release, "indirect_leaf_expand"));
+        assert_eq!(expansions, [usize::from(release); 3]);
+        // After the single promoted site's merge, ordinary adjacent sites
+        // resume snapshot reuse. Measure that steady per-site slope.
+        let refs = [2, 3, 9].map(|sites| count(&source(sites), release, PANIC_DEPTH));
+        assert!(refs[1] > refs[0]);
+        assert_eq!(refs[2] - refs[0], 7 * (refs[1] - refs[0]));
+        let bytes = [1, 9, 65].map(|sites| compile_and_measure_text_bytes(&source(sites), release));
+        let short = (bytes[1] - bytes[0]) / 8;
+        let long = (bytes[2] - bytes[1]) / 56;
+        println!(
+            "fn-value scaling release={release}: refs={refs:?} expansions={expansions:?} text_bytes={bytes:?}"
+        );
+        assert!(long * 4 <= short * 5, "release={release}: {bytes:?}");
+    }
+}
+
+#[test]
+fn promoted_function_values_guard_target_and_evaluate_operands_once() {
+    for (out, ok) in both(include_str!("../../example/guarded_fn_values.wi")) {
+        assert!(ok, "{out}");
+        assert_eq!(out, "4\n1\n6\n2\nrecovered\n-1\n1\n-3\nfalse\n");
+    }
+}
+
+#[test]
+fn promoted_function_values_bound_candidate_fanout() {
+    for candidates in [1, 2, 8, 65] {
+        let definitions: String = (0..candidates)
+            .map(|i| format!("fn leaf{i}(x: i64) -> i64 {{ return x + {i}; }}\n"))
+            .collect();
+        let source = format!(
+            "{definitions}fn apply(f: fn(i64) -> i64) -> i64 {{ return f(10); }} fn main() {{ println(apply(leaf0)); }}"
+        );
+        let expansions = count(&source, true, "indirect_leaf_expand");
+        assert_eq!(expansions, usize::from(candidates == 1));
+        println!("fn-value fanout candidates={candidates}: expansions={expansions}");
+        let (out, ok) = compile_and_run_release(&source);
+        assert!(ok, "{out}");
+        assert_eq!(out, "10\n");
+    }
+}
+
+#[test]
+fn promoted_function_values_reject_faulting_effectful_and_large_bodies() {
+    for body in [
+        "return 12 / x;",
+        "return 12 % x;",
+        "return 2 ** x;",
+        "println(x); return x;",
+        "let mut i = 0; while i < x { i = i + 1; } return i;",
+        "return x.toString().len();",
+        "return (((((((((x + 1) * 2 + 3) * 4 + 5) * 6 + 7) * 8 + 9) * 10 + 11) * 12 + 13) * 14 + 15) * 16 + 17);",
+    ] {
+        let source = format!(
+            "fn leaf(x: i64) -> i64 {{ {body} }} fn apply(f: fn(i64) -> i64) -> i64 {{ return f(2); }} fn main() {{ println(apply(leaf)); }}"
+        );
+        assert_eq!(count(&source, true, "indirect_leaf_expand"), 0, "{body}");
+    }
+}

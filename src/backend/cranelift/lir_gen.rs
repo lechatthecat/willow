@@ -7764,8 +7764,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let signature = self.builder.import_signature(signature);
                 let name = name.to_string();
                 if !closure {
-                    return self
-                        .emit_lir_indirect_call(signature, target, &values, &name, span, None);
+                    return self.emit_promoted_fn_call(
+                        signature, target, &values, params, result, &name, span,
+                    );
                 }
                 // A closure whose body cannot raise tags its code word
                 // (see `LirRvalue::Closure`); only an untagged one needs the
@@ -7911,7 +7912,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().iconst(types::I64, flag)
     }
 
-    fn emit_lir_binop(
+    pub(super) fn emit_lir_binop(
         &mut self,
         op: &BinOp,
         l: cranelift_codegen::ir::Value,
@@ -8043,7 +8044,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// computations on both paths, and a chain of such sites would then grow
     /// quadratically (willow-8hq4.28). Returns the result, or an `i8` zero
     /// for `void`.
-    fn emit_lir_indirect_call(
+    pub(super) fn emit_lir_indirect_call(
         &mut self,
         signature: cranelift_codegen::ir::SigRef,
         code: cranelift_codegen::ir::Value,

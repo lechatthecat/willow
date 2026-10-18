@@ -74,6 +74,7 @@ mod flat_control;
 mod flat_objects;
 mod flat_references;
 mod gc_codegen;
+mod indirect_leaf;
 mod lir_gen;
 mod local_maps;
 mod nonnegative;
@@ -218,6 +219,7 @@ pub struct UnitCodegenContext<'a> {
     /// safepoint-free leaf, so it can neither raise nor reach a GC point
     /// (willow-8hq4.28). Their closures tag the code word.
     leaf_lambdas: HashSet<ExprId>,
+    indirect_leaves: indirect_leaf::Candidates,
     effect_queries: Option<(
         std::rc::Rc<crate::compiler_db::effects::EffectQueries>,
         crate::module::UnitId,
@@ -1488,6 +1490,8 @@ struct FuncGen<'a, 'b> {
     builtin_module_aliases: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<ExprId, FunctionId>,
     leaf_lambdas: &'a HashSet<ExprId>,
+    indirect_leaves: &'a indirect_leaf::Candidates,
+    indirect_leaf_promoted: bool,
     string_literals: &'a HashMap<String, StringLiteralData>,
     /// This unit's alias-resolving view of the frozen class layouts, base
     /// edges, runtime type ids, virtual slot orders and interface

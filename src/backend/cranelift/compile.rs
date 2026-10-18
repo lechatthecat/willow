@@ -841,6 +841,39 @@ impl UnitCodegenContext<'_> {
         Ok(Some(body))
     }
 
+    /// Build a bounded scalar-leaf index once per unit, never per call site.
+    fn prepare_indirect_leaves(&mut self, plan: &[UnitBody<'_>]) -> Result<()> {
+        if self.build_mode != BuildMode::Release {
+            return Ok(());
+        }
+        for target in plan {
+            let name = match &target.target {
+                BodyTarget::Function { symbol, .. } => symbol.as_ref(),
+                BodyTarget::Lambda { name, .. } => name,
+                BodyTarget::Method { .. } => continue,
+            };
+            let id = self.func_ids.scope().lookup_id(name);
+            let owned;
+            let function = if let (Some(body), Some(queries)) = (target.body, &self.lir_queries) {
+                owned = queries.body(body)?;
+                &owned
+            } else if let Some(function) = self.lir_functions.get(&id) {
+                function
+            } else if let BodyTarget::Lambda { lambda, .. } = &target.target {
+                let Some(function) = self.lir_lambdas.get(&lambda.id) else {
+                    continue;
+                };
+                function
+            } else {
+                continue;
+            };
+            if let Some(leaf) = super::indirect_leaf::Leaf::analyze(function, self.func_ids[name]) {
+                self.indirect_leaves.insert(leaf);
+            }
+        }
+        Ok(())
+    }
+
     /// Emit one body of the unit whose alias scope is installed.
     ///
     /// The lowered IR is read from `lir_body(BodyId)` — one artifact, for this
@@ -879,6 +912,7 @@ impl UnitCodegenContext<'_> {
         emit: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
         self.install_module_scope(unit);
+        self.prepare_indirect_leaves(&self.module_body_plan(unit))?;
         emit(self)?;
         // Inside the alias scope, for the reason the bodies are.
         self.compile_unit_static_init(unit)
@@ -1218,6 +1252,7 @@ impl UnitCodegenContext<'_> {
         self.alias_item_import_types(&unit.item_imports);
         self.alias_unit_module_spellings(&unit.module_spellings);
 
+        self.prepare_indirect_leaves(&self.program_body_plan(unit))?;
         emit(self)?;
         // Compile the static-init function body after all symbols are defined.
         self.compile_static_init()
@@ -1915,6 +1950,8 @@ impl UnitCodegenContext<'_> {
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
             leaf_lambdas: &self.leaf_lambdas,
+            indirect_leaves: &self.indirect_leaves,
+            indirect_leaf_promoted: false,
             string_literals: &self.output.string_literals,
             classes: ClassView::new(&self.type_scope, &self.layout_queries),
             static_storage: &self.static_storage,
@@ -2361,6 +2398,8 @@ impl UnitCodegenContext<'_> {
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
             leaf_lambdas: &self.leaf_lambdas,
+            indirect_leaves: &self.indirect_leaves,
+            indirect_leaf_promoted: false,
             string_literals: &self.output.string_literals,
             classes: ClassView::new(&self.type_scope, &self.layout_queries),
             static_storage: &self.static_storage,
@@ -2965,6 +3004,8 @@ impl UnitCodegenContext<'_> {
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
             leaf_lambdas: &self.leaf_lambdas,
+            indirect_leaves: &self.indirect_leaves,
+            indirect_leaf_promoted: false,
             string_literals: &self.output.string_literals,
             classes: ClassView::new(&self.type_scope, &self.layout_queries),
             static_storage: &self.static_storage,
