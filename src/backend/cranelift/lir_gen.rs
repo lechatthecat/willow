@@ -8376,7 +8376,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     receiver
                 };
                 let runtime = if self.is_inline_pair(&element) {
-                    "willow_array_push_scalar_pairs"
+                    // emit_to_storage_word just allocated this pair box;
+                    // its mutable storage has no alias outside the push.
+                    "willow_array_push_owned_pair"
                 } else {
                     "willow_array_push"
                 };

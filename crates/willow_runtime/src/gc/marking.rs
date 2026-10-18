@@ -1,5 +1,27 @@
 use super::*;
 
+/// Visit only set reference bits, bounded by the immutable payload layout.
+fn inline_references(
+    value: usize,
+    metadata: raw_heap::TraceMetadata,
+    mut visit: impl FnMut(*mut u8),
+) -> usize {
+    let words = (metadata.payload_size / GC_STORAGE_WORD_BYTES).min(64);
+    let mut bits =
+        metadata.inline_ref_mask() & u64::MAX.checked_shr((64 - words) as u32).unwrap_or(0);
+    let count = bits.count_ones() as usize;
+    while bits != 0 {
+        let word = bits.trailing_zeros() as usize;
+        // SAFETY: the validated immutable layout bounds this live payload;
+        // reference stores use matching atomic publication.
+        visit(unsafe {
+            load_gc_reference((value as *mut u8).add(word * GC_STORAGE_WORD_BYTES).cast())
+        });
+        bits &= bits - 1;
+    }
+    count
+}
+
 /// Trace the GC graph from `worklist` (the marked-set fixpoint via the TypeInfo
 /// registry + gc_ref_mask interior pointers). Shared by the single-mutator and
 /// stop-the-world collection paths.
@@ -56,6 +78,39 @@ pub(super) struct MarkBatch<'a> {
     pub(super) native_counts: crate::gc_telemetry::native_trace::Counts,
     pub(super) unindexed: HashSet<usize>,
     pub(super) cpu_start: Option<u64>,
+    pub(super) inline_children: bool,
+    pub(super) branch_children: Vec<crate::gc_mark_queue::ObjectRef>,
+    pub(super) discovery_counts: [u64; 3],
+    pub(super) region_hint: Option<usize>,
+    pub(super) inline_types: [Option<(u32, bool)>; 4],
+    pub(super) local_child: Option<(crate::gc_mark_queue::ObjectRef, raw_heap::TraceMetadata)>,
+}
+impl MarkBatch<'_> {
+    fn generated_inline(&mut self, metadata: raw_heap::TraceMetadata) -> bool {
+        let slot = metadata.type_id as usize % self.inline_types.len();
+        if let Some((id, answer)) = self.inline_types[slot]
+            && id == metadata.type_id
+        {
+            return answer;
+        }
+        let answer = self.cycle.generated_inline(metadata);
+        self.inline_types[slot] = Some((metadata.type_id, answer));
+        answer
+    }
+
+    fn publish_branches(&mut self) {
+        if self.branch_children.is_empty() {
+            return;
+        }
+        let objects = std::mem::take(&mut self.branch_children).into_boxed_slice();
+        self.cycle
+            .queue
+            .inject(crate::gc_mark_queue::MarkWork::new(
+                self.cycle.mark_epoch,
+                crate::gc_mark_queue::MarkWorkItem::ObjectBatch(objects),
+            ))
+            .expect("claimed branches belong to active drain");
+    }
 }
 impl Drop for MarkBatch<'_> {
     fn drop(&mut self) {
@@ -64,6 +119,16 @@ impl Drop for MarkBatch<'_> {
             // may run after queue retirement makes outstanding reach zero.
             self.cycle.worker_failed.store(true, Ordering::Release);
         }
+        self.publish_branches();
+        self.cycle
+            .pointer_checks
+            .fetch_add(self.discovery_counts[0], Ordering::Relaxed);
+        self.cycle
+            .duplicate_discoveries
+            .fetch_add(self.discovery_counts[1], Ordering::Relaxed);
+        self.cycle
+            .unindexed_discoveries
+            .fetch_add(self.discovery_counts[2], Ordering::Relaxed);
         // An idle drain (e.g. an assist finding an empty queue) contributes no
         // mark work, so it must not dilute the pacer's mark-rate sample.
         let idle = self.work.marked_bytes == 0
@@ -103,6 +168,17 @@ impl Drop for MarkBatch<'_> {
                 .lock()
                 .unwrap()
                 .extend(self.unindexed.drain());
+        }
+        // A bounded drain owns termination until its claimed continuation is
+        // visible again, including on unwind and before a minor safepoint.
+        if let Some((child, _)) = self.local_child.take() {
+            self.cycle
+                .queue
+                .inject(crate::gc_mark_queue::MarkWork::object(
+                    self.cycle.mark_epoch,
+                    child,
+                ))
+                .expect("local continuation belongs to active drain");
         }
         self.cycle.active_drains.fetch_sub(1, Ordering::Release);
     }
@@ -208,7 +284,13 @@ impl ConcurrentCycle {
             // A captured active TLAB may not have published its starts yet.
             // Never discard SATB/roots just because retirement has not arrived.
             self.unindexed_discoveries.fetch_add(1, Ordering::Relaxed);
-            self.unindexed.lock().unwrap().insert(address);
+            // Extents allocated after capture are implicitly black through
+            // sweep and minor relocation. Only a captured extent can need a
+            // delayed start publication; do not retain every new allocation in
+            // an additional address set.
+            if self.objects.reader().needs_start_publication(address) {
+                self.unindexed.lock().unwrap().insert(address);
+            }
         } else {
             self.duplicate_discoveries.fetch_add(1, Ordering::Relaxed);
         }
@@ -266,14 +348,15 @@ impl ConcurrentCycle {
     pub(super) fn trace(
         &self,
         value: usize,
+        metadata: Option<raw_heap::TraceMetadata>,
         children: &mut Vec<*mut u8>,
         batch: &mut MarkBatch<'_>,
     ) {
         // Also discard a partial snapshot left by an unwinding native hook.
         children.clear();
-        let Some(metadata) = self.objects.metadata(value) else {
-            return;
-        };
+        // SAFETY: queue publication validates/claims the start, and this
+        // active drain prevents minor relocation or sweep reclamation.
+        let metadata = metadata.unwrap_or_else(|| unsafe { self.objects.claimed_metadata(value) });
         if self.legacy_traces.contains(&metadata.type_id)
             && trace_mode(
                 self.traces.contains_key(&metadata.type_id),
@@ -294,18 +377,7 @@ impl ConcurrentCycle {
         );
         let payload = value as *mut u8;
         let words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
-        let mut slots = 0;
-        let inline_mask = metadata.inline_ref_mask();
-        for index in 0..words.min(64) {
-            if inline_mask & (1u64 << index) != 0 {
-                // SAFETY: immutable epoch metadata bounds the live allocation;
-                // generated and native reference stores use atomic publication.
-                children.push(unsafe {
-                    load_gc_reference(payload.add(index * GC_STORAGE_WORD_BYTES).cast::<*mut u8>())
-                });
-                slots += 1;
-            }
-        }
+        let mut slots = inline_references(value, metadata, |child| children.push(child));
         if metadata.type_id == willow_abi::GC_BITMAP_TYPE_ID {
             let descriptor = metadata.gc_ref_mask as *const u64;
             // SAFETY: bitmap descriptors are validated immutable static data.
@@ -325,40 +397,104 @@ impl ConcurrentCycle {
             }
             slots += children.len() - before;
         }
-        for child in children.drain(..) {
-            self.discover_child(child, batch);
+        {
+            let index = self.objects.reader();
+            for child in children.drain(..) {
+                self.discover_child(child, batch, &index);
+            }
         }
         batch
             .work
             .object(GC_HEADER_SIZE + metadata.payload_size, slots);
     }
 
-    fn discover_child(&self, child: *mut u8, batch: &mut MarkBatch<'_>) {
-        if !self.claim_or_defer(child as usize) {
-            return;
-        }
-        // A pointer-free generated leaf needs only its mark bit and byte
-        // accounting. The active drain owns termination across this claim;
-        // avoid allocating and synchronizing a queue item with no trace work.
-        if let Some(metadata) = self.objects.metadata(child as usize)
-            && metadata.type_id != willow_abi::GC_BITMAP_TYPE_ID
-            && metadata.gc_ref_mask == 0
+    /// Generated inline layouts have no additional native/legacy trace work.
+    pub(super) fn generated_inline(&self, metadata: raw_heap::TraceMetadata) -> bool {
+        metadata.type_id != willow_abi::GC_BITMAP_TYPE_ID
             && !self.legacy_traces.contains(&metadata.type_id)
             && !self.traces.contains_key(&metadata.type_id)
             && !self.slices.contains_key(&metadata.type_id)
-        {
+    }
+
+    /// Credit an inline layout whose complete reference mask was already
+    /// visited under STW. The caller must separately publish its old children.
+    pub(super) fn account_scanned_inline(
+        &self,
+        metadata: raw_heap::TraceMetadata,
+        work: &mut crate::gc_telemetry::MarkWork,
+    ) -> bool {
+        if !self.generated_inline(metadata) {
+            return false;
+        }
+        let words = (metadata.payload_size / GC_STORAGE_WORD_BYTES).min(64);
+        let mask = metadata.gc_ref_mask & u64::MAX.checked_shr((64 - words) as u32).unwrap_or(0);
+        work.frame(
+            metadata.layout_id,
+            metadata.type_id,
+            metadata.payload_size,
+            metadata.gc_ref_mask,
+        );
+        work.object(
+            GC_HEADER_SIZE + metadata.payload_size,
+            mask.count_ones() as usize,
+        );
+        true
+    }
+
+    fn discover_child(
+        &self,
+        child: *mut u8,
+        batch: &mut MarkBatch<'_>,
+        index: &epoch_index::EpochReader<'_>,
+    ) {
+        if child.is_null() {
+            return;
+        }
+        batch.discovery_counts[0] += 1;
+        let metadata = match index.claim_metadata(child as usize, &mut batch.region_hint) {
+            Some(Some(metadata)) => metadata,
+            Some(None) => {
+                batch.discovery_counts[1] += 1;
+                return;
+            }
+            None => {
+                batch.discovery_counts[2] += 1;
+                if index.needs_start_publication(child as usize) {
+                    batch.unindexed.insert(child as usize);
+                }
+                return;
+            }
+        };
+        // A pointer-free generated leaf needs only its mark bit and byte
+        // accounting. The active drain owns termination across this claim;
+        // avoid allocating and synchronizing a queue item with no trace work.
+        if metadata.gc_ref_mask == 0 && batch.generated_inline(metadata) {
             batch.work.frame(
                 metadata.layout_id,
                 metadata.type_id,
                 metadata.payload_size,
-                metadata.gc_ref_mask,
+                0,
             );
             batch.work.object(GC_HEADER_SIZE + metadata.payload_size, 0);
         } else {
+            let child = crate::gc_mark_queue::ObjectRef::from_ptr(child).unwrap();
+            // Keep one descendant in the active drain. Branches remain visible
+            // to other workers; chains avoid a global enqueue/dequeue per edge.
+            if batch.inline_children && batch.local_child.is_none() {
+                batch.local_child = Some((child, metadata));
+                return;
+            }
+            if batch.inline_children {
+                batch.branch_children.push(child);
+                if batch.branch_children.len() == 32 {
+                    batch.publish_branches();
+                }
+                return;
+            }
             self.queue
                 .inject(crate::gc_mark_queue::MarkWork::object(
                     self.mark_epoch,
-                    crate::gc_mark_queue::ObjectRef::from_ptr(child).unwrap(),
+                    child,
                 ))
                 .expect("claimed child belongs to the active drain");
         }
@@ -416,23 +552,22 @@ impl ConcurrentCycle {
         batch: &mut MarkBatch<'_>,
     ) {
         children.clear();
-        let metadata = self
-            .objects
-            .metadata(value)
-            .expect("native epoch retains its object");
+        // SAFETY: native continuations originate in a validated queue object.
+        let metadata = unsafe { self.objects.claimed_metadata(value) };
         let slots = self.snapshot_native_slice(value, metadata.type_id, offset, children);
-        for child in children.drain(..) {
-            self.discover_child(child, batch);
+        {
+            let index = self.objects.reader();
+            for child in children.drain(..) {
+                self.discover_child(child, batch, &index);
+            }
         }
         batch.work.object(0, slots);
     }
 
     pub(super) fn trace_bitmap_slice(&self, value: usize, start: usize, batch: &mut MarkBatch<'_>) {
         const DESCRIPTOR_WORDS_PER_SLICE: usize = 8;
-        let metadata = self
-            .objects
-            .metadata(value)
-            .expect("bitmap epoch retains its object");
+        // SAFETY: bitmap continuations originate in a validated queue object.
+        let metadata = unsafe { self.objects.claimed_metadata(value) };
         assert_eq!(metadata.type_id, willow_abi::GC_BITMAP_TYPE_ID);
         let descriptor = metadata.gc_ref_mask as *const u64;
         let words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
@@ -441,6 +576,7 @@ impl ConcurrentCycle {
         let count = (unsafe { *descriptor } as usize).min(words.div_ceil(64));
         let end = start.saturating_add(DESCRIPTOR_WORDS_PER_SLICE).min(count);
         let mut slots = 0;
+        let index_reader = self.objects.reader();
         for word in start..end {
             let mut bits = unsafe { *descriptor.add(word + 1) };
             while bits != 0 {
@@ -453,7 +589,7 @@ impl ConcurrentCycle {
                                 .cast::<*mut u8>(),
                         )
                     };
-                    self.discover_child(child, batch);
+                    self.discover_child(child, batch, &index_reader);
                     slots += 1;
                 }
                 bits &= bits - 1;
@@ -527,7 +663,12 @@ impl ConcurrentCycle {
             // has a slotless consumer and will drain work not taken here.
             return 0;
         };
-        self.drain_worker(limit, children, &mut worker).0
+        // Amortize registration/accounting over a larger claim while keeping
+        // a bounded return to the worker safepoint. Minor requests are checked
+        // between every object as before; native callbacks stay indivisible.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1);
+        self.drain_worker_until_stride(limit, children, &mut worker, Some(deadline), 16)
+            .0
     }
 
     pub(super) fn drain_worker(
@@ -546,6 +687,17 @@ impl ConcurrentCycle {
         worker: &mut crate::gc_mark_queue::MarkWorker,
         deadline: Option<std::time::Instant>,
     ) -> (usize, u64) {
+        self.drain_worker_until_stride(limit, children, worker, deadline, 1)
+    }
+
+    fn drain_worker_until_stride(
+        &self,
+        limit: usize,
+        children: &mut Vec<*mut u8>,
+        worker: &mut crate::gc_mark_queue::MarkWorker,
+        deadline: Option<std::time::Instant>,
+        clock_stride: usize,
+    ) -> (usize, u64) {
         let _owner = self.termination.enter();
         use crate::gc_mark_queue::MarkWorkItem;
         // Barriers may enqueue before activation completes, but scanning then
@@ -556,7 +708,18 @@ impl ConcurrentCycle {
         {
             return (0, 0);
         }
-        let expired = || deadline.is_some_and(|end| std::time::Instant::now() >= end);
+        // Background claims amortize the clock over 16 bounded work items;
+        // assists retain per-item deadline checks. Minor polling is unaffected.
+        let clock_calls = std::cell::Cell::new(0);
+        let expired = || {
+            let calls = clock_calls.get();
+            clock_calls.set(if calls + 1 == clock_stride {
+                0
+            } else {
+                calls + 1
+            });
+            calls == 0 && deadline.is_some_and(|end| std::time::Instant::now() >= end)
+        };
         self.active_drains.fetch_add(1, Ordering::AcqRel);
         let mut scanned = 0;
         let mut batch = MarkBatch {
@@ -567,13 +730,30 @@ impl ConcurrentCycle {
             unindexed: HashSet::new(),
             // Started at the first work item: an empty drain pays no clock read.
             cpu_start: None,
+            inline_children: true,
+            branch_children: Vec::new(),
+            discovery_counts: [0; 3],
+            region_hint: None,
+            inline_types: [None; 4],
+            local_child: None,
         };
+        // Reuse the epoch reader only across generated inline continuations.
+        // Drop before native/bitmap work, callbacks, or returning to a safepoint.
+        // Declared after `batch`, so it drops before active_drains is released.
+        let mut inline_reader: Option<epoch_index::EpochReader<'_>> = None;
         while scanned < limit {
             // Always permit one work item, even after descheduling at entry.
             if scanned != 0 && (expired() || minor::requested()) {
                 break;
             }
-            let Some(work) = worker.next_work() else {
+            let (work, metadata) = if let Some((child, metadata)) = batch.local_child.take() {
+                (
+                    crate::gc_mark_queue::MarkWork::object(self.mark_epoch, child),
+                    Some(metadata),
+                )
+            } else if let Some(work) = worker.next_work() {
+                (work, None)
+            } else {
                 break;
             };
             if scanned == 0 {
@@ -581,7 +761,32 @@ impl ConcurrentCycle {
             }
             match work.item {
                 MarkWorkItem::Object(object) => {
-                    self.trace(object.addr(), children, &mut batch);
+                    // Queue ownership plus active_drains pins this claimed
+                    // header until completion, just as for slice continuations.
+                    let metadata = metadata.unwrap_or_else(|| unsafe {
+                        match inline_reader.as_ref() {
+                            Some(reader) => reader.claimed_metadata(object.addr()),
+                            None => self.objects.claimed_metadata(object.addr()),
+                        }
+                    });
+                    if batch.generated_inline(metadata) {
+                        let reader = inline_reader.get_or_insert_with(|| self.objects.reader());
+                        batch.work.frame(
+                            metadata.layout_id,
+                            metadata.type_id,
+                            metadata.payload_size,
+                            metadata.gc_ref_mask,
+                        );
+                        let slots = inline_references(object.addr(), metadata, |child| {
+                            self.discover_child(child, &mut batch, reader);
+                        });
+                        batch
+                            .work
+                            .object(GC_HEADER_SIZE + metadata.payload_size, slots);
+                    } else {
+                        inline_reader = None;
+                        self.trace(object.addr(), Some(metadata), children, &mut batch);
+                    }
                     scanned += 1;
                 }
                 MarkWorkItem::ObjectBatch(objects) => {
@@ -589,7 +794,31 @@ impl ConcurrentCycle {
                     // exceed its object budget by at most 31, never by B.
                     let mut objects = objects.into_vec().into_iter();
                     while let Some(object) = objects.next() {
-                        self.trace(object.addr(), children, &mut batch);
+                        // Batches contain already-claimed, validated objects.
+                        let metadata = unsafe {
+                            match inline_reader.as_ref() {
+                                Some(reader) => reader.claimed_metadata(object.addr()),
+                                None => self.objects.claimed_metadata(object.addr()),
+                            }
+                        };
+                        if batch.generated_inline(metadata) {
+                            let reader = inline_reader.get_or_insert_with(|| self.objects.reader());
+                            batch.work.frame(
+                                metadata.layout_id,
+                                metadata.type_id,
+                                metadata.payload_size,
+                                metadata.gc_ref_mask,
+                            );
+                            let slots = inline_references(object.addr(), metadata, |child| {
+                                self.discover_child(child, &mut batch, reader);
+                            });
+                            batch
+                                .work
+                                .object(GC_HEADER_SIZE + metadata.payload_size, slots);
+                        } else {
+                            inline_reader = None;
+                            self.trace(object.addr(), Some(metadata), children, &mut batch);
+                        }
                         scanned += 1;
                         if expired() && objects.len() != 0 {
                             // Publish the unfinished tail before completing the
@@ -607,10 +836,10 @@ impl ConcurrentCycle {
                     }
                 }
                 MarkWorkItem::ObjectSlice { object, word } => {
-                    let metadata = self
-                        .objects
-                        .metadata(object.addr())
-                        .expect("live continuation");
+                    inline_reader = None;
+                    // SAFETY: a continuation retains its validated allocation
+                    // through the active drain, including after minor remapping.
+                    let metadata = unsafe { self.objects.claimed_metadata(object.addr()) };
                     if metadata.type_id == willow_abi::GC_BITMAP_TYPE_ID {
                         self.trace_bitmap_slice(object.addr(), word, &mut batch);
                     } else {
@@ -620,8 +849,22 @@ impl ConcurrentCycle {
                 }
                 _ => unreachable!("major marker queues only object work"),
             }
-            worker.complete_current();
+            batch.publish_branches();
+            if batch.local_child.is_none() {
+                worker.complete_current();
+            }
         }
+        // Retain the original queue claim while following inline descendants.
+        // Publish a bounded-drain tail before completing that claim.
+        if let Some((child, _)) = batch.local_child.take() {
+            self.queue
+                .inject(crate::gc_mark_queue::MarkWork::object(
+                    self.mark_epoch,
+                    child,
+                ))
+                .expect("bounded continuation belongs to active drain");
+        }
+        worker.complete_current();
         // Drop publishes remaining private work and publishes private work before a
         // mutator can reach its next safepoint.
         (

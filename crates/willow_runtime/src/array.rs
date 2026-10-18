@@ -27,14 +27,14 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::gc::{
-    GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
-    write_barrier_object_owner,
+    GcObjectKind, GcStoreDestination, willow_alloc_with_layout, write_barrier_object_owner,
 };
 
 use willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID;
 
 use willow_abi::array_layout::{
-    BUFFER_HEADER_WORDS, H_BUF, H_CAP, H_IS_REF, H_LEN, HANDLE_MASK, HANDLE_WORDS, WORD_BYTES,
+    BUFFER_HEADER_WORDS, H_BUF, H_CAP, H_IS_REF, H_LEN, HANDLE_MASK, HANDLE_WORDS,
+    PAIR_STORAGE_EXPOSED, WORD_BYTES,
 };
 const WORD: i64 = WORD_BYTES as i64;
 
@@ -60,6 +60,27 @@ unsafe fn trace_array_ref(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     for index in 0..len {
         slots.push(unsafe { buf_slot(payload, index).cast() });
     }
+}
+
+/// The stopped minor collector can visit this built-in contiguous slot range
+/// without materializing a temporary vector. Registry overrides keep the hook
+/// path; the caller also requires a zero inline mask to avoid skipping slots.
+///
+/// # Safety
+/// `payload` is a live buffer of `type_id`, and all mutators are stopped.
+pub(crate) unsafe fn minor_reference_range(
+    type_id: u32,
+    trace: Option<crate::gc::TraceFn>,
+    payload: *mut u8,
+) -> Option<(*mut *mut u8, usize)> {
+    if type_id != ARRAY_REF_TYPE_ID
+        || !trace
+            .is_some_and(|hook| std::ptr::fn_addr_eq(hook, trace_array_ref as crate::gc::TraceFn))
+    {
+        return None;
+    }
+    let len = unsafe { buffer_len(payload) }.max(0) as usize;
+    Some((unsafe { buf_slot(payload, 0).cast() }, len))
 }
 
 /// Both length and reference slots use atomic publication for concurrent GC.
@@ -270,7 +291,7 @@ unsafe fn init_array(handle: *mut u8, buffer: *mut u8, len: i64, elem_is_ref: i6
         set_buffer_len(buffer, len);
         set_handle_word(handle, H_LEN, len);
         set_handle_word(handle, H_CAP, len);
-        set_handle_word(handle, H_IS_REF, elem_is_ref);
+        set_handle_word(handle, H_IS_REF, i64::from(elem_is_ref != 0));
         write_barrier_object_owner(
             handle,
             std::ptr::null_mut(),
@@ -352,7 +373,7 @@ unsafe fn pair_ref_mask(pair: *const i64) -> u64 {
 /// ordinary array elements; the vtable word is never interpreted as a pointer.
 unsafe fn store_pair(pair: *mut i64, first: i64, second: i64, mask: u64) {
     if mask & 1 != 0 {
-        willow_gc_write_barrier(
+        write_barrier_object_owner(
             pair.cast(),
             unsafe { crate::gc::load_gc_reference(pair.cast()) },
             first as *mut u8,
@@ -371,8 +392,20 @@ unsafe fn store_pair(pair: *mut i64, first: i64, second: i64, mask: u64) {
 unsafe fn copy_scalar_pair(source: *const i64) -> *mut u8 {
     let mask = unsafe { pair_ref_mask(source) };
     let (first, second) = unsafe { (source.read(), source.add(1).read()) };
+    // A successful bump allocation cannot collect: both source words remain
+    // valid, and no root registration/old-region indexing is needed. The
+    // collecting fallback below retains its existing roots and reloads.
+    if let Some([pair]) =
+        crate::gc::array_pair_layout(mask).and_then(|layout| crate::gc::try_alloc_young([layout]))
+    {
+        unsafe { store_pair(pair.cast(), first, second, mask) };
+        return pair;
+    }
     let object = (mask & 1 != 0).then(|| crate::gc::GcRootHandle::new(first as *mut u8));
-    let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, mask);
+    let pair = crate::gc::array_pair_layout(mask).map_or_else(
+        || willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, mask),
+        crate::gc::alloc_young_layout_slow,
+    );
     if !pair.is_null() {
         unsafe {
             store_pair(
@@ -412,6 +445,7 @@ pub extern "C" fn willow_array_get(arr: *mut u8, index: i64) -> i64 {
     if !check_bounds(arr, index) {
         return 0;
     }
+    unsafe { expose_pair_storage(arr) };
     unsafe { *buf_slot(handle_buffer(arr), index) }
 }
 
@@ -422,6 +456,7 @@ pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
     if !check_bounds(arr, index) {
         return;
     }
+    unsafe { expose_pair_storage(arr) };
     let is_ref = unsafe { handle_word(arr, H_IS_REF) } != 0;
     let buffer = unsafe { handle_buffer(arr) };
     unsafe { store_buffer_slot(buffer, index, value, is_ref) };
@@ -438,6 +473,7 @@ pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8
     if !check_bounds(arr, index) {
         return std::ptr::null_mut();
     }
+    unsafe { expose_pair_storage(arr) };
     unsafe { buf_slot(handle_buffer(arr), index) as *mut u8 }
 }
 
@@ -451,14 +487,24 @@ pub extern "C" fn willow_array_reference_owner(arr: *mut u8, index: i64) -> *mut
     if !check_bounds(arr, index) {
         return std::ptr::null_mut();
     }
+    unsafe { expose_pair_storage(arr) };
     unsafe { handle_buffer(arr) }
+}
+
+/// Exposing a reference slot or accepting externally owned storage forbids
+/// transferring pair boxes on the next growth. It does not affect scalar arrays.
+unsafe fn expose_pair_storage(arr: *mut u8) {
+    let flags = unsafe { handle_word(arr, H_IS_REF) };
+    if flags != 0 {
+        unsafe { set_handle_word(arr, H_IS_REF, flags | PAIR_STORAGE_EXPOSED) };
+    }
 }
 
 /// Append `value`, growing the buffer (doubling, min 4) when full.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
-    array_push(arr, value, false);
+    array_push(arr, value, false, false);
 }
 
 /// Pair boxes are mutable element storage, not shared referents. A captured
@@ -467,7 +513,16 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_push_scalar_pairs(arr: *mut u8, value: i64) {
-    array_push(arr, value, true);
+    array_push(arr, value, true, false);
+}
+
+/// Compiler-only ownership transfer: `value` is a freshly boxed inline pair
+/// with no storage alias outside this call. Captured element references still
+/// force independent copies on growth; the ordinary public entry remains conservative.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_array_push_owned_pair(arr: *mut u8, value: i64) {
+    array_push(arr, value, true, true);
 }
 
 /// Allocate the grown buffer of `array_push` on the old-generation path,
@@ -525,7 +580,7 @@ fn grow_rooted(
     Some((arr, value, new_buf))
 }
 
-fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
+fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bool) {
     if arr.is_null() {
         raise_with("cannot push to a null array");
         return;
@@ -535,11 +590,13 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
     let is_ref = unsafe { handle_word(arr, H_IS_REF) } != 0;
 
     if len == cap {
+        let clone_pairs =
+            copy_pairs && unsafe { handle_word(arr, H_IS_REF) } & PAIR_STORAGE_EXPOSED != 0;
         let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
         // A buffer that fits the TLAB is bump-allocated young without a GC
         // point, so `arr` and `value` stay valid and need no roots. Pair
         // arrays allocate per element and keep the rooted path.
-        let young = (!copy_pairs)
+        let young = (!clone_pairs)
             .then(|| young_buffer_layout(new_cap, is_ref))
             .flatten()
             .and_then(|layout| crate::gc::try_alloc_young([layout]));
@@ -547,7 +604,7 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
             Some([buffer]) => buffer,
             None => {
                 let Some((moved_arr, moved_value, buffer)) =
-                    grow_rooted(arr, value, len, new_cap, is_ref, copy_pairs)
+                    grow_rooted(arr, value, len, new_cap, is_ref, clone_pairs)
                 else {
                     return;
                 };
@@ -557,7 +614,34 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
         };
         unsafe {
             let old_buf = handle_buffer(arr);
-            if is_ref && !copy_pairs {
+            if is_ref && !clone_pairs && owned_pair {
+                // The source buffer remains owned by arr throughout this
+                // non-safepoint copy. The handle barrier below publishes its
+                // deletion to SATB, retaining every copied old edge. A fresh
+                // destination has no deleted edges of its own; one young edge
+                // suffices to remember the whole destination buffer.
+                let mut young: *mut u8 = std::ptr::null_mut();
+                for i in 0..len {
+                    let value = crate::gc::load_gc_reference(buf_slot(old_buf, i).cast());
+                    crate::gc::store_gc_reference(buf_slot(new_buf, i).cast(), value);
+                    if young.is_null() && !value.is_null() {
+                        let header = value
+                            .sub(crate::gc::GC_HEADER_SIZE)
+                            .cast::<crate::gc::GcHeader>();
+                        if (*header).generation == willow_abi::gc_header::GENERATION_YOUNG {
+                            young = value;
+                        }
+                    }
+                }
+                if !young.is_null() {
+                    write_barrier_object_owner(
+                        new_buf,
+                        std::ptr::null_mut(),
+                        young,
+                        GcStoreDestination::ArrayElement as i64,
+                    );
+                }
+            } else if is_ref && !clone_pairs {
                 for i in 0..len {
                     store_buffer_slot(new_buf, i, *buf_slot(old_buf, i), true);
                 }
@@ -579,9 +663,15 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
             );
             set_handle_word(arr, H_BUF, new_buf as i64);
             set_handle_word(arr, H_CAP, new_cap);
+            // The old captured buffer keeps its own cloned storage. No view
+            // has observed the new buffer yet.
+            set_handle_word(arr, H_IS_REF, i64::from(is_ref));
         }
     }
     unsafe {
+        if !owned_pair {
+            expose_pair_storage(arr);
+        }
         let buffer = handle_buffer(arr);
         let existing = if copy_pairs {
             *buf_slot(buffer, len)
@@ -1100,6 +1190,123 @@ mod tests {
         unsafe { store_pair(pair.cast(), object as i64, vtable, 1) };
         willow_pop_roots(1);
         pair
+    }
+
+    #[test]
+    fn minor_contiguous_range_requires_the_builtin_trace_registration() {
+        unsafe fn replacement(_: *mut u8, _: &mut Vec<*mut *mut u8>) {}
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        for count in [1, 32, 10_000] {
+            let mut array = willow_array_new(count, 1);
+            willow_push_root(&mut array);
+            let buffer = unsafe { handle_buffer(array) };
+            let range =
+                unsafe { minor_reference_range(ARRAY_REF_TYPE_ID, Some(trace_array_ref), buffer) }
+                    .unwrap();
+            assert_eq!(range.0, unsafe { buf_slot(buffer, 0).cast() });
+            assert_eq!(range.1, count as usize);
+            assert!(
+                unsafe { minor_reference_range(ARRAY_REF_TYPE_ID, Some(replacement), buffer) }
+                    .is_none()
+            );
+            assert!(unsafe { minor_reference_range(ARRAY_REF_TYPE_ID, None, buffer) }.is_none());
+            assert!(unsafe { minor_reference_range(0, Some(trace_array_ref), buffer) }.is_none());
+            willow_pop_roots(1);
+        }
+    }
+
+    #[test]
+    fn owned_pair_growth_transfers_only_unexposed_storage() {
+        let _guard = runtime_test_guard();
+        for count in [4i64, 16, 1024] {
+            willow_gc_init();
+            let mut arr = willow_array_new(0, 1);
+            willow_push_root(&mut arr);
+            for i in 0..count {
+                let pair = interface_pair_for_test("private", i);
+                willow_array_push_owned_pair(arr, pair as i64);
+            }
+            // Private test inspection does not expose storage through the ABI.
+            let first = unsafe { *buf_slot(handle_buffer(arr), 0) };
+            let incoming = interface_pair_for_test("new", 99);
+            let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
+            willow_array_push_owned_pair(arr, incoming as i64);
+            assert_eq!(
+                crate::gc::telemetry_heap_snapshot().0.allocation_count - before,
+                1
+            );
+            assert_eq!(unsafe { *buf_slot(handle_buffer(arr), 0) }, first);
+            for _ in count + 1..2 * count {
+                let pair = interface_pair_for_test("private", 5);
+                willow_array_push_owned_pair(arr, pair as i64);
+            }
+            let mut captured = willow_array_reference_owner(arr, 0);
+            willow_push_root(&mut captured);
+            let incoming = interface_pair_for_test("new", 100);
+            willow_array_push_owned_pair(arr, incoming as i64);
+            let fresh = unsafe { *buf_slot(handle_buffer(arr), 0) };
+            let old = unsafe { *buf_slot(captured, 0) };
+            assert_ne!(fresh, old);
+            unsafe { store_pair(old as *mut i64, 0, 777, 1) };
+            assert_eq!(
+                unsafe { willow_string_as_str(*(fresh as *const *mut u8)) },
+                "private"
+            );
+            for _ in 2 * count + 1..4 * count {
+                let pair = interface_pair_for_test("private", 5);
+                willow_array_push_owned_pair(arr, pair as i64);
+            }
+            let incoming = interface_pair_for_test("new", 101);
+            willow_array_push_owned_pair(arr, incoming as i64);
+            // Capturing the obsolete buffer does not expose a later buffer.
+            assert_eq!(unsafe { *buf_slot(handle_buffer(arr), 0) }, fresh);
+            assert_eq!(
+                unsafe { *((*buf_slot(captured, 0) as *const i64).add(1)) },
+                777
+            );
+            willow_gc_collect();
+            assert_eq!(willow_array_len(arr), 4 * count + 1);
+            willow_pop_roots(2);
+        }
+    }
+
+    #[test]
+    fn interface_pair_copies_use_tlab_and_preserve_moving_references() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let _owner = crate::gc::RuntimeTlabOwner::enter();
+        let mut source = interface_pair_for_test("retained", 1234);
+        willow_push_root(&mut source);
+        for count in [1, 100, 10_000] {
+            let mut array = willow_array_new(count, 1);
+            willow_push_root(&mut array);
+            for index in 0..count {
+                let pair = unsafe { copy_scalar_pair(source.cast()) };
+                assert!(!pair.is_null());
+                assert_ne!(pair, source);
+                // Both slow refill and fast copies on a TLAB-owning thread
+                // allocate young. The source object survives any refill GC.
+                let header = unsafe {
+                    &*pair
+                        .sub(crate::gc::GC_HEADER_SIZE)
+                        .cast::<crate::gc::GcHeader>()
+                };
+                assert_eq!(header.generation, willow_abi::gc_header::GENERATION_YOUNG);
+                willow_array_set(array, index, pair as i64);
+            }
+            crate::gc::minor_collect_internal();
+            for index in 0..count {
+                let pair = willow_array_get(array, index) as *mut i64;
+                unsafe {
+                    assert_eq!(pair_ref_mask(pair), 1);
+                    assert_eq!(willow_string_as_str(pair.read() as *mut u8), "retained");
+                    assert_eq!(pair.add(1).read(), 1234);
+                }
+            }
+            willow_pop_roots(1);
+        }
+        willow_pop_roots(1);
     }
 
     #[test]

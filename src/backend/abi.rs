@@ -473,6 +473,7 @@ mod alloc_effects_tests {
         "willow_array_set",
         "willow_array_push",
         "willow_array_push_scalar_pairs",
+        "willow_array_push_owned_pair",
         "willow_array_pop",
         "willow_array_pop_scalar_pair_into",
         "willow_array_to_string",

@@ -997,3 +997,280 @@ fn persistent_old_roots_only_scan_changed_young_edges() {
         reset_internal();
     }
 }
+
+#[test]
+fn minor_reference_slot_scratch_reuses_capacity_across_shapes() {
+    use crate::gc::*;
+    use crate::scheduler::scaling_measurements::counting_allocator as counter;
+    let _guard = runtime_test_guard();
+    reset_internal();
+    let _stress = GcStressTestScope::normal();
+    unsafe fn native_trace(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+        slots.push(payload.cast());
+        slots.push(std::ptr::null_mut());
+    }
+    let mut registry = std::collections::HashMap::new();
+    registry.insert(123456, native_trace as TraceFn);
+    let bitmap = [3_u64, 1, 1_u64 << 63, 1];
+    let shapes = [
+        (willow_alloc_typed(0, 0), vec![]),
+        (willow_alloc_typed(8, 0), vec![]),
+        (willow_alloc_typed(8, 1), vec![0]),
+        (willow_alloc_typed(512, 1_u64 << 63), vec![63]),
+        (willow_alloc_typed(32, 15), vec![0, 1, 2, 3]),
+        (willow_alloc_object(123456, 8), vec![0, usize::MAX]),
+        (
+            willow_gc_alloc_bitmap(0, 129 * 8, bitmap.as_ptr()),
+            vec![0, 127, 128],
+        ),
+    ];
+    let mut slots = Vec::with_capacity(8);
+    for count in [1, 100, 10000] {
+        let before = counter::thread_allocations();
+        let mut visited = 0;
+        for _ in 0..count {
+            for (payload, indices) in &shapes {
+                slots.clear();
+                let object = HeapObject::from_payload(GcPayload::from_raw(*payload).unwrap());
+                append_object_reference_slots(object, &registry, &mut slots);
+                assert_eq!(slots.len(), indices.len());
+                for (&slot, &index) in slots.iter().zip(indices) {
+                    let expected = if index == usize::MAX {
+                        std::ptr::null_mut()
+                    } else {
+                        object.payload_slot(index)
+                    };
+                    assert_eq!(slot, expected);
+                    visited += 1;
+                }
+            }
+        }
+        assert_eq!(counter::thread_allocations() - before, 0);
+        assert_eq!(visited, count * 11);
+        eprintln!(
+            "slot_scratch scans={} slots={visited} allocations=0",
+            count * shapes.len()
+        );
+    }
+    reset_internal();
+}
+
+#[test]
+fn minor_collector_keeps_reference_scratch_between_objects() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    reset_internal();
+    let _stress = GcStressTestScope::normal();
+    unsafe fn native_slots(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+        for index in 0..4 {
+            slots.push(unsafe { payload.cast::<*mut u8>().add(index) });
+        }
+    }
+    willow_register_type(123_459, native_slots);
+    let first = crate::gc::allocate_old(0, 123_459, 32, 0);
+    let second = crate::gc::allocate_old(0, 123_459, 32, 0);
+    let registry = minor_registry_snapshot();
+    let mut state = runtime().heap.lock().unwrap();
+    retire_all_tlabs_unindexed(&mut state);
+    let mut stop = Default::default();
+    let mut collector = MinorCollector::new(&mut state, registry, &mut stop);
+    collector.scan_object(HeapObject::from_payload(
+        GcPayload::from_raw(first).unwrap(),
+    ));
+    let buffer = collector.reference_slots.as_ptr();
+    assert!(collector.reference_slots.capacity() >= 4);
+    assert!(collector.reference_slots.is_empty());
+    collector.scan_object(HeapObject::from_payload(
+        GcPayload::from_raw(second).unwrap(),
+    ));
+    assert_eq!(collector.reference_slots.as_ptr(), buffer);
+    assert!(collector.reference_slots.is_empty());
+    drop(collector);
+    drop(state);
+    reset_internal();
+}
+
+#[test]
+fn promotion_cursor_rekeys_regions_instead_of_each_object() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    for count in [1usize, 1_000, 100_000] {
+        reset_internal();
+        let _stress = GcStressTestScope::normal();
+        let mut source = HeapObject::from_payload(GcPayload::from_raw(willow_alloc(8)).unwrap());
+        let registry = minor_registry_snapshot();
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_unindexed(&mut state);
+        let mut stop = Default::default();
+        let mut collector = MinorCollector::new(&mut state, registry, &mut stop);
+        let mut switches = 0;
+        let mut previous = None;
+        for _ in 0..count {
+            // Repeatedly transfer one descriptor through fresh destinations;
+            // payload contents are immaterial to allocation/index ownership.
+            source = collector
+                .allocate_promotion(source, source.trace_metadata())
+                .unwrap();
+            let index = collector.promotion_destination.unwrap();
+            if previous != Some(index) {
+                switches += 1;
+                previous = Some(index);
+            }
+            assert!(
+                !collector
+                    .state
+                    .old_region_candidates
+                    .iter()
+                    .any(|&(_, id)| id == index)
+            );
+        }
+        assert!(switches <= 1 + count * (GC_HEADER_SIZE + 8) / GC_OLD_REGION_SIZE);
+        eprintln!("promotions={count} candidate_regions={switches}");
+        // Drop restores a partially filled candidate, including during unwind.
+        drop(collector);
+        assert!(verify_old_region_metadata(&state).is_ok());
+        drop(state);
+        reset_internal();
+    }
+}
+
+#[test]
+fn persistent_survival_skips_intermediate_copy_and_churn_restores_it() {
+    use crate::gc::{
+        GC_GENERATION_OLD, GC_GENERATION_YOUNG, minor_collect_internal, payload_to_header,
+        reset_internal_for_test,
+    };
+    let _guard = runtime_test_guard();
+    for count in [16usize, 1_000, 10_000] {
+        reset_internal_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.pacer_trigger = u64::MAX;
+            state.pacer.disable_for_test();
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let mut tls = tlab_state_for_test();
+        let mut head = std::ptr::null_mut();
+        let slot = (&mut head as *mut *mut u8).cast::<u8>();
+        runtime().runtime_root_slots.add(slot);
+        for round in 0..5 {
+            let before = runtime()
+                .heap
+                .lock()
+                .unwrap()
+                .survivor_stats
+                .survivor_copies;
+            for _ in 0..count {
+                let node = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 1);
+                unsafe {
+                    *node.cast::<*mut u8>() = head;
+                }
+                head = node;
+            }
+            minor_collect_internal();
+            let state = runtime().heap.lock().unwrap();
+            assert_eq!(
+                state.survivor_stats.survivor_copies - before,
+                if round >= 3 { 0 } else { count as u64 }
+            );
+            assert_eq!(
+                unsafe { (*payload_to_header(head)).generation },
+                if round >= 3 {
+                    GC_GENERATION_OLD
+                } else {
+                    GC_GENERATION_YOUNG
+                }
+            );
+            verify_old_region_metadata(&state).unwrap();
+            drop(state);
+            let mut cursor = head;
+            for _ in 0..((round + 1) * count) {
+                assert!(!cursor.is_null());
+                cursor = unsafe { *cursor.cast::<*mut u8>() };
+            }
+            assert!(cursor.is_null());
+        }
+        // An allocation wave that dies young resets the policy. No roots or
+        // thresholds are weakened to retain those dead objects.
+        for _ in 0..count {
+            willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+        }
+        minor_collect_internal();
+        assert_eq!(runtime().heap.lock().unwrap().tenuring.age(), 2);
+        runtime().runtime_root_slots.remove(slot);
+        reset_internal_for_test();
+    }
+}
+
+#[test]
+fn old_reference_slots_do_not_probe_the_young_page_index() {
+    let _guard = runtime_test_guard();
+    for count in [1, 1000, 100000] {
+        reset_internal();
+        let old = crate::gc::allocate_old(0, 0, 8, 0);
+        let registry = minor_registry_snapshot();
+        let mut state = runtime().heap.lock().unwrap();
+        let mut stop = Default::default();
+        let mut collector = MinorCollector::new(&mut state, registry, &mut stop);
+        super::PAGE_QUERIES.set(0);
+        for _ in 0..count {
+            let mut slot = old;
+            collector.scan_slot(&raw mut slot);
+            assert_eq!(slot, old);
+        }
+        assert_eq!(super::PAGE_QUERIES.get(), 0);
+        assert!(collector.worklist.is_empty());
+        drop(collector);
+        drop(state);
+    }
+    reset_internal();
+}
+
+#[test]
+fn fully_forwarded_chunks_release_without_a_second_header_walk() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    let _stress = GcStressTestScope::normal();
+    for chunks in [1usize, 16, 256] {
+        reset_internal();
+        let mut tls = tlab_state_for_test();
+        let mut payloads = fill_chunks(&mut tls, chunks, 32, |_| 0, 0);
+        for (index, payload) in payloads.iter().enumerate() {
+            unsafe {
+                *(*payload).cast::<usize>() = index;
+            }
+        }
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            for _ in 0..3 {
+                state.tenuring.complete(1024, 1024);
+            }
+        }
+        let stop = collect_with_stop(payloads.iter_mut().map(|p| p as *mut *mut u8).collect());
+        let count = payloads.len() as u64;
+        assert_eq!(stop.swept_objects, count);
+        // Debug retains the source poison walk; release discards the fully
+        // forwarded chunk after its one validation/indexing pass.
+        assert_eq!(
+            stop.metadata_objects,
+            count * if cfg!(debug_assertions) { 2 } else { 1 }
+        );
+        for (index, payload) in payloads.iter().enumerate() {
+            assert_eq!(unsafe { *(*payload).cast::<usize>() }, index);
+            assert_eq!(
+                unsafe { (*payload_to_header(*payload)).generation },
+                GC_GENERATION_OLD
+            );
+        }
+        let state = runtime().heap.lock().unwrap();
+        assert_eq!(state.moved_objects, count);
+        assert!(state.tlab_chunks.is_empty());
+        verify_old_region_metadata(&state).unwrap();
+        eprintln!(
+            "forwarded_chunks={chunks} objects={count} metadata_objects={}",
+            stop.metadata_objects
+        );
+    }
+    reset_internal();
+}

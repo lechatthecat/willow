@@ -6,8 +6,8 @@ use std::ops::Deref;
 
 #[derive(Debug, Default)]
 pub(super) struct RememberedSet {
-    owners: HashSet<usize>,
-    cards: HashMap<usize, usize>,
+    owners: IdSet<usize>,
+    cards: IdMap<usize, usize>,
 }
 impl RememberedSet {
     pub(super) fn insert(&mut self, owner: usize) -> bool {
@@ -38,7 +38,7 @@ impl RememberedSet {
     }
 }
 impl Deref for RememberedSet {
-    type Target = HashSet<usize>;
+    type Target = IdSet<usize>;
     fn deref(&self) -> &Self::Target {
         &self.owners
     }
@@ -53,7 +53,7 @@ impl IntoIterator for RememberedSet {
 #[cfg(test)]
 impl PartialEq<HashSet<usize>> for RememberedSet {
     fn eq(&self, other: &HashSet<usize>) -> bool {
-        self.owners == *other
+        self.owners.len() == other.len() && self.owners.iter().all(|owner| other.contains(owner))
     }
 }
 

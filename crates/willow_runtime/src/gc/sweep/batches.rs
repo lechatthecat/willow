@@ -88,7 +88,10 @@ struct Cursor {
     // Allocation entries at `offset..`, read with one map descent per heap
     // hold, nearest last. Only this cursor mutates the quarantined region's
     // index, and only behind `offset`; the hold's end discards the snapshot.
-    ahead: Vec<(usize, usize)>,
+    ahead: Vec<(usize, usize, bool)>,
+    // Checked numeric hint only, not a reader or raw view. The sealed sweep
+    // epoch cannot relocate; retain it across short heap holds.
+    epoch_region_hint: Option<usize>,
     report: Report,
 }
 
@@ -210,6 +213,7 @@ impl Cursor {
                 || std::env::var_os("WILLOW_GC_LOG").is_some(),
             deadline_due: false,
             ahead: Vec::with_capacity(DEADLINE_STRIDE as usize),
+            epoch_region_hint: None,
             report: Report::default(),
         }
     }
@@ -489,14 +493,26 @@ impl Cursor {
                 self.report.index_reads += 1;
             }
             let entries = region.allocations.range(self.offset..);
-            self.ahead.extend(
-                entries
-                    .take(want as usize)
-                    .map(|(&offset, &span)| (offset, span)),
-            );
+            // One short epoch guard for this heap hold, never across hooks,
+            // reclamation callbacks or yields. Marking is sealed before sweep.
+            let epoch = self
+                .plan
+                .marking
+                .as_ref()
+                .map(|cycle| cycle.objects.reader());
+            self.ahead
+                .extend(entries.take(want as usize).map(|(&offset, &span)| {
+                    let retained = epoch.as_ref().is_some_and(|reader| {
+                        reader.retains_allocated_cached(
+                            region.start() + offset + GC_HEADER_SIZE,
+                            &mut self.epoch_region_hint,
+                        )
+                    });
+                    (offset, span, retained)
+                }));
             self.ahead.reverse();
         }
-        let Some(&(offset, span)) = self.ahead.last() else {
+        let Some(&(offset, span, retained)) = self.ahead.last() else {
             if assist {
                 return Action::Yield;
             }
@@ -507,12 +523,8 @@ impl Cursor {
         };
         let object = HeapObject::from_raw(unsafe { region.base.add(offset) }.cast()).unwrap();
         let size = object.size();
-        let live = object.marked()
-            || self.plan.marking.as_ref().is_some_and(|marking| {
-                marking
-                    .objects
-                    .retains_allocated(object.payload().as_ptr() as usize)
-            });
+        let header_marked = object.marked();
+        let live = header_marked || retained;
         let hook = if live {
             None
         } else {
@@ -553,7 +565,12 @@ impl Cursor {
                 });
             }
             self.live_end = offset + span;
-            object.clear_mark();
+            // Concurrent epoch marks live in the side bitmap. Avoid dirtying
+            // every live payload cache line when its legacy header mark was
+            // already clear; only actual header marks need resetting.
+            if header_marked {
+                object.clear_mark();
+            }
             Action::Progress
         } else {
             self.region_reclaimed = true;

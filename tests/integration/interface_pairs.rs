@@ -354,3 +354,67 @@ perspective!(
     }"#,
     "102\n1\n103\n7\n"
 );
+
+// Five inline-pair shapes at three growth sizes exercise owned insertion,
+// unexposed transfer, captured-buffer cloning, freeze, and popped-slot reuse.
+#[test]
+fn iface_pair_owned_growth_shapes() {
+    for (ty, value, replacement, read, expected) in [
+        ("Value", "new Number(7)", "new Number(99)", "get()", "7"),
+        ("Option<i64>", "Some(7)", "Some(99)", "unwrap()", "7"),
+        (
+            "Option<bool>",
+            "Some(true)",
+            "Some(false)",
+            "unwrap()",
+            "true",
+        ),
+        (
+            "Option<f64>",
+            "Some(7.0)",
+            "Some(99.0)",
+            "unwrap() == 7.0",
+            "true",
+        ),
+        ("Result<i64,bool>", "Ok(7)", "Ok(99)", "unwrap()", "7"),
+    ] {
+        for count in [4, 16, 128] {
+            let source = format!(
+                r#"
+fn grow(a: Array<{ty}>) -> i64 {{
+    let mut i = 0;
+    while i < {count} * 4 {{ a.push({value}); i += 1; }}
+    gc_minor_collect(); return 0;
+}}
+fn replace(x: &mut {ty}, ignored: i64) {{ x = {replacement}; }}
+fn main() {{
+    let a: Array<{ty}> = [];
+    let mut i = 0;
+    while i < {count} {{ a.push({value}); i += 1; }}
+    gc_collect();
+    let frozen = a.freeze();
+    replace(&a[0], grow(a));
+    gc_collect();
+    println(a[0].{read}); println(frozen[0].{read});
+    let popped = a.pop(); a.push({value}); gc_minor_collect();
+    println(popped.{read}); println(a[a.len() - 1].{read});
+}}
+"#
+            );
+            check(
+                &source,
+                &format!("{expected}\n{expected}\n{expected}\n{expected}\n"),
+            );
+        }
+    }
+}
+
+#[test]
+fn iface_pair_owned_growth_example() {
+    let source = include_str!("../../example/array_owned_pair_growth.wi");
+    for stress in ["alloc", "minor", "all"] {
+        let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", stress)]);
+        assert!(ok, "{stress}: {out}");
+        assert_eq!(out, "7\n7\n99\n7\n");
+    }
+}

@@ -151,11 +151,20 @@ fn assert_satb_mutation_retains(old: *mut u8, mutation: impl FnOnce()) {
     cycle.drain(usize::MAX);
     assert!(cycle.is_marked(old as usize), "deleted edge was not traced");
     assert!(cycle.queue.snapshot().is_drained());
-    assert_eq!(
-        cycle.queue.snapshot().injected,
-        cycle.objects.marked_count() as u64,
-        "equivalent publications must not create duplicate queue jobs"
-    );
+    // Inline descendants and bounded batches can share a queue job. Verify
+    // unique tracing by byte accounting rather than requiring one job/object.
+    let deferred = cycle.deferred.lock().unwrap();
+    let expected_bytes: u64 =
+        epoch_objects(&runtime().heap.lock().unwrap(), &mut Default::default())
+            .into_iter()
+            .filter(|object| {
+                let address = object.payload().as_ptr() as usize;
+                cycle.is_marked(address) && !deferred.contains(&address)
+            })
+            .map(|object| object.size() as u64)
+            .sum();
+    assert_eq!(cycle.work.lock().unwrap().marked_bytes, expected_bytes);
+    drop(deferred);
     GC_MARK_PHASE.store(0, Ordering::Release);
     marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
     assert_eq!(cycle.queue.end_epoch(), 0);
@@ -215,9 +224,12 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
     let value = willow_alloc(8);
     let deleted = willow_alloc(8);
     let late = willow_alloc(8);
+    let mut tls = tlab_state_for_test();
+    let young = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
     let cycle = {
         let mut state = runtime().heap.lock().unwrap();
         retire_all_tlabs_locked(&mut state);
+        barrier::remember_owner(&mut state, owner as usize);
         let cycle = Arc::new(ConcurrentCycle::new(
             epoch_objects(&state, &mut Default::default())
                 .into_iter()
@@ -235,6 +247,7 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
     let done = Arc::new(AtomicBool::new(false));
     let worker = {
         let (warmed, go, done) = (warmed.clone(), go.clone(), done.clone());
+        let young = young as usize;
         let (owner, old, value, deleted) = (
             owner as usize,
             old as usize,
@@ -253,6 +266,12 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
                 old as *mut u8,
                 value as *mut u8,
                 GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_VALUE_HAS_HEADER,
+            );
+            barrier::write_barrier_object_owner(
+                owner as *mut u8,
+                std::ptr::null_mut(),
+                young as *mut u8,
+                GcStoreDestination::ObjectField as i64,
             );
             satb_delete(deleted as *mut u8);
             done.store(true, Ordering::Release);
@@ -276,6 +295,7 @@ fn marking_barriers_publish_without_heap_lock_until_sealed() {
     worker.join().unwrap();
     // The new edge is enqueued eagerly; deletions wait in the shard buffer.
     assert!(cycle.is_marked(value as usize));
+    assert!(cycle.is_marked(young as usize));
     assert!(!cycle.is_marked(old as usize));
     assert!(!cycle.is_marked(deleted as usize));
     with_stw(
@@ -1151,7 +1171,9 @@ fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
             assert_eq!(cycle.objects.marked_count(), objects);
             let snapshot = cycle.queue.snapshot();
             assert!(snapshot.is_drained());
-            assert_eq!(snapshot.injected, objects as u64);
+            // Inline continuations may trace a chain under one queue claim;
+            // every object is still traced exactly once (ids assertion below).
+            assert!(snapshot.injected > 0 && snapshot.injected <= objects as u64);
             assert_eq!(snapshot.registered_workers, 0);
             assert_eq!(snapshot.registered_assists, 0);
             assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
@@ -1165,7 +1187,8 @@ fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
             drop(ids);
             assert_eq!(cycle.queue.end_epoch(), 0);
             println!(
-                "marker workers={workers} objects={objects} worker_traces={worker_traces} trace_jobs={objects} readers_after=0"
+                "marker workers={workers} objects={objects} worker_traces={worker_traces} trace_jobs={} readers_after=0",
+                snapshot.injected
             );
             // No references remain in any worker when storage is reclaimed.
             reset_internal_for_test();
@@ -2576,6 +2599,12 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
                     cycle.active_drains.fetch_add(1, Ordering::AcqRel);
                     let mut batch = MarkBatch {
                         cpu_start: None,
+                        inline_children: false,
+                        branch_children: Vec::new(),
+                        discovery_counts: [0; 3],
+                        region_hint: None,
+                        inline_types: [None; 4],
+                        local_child: None,
                         cycle: &cycle,
                         work: Default::default(),
                         deferred: Vec::new(),
@@ -2772,6 +2801,12 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
             cycle.active_drains.fetch_add(1, Ordering::AcqRel);
             let mut batch = MarkBatch {
                 cpu_start: None,
+                inline_children: false,
+                branch_children: Vec::new(),
+                discovery_counts: [0; 3],
+                region_hint: None,
+                inline_types: [None; 4],
+                local_child: None,
                 cycle: &cycle,
                 work: Default::default(),
                 deferred: Vec::new(),
@@ -2875,9 +2910,10 @@ fn marker_pool_shared_budget_bounds_retries_and_preserves_pending_work() {
                 calls <= budget,
                 "workers={workers} calls={calls} budget={budget}"
             );
-            if workers == 1 {
-                assert_eq!(calls, budget);
-            }
+            // A deadline can return unused claim capacity even with one
+            // worker. The shared finite cap and pending-publication assertions
+            // still hold; early safe return is part of the bounded drain.
+            assert!(calls > 0);
             assert!(!cycle.worker_failed.load(Ordering::Acquire));
             assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
             assert_eq!(registered_mutator_count(), 0);
@@ -3930,6 +3966,217 @@ fn pointer_free_leaf_fanout_uses_only_bounded_parent_jobs() {
         marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
         GC_MARK_PHASE.store(0, Ordering::Release);
         willow_pop_root();
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn concurrent_chain_continuations_bound_queue_publication_and_preserve_tails() {
+    let _guard = runtime_test_guard();
+    for count in [100usize, 1_000, 10_000] {
+        reset_internal_for_test();
+        let mut head = std::ptr::null_mut();
+        willow_push_root(&mut head);
+        for _ in 0..count {
+            let node = willow_alloc_typed(8, 1);
+            unsafe {
+                store_gc_reference(node.cast(), head);
+            }
+            head = node;
+        }
+        let (_, cycle) = root_handshake::begin().unwrap();
+        let mut consumer = cycle.queue.register_assist();
+        let mut children = Vec::new();
+        let mut scanned = 0;
+        let before = cycle.queue.snapshot().injected;
+        epoch_index::EPOCH_READS.set(0);
+        while !cycle.queue.snapshot().is_drained() {
+            let (processed, _) = cycle.drain_worker(64, &mut children, &mut consumer);
+            assert!(processed > 0 && processed <= 64);
+            scanned += processed;
+            assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
+        }
+        let readers = epoch_index::EPOCH_READS.get();
+        assert_eq!(readers, count.div_ceil(64));
+        eprintln!("inline-chain nodes={count} epoch_readers={readers}");
+        assert_eq!(scanned, count);
+        assert_eq!(
+            cycle.queue.snapshot().injected - before,
+            (count.div_ceil(64) - 1) as u64
+        );
+        assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
+        let mut node = head;
+        for _ in 0..count {
+            assert!(cycle.is_marked(node as usize));
+            node = unsafe { load_gc_reference(node.cast()) };
+        }
+        assert!(node.is_null());
+        drop(consumer);
+        assert_eq!(cycle.queue.end_epoch(), 0);
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+        GC_MARK_PHASE.store(0, Ordering::Release);
+        willow_pop_root();
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn concurrent_nonleaf_fanout_batches_claims_without_losing_shared_edges() {
+    let _guard = runtime_test_guard();
+    for count in [1_000usize, 10_000, 100_000] {
+        reset_internal_for_test();
+        let mut array = crate::array::willow_array_new(count as i64, 1);
+        willow_push_root(&mut array);
+        let mut shared = willow_alloc(8);
+        willow_push_root(&mut shared);
+        for index in 0..count {
+            let child = willow_alloc_typed(8, 1);
+            unsafe {
+                store_gc_reference(child.cast(), shared);
+            }
+            crate::array::willow_array_set(array, index as i64, child as i64);
+        }
+        let (_, cycle) = root_handshake::begin().unwrap();
+        let before = cycle.queue.snapshot().injected;
+        let mut consumer = cycle.queue.register_assist();
+        let mut children = Vec::new();
+        epoch_index::EPOCH_READS.set(0);
+        while !cycle.queue.snapshot().is_drained() {
+            cycle.drain_worker(64, &mut children, &mut consumer);
+        }
+        let readers = epoch_index::EPOCH_READS.get();
+        assert!(
+            readers <= count.div_ceil(32) + 4 * count.div_ceil(512) + 8,
+            "fanout={count} epoch_readers={readers}"
+        );
+        eprintln!("fanout={count} epoch_readers={readers}");
+        // At most one slice job and one bounded local tail per 512 references.
+        eprintln!(
+            "fanout={count} before={before} after={:?}",
+            cycle.queue.snapshot()
+        );
+        assert!(
+            cycle.queue.snapshot().injected - before
+                <= (count.div_ceil(32) + 2 * count.div_ceil(512) + 2) as u64
+        );
+        assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
+        assert!(cycle.is_marked(shared as usize));
+        for index in 0..count {
+            let child = crate::array::willow_array_get(array, index as i64) as usize;
+            assert!(cycle.is_marked(child));
+        }
+        drop(consumer);
+        assert_eq!(cycle.queue.end_epoch(), 0);
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+        GC_MARK_PHASE.store(0, Ordering::Release);
+        willow_pop_root();
+        willow_pop_root();
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn owned_pair_growth_bulk_barrier_retains_all_snapshot_edges() {
+    use crate::array::{willow_array_new, willow_array_push_owned_pair};
+    let _guard = runtime_test_guard();
+    for count in [4usize, 1024, 16384] {
+        reset_internal_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.pacer_trigger = u64::MAX;
+            state.pacer.disable_for_test();
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let mut array = willow_array_new(0, 1);
+        willow_push_root(&mut array);
+        let mut pairs = Vec::new();
+        let mut children = Vec::new();
+        for _ in 0..count {
+            let child = willow_alloc(8);
+            let pair = willow_alloc_typed(16, 1);
+            unsafe {
+                store_gc_reference(pair.cast(), child);
+            }
+            willow_array_push_owned_pair(array, pair as i64);
+            pairs.push(pair);
+            children.push(child);
+        }
+        let (_, cycle) = root_handshake::begin().unwrap();
+        assert!(pairs.iter().all(|p| !cycle.is_marked(*p as usize)));
+        let incoming = willow_alloc_typed(16, 1);
+        let before = runtime().write_barrier_calls.load(Ordering::Relaxed);
+        willow_array_push_owned_pair(array, incoming as i64);
+        // Deletion barriers buffer SATB roots until the owner's safepoint;
+        // closure flushes these producers before draining their publications.
+        barrier::flush_satb_current(false);
+        let barriers = runtime().write_barrier_calls.load(Ordering::Relaxed) - before;
+        // Allocation may assist queued slice work; count the growth's actual
+        // barriers, not queue jobs also generated by those marker assists.
+        assert!(barriers <= 4, "count={count} barriers={barriers}");
+        cycle.drain(usize::MAX);
+        for pointer in pairs.iter().chain(&children) {
+            assert!(cycle.is_marked(*pointer as usize));
+        }
+        assert!(cycle.queue.snapshot().is_drained());
+        assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
+        assert_eq!(cycle.queue.end_epoch(), 0);
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+        GC_MARK_PHASE.store(0, Ordering::Release);
+        willow_gc_collect();
+        assert_eq!(crate::array::willow_array_len(array), count as i64 + 1);
+        willow_pop_root();
+        eprintln!("bulk_growth edges={count} barriers={barriers}");
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn owned_pair_growth_bulk_barrier_remembers_young_destination_edges() {
+    use crate::array::{willow_array_new, willow_array_push_owned_pair};
+    let _guard = runtime_test_guard();
+    for count in [1024usize, 16384] {
+        reset_internal_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.pacer_trigger = u64::MAX;
+            state.pacer.disable_for_test();
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let mut array = willow_array_new(0, 1);
+        willow_push_root(&mut array);
+        let mut tls = tlab_state_for_test();
+        let child = willow_alloc(8);
+        for index in 0..=count {
+            let pair = willow_gc_alloc_slow(&mut tls, 1, 0, 16, 1);
+            unsafe {
+                store_gc_reference(pair.cast(), child);
+                *pair.cast::<usize>().add(1) = index;
+            }
+            willow_array_push_owned_pair(array, pair as i64);
+        }
+        let buffer = unsafe { *array.cast::<usize>().add(willow_abi::array_layout::H_BUF) };
+        assert_eq!(
+            unsafe { (*payload_to_header(buffer as *mut u8)).generation },
+            GC_GENERATION_OLD
+        );
+        assert!(
+            runtime()
+                .heap
+                .lock()
+                .unwrap()
+                .remembered_set
+                .contains(&buffer)
+        );
+        minor_collect_internal();
+        for index in 0..=count {
+            let pair = crate::array::willow_array_get(array, index as i64) as *mut u8;
+            assert_eq!(unsafe { *pair.cast::<usize>().add(1) }, index);
+            assert_eq!(unsafe { load_gc_reference(pair.cast()) }, child);
+        }
+        willow_pop_root();
+        eprintln!("bulk_growth_young edges={}", count + 1);
     }
     reset_internal_for_test();
 }

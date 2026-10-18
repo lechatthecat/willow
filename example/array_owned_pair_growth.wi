@@ -1,0 +1,24 @@
+// Pair storage transfers across growth until an element reference escapes.
+import std::collections::Array;
+interface Value { fn get(self) -> i64; }
+class Number implements Value {
+    pub n: i64;
+    pub fn get(self) -> i64 { return self.n; }
+}
+fn grow(a: Array<Value>) -> i64 {
+    let mut i = 0;
+    while i < 128 { a.push(new Number(i)); i += 1; }
+    gc_minor_collect(); return 0;
+}
+fn replace(x: &mut Value, ignored: i64) {
+    x = new Number(99); println(x.get());
+}
+fn main() {
+    let a: Array<Value> = [];
+    let mut i = 0;
+    while i < 16 { a.push(new Number(7)); i += 1; }
+    let snapshot = a.freeze();
+    println(a[0].get()); println(snapshot[0].get());
+    replace(&a[0], grow(a));
+    gc_collect(); println(a[0].get());
+}

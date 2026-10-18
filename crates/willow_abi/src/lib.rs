@@ -46,6 +46,9 @@ pub mod array_layout {
     pub const H_LEN: usize = 0;
     pub const H_CAP: usize = 1;
     pub const H_IS_REF: usize = 2;
+    /// H_IS_REF remains truthy for reference buffers. This additional bit
+    /// records exposed pair storage in the current buffer; scalar handles stay 0.
+    pub const PAIR_STORAGE_EXPOSED: i64 = 2;
     pub const H_BUF: usize = 3;
     pub const HANDLE_WORDS: i64 = 4;
     pub const HANDLE_MASK: u64 = 1 << H_BUF;
@@ -259,6 +262,11 @@ pub enum GcStoreDestination {
 /// (class instances, strings, GC-owner words). Lets the runtime barrier skip
 /// the generational heap-locked path for old values while marking.
 pub const GC_STORE_VALUE_HAS_HEADER: i64 = 1 << 32;
+
+/// The non-null owner is a GC payload start, so its generation/remembered
+/// header bytes can be checked without a heap-index lookup. Never set this
+/// for an interior reference slot or a global/static address.
+pub const GC_STORE_OWNER_HAS_HEADER: i64 = 1 << 33;
 
 /// Derive the opaque layout fingerprint used by generated and native objects.
 pub const fn gc_layout_id(

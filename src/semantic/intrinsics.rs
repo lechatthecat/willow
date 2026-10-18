@@ -384,7 +384,7 @@ impl Intrinsic {
             ChannelRecvOpt => &["willow_channel_recv_opt_into"],
             ChannelClose => &["willow_channel_close"],
             ArrayLen | FrozenArrayLen => &["willow_array_len"],
-            ArrayPush => &["willow_array_push", "willow_array_push_scalar_pairs"],
+            ArrayPush => &["willow_array_push", "willow_array_push_owned_pair"],
             ArrayPop => &["willow_array_pop", "willow_array_pop_scalar_pair_into"],
             ArrayToString => &["willow_array_to_string"],
             ArrayFreeze => &["willow_array_copy", "willow_array_copy_scalar_pairs"],

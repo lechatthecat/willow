@@ -5,7 +5,7 @@ use super::*;
 /// observes one point between those calls, never a mixture of different times.
 #[derive(Default)]
 pub(super) struct MinorRegistrySnapshot {
-    pub trace: HashMap<u32, TraceFn>,
+    pub trace: IdMap<u32, TraceFn>,
     /// Fast ID hashing is prepared once per registry generation.
     pub drops: IdMap<u32, DropFn>,
     /// Only opaque native payloads are excluded from inline-TLAB allocation.
@@ -51,7 +51,7 @@ pub(super) fn minor_registry_snapshot() -> std::sync::Arc<MinorRegistrySnapshot>
         })
         .collect();
     let snapshot = std::sync::Arc::new(MinorRegistrySnapshot {
-        trace: trace.clone(),
+        trace: trace.iter().map(|(&id, &hook)| (id, hook)).collect(),
         drops,
         generated_drop,
         generation: cache.generation,

@@ -1,6 +1,9 @@
 //! Integer-only feedback for the heap runway. Sampling and policy are separate;
 //! unavailable CPU measurements never masquerade as zero-cost marking.
 const MIN_GOAL: u64 = 1024 * 1024;
+// Coalesce sub-millisecond allocation bursts instead of feeding refill-scale
+// clock/scheduling noise into the immediate-rise runway estimator.
+const ALLOCATION_SAMPLE_NS: u64 = 1_000_000;
 
 /// The sole mutable writer of the heap goal and pacing trigger. Allocation
 /// accounting never grants runway; reservation budgets are enforced separately.
@@ -36,7 +39,7 @@ pub(super) fn sample_threshold(state: &mut super::GcState) {
     let goal = state.threshold_bytes as u64;
     let trigger = goal
         .saturating_sub(decision.runway)
-        .max(input.live.saturating_add(MIN_GOAL / 4))
+        .max(minimum_trigger(input.live))
         .min(goal);
     publish(state, goal, trigger, "allocation_sample");
 }
@@ -74,6 +77,14 @@ pub(super) struct Decision {
     pub runway: u64,
 }
 
+// A completed full-heap scan must buy allocation progress proportional to
+// its live work. A fixed 256 KiB floor could repeatedly scan an arbitrarily
+// large unchanged live set when a noisy runway estimate exceeded the bounded
+// goal. The hard/soft reservation controllers still enforce their own limits.
+fn minimum_trigger(live: u64) -> u64 {
+    live.saturating_add((live / 4).max(MIN_GOAL / 4))
+}
+
 fn mul_div_ceil(a: u64, b: u64, divisor: u128) -> u64 {
     (u128::from(a) * u128::from(b))
         .div_ceil(divisor.max(1))
@@ -103,7 +114,7 @@ pub(super) fn decide(input: Inputs) -> Decision {
         .max(input.live);
     let trigger = goal
         .saturating_sub(runway)
-        .max(input.live.saturating_add(MIN_GOAL / 4).min(goal));
+        .max(minimum_trigger(input.live).min(goal));
     Decision {
         goal,
         trigger,
@@ -157,11 +168,22 @@ impl Sampler {
                 .is_none_or(|(_, previous)| bytes.saturating_sub(previous) >= 65536)
     }
 
+    /// Collection time is not mutator allocation time. Resume the sampling
+    /// window without treating a long GC pause as a fall in allocation demand.
+    /// Occupancy and hard reservation accounting remain independent.
+    pub(super) fn resume_allocation(&mut self, ns: u64, bytes: u64) {
+        self.last = Some((ns, bytes));
+    }
+
     pub(super) fn allocation(&mut self, ns: u64, bytes: u64) {
-        let previous = self.last.replace((ns, bytes));
-        let Some((old_ns, old_bytes)) = previous else {
+        let Some((old_ns, old_bytes)) = self.last else {
+            self.last = Some((ns, bytes));
             return;
         };
+        if ns > old_ns && ns - old_ns < ALLOCATION_SAMPLE_NS && bytes >= old_bytes {
+            return;
+        }
+        self.last = Some((ns, bytes));
         let Some(elapsed) = ns.checked_sub(old_ns).filter(|&elapsed| elapsed != 0) else {
             self.allocation_rate = 0;
             self.mark_rate = None;
@@ -208,6 +230,21 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn collection_pauses_do_not_decay_mutator_allocation_rate() {
+        let mut sampler = Sampler::default();
+        sampler.allocation(0, 0);
+        sampler.allocation(1_000_000, 1_000_000);
+        assert_eq!(sampler.allocation_rate, 1_000_000_000);
+        for pause in [1_000_000u64, 1_000_000_000, 10_000_000_000] {
+            let (time, bytes) = sampler.last.unwrap();
+            sampler.resume_allocation(time + pause, bytes);
+            assert_eq!(sampler.allocation_rate, 1_000_000_000);
+            sampler.allocation(time + pause + 1_000_000, bytes + 1_000_000);
+            assert_eq!(sampler.allocation_rate, 1_000_000_000);
+        }
+    }
+
     fn input() -> Inputs {
         Inputs {
             live: MIN_GOAL,
@@ -238,6 +275,30 @@ mod tests {
         assert_eq!(state.pacer_trigger, MIN_GOAL);
         drop(state);
         reset_internal();
+    }
+
+    #[test]
+    fn saturated_runway_requires_proportional_allocation_progress() {
+        for live in [MIN_GOAL, 16 * MIN_GOAL, 256 * MIN_GOAL, 4096 * MIN_GOAL] {
+            for rate in [1, MIN_GOAL, u64::MAX] {
+                let decision = decide(Inputs {
+                    live,
+                    previous_goal: live * 2,
+                    expected_work: live,
+                    allocation_per_second: u64::MAX,
+                    mark_per_cpu_second: Some(rate),
+                    cpu_capacity: 1,
+                    active: false,
+                });
+                assert!(decision.trigger >= live + live / 4);
+                assert!(decision.trigger <= decision.goal);
+                // At most four full scans per live-size worth of allocation,
+                // independent of the absolute live-set size.
+                assert!(live.div_ceil(decision.trigger - live) <= 4);
+            }
+        }
+        assert_eq!(minimum_trigger(u64::MAX), u64::MAX);
+        assert_eq!(minimum_trigger(0), MIN_GOAL / 4);
     }
 
     #[test]
@@ -291,6 +352,22 @@ mod tests {
         sampler.mark(100, Some(100));
         sampler.allocation(6_000_000_002, 1000);
         assert_eq!(sampler.mark_rate, None);
+    }
+
+    #[test]
+    fn allocation_bursts_share_a_stable_sampling_window() {
+        for pieces in [1u64, 10, 1000] {
+            let mut sampler = Sampler::default();
+            sampler.allocation(0, 0);
+            for i in 1..pieces {
+                sampler.allocation(i * ALLOCATION_SAMPLE_NS / pieces, i * 1_000_000 / pieces);
+                assert_eq!(sampler.allocation_rate, 0);
+            }
+            sampler.allocation(ALLOCATION_SAMPLE_NS, 1_000_000);
+            assert_eq!(sampler.allocation_rate, 1_000_000_000);
+            sampler.allocation(2 * ALLOCATION_SAMPLE_NS, 3_000_000);
+            assert_eq!(sampler.allocation_rate, 2_000_000_000);
+        }
     }
 
     #[test]

@@ -208,6 +208,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     PANIC_ALLOC; "willow_array_set" => ([Ptr, I64, Word] -> None);
     PANIC_ALLOC; "willow_array_push" => ([Ptr, Word] -> None);
     PANIC_ALLOC; "willow_array_push_scalar_pairs" => ([Ptr, Word] -> None);
+    PANIC_ALLOC; "willow_array_push_owned_pair" => ([Ptr, Word] -> None);
     PANIC_ALLOC; "willow_array_pop" => ([Ptr] -> Some(Word));
     PANIC_ALLOC; "willow_array_pop_scalar_pair_into" => ([Ptr, Ptr] -> None);
     PANIC_ALLOC; "willow_array_to_string" => ([Ptr, I64] -> Some(Ptr));

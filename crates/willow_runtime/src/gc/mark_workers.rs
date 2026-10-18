@@ -11,6 +11,8 @@ use std::thread::JoinHandle;
 #[cfg(test)]
 pub(super) static BACKGROUND_DRAINS: AtomicUsize = AtomicUsize::new(0);
 
+const BACKGROUND_BATCH: usize = 1024;
+
 struct Job {
     cycle: Arc<ConcurrentCycle>,
     remaining_work: AtomicUsize,
@@ -20,9 +22,9 @@ impl Job {
     fn claim(&self) -> usize {
         self.remaining_work
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                (remaining != 0).then(|| remaining.saturating_sub(32))
+                (remaining != 0).then(|| remaining.saturating_sub(BACKGROUND_BATCH))
             })
-            .map_or(0, |remaining| remaining.min(32))
+            .map_or(0, |remaining| remaining.min(BACKGROUND_BATCH))
     }
 }
 

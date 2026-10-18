@@ -217,8 +217,10 @@ pub struct GcHeader {
     /// call (willow-8hq4.15); only the runtime writes it, under the heap lock
     /// or with mutators stopped.
     pub remembered: u8,
-    /// Live: immutable descriptor address. Reclaimed: original allocation size,
-    /// so retained TLAB holes remain walkable without retaining dead metadata.
+    /// Live: immutable descriptor address. During minor STW only, a moved
+    /// source holds its destination payload address tagged with low bit 1;
+    /// metadata then comes from that live destination. Reclaimed: original
+    /// allocation size, so retained TLAB holes remain walkable without metadata.
     pub descriptor: usize,
 }
 
@@ -263,7 +265,8 @@ mod runtime_tlab;
 pub use runtime_tlab::willow_gc_current_tlab;
 pub(crate) use runtime_tlab::{
     RuntimeTlabOwner, YoungLayout, alloc_string_payload_slow, alloc_young_layout_slow,
-    array_buffer_layout, array_handle_layout, try_alloc_young, try_alloc_young_string_payload,
+    array_buffer_layout, array_handle_layout, array_pair_layout, try_alloc_young,
+    try_alloc_young_string_payload,
 };
 
 /// Raw allocation and pointer arithmetic boundary for the collector. The rest
@@ -324,6 +327,7 @@ struct GcState {
     /// young bytes reach this mark, one TLAB chunk past the deferral.
     minor_retry_bytes: usize,
     nursery_policy: nursery::Policy,
+    tenuring: nursery::Tenuring,
     /// Total objects allocated lifetime.
     total_allocs: u64,
     total_allocated_bytes: u64,
@@ -718,6 +722,7 @@ impl Default for GcState {
             minor_deferral_start_bytes: None,
             minor_retry_bytes: 0,
             nursery_policy,
+            tenuring: Default::default(),
             total_allocs: 0,
             total_allocated_bytes: 0,
             released_bytes: 0,
@@ -1374,6 +1379,26 @@ fn allocate_old_region_object_locked(
     gc_ref_mask: u64,
     count_logical_allocation: bool,
 ) -> Option<HeapObject> {
+    allocate_old_region_object_for_move(
+        state,
+        layout_id,
+        type_id,
+        payload_size,
+        gc_ref_mask,
+        count_logical_allocation,
+        None,
+    )
+}
+
+fn allocate_old_region_object_for_move(
+    state: &mut GcState,
+    layout_id: u64,
+    type_id: u32,
+    payload_size: usize,
+    gc_ref_mask: u64,
+    count_logical_allocation: bool,
+    source: Option<HeapObject>,
+) -> Option<HeapObject> {
     let total_size = GC_HEADER_SIZE.checked_add(payload_size)?;
     let span_size = total_size.checked_next_multiple_of(GC_REGION_MARK_GRANULE)?;
     let large = total_size > GC_LARGE_OBJECT_THRESHOLD;
@@ -1392,11 +1417,12 @@ fn allocate_old_region_object_locked(
         .copied()
         .filter(|(available, _)| !large && *available >= span_size);
     let (object, reused) = if let Some((_, index)) = candidate {
-        let allocated = state.old_regions[index].allocate_object(
+        let allocated = state.old_regions[index].allocate_object_for_move(
             type_id,
             layout_id,
             gc_ref_mask,
             payload_size,
+            source,
         )?;
         let available = state.old_regions[index].available_span();
         state.old_region_candidates.pop_last();
@@ -1415,7 +1441,13 @@ fn allocate_old_region_object_locked(
             RegionKind::Old
         };
         let mut region = OldRegion::new(kind, capacity)?;
-        let allocated = region.allocate_object(type_id, layout_id, gc_ref_mask, payload_size)?;
+        let allocated = region.allocate_object_for_move(
+            type_id,
+            layout_id,
+            gc_ref_mask,
+            payload_size,
+            source,
+        )?;
         state
             .old_addresses
             .insert(region.base as usize, state.old_regions.len());
@@ -1426,19 +1458,27 @@ fn allocate_old_region_object_locked(
         allocated
     };
 
-    consume_headrooms(object.size());
-    state.allocated_bytes = state.allocated_bytes.saturating_add(object.size());
+    account_old_region_allocation(state, object.size(), reused, count_logical_allocation);
+    Some(object)
+}
+
+#[inline]
+fn account_old_region_allocation(
+    state: &mut GcState,
+    size: usize,
+    reused: bool,
+    count_logical_allocation: bool,
+) {
+    consume_headrooms(size);
+    state.allocated_bytes = state.allocated_bytes.saturating_add(size);
     state.old_region_allocations = state.old_region_allocations.saturating_add(1);
     if reused {
         state.old_region_reuses = state.old_region_reuses.saturating_add(1);
     }
     if count_logical_allocation {
         state.total_allocs = state.total_allocs.saturating_add(1);
-        state.total_allocated_bytes = state
-            .total_allocated_bytes
-            .saturating_add(object.size() as u64);
+        state.total_allocated_bytes = state.total_allocated_bytes.saturating_add(size as u64);
     }
-    Some(object)
 }
 
 fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
@@ -1679,24 +1719,32 @@ fn append_bitmap_slots(object: HeapObject, slots: &mut Vec<*mut *mut u8>) {
 
 fn object_reference_slots(
     object: HeapObject,
-    trace_registry: &HashMap<u32, TraceFn>,
+    trace_registry: &HashMap<u32, TraceFn, impl std::hash::BuildHasher>,
 ) -> Vec<*mut *mut u8> {
+    let mut slots = Vec::new();
+    append_object_reference_slots(object, trace_registry, &mut slots);
+    slots
+}
+
+fn append_object_reference_slots(
+    object: HeapObject,
+    trace_registry: &HashMap<u32, TraceFn, impl std::hash::BuildHasher>,
+    slots: &mut Vec<*mut *mut u8>,
+) {
     let metadata = object.trace_metadata();
     let payload_words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
-    let mut slots = Vec::new();
     let inline_mask = metadata.inline_ref_mask();
     for index in 0..payload_words.min(64) {
         if (inline_mask & (1u64 << index)) != 0 {
             slots.push(object.payload_slot(index));
         }
     }
-    append_bitmap_slots(object, &mut slots);
+    append_bitmap_slots(object, slots);
     if let Some(trace) = trace_registry.get(&metadata.type_id).copied() {
         // SAFETY: trace is registered for this runtime type and exposes mutable
         // reference slots without allocating GC objects.
-        unsafe { trace(object.payload().as_ptr(), &mut slots) };
+        unsafe { trace(object.payload().as_ptr(), slots) };
     }
-    slots
 }
 
 fn automatic_collect(stress: bool) {
@@ -1817,7 +1865,7 @@ fn try_collect_internal() -> bool {
         let bytes = policy_allocated_total(&state);
         state
             .pacer
-            .allocation(crate::gc_telemetry::timestamp_ns(), bytes);
+            .resume_allocation(crate::gc_telemetry::timestamp_ns(), bytes);
         pacer::complete_threshold(&mut state, previous_goal);
         // A completed full cycle services any high reservation pressure. If
         // reclamation crossed the low watermark, rearm before new allocations
@@ -2074,6 +2122,7 @@ fn reset_internal() {
     assist::reset();
     state.young_allocated_bytes = 0;
     state.nursery_policy = nursery::Policy::from_env();
+    state.tenuring = Default::default();
     state.nursery_threshold_bytes = state.nursery_policy.initial(state.memory_limit_bytes);
     state.minor_deferral_start_bytes = None;
     state.minor_retry_bytes = 0;

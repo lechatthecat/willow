@@ -1,7 +1,5 @@
 //! Stop-the-world minor collection, survivor copying, and tenuring.
 
-const TENURE_THRESHOLD: u8 = 2;
-
 use std::alloc::{Layout, dealloc};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
@@ -9,9 +7,9 @@ use std::hash::BuildHasherDefault;
 use super::{
     DropFn, GC_GENERATION_OLD, GC_GENERATION_YOUNG, GC_HEADER_SIZE, GC_REGION_MARK_GRANULE,
     GcHeader, GcPayload, GcState, HeapObject, MinorRegistrySnapshot, RegionKind, RootSlot,
-    allocate_old_region_object_locked, append_parked_roots, foreign_root_stack_owner_active,
-    foreign_root_stack_owner_active_locked, index_retired_chunk, minor_registry_snapshot,
-    minor_stack_roots, object_reference_slots, retire_all_tlabs_unindexed, runtime,
+    allocate_old_region_object_for_move, append_object_reference_slots, append_parked_roots,
+    foreign_root_stack_owner_active, foreign_root_stack_owner_active_locked, index_retired_chunk,
+    minor_registry_snapshot, minor_stack_roots, retire_all_tlabs_unindexed, runtime,
     runtime_root_slots, tlab_payload_generation, verify_old_region_metadata, verify_remembered_set,
     willow_gc_safepoint, with_stw,
 };
@@ -31,23 +29,44 @@ mod tests;
 mod overlap_tests;
 
 #[cfg(test)]
-thread_local! { static PAGE_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! {
+    static PAGE_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SNAPSHOT_DEDUP_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 struct MinorCollector<'a> {
     work: crate::gc_telemetry::MarkWork,
     stop_work: &'a mut crate::gc_telemetry::stops::StopWorkV2,
     state: &'a mut GcState,
     survivor_destination: Option<usize>,
+    promotion_destination: Option<usize>,
+    promotion_entries: Vec<(usize, usize)>,
+    buffer_promotion_entries: bool,
     /// Chunks at indices below this existed before the cycle; later ones are
     /// survivor destinations allocated by this cycle.
     source_chunks: usize,
     chunk_pages: AddressMap<[usize; 2]>,
-    forwarding: AddressMap<*mut u8>,
+    last_chunk: std::cell::Cell<Option<usize>>,
+    forwarded_objects: usize,
+    forwarded_per_chunk: Vec<usize>,
     published: Vec<usize>,
-    needs_scan: AddressSet,
-    worklist: Vec<HeapObject>,
+    // Old edges from inline generated layouts scanned by this minor. Publish
+    // after all relocated targets have their epoch marks, so new-to-new edges
+    // do not create duplicate trace jobs.
+    major_old_edges: AddressSet,
+    already_queued: AddressSet,
+    worklist: Vec<(HeapObject, bool)>,
+    // Reuse storage across objects; trace hooks retain their existing Vec ABI.
+    reference_slots: Vec<*mut *mut u8>,
+    inline_types: [Option<(u32, bool, bool)>; 4],
     scanned: AddressSet,
     registry: std::sync::Arc<MinorRegistrySnapshot>,
+}
+
+impl Drop for MinorCollector<'_> {
+    fn drop(&mut self) {
+        self.release_promotion_destination();
+    }
 }
 
 impl<'a> MinorCollector<'a> {
@@ -74,12 +93,20 @@ impl<'a> MinorCollector<'a> {
             stop_work,
             state,
             survivor_destination: None,
+            promotion_destination: None,
+            promotion_entries: Vec::new(),
+            buffer_promotion_entries: false,
             source_chunks,
             chunk_pages: AddressMap::default(),
-            forwarding: AddressMap::default(),
+            last_chunk: std::cell::Cell::new(None),
+            forwarded_objects: 0,
+            forwarded_per_chunk: vec![0; source_chunks],
             published: Vec::new(),
-            needs_scan: AddressSet::default(),
+            major_old_edges: AddressSet::default(),
+            already_queued: AddressSet::default(),
             worklist: Vec::new(),
+            reference_slots: Vec::new(),
+            inline_types: [None; 4],
             scanned: AddressSet::default(),
             registry,
         };
@@ -106,9 +133,20 @@ impl<'a> MinorCollector<'a> {
     // Expected O(1) lookup; no ordered-region search for every live child.
     // The map is used only before sweep compacts the chunk vector.
     fn chunk_index(&self, header: usize) -> Option<usize> {
+        // Sequential graph edges usually stay in the same retired chunk. The
+        // range is rechecked against current `used`; indices stay stable until
+        // sweep, after which this collector's page index is no longer queried.
+        if let Some(index) = self.last_chunk.get() {
+            let chunk = &self.state.tlab_chunks[index];
+            let base = chunk.base as usize;
+            if header >= base && header < base + chunk.used {
+                return Some(index);
+            }
+        }
         #[cfg(test)]
         PAGE_QUERIES.set(PAGE_QUERIES.get() + 1);
-        self.chunk_pages
+        let index = self
+            .chunk_pages
             .get(&(header / super::GC_TLAB_CHUNK_SIZE))?
             .iter()
             .copied()
@@ -117,7 +155,9 @@ impl<'a> MinorCollector<'a> {
                 let chunk = &self.state.tlab_chunks[index];
                 let base = chunk.base as usize;
                 header >= base && header < base + chunk.used
-            })
+            });
+        self.last_chunk.set(index);
+        index
     }
 
     fn chunk_generation(&self, address: usize) -> Option<u8> {
@@ -168,6 +208,9 @@ impl<'a> MinorCollector<'a> {
             return;
         }
         let address = payload as usize;
+        if !self.scanned.insert(address) {
+            return;
+        }
         if let Some(object) = self.young_source(address) {
             if verify_no_pin() {
                 crate::failure::fatal_invariant(&format!(
@@ -185,13 +228,13 @@ impl<'a> MinorCollector<'a> {
                 self.state.young_allocated_bytes.saturating_sub(size);
             self.state.promoted_objects = self.state.promoted_objects.saturating_add(1);
             self.state.promoted_bytes = self.state.promoted_bytes.saturating_add(size as u64);
-            self.worklist.push(object);
+            self.worklist.push((object, true));
             return;
         }
         if let Some(payload) = GcPayload::from_raw(payload) {
             let object = HeapObject::from_payload(payload);
             if object.allocated() && object.generation() == GC_GENERATION_OLD {
-                self.worklist.push(object);
+                self.worklist.push((object, true));
                 return;
             }
         }
@@ -201,9 +244,13 @@ impl<'a> MinorCollector<'a> {
 
     /// A per-cycle bump cursor: destinations are never evacuation sources in
     /// this cycle, and no search over old survivor chunks is needed per copy.
-    fn allocate_survivor(&mut self, source: HeapObject, age: u8) -> Option<HeapObject> {
+    fn allocate_survivor(
+        &mut self,
+        source: HeapObject,
+        size: usize,
+        age: u8,
+    ) -> Option<HeapObject> {
         use super::{BumpChunk, GC_TLAB_CHUNK_SIZE, RegionMarkBitmap};
-        let size = source.size();
         if size > GC_TLAB_CHUNK_SIZE {
             return None;
         }
@@ -246,14 +293,10 @@ impl<'a> MinorCollector<'a> {
             self.survivor_destination = Some(index);
         }
         let chunk = &mut self.state.tlab_chunks[self.survivor_destination.unwrap()];
-        let metadata = source.trace_metadata();
         // SAFETY: this exclusive collector cursor owns sufficient aligned space.
-        let target = HeapObject::initialize_at(
+        let target = HeapObject::initialize_moved_at(
             unsafe { chunk.base.add(chunk.used) },
-            size,
-            metadata.type_id,
-            metadata.layout_id,
-            metadata.gc_ref_mask,
+            source,
             GC_GENERATION_YOUNG,
         )?;
         unsafe {
@@ -262,7 +305,7 @@ impl<'a> MinorCollector<'a> {
         chunk
             .header_offsets
             .push(u16::try_from(chunk.used).expect("chunk offset fits u16"));
-        chunk.mark_bitmap.mark(chunk.used);
+        chunk.mark_bitmap.mark_stopped(chunk.used);
         chunk.used += size;
         chunk.live_bytes += size;
         self.state.survivor_stats.survivor_space_live += size as u64;
@@ -271,35 +314,134 @@ impl<'a> MinorCollector<'a> {
         Some(target)
     }
 
+    fn release_promotion_destination(&mut self) {
+        if let Some(index) = self.promotion_destination.take() {
+            if self.buffer_promotion_entries {
+                // Bulk-build sorted starts once per fresh region rather than
+                // updating its allocation tree on every promotion.
+                // Include the ordinary allocator's first entry in that same
+                // build. Collect-then-append would build and discard a second
+                // BTreeMap for every fresh promotion region.
+                let allocations = &mut self.state.old_regions[index].allocations;
+                debug_assert_eq!(allocations.len(), 1);
+                *allocations = std::mem::take(allocations)
+                    .into_iter()
+                    .chain(self.promotion_entries.drain(..))
+                    .collect();
+                self.buffer_promotion_entries = false;
+            }
+            super::index_old_region(self.state, index);
+        }
+    }
+
+    /// The stopped collector exclusively fills one regular region. Re-key its
+    /// candidate entry once per region rather than once per promoted object.
+    fn allocate_promotion(
+        &mut self,
+        source: HeapObject,
+        metadata: super::raw_heap::TraceMetadata,
+    ) -> Option<HeapObject> {
+        let size = GC_HEADER_SIZE + metadata.payload_size;
+        if let Some(index) = self.promotion_destination {
+            let allocated = if self.buffer_promotion_entries {
+                self.state.old_regions[index]
+                    .allocate_fresh_promotion(source, size, &mut self.promotion_entries)
+                    .map(|object| (object, false))
+            } else {
+                self.state.old_regions[index].allocate_object_for_move_buffered(
+                    metadata.type_id,
+                    metadata.layout_id,
+                    metadata.gc_ref_mask,
+                    metadata.payload_size,
+                    Some(source),
+                    None,
+                )
+            };
+            if let Some((object, reused)) = allocated {
+                super::account_old_region_allocation(self.state, size, reused, false);
+                return Some(object);
+            }
+            self.release_promotion_destination();
+        }
+        let previous_regions = self.state.old_regions.len();
+        let object = allocate_old_region_object_for_move(
+            self.state,
+            metadata.layout_id,
+            metadata.type_id,
+            metadata.payload_size,
+            metadata.gc_ref_mask,
+            false,
+            Some(source),
+        )?;
+        let index = self
+            .state
+            .old_addresses
+            .candidate(object.as_ptr() as usize)
+            .expect("promoted object has an old region");
+        if self.state.old_regions[index].kind == RegionKind::Old {
+            let available = self.state.old_regions[index].available_span();
+            self.state.old_region_candidates.remove(&(available, index));
+            self.promotion_destination = Some(index);
+            self.buffer_promotion_entries = index >= previous_regions;
+        }
+        Some(object)
+    }
+
     fn evacuate(&mut self, payload: *mut u8) -> *mut u8 {
         if payload.is_null() {
             return payload;
         }
-        let address = payload as usize;
-        // Value roots were already retained in place and are no longer young;
-        // destinations of this cycle are never sources.
-        let Some(source) = self.young_source(address) else {
+        // Reference slots supplied by generated layouts and registered trace
+        // hooks contain managed payloads. Most entries of a growing old array
+        // already point to old objects: reject them before probing the nursery
+        // page index. This is the same header proof used after scan_slot below.
+        let object = HeapObject::from_payload(GcPayload::from_raw(payload).unwrap());
+        if object.generation() == GC_GENERATION_OLD {
+            return payload;
+        }
+        // This slot already proves an exact allocated payload. Locate its
+        // chunk only to distinguish pre-cycle sources from survivor targets;
+        // root/publication boundaries still use young_source's full checks.
+        let Some(index) = self.chunk_index(object.as_ptr() as usize) else {
             return payload;
         };
-        if let Some(&forwarded) = self.forwarding.get(&address) {
-            return forwarded;
+        if index >= self.source_chunks {
+            return payload;
+        }
+        let chunk = &mut self.state.tlab_chunks[index];
+        if chunk.kind == RegionKind::Pinned {
+            return payload;
+        }
+        if chunk.needs_index() {
+            let indexed = index_retired_chunk(chunk) as u64;
+            self.stop_work.metadata_objects += indexed;
+            self.stop_work.metadata_bytes += indexed * GC_HEADER_SIZE as u64;
+        }
+        debug_assert!(object.allocated());
+        debug_assert!(
+            chunk
+                .mark_bitmap
+                .is_marked(object.as_ptr() as usize - chunk.base as usize)
+        );
+        self.evacuate_source(object, payload)
+    }
+
+    /// `source` was validated once by the caller for this stopped cycle.
+    fn evacuate_source(&mut self, source: HeapObject, payload: *mut u8) -> *mut u8 {
+        if let Some(forwarded) = source.forwarded_to() {
+            return forwarded.as_ptr();
         }
 
         let metadata = source.trace_metadata();
-        let size = source.size();
+        let size = GC_HEADER_SIZE + metadata.payload_size;
+        // young_source validated this exact source and cached its stable index.
+        let source_chunk = self.last_chunk.get().expect("validated young source chunk");
         // SAFETY: the source is a validated young allocation under STW.
         let age = unsafe { (*source.as_ptr()).age }.saturating_add(1);
-        let target = if age < TENURE_THRESHOLD {
-            self.allocate_survivor(source, age)
+        let target = if age < self.state.tenuring.age() {
+            self.allocate_survivor(source, size, age)
         } else {
-            allocate_old_region_object_locked(
-                self.state,
-                metadata.layout_id,
-                metadata.type_id,
-                metadata.payload_size,
-                metadata.gc_ref_mask,
-                false,
-            )
+            self.allocate_promotion(source, metadata)
         };
         let Some(target) = target else {
             if self.state.memory_limit_bytes.is_some() {
@@ -314,11 +456,16 @@ impl<'a> MinorCollector<'a> {
         // SAFETY: source and target are distinct allocations with identical
         // payload sizes. Header/list metadata remains owned by the collector.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                source.payload().as_ptr(),
-                target.payload().as_ptr(),
-                metadata.payload_size,
-            );
+            let from = source.payload().as_ptr();
+            let to = target.payload().as_ptr();
+            // Constant-sized scalar/pair payloads compile to direct loads and
+            // stores instead of a general memcpy call for every tiny object.
+            match metadata.payload_size {
+                0 => {}
+                8 => std::ptr::copy_nonoverlapping(from, to, 8),
+                16 => std::ptr::copy_nonoverlapping(from, to, 16),
+                size => std::ptr::copy_nonoverlapping(from, to, size),
+            }
         }
         if target.generation() == GC_GENERATION_OLD {
             self.state.promoted_objects = self.state.promoted_objects.saturating_add(1);
@@ -331,11 +478,25 @@ impl<'a> MinorCollector<'a> {
         }
         self.state.moved_objects = self.state.moved_objects.saturating_add(1);
         let forwarded = target.payload().as_ptr();
-        self.forwarding.insert(address, forwarded);
+        source.forward_to(target);
+        self.forwarded_objects += 1;
+        self.forwarded_per_chunk[source_chunk] += 1;
         if self.state.concurrent_cycle.is_some() {
             self.published.push(forwarded as usize);
         }
-        self.worklist.push(target);
+        if metadata.gc_ref_mask == 0 && self.inline_policy(metadata).0 {
+            // A generated leaf has no slots to rewrite. Credit its scan here
+            // instead of enqueueing and decoding the same header again.
+            self.work.frame(
+                metadata.layout_id,
+                metadata.type_id,
+                metadata.payload_size,
+                0,
+            );
+            self.work.object(size, 0);
+        } else {
+            self.worklist.push((target, false));
+        }
         forwarded
     }
 
@@ -363,8 +524,12 @@ impl<'a> MinorCollector<'a> {
         if value.is_null() {
             return;
         }
-        if self.young_source(value as usize).is_some() {
-            self.scan_slot(slot);
+        if let Some(source) = self.young_source(value as usize) {
+            let updated = self.evacuate_source(source, value);
+            // SAFETY: the published root slot is writable under this stop.
+            if updated != value {
+                unsafe { *slot = updated };
+            }
             return;
         }
         if !self.is_destination(value as usize) {
@@ -380,9 +545,30 @@ impl<'a> MinorCollector<'a> {
             .is_some_and(|index| index >= self.source_chunks)
     }
 
+    // Both registries and the current major epoch are immutable throughout
+    // this stopped minor. Cache only type dispatch, never payloads or liveness.
+    fn inline_policy(&mut self, metadata: super::raw_heap::TraceMetadata) -> (bool, bool) {
+        let index = metadata.type_id as usize % self.inline_types.len();
+        if let Some((id, inline, major)) = self.inline_types[index]
+            && id == metadata.type_id
+        {
+            return (inline, major);
+        }
+        let inline = metadata.type_id != willow_abi::GC_BITMAP_TYPE_ID
+            && !self.registry.trace.contains_key(&metadata.type_id);
+        let major = inline
+            && self
+                .state
+                .concurrent_cycle
+                .as_ref()
+                .is_some_and(|cycle| cycle.generated_inline(metadata));
+        self.inline_types[index] = Some((metadata.type_id, inline, major));
+        (inline, major)
+    }
+
     fn scan_object(&mut self, object: HeapObject) {
         let address = object.payload().as_ptr() as usize;
-        if !object.allocated() || !self.scanned.insert(address) {
+        if !object.allocated() {
             return;
         }
         let metadata = object.trace_metadata();
@@ -392,29 +578,88 @@ impl<'a> MinorCollector<'a> {
             metadata.payload_size,
             metadata.gc_ref_mask,
         );
-        let slots = object_reference_slots(object, &self.registry.trace);
-        self.work.object(
-            object.size(),
-            slots.iter().filter(|slot| !slot.is_null()).count(),
-        );
+        let (inline, scanned_for_major) = self.inline_policy(metadata);
         let old_owner = object.generation() == GC_GENERATION_OLD;
         let mut has_young_child = false;
-        for slot in slots {
-            self.scan_slot(slot);
-            if old_owner && !has_young_child && !slot.is_null() {
-                // SAFETY: scan_slot has updated this validated reference slot.
-                let child = unsafe { *slot };
-                if !child.is_null()
-                    && HeapObject::from_payload(GcPayload::from_raw(child).unwrap()).generation()
-                        == GC_GENERATION_YOUNG
-                {
-                    has_young_child = true;
-                }
+        if inline {
+            let words = (metadata.payload_size / super::GC_STORAGE_WORD_BYTES).min(64);
+            let mut mask =
+                metadata.gc_ref_mask & u64::MAX.checked_shr((64 - words) as u32).unwrap_or(0);
+            self.work.object(
+                GC_HEADER_SIZE + metadata.payload_size,
+                mask.count_ones() as usize,
+            );
+            while mask != 0 {
+                let index = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                has_young_child |= self.scan_reference_slot(
+                    object.payload_slot(index),
+                    scanned_for_major,
+                    old_owner,
+                );
             }
+        } else if let Some((first, count)) = (metadata.gc_ref_mask == 0)
+            .then(|| unsafe {
+                crate::array::minor_reference_range(
+                    metadata.type_id,
+                    self.registry.trace.get(&metadata.type_id).copied(),
+                    object.payload().as_ptr(),
+                )
+            })
+            .flatten()
+        {
+            self.work
+                .object(GC_HEADER_SIZE + metadata.payload_size, count);
+            for index in 0..count {
+                // Built-in buffer length bounds this contiguous slot range.
+                has_young_child |=
+                    self.scan_reference_slot(unsafe { first.add(index) }, false, old_owner);
+            }
+        } else {
+            let mut slots = std::mem::take(&mut self.reference_slots);
+            append_object_reference_slots(object, &self.registry.trace, &mut slots);
+            self.work.object(
+                GC_HEADER_SIZE + metadata.payload_size,
+                slots.iter().filter(|slot| !slot.is_null()).count(),
+            );
+            for &slot in &slots {
+                has_young_child |= self.scan_reference_slot(slot, scanned_for_major, old_owner);
+            }
+            slots.clear();
+            self.reference_slots = slots;
         }
         if has_young_child {
             super::barrier::remember_owner(self.state, address);
         }
+    }
+
+    fn scan_reference_slot(
+        &mut self,
+        slot: *mut *mut u8,
+        scanned_for_major: bool,
+        old_owner: bool,
+    ) -> bool {
+        if slot.is_null() {
+            return false;
+        }
+        if scanned_for_major {
+            // Record old children before evacuation; newly promoted children
+            // are credited and published by this stopped minor itself.
+            let child = unsafe { *slot };
+            if let Some(payload) = GcPayload::from_raw(child)
+                && HeapObject::from_payload(payload).generation() == GC_GENERATION_OLD
+            {
+                self.major_old_edges.insert(child as usize);
+            }
+        }
+        self.scan_slot(slot);
+        if old_owner {
+            let child = unsafe { *slot };
+            if let Some(payload) = GcPayload::from_raw(child) {
+                return HeapObject::from_payload(payload).generation() == GC_GENERATION_YOUNG;
+            }
+        }
+        false
     }
 
     fn snapshot_roots(&self) -> Vec<*mut u8> {
@@ -427,22 +672,26 @@ impl<'a> MinorCollector<'a> {
                 0
             );
             let mut seen = AddressSet::default();
-            let mut retain = |address| {
+            let mut retain = |address, transport| {
                 if self.chunk_generation(address) == Some(GC_GENERATION_YOUNG)
-                    && seen.insert(address)
+                    && if transport {
+                        seen.insert(address)
+                    } else {
+                        !seen.contains(&address)
+                    }
                 {
                     mark_roots.push(address as *mut u8);
                 }
             };
             cycle.queue.remap_stopped(|object| {
-                retain(object.addr());
+                retain(object.addr(), true);
                 Some(object)
             });
             for &address in cycle.deferred.lock().unwrap().iter() {
-                retain(address);
+                retain(address, true);
             }
             for &address in cycle.unindexed.lock().unwrap().iter() {
-                retain(address);
+                retain(address, true);
             }
             for chunk in &self.state.tlab_chunks {
                 if chunk.kind == RegionKind::Pinned {
@@ -459,9 +708,14 @@ impl<'a> MinorCollector<'a> {
                 bits.for_each_set(|bit| {
                     let address =
                         chunk.base as usize + bit * GC_REGION_MARK_GRANULE + GC_HEADER_SIZE;
-                    retain(address);
+                    // Bits are unique within disjoint extents. Only queued
+                    // transports need a dedup entry; never insert every marked
+                    // survivor into a second per-object hash table.
+                    retain(address, false);
                 });
             }
+            #[cfg(test)]
+            SNAPSHOT_DEDUP_KEYS.set(seen.len());
         }
         mark_roots
     }
@@ -492,36 +746,45 @@ impl<'a> MinorCollector<'a> {
         for slot in roots.slots {
             self.scan_root_slot(slot);
         }
-        while let Some(object) = self.worklist.pop() {
+        while let Some((object, root)) = self.worklist.pop() {
+            // Evacuation queues each new destination once. A repeated root slot
+            // may also pin a promoted destination; the root entry owns its scan.
+            // Keep the dedup set proportional to roots/pins, not all survivors.
+            if !root && self.scanned.contains(&(object.payload().as_ptr() as usize)) {
+                continue;
+            }
             self.scan_object(object);
         }
+
+        self.release_promotion_destination();
 
         // All referents have moved, but source headers remain valid until sweep.
         // Translate every transport before freeing storage, including legacy and
         // not-yet-indexed work. Old/pinned referents keep their identity.
         if let Some(cycle) = self.state.concurrent_cycle.clone() {
             let remap = |address: usize| -> Option<usize> {
-                if let Some(&new) = self.forwarding.get(&address) {
-                    return Some(new as usize);
-                }
                 if self.chunk_generation(address) == Some(GC_GENERATION_YOUNG)
                     && !self.is_destination(address)
                 {
-                    return None;
+                    let source = HeapObject::from_payload(GcPayload::from_raw(address as *mut u8)?);
+                    return source.forwarded_to().map(|new| new.as_ptr() as usize);
                 }
                 Some(address)
             };
-            let mut needs_scan: AddressSet = self.published.iter().copied().collect();
+            // Only queue-owned addresses need a dedup entry. Building the
+            // complement from every copied object adds an avoidable O(V) table
+            // even when the old marker queue is empty.
+            let mut already_queued = AddressSet::default();
             cycle.queue.remap_stopped(|object| {
                 let address = remap(object.addr())?;
-                needs_scan.remove(&address);
+                already_queued.insert(address);
                 crate::gc_mark_queue::ObjectRef::from_addr(address)
             });
             let mut deferred = cycle.deferred.lock().unwrap();
             *deferred = deferred.iter().copied().filter_map(&remap).collect();
             let mut unindexed = cycle.unindexed.lock().unwrap();
             *unindexed = unindexed.iter().copied().filter_map(remap).collect();
-            self.needs_scan = needs_scan;
+            self.already_queued = already_queued;
         }
 
         self.work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
@@ -544,7 +807,28 @@ impl<'a> MinorCollector<'a> {
             }
             let base = self.state.tlab_chunks[chunk_index].base;
             let used = self.state.tlab_chunks[chunk_index].used;
-            let source = chunk_identities[chunk_index] < self.source_chunks;
+            let identity = chunk_identities[chunk_index];
+            let source = identity < self.source_chunks;
+            if source
+                && !poison_moved
+                && self.forwarded_per_chunk[identity] != 0
+                && self.forwarded_per_chunk[identity]
+                    == self.state.tlab_chunks[chunk_index].header_offsets.len()
+            {
+                // Every validated header in this chunk was forwarded exactly
+                // once. Descriptor ownership moved with each destination;
+                // no source owns a drop or descriptor release. Discard the
+                // whole prefix without decoding all forwarded headers again.
+                let objects = self.forwarded_per_chunk[identity] as u64;
+                self.stop_work.swept_objects += objects;
+                reclaimed_young += objects;
+                self.state.allocated_bytes = self.state.allocated_bytes.saturating_sub(used);
+                self.state.young_allocated_bytes =
+                    self.state.young_allocated_bytes.saturating_sub(used);
+                reclaimed_bytes = reclaimed_bytes.saturating_add(used);
+                self.release_chunk(chunk_index, &mut chunk_identities);
+                continue;
+            }
             if self.state.tlab_chunks[chunk_index].needs_index() {
                 // Marking never found a young object here, or `young_source`
                 // would have indexed the chunk: every object in it is dead
@@ -609,9 +893,7 @@ impl<'a> MinorCollector<'a> {
                             drop_fn
                         }
                     };
-                    let forwarded = self
-                        .forwarding
-                        .contains_key(&(object.payload().as_ptr() as usize));
+                    let forwarded = object.forwarded_to().is_some();
                     if let Some(drop_fn) = drop_fn
                         && !forwarded
                     {
@@ -647,7 +929,9 @@ impl<'a> MinorCollector<'a> {
                     );
                     has_allocated = true;
                     live_bytes = live_bytes.saturating_add(object.size());
-                    self.state.tlab_chunks[chunk_index].mark_bitmap.mark(offset);
+                    self.state.tlab_chunks[chunk_index]
+                        .mark_bitmap
+                        .mark_stopped(offset);
                 }
             }
             self.state.tlab_chunks[chunk_index].header_offsets = offsets;
@@ -670,7 +954,7 @@ impl<'a> MinorCollector<'a> {
         self.state.total_frees = self
             .state
             .total_frees
-            .saturating_add(reclaimed_young.saturating_sub(self.forwarding.len() as u64));
+            .saturating_add(reclaimed_young.saturating_sub(self.forwarded_objects as u64));
         for (index, &identity) in chunk_identities.iter().enumerate() {
             chunk_positions[identity] = Some(index);
         }
@@ -679,22 +963,73 @@ impl<'a> MinorCollector<'a> {
             cycle.objects.refresh_stopped(self.state);
             // Publication must scan promoted black objects too; enqueue() would
             // suppress already-black destinations allocated in existing old regions.
-            for address in self.published {
+            let mut pending = Vec::with_capacity(32);
+            let mut scanned_work = crate::gc_telemetry::MarkWork::default();
+            let publication_cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
+            for address in self.published.drain(..) {
                 cycle.objects.claim(address);
-                if !self.needs_scan.contains(&address) {
+                if self.already_queued.contains(&address) {
                     continue;
                 }
+                let object =
+                    HeapObject::from_payload(GcPayload::from_raw(address as *mut u8).unwrap());
+                let metadata = object.trace_metadata();
+                if !self.registry.trace.contains_key(&metadata.type_id)
+                    && cycle.account_scanned_inline(metadata, &mut scanned_work)
+                {
+                    continue;
+                }
+                pending.push(crate::gc_mark_queue::ObjectRef::from_addr(address).unwrap());
+                if pending.len() == 32 {
+                    cycle
+                        .queue
+                        .inject(crate::gc_mark_queue::MarkWork::new(
+                            cycle.mark_epoch,
+                            crate::gc_mark_queue::MarkWorkItem::ObjectBatch(
+                                std::mem::take(&mut pending).into_boxed_slice(),
+                            ),
+                        ))
+                        .expect("minor publications retain the old epoch");
+                }
+            }
+            if !pending.is_empty() {
                 cycle
                     .queue
-                    .inject(crate::gc_mark_queue::MarkWork::object(
+                    .inject(crate::gc_mark_queue::MarkWork::new(
                         cycle.mark_epoch,
-                        crate::gc_mark_queue::ObjectRef::from_addr(address).unwrap(),
+                        crate::gc_mark_queue::MarkWorkItem::ObjectBatch(pending.into_boxed_slice()),
                     ))
                     .expect("minor publications retain the old epoch");
             }
+            for child in self.major_old_edges.drain() {
+                cycle.enqueue(child as *mut u8);
+            }
+            // The collector already owns the epoch under STW. Account all
+            // scanned publications once; no marker can race this minor phase.
+            {
+                let cpu = publication_cpu_start.and_then(|start| {
+                    crate::gc_telemetry::workers::thread_cpu_ns()?.checked_sub(start)
+                });
+                let mut total = cycle.work.lock().unwrap();
+                total.collector_mark_cpu_ns =
+                    total.collector_mark_cpu_ns.saturating_add(cpu.unwrap_or(0));
+                if let Some(cpu) = cpu.and_then(|cpu| total.cpu_ns.checked_add(cpu)) {
+                    total.cpu_ns = cpu;
+                } else {
+                    total.cpu_incomplete = true;
+                }
+                total.frame_scans = total.frame_scans.saturating_add(scanned_work.frame_scans);
+                total.marked_bytes = total.marked_bytes.saturating_add(scanned_work.marked_bytes);
+                total.scanned_bytes = total
+                    .scanned_bytes
+                    .saturating_add(scanned_work.scanned_bytes);
+                total.descriptor_bytes = total
+                    .descriptor_bytes
+                    .saturating_add(scanned_work.descriptor_bytes);
+            }
             cycle.termination.restart();
         }
-        (reclaimed_bytes, self.work)
+        (reclaimed_bytes, std::mem::take(&mut self.work))
     }
 
     /// Whether an unindexed source chunk may hold an object with a drop hook.
@@ -726,9 +1061,7 @@ impl<'a> MinorCollector<'a> {
                 object.allocated()
                     && object.generation() == GC_GENERATION_YOUNG
                     && !self.registry.drops.contains_key(&object.type_id())
-                    && !self
-                        .forwarding
-                        .contains_key(&(object.payload().as_ptr() as usize)),
+                    && object.forwarded_to().is_none(),
                 "unwalked dead chunk holds a live, old or droppable object"
             );
             expected = offset + object.size();
@@ -882,14 +1215,16 @@ fn minor_collect_with_roots(
         .slots
         .extend(mark_roots.iter_mut().map(|p| p as *mut *mut u8));
     let (_, work) = collector.run(roots, remembered);
+    let survived = state.promoted_bytes.saturating_sub(promoted_before)
+        + state
+            .survivor_stats
+            .survivor_bytes
+            .saturating_sub(copied_before);
+    state.tenuring.complete(young_before, survived);
     state.nursery_threshold_bytes = state.nursery_policy.next(
         state.nursery_threshold_bytes,
         young_before,
-        state.promoted_bytes.saturating_sub(promoted_before)
-            + state
-                .survivor_stats
-                .survivor_bytes
-                .saturating_sub(copied_before),
+        survived,
         state.memory_limit_bytes,
     );
     if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()
@@ -897,6 +1232,10 @@ fn minor_collect_with_roots(
     {
         panic!("willow gc: region verification failed after minor collection: {message}");
     }
+    let allocated_total = super::policy_allocated_total(&state);
+    state
+        .pacer
+        .resume_allocation(crate::gc_telemetry::timestamp_ns(), allocated_total);
     super::progress::record_success(state.total_allocated_bytes);
     Some((before, state.allocated_bytes as u64, work))
 }

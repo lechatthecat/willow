@@ -87,6 +87,30 @@ impl Object {
         Some(Self(header))
     }
 
+    /// Initialize an evacuation destination, transferring the descriptor reference.
+    /// The collector keeps the destination alive until source metadata is no
+    /// longer read, and reclaims the source without releasing that reference.
+    /// No interning or reference-count operation is needed for a move.
+    pub(super) fn initialize_moved_at(raw: *mut u8, source: Self, generation: u8) -> Option<Self> {
+        let target = NonNull::new(raw.cast::<GcHeader>())?;
+        // SAFETY: under STW, raw is a distinct, aligned, writable destination
+        // with source.size() bytes. Source remains readable until minor sweep;
+        // the successfully evacuated target owns its descriptor lifetime.
+        unsafe {
+            let source = &mut *source.as_ptr();
+            let header = &mut *target.as_ptr();
+            header.marked = false;
+            header.allocated = true;
+            header.generation = generation;
+            header.age = 0;
+            header.remembered = 0;
+            header.descriptor = source.descriptor;
+            header.descriptor_owned = source.descriptor_owned;
+            source.descriptor_owned = false;
+        }
+        Some(Self(target))
+    }
+
     pub(super) fn as_ptr(self) -> *mut GcHeader {
         self.0.as_ptr()
     }
@@ -225,10 +249,42 @@ impl Object {
         }
     }
 
+    /// Only evacuated source headers carry this tag, while minor STW owns
+    /// every reader. Normal descriptors and payloads are pointer-aligned.
+    pub(super) fn forwarded_to(self) -> Option<Payload> {
+        // Read only the stable fields: other old-header flags may be updated
+        // by concurrent collection, so do not borrow the complete header.
+        let allocated = unsafe { (*self.as_ptr()).allocated };
+        let descriptor = unsafe { (*self.as_ptr()).descriptor };
+        (allocated && descriptor & 1 != 0)
+            .then(|| Payload::from_raw((descriptor & !1) as *mut u8).unwrap())
+    }
+
+    pub(super) fn forward_to(self, target: Self) {
+        debug_assert!(self.allocated() && target.allocated());
+        debug_assert!(target.forwarded_to().is_none());
+        // Ownership was transferred during destination initialization. Its
+        // descriptor remains alive until all source metadata reads finish.
+        unsafe {
+            debug_assert!(!(*self.as_ptr()).descriptor_owned);
+            (*self.as_ptr()).descriptor = target.payload().as_ptr() as usize | 1;
+        }
+    }
+
     fn descriptor(self) -> willow_abi::GcLayoutDescriptor {
+        let address = if let Some(target) = self.forwarded_to() {
+            let target = Self::from_payload(target);
+            // Destinations are never sources in the same minor cycle. No
+            // forwarding-chain traversal or additional registry reference.
+            debug_assert!(target.forwarded_to().is_none());
+            unsafe { (*target.as_ptr()).descriptor }
+        } else {
+            unsafe { (*self.as_ptr()).descriptor }
+        };
         // SAFETY: live headers own a registry reference or point to static
-        // generated data; collection excludes readers before reclamation.
-        unsafe { *((*self.as_ptr()).descriptor as *const willow_abi::GcLayoutDescriptor) }
+        // generated data. Evacuated sources borrow their live destination's
+        // descriptor, under STW, until the source storage is reclaimed.
+        unsafe { *(address as *const willow_abi::GcLayoutDescriptor) }
     }
 
     pub(super) fn type_id(self) -> u32 {
@@ -291,3 +347,115 @@ impl RootSlot {
 
 /// Optional registry guard: generated immutable descriptors need no release.
 pub(super) struct ReclaimPermit(Option<super::layouts::ReleaseGuard>);
+
+#[cfg(test)]
+mod move_tests {
+    use super::*;
+    use crate::gc::{GC_GENERATION_OLD, GC_GENERATION_YOUNG, GC_HEADER_SIZE};
+
+    #[test]
+    fn moving_header_transfers_interned_descriptor_once() {
+        let _guard = crate::gc::runtime_test_guard();
+        let key = willow_abi::GcLayoutDescriptor {
+            type_id: 789123,
+            layout_id: 789123,
+            gc_ref_mask: 0,
+            size: GC_HEADER_SIZE as u64,
+        };
+        for count in [1, 100, 10000] {
+            let before = crate::gc::layouts::references(key);
+            let mut source_storage = std::mem::MaybeUninit::<GcHeader>::uninit();
+            let source = Object::initialize_at(
+                source_storage.as_mut_ptr().cast(),
+                GC_HEADER_SIZE,
+                key.type_id as u32,
+                key.layout_id,
+                0,
+                GC_GENERATION_YOUNG,
+            )
+            .unwrap();
+            assert_eq!(crate::gc::layouts::references(key), before + 1);
+            assert!(
+                Object::initialize_moved_at(std::ptr::null_mut(), source, GC_GENERATION_YOUNG)
+                    .is_none()
+            );
+            assert!(unsafe { (*source.as_ptr()).descriptor_owned });
+            let descriptor = unsafe { (*source.as_ptr()).descriptor };
+            let mut a = std::mem::MaybeUninit::<GcHeader>::uninit();
+            let mut b = std::mem::MaybeUninit::<GcHeader>::uninit();
+            let mut current = source;
+            // Holding the registry exclusively proves moves and moved-source
+            // reclamation never consult it. The one live owner remains intact.
+            crate::gc::layouts::with_exclusive_registry(|| {
+                for index in 0..count {
+                    let raw = if index % 2 == 0 {
+                        a.as_mut_ptr()
+                    } else {
+                        b.as_mut_ptr()
+                    };
+                    let generation = if index + 1 == count {
+                        GC_GENERATION_OLD
+                    } else {
+                        GC_GENERATION_YOUNG
+                    };
+                    let next =
+                        Object::initialize_moved_at(raw.cast(), current, generation).unwrap();
+                    assert_eq!(unsafe { (*next.as_ptr()).descriptor }, descriptor);
+                    assert!(unsafe { (*next.as_ptr()).descriptor_owned });
+                    assert!(!unsafe { (*current.as_ptr()).descriptor_owned });
+                    current.forward_to(next);
+                    assert_eq!(
+                        current.forwarded_to().unwrap().as_ptr(),
+                        next.payload().as_ptr()
+                    );
+                    assert_eq!(current.trace_metadata().type_id, key.type_id as u32);
+                    assert_eq!(current.size(), GC_HEADER_SIZE);
+                    current.reclaim_in_place();
+                    assert!(current.forwarded_to().is_none());
+                    current = next;
+                }
+            });
+            assert_eq!(crate::gc::layouts::references(key), before + 1);
+            assert_eq!(current.generation(), GC_GENERATION_OLD);
+            current.reclaim_in_place();
+            assert_eq!(crate::gc::layouts::references(key), before);
+            eprintln!("descriptor_moves={count} registry_acquires=1 releases=1");
+        }
+    }
+
+    #[test]
+    fn moving_header_preserves_static_descriptor_and_resets_flags() {
+        let descriptor = willow_abi::GcLayoutDescriptor {
+            type_id: 42,
+            layout_id: 7,
+            gc_ref_mask: 0,
+            size: GC_HEADER_SIZE as u64,
+        };
+        let mut header = GcHeader {
+            marked: true,
+            allocated: true,
+            generation: GC_GENERATION_YOUNG,
+            age: 1,
+            descriptor_owned: false,
+            remembered: 1,
+            descriptor: (&descriptor as *const _) as usize,
+        };
+        let source = Object::from_raw(&mut header).unwrap();
+        let mut target = std::mem::MaybeUninit::<GcHeader>::uninit();
+        let moved =
+            Object::initialize_moved_at(target.as_mut_ptr().cast(), source, GC_GENERATION_OLD)
+                .unwrap();
+        assert!(!moved.marked());
+        assert!(!moved.remembered());
+        assert_eq!(unsafe { (*moved.as_ptr()).age }, 0);
+        assert!(!unsafe { (*moved.as_ptr()).descriptor_owned });
+        source.forward_to(moved);
+        assert_eq!(source.trace_metadata().layout_id, 7);
+        source.reclaim_in_place();
+        assert!(source.forwarded_to().is_none());
+        assert_eq!(moved.trace_metadata().type_id, 42);
+        assert_eq!(moved.trace_metadata().layout_id, 7);
+        moved.reclaim_in_place();
+        assert_eq!(moved.size(), GC_HEADER_SIZE);
+    }
+}

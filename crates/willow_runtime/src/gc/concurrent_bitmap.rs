@@ -44,6 +44,16 @@ impl ConcurrentMarkBits {
             word.fetch_or(1u64 << (index % 64), Ordering::Release);
         }
     }
+    /// Set under stopped collection with all bitmap writers quiescent. Keep
+    /// atomic publication for readers, but avoid a locked RMW per copied object.
+    pub(super) fn set_stopped(&self, index: usize) {
+        if let Some(word) = self.words.get(index / 64) {
+            word.store(
+                word.load(Ordering::Relaxed) | (1u64 << (index % 64)),
+                Ordering::Release,
+            );
+        }
+    }
     pub(super) fn unset(&self, index: usize) {
         if let Some(word) = self.words.get(index / 64) {
             word.fetch_and(!(1u64 << (index % 64)), Ordering::Release);
@@ -103,6 +113,25 @@ impl ConcurrentMarkBits {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn stopped_sets_preserve_neighbours_across_words() {
+        for count in [1, 63, 64, 65, 4096] {
+            let bits = ConcurrentMarkBits::new(count);
+            for i in (0..count).step_by(2) {
+                bits.set(i);
+            }
+            for i in (1..count).step_by(2) {
+                bits.set_stopped(i);
+                bits.set_stopped(i);
+            }
+            assert_eq!(bits.count(), count);
+            for i in 0..count {
+                assert!(bits.contains(i));
+                assert!(!bits.claim(i));
+            }
+        }
+    }
 
     #[test]
     fn for_each_set_visits_ascending_indices_across_words() {

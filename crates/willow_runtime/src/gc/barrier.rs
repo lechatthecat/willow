@@ -209,6 +209,15 @@ pub(super) fn flush_satb_all_locked(coord: &GcCoord, state: &mut GcState) {
     }
 }
 
+fn count_barrier_call() {
+    let _ =
+        runtime()
+            .write_barrier_calls
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |calls| {
+                Some(calls.saturating_add(1))
+            });
+}
+
 /// Fused pre-store barrier: retain the overwritten reference for SATB, publish
 /// the new edge for the existing incremental marker, and remember old-to-young
 /// edges. The caller must capture `old_value` before overwriting, including
@@ -222,7 +231,9 @@ pub extern "C" fn willow_gc_write_barrier(
     destination_kind: i64,
 ) {
     let value_has_header = destination_kind & willow_abi::GC_STORE_VALUE_HAS_HEADER != 0;
-    let destination_kind = destination_kind & !willow_abi::GC_STORE_VALUE_HAS_HEADER;
+    let owner_has_header = destination_kind & willow_abi::GC_STORE_OWNER_HAS_HEADER != 0;
+    let destination_kind = destination_kind
+        & !(willow_abi::GC_STORE_VALUE_HAS_HEADER | willow_abi::GC_STORE_OWNER_HAS_HEADER);
     let phase = GC_MARK_PHASE.load(Ordering::Acquire);
     let marking_active = phase != 0;
     // A null store creates no generational edge; its deletion is relevant
@@ -231,12 +242,7 @@ pub extern "C" fn willow_gc_write_barrier(
     if value.is_null() && (old_value.is_null() || !marking_active) {
         return;
     }
-    let _ =
-        runtime()
-            .write_barrier_calls
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |calls| {
-                Some(calls.saturating_add(1))
-            });
+    count_barrier_call();
     // With no nursery ever published there are no old-to-young edges. A value
     // flagged as a GC payload start has a readable header; an old one cannot
     // create such an edge either (the inline filter trusts the same byte).
@@ -245,6 +251,11 @@ pub extern "C" fn willow_gc_write_barrier(
         && !(value_has_header
             && GcPayload::from_raw(value).is_some_and(|value| {
                 HeapObject::from_payload(value).generation() == GC_GENERATION_OLD
+            }))
+        && (!owner_has_header
+            || GcPayload::from_raw(owner).is_some_and(|owner| {
+                let owner = HeapObject::from_payload(owner);
+                owner.generation() == GC_GENERATION_OLD && !owner.remembered()
             }));
     // Initial STW crosses pre-activation barrier/store pairs before root
     // snapshots; active epochs publish under a private buffer lock, or
@@ -293,7 +304,9 @@ pub(crate) fn write_barrier_object_owner(
         owner,
         old_value,
         value,
-        destination_kind | willow_abi::GC_STORE_VALUE_HAS_HEADER,
+        destination_kind
+            | willow_abi::GC_STORE_VALUE_HAS_HEADER
+            | willow_abi::GC_STORE_OWNER_HAS_HEADER,
     );
 }
 

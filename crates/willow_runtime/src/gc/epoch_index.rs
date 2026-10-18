@@ -5,6 +5,12 @@
 use super::*;
 
 const PAGE_BYTES: usize = 4096;
+#[cfg(test)]
+thread_local! {
+    static READER_ACQUIRED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static REGION_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static EPOCH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 struct RegionView {
     base: usize,
@@ -299,11 +305,13 @@ impl RegionIndex {
         self.publish_late(self.snapshot_late(state));
     }
 
-    fn locate_region(&self, address: usize) -> Option<(&RegionView, usize)> {
+    fn locate_region_id(&self, address: usize) -> Option<(usize, usize)> {
+        #[cfg(test)]
+        REGION_LOOKUPS.set(REGION_LOOKUPS.get() + 1);
         let header = address.checked_sub(GC_HEADER_SIZE)?;
         if let Some(&id) = self.large.get(&header) {
             let view = self.regions[id].as_ref().unwrap();
-            return view.position(header).map(|bit| (view, bit));
+            return view.position(header).map(|bit| (id, bit));
         }
         for &id in self.pages.get(&(header / PAGE_BYTES))? {
             if id == usize::MAX {
@@ -311,10 +319,39 @@ impl RegionIndex {
             }
             let view = self.regions[id].as_ref().unwrap();
             if let Some(bit) = view.position(header) {
-                return Some((view, bit));
+                return Some((id, bit));
             }
         }
         None
+    }
+    fn locate_region(&self, address: usize) -> Option<(&RegionView, usize)> {
+        let (id, bit) = self.locate_region_id(address)?;
+        Some((self.regions[id].as_ref().unwrap(), bit))
+    }
+    fn locate_extent_cached(
+        &self,
+        address: usize,
+        hint: &mut Option<usize>,
+    ) -> Option<(&RegionView, usize)> {
+        let header = address.checked_sub(GC_HEADER_SIZE)?;
+        if let Some(id) = *hint
+            && let Some(view) = self.regions.get(id).and_then(Option::as_ref)
+            && let Some(bit) = view.position(header)
+        {
+            return Some((view, bit));
+        }
+        let (id, bit) = self.locate_region_id(address)?;
+        *hint = Some(id);
+        let view = self.regions[id].as_ref().unwrap();
+        Some((view, bit))
+    }
+    fn locate_cached(
+        &self,
+        address: usize,
+        hint: &mut Option<usize>,
+    ) -> Option<(&RegionView, usize)> {
+        self.locate_extent_cached(address, hint)
+            .filter(|(view, bit)| view.starts.contains(*bit))
     }
     fn locate(&self, address: usize) -> Option<(&RegionView, usize)> {
         self.locate_region(address)
@@ -332,6 +369,81 @@ enum EpochData {
     },
 }
 pub(super) struct EpochIndex(std::sync::RwLock<EpochData>);
+/// A short reader for one copied batch of child references. Never retained
+/// across a native trace callback or a safepoint.
+pub(super) struct EpochReader<'a>(std::sync::RwLockReadGuard<'a, EpochData>);
+impl EpochReader<'_> {
+    /// Read a queue-owned header through this guard, including debug/test
+    /// validation. Reacquiring the index here could deadlock behind a writer.
+    ///
+    /// # Safety
+    /// Same claimed-allocation and active-drain requirements as
+    /// `EpochIndex::claimed_metadata`.
+    pub(super) unsafe fn claimed_metadata(&self, address: usize) -> raw_heap::TraceMetadata {
+        match &*self.0 {
+            EpochData::Regions(index) => {
+                debug_assert!(index.locate(address).is_some());
+                HeapObject::from_raw((address - GC_HEADER_SIZE) as *mut GcHeader)
+                    .expect("claimed allocation is nonnull")
+                    .trace_metadata()
+            }
+            #[cfg(test)]
+            EpochData::Synthetic { objects, .. } => {
+                objects.get(&address).expect("claimed test object exists").0
+            }
+        }
+    }
+
+    /// Allocations were validated by the sweep index; starts may be rebuilding.
+    pub(super) fn retains_allocated_cached(
+        &self,
+        address: usize,
+        hint: &mut Option<usize>,
+    ) -> bool {
+        match &*self.0 {
+            EpochData::Regions(index) => index
+                .locate_extent_cached(address, hint)
+                .is_none_or(|(view, bit)| view.marks.contains(bit)),
+            #[cfg(test)]
+            EpochData::Synthetic { objects, marks } => objects
+                .get(&address)
+                .is_none_or(|(_, bit)| marks.contains(*bit)),
+        }
+    }
+
+    pub(super) fn needs_start_publication(&self, address: usize) -> bool {
+        match &*self.0 {
+            EpochData::Regions(index) => index.locate_region(address).is_some(),
+            #[cfg(test)]
+            EpochData::Synthetic { .. } => true,
+        }
+    }
+
+    /// Claim and read immutable layout through one extent lookup/read lock.
+    /// `None` is unindexed; `Some(None)` is already claimed.
+    pub(super) fn claim_metadata(
+        &self,
+        address: usize,
+        hint: &mut Option<usize>,
+    ) -> Option<Option<raw_heap::TraceMetadata>> {
+        match &*self.0 {
+            EpochData::Regions(index) => {
+                let (view, bit) = index.locate_cached(address, hint)?;
+                if !view.marks.claim(bit) {
+                    return Some(None);
+                }
+                let object = HeapObject::from_raw((address - GC_HEADER_SIZE) as *mut GcHeader)
+                    .expect("published start names a header");
+                Some(Some(object.trace_metadata()))
+            }
+            #[cfg(test)]
+            EpochData::Synthetic { objects, marks } => {
+                let (metadata, bit) = objects.get(&address)?;
+                Some(marks.claim(*bit).then_some(*metadata))
+            }
+        }
+    }
+}
 impl EpochIndex {
     pub(super) fn regions(index: RegionIndex) -> Self {
         Self(std::sync::RwLock::new(EpochData::Regions(index)))
@@ -411,6 +523,16 @@ impl EpochIndex {
                 .is_some_and(|(_, bit)| marks.claim(*bit)),
         }
     }
+    pub(super) fn reader(&self) -> EpochReader<'_> {
+        #[cfg(test)]
+        EPOCH_READS.set(EPOCH_READS.get() + 1);
+        let reader = EpochReader(self.0.read().unwrap());
+        #[cfg(test)]
+        if let Some(hook) = READER_ACQUIRED.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+        reader
+    }
     pub(super) fn is_marked(&self, address: usize) -> bool {
         match &*self.0.read().unwrap() {
             EpochData::Regions(index) => index
@@ -434,6 +556,25 @@ impl EpochIndex {
             EpochData::Synthetic { objects, marks } => objects
                 .get(&address)
                 .is_none_or(|(_, bit)| marks.contains(*bit)),
+        }
+    }
+    /// Read a queue-owned object's immutable header without repeating region
+    /// lookup. The active drain excludes relocation and reclamation.
+    ///
+    /// # Safety
+    /// `address` must be a validated allocation published to this epoch's
+    /// queue (or a child successfully claimed through its start bitmap).
+    pub(super) unsafe fn claimed_metadata(&self, address: usize) -> raw_heap::TraceMetadata {
+        #[cfg(test)]
+        {
+            self.metadata(address).expect("claimed test object exists")
+        }
+        #[cfg(not(test))]
+        {
+            debug_assert!(self.contains(address));
+            HeapObject::from_raw((address - GC_HEADER_SIZE) as *mut GcHeader)
+                .expect("claimed allocation is nonnull")
+                .trace_metadata()
         }
     }
     pub(super) fn metadata(&self, address: usize) -> Option<raw_heap::TraceMetadata> {
@@ -468,6 +609,116 @@ impl EpochIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claimed_metadata_with_waiting_late_publisher_completes() {
+        use std::time::{Duration, Instant};
+        const KEY: &str = "WILLOW_EPOCH_READER_RACE_CHILD";
+        const TEST: &str =
+            "gc::epoch_index::tests::claimed_metadata_with_waiting_late_publisher_completes";
+        let Ok(mode) = std::env::var(KEY) else {
+            // A regressed recursive read cannot be unwound. Bound each shape
+            // in its own child so failure never wedges the test runner.
+            for mode in ["object", "batch"] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(KEY, mode)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while child.try_wait().unwrap().is_none() {
+                    if Instant::now() >= deadline {
+                        child.kill().unwrap();
+                        let output = child.wait_with_output().unwrap();
+                        panic!("{mode} drain/publisher deadlocked: {output:?}");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let output = child.wait_with_output().unwrap();
+                assert!(output.status.success(), "{mode}: {output:?}");
+            }
+            return;
+        };
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        let objects = [willow_alloc_typed(8, 1), willow_alloc_typed(8, 1)];
+        let index = RegionIndex::capture(&runtime().heap.lock().unwrap());
+        let cycle = Arc::new(ConcurrentCycle::with_index(
+            EpochIndex::regions(index),
+            IdSet::default(),
+            IdMap::default(),
+            0,
+        ));
+        let late_object = willow_gc_alloc_layout(0, 0, GC_OLD_REGION_SIZE as i64, 0);
+        let late = cycle.objects.snapshot_late(&runtime().heap.lock().unwrap());
+        assert!(!cycle.objects.contains(late_object as usize));
+        if mode == "object" {
+            for object in objects {
+                cycle.enqueue(object);
+            }
+        } else {
+            assert_eq!(mode, "batch");
+            cycle.enqueue_satb_batch(&objects.map(|object| object as usize));
+        }
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let publisher_cycle = cycle.clone();
+        let publisher = std::thread::spawn(move || {
+            start_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // The generated-object reader is already held: this publication
+            // cannot acquire its write lock until that reader is released.
+            assert!(matches!(
+                publisher_cycle.objects.0.try_write(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            waiting_tx.send(()).unwrap();
+            publisher_cycle.objects.publish_late(late);
+        });
+        let reader_cycle = cycle.clone();
+        READER_ACQUIRED.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                start_tx.send(()).unwrap();
+                waiting_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                // Linux's writer-preferring lock exposes the queued writer by
+                // denying a fresh read. Other OS policies may allow new readers.
+                let deadline = Instant::now() + Duration::from_millis(100);
+                let mut writer_queued = false;
+                while Instant::now() < deadline {
+                    if matches!(
+                        reader_cycle.objects.0.try_read(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ) {
+                        writer_queued = true;
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                if cfg!(target_os = "linux") {
+                    assert!(writer_queued, "publisher did not queue");
+                }
+            }))
+        });
+        let mut worker = cycle.queue.register_assist();
+        let (scanned, _) = cycle.drain_worker(8, &mut Vec::new(), &mut worker);
+        assert_eq!(scanned, 2);
+        assert!(READER_ACQUIRED.with(|slot| slot.borrow().is_none()));
+        publisher.join().unwrap();
+        assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
+        assert!(cycle.objects.0.try_write().is_ok(), "epoch reader leaked");
+        assert!(cycle.objects.contains(late_object as usize));
+        for object in objects {
+            assert!(cycle.is_marked(object as usize));
+        }
+        assert_eq!(cycle.work.lock().unwrap().scanned_bytes, 16);
+        assert!(cycle.queue.snapshot().is_drained());
+        drop(worker);
+        assert_eq!(cycle.queue.end_epoch(), 0);
+        drop(cycle);
+        reset_internal_for_test();
+    }
 
     #[test]
     fn minor_refresh_does_not_rebuild_existing_old_pages_or_clear_colors() {
@@ -809,6 +1060,74 @@ mod tests {
             assert!(!epoch.contains(PAGE_BYTES + GC_HEADER_SIZE + GC_REGION_MARK_GRANULE));
             assert_eq!(marks.count(), 1);
             println!("large_capacity={capacity} page_entries=0 exact_entries=1 mark_words=1");
+        }
+    }
+    #[test]
+    fn cached_epoch_region_bounds_and_query_counts() {
+        for count in [1usize, 10, 100] {
+            let mut index = empty();
+            for i in 0..count {
+                let starts = Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(
+                    PAGE_BYTES / GC_REGION_MARK_GRANULE,
+                ));
+                let marks = Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(
+                    PAGE_BYTES / GC_REGION_MARK_GRANULE,
+                ));
+                starts.set(0);
+                starts.set(2);
+                index.add((i + 1) * 2 * PAGE_BYTES, PAGE_BYTES, &starts, &marks, false);
+            }
+            let mut hint = None;
+            REGION_LOOKUPS.set(0);
+            for i in 0..count {
+                let base = (i + 1) * 2 * PAGE_BYTES;
+                for _ in 0..100 {
+                    for bit in [0, 2] {
+                        let address = base + bit * GC_REGION_MARK_GRANULE + GC_HEADER_SIZE;
+                        let (view, found) = index.locate_cached(address, &mut hint).unwrap();
+                        assert_eq!((view.base, found), (base, bit));
+                    }
+                }
+            }
+            assert_eq!(REGION_LOOKUPS.get(), count);
+            for initial in [None, Some(0), Some(usize::MAX)] {
+                hint = initial;
+                for address in [
+                    0,
+                    1,
+                    2 * PAGE_BYTES + GC_HEADER_SIZE + 1,
+                    3 * PAGE_BYTES + GC_HEADER_SIZE,
+                ] {
+                    assert!(index.locate_cached(address, &mut hint).is_none());
+                }
+            }
+            for view in index.regions.iter().flatten() {
+                view.starts.clear();
+                view.marks.set(2);
+            }
+            let epoch = EpochIndex::regions(index);
+            let reader = epoch.reader();
+            hint = None;
+            REGION_LOOKUPS.set(0);
+            for i in 0..count {
+                let base = (i + 1) * 2 * PAGE_BYTES;
+                for _ in 0..100 {
+                    for bit in [0, 2] {
+                        let address = base + bit * GC_REGION_MARK_GRANULE + GC_HEADER_SIZE;
+                        assert_eq!(
+                            reader.retains_allocated_cached(address, &mut hint),
+                            bit == 2
+                        );
+                    }
+                }
+            }
+            assert_eq!(REGION_LOOKUPS.get(), count);
+            // New extents are implicitly black, even after a cached old extent.
+            assert!(reader.retains_allocated_cached(
+                (count + 2) * 2 * PAGE_BYTES + GC_HEADER_SIZE,
+                &mut hint,
+            ));
+            eprintln!("epoch references={} region_queries={count}", count * 200);
         }
     }
 }

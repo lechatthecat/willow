@@ -27,6 +27,9 @@ impl RegionMarkBitmap {
     pub(super) fn mark(&mut self, offset: usize) {
         self.bits.set(offset / GC_REGION_MARK_GRANULE);
     }
+    pub(super) fn mark_stopped(&mut self, offset: usize) {
+        self.bits.set_stopped(offset / GC_REGION_MARK_GRANULE);
+    }
     pub(super) fn is_marked(&self, offset: usize) -> bool {
         self.bits.contains(offset / GC_REGION_MARK_GRANULE)
     }
@@ -200,6 +203,40 @@ impl OldRegion {
         gc_ref_mask: u64,
         payload_size: usize,
     ) -> Option<(HeapObject, bool)> {
+        self.allocate_object_for_move(type_id, layout_id, gc_ref_mask, payload_size, None)
+    }
+
+    pub(super) fn allocate_object_for_move(
+        &mut self,
+        type_id: u32,
+        layout_id: u64,
+        gc_ref_mask: u64,
+        payload_size: usize,
+        source: Option<HeapObject>,
+    ) -> Option<(HeapObject, bool)> {
+        self.allocate_object_for_move_buffered(
+            type_id,
+            layout_id,
+            gc_ref_mask,
+            payload_size,
+            source,
+            None,
+        )
+    }
+
+    /// A stopped collector may buffer entries for a newly reserved region;
+    /// it must publish them before exposing the region to any heap index reader.
+    /// A non-null `source` also requires all bitmap writers to be quiescent;
+    /// only stopped minor evacuation supplies one.
+    pub(super) fn allocate_object_for_move_buffered(
+        &mut self,
+        type_id: u32,
+        layout_id: u64,
+        gc_ref_mask: u64,
+        payload_size: usize,
+        source: Option<HeapObject>,
+        pending: Option<&mut Vec<(usize, usize)>>,
+    ) -> Option<(HeapObject, bool)> {
         assert!(
             !self.sweep_quarantined,
             "reclaimed spans are not reusable before sweep completion"
@@ -230,29 +267,91 @@ impl OldRegion {
 
         // SAFETY: the chosen span is exclusively owned by this allocation.
         let raw = unsafe { self.base.add(offset) };
-        unsafe { std::ptr::write_bytes(raw, 0, span_size) };
-        let object = HeapObject::initialize_at(
-            raw,
-            total_size,
-            type_id,
-            layout_id,
-            gc_ref_mask,
-            GC_GENERATION_OLD,
-        )?;
-        self.allocations.insert(offset, span_size);
+        // Evacuation initializes the header and copies every payload byte
+        // before the stopped collector publishes the destination. Zeroing the
+        // same bytes first is redundant. Ordinary allocations still start zeroed.
+        if source.is_none() {
+            unsafe { std::ptr::write_bytes(raw, 0, span_size) };
+        }
+        let object = if let Some(source) = source {
+            debug_assert_eq!(source.size(), total_size);
+            HeapObject::initialize_moved_at(raw, source, GC_GENERATION_OLD)
+        } else {
+            HeapObject::initialize_at(
+                raw,
+                total_size,
+                type_id,
+                layout_id,
+                gc_ref_mask,
+                GC_GENERATION_OLD,
+            )
+        }?;
+        if let Some(pending) = pending {
+            debug_assert!(!reused, "buffered promotion uses a fresh region");
+            pending.push((offset, span_size));
+        } else {
+            self.allocations.insert(offset, span_size);
+        }
         self.live_bytes = self.live_bytes.saturating_add(total_size);
         // Header initialization and black color precede publishing the start bit.
         // An epoch reader that observes the start may safely read immutable metadata.
         if GC_MARK_PHASE.load(Ordering::Acquire) != 0 {
-            self.concurrent_marks.set(offset / GC_REGION_MARK_GRANULE);
+            if source.is_some() {
+                self.concurrent_marks
+                    .set_stopped(offset / GC_REGION_MARK_GRANULE);
+            } else {
+                self.concurrent_marks.set(offset / GC_REGION_MARK_GRANULE);
+            }
         }
-        self.mark_bitmap.mark(offset);
+        if source.is_some() {
+            self.mark_bitmap.mark_stopped(offset);
+        } else {
+            self.mark_bitmap.mark(offset);
+        }
         if self.sweep_pending {
             // Marking is closed, but this region has not yet been swept. New
             // allocations must survive its pending visit, including reused holes.
             object.begin_trace();
         }
         Some((object, reused))
+    }
+
+    /// Stopped evacuation into a fresh, exclusively owned promotion region.
+    /// No free-span search, zeroing, or per-object tree insertion is needed.
+    #[inline]
+    pub(super) fn allocate_fresh_promotion(
+        &mut self,
+        source: HeapObject,
+        size: usize,
+        pending: &mut Vec<(usize, usize)>,
+    ) -> Option<HeapObject> {
+        debug_assert!(!self.sweep_quarantined && !self.sweep_pending);
+        debug_assert_eq!(self.largest_free_span, 0);
+        #[cfg(test)]
+        {
+            self.allocation_attempts += 1;
+        }
+        debug_assert_eq!(size, source.size());
+        debug_assert!(size.is_multiple_of(GC_REGION_MARK_GRANULE));
+        if size > self.capacity - self.used {
+            return None;
+        }
+        let offset = self.used;
+        // The validated young span is aligned and this cursor owns its tail.
+        let object = HeapObject::initialize_moved_at(
+            unsafe { self.base.add(offset) },
+            source,
+            GC_GENERATION_OLD,
+        )?;
+        self.used += size;
+        self.live_bytes += size;
+        pending.push((offset, size));
+        if GC_MARK_PHASE.load(Ordering::Acquire) != 0 {
+            self.concurrent_marks
+                .set_stopped(offset / GC_REGION_MARK_GRANULE);
+        }
+        self.mark_bitmap.mark_stopped(offset);
+        Some(object)
     }
 
     /// Reserve `[offset, offset + len)` for a per-thread allocation buffer,

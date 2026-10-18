@@ -730,7 +730,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             destination as i64
         };
-        let destination = self.builder.ins().iconst(types::I64, destination_kind);
+        // This helper already reads the owner's header above; preserve that
+        // proof for the concurrent-marking runtime path as well.
+        let destination = self.builder.ins().iconst(
+            types::I64,
+            destination_kind | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+        );
         let barrier_id = self.func_id("willow_gc_write_barrier");
         let barrier_ref = self
             .module

@@ -115,6 +115,29 @@ pub(crate) struct YoungLayout {
     kind: GcObjectKind,
 }
 
+/// Pair copies keep the same enum layout and independent storage. Only the
+/// first word can be a managed reference; the second is scalar/vtable data.
+pub(crate) fn array_pair_layout(mask: u64) -> Option<YoungLayout> {
+    static DESCRIPTORS: [willow_abi::GcLayoutDescriptor; 2] = [
+        willow_abi::GcLayoutDescriptor {
+            type_id: 0,
+            layout_id: willow_abi::gc_layout_id(GcObjectKind::Enum, 16, 0, 0),
+            gc_ref_mask: 0,
+            size: GC_HEADER_SIZE as u64 + 16,
+        },
+        willow_abi::GcLayoutDescriptor {
+            type_id: 0,
+            layout_id: willow_abi::gc_layout_id(GcObjectKind::Enum, 16, 0, 1),
+            gc_ref_mask: 1,
+            size: GC_HEADER_SIZE as u64 + 16,
+        },
+    ];
+    Some(YoungLayout {
+        descriptor: DESCRIPTORS.get(usize::try_from(mask).ok()?)?,
+        kind: GcObjectKind::Enum,
+    })
+}
+
 pub(crate) fn array_handle_layout() -> YoungLayout {
     YoungLayout {
         descriptor: &ARRAY_HANDLE_DESCRIPTOR,

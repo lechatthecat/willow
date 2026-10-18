@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) fn verify_remembered_set(
     state: &GcState,
-    trace_registry: &HashMap<u32, TraceFn>,
+    trace_registry: &HashMap<u32, TraceFn, impl std::hash::BuildHasher>,
 ) -> Result<(), String> {
     let mut old_objects = Vec::new();
     for object in old_region_objects(state) {

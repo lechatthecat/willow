@@ -49,9 +49,18 @@ fn overlap_graph_copy_promotion_and_snapshot_only_reachability() {
                 collect_owned();
                 assert_eq!(
                     cycle.queue.snapshot().outstanding,
-                    count as u64,
-                    "each survivor needs exactly one scan job"
+                    u64::from(count == 1 && pass == 0),
+                    "only the previously queued root retains a trace job"
                 );
+                let mut queued = std::collections::HashSet::new();
+                cycle.queue.remap_stopped(|object| {
+                    assert!(
+                        queued.insert(object.addr()),
+                        "duplicate survivor publication"
+                    );
+                    Some(object)
+                });
+                assert_eq!(queued.len(), usize::from(count == 1 && pass == 0));
                 cycle.drain(usize::MAX);
                 let state = runtime().heap.lock().unwrap();
                 assert_eq!(state.moved_objects - before, count as u64);
@@ -439,7 +448,23 @@ fn concurrent_minor_snapshot_and_relocation_scale_linearly() {
         for pass in 0..2 {
             PAGE_QUERIES.set(0);
             let before = runtime().heap.lock().unwrap().moved_objects;
+            let before_injected = cycle.queue.snapshot().injected;
+            let before_bytes = cycle.work.lock().unwrap().marked_bytes;
             collect_owned();
+            assert_eq!(
+                SNAPSHOT_DEDUP_KEYS.get(),
+                0,
+                "bitmap roots need no hash entries"
+            );
+            let publications = cycle.queue.snapshot().injected - before_injected;
+            assert_eq!(
+                publications, 0,
+                "minor already scanned generated inline layouts"
+            );
+            assert_eq!(
+                cycle.work.lock().unwrap().marked_bytes - before_bytes,
+                (count * bytes) as u64
+            );
             let queries = PAGE_QUERIES.get();
             assert!(queries <= 16 * count, "queries={queries}, nodes={count}");
             cycle.drain(usize::MAX);
@@ -449,10 +474,104 @@ fn concurrent_minor_snapshot_and_relocation_scale_linearly() {
             assert!(cycle.queue.snapshot().is_drained());
             verify_old_region_metadata(&state).unwrap();
             eprintln!(
-                "concurrent-minor nodes={count} pass={pass} page_queries={queries} copies={count} live_marks={count}"
+                "concurrent-minor nodes={count} pass={pass} page_queries={queries} copies={count} live_marks={count} publications={publications}"
             );
         }
         end(&cycle);
     }
     reset_internal();
+}
+
+#[test]
+fn post_snapshot_extent_publications_do_not_build_per_object_pending_sets() {
+    let _guard = runtime_test_guard();
+    for count in [100usize, 1_000, 10_000] {
+        reset_internal_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.pacer_trigger = u64::MAX;
+            state.pacer.disable_for_test();
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let elected = cycle_wait::CollectorGuard::try_acquire().unwrap();
+        let (_, cycle) = root_handshake::begin().unwrap();
+        let mut tls = tlab_state_for_test();
+        for _ in 0..count {
+            let young = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+            cycle.enqueue(young);
+        }
+        assert!(cycle.unindexed.lock().unwrap().is_empty());
+        assert!(cycle.queue.snapshot().is_drained());
+        collect_owned();
+        assert!(
+            cycle.queue.snapshot().is_drained(),
+            "leaf copies need no trace job"
+        );
+        assert_eq!(
+            cycle.work.lock().unwrap().marked_bytes,
+            (count * (GC_HEADER_SIZE + 8)) as u64
+        );
+        cycle.drain(usize::MAX);
+        assert_eq!(cycle.objects.marked_count(), count);
+        let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
+        sweep::concurrent(plan);
+        {
+            let state = runtime().heap.lock().unwrap();
+            assert_eq!(state.total_allocs - state.total_frees, count as u64);
+        }
+        drop(elected);
+        minor_collect_internal();
+        assert_eq!(runtime().heap.lock().unwrap().allocated_bytes, 0);
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn overlap_minor_inline_credit_publishes_old_descendants() {
+    let _guard = runtime_test_guard();
+    for count in [1usize, 100, 10_000] {
+        reset_internal_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.pacer_trigger = u64::MAX;
+            state.pacer.disable_for_test();
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let old_leaf = willow_alloc(8);
+        let old_parent = willow_gc_alloc_layout(2, 0, 8, 1);
+        unsafe {
+            *old_parent.cast::<*mut u8>() = old_leaf;
+        }
+        let elected = cycle_wait::CollectorGuard::try_acquire().unwrap();
+        let (_, cycle) = root_handshake::begin().unwrap();
+        assert!(!cycle.is_marked(old_parent as usize));
+        assert!(!cycle.is_marked(old_leaf as usize));
+        let mut tls = tlab_state_for_test();
+        let mut previous = old_parent;
+        for _ in 0..count {
+            let node = willow_gc_alloc_slow(&mut tls, 1, 0, 16, 3);
+            unsafe {
+                *node.cast::<*mut u8>() = previous;
+                *node.cast::<*mut u8>().add(1) = old_parent;
+            }
+            previous = node;
+        }
+        collect_owned();
+        // Repeated old edges still produce one claim/job, and tracing that
+        // old parent must keep its otherwise-unrooted old descendant alive.
+        assert!(cycle.is_marked(old_parent as usize));
+        cycle.drain(usize::MAX);
+        assert!(cycle.is_marked(old_leaf as usize));
+        assert!(cycle.queue.snapshot().is_drained());
+        let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
+        sweep::concurrent(plan);
+        {
+            let state = runtime().heap.lock().unwrap();
+            assert_eq!(state.total_allocs - state.total_frees, count as u64 + 2);
+        }
+        drop(elected);
+    }
+    reset_internal_for_test();
 }
