@@ -124,6 +124,7 @@ impl AsyncRwLock {
                 self.frame_refs.fetch_add(1, Ordering::AcqRel);
                 RwAcquire::Acquired(token)
             }
+            AcquireOutcome::Recursive => RwAcquire::Recursive,
             AcquireOutcome::Queued(token) => RwAcquire::Pending(token),
             AcquireOutcome::Ineligible => RwAcquire::Ineligible,
         }

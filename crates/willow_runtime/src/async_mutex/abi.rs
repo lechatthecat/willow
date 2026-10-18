@@ -98,8 +98,7 @@ unsafe fn mutex_from_raw<'a>(raw: *mut c_void) -> Option<&'a AsyncMutex> {
 /// The running task, or `None` outside any task. A lock statement is only legal
 /// inside an `async fn` (§6.1), so `None` means the caller is misusing the ABI.
 fn current_task() -> Option<RuntimeTaskId> {
-    let id = crate::scheduler::willow_sched_current_task();
-    (id != 0).then_some(id as RuntimeTaskId)
+    crate::scheduler::current_task()
 }
 
 #[unsafe(no_mangle)]
@@ -136,7 +135,23 @@ pub extern "C" fn willow_async_mutex_new(value: i64, is_ref: i64) -> *mut c_void
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_acquire(raw: *mut c_void, out_token: *mut i64) -> i32 {
-    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    acquire_impl(raw, out_token, std::ptr::null_mut())
+}
+
+/// Scalar lowering writes the existing 64-bit async-frame value slot in the
+/// acquire boundary. Reference/pair values keep the separately rooted load path.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_async_mutex_acquire_load(
+    raw: *mut c_void,
+    out_token: *mut i64,
+    out_value: *mut i64,
+) -> i32 {
+    acquire_impl(raw, out_token, out_value)
+}
+
+#[inline]
+fn acquire_impl(raw: *mut c_void, out_token: *mut i64, out_value: *mut i64) -> i32 {
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return MUTEX_STATUS_LOST;
     };
@@ -148,6 +163,11 @@ pub extern "C" fn willow_async_mutex_acquire(raw: *mut c_void, out_token: *mut i
     match mutex.acquire(task) {
         MutexAcquire::Acquired(token) => {
             store(token);
+            if !out_value.is_null() {
+                unsafe {
+                    *out_value = mutex.value.load(Ordering::Acquire);
+                }
+            }
             MUTEX_STATUS_ACQUIRED
         }
         MutexAcquire::Pending(token) => {
@@ -163,12 +183,34 @@ pub extern "C" fn willow_async_mutex_acquire(raw: *mut c_void, out_token: *mut i
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_poll(raw: *mut c_void, token: i64) -> i32 {
+    poll_impl(raw, token, std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_async_mutex_poll_load(
+    raw: *mut c_void,
+    token: i64,
+    out_value: *mut i64,
+) -> i32 {
+    poll_impl(raw, token, out_value)
+}
+
+#[inline]
+fn poll_impl(raw: *mut c_void, token: i64, out_value: *mut i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return MUTEX_STATUS_LOST;
     };
     match mutex.poll_acquire(task, token as RegistrationToken) {
-        MutexResume::Acquired => MUTEX_STATUS_ACQUIRED,
+        MutexResume::Acquired => {
+            if !out_value.is_null() {
+                unsafe {
+                    *out_value = mutex.value.load(Ordering::Acquire);
+                }
+            }
+            MUTEX_STATUS_ACQUIRED
+        }
         MutexResume::Pending => MUTEX_STATUS_PENDING,
         MutexResume::Lost => MUTEX_STATUS_LOST,
     }
@@ -197,12 +239,29 @@ pub extern "C" fn willow_async_mutex_commit(raw: *mut c_void, token: i64, value:
     mutex.commit(task, token as RegistrationToken, value) as i32
 }
 
+/// Commit and release a loaded frame in one ABI call. The original separate
+/// entry points remain available for callers that do not have a loaded value.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_async_mutex_commit_release(
+    raw: *mut c_void,
+    token: i64,
+    value: i64,
+) -> i32 {
+    let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
+        return 0;
+    };
+    matches!(
+        mutex.commit_release(task, token as RegistrationToken, value),
+        MutexRelease::Released { .. }
+    ) as i32
+}
+
 /// Release ownership and hand off. Returns 1 on success, 0 if the caller was not
 /// the owner (a stale or double release).
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_release(raw: *mut c_void, token: i64) -> i32 {
-    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return 0;
     };

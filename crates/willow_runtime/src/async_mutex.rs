@@ -53,9 +53,18 @@ use crate::lock_wait::{
     reconcile_cancelled_lock_wait,
 };
 use crate::task::RuntimeTaskId;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 mod abi;
+
+// Atomic admission switch. Low bits are a monotonic fast generation: odd
+// means owned, even means free. Queued contention closes atomic admission until the queue
+// empties. Reopening and slow-path registration share the backing state lock.
+const SLOW: u64 = 1 << 63;
+// Total pause-instruction budget, not a duration guarantee. Exponential
+// backoff caps shared-word reads at about 4K and avoids cache-line flooding.
+// Exhaustion closes admission and joins the unchanged FIFO scheduler queue.
+const MAX_SPIN_PAUSES: usize = 262_144;
 
 // Preserve the runtime API paths used by scheduler, GC, and generated-code tests.
 pub use abi::*;
@@ -139,20 +148,19 @@ pub enum ReclamationStatus {
 pub struct AsyncMutex {
     /// Boxed so its address is stable: task-side links hold it (§8.2.2).
     state: Box<AsyncLockState>,
+    fast: AtomicU64,
+    fast_owner: AtomicU64,
+    fast_published: AtomicU64,
+    value: AtomicI64,
     /// Identity copied into the moving/GC-managed handle. Every native pointer
     /// use validates this against the stable boxed state before dereference.
     expected_lock_id: LockId,
-    /// The protected word. Scalars by value, GC values as their pointer, the
-    /// same representation the blocking [`crate::lock`] cells use. Only a task
-    /// that has proved `(task, token)` ownership reads or writes it, so the
-    /// atomic is for publication between workers, not for mutual exclusion.
-    value: AtomicI64,
     /// Whether `value` is a GC pointer the collector must trace.
     is_ref: bool,
-    /// Frame-side ownership references (§15.1): incremented when a frame takes
-    /// ownership, decremented when it releases. A lock whose owner has loaded
-    /// the value is not reclaimable even for the instant `owner` is being
-    /// reassigned.
+    /// Queued-path frame ownership references (§15.1). Fast ownership uses
+    /// the held bit instead; `frame_refs()` includes both. The old frame's
+    /// reference is removed before reopening atomic admission, and a loaded
+    /// owner remains retained across a queued ownership transfer.
     frame_refs: AtomicUsize,
 }
 
@@ -162,12 +170,15 @@ impl AsyncMutex {
     }
 
     fn new_payload(value: i64, is_ref: bool) -> Self {
-        let state = AsyncLockState::new();
+        let state = AsyncLockState::new_fast_mutex_backing();
         let expected_lock_id = state.lock_id();
         Self {
             state,
-            expected_lock_id,
+            fast: AtomicU64::new(0),
+            fast_owner: AtomicU64::new(0),
+            fast_published: AtomicU64::new(0),
             value: AtomicI64::new(value),
+            expected_lock_id,
             is_ref,
             frame_refs: AtomicUsize::new(0),
         }
@@ -191,7 +202,25 @@ impl AsyncMutex {
     }
 
     pub fn owner(&self) -> Option<(RuntimeTaskId, RegistrationToken)> {
-        self.validated_state().owner()
+        self.validated_state();
+        loop {
+            let fast = self.fast.load(Ordering::Acquire);
+            if fast & 1 != 0 {
+                let token = fast & !SLOW;
+                if self.fast_published.load(Ordering::Acquire) != token {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let owner = self.fast_owner.load(Ordering::Relaxed);
+                if self.fast.load(Ordering::Acquire) & !SLOW == token {
+                    return Some((owner, token));
+                }
+            } else if fast & SLOW != 0 {
+                return self.state.owner().filter(|&(task, _)| task != 0);
+            } else {
+                return None;
+            }
+        }
     }
 
     pub fn queued_waiters(&self) -> Vec<RuntimeTaskId> {
@@ -203,7 +232,7 @@ impl AsyncMutex {
     }
 
     pub fn frame_refs(&self) -> usize {
-        self.frame_refs.load(Ordering::Acquire)
+        self.frame_refs.load(Ordering::Acquire) + (self.fast.load(Ordering::Acquire) & 1) as usize
     }
 
     /// Attempt to acquire for `task` (§8.5).
@@ -212,40 +241,126 @@ impl AsyncMutex {
     /// thread of execution, so it cannot race with itself here, and answering
     /// before publishing anything keeps a rejected recursive acquire from
     /// leaving a queue entry behind.
+    #[inline]
     pub fn acquire(&self, task: RuntimeTaskId) -> MutexAcquire {
-        if self.holds_or_awaits(task) {
-            return MutexAcquire::Recursive;
+        let fast = self.fast.load(Ordering::Relaxed);
+        if fast & (SLOW | 1) == 0
+            && fast < SLOW - 2
+            && self
+                .fast
+                .compare_exchange(fast, fast + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.fast_owner.store(task, Ordering::Relaxed);
+            self.fast_published.store(fast + 1, Ordering::Release);
+            return MutexAcquire::Acquired(fast + 1);
         }
-        // One critical section, not a try-then-register pair: see
-        // `AsyncLockState::acquire_or_register` for the lost-wakeup window that
-        // splitting it opens.
-        match self.validated_state().acquire_or_register(task) {
-            AcquireOutcome::Acquired(token) => {
-                // Idle -> ValueLoaded: no park, no reverse link, so there is
-                // nothing for a cancellation to find in the task table.
-                self.frame_refs.fetch_add(1, Ordering::AcqRel);
-                MutexAcquire::Acquired(token)
+        self.acquire_slow(task)
+    }
+
+    #[cold]
+    fn acquire_slow(&self, task: RuntimeTaskId) -> MutexAcquire {
+        self.validated_state();
+        let spin_limit = if crate::scheduler::lock_spinning_allowed(task) {
+            MAX_SPIN_PAUSES
+        } else {
+            0
+        };
+        let mut spins = 0;
+        let mut backoff = 1;
+        let mut fast = self.fast.load(Ordering::Acquire);
+        loop {
+            if fast & SLOW != 0 {
+                let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+                if self.is_fast_owner(task) {
+                    return MutexAcquire::Recursive;
+                }
+                if let Some(outcome) = self
+                    .state
+                    .acquire_mutex_if(task, || self.fast.load(Ordering::Acquire) & SLOW != 0)
+                {
+                    return match outcome {
+                        AcquireOutcome::Acquired(token) => {
+                            self.frame_refs.fetch_add(1, Ordering::AcqRel);
+                            MutexAcquire::Acquired(token)
+                        }
+                        AcquireOutcome::Queued(token) => MutexAcquire::Pending(token),
+                        AcquireOutcome::Recursive => MutexAcquire::Recursive,
+                        AcquireOutcome::Ineligible => MutexAcquire::Ineligible,
+                    };
+                }
+                fast = self.fast.load(Ordering::Acquire);
+                continue;
             }
-            AcquireOutcome::Queued(token) => MutexAcquire::Pending(token),
-            AcquireOutcome::Ineligible => MutexAcquire::Ineligible,
+            if fast & 1 == 0 {
+                if fast == SLOW - 2 {
+                    crate::panic_context::fatal_invariant("Mutex fast token space exhausted");
+                }
+                match self.fast.compare_exchange_weak(
+                    fast,
+                    fast + 1,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        self.fast_owner.store(task, Ordering::Relaxed);
+                        self.fast_published.store(fast + 1, Ordering::Release);
+                        return MutexAcquire::Acquired(fast + 1);
+                    }
+                    Err(current) => {
+                        fast = current;
+                        continue;
+                    }
+                }
+            }
+            if self.fast_published.load(Ordering::Acquire) == fast
+                && self.fast_owner.load(Ordering::Relaxed) == task
+            {
+                return MutexAcquire::Recursive;
+            }
+            if spins < spin_limit {
+                let pauses = backoff.min(spin_limit - spins);
+                for _ in 0..pauses {
+                    std::hint::spin_loop();
+                }
+                spins += pauses;
+                backoff = (backoff * 2).min(64);
+                fast = self.fast.load(Ordering::Acquire);
+                continue;
+            }
+            // The backing sentinel already closes admission. The fast owner
+            // either releases before this CAS (retry), or observes SLOW and
+            // releases the sentinel, progressing any registered waiter.
+            match self.fast.compare_exchange_weak(
+                fast,
+                fast | SLOW,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => fast |= SLOW,
+                Err(current) => fast = current,
+            }
         }
     }
 
-    /// Whether `task` already owns this mutex or is queued on it (§11).
-    fn holds_or_awaits(&self, task: RuntimeTaskId) -> bool {
-        if matches!(self.validated_state().owner(), Some((owner, _)) if owner == task) {
-            return true;
-        }
-        matches!(lock_wait_link_of(task), Some(link) if link.lock_id == self.lock_id())
+    /// Fast-owner recursion; slow ownership and membership are checked under
+    /// the backing admission lock in `acquire_mutex_if`.
+    fn is_fast_owner(&self, task: RuntimeTaskId) -> bool {
+        let fast = self.fast.load(Ordering::Acquire);
+        fast & 1 != 0
+            && self.fast_published.load(Ordering::Acquire) == fast & !SLOW
+            && self.fast_owner.load(Ordering::Relaxed) == task
+        // Slow owner/queue recursion is checked under the admission lock.
     }
 
     /// Re-poll a pending acquire (§8.7). `token` is the one `acquire` returned.
     pub fn poll_acquire(&self, task: RuntimeTaskId, token: RegistrationToken) -> MutexResume {
-        if consume_handoff(task, self.lock_id(), token) {
-            // HandoffOwned -> ValueLoaded. The reverse link is gone, so a late
-            // `Waiting` cleanup cannot run against this generation.
-            self.frame_refs.fetch_add(1, Ordering::AcqRel);
-            return MutexResume::Acquired;
+        if token < SLOW {
+            return if self.is_owner(task, token) {
+                MutexResume::Acquired
+            } else {
+                MutexResume::Lost
+            };
         }
         match lock_wait_link_of(task) {
             Some(link) if link.lock_id == self.lock_id() && link.token == token => {
@@ -253,21 +368,41 @@ impl AsyncMutex {
                     // Still queued: a spurious wake, or a wake for a different
                     // wait. Park again.
                     LockWaitPhase::Waiting => MutexResume::Pending,
-                    // Promoted but not consumable: the lock-side reservation no
-                    // longer matches, so this generation is dead.
-                    LockWaitPhase::HandoffOwned => MutexResume::Lost,
+                    // Inspect the phase BEFORE consuming. A handoff between a
+                    // failed consume and a later phase read is still live, not
+                    // Lost (concurrent repeated-poll regression).
+                    LockWaitPhase::HandoffOwned => {
+                        if consume_handoff(task, self.lock_id(), token) {
+                            self.frame_refs.fetch_add(1, Ordering::AcqRel);
+                            MutexResume::Acquired
+                        } else {
+                            MutexResume::Lost
+                        }
+                    }
                 }
             }
             // An uncontended acquire has no link; ownership alone is proof.
-            _ if self.validated_state().owner() == Some((task, token)) => MutexResume::Acquired,
+            _ if self.is_owner(task, token) => MutexResume::Acquired,
             _ => MutexResume::Lost,
+        }
+    }
+
+    #[inline(always)]
+    fn is_owner(&self, task: RuntimeTaskId, token: RegistrationToken) -> bool {
+        if token < SLOW {
+            token & 1 != 0
+                && self.fast.load(Ordering::Acquire) & !SLOW == token
+                && self.fast_published.load(Ordering::Acquire) == token
+                && self.fast_owner.load(Ordering::Relaxed) == task
+        } else {
+            self.validated_state().exclusive_owner_is(task, token)
         }
     }
 
     /// Read the protected value. `None` unless `(task, token)` owns the lock —
     /// a `Waiting` or stale caller must never observe it (§8.4).
     pub fn load(&self, task: RuntimeTaskId, token: RegistrationToken) -> Option<i64> {
-        if self.validated_state().owner() != Some((task, token)) {
+        if !self.is_owner(task, token) {
             return None;
         }
         Some(self.value.load(Ordering::Acquire))
@@ -276,9 +411,15 @@ impl AsyncMutex {
     /// Write the protected value back. Same ownership proof as [`Self::load`];
     /// a stale generation cannot commit over the current owner's work.
     pub fn commit(&self, task: RuntimeTaskId, token: RegistrationToken, value: i64) -> bool {
-        if self.validated_state().owner() != Some((task, token)) {
+        if !self.is_owner(task, token) {
             return false;
         }
+        self.store_owned(value);
+        true
+    }
+
+    #[inline]
+    fn store_owned(&self, value: i64) {
         if self.is_ref {
             crate::gc::willow_gc_write_barrier(
                 self as *const Self as *mut u8,
@@ -288,7 +429,6 @@ impl AsyncMutex {
             );
         }
         self.value.store(value, Ordering::Release);
-        true
     }
 
     /// Release ownership and hand the lock directly to the next valid waiter
@@ -298,15 +438,90 @@ impl AsyncMutex {
     /// `Terminal` wake by revoking the exact reservation and continuing the
     /// scan, so a dying waiter cannot swallow the lock.
     pub fn release(&self, task: RuntimeTaskId, token: RegistrationToken) -> MutexRelease {
-        if !self.validated_state().release_owner(task, token) {
+        if token < SLOW {
+            if !self.is_owner(task, token) {
+                return MutexRelease::NotOwner;
+            }
+            return self.release_fast(token);
+        }
+        self.release_queued(task, token, true)
+    }
+
+    #[inline]
+    fn commit_release(
+        &self,
+        task: RuntimeTaskId,
+        token: RegistrationToken,
+        value: i64,
+    ) -> MutexRelease {
+        if !self.is_owner(task, token) {
             return MutexRelease::NotOwner;
         }
-        self.release_frame_ref();
-        let handed_to = self
+        self.store_owned(value);
+        if token < SLOW {
+            self.release_fast(token)
+        } else {
+            self.release_queued(task, token, true)
+        }
+    }
+
+    #[inline]
+    fn release_fast(&self, token: RegistrationToken) -> MutexRelease {
+        match self
+            .fast
+            .compare_exchange(token, token + 1, Ordering::Release, Ordering::Relaxed)
+        {
+            Ok(_) => MutexRelease::Released { handed_to: None },
+            Err(current) if current == token | SLOW => {
+                // No new fast acquisition is possible after SLOW. Clear
+                // the fast frame reference before opening the FIFO gate.
+                if self
+                    .fast
+                    .compare_exchange(
+                        current,
+                        SLOW | (token + 1),
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_err()
+                {
+                    return MutexRelease::NotOwner;
+                }
+                self.release_queued(0, 0, false)
+            }
+            Err(_) => MutexRelease::NotOwner,
+        }
+    }
+
+    fn release_queued(
+        &self,
+        task: RuntimeTaskId,
+        token: RegistrationToken,
+        frame: bool,
+    ) -> MutexRelease {
+        let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+        let reopened = self
             .validated_state()
-            .handoff_to_next_waiter_and_wake()
-            .map(|(next, _)| next);
-        MutexRelease::Released { handed_to }
+            .release_mutex_or_reopen(task, token, || {
+                if frame {
+                    self.release_frame_ref();
+                }
+                self.fast.fetch_and(!SLOW, Ordering::Release);
+            });
+        match reopened {
+            None => MutexRelease::NotOwner,
+            Some(true) => MutexRelease::Released { handed_to: None },
+            Some(false) => {
+                if frame {
+                    self.release_frame_ref();
+                }
+                let handed_to = self
+                    .state
+                    .handoff_to_next_waiter_and_wake()
+                    .map(|(next, _)| next);
+                MutexRelease::Released { handed_to }
+            }
+        }
     }
 
     /// Release a frame-side ownership reference without underflowing. A double
@@ -324,6 +539,19 @@ impl AsyncMutex {
     /// assertion: a release build that frees a retained state produces a
     /// use-after-free of some task's reverse link.
     pub fn reclamation_status(&self) -> ReclamationStatus {
+        let fast = self.fast.load(Ordering::Acquire);
+        if fast & SLOW == 0 {
+            self.validated_state();
+            return if fast & 1 == 0 {
+                ReclamationStatus::Reclaimable
+            } else {
+                ReclamationStatus::Retained {
+                    owned: true,
+                    waiters: 0,
+                    frame_refs: 1,
+                }
+            };
+        }
         let frame_refs = self.frame_refs();
         let waiters = self.waiter_count();
         let state = self.validated_state();

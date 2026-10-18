@@ -288,9 +288,12 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // re-identify its own generation after a wake.
     ALLOC; "willow_async_mutex_new" => ([Word, I64] -> Some(Ptr));
     SUSPEND; "willow_async_mutex_acquire" => ([Ptr, Ptr] -> Some(I32));
+    SUSPEND; "willow_async_mutex_acquire_load" => ([Ptr, Ptr, Ptr] -> Some(I32));
+    SUSPEND; "willow_async_mutex_poll_load" => ([Ptr, I64, Ptr] -> Some(I32));
     SUSPEND; "willow_async_mutex_poll" => ([Ptr, I64] -> Some(I32));
     NONE; "willow_async_mutex_load" => ([Ptr, I64] -> Some(Word));
     NONE; "willow_async_mutex_commit" => ([Ptr, I64, Word] -> Some(I32));
+    NONE; "willow_async_mutex_commit_release" => ([Ptr, I64, Word] -> Some(I32));
     NONE; "willow_async_mutex_release" => ([Ptr, I64] -> Some(I32));
     NONE; "willow_async_mutex_cancel" => ([] -> Some(I32));
     PANIC_ALLOC; "willow_async_mutex_recursive_panic" => ([Ptr, I32, I32] -> None);

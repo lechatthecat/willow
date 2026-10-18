@@ -1657,3 +1657,292 @@ fn scheduler_aware_lock_benchmark_reports_stage7_metrics() {
         memory_after,
     );
 }
+
+#[test]
+fn fast_mutex_generation_scaling_has_two_transitions_per_section() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let task = parked_task();
+    for n in [1, 8, 64, 512, 4096] {
+        let mutex = AsyncMutex::new(0, false);
+        for i in 0..n {
+            let token = acquire_now(&mutex, task);
+            assert_eq!(token, 2 * i + 1);
+            assert_eq!(mutex.frame_refs(), 1);
+            assert!(mutex.commit(task, token, i as i64 + 1));
+            assert!(matches!(
+                mutex.release(task, token),
+                MutexRelease::Released { handed_to: None }
+            ));
+            assert_eq!(mutex.load(task, token), None);
+            assert_eq!(mutex.frame_refs(), 0);
+        }
+        assert_eq!(mutex.fast.load(Ordering::Relaxed), 2 * n);
+        assert_eq!(mutex.reclamation_status(), ReclamationStatus::Reclaimable);
+        println!(
+            "sections={n} successful_fast_transitions={} waiters={}",
+            2 * n,
+            mutex.waiter_count()
+        );
+    }
+}
+
+#[test]
+fn fast_mutex_reopens_after_fifo_drain_without_reusing_tokens() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let mutex = AsyncMutex::new(0, false);
+    let a = parked_task();
+    let b = parked_task();
+    let mut previous_fast = 0;
+    let mut previous_slow = 0;
+    for _ in 0..64 {
+        let fast = acquire_now(&mutex, a);
+        assert!(fast > previous_fast && fast < crate::async_mutex::SLOW);
+        let slow = queue_on(&mutex, b);
+        assert!(slow > previous_slow && slow >= crate::async_mutex::SLOW);
+        assert_eq!(
+            mutex.release(a, fast),
+            MutexRelease::Released { handed_to: Some(b) }
+        );
+        assert_eq!(mutex.poll_acquire(b, slow), MutexResume::Acquired);
+        assert!(!mutex.commit(a, fast, -1));
+        assert_eq!(
+            mutex.release(b, slow),
+            MutexRelease::Released { handed_to: None }
+        );
+        assert_eq!(
+            mutex.fast.load(Ordering::Relaxed) & crate::async_mutex::SLOW,
+            0
+        );
+        assert!(!mutex.commit(b, slow, -1));
+        assert_eq!(mutex.release(b, slow), MutexRelease::NotOwner);
+        previous_fast = fast;
+        previous_slow = slow;
+    }
+}
+
+#[test]
+fn fast_mutex_publication_window_does_not_report_false_recursion() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let mutex = AsyncMutex::new(0, false);
+    let previous = parked_task();
+    let next = parked_task();
+    let token = acquire_now(&mutex, previous);
+    assert_eq!(
+        mutex.release(previous, token),
+        MutexRelease::Released { handed_to: None }
+    );
+    // Pause the next acquire exactly between its successful CAS and publishing
+    // its task id. The old task must queue, not see its previous id as recursive.
+    assert_eq!(
+        mutex
+            .fast
+            .compare_exchange(2, 3, Ordering::Acquire, Ordering::Relaxed),
+        Ok(2)
+    );
+    assert_eq!(mutex.load(previous, 3), None);
+    let waiting = queue_on(&mutex, previous);
+    mutex.fast_owner.store(next, Ordering::Relaxed);
+    mutex.fast_published.store(3, Ordering::Release);
+    assert_eq!(
+        mutex.release(next, 3),
+        MutexRelease::Released {
+            handed_to: Some(previous)
+        }
+    );
+    assert_eq!(mutex.poll_acquire(previous, waiting), MutexResume::Acquired);
+    assert_eq!(
+        mutex.release(previous, waiting),
+        MutexRelease::Released { handed_to: None }
+    );
+}
+
+#[test]
+fn fast_mutex_failed_and_stale_admission_leave_no_hidden_waiter() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let mutex = AsyncMutex::new(0, false);
+    let owner = parked_task();
+    let dead = parked_task();
+    make_terminal(dead);
+    let token = acquire_now(&mutex, owner);
+    assert_eq!(mutex.acquire(dead), MutexAcquire::Ineligible);
+    assert_eq!(
+        mutex.release(owner, token),
+        MutexRelease::Released { handed_to: None }
+    );
+    let arrival = parked_task();
+    assert_eq!(mutex.state.acquire_mutex_if(arrival, || false), None);
+    assert_eq!(mutex.waiter_count(), 0);
+    assert!(lock_wait_link_of(arrival).is_none());
+    let token = acquire_now(&mutex, arrival);
+    assert!(token < crate::async_mutex::SLOW);
+    assert_eq!(
+        mutex.release(arrival, token),
+        MutexRelease::Released { handed_to: None }
+    );
+}
+
+#[test]
+fn fast_mutex_concurrent_reopening_preserves_exclusion_and_sum() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let mutex = AsyncMutex::new(0, false);
+    let tasks: Vec<_> = (0..8)
+        .map(|_| {
+            let task = parked_task();
+            make_running(task);
+            task
+        })
+        .collect();
+    let inside = AtomicUsize::new(0);
+    let start = Barrier::new(tasks.len());
+    std::thread::scope(|scope| {
+        for &task in &tasks {
+            let mutex = &mutex;
+            let inside = &inside;
+            let start = &start;
+            scope.spawn(move || {
+                start.wait();
+                for _ in 0..1000 {
+                    let token = match mutex.acquire(task) {
+                        MutexAcquire::Acquired(token) => token,
+                        MutexAcquire::Pending(token) => {
+                            loop {
+                                match mutex.poll_acquire(task, token) {
+                                    MutexResume::Acquired => break,
+                                    MutexResume::Pending => std::thread::yield_now(),
+                                    MutexResume::Lost => panic!("lost live reservation"),
+                                }
+                            }
+                            token
+                        }
+                        other => panic!("unexpected acquire: {other:?}"),
+                    };
+                    assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0);
+                    let value = mutex.load(task, token).expect("owner");
+                    assert!(mutex.commit(task, token, value + 1));
+                    assert_eq!(inside.fetch_sub(1, Ordering::SeqCst), 1);
+                    assert!(matches!(
+                        mutex.release(task, token),
+                        MutexRelease::Released { .. }
+                    ));
+                }
+            });
+        }
+    });
+    let token = acquire_now(&mutex, tasks[0]);
+    assert_eq!(mutex.load(tasks[0], token), Some(8000));
+    assert_eq!(
+        mutex.release(tasks[0], token),
+        MutexRelease::Released { handed_to: None }
+    );
+    assert_eq!(mutex.reclamation_status(), ReclamationStatus::Reclaimable);
+}
+
+#[test]
+fn fused_commit_release_rejects_stale_and_wrong_owner() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    willow_gc_init();
+    let raw = willow_async_mutex_new(0, 0);
+    let a = parked_task();
+    let b = parked_task();
+    let mut token = 0;
+    with_current_task_for_test(a, || {
+        assert_eq!(
+            willow_async_mutex_acquire(raw, &mut token),
+            MUTEX_STATUS_ACQUIRED
+        );
+    });
+    with_current_task_for_test(b, || {
+        assert_eq!(willow_async_mutex_commit_release(raw, token, 99), 0);
+    });
+    with_current_task_for_test(a, || {
+        assert_eq!(willow_async_mutex_commit_release(raw, token, 42), 1);
+        assert_eq!(willow_async_mutex_commit_release(raw, token, 99), 0);
+        assert_eq!(
+            willow_async_mutex_commit_release(std::ptr::null_mut(), token, 99),
+            0
+        );
+        assert_eq!(
+            willow_async_mutex_acquire(raw, &mut token),
+            MUTEX_STATUS_ACQUIRED
+        );
+        assert_eq!(willow_async_mutex_load(raw, token), 42);
+        assert_eq!(willow_async_mutex_release(raw, token), 1);
+    });
+}
+
+#[test]
+fn fused_scalar_acquire_and_poll_write_only_on_success() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let raw = willow_async_mutex_new(7, 0);
+    let a = parked_task();
+    let b = parked_task();
+    let mut ta = 0;
+    let mut tb = 0;
+    let mut value = -99;
+    with_current_task_for_test(a, || {
+        assert_eq!(
+            willow_async_mutex_acquire_load(raw, &mut ta, &mut value),
+            MUTEX_STATUS_ACQUIRED
+        );
+        assert_eq!(value, 7);
+        value = -99;
+        assert_eq!(
+            willow_async_mutex_acquire_load(raw, &mut ta, &mut value),
+            MUTEX_STATUS_RECURSIVE
+        );
+        assert_eq!(value, -99);
+    });
+    with_current_task_for_test(b, || {
+        assert_eq!(
+            willow_async_mutex_acquire_load(raw, &mut tb, &mut value),
+            MUTEX_STATUS_PENDING
+        );
+        assert_eq!(value, -99);
+        assert_eq!(
+            willow_async_mutex_poll_load(raw, tb, &mut value),
+            MUTEX_STATUS_PENDING
+        );
+        assert_eq!(value, -99);
+    });
+    with_current_task_for_test(a, || {
+        assert_eq!(willow_async_mutex_commit_release(raw, ta, 42), 1);
+    });
+    with_current_task_for_test(b, || {
+        assert_eq!(
+            willow_async_mutex_poll_load(raw, tb, &mut value),
+            MUTEX_STATUS_ACQUIRED
+        );
+        assert_eq!(value, 42);
+        assert_eq!(willow_async_mutex_release(raw, tb), 1);
+        value = -99;
+        assert_eq!(
+            willow_async_mutex_poll_load(raw, tb, &mut value),
+            MUTEX_STATUS_LOST
+        );
+        assert_eq!(value, -99);
+        assert_eq!(
+            willow_async_mutex_acquire_load(std::ptr::null_mut(), &mut tb, &mut value),
+            MUTEX_STATUS_LOST
+        );
+        assert_eq!(value, -99);
+    });
+}
+
+#[test]
+fn fast_mutex_single_worker_and_off_task_never_spin() {
+    let _guard = runtime_test_guard();
+    let _single = single_worker_for_test();
+    reset_global_scheduler_for_test();
+    let task = parked_task();
+    assert!(!crate::scheduler::lock_spinning_allowed(task));
+    with_current_task_for_test(task, || {
+        assert!(!crate::scheduler::lock_spinning_allowed(task));
+    });
+}

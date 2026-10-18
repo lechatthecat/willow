@@ -156,6 +156,7 @@ const WORD_PINS: &[(&str, &[AbiTy], Option<AbiTy>)] = &[
     ("willow_array_set", &[Ptr, I64, Word], None),
     ("willow_array_push", &[Ptr, Word], None),
     ("willow_array_push_scalar_pairs", &[Ptr, Word], None),
+    ("willow_array_push_owned_pair", &[Ptr, Word], None),
     ("willow_array_pop", &[Ptr], Some(Word)),
     // (map, key_word, key_is_ref, val_word, val_is_ref): the flag for a word
     // follows that word. The old schema `[Ptr, Word, Word, I64, I64]` only
@@ -178,6 +179,11 @@ const WORD_PINS: &[(&str, &[AbiTy], Option<AbiTy>)] = &[
     ("willow_async_mutex_new", &[Word, I64], Some(Ptr)),
     ("willow_async_mutex_load", &[Ptr, I64], Some(Word)),
     ("willow_async_mutex_commit", &[Ptr, I64, Word], Some(I32)),
+    (
+        "willow_async_mutex_commit_release",
+        &[Ptr, I64, Word],
+        Some(I32),
+    ),
     ("willow_async_rwlock_new", &[Word, I64], Some(Ptr)),
     ("willow_async_rwlock_load", &[Ptr, I64], Some(Word)),
     ("willow_async_rwlock_commit", &[Ptr, I64, Word], Some(I32)),
@@ -189,6 +195,7 @@ fn word_carrying_rows_keep_i64_payload_types_in_rust() {
     let _: extern "C" fn(*mut u8, i64, i64) = array::willow_array_set;
     let _: extern "C" fn(*mut u8, i64) = array::willow_array_push;
     let _: extern "C" fn(*mut u8, i64) = array::willow_array_push_scalar_pairs;
+    let _: extern "C" fn(*mut u8, i64) = array::willow_array_push_owned_pair;
     let _: extern "C" fn(*mut u8) -> i64 = array::willow_array_pop;
     let _: extern "C" fn(*mut u8, i64, i64, i64, i64) = map::willow_map_insert;
     let _: extern "C" fn(*mut u8, i64, i64, i64) -> *mut u8 = map::willow_map_get;
@@ -203,6 +210,8 @@ fn word_carrying_rows_keep_i64_payload_types_in_rust() {
     let _: extern "C" fn(i64, i64) -> *mut c_void = async_mutex::willow_async_mutex_new;
     let _: extern "C" fn(*mut c_void, i64) -> i64 = async_mutex::willow_async_mutex_load;
     let _: extern "C" fn(*mut c_void, i64, i64) -> i32 = async_mutex::willow_async_mutex_commit;
+    let _: extern "C" fn(*mut c_void, i64, i64) -> i32 =
+        async_mutex::willow_async_mutex_commit_release;
     let _: extern "C" fn(i64, i64) -> *mut c_void = async_rwlock::willow_async_rwlock_new;
     let _: extern "C" fn(*mut c_void, i64) -> i64 = async_rwlock::willow_async_rwlock_load;
     let _: extern "C" fn(*mut c_void, i64, i64) -> i32 = async_rwlock::willow_async_rwlock_commit;
@@ -597,4 +606,18 @@ fn task_frame_diagnostics_are_void_and_may_block_on_output() {
             .effects,
         willow_abi::RuntimeEffects::MAY_BLOCK
     );
+}
+
+#[test]
+fn fused_mutex_out_slots_have_native_pointer_signatures() {
+    let _: extern "C" fn(*mut c_void, *mut i64, *mut i64) -> i32 =
+        async_mutex::willow_async_mutex_acquire_load;
+    let _: extern "C" fn(*mut c_void, i64, *mut i64) -> i32 =
+        async_mutex::willow_async_mutex_poll_load;
+    assert_schema(
+        "willow_async_mutex_acquire_load",
+        &[Ptr, Ptr, Ptr],
+        Some(I32),
+    );
+    assert_schema("willow_async_mutex_poll_load", &[Ptr, I64, Ptr], Some(I32));
 }

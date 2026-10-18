@@ -162,6 +162,8 @@ unsafe fn state_of(link: &LockWaitLink) -> &AsyncLockState {
 pub struct AsyncLockState {
     lock_id: LockId,
     kind: LockStateKind,
+    exclusive_token: AtomicU64,
+    exclusive_task: AtomicU64,
     /// Short critical sections only. Per §8.1 this native mutex is never held
     /// across a user critical section, a task park, a scheduler wake, or a GC
     /// safepoint wait.
@@ -256,6 +258,8 @@ fn fresh_token(inner: &mut LockStateInner) -> RegistrationToken {
 /// "take it or queue for it" step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquireOutcome {
+    /// The exclusive caller already owns or is queued on this mutex.
+    Recursive,
     /// Nobody owned the lock and nobody was queued: ownership is now this
     /// task's, with no park and no reverse link.
     Acquired(RegistrationToken),
@@ -301,6 +305,19 @@ impl AsyncLockState {
         Self::new_kind(LockStateKind::Mutex)
     }
 
+    /// Queue backing an atomic fast mutex. The sentinel prevents slow arrivals
+    /// from acquiring until the last fast owner releases it. Slow generations
+    /// occupy the upper half of the token space, disjoint from fast tokens.
+    pub(crate) fn new_fast_mutex_backing() -> Box<Self> {
+        let state = Self::new();
+        {
+            let mut inner = state.inner();
+            state.set_exclusive_owner(&mut inner, Some((0, 0)));
+            inner.next_token = 1 << 63;
+        }
+        state
+    }
+
     /// A fresh reader/writer state.  It shares the exact same waiter/link/token
     /// protocol as `Mutex`, but admission and handoff are mode-aware.
     pub fn new_rwlock() -> Box<Self> {
@@ -311,6 +328,8 @@ impl AsyncLockState {
         Box::new(Self {
             lock_id: next_lock_id(),
             kind,
+            exclusive_token: AtomicU64::new(0),
+            exclusive_task: AtomicU64::new(0),
             inner: StdMutex::with_base(LockStateInner::default(), size_of::<Self>()),
         })
     }
@@ -323,6 +342,32 @@ impl AsyncLockState {
     /// the lifetime invariant (§8.2.2) is responsible for.
     pub fn stable_ptr(&self) -> NonNull<AsyncLockState> {
         NonNull::from(self)
+    }
+
+    fn set_exclusive_owner(
+        &self,
+        inner: &mut LockStateInner,
+        owner: Option<(RuntimeTaskId, RegistrationToken)>,
+    ) {
+        inner.owner = owner;
+        if let Some((task, token)) = owner {
+            self.exclusive_task.store(task, Ordering::Relaxed);
+            self.exclusive_token.store(token, Ordering::Release);
+        } else {
+            self.exclusive_token.store(0, Ordering::Release);
+        }
+    }
+
+    /// Read the published exclusive generation without taking the queue lock.
+    /// Handoff consumption still checks both sides under the normal lock order.
+    pub(crate) fn exclusive_token_is(&self, token: RegistrationToken) -> bool {
+        token != 0 && self.exclusive_token.load(Ordering::Acquire) == token
+    }
+
+    pub(crate) fn exclusive_owner_is(&self, task: RuntimeTaskId, token: RegistrationToken) -> bool {
+        self.exclusive_token_is(token)
+            && self.exclusive_task.load(Ordering::Relaxed) == task
+            && self.exclusive_token_is(token)
     }
 
     fn inner(&self) -> MutexGuard<'_, LockStateInner> {
@@ -343,7 +388,7 @@ impl AsyncLockState {
             return None;
         }
         let token = fresh_token(&mut inner);
-        inner.owner = Some((task, token));
+        self.set_exclusive_owner(&mut inner, Some((task, token)));
         Some(token)
     }
 
@@ -401,6 +446,35 @@ impl AsyncLockState {
         access: LockAccess,
     ) -> AcquireOutcome {
         let mut inner = self.inner();
+        self.acquire_or_register_locked(&mut inner, task, access)
+    }
+
+    /// Test the fast/queued admission gate while holding the same state lock
+    /// as release/reopening. A stale slow-path arrival must retry, not queue
+    /// behind a sentinel whose fast owner does not know it has waiters.
+    pub(crate) fn acquire_mutex_if(
+        &self,
+        task: RuntimeTaskId,
+        admitted: impl FnOnce() -> bool,
+    ) -> Option<AcquireOutcome> {
+        let mut inner = self.inner();
+        if !admitted() {
+            return None;
+        }
+        if matches!(inner.owner, Some((owner, _)) if owner == task)
+            || inner.tokens.contains_key(&task)
+        {
+            return Some(AcquireOutcome::Recursive);
+        }
+        Some(self.acquire_or_register_locked(&mut inner, task, LockAccess::Mutex))
+    }
+
+    fn acquire_or_register_locked(
+        &self,
+        inner: &mut MutexGuard<'_, LockStateInner>,
+        task: RuntimeTaskId,
+        access: LockAccess,
+    ) -> AcquireOutcome {
         let immediately_available = inner.waiters.is_empty()
             && inner.owner.is_none()
             && match access {
@@ -410,18 +484,18 @@ impl AsyncLockState {
         if immediately_available {
             // No reverse link: an uncontended acquire never parks, so its phase
             // lives only in the frame and a cancellation has nothing to find.
-            let token = fresh_token(&mut inner);
+            let token = fresh_token(inner);
             match access {
                 LockAccess::Read => {
                     inner.readers.insert(task, token);
                 }
                 LockAccess::Mutex | LockAccess::Write => {
-                    inner.owner = Some((task, token));
+                    self.set_exclusive_owner(inner, Some((task, token)));
                 }
             }
             return AcquireOutcome::Acquired(token);
         }
-        match self.register_waiter_locked(&mut inner, task, access) {
+        match self.register_waiter_locked(inner, task, access) {
             Some(token) => AcquireOutcome::Queued(token),
             None => AcquireOutcome::Ineligible,
         }
@@ -519,7 +593,7 @@ impl AsyncLockState {
                     inner.readers.insert(task, token);
                 }
                 LockAccess::Mutex | LockAccess::Write => {
-                    inner.owner = Some((task, token));
+                    self.set_exclusive_owner(&mut inner, Some((task, token)));
                 }
             }) {
                 accepted.push((task, token, access));
@@ -623,7 +697,7 @@ impl AsyncLockState {
                     inner.readers.remove(&task);
                 }
                 LockAccess::Mutex | LockAccess::Write if inner.owner == Some((task, token)) => {
-                    inner.owner = None;
+                    self.set_exclusive_owner(&mut inner, None);
                 }
                 _ => {}
             }
@@ -637,10 +711,33 @@ impl AsyncLockState {
     pub fn release_owner(&self, task: RuntimeTaskId, token: RegistrationToken) -> bool {
         let mut inner = self.inner();
         if inner.owner == Some((task, token)) {
-            inner.owner = None;
+            self.set_exclusive_owner(&mut inner, None);
             return true;
         }
         false
+    }
+
+    /// Release a queued-mode mutex; reopen atomic admission only when the
+    /// queue is empty. The sentinel and the admission word change under the
+    /// same lock used by `acquire_mutex_if`. Returns whether it reopened.
+    pub(crate) fn release_mutex_or_reopen(
+        &self,
+        task: RuntimeTaskId,
+        token: RegistrationToken,
+        reopen: impl FnOnce(),
+    ) -> Option<bool> {
+        let mut inner = self.inner();
+        if inner.owner != Some((task, token)) {
+            return None;
+        }
+        if inner.waiters.is_empty() {
+            self.set_exclusive_owner(&mut inner, Some((0, 0)));
+            reopen();
+            Some(true)
+        } else {
+            self.set_exclusive_owner(&mut inner, None);
+            Some(false)
+        }
     }
 
     /// Release an exact shared owner.
@@ -786,7 +883,9 @@ pub(crate) fn reconcile_cancelled_lock_wait(
                     LockAccess::Read => {
                         inner.readers.remove(&task);
                     }
-                    LockAccess::Mutex | LockAccess::Write => inner.owner = None,
+                    LockAccess::Mutex | LockAccess::Write => {
+                        state.set_exclusive_owner(&mut inner, None)
+                    }
                 }
                 LockCancelOutcome::ReleasedOwnership {
                     lock_id: link.lock_id,

@@ -93,6 +93,11 @@ mod tests {
                 Some(types::I32),
             ),
             (
+                "willow_async_mutex_commit_release",
+                vec![types::I32, types::I64, types::I64],
+                Some(types::I32),
+            ),
+            (
                 "willow_channel_send_ptr",
                 vec![types::I32, types::I32],
                 None,
@@ -292,6 +297,9 @@ mod tests {
         );
         for name in [
             "willow_async_mutex_acquire",
+            "willow_async_mutex_acquire_load",
+            "willow_async_mutex_poll_load",
+            "willow_async_mutex_commit_release",
             "willow_async_mutex_poll",
             "willow_async_mutex_release",
             "willow_async_mutex_cancel",
@@ -378,6 +386,14 @@ mod tests {
             (&[AbiTy::Ptr, AbiTy::Ptr][..], Some(AbiTy::I64))
         );
 
+        assert_eq!(
+            signature("willow_async_mutex_acquire_load"),
+            (&[AbiTy::Ptr, AbiTy::Ptr, AbiTy::Ptr][..], Some(AbiTy::I32))
+        );
+        assert_eq!(
+            signature("willow_async_mutex_poll_load"),
+            (&[AbiTy::Ptr, AbiTy::I64, AbiTy::Ptr][..], Some(AbiTy::I32))
+        );
         // Task ids and netpoll's cross-platform native-handle integer are
         // explicitly 64-bit numbers, not dereferenceable pointers.
         assert_eq!(signature("willow_sched_wake"), (&[AbiTy::I64][..], None));

@@ -222,6 +222,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .load(types::I64, MemFlagsData::new(), frame, phase_offset);
         let commit_b = self.builder.create_block();
         let release_b = self.builder.create_block();
+        let cleared_b = self.builder.create_block();
         if mode == LockMode::Read {
             self.builder.ins().jump(release_b, &[]);
         } else {
@@ -251,14 +252,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Runtime commit captures the protected old value under its ownership
         // check and performs the fused SATB/generational barrier.
         let commit = match mode {
-            LockMode::Mutex => "willow_async_mutex_commit",
+            LockMode::Mutex => "willow_async_mutex_commit_release",
             // The read-mode commit block has no predecessor, but Cranelift
             // still emits it structurally. Point it at the ownership-checking
             // RwLock ABI; it is unreachable at run time and cannot publish.
             LockMode::Read | LockMode::Write => "willow_async_rwlock_commit",
         };
         self.emit_value_runtime_call(commit, &[handle, token, word]);
-        self.builder.ins().jump(release_b, &[]);
+        self.builder.ins().jump(
+            if mode == LockMode::Mutex {
+                cleared_b
+            } else {
+                release_b
+            },
+            &[],
+        );
 
         self.builder.switch_to_block(release_b);
         self.builder.seal_block(release_b);
@@ -273,6 +281,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             handle_offset,
         );
         self.emit_value_runtime_call(release, &[handle, token]);
+
+        self.builder.ins().jump(cleared_b, &[]);
+        self.builder.switch_to_block(cleared_b);
+        self.builder.seal_block(cleared_b);
 
         // Native pointer use is over. Mark the acquisition inactive before
         // dropping the frame references so any later cleanup is an idempotent

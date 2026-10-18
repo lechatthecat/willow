@@ -2222,10 +2222,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         frame: cranelift_codegen::ir::Value,
     ) {
         let [handle_offset, token_offset, phase_offset, value_offset] = offsets;
+        // I64/F64 output can go straight to the existing 64-bit frame slot:
+        // it needs no GC barrier and remains inactive until phase=Held. Bool
+        // keeps its byte-width conversion (also correct on big-endian targets).
+        // Reuse avoids O(number of lock sites) additional native stack slots.
+        let fused_scalar = mode == LockMode::Mutex && matches!(value_ty, Type::I64 | Type::F64);
         let (acquire_fn, poll_fn, load_fn, recursive_fn, invalid_fn) = match mode {
             LockMode::Mutex => (
-                "willow_async_mutex_acquire",
-                "willow_async_mutex_poll",
+                if fused_scalar {
+                    "willow_async_mutex_acquire_load"
+                } else {
+                    "willow_async_mutex_acquire"
+                },
+                if fused_scalar {
+                    "willow_async_mutex_poll_load"
+                } else {
+                    "willow_async_mutex_poll"
+                },
                 "willow_async_mutex_load",
                 "willow_async_mutex_recursive_panic",
                 "willow_async_mutex_invalid_status",
@@ -2261,7 +2274,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
         let token_ptr = self.builder.ins().iadd_imm_s(frame, token_offset as i64);
         let status = if mode == LockMode::Mutex {
-            self.emit_value_runtime_call(acquire_fn, &[handle, token_ptr])
+            if fused_scalar {
+                let value_ptr = self.builder.ins().iadd_imm_s(frame, value_offset as i64);
+                self.emit_value_runtime_call(acquire_fn, &[handle, token_ptr, value_ptr])
+            } else {
+                self.emit_value_runtime_call(acquire_fn, &[handle, token_ptr])
+            }
         } else {
             let mode_value = self.builder.ins().iconst(
                 types::I32,
@@ -2363,7 +2381,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .load(types::I64, MemFlagsData::new(), frame, token_offset);
-        let status = self.emit_value_runtime_call(poll_fn, &[handle, token]);
+        let status = if fused_scalar {
+            let value_ptr = self.builder.ins().iadd_imm_s(frame, value_offset as i64);
+            self.emit_value_runtime_call(poll_fn, &[handle, token, value_ptr])
+        } else {
+            self.emit_value_runtime_call(poll_fn, &[handle, token])
+        };
         let poll_pending_b = self.builder.create_block();
         let poll_not_pending_b = self.builder.create_block();
         let poll_not_recursive_b = self.builder.create_block();
@@ -2426,25 +2449,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // --- owned --------------------------------------------------------
         self.builder.switch_to_block(owned_b);
         self.terminated = false;
-        let handle = self.builder.ins().load(
-            reference_type(self.module.target_config()),
-            MemFlagsData::new(),
-            frame,
-            handle_offset,
-        );
-        let token = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), frame, token_offset);
-        let word = self.emit_value_runtime_call(load_fn, &[handle, token]);
-        let value = self.emit_from_storage_word(word, value_ty);
-        self.emit_gc_heap_store(
-            frame,
-            value_offset,
-            value,
-            value_ty,
-            GcStoreDestination::AsyncFrameSlot,
-        );
+        if !fused_scalar {
+            let handle = self.builder.ins().load(
+                reference_type(self.module.target_config()),
+                MemFlagsData::new(),
+                frame,
+                handle_offset,
+            );
+            let token =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), frame, token_offset);
+            let word = self.emit_value_runtime_call(load_fn, &[handle, token]);
+            let value = self.emit_from_storage_word(word, value_ty);
+            self.emit_gc_heap_store(
+                frame,
+                value_offset,
+                value,
+                value_ty,
+                GcStoreDestination::AsyncFrameSlot,
+            );
+        }
         let phase_held = self.builder.ins().iconst(types::I64, 1);
         self.builder
             .ins()

@@ -1,0 +1,13 @@
+// Newly reconstructed for willow-8hq4.42; same increment and lock body as contention.
+async fn work(shared: Mutex<i64>, n: i64) {
+    let mut i = 0;
+    while i < n { lock shared as mut value { value = value + 1; } i = i + 1; }
+}
+async fn main() {
+    let shared = Mutex::new(0);
+    println("@start work");
+    let task = work(shared, 1600000);
+    await task;
+    println("@end work");
+    lock shared as value { println(value); }
+}

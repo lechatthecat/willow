@@ -43,6 +43,7 @@ AGENTS.md
 /benches/runtime_compare/*
 !/benches/runtime_compare/harness.js
 !/benches/runtime_compare/mutex_contention.wi
+!/benches/runtime_compare/mutex.go
 !/benches/runtime_compare/producer_consumer.wi
 !/benches/runtime_compare/gc_scheduler.wi
 !/benches/runtime_compare/atomic_counter.wi
@@ -59,3 +60,6 @@ AGENTS.md
 !/tests/fixtures/agent/v0/AGENTS.md
 !/tests/fixtures/agent/v0/CLAUDE.md
 /scripts
+
+# Reconstructed Mutex acceptance probe (willow-8hq4.42).
+!/benches/runtime_compare/probes/mutex_split.wi

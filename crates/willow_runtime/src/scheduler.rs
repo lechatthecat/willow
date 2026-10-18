@@ -2960,6 +2960,12 @@ pub(crate) fn current_task() -> Option<RuntimeTaskId> {
     current_task_id()
 }
 
+/// A bounded lock spin can make progress only if another worker can execute
+/// its owner. Off-task callers and single-worker drives must park immediately.
+pub(crate) fn lock_spinning_allowed(task: RuntimeTaskId) -> bool {
+    current_task_id() == Some(task) && global_run_queues().worker_count() > 1
+}
+
 /// Render the active async chain for panic diagnostics (willow-9lw).
 pub fn async_chain_text() -> String {
     let current = current_task_id();
