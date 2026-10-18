@@ -1,0 +1,41 @@
+// SeqCst fetch-add, CAS retry, and publication through AtomicBool.
+// Four tasks update shared cells; printed totals must both be 20000.
+async fn increment(fetch: AtomicI64, cas: AtomicI64) {
+    for i in 0..5000 {
+        fetch.add(1);
+        let mut done = false;
+        while !done {
+            let old = cas.load();
+            done = cas.compare_exchange(old, old + 1);
+            if !done { await yield(); }
+        }
+    }
+}
+async fn publish(data: AtomicI64, ready: AtomicBool) {
+    data.store(42);
+    ready.store(true);
+}
+async fn observe(data: AtomicI64, ready: AtomicBool) -> i64 {
+    while !ready.load() { await yield(); }
+    return data.load();
+}
+async fn main() {
+    let fetch = AtomicI64::new(0);
+    let cas = AtomicI64::new(0);
+    let a = increment(fetch, cas);
+    let b = increment(fetch, cas);
+    let c = increment(fetch, cas);
+    let d = increment(fetch, cas);
+    await a;
+    await b;
+    await c;
+    await d;
+    println(fetch.load());
+    println(cas.load());
+    let data = AtomicI64::new(0);
+    let ready = AtomicBool::new(false);
+    let reader = observe(data, ready);
+    let writer = publish(data, ready);
+    println(await reader);
+    await writer;
+}

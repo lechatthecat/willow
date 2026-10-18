@@ -32,8 +32,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, condcodes::FloatCC,
-    condcodes::IntCC, types,
+    AbiParam, AtomicRmwOp, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
+    condcodes::FloatCC, condcodes::IntCC, types,
 };
 use cranelift_module::Module;
 
@@ -6267,6 +6267,71 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    fn emit_atomic_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        receiver: cranelift_codegen::ir::Value,
+        receiver_ty: &Type,
+        args: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
+        use Intrinsic::*;
+        let cell = atomic_cell(receiver_ty).expect("validated atomic intrinsic");
+        // Cranelift atomics are SeqCst, including failed strong CAS.
+        // The handle already points to the payload; no runtime check or
+        // safepoint existed for these ABI operations. Keep operand roots
+        // and evaluation order established by LIR.
+        let address = self
+            .builder
+            .ins()
+            .iadd_imm_s(receiver, i64::from(willow_abi::atomic_layout::VALUE_OFFSET));
+        let flags = MemFlagsData::new();
+        let ty = if cell.is_i64 { types::I64 } else { types::I8 };
+        let normalize = |this: &mut Self, value| {
+            if cell.is_i64 {
+                value
+            } else {
+                this.builder.ins().icmp_imm_s(IntCC::NotEqual, value, 0)
+            }
+        };
+        match intrinsic {
+            AtomicLoad => self.builder.ins().atomic_load(ty, flags, address),
+            AtomicStore => {
+                let value = normalize(self, args[0]);
+                if self.module.isa().triple().architecture == target_lexicon::Architecture::X86_64 {
+                    // x86 SeqCst store is an exchange with its old value unused.
+                    // Cranelift's atomic_store emits mov + mfence, substantially
+                    // slower here than xchg (also used by the Rust runtime).
+                    self.builder
+                        .ins()
+                        .atomic_rmw(ty, flags, AtomicRmwOp::Xchg, address, value);
+                } else {
+                    self.builder.ins().atomic_store(flags, value, address);
+                }
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            AtomicCompareExchange => {
+                let expected = normalize(self, args[0]);
+                let desired = normalize(self, args[1]);
+                let old = self
+                    .builder
+                    .ins()
+                    .atomic_cas(flags, address, expected, desired);
+                self.builder.ins().icmp(IntCC::Equal, old, expected)
+            }
+            AtomicSwap | AtomicAdd | AtomicSub => {
+                let op = match intrinsic {
+                    AtomicSwap => AtomicRmwOp::Xchg,
+                    AtomicAdd => AtomicRmwOp::Add,
+                    AtomicSub => AtomicRmwOp::Sub,
+                    _ => unreachable!(),
+                };
+                let value = normalize(self, args[0]);
+                self.builder.ins().atomic_rmw(ty, flags, op, address, value)
+            }
+            _ => unreachable!(),
+        }
+    }
+
     // Keep explicit emission operands aligned with the LIR/runtime ABI.
     #[allow(clippy::too_many_arguments)]
     fn emit_lir_block(
@@ -8152,6 +8217,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 return self.emit_scalar_array_push(receiver, word);
             }
         }
+        // Arguments have already been evaluated and rooted by LIR. Atomic
+        // instructions cannot allocate, block, or safepoint, so they need no
+        // additional transient receiver root or runtime cleanup scaffolding.
+        if matches!(
+            intrinsic,
+            Intrinsic::AtomicLoad
+                | Intrinsic::AtomicStore
+                | Intrinsic::AtomicSwap
+                | Intrinsic::AtomicCompareExchange
+                | Intrinsic::AtomicAdd
+                | Intrinsic::AtomicSub
+        ) {
+            return self.emit_atomic_intrinsic(intrinsic, receiver, receiver_ty, args);
+        }
         // Frame-backed references can otherwise move during a blocking runtime
         // call. The operand roots are relocatable: an arm that reaches an
         // allocation before its runtime call reloads the operands it still
@@ -8290,24 +8369,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             | AtomicCompareExchange
             | AtomicAdd
             | AtomicSub => {
-                let cell = atomic_cell(receiver_ty).expect("validated atomic intrinsic");
-                let operation = match intrinsic {
-                    AtomicLoad => "load",
-                    AtomicStore => "store",
-                    AtomicSwap => "swap",
-                    AtomicCompareExchange => "compare_exchange",
-                    AtomicAdd => "add",
-                    AtomicSub => "sub",
-                    _ => unreachable!(),
-                };
-                let mut values = vec![receiver];
-                values.extend_from_slice(args);
-                self.emit_runtime_call_with_cleanup(
-                    &format!("willow_atomic_{}_{operation}", cell.suffix()),
-                    &values,
-                    |_| {},
-                )
-                .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+                unreachable!("atomic operations use the non-allocating fast path")
             }
             CellGet | CellSet | RwCellRead | RwCellWrite => {
                 let (kind, element) = blocking_cell(receiver_ty).expect("validated cell intrinsic");

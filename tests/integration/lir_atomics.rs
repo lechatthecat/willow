@@ -1,8 +1,8 @@
 //! `AtomicI64` / `AtomicBool` compiled from Lowered IR (willow-0g8j.2.13).
 //!
-//! Both cells are a GC-allocated word the runtime reads and writes atomically.
+//! Both cells are GC-allocated words accessed with inline SeqCst instructions.
 //! Admitting them to the walker is three pieces: the type itself, the
-//! `Atomic*::new` constructor, and the five method intrinsics. Nothing here
+//! `Atomic*::new` constructor, and the atomic method intrinsics. Nothing here
 //! suspends, so the same code has to work identically in a synchronous function
 //! and inside a poll function.
 //!
@@ -607,4 +607,80 @@ fn compare_exchange_permit_example() {
         "true\nfalse\ntrue\nfalse\ntrue\nfalse\n200\n",
         &["release", "visit", "increment", "main"],
     );
+}
+
+#[test]
+fn inline_atomics_wraparound() {
+    assert_atomics(
+        r#"
+fn main() {
+    let hi = 9223372036854775807;
+    let lo = -9223372036854775807 - 1;
+    let c = AtomicI64::new(hi);
+    println(c.add(1));
+    println(c.load());
+    println(c.sub(1));
+    println(c.load());
+    c.store(0);
+    println(c.sub(lo));
+    println(c.load());
+    println(c.add(lo));
+    println(c.load());
+}
+"#,
+        "9223372036854775807\n-9223372036854775808\n-9223372036854775808\n9223372036854775807\n0\n-9223372036854775808\n-9223372036854775808\n0\n",
+        &["main"],
+    );
+}
+
+#[test]
+fn inline_atomics_contention_and_publication() {
+    let source = include_str!("../../example/atomic_inline.wi");
+    assert_atomics(
+        source,
+        "20000\n20000\n42\n",
+        &["increment", "publish", "observe", "main"],
+    );
+    let (output, ok) = compile_and_run_with_env(source, &[("WILLOW_WORKERS", "4")]);
+    assert!(ok, "{output}");
+    assert_eq!(output, "20000\n20000\n42\n");
+    let (output, ok) = super::support::compile_and_run_release(source);
+    assert!(ok, "{output}");
+    assert_eq!(output, "20000\n20000\n42\n");
+}
+
+#[test]
+fn inline_atomics_have_no_operation_runtime_calls() {
+    let source = r#"
+fn main() {
+    let a = AtomicI64::new(0);
+    let b = AtomicBool::new(false);
+    a.add(1);
+    a.sub(1);
+    a.swap(42);
+    println(a.compare_exchange(42, 7));
+    a.store(a.load());
+    println(b.swap(true));
+    println(b.compare_exchange(true, false));
+    b.store(b.load());
+}
+"#;
+    for release in [false, true] {
+        let names =
+            super::support::compile_and_collect_relocation_targets_mode(source, &[], release);
+        for constructor in ["willow_atomic_i64_new", "willow_atomic_bool_new"] {
+            assert!(
+                names.iter().any(|name| name == constructor),
+                "missing constructor {constructor}"
+            );
+        }
+        let operations: Vec<_> = names
+            .iter()
+            .filter(|name| name.starts_with("willow_atomic_") && !name.ends_with("_new"))
+            .collect();
+        assert!(
+            operations.is_empty(),
+            "atomic runtime calls: {operations:?}"
+        );
+    }
 }

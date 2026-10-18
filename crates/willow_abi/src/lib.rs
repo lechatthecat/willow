@@ -59,6 +59,17 @@ pub mod array_layout {
     }
 }
 
+/// Atomic handles point directly to the GC payload (not its preceding header).
+/// Both cells reserve one aligned word; bool accesses only its first byte.
+/// All operations use sequentially consistent ordering.
+pub mod atomic_layout {
+    pub const VALUE_OFFSET: i32 = 0;
+    pub const PAYLOAD_BYTES: i64 = 8;
+    pub const ALIGNMENT: usize = 8;
+    pub const I64_BYTES: usize = 8;
+    pub const BOOL_BYTES: usize = 1;
+}
+
 pub mod workers;
 
 pub mod runtime_symbols;

@@ -14,15 +14,27 @@ use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::SeqCst};
 
 use crate::gc::{GcObjectKind, willow_alloc_with_layout};
+use willow_abi::atomic_layout;
+
+// The allocator aligns headers and payloads together; check the ABI on every
+// target at compile time, including Rust's native atomic representation.
+const _: () = {
+    assert!(std::mem::align_of::<crate::gc::GcHeader>() >= atomic_layout::ALIGNMENT);
+    assert!(crate::gc::GC_HEADER_SIZE.is_multiple_of(atomic_layout::ALIGNMENT));
+    assert!(std::mem::size_of::<AtomicI64>() == atomic_layout::I64_BYTES);
+    assert!(std::mem::size_of::<AtomicBool>() == atomic_layout::BOOL_BYTES);
+    assert!(atomic_layout::ALIGNMENT.is_multiple_of(std::mem::align_of::<AtomicI64>()));
+    assert!(atomic_layout::ALIGNMENT.is_multiple_of(std::mem::align_of::<AtomicBool>()));
+};
 
 #[inline]
 unsafe fn as_i64(ptr: *mut c_void) -> &'static AtomicI64 {
-    unsafe { &*(ptr as *const AtomicI64) }
+    unsafe { &*(ptr.byte_offset(atomic_layout::VALUE_OFFSET as isize) as *const AtomicI64) }
 }
 
 #[inline]
 unsafe fn as_bool(ptr: *mut c_void) -> &'static AtomicBool {
-    unsafe { &*(ptr as *const AtomicBool) }
+    unsafe { &*(ptr.byte_offset(atomic_layout::VALUE_OFFSET as isize) as *const AtomicBool) }
 }
 
 #[unsafe(no_mangle)]
@@ -37,7 +49,7 @@ fn atomic_i64_new_with_allocator(
     init: i64,
     alloc: impl FnOnce(GcObjectKind, u32, i64, u64) -> *mut u8,
 ) -> *mut c_void {
-    let ptr = alloc(GcObjectKind::AtomicCell, 0, 8, 0) as *mut c_void;
+    let ptr = alloc(GcObjectKind::AtomicCell, 0, atomic_layout::PAYLOAD_BYTES, 0) as *mut c_void;
     if ptr.is_null() {
         return ptr;
     }
@@ -88,7 +100,7 @@ fn atomic_bool_new_with_allocator(
     init: u8,
     alloc: impl FnOnce(GcObjectKind, u32, i64, u64) -> *mut u8,
 ) -> *mut c_void {
-    let ptr = alloc(GcObjectKind::AtomicCell, 0, 8, 0) as *mut c_void;
+    let ptr = alloc(GcObjectKind::AtomicCell, 0, atomic_layout::PAYLOAD_BYTES, 0) as *mut c_void;
     if ptr.is_null() {
         return ptr;
     }
@@ -150,6 +162,24 @@ pub extern "C" fn willow_atomic_bool_compare_exchange(
 mod tests {
     use super::*;
     use crate::gc::{runtime_test_guard, willow_gc_init};
+
+    #[test]
+    fn atomic_payload_matches_shared_layout() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let integer = willow_atomic_i64_new(-17);
+        let boolean = willow_atomic_bool_new(255);
+        for pointer in [integer, boolean] {
+            assert!(!pointer.is_null());
+            assert!((pointer as usize).is_multiple_of(atomic_layout::ALIGNMENT));
+        }
+        assert_eq!(unsafe { as_i64(integer).load(SeqCst) }, -17);
+        assert!(unsafe { as_bool(boolean).load(SeqCst) });
+        // Non-compiled ABI callers retain bool normalization for every operand.
+        willow_atomic_bool_store(boolean, 2);
+        assert_eq!(willow_atomic_bool_swap(boolean, 255), 1);
+        assert_eq!(willow_atomic_bool_load(boolean), 1);
+    }
 
     #[test]
     fn compare_exchange_contention_has_exactly_one_winner() {
