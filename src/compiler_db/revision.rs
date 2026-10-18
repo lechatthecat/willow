@@ -1284,6 +1284,30 @@ mod tests {
     }
 
     #[test]
+    fn revision_imported_value_constructors_match_cold_after_declaration_edits() {
+        let f = Fixture::new();
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        for (name, body) in [
+            ("A", "pub x: i64;"),
+            ("B", "pub x: i64;"),
+            (
+                "B",
+                "pub x: i64; pub init(self, n: i64) { self.x = 10 / n; }",
+            ),
+            ("B", "pub x: i64;"),
+        ] {
+            f.write(
+                "model.wi",
+                &format!("pub class {name} {{ {body} }} pub enum E {{ {name}(i64) }}"),
+            );
+            f.write("main.wi", &format!("import model; fn make(n: i64) -> model::{name} {{ return new model::{name}(n); }} fn value() -> model::E {{ return model::E::{name}(1); }} fn main() {{}}"));
+            assert!(f.compare(&mut warm));
+            assert!(f.compare(&mut warm));
+        }
+    }
+
+    #[test]
     fn revision_preserves_defaults_constructors_statics_and_nested_lambdas() {
         let f = Fixture::new();
         f.write("main.wi", r#"

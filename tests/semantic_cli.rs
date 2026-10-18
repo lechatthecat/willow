@@ -3783,3 +3783,94 @@ fn effects_compact_worker_is_smaller_than_source_and_explain_keeps_details() {
     assert!(json["result"]["compiler_witnesses"].is_array());
     assert!(json["result"]["effect_evidence"].is_array());
 }
+
+#[test]
+fn imported_constructor_effects_match_local_field_initialization() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::create_dir_all(f.0.join("src/imported_constructor_effects_support")).unwrap();
+    fs::write(
+        f.0.join("src/imported_constructor_effects_support/model.wi"),
+        include_str!("../example/imported_constructor_effects_support/model.wi"),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/imported_constructor_effects.wi"),
+    )
+    .unwrap();
+    let local = f.json(&["effects", "main::local", "--explain"], 0);
+    assert_eq!(local["result"]["compiler_effects"], 0);
+    for name in [
+        "memberwise",
+        "explicit",
+        "empty",
+        "pair",
+        "inherited",
+        "aliased",
+        "repeated",
+        "relay",
+        "enum_unit",
+        "enum_payload",
+        "enum_nested",
+    ] {
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+        assert_eq!(
+            value["result"]["compiler_effects"], local["result"]["compiler_effects"],
+            "{value}"
+        );
+        if name.starts_with("enum_") {
+            assert_eq!(
+                value["result"]["runtime_effects"].as_u64().unwrap()
+                    & u64::from(E::MAY_BLOCK.bits() | E::MAY_SUSPEND.bits()),
+                0,
+                "{value}"
+            );
+        } else {
+            assert_eq!(
+                value["result"]["runtime_effects"], local["result"]["runtime_effects"],
+                "{value}"
+            );
+        }
+        assert!(!value.to_string().contains("missing-witness"), "{value}");
+        if matches!(name, "enum_payload" | "enum_nested") {
+            let allocation = value["result"]["effect_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["effect"] == E::MAY_ALLOCATE.bits())
+                .unwrap();
+            assert_eq!(
+                allocation["witness"]["cause"]["operation"], "enum-allocation",
+                "{value}"
+            );
+            assert_eq!(
+                allocation["witness"]["cause"]["location"]["path"], "src/main.wi",
+                "{value}"
+            );
+        }
+    }
+    let risky = f.json(&["effects", "main::risky", "--explain"], 0);
+    assert_ne!(
+        risky["result"]["compiler_effects"].as_u64().unwrap() & u64::from(E::MAY_PANIC.bits()),
+        0,
+        "{risky}"
+    );
+    assert_eq!(
+        risky["result"]["compiler_effects"].as_u64().unwrap()
+            & u64::from(E::MAY_BLOCK.bits() | E::MAY_SUSPEND.bits()),
+        0,
+        "{risky}"
+    );
+    let waiting = f.json(&["effects", "main::waiting", "--explain"], 0);
+    assert_ne!(
+        waiting["result"]["compiler_effects"].as_u64().unwrap()
+            & u64::from(E::MAY_BLOCK.bits() | E::MAY_SUSPEND.bits()),
+        0,
+        "{waiting}"
+    );
+    assert!(
+        !waiting.to_string().contains("missing-witness"),
+        "{waiting}"
+    );
+}

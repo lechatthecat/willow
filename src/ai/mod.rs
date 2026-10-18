@@ -383,6 +383,24 @@ pub(crate) fn capture(
                         // Keep the bound without displacing actual allocation sites.
                         bits |= RuntimeEffects::MAY_ALLOCATE.bits();
                     }
+                    // A resolved enum variant has no callable body. Keep its
+                    // allocation bound tied to the construction site rather
+                    // than exposing a propagated bit without any witness.
+                    if matches!(e, Expr::StaticCall(_))
+                        && calls
+                            .get(&e.id())
+                            .and_then(|target| *target)
+                            .and_then(|target| target.owner_type())
+                            .is_some_and(|owner| symbols.lookup_enum(&owner.to_string()).is_some())
+                    {
+                        bits |= RuntimeEffects::MAY_ALLOCATE.bits();
+                        result.semantic.capability(
+                            id,
+                            RuntimeEffects::MAY_ALLOCATE.bits(),
+                            e.span(),
+                            "enum-allocation",
+                        );
+                    }
                     let effects = match e {
                         Expr::New(_) | Expr::ArrayLiteral(..) | Expr::ObjectLiteral(_) => {
                             RuntimeEffects::MAY_ALLOCATE.bits()

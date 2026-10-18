@@ -1,0 +1,33 @@
+// Imported constructors retain the same facts as local construction.
+import imported_constructor_effects_support::model;
+import imported_constructor_effects_support::model::U;
+import imported_constructor_effects_support::model::V;
+import imported_constructor_effects_support::model as alias;
+class Local { pub x: i64; }
+fn local() -> Local { return new Local(1); }
+fn memberwise() -> U { return new U(1); }
+fn explicit() -> V { return new V(1); }
+fn empty() -> model::Empty { return new model::Empty(); }
+fn pair() -> model::Pair { return new model::Pair(1, true); }
+fn inherited() -> model::Child { return new model::Child(1, 2); }
+fn aliased() -> alias::U { return new alias::U(1); }
+fn repeated() -> U { let first = new U(1); return new U(first.x); }
+fn relay() -> U { return memberwise(); }
+fn risky(n: i64) -> model::Risky { return new model::Risky(n); }
+fn enum_unit() -> model::Color { return model::Color::White; }
+fn enum_payload() -> model::Move { let value = model::Move::Quiet(1); return value; }
+fn enum_nested() -> model::Move { let value = model::Move::Castle(model::Color::Black); return value; }
+fn waiting(ch: Channel<i64>) -> model::Waiting { return new model::Waiting(ch); }
+fn main() {
+    println(local().x);
+    println(memberwise().x);
+    println(explicit().x);
+    let e = empty();
+    let move = enum_nested();
+    println(pair().x);
+    println(inherited().y);
+    println(aliased().x);
+    println(repeated().x);
+    println(relay().x);
+    println(risky(2).x);
+}

@@ -1,0 +1,11 @@
+module imported_constructor_effects_support::model;
+pub class Empty {}
+pub class U { pub x: i64; }
+pub class Pair { pub x: i64; pub y: bool; }
+pub class V { pub x: i64; pub init(self, x: i64) { self.x = x; } }
+pub open class Base { pub x: i64; }
+pub class Child extends Base { pub y: i64; }
+pub class Risky { pub x: i64; pub init(self, n: i64) { self.x = 10 / n; } }
+pub enum Color { White, Black }
+pub enum Move { Quiet(i64), Castle(Color) }
+pub class Waiting { pub init(self, ch: Channel<i64>) { ch.recv(); } }

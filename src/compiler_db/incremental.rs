@@ -34,6 +34,7 @@ pub(crate) struct SyntaxQueries {
     interface_dispatch: HashMap<UnitId, Vec<FunctionId>>,
     pub(crate) dispatch_classes: HashMap<UnitId, std::collections::BTreeSet<String>>,
     captured: HashMap<PathBuf, Source>,
+    source_paths: HashMap<UnitId, PathBuf>,
     advanced: bool,
     bodies: HashMap<BodyId, BodyBinding>,
     prepared: HashMap<BodyId, PreparedBody>,
@@ -227,6 +228,7 @@ impl SyntaxQueries {
             dispatch_classes: self.dispatch_classes.clone(),
             interface_dispatch: self.interface_dispatch.clone(),
             captured: HashMap::new(),
+            source_paths: HashMap::new(),
             advanced: false,
             bodies: HashMap::new(),
             prepared: HashMap::new(),
@@ -313,6 +315,7 @@ impl SyntaxQueries {
     }
     fn provider(&self) -> SyntaxProvider<'_> {
         SyntaxProvider {
+            source_paths: &self.source_paths,
             interface_dispatch: &self.interface_dispatch,
             bodies: &self.bodies,
             prepared: &self.prepared,
@@ -744,6 +747,7 @@ impl SyntaxQueries {
             + self.interface_dispatch.heap_bytes()
             + self.dispatch_classes.heap_bytes()
             + self.captured.heap_bytes()
+            + self.source_paths.heap_bytes()
             + self.bodies.heap_bytes()
             + self.prepared.heap_bytes()
             + self.symbols.heap_bytes()
@@ -795,6 +799,8 @@ impl SyntaxQueries {
             }
             self.table
                 .capture_candidate_with_durability(node, value, self.source_durability(path));
+            self.source_paths
+                .insert(crate::module::ModuleId(file.0), path.to_owned());
             self.captured.insert(path.to_owned(), captured);
         }
         let result = self
@@ -890,6 +896,7 @@ struct EffectInventoryValue {
     metadata: CompactJson,
 }
 struct SyntaxProvider<'a> {
+    source_paths: &'a HashMap<UnitId, PathBuf>,
     interface_dispatch: &'a HashMap<UnitId, Vec<FunctionId>>,
     bodies: &'a HashMap<BodyId, BodyBinding>,
     prepared: &'a HashMap<BodyId, PreparedBody>,
@@ -1117,6 +1124,14 @@ impl QueryProvider for SyntaxProvider<'_> {
                     return Err(super::tracked::DeferredQuery(node.clone()).into());
                 };
                 table.input(&InputNode::EffectRoots(*unit))?;
+                // A declaration-only unit still publishes memberwise/variant
+                // constructors. No BodySyntax root can invalidate that inventory
+                // when a class or variant is added, removed, or renamed.
+                if prepared.roots.is_empty()
+                    && let Some(path) = self.source_paths.get(unit)
+                {
+                    table.read(self, QueryNode::SyntaxDeclarations(path.clone()))?;
+                }
                 for &id in self.interface_dispatch.get(unit).into_iter().flatten() {
                     table.read(self, QueryNode::InterfaceDispatchTargets(*unit, id))?;
                 }

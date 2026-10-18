@@ -631,6 +631,7 @@ pub(crate) fn solve_unit<N>(
     let mut pending = Vec::new();
     let mut helpers = HashMap::new();
     let mut foreign = Vec::new();
+    let mut value_constructors = Vec::new();
     // Injected default copies the checker skipped: they have no typed body in
     // this unit and reuse their declaring interface's check (willow-rvpp).
     let mut reused = HashSet::new();
@@ -649,6 +650,9 @@ pub(crate) fn solve_unit<N>(
             }
             Item::Class(c) => {
                 let owner = TypeId::local(&c.name);
+                if c.constructors.is_empty() {
+                    value_constructors.push(FunctionId::method(owner, "init"));
+                }
                 for m in &c.methods {
                     let id = FunctionId::method(owner, &m.name);
                     if m.is_default_injected {
@@ -661,6 +665,12 @@ pub(crate) fn solve_unit<N>(
                 }
                 for init in &c.constructors {
                     pending.push((FunctionId::method(owner, "init"), init.body.id, &init.body));
+                }
+            }
+            Item::Enum(e) => {
+                let owner = TypeId::local(&e.name);
+                for variant in &e.variants {
+                    value_constructors.push(FunctionId::method(owner, &variant.name));
                 }
             }
             Item::Interface(i) if i.type_params.is_empty() => {
@@ -713,6 +723,15 @@ pub(crate) fn solve_unit<N>(
                 .union(RuntimeEffects::MAY_ALLOCATE),
         );
     let mut own = HashSet::new();
+    // Memberwise and enum initialization only store already-evaluated arguments.
+    // Publish its empty summary even when no body in this unit constructs the
+    // class: imported callers must not mistake an unused constructor for an
+    // unavailable implementation. Allocation belongs to the construction site.
+    let value_constructor_count = value_constructors.len();
+    for id in value_constructors {
+        own.insert(id);
+        problem = problem.seed(id, RuntimeEffects::NONE, None);
+    }
     let mut loops = HashSet::new();
     let mut preemption_loops = HashSet::new();
     let mut loop_spans = HashMap::new();
@@ -742,7 +761,7 @@ pub(crate) fn solve_unit<N>(
         );
         may_io.insert(id);
     }
-    let mut visits = 0;
+    let mut visits = value_constructor_count;
     while let Some((id, body_id, body)) = pending.pop() {
         visits += 1;
         own.insert(id);
@@ -1564,6 +1583,79 @@ pub(crate) struct LockEffectCallsite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memberwise_constructor_facts_scale_without_local_uses() {
+        use crate::query_stats::{Counter, Session, count};
+        // Empty/wide classes, inheritance chains, and repeated references all
+        // publish one summary per declaration, independent of use frequency.
+        for shape in ["empty", "wide", "chain", "repeated", "enum"] {
+            for size in [1, 8, 64, 256] {
+                let mut source = String::new();
+                for i in 0..size {
+                    let base = if shape == "chain" && i > 0 {
+                        format!(" extends C{}", i - 1)
+                    } else {
+                        String::new()
+                    };
+                    let fields = if shape == "wide" {
+                        (0..32)
+                            .map(|j| format!("pub f{j}: i64;"))
+                            .collect::<String>()
+                    } else {
+                        String::new()
+                    };
+                    if shape == "enum" {
+                        source.push_str(&format!("enum C{i} {{ Value(i64) }}\n"));
+                    } else {
+                        source.push_str(&format!("open class C{i}{base} {{ {fields} }}\n"));
+                    }
+                }
+                let program = program(&source);
+                let mut graph = CallGraph::default();
+                if shape == "repeated" {
+                    for i in 0..size {
+                        let mut sites = crate::semantic::call_graph::CallSites::default();
+                        sites
+                            .targets
+                            .insert(FunctionId::method(TypeId::local("C0"), "init"));
+                        graph.merge(FunctionId::free(format!("caller{i}")), sites);
+                    }
+                }
+                let _session = Session::start(true, false);
+                let effects = solve_unit(
+                    &program,
+                    &graph,
+                    &HashMap::<ExprId, Type>::new(),
+                    None,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    |_| panic!("local constructor treated as external"),
+                );
+                for i in 0..size {
+                    let id = FunctionId::method(
+                        TypeId::local(format!("C{i}")),
+                        if shape == "enum" { "Value" } else { "init" },
+                    );
+                    assert_eq!(
+                        effects.facts.get(&id).unwrap().effects(),
+                        RuntimeEffects::NONE
+                    );
+                }
+                assert_eq!(count(Counter::EffectInventory), size);
+                assert_eq!(
+                    effects.facts.iter().count(),
+                    size * if shape == "repeated" { 2 } else { 1 }
+                );
+                assert_eq!(count(Counter::EffectSolve), 1);
+                eprintln!(
+                    "memberwise shape={shape} classes={size} inventory={} facts={}",
+                    count(Counter::EffectInventory),
+                    effects.facts.iter().count()
+                );
+            }
+        }
+    }
 
     #[test]
     fn imported_generic_targets_resolve_module_owners_without_losing_classes() {

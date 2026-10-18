@@ -91,6 +91,7 @@ fn explicit_allocation(operation: Option<&str>) -> bool {
         operation,
         Some(
             "array-allocation"
+                | "enum-allocation"
                 | "object-allocation"
                 | "object-literal-allocation"
                 | "string-concatenation"
