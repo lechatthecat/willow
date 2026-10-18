@@ -1296,10 +1296,10 @@ mod tests {
 
     static SCALE_START: AtomicBool = AtomicBool::new(false);
     static SCALE_DONE: AtomicBool = AtomicBool::new(false);
-    fn scale_between_regions(index: usize) {
-        if index == 0 {
-            SCALE_START.store(true, Ordering::Release);
-        }
+    // One background batch can complete several regions and reports only the
+    // last one, so the first pause need not carry index 0.
+    fn scale_between_regions(_index: usize) {
+        SCALE_START.store(true, Ordering::Release);
     }
 
     #[test]
@@ -1361,6 +1361,9 @@ mod tests {
             willow_gc_collect();
             let elapsed = began.elapsed().as_nanos() as u64;
             *SWEEP_TEST_HOOK.lock().unwrap() = None;
+            // A sweep that finishes inside its first batch never pauses;
+            // release the mutator instead of waiting for it forever.
+            SCALE_START.store(true, Ordering::Release);
             let (stalls, mutator_ns, overlapped) = worker.join().unwrap();
             let report = LAST
                 .lock()
