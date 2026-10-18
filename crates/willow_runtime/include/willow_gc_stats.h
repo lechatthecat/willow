@@ -116,6 +116,24 @@ typedef struct {
     uint64_t barrier_variants[13], satb_deletions, barrier_variants_valid;
 } WillowGcStatsV3;
 
+/* V4 detailed measurement is opt-in (WILLOW_GC_MEASURE=1 or trace version 4).
+ * flags: enabled=1, history loss=2, saturation=4, protocol error=8.
+ * A zero interval count without enabled and intact coverage proves nothing. */
+typedef struct {
+    uint64_t objects, slots, bytes, metadata_bytes, budget_checks, yields, restarts;
+} WillowGcWorkV4;
+typedef struct {
+    uint64_t flags, sequence, dropped, active_intervals, registered, unregistered, progress;
+    WillowGcLatencyV1 intervals[9];
+    WillowGcWorkV4 work[6];
+} WillowGcObservationsV4;
+typedef struct {
+    uint32_t version, struct_size;
+    uint64_t timestamp_ns;
+    WillowGcStatsV3 baseline;
+    WillowGcObservationsV4 observations;
+} WillowGcStatsV4;
+
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -226,6 +226,19 @@ impl StopMeasurement {
         &mut self.event.work
     }
     pub(crate) fn finish(mut self, aborted: bool) {
+        super::observations::work(
+            self.event.reason as usize - 1,
+            super::observations::Work {
+                objects: self
+                    .event
+                    .work
+                    .metadata_objects
+                    .saturating_add(self.event.work.swept_objects),
+                slots: self.event.work.root_values,
+                metadata_bytes: self.event.work.metadata_bytes,
+                ..Default::default()
+            },
+        );
         self.event.outcome = u32::from(aborted);
         self.event.released_ns = timestamp_ns();
         STOPS

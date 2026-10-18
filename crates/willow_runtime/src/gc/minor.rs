@@ -1065,6 +1065,7 @@ impl<'a> MinorCollector<'a> {
                     total.cpu_incomplete = true;
                 }
                 total.frame_scans = total.frame_scans.saturating_add(scanned_work.frame_scans);
+                total.objects = total.objects.saturating_add(scanned_work.objects);
                 total.marked_bytes = total.marked_bytes.saturating_add(scanned_work.marked_bytes);
                 total.scanned_bytes = total
                     .scanned_bytes

@@ -95,6 +95,9 @@ pub(super) fn wait_for_minor_budget() -> bool {
         return false;
     }
     let generation = coord.cycle_generation;
+    let _interval = crate::gc_telemetry::observations::Span::new(
+        crate::gc_telemetry::observations::Kind::AllocationStall,
+    );
     wait_for_cycle(coord, generation);
     true
 }
@@ -127,6 +130,8 @@ pub(super) fn take_recovery_request() -> bool {
         && requested == Some(coord.cycle_generation)
 }
 
+/// Shared by allocation, explicit `gc()` and unregister waits; callers own any
+/// interval attribution.
 pub(super) fn wait_for_cycle(mut coord: std::sync::MutexGuard<'_, GcCoord>, generation: u64) {
     loop {
         #[cfg(test)]

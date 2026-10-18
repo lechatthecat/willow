@@ -298,6 +298,9 @@ pub extern "C" fn willow_gc_write_barrier(
     if !young_edge_possible && (published || !marking_active) {
         return;
     }
+    let _interval = crate::gc_telemetry::observations::Span::new(
+        crate::gc_telemetry::observations::Kind::BarrierSlow,
+    );
     let mut state = runtime().heap.lock().unwrap();
     if marking_active && !published {
         record_satb_locked(&mut state, old_value);

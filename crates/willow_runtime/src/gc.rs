@@ -622,7 +622,11 @@ static ELECTION_BUDGET_WAITING: std::sync::atomic::AtomicBool =
 
 /// Give reclamation one opportunity before treating reservation pressure as
 /// exhaustion. Waiting mutators cooperate with remark and wait through sweep.
+/// Allocation-failure path only; explicit `gc()` uses `cycle_wait` directly.
 fn collect_for_budget() {
+    let _interval = crate::gc_telemetry::observations::Span::new(
+        crate::gc_telemetry::observations::Kind::AllocationStall,
+    );
     cycle_wait::collect_for_budget();
 }
 
@@ -822,7 +826,7 @@ struct GcCoord {
 /// coordinator behind one explicit owner makes lock ordering visible and keeps
 /// runtime entry points from reaching into unrelated globals.
 struct GcRuntime {
-    heap: Mutex<GcState>,
+    heap: crate::gc_telemetry::observations::HeapMutex<GcState>,
     write_barrier_calls: AtomicU64,
     /// Conservative nursery-presence gate: set before the first TLAB can
     /// publish an object, and cleared only by the quiescent runtime reset.
@@ -861,7 +865,7 @@ struct GcRuntime {
 impl Default for GcRuntime {
     fn default() -> Self {
         Self {
-            heap: Mutex::new(GcState::default()),
+            heap: crate::gc_telemetry::observations::HeapMutex::new(GcState::default()),
             write_barrier_calls: AtomicU64::new(0),
             tlab_ever_allocated: std::sync::atomic::AtomicBool::new(false),
             collect_lock: Mutex::new(()),

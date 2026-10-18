@@ -69,6 +69,7 @@ pub extern "C" fn willow_main_fail(message: *const u8) {
         let msg = unsafe { willow_string_as_str(message) };
         eprintln!("Error: {msg}");
     }
+    crate::gc_telemetry::flush_observations();
     // Reached with the runtime's threads still running, so it exits the same
     // way a successful `main` does (willow-ihr5).
     crate::exit::terminate_without_teardown(1);

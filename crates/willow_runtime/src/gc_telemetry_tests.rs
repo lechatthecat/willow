@@ -113,7 +113,7 @@ fn negotiated_snapshot_validates_before_writing_and_accepts_byte_buffers() {
     assert_eq!(willow_gc_stats_size(1), size as i64);
     let mut bytes = vec![0xa5u8; size + 17];
     let out = unsafe { bytes.as_mut_ptr().add(1) };
-    for version in [i64::MIN, -1, 0, 4, i64::MAX] {
+    for version in [i64::MIN, -1, 0, 5, i64::MAX] {
         assert_eq!(willow_gc_stats_size(version), -1);
         assert_eq!(willow_gc_stats_snapshot(version, out, size as i64), -1);
         assert_eq!(

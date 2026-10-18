@@ -675,6 +675,14 @@ std::thread_local! {
 }
 impl Drop for RemarkBudget {
     fn drop(&mut self) {
+        crate::gc_telemetry::observations::work(
+            1,
+            crate::gc_telemetry::observations::Work {
+                budget_checks: self.checks,
+                yields: self.yields,
+                ..Default::default()
+            },
+        );
         LAST_BUDGET.set(BudgetDiagnostic {
             limits: [self.max_slots, self.max_bytes, self.max_work_ns],
             used: [

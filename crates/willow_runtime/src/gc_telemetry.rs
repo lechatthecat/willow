@@ -15,6 +15,7 @@ pub mod failure_record;
 pub mod measurement;
 pub mod milestones;
 pub mod native_trace;
+pub mod observations;
 pub mod stops;
 pub mod workers;
 pub use milestones::{GcStage, GcTicket, WaitError, wait_gc_for_test};
@@ -37,6 +38,17 @@ pub struct WillowGcStatsV3 {
     pub barrier_variants_valid: u64,
 }
 pub use stops::WillowGcStatsV2;
+
+/// V4 preserves all earlier layouts and adds opt-in interval/work observations.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WillowGcStatsV4 {
+    pub version: u32,
+    pub struct_size: u32,
+    pub timestamp_ns: u64,
+    pub baseline: WillowGcStatsV3,
+    pub observations: observations::Stats,
+}
 
 pub const GC_STATS_VERSION: u32 = 1;
 pub const HISTOGRAM_BUCKETS: usize = 65;
@@ -260,6 +272,7 @@ impl GcRates {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MarkWork {
+    pub objects: u64,
     pub marked_bytes: u64,
     pub scanned_bytes: u64,
     pub root_scan_bytes: u64,
@@ -305,6 +318,7 @@ impl MarkWork {
         }
     }
     pub(crate) fn object(&mut self, bytes: usize, slots: usize) {
+        self.objects = self.objects.saturating_add(1);
         self.marked_bytes = self.marked_bytes.saturating_add(bytes as u64);
         self.scanned_bytes = self
             .scanned_bytes
@@ -369,6 +383,7 @@ impl Cycle {
             .expect("GC cycle identity exhausted");
         stats.phase = kind as u32;
         milestones::begin(stats.epoch);
+        observations::epoch(stats.epoch);
         Self {
             kind,
             epoch: stats.epoch,
@@ -405,6 +420,16 @@ impl Cycle {
         reclaimed: Option<u64>,
     ) -> GcCycleV1 {
         let end_ns = timestamp_ns();
+        observations::work(
+            if self.kind == CycleKind::Major { 4 } else { 5 },
+            observations::Work {
+                objects: work.objects,
+                slots: work.scanned_bytes / std::mem::size_of::<usize>() as u64,
+                bytes: work.marked_bytes,
+                metadata_bytes: work.descriptor_bytes,
+                ..Default::default()
+            },
+        );
         let cycle = GcCycleV1 {
             epoch: self.epoch,
             kind: self.kind as u32,
@@ -547,6 +572,7 @@ pub extern "C" fn willow_gc_stats_size(version: i64) -> i64 {
         1 => std::mem::size_of::<WillowGcStatsV1>() as i64,
         2 => std::mem::size_of::<WillowGcStatsV2>() as i64,
         3 => std::mem::size_of::<WillowGcStatsV3>() as i64,
+        4 => std::mem::size_of::<WillowGcStatsV4>() as i64,
         _ => -1,
     }
 }
@@ -589,7 +615,7 @@ pub extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: 
             let (barrier_variants, satb_deletions, valid) = crate::gc::barrier_variant_counts();
             let stats = WillowGcStatsV3 {
                 version: 3,
-                struct_size: size as u32,
+                struct_size: std::mem::size_of::<WillowGcStatsV3>() as u32,
                 timestamp_ns: timestamp_ns(),
                 baseline: stats,
                 milestones: milestones::snapshot(),
@@ -601,7 +627,18 @@ pub extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: 
                 satb_deletions,
                 barrier_variants_valid: u64::from(valid),
             };
-            unsafe { out.cast::<WillowGcStatsV3>().write_unaligned(stats) };
+            if version == 3 {
+                unsafe { out.cast::<WillowGcStatsV3>().write_unaligned(stats) };
+            } else {
+                let stats = WillowGcStatsV4 {
+                    version: 4,
+                    struct_size: size as u32,
+                    timestamp_ns: timestamp_ns(),
+                    baseline: stats,
+                    observations: observations::snapshot(),
+                };
+                unsafe { out.cast::<WillowGcStatsV4>().write_unaligned(stats) };
+            }
         }
     }
     size
@@ -766,12 +803,46 @@ static TRACE: LazyLock<Option<Mutex<TraceSink>>> = LazyLock::new(|| {
 static TRACE_STOPS: LazyLock<bool> = LazyLock::new(|| {
     matches!(
         std::env::var("WILLOW_GC_TRACE_VERSION").as_deref(),
-        Ok("2" | "3")
+        Ok("2" | "3" | "4")
     )
 });
-static TRACE_MILESTONES: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("WILLOW_GC_TRACE_VERSION").as_deref() == Ok("3"));
+static TRACE_MILESTONES: LazyLock<bool> = LazyLock::new(|| {
+    matches!(
+        std::env::var("WILLOW_GC_TRACE_VERSION").as_deref(),
+        Ok("3" | "4")
+    )
+});
+/// V4 observation lines go only to version-4 streams; V1-V3 consumers never
+/// see them even when `WILLOW_GC_MEASURE=1` enables the aggregate snapshot.
+static TRACE_OBSERVATIONS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WILLOW_GC_TRACE_VERSION").as_deref() == Ok("4"));
+/// Whether a V4 sink exists to drain per-event observation history.
+fn observation_history() -> bool {
+    *TRACE_OBSERVATIONS && TRACE.is_some()
+}
+/// Flush V4 observations after releasing GC locks. Collections flush per cycle;
+/// runtime exit flushes the final checkpoint, including for workloads that
+/// perform no collection. Broken sinks remain nonfatal.
+pub fn flush_observations() {
+    if !observations::enabled() || !*TRACE_OBSERVATIONS {
+        return;
+    }
+    // Serialize drain with output so concurrent flushes cannot reorder batches.
+    if let Some(sink) = &*TRACE {
+        let mut sink = sink.lock().unwrap_or_else(|p| p.into_inner());
+        let (events, stats) = observations::take_events();
+        if let Some(writer) = sink.writer.as_mut()
+            && observations::write(writer, &events, stats)
+                .and_then(|()| writer.flush())
+                .is_err()
+        {
+            trace_error();
+            sink.writer = None;
+        }
+    }
+}
 pub(crate) fn emit_cycle(cycle: GcCycleV1) {
+    flush_observations();
     // Always drain: disabled tracing must neither retain an unbounded history
     // nor report artificial event loss after 64 successful stops.
     let events = if TRACE.is_some() && *TRACE_STOPS {

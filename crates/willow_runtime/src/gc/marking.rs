@@ -139,6 +139,7 @@ impl Drop for MarkBatch<'_> {
                 crate::gc_telemetry::workers::thread_cpu_ns()?.checked_sub(start)
             });
             let mut total = self.cycle.work.lock().unwrap();
+            total.objects = total.objects.saturating_add(self.work.objects);
             total.frame_scans = total.frame_scans.saturating_add(self.work.frame_scans);
             total.marked_bytes = total.marked_bytes.saturating_add(self.work.marked_bytes);
             total.scanned_bytes = total.scanned_bytes.saturating_add(self.work.scanned_bytes);

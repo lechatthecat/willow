@@ -166,6 +166,7 @@ pub(super) fn multi_mutator_active() -> bool {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_register_mutator() {
+    crate::gc_telemetry::observations::register();
     let (lock, _) = &runtime().coord;
     {
         let mut coord = lock.lock().unwrap();
@@ -211,6 +212,7 @@ pub extern "C" fn willow_gc_unregister_mutator() {
         }
         claim_legacy_owner_locked(&coord, false);
     }
+    crate::gc_telemetry::observations::unregister();
     coord.mutators.remove(&id);
     coord.stw_pending.remove(&id);
     REGISTERED_EPOCH.set(0);
@@ -399,6 +401,7 @@ pub extern "C" fn willow_gc_stop_flag() -> *const u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_safepoint() {
+    crate::gc_telemetry::observations::progress();
     flush_satb_current(false);
     // Hot-path: a single relaxed atomic load. No collection pending → return
     // immediately without touching the coordination lock.
@@ -414,6 +417,9 @@ pub extern "C" fn willow_gc_safepoint() {
     // the world restarts. Checking here makes that rule enforced rather than
     // merely documented, and costs one TLS read on the already-slow path.
     crate::gc_mark_queue::assert_no_queue_lock_held("willow_gc_safepoint");
+    let _interval = crate::gc_telemetry::observations::Span::new(
+        crate::gc_telemetry::observations::Kind::Handshake,
+    );
     let (lock, cv) = &runtime().coord;
     let mut coord = lock.lock().unwrap();
     if !coord.stop_requested {
@@ -478,6 +484,9 @@ pub(super) fn with_stw<R>(
     measurement.stopped();
     let collector_start = crate::gc_telemetry::timestamp_ns();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _interval = crate::gc_telemetry::observations::Span::new(
+            crate::gc_telemetry::observations::Kind::Collector,
+        );
         collect(&coord, measurement.work())
     }));
     let collector_end = crate::gc_telemetry::timestamp_ns();

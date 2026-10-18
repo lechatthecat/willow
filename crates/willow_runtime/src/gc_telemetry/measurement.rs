@@ -99,13 +99,21 @@ pub(crate) struct Span {
     phase: Phase,
     start: Instant,
     cpu: Option<u64>,
+    _interval: super::observations::Span,
 }
 impl Span {
     pub(crate) fn new(phase: Phase) -> Self {
         let cpu = matches!(phase, Phase::Assist)
             .then(super::workers::thread_cpu_ns)
             .flatten();
+        let kind = match phase {
+            Phase::Roots => super::observations::Kind::Roots,
+            Phase::Evacuation => super::observations::Kind::Evacuation,
+            Phase::Resume => super::observations::Kind::Resume,
+            Phase::Assist => super::observations::Kind::Assist,
+        };
         Self {
+            _interval: super::observations::Span::new(kind),
             phase,
             start: Instant::now(),
             cpu,
