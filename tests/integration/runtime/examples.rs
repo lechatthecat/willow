@@ -5,6 +5,28 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),
+        ("example/array_owned_pair_growth.wi", "7\n7\n99\n7\n"),
+        ("example/async_frame_safepoints.wi", "20\n20\n390\n6\n"),
+        ("example/atomic_inline.wi", "20000\n20000\n42\n"),
+        (
+            "example/guarded_fn_values.wi",
+            "4\n1\n6\n2\nrecovered\n-1\n1\n-3\nfalse\n",
+        ),
+        (
+            "example/imported_constructor_effects.wi",
+            "1\n1\n1\n1\n2\n1\n1\n1\n5\n",
+        ),
+        (
+            "example/indirect_call_preemption.wi",
+            "fn resumed\nclosure resumed\n",
+        ),
+        (
+            "example/gc_barrier_variants.wi",
+            "7\n1\n14\n2\n21\n3\n28\n4\n35\n5\n42\n6\n49\n7\n56\n8\n",
+        ),
+        ("example/inline_panic_depth.wi", "inner\nouter\n"),
+        ("example/inline_shadow_roots.wi", "true\ntrue\ntrue\n"),
+        ("example/interface_effect_evidence/main.wi", "7\n"),
         ("example/gc_old_cycle.wi", "499500\n499500\n499500\n"),
         ("example/generic_nominal_bindings.wi", "17\n79\n80\n"),
         ("example/standalone_generic_aliases/main.wi", "17\n"),
@@ -1392,7 +1414,10 @@ fn test_constructor_flow_example() {
 fn test_runnable_example_files_compile_and_run() {
     run_rust_project_examples();
     for &(path, expected) in runnable_example_cases() {
-        let (out, ok) = if path == "example/lir_self_statics.wi" {
+        let (out, ok) = if matches!(
+            path,
+            "example/lir_self_statics.wi" | "example/gc_barrier_variants.wi"
+        ) {
             // `static mut` state with task execution requires one worker.
             let source = fs::read_to_string(path).unwrap();
             compile_and_run_with_env(&source, &[("WILLOW_WORKERS", "1")])
