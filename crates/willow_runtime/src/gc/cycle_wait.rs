@@ -35,6 +35,7 @@ impl Drop for CollectorGuard {
         // Release serialization before publishing completion, including skip
         // and unwind paths. A new election cannot interleave under coord.
         drop(self.0.take());
+        crate::gc_telemetry::milestones::quiescent();
         IS_COLLECTOR.set(false);
         coord.cycle_collector = None;
         coord.recovery_requested_for = None;

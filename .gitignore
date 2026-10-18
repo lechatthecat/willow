@@ -36,6 +36,21 @@ AGENTS.md
 # Local-only internal docs (reference private bd issues / requirements)
 /docs
 
+# Reviewed public GC M0 documentation and reproduction sources only.
+!/docs/
+/docs/*
+!/docs/gc_telemetry.md
+!/docs/audits/
+/docs/audits/*
+!/docs/audits/willow-6fv.7.1/
+/docs/audits/willow-6fv.7.1/*
+!/docs/audits/willow-6fv.7.1/audit.md
+!/docs/audits/willow-6fv.7.1/reproduce.py
+!/docs/audits/willow-6fv.7.1/barrier_proof.py
+!/docs/audits/willow-6fv.7.1/validate_failure_json.py
+!/docs/audits/willow-6fv.7.1/abi_layout.c
+!/docs/audits/willow-6fv.7.1/wide_enum.wi
+
 # Publish the compiler harness and reconstructed async-safepoint workloads.
 /benches/*
 !/benches/compiler_bench.rs

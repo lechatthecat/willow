@@ -1,0 +1,50 @@
+// Focused M0 barrier proof. The audit harness checks V3 execution counters.
+import std::collections::Array;
+import std::collections::Map;
+
+interface Shape extends Send { fn score() -> i64; }
+class Node implements Shape {
+    pub value: i64;
+    pub fn score() -> i64 { return self.value; }
+}
+class Holder { pub node: Node; }
+class Shared { pub static mut node: Node = new Node(0); }
+enum Entry { Empty, Full(Node) }
+
+fn replace(slot: &mut Node, value: Node) { slot = value; }
+
+async fn main() {
+    let holder = new Holder(new Node(0));
+    let shapes: Array<Shape> = [new Node(0)];
+    let entries: Array<Entry> = [Entry::Empty];
+    let nodes: Array<Node> = [new Node(0)];
+    let map: Map<i64, Node> = Map::new();
+    let cell = BlockingCell::new(new Node(0));
+    let rw = BlockingRwCell::new(new Node(0));
+    let mutex = Mutex::new(new Node(0));
+    let async_rw = RwLock::new(new Node(0));
+    let mut carried = new Node(0);
+    let mut i = 1;
+    while i <= 8 {
+        gc_minor_collect();
+        holder.node = new Node(i);
+        shapes[0] = new Node(i);
+        entries[0] = Entry::Full(new Node(i));
+        nodes[0] = new Node(i);
+        nodes.push(new Node(i));
+        map.insert(0, new Node(i));
+        Shared::node = new Node(i);
+        replace(&holder.node, new Node(i));
+        cell.set(new Node(i));
+        rw.write(new Node(i));
+        lock mutex as mut value { value = new Node(i); }
+        lock write async_rw as mut value { value = new Node(i); }
+        carried = new Node(i);
+        await sleep(0);
+        gc_collect();
+        println(holder.node.value + shapes[0].score() + nodes[0].value
+            + cell.get().value + rw.read().value + carried.value + Shared::node.value);
+        match entries[0] { Entry::Full(n) => println(n.value), Entry::Empty => println(-1) }
+        i = i + 1;
+    }
+}

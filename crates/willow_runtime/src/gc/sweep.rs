@@ -23,7 +23,9 @@ pub(super) struct SweepPlan {
 
 pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>) -> SweepPlan {
     assert!(state.sweeping.is_none());
+    crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::MarkComplete);
     state.sweeping = Some(std::thread::current().id());
+    state.pending_sweep_chunks = 0..state.tlab_chunks.len();
     publish_collection_busy(state);
     state.major_collections = state.major_collections.saturating_add(1);
     // Active buffers copied a clear sweep_pending flag.
@@ -65,6 +67,7 @@ pub(super) fn prepare_bounded(
     }
     assert!(state.sweeping.is_none());
     state.sweeping = Some(std::thread::current().id());
+    state.pending_sweep_chunks = 0..state.tlab_chunks.len();
     publish_collection_busy(state);
     state.major_collections = state.major_collections.saturating_add(1);
     Some(SweepPlan {
@@ -204,6 +207,7 @@ fn execute(
             .unwrap()
             .transition(old_cycle::Phase::Idle);
     }
+    crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::SweepComplete);
     // Account reusable storage before another sweep can start.
     crate::frame_lifetime::record_sweep(
         crate::frame_lifetime::FrameEventKind::SweepCompleted,
@@ -341,6 +345,7 @@ fn sweep_chunk(
     drops: &mut Vec<PendingDrop>,
     marking: Option<&ConcurrentCycle>,
 ) -> (usize, bool) {
+    state.pending_sweep_chunks.start = chunk_index + 1;
     let mut freed_bytes = 0;
     let base = state.tlab_chunks[chunk_index].base;
     let used = state.tlab_chunks[chunk_index].used;
@@ -517,6 +522,7 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
             .map(|owner| owner / GC_CARD_SIZE),
     );
     state.sweeping = None;
+    state.pending_sweep_chunks = 0..0;
     publish_collection_busy(state);
     if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()
         && let Err(message) = verify_old_region_metadata(state)

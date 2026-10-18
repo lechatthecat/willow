@@ -280,3 +280,7 @@ pub(super) fn reset_for_test() {
 #[cfg(test)]
 #[path = "stops_tests.rs"]
 mod tests;
+
+pub(crate) fn diagnostic_stop() -> Option<StopEventV2> {
+    Some(STOPS.try_lock().ok()?.stats.last_event)
+}

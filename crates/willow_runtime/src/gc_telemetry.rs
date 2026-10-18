@@ -11,9 +11,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
+pub mod failure_record;
+pub mod measurement;
+pub mod milestones;
 pub mod native_trace;
 pub mod stops;
 pub mod workers;
+pub use milestones::{GcStage, GcTicket, WaitError, wait_gc_for_test};
+
+/// V3 extends the existing snapshot protocol without growing V1 or V2.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WillowGcStatsV3 {
+    pub version: u32,
+    pub struct_size: u32,
+    pub timestamp_ns: u64,
+    pub baseline: WillowGcStatsV2,
+    pub milestones: milestones::CycleMilestones,
+    pub memory: measurement::GcMemoryV3,
+    pub survivors: GcSurvivorStats,
+    pub frames: crate::frame_lifetime::FrameLifetimeSnapshot,
+    pub measurements: measurement::MeasurementsV3,
+    pub barrier_variants: [u64; 13],
+    pub satb_deletions: u64,
+    pub barrier_variants_valid: u64,
+}
 pub use stops::WillowGcStatsV2;
 
 pub const GC_STATS_VERSION: u32 = 1;
@@ -75,6 +97,7 @@ pub struct GcCountersV1 {
 /// Copies are physical movement, not logical allocations. Promotions count only
 /// objects reaching old generation; pinned promotions do not copy payloads.
 #[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
 pub struct GcSurvivorStats {
     pub survivor_copies: u64,
     pub survivor_bytes: u64,
@@ -323,6 +346,7 @@ impl Drop for Cycle {
             // epoch consumed while allowing the next elected collector to start.
             let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
             telemetry.stats.phase = self.previous_phase;
+            milestones::abort(self.epoch);
         }
     }
 }
@@ -339,8 +363,12 @@ impl Cycle {
             previous_phase == 0
                 || (previous_phase == CycleKind::Major as u32 && kind == CycleKind::Minor)
         );
-        stats.epoch = stats.epoch.saturating_add(1);
+        stats.epoch = stats
+            .epoch
+            .checked_add(1)
+            .expect("GC cycle identity exhausted");
         stats.phase = kind as u32;
+        milestones::begin(stats.epoch);
         Self {
             kind,
             epoch: stats.epoch,
@@ -440,7 +468,11 @@ impl Cycle {
                 }
             }
         }
+        if self.previous_phase != 0 {
+            milestones::quiescent();
+        }
         self.completed = true;
+        measurement::completed(work, cycle.reclaimed_bytes);
         cycle
     }
 }
@@ -514,6 +546,7 @@ pub extern "C" fn willow_gc_stats_size(version: i64) -> i64 {
     match version {
         1 => std::mem::size_of::<WillowGcStatsV1>() as i64,
         2 => std::mem::size_of::<WillowGcStatsV2>() as i64,
+        3 => std::mem::size_of::<WillowGcStatsV3>() as i64,
         _ => -1,
     }
 }
@@ -543,13 +576,33 @@ pub extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: 
     } else {
         let stats = WillowGcStatsV2 {
             version: 2,
-            struct_size: size as u32,
+            struct_size: std::mem::size_of::<WillowGcStatsV2>() as u32,
             timestamp_ns: timestamp_ns(),
             baseline: snapshot_with_resident(),
             stops: stops::snapshot_stops(),
             workers: workers::snapshot(),
         };
-        unsafe { out.cast::<WillowGcStatsV2>().write_unaligned(stats) };
+        if version == 2 {
+            unsafe { out.cast::<WillowGcStatsV2>().write_unaligned(stats) };
+        } else {
+            let (memory, survivors) = crate::gc::telemetry_memory_snapshot();
+            let (barrier_variants, satb_deletions, valid) = crate::gc::barrier_variant_counts();
+            let stats = WillowGcStatsV3 {
+                version: 3,
+                struct_size: size as u32,
+                timestamp_ns: timestamp_ns(),
+                baseline: stats,
+                milestones: milestones::snapshot(),
+                memory,
+                survivors,
+                frames: crate::frame_lifetime::snapshot(),
+                measurements: measurement::snapshot(),
+                barrier_variants,
+                satb_deletions,
+                barrier_variants_valid: u64::from(valid),
+            };
+            unsafe { out.cast::<WillowGcStatsV3>().write_unaligned(stats) };
+        }
     }
     size
 }
@@ -584,6 +637,19 @@ impl TraceSink {
     fn cycle(&mut self, c: GcCycleV1) {
         if let Some(writer) = self.writer.as_mut()
             && write_cycle(writer, c)
+                .and_then(|()| {
+                    if !*TRACE_MILESTONES {
+                        return Ok(());
+                    }
+                    if let Some(record) = milestones::record(c.epoch) {
+                        write_milestones(writer, record)?;
+                    } else {
+                        if c.epoch != 0 {
+                            trace_error(); // Bounded history expired before trace publication.
+                        }
+                    }
+                    write_verification(writer, c.epoch)
+                })
                 .and_then(|()| writer.flush())
                 .is_err()
         {
@@ -603,6 +669,44 @@ impl TraceSink {
             self.writer = None;
         }
     }
+}
+
+fn write_milestones(writer: &mut dyn Write, record: milestones::CycleMilestones) -> io::Result<()> {
+    for (stage, name, timestamp) in [
+        (1, "MarkComplete", record.mark_complete_ns),
+        (2, "SweepComplete", record.sweep_complete_ns),
+        (3, "Quiescent", record.quiescent_ns),
+    ] {
+        if record.stage >= stage {
+            writeln!(
+                writer,
+                "{{\"version\":3,\"event\":\"{name}\",\"epoch\":{},\"timestamp_ns\":{timestamp}}}",
+                record.epoch
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn write_verification(writer: &mut dyn Write, event_epoch: u64) -> io::Result<()> {
+    let (counts, deletions, valid) = crate::gc::barrier_variant_counts();
+    let stats = measurement::snapshot();
+    let telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
+    let (counter_epoch, generation) = (telemetry.stats.epoch, telemetry.stats.reset_generation);
+    drop(telemetry);
+    writeln!(
+        writer,
+        "{{\"version\":3,\"event\":\"gc_verification\",\"event_epoch\":{event_epoch},\"counter_epoch\":{counter_epoch},\"reset_generation\":{generation},\"timestamp_ns\":{},\"consistency\":\"atomic_approximate\",\"barrier_variants_valid\":{valid},\"barrier_variants\":{counts:?},\"satb_deletions\":{deletions},\"mark_cpu_ns\":{},\"mark_cpu_missing_cycles\":{},\"assist_cpu_ns\":{},\"assist_cpu_missing_samples\":{},\"reclaimed_bytes\":{},\"worker_threads\":{},\"worker_busy\":{},\"worker_idle\":{}}}",
+        timestamp_ns(),
+        stats.mark_cpu_ns,
+        stats.mark_cpu_missing_cycles,
+        stats.assist_cpu_ns,
+        stats.assist_cpu_missing_samples,
+        stats.reclaimed_bytes,
+        stats.worker_threads,
+        stats.worker_busy,
+        stats.worker_idle
+    )
 }
 
 fn write_stop(writer: &mut dyn Write, e: &stops::StopEventV2) -> io::Result<()> {
@@ -659,8 +763,14 @@ static TRACE: LazyLock<Option<Mutex<TraceSink>>> = LazyLock::new(|| {
     sink.writer.as_ref()?;
     Some(Mutex::new(sink))
 });
-static TRACE_STOPS: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("WILLOW_GC_TRACE_VERSION").as_deref() == Ok("2"));
+static TRACE_STOPS: LazyLock<bool> = LazyLock::new(|| {
+    matches!(
+        std::env::var("WILLOW_GC_TRACE_VERSION").as_deref(),
+        Ok("2" | "3")
+    )
+});
+static TRACE_MILESTONES: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WILLOW_GC_TRACE_VERSION").as_deref() == Ok("3"));
 pub(crate) fn emit_cycle(cycle: GcCycleV1) {
     // Always drain: disabled tracing must neither retain an unbounded history
     // nor report artificial event loss after 64 successful stops.
@@ -767,6 +877,7 @@ pub(crate) fn reset_for_test() {
     telemetry.stats.reset_generation = generation;
     stops::reset_for_test();
     native_trace::reset();
+    measurement::reset();
 }
 
 #[cfg(test)]
@@ -804,4 +915,9 @@ pub fn native_memory_snapshot() -> NativeMemorySnapshot {
         committed_bytes: None,
         process_limit_coverage_complete: false,
     }
+}
+
+/// Bounded panic-path sample; never block while a collector owns telemetry.
+pub(crate) fn diagnostic_cycle() -> Option<WillowGcStatsV1> {
+    Some(TELEMETRY.try_lock().ok()?.stats)
 }

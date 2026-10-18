@@ -8,6 +8,7 @@ pub(super) struct FreeSpans {
     spans: Vec<Option<RegionFreeSpan>>,
     maxima: Vec<usize>,
     leaves: usize,
+    bytes: usize,
     #[cfg(test)]
     node_visits: usize,
     #[cfg(test)]
@@ -21,9 +22,11 @@ impl From<Vec<RegionFreeSpan>> for FreeSpans {
         }
         let leaves = spans.len().next_power_of_two();
         let mut maxima = vec![0; 2 * leaves];
+        let mut bytes = 0;
         #[cfg(test)]
         let mut build_visits = 0;
         for (index, span) in spans.iter().enumerate() {
+            bytes += span.size;
             maxima[leaves + index] = span.size;
             #[cfg(test)]
             {
@@ -41,6 +44,7 @@ impl From<Vec<RegionFreeSpan>> for FreeSpans {
             spans: spans.into_iter().map(Some).collect(),
             maxima,
             leaves,
+            bytes,
             #[cfg(test)]
             node_visits: 0,
             #[cfg(test)]
@@ -50,6 +54,9 @@ impl From<Vec<RegionFreeSpan>> for FreeSpans {
 }
 
 impl FreeSpans {
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
     pub(super) fn largest(&self) -> usize {
         self.maxima.get(1).copied().unwrap_or(0)
     }
@@ -79,6 +86,7 @@ impl FreeSpans {
         let offset = span.offset;
         span.offset += size;
         span.size -= size;
+        self.bytes -= size;
         self.maxima[node] = span.size;
         if span.size == 0 {
             *slot = None;
@@ -121,9 +129,10 @@ impl FreeSpans {
 
     pub(super) fn is_consistent(&self) -> bool {
         if self.spans.is_empty() {
-            return self.leaves == 0 && self.maxima.is_empty();
+            return self.leaves == 0 && self.maxima.is_empty() && self.bytes == 0;
         }
-        self.leaves == self.spans.len().next_power_of_two()
+        self.bytes == self.iter().map(|span| span.size).sum::<usize>()
+            && self.leaves == self.spans.len().next_power_of_two()
             && self.maxima.len() == 2 * self.leaves
             && (0..self.leaves).all(|index| {
                 self.maxima[self.leaves + index]
@@ -201,6 +210,7 @@ impl Builder {
                 spans: Vec::with_capacity(source.len()),
                 maxima: Vec::with_capacity(2 * leaves),
                 leaves,
+                bytes: 0,
                 #[cfg(test)]
                 node_visits: 0,
                 #[cfg(test)]
@@ -218,6 +228,7 @@ impl Builder {
         } else if self.copied < self.source.len() {
             let span = self.source[self.copied];
             self.result.spans.push(Some(span));
+            self.result.bytes += span.size;
             self.result.maxima[self.result.leaves + self.copied] = span.size;
             self.copied += 1;
             #[cfg(test)]
@@ -246,6 +257,37 @@ impl Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn m0_free_bytes_follow_incremental_build_and_fragmented_allocation() {
+        for holes in [0, 1, 8, 64, 512, 4096] {
+            let spans: Vec<_> = (0..holes)
+                .map(|i| RegionFreeSpan {
+                    offset: i * 32,
+                    size: 16,
+                })
+                .collect();
+            let mut builder = Builder::new(spans);
+            let mut steps = 1;
+            while !builder.step() {
+                steps += 1;
+            }
+            let (mut free, _) = builder.finish();
+            assert_eq!(free.bytes(), holes * 16);
+            assert!(steps <= 6 * holes + 1);
+            for remaining in (0..holes).rev() {
+                assert!(free.take_up_to(8, 8).is_some());
+                assert_eq!(free.bytes(), remaining * 16 + 8);
+                assert!(free.take(8).is_some());
+                assert_eq!(free.bytes(), remaining * 16);
+            }
+            assert!(free.is_consistent());
+            eprintln!(
+                "m0_free_bytes holes={holes} build_steps={steps} samples={}",
+                2 * holes + 1
+            );
+        }
+    }
 
     fn reference_take(spans: &mut Vec<RegionFreeSpan>, size: usize) -> Option<usize> {
         let index = spans.iter().position(|span| span.size >= size)?;

@@ -371,7 +371,7 @@ pub(super) fn wait_for_mutators<'a>(
                 handshake_timeout().unwrap_or_default().as_secs(),
                 stuck.len(),
             );
-            std::process::abort();
+            crate::failure::fatal_invariant("registered mutator handshake timed out");
         };
         coord = cv
             .wait_timeout(coord, remaining)
@@ -481,6 +481,9 @@ pub(super) fn with_stw<R>(
         collect(&coord, measurement.work())
     }));
     let collector_end = crate::gc_telemetry::timestamp_ns();
+    let resume = crate::gc_telemetry::measurement::Span::new(
+        crate::gc_telemetry::measurement::Phase::Resume,
+    );
     coord.stop_requested = false;
     runtime()
         .stop_requested
@@ -489,6 +492,7 @@ pub(super) fn with_stw<R>(
     cv.notify_all();
     drop(coord);
     let unlocked = crate::gc_telemetry::timestamp_ns();
+    drop(resume);
     measurement.finish(result.is_err());
     old_cycle::record_stop(reason as u32, collector_start, collector_end, unlocked);
     match result {

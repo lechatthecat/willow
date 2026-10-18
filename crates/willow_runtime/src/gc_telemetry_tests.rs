@@ -113,7 +113,7 @@ fn negotiated_snapshot_validates_before_writing_and_accepts_byte_buffers() {
     assert_eq!(willow_gc_stats_size(1), size as i64);
     let mut bytes = vec![0xa5u8; size + 17];
     let out = unsafe { bytes.as_mut_ptr().add(1) };
-    for version in [i64::MIN, -1, 0, 3, i64::MAX] {
+    for version in [i64::MIN, -1, 0, 4, i64::MAX] {
         assert_eq!(willow_gc_stats_size(version), -1);
         assert_eq!(willow_gc_stats_snapshot(version, out, size as i64), -1);
         assert_eq!(
@@ -603,6 +603,39 @@ fn trace_file_flushes_complete_pairs_and_open_failure_preserves_gc() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn milestone_v3_trace_serializes_actual_completed_boundaries() {
+    let dir = std::env::temp_dir().join(format!(
+        "willow-gc-milestones-{}-{}",
+        std::process::id(),
+        timestamp_ns()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("cycles.ndjson");
+    run_trace_child_version(&path, 0, 3);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let stages: Vec<_> = text
+        .lines()
+        .filter(|line| {
+            ["MarkComplete", "SweepComplete", "Quiescent"]
+                .iter()
+                .any(|name| line.contains(&format!("\"event\":\"{name}\"")))
+        })
+        .collect();
+    assert_eq!(stages.len(), 6);
+    for (index, triple) in stages.chunks(3).enumerate() {
+        let epoch = format!("\"epoch\":{},", index + 1);
+        for (line, name) in triple
+            .iter()
+            .zip(["MarkComplete", "SweepComplete", "Quiescent"])
+        {
+            assert!(line.contains(&format!("\"event\":\"{name}\"")));
+            assert!(line.contains(&epoch));
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn trace_file_write_failure_preserves_collection() {
@@ -660,6 +693,7 @@ fn nested_minor_preserves_major_phase_and_monotonic_epoch() {
     assert_eq!(snapshot().phase, CycleKind::Major as u32);
     assert_eq!(snapshot().minor_cycles, 1);
     let major_event = major.finish_concurrent(100, 70, MarkWork::roots(2), 7, 30);
+    milestones::quiescent();
     let stats = snapshot();
     assert!(minor_event.epoch > major_event.epoch);
     assert_eq!(stats.epoch, minor_event.epoch);

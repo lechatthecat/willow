@@ -125,7 +125,8 @@ fn satb_deleted_subgraph_survives_then_dies_in_the_next_epoch() {
 
 /// Exercise real container mutations before any snapshot graph is scanned.
 /// No root/new-edge publication can keep the overwritten object alive here.
-fn assert_satb_mutation_retains(old: *mut u8, mutation: impl FnOnce()) {
+pub(super) fn assert_satb_mutation_retains(old: *mut u8, mutation: impl FnOnce()) {
+    let _elected = cycle_wait::CollectorGuard::try_acquire().expect("test owns collector election");
     let cycle = {
         let mut state = runtime().heap.lock().unwrap();
         retire_all_tlabs_locked(&mut state);
@@ -168,6 +169,28 @@ fn assert_satb_mutation_retains(old: *mut u8, mutation: impl FnOnce()) {
     GC_MARK_PHASE.store(0, Ordering::Release);
     marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
     assert_eq!(cycle.queue.end_epoch(), 0);
+}
+
+/// Count only the actual mutation under active marking, excluding setup stores.
+fn assert_satb_variant_mutation_retains(
+    old: *mut u8,
+    destination: Option<GcStoreDestination>,
+    mutation: impl FnOnce(),
+) {
+    assert_satb_mutation_retains(old, || {
+        let before = barrier_variant_counts();
+        mutation();
+        let after = barrier_variant_counts();
+        if let Some(destination) = destination {
+            let index = destination as usize - 1;
+            assert!(
+                after.0[index] > before.0[index],
+                "destination={destination:?}"
+            );
+        } else {
+            assert!(after.1 > before.1, "logical deletion barrier did not run");
+        }
+    });
 }
 
 /// willow-jz15.53: while concurrently marking, write barriers and logical
@@ -375,16 +398,30 @@ fn old_only_barriers_still_publish_during_marking_and_closure() {
 #[test]
 fn satb_native_container_overwrites_and_removals_publish_old_references() {
     let _guard = runtime_test_guard();
+    let _stress = GcStressTestScope::with_modes("all");
     for capacity in [1, 256] {
         for case in 0..12 {
             reset_internal_for_test();
             runtime().heap.lock().unwrap().satb = satb::SatbBuffers::new(capacity);
-            let old = willow_alloc(8);
+            let mut old = willow_alloc(8);
+            willow_push_root(&mut old);
+            let destination = match case {
+                0 | 1 => Some(GcStoreDestination::ArrayElement),
+                2 => Some(GcStoreDestination::MapValue),
+                3 => Some(GcStoreDestination::BlockingCell),
+                4 => Some(GcStoreDestination::BlockingRwCell),
+                6 => Some(GcStoreDestination::GlobalStatic),
+                8 => Some(GcStoreDestination::AsyncFrameSlot),
+                9 => Some(GcStoreDestination::ContainerInternal),
+                10 => Some(GcStoreDestination::AsyncMutexCell),
+                11 => Some(GcStoreDestination::AsyncRwLockCell),
+                _ => None,
+            };
             match case {
                 0 | 1 => {
                     let array = crate::array::willow_array_new(1, 1);
                     crate::array::willow_array_set(array, 0, old as i64);
-                    assert_satb_mutation_retains(old, || {
+                    assert_satb_variant_mutation_retains(old, destination, || {
                         if case == 0 {
                             crate::array::willow_array_set(array, 0, 0);
                         } else {
@@ -395,19 +432,19 @@ fn satb_native_container_overwrites_and_removals_publish_old_references() {
                 2 => {
                     let map = crate::map::willow_map_new(0, 4, 1);
                     crate::map::willow_map_insert(map, 7, 0, old as i64, 1);
-                    assert_satb_mutation_retains(old, || {
+                    assert_satb_variant_mutation_retains(old, destination, || {
                         crate::map::willow_map_insert(map, 7, 0, 0, 1)
                     });
                 }
                 3 => {
                     let cell = crate::lock::willow_blocking_cell_new(old as i64, 1);
-                    assert_satb_mutation_retains(old, || {
+                    assert_satb_variant_mutation_retains(old, destination, || {
                         crate::lock::willow_blocking_cell_set(cell, 0)
                     });
                 }
                 4 => {
                     let cell = crate::lock::willow_blocking_rw_cell_new(old as i64, 1);
-                    assert_satb_mutation_retains(old, || {
+                    assert_satb_variant_mutation_retains(old, destination, || {
                         crate::lock::willow_blocking_rw_cell_write(cell, 0)
                     });
                 }
@@ -417,18 +454,20 @@ fn satb_native_container_overwrites_and_removals_publish_old_references() {
                         crate::channel::willow_channel_try_send_ptr(channel, old.cast()),
                         1
                     );
-                    assert_satb_mutation_retains(old, || {
+                    assert_satb_variant_mutation_retains(old, destination, || {
                         assert_eq!(crate::channel::willow_channel_recv_ptr(channel), old.cast());
                     });
                 }
                 6 => {
                     let arena = GcRootArena::default();
                     let handle = arena.insert(std::ptr::null_mut(), old);
-                    assert_satb_mutation_retains(old, || handle.release());
+                    assert_satb_variant_mutation_retains(old, destination, || handle.release());
                 }
                 7 => {
                     willow_gc_add_runtime_root(old);
-                    assert_satb_mutation_retains(old, || willow_gc_remove_runtime_root(old));
+                    assert_satb_variant_mutation_retains(old, destination, || {
+                        willow_gc_remove_runtime_root(old)
+                    });
                 }
                 8 => {
                     use crate::native_frame::{NativeFrameSpec, NativeTaskFrame};
@@ -440,12 +479,14 @@ fn satb_native_container_overwrites_and_removals_publish_old_references() {
                     }
                     let frame = NativeTaskFrame::<Frame>::allocate().unwrap();
                     frame.store_gc(0, old);
-                    assert_satb_mutation_retains(old, || frame.store_gc(0, std::ptr::null_mut()));
+                    assert_satb_variant_mutation_retains(old, destination, || {
+                        frame.store_gc(0, std::ptr::null_mut())
+                    });
                 }
                 9 => {
                     let array = crate::array::willow_array_new(1, 1);
                     let old_buffer = crate::array::willow_array_reference_owner(array, 0);
-                    assert_satb_mutation_retains(old_buffer, || {
+                    assert_satb_variant_mutation_retains(old_buffer, destination, || {
                         crate::array::willow_array_push(array, 0)
                     });
                 }
@@ -457,7 +498,9 @@ fn satb_native_container_overwrites_and_removals_publish_old_references() {
                     let MutexAcquire::Acquired(token) = cell.acquire(task) else {
                         panic!("acquire");
                     };
-                    assert_satb_mutation_retains(old, || assert!(cell.commit(task, token, 0)));
+                    assert_satb_variant_mutation_retains(old, destination, || {
+                        assert!(cell.commit(task, token, 0))
+                    });
                     cell.release(task, token);
                 }
                 _ => {
@@ -470,10 +513,13 @@ fn satb_native_container_overwrites_and_removals_publish_old_references() {
                     else {
                         panic!("acquire");
                     };
-                    assert_satb_mutation_retains(old, || assert!(cell.commit(task, token, 0)));
+                    assert_satb_variant_mutation_retains(old, destination, || {
+                        assert!(cell.commit(task, token, 0))
+                    });
                     cell.release(task, token);
                 }
             }
+            willow_pop_root();
             willow_gc_collect();
         }
     }
@@ -4177,6 +4223,75 @@ fn owned_pair_growth_bulk_barrier_remembers_young_destination_edges() {
         }
         willow_pop_root();
         eprintln!("bulk_growth_young edges={}", count + 1);
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn m0_marker_slice_recovery_emits_without_panic_hook() {
+    const CHILD: &str = "WILLOW_TEST_MARKER_DIAGNOSTIC";
+    if std::env::var_os(CHILD).is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gc::concurrent_tests::m0_marker_slice_recovery_emits_without_panic_hook",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(child.stderr).unwrap();
+        assert!(child.status.success(), "{stderr}");
+        let records: Vec<_> = stderr.lines().filter(|s| s.starts_with('{')).collect();
+        assert_eq!(records.len(), 3, "{stderr}");
+        for (record, reason) in records.iter().zip([
+            "native trace exceeded its slot budget",
+            "native trace did not advance its cursor",
+            "retry must not publish a partial native slice",
+        ]) {
+            assert!(record.len() < crate::gc_telemetry::failure_record::FAILURE_RECORD_LIMIT);
+            assert!(record.contains("\"kind\":\"marker_panic\""), "{record}");
+            assert!(record.contains(reason), "{record}");
+            println!("{record}");
+        }
+        return;
+    }
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    std::panic::set_hook(Box::new(|_| {}));
+    unsafe fn invalid_slice(
+        _: *mut u8,
+        offset: usize,
+        max: usize,
+        children: &mut Vec<*mut u8>,
+    ) -> TraceSliceProgress {
+        match offset {
+            0 => {
+                children.resize(max + 1, std::ptr::null_mut());
+                TraceSliceProgress::Done
+            }
+            1 => TraceSliceProgress::Continue(offset),
+            _ => {
+                children.push(std::ptr::null_mut());
+                TraceSliceProgress::Retry
+            }
+        }
+    }
+    for offset in 0..3 {
+        let mut cycle = ConcurrentCycle::new([], IdSet::default(), IdMap::default(), 1);
+        cycle.slices.insert(0xFA79, invalid_slice);
+        let before = crate::gc_telemetry::workers::snapshot().marker_panics;
+        let result = cycle
+            .drain_recovering(|| cycle.snapshot_native_slice(0, 0xFA79, offset, &mut Vec::new()));
+        assert_eq!(result, 0);
+        assert!(cycle.worker_failed.load(Ordering::Acquire));
+        assert_eq!(
+            crate::gc_telemetry::workers::snapshot().marker_panics,
+            before + 1
+        );
+        // A failed cycle never attempts another partial scan or reports again.
+        cycle.drain_recovering::<()>(|| panic!("must not drain a failed cycle"));
+        cycle.queue.end_epoch();
     }
     reset_internal_for_test();
 }

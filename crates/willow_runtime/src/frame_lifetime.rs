@@ -43,6 +43,7 @@ macro_rules! counters {
     ($($field:ident),+ $(,)?) => {
         $(static $field: AtomicU64 = AtomicU64::new(0);)+
         #[derive(Debug, Clone, Copy, Default)]
+        #[repr(C)]
         pub struct FrameLifetimeSnapshot {
             $(pub $field: u64,)+
             pub task_frames_running: u64,
