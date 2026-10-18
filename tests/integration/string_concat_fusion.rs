@@ -341,7 +341,7 @@ fn main() {
 }
 "#;
     for release in [false, true] {
-        let targets = compile_and_collect_relocation_targets_mode(src, &[], release);
+        let targets = compile_and_collect_panic_events_mode(src, &[], release);
         let n_ary = targets
             .iter()
             .filter(|name| name.as_str() == "willow_string_concat_n")
@@ -356,7 +356,7 @@ fn main() {
             "toString must be formatted in place: {targets:?}"
         );
         assert!(
-            targets.iter().any(|name| name == "willow_panic_depth"),
+            targets.iter().any(|name| name == "inline_panic_depth"),
             "the fused call keeps its panic check: {targets:?}"
         );
     }
@@ -371,7 +371,7 @@ fn main() {
     println(a + b);
 }
 "#;
-    let targets = compile_and_collect_relocation_targets(src, &[]);
+    let targets = compile_and_collect_panic_events(src, &[]);
     assert!(
         targets.iter().any(|name| name == "willow_string_concat"),
         "{targets:?}"

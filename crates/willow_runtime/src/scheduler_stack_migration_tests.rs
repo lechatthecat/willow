@@ -53,7 +53,15 @@ unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
             if MODE.load(Ordering::Relaxed) == 1 {
                 crate::panic_context::raise_language_message("migration unwind");
             }
+            assert_eq!(
+                crate::generated_context::published_depth(),
+                usize::from(MODE.load(Ordering::Relaxed) == 1)
+            );
             let cancelled = crate::preempt::willow_sync_safepoint();
+            assert_eq!(
+                crate::generated_context::published_depth(),
+                usize::from(MODE.load(Ordering::Relaxed) == 1)
+            );
             assert_eq!(cancelled, i32::from(MODE.load(Ordering::Relaxed) == 2));
             assert_eq!(current_worker(), 2);
             assert_ne!(

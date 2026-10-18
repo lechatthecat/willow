@@ -36,17 +36,17 @@
 //!   23 panics raised by a closure are recoverable by the caller's `recover`
 //!   24 the runnable example
 use super::support::{
-    compile_and_collect_relocation_targets_mode, compile_and_measure_text_bytes, compile_and_run,
+    compile_and_collect_panic_events_mode, compile_and_measure_text_bytes, compile_and_run,
     compile_and_run_gc_stress_all, compile_and_run_release, compile_and_run_with_env,
 };
 
 const ROOT: &str = "willow_push_root";
 const POLL: &str = "willow_gc_stop_flag";
-const PANIC_DEPTH: &str = "willow_panic_depth";
+const PANIC_DEPTH: &str = "inline_panic_depth";
 const NO_EFFECTS: [(&str, &str); 1] = [("WILLOW_PANIC_EFFECTS", "0")];
 
 fn count(source: &str, release: bool, symbol: &str) -> usize {
-    compile_and_collect_relocation_targets_mode(source, &[], release)
+    compile_and_collect_panic_events_mode(source, &[], release)
         .iter()
         .filter(|name| name.as_str() == symbol)
         .count()

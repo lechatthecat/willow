@@ -93,6 +93,10 @@ impl PanicContext {
         self.depth() != 0
     }
 
+    pub(crate) fn depth_ptr(&self) -> *mut AtomicUsize {
+        (&raw const self.active_depth).cast_mut()
+    }
+
     fn depth(&self) -> usize {
         self.active_depth.load(Ordering::Acquire)
     }
@@ -215,7 +219,14 @@ thread_local! {
 /// Replace the worker-local cache and return the previously installed context.
 /// Ownership remains in `Arc`; TLS never owns panic state by itself.
 pub fn replace_current_context(context: Option<Arc<PanicContext>>) -> Option<Arc<PanicContext>> {
-    CURRENT_CONTEXT.with(|slot| slot.replace(context))
+    let old = CURRENT_CONTEXT.with(|slot| slot.replace(context));
+    crate::generated_context::refresh_panic_depth();
+    old
+}
+
+/// Borrow only long enough to publish the address; CURRENT_CONTEXT retains ownership.
+pub(crate) fn current_depth_ptr() -> Option<*mut AtomicUsize> {
+    CURRENT_CONTEXT.with(|slot| slot.borrow().as_ref().map(|context| context.depth_ptr()))
 }
 
 pub fn current_context() -> Option<Arc<PanicContext>> {
@@ -702,6 +713,10 @@ mod tests {
         let second = Arc::new(PanicContext::new(241));
         let check = |expected| {
             assert_eq!(willow_panic_depth(), expected);
+            assert_eq!(
+                crate::generated_context::published_depth(),
+                expected as usize
+            );
             assert_eq!(willow_panic_active(), i32::from(expected != 0));
             assert_eq!(willow_unwind_reason(), i32::from(expected != 0));
             assert_eq!(current_snapshot().unwrap().active, expected as usize);
@@ -731,6 +746,41 @@ mod tests {
     }
 
     #[test]
+    fn generated_depth_tracks_active_context_lifetime_and_nested_recovery() {
+        let _heap = runtime_test_guard();
+        willow_gc_init();
+        let generated = crate::generated_context::Context::new();
+        generated.refresh();
+        struct Restore(*const crate::generated_context::Context);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::generated_context::replace(self.0);
+            }
+        }
+        let _generated_restore = Restore(crate::generated_context::replace(&generated));
+        let _restore = ContextTestGuard::install(244);
+        let first = current_context().unwrap();
+        for depth in 1..=32 {
+            raise("nested", "", 0, 0);
+            assert_eq!(crate::generated_context::published_depth(), depth);
+        }
+        let second = Arc::new(PanicContext::new(245));
+        replace_current_context(Some(second));
+        assert_eq!(crate::generated_context::published_depth(), 0);
+        raise("second", "", 0, 0);
+        assert_eq!(crate::generated_context::published_depth(), 1);
+        willow_panic_release_recovered(recover_one());
+        // The second Arc is destroyed by replacement; no stale pointer survives.
+        replace_current_context(Some(first));
+        for depth in (0..32).rev() {
+            willow_panic_release_recovered(recover_one());
+            assert_eq!(crate::generated_context::published_depth(), depth);
+        }
+        replace_current_context(None);
+        assert_eq!(crate::generated_context::published_depth(), 0);
+    }
+
+    #[test]
     fn shared_context_depth_tracks_another_threads_mutations() {
         let _heap = runtime_test_guard();
         willow_gc_init();
@@ -750,6 +800,7 @@ mod tests {
         .unwrap();
         assert_eq!(willow_panic_depth(), 0);
         assert_eq!(context.depth(), context.snapshot().active);
+        assert_eq!(crate::generated_context::published_depth(), 0);
     }
 
     #[test]

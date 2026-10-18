@@ -15,7 +15,7 @@
 //!  24 indirect calls remain conservative in panic-effect analysis.
 
 use super::support::{
-    assert_compile_error_contains, compile_and_collect_relocation_targets, compile_and_run,
+    assert_compile_error_contains, compile_and_collect_panic_events, compile_and_run,
     compile_and_run_release, compile_and_run_with_env,
 };
 
@@ -226,7 +226,7 @@ fn lambda_shadow_22_release_matches_debug() {
 
 #[test]
 fn lambda_shadow_24_indirect_call_keeps_panic_observation() {
-    let targets = compile_and_collect_relocation_targets(
+    let targets = compile_and_collect_panic_events(
         r#"
 fn f(x: i64) -> i64 { return x + 1; }
 fn chosen() -> i64 {
@@ -238,7 +238,7 @@ fn main() { println(chosen()); }
         &[],
     );
     assert!(
-        targets.iter().any(|target| target == "willow_panic_depth"),
+        targets.iter().any(|target| target == "inline_panic_depth"),
         "indirect call must remain fail-closed: {targets:?}"
     );
 }

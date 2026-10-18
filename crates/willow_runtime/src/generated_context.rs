@@ -3,7 +3,7 @@
 //! in generated code. Runtime-to-generated calls establish the pinned register.
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 #[repr(C)]
 pub(crate) struct Helper {
@@ -11,10 +11,13 @@ pub(crate) struct Helper {
     len: usize,
 }
 
+static NO_PANIC: AtomicUsize = AtomicUsize::new(0);
+
 #[repr(C)]
 pub(crate) struct Context {
     helper: AtomicPtr<Helper>,
     tlab: AtomicPtr<crate::gc::GcTlabState>,
+    panic_depth: AtomicPtr<AtomicUsize>,
 }
 
 impl Context {
@@ -22,10 +25,19 @@ impl Context {
         Self {
             helper: AtomicPtr::new(std::ptr::null_mut()),
             tlab: AtomicPtr::new(std::ptr::null_mut()),
+            panic_depth: AtomicPtr::new((&raw const NO_PANIC).cast_mut()),
         }
     }
 
+    fn refresh_panic_depth(&self) {
+        self.panic_depth.store(
+            crate::panic_context::current_depth_ptr().unwrap_or((&raw const NO_PANIC).cast_mut()),
+            Ordering::Relaxed,
+        );
+    }
+
     pub(crate) fn refresh(&self) {
+        self.refresh_panic_depth();
         self.tlab
             .store(crate::gc::willow_gc_current_tlab(), Ordering::Relaxed);
     }
@@ -62,12 +74,28 @@ const _: () = {
     assert!(
         std::mem::offset_of!(Context, tlab) == willow_abi::generated_context::TLAB_OFFSET as usize
     );
+    assert!(
+        std::mem::offset_of!(Context, panic_depth)
+            == willow_abi::generated_context::PANIC_DEPTH_OFFSET as usize
+    );
     assert!(std::mem::size_of::<Context>() == willow_abi::generated_context::SIZE);
 };
 
 thread_local! {
     static ACTIVE: Cell<*const Context> = const { Cell::new(std::ptr::null()) };
     static THREAD: Context = const { Context::new() };
+}
+
+// Only the running owner reads this pointer. CURRENT_CONTEXT retains its Arc
+// until replacement; refresh before dropping that Arc or entering/resuming code.
+// Inactive contexts can contain stale pointers, but are refreshed before use.
+pub(crate) fn refresh_panic_depth() {
+    let active = ACTIVE.get();
+    if active.is_null() {
+        THREAD.with(Context::refresh_panic_depth);
+    } else {
+        unsafe { &*active }.refresh_panic_depth();
+    }
 }
 
 pub(crate) fn replace(context: *const Context) -> *const Context {
@@ -83,6 +111,21 @@ fn current() -> *const Context {
         context.refresh();
         context as *const Context
     })
+}
+
+/// Test the exact published pointer, without borrowing panic TLS.
+#[cfg(test)]
+pub(crate) fn published_depth() -> usize {
+    let read = |context: &Context| {
+        let pointer = context.panic_depth.load(Ordering::Relaxed);
+        unsafe { &*pointer }.load(Ordering::Acquire)
+    };
+    let active = ACTIVE.get();
+    if active.is_null() {
+        THREAD.with(read)
+    } else {
+        read(unsafe { &*active })
+    }
 }
 
 /// Enter a pointer/void or pointer/i32 C-ABI callback.

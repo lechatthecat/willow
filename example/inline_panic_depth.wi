@@ -1,0 +1,16 @@
+// Inline panic-state reads must observe nested raise/recover across calls.
+fn fail(message: String) { panic(message); }
+fn main() {
+    defer match recover() {
+        Some(info) => println(info.message),
+        None => println("missing outer panic"),
+    }
+    defer {
+        defer match recover() {
+            Some(info) => println(info.message),
+            None => println("missing inner panic"),
+        }
+        fail("inner");
+    }
+    fail("outer");
+}

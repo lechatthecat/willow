@@ -862,6 +862,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         name: &str,
         args: &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Value {
+        // These ABI queries are compiler intrinsics: the stable execution
+        // context points at the Arc-owned atomic, never at worker TLS. Keep
+        // the load atomic (also on AArch64) and preserve i32 saturation.
+        if name == "willow_panic_depth" || name == "willow_panic_active" {
+            let ptr_ty = reference_type(self.module.target_config());
+            let context = self.builder.ins().get_pinned_reg(ptr_ty);
+            let pointer = self.builder.ins().load(
+                ptr_ty,
+                MemFlagsData::trusted(),
+                context,
+                willow_abi::generated_context::PANIC_DEPTH_OFFSET,
+            );
+            let depth = self
+                .builder
+                .ins()
+                .atomic_load(ptr_ty, MemFlagsData::trusted(), pointer);
+            if name == "willow_panic_active" {
+                let active = self.builder.ins().icmp_imm_u(IntCC::NotEqual, depth, 0);
+                return self.builder.ins().uextend(types::I32, active);
+            }
+            let max = self.builder.ins().iconst(ptr_ty, i32::MAX as i64);
+            let saturated = self.builder.ins().umin(depth, max);
+            return self.builder.ins().ireduce(types::I32, saturated);
+        }
         self.emit_runtime_call_with_cleanup(name, args, |_| {})
             .unwrap_or_else(|| panic!("runtime call `{name}` unexpectedly returned void"))
     }

@@ -1,10 +1,9 @@
 //! willow-s9ej.8 — conservative may-panic analysis and fast-path coverage.
 
 use super::support::{
-    TestProject, compile_and_collect_relocation_targets,
-    compile_and_collect_relocation_targets_all, compile_and_collect_relocation_targets_mode,
-    compile_and_run_release, compile_and_run_with_env, compile_release_with_compiler_env,
-    compile_with_compiler_env,
+    TestProject, compile_and_collect_panic_events, compile_and_collect_panic_events_all,
+    compile_and_collect_panic_events_mode, compile_and_run_release, compile_and_run_with_env,
+    compile_release_with_compiler_env, compile_with_compiler_env,
 };
 
 const PURE_RECURSION: &str = r#"
@@ -29,8 +28,8 @@ fn main() { println(chain(0)); }
 #[test]
 fn panic_snapshots_reduce_three_surviving_straight_line_reads() {
     for release in [false, true] {
-        let optimized = compile_and_collect_relocation_targets_mode(SNAPSHOT_CHAIN, &[], release);
-        let baseline = compile_and_collect_relocation_targets_mode(
+        let optimized = compile_and_collect_panic_events_mode(SNAPSHOT_CHAIN, &[], release);
+        let baseline = compile_and_collect_panic_events_mode(
             SNAPSHOT_CHAIN,
             &[("WILLOW_PANIC_SNAPSHOT_REUSE", "0")],
             release,
@@ -38,7 +37,7 @@ fn panic_snapshots_reduce_three_surviving_straight_line_reads() {
         let count = |names: &[String]| {
             names
                 .iter()
-                .filter(|name| name.as_str() == "willow_panic_depth")
+                .filter(|name| name.as_str() == "inline_panic_depth")
                 .count()
         };
         assert!(count(&optimized) > 0, "may-panic calls must retain checks");
@@ -56,10 +55,10 @@ fn panic_snapshots_reduce_three_surviving_straight_line_reads() {
 fn panic_snapshots_do_not_add_reads_to_pure_calls() {
     // Pure only in release: debug overflow checks make `fib` may-panic
     // (willow-jz15.14).
-    let targets = compile_and_collect_relocation_targets_mode(PURE_RECURSION, &[], true);
-    assert!(!has_target(&targets, "willow_panic_depth"));
-    let targets = compile_and_collect_relocation_targets_mode(PURE_RECURSION, &[], false);
-    assert!(has_target(&targets, "willow_panic_depth"));
+    let targets = compile_and_collect_panic_events_mode(PURE_RECURSION, &[], true);
+    assert!(!has_target(&targets, "inline_panic_depth"));
+    let targets = compile_and_collect_panic_events_mode(PURE_RECURSION, &[], false);
+    assert!(has_target(&targets, "inline_panic_depth"));
 }
 
 #[test]
@@ -277,8 +276,8 @@ fn main() {}
 
 #[test]
 fn pe_03_proven_pure_call_graph_emits_no_panic_depth_relocation() {
-    let targets = compile_and_collect_relocation_targets_mode(PURE_RECURSION, &[], true);
-    assert!(!has_target(&targets, "willow_panic_depth"), "{targets:?}");
+    let targets = compile_and_collect_panic_events_mode(PURE_RECURSION, &[], true);
+    assert!(!has_target(&targets, "inline_panic_depth"), "{targets:?}");
     // Task-aware synchronous cancellation restores GC roots independently of
     // panic propagation. Its root-depth relocation does not make this pure
     // call graph require a panic-depth check.
@@ -287,8 +286,8 @@ fn pe_03_proven_pure_call_graph_emits_no_panic_depth_relocation() {
 #[test]
 fn pe_04_analysis_off_restores_conservative_depth_checks() {
     let targets =
-        compile_and_collect_relocation_targets(PURE_RECURSION, &[("WILLOW_PANIC_EFFECTS", "0")]);
-    assert!(has_target(&targets, "willow_panic_depth"), "{targets:?}");
+        compile_and_collect_panic_events(PURE_RECURSION, &[("WILLOW_PANIC_EFFECTS", "0")]);
+    assert!(has_target(&targets, "inline_panic_depth"), "{targets:?}");
     // Disabling panic effects must not disable the independent zero-root proof.
     assert!(!has_target(&targets, "willow_root_depth"), "{targets:?}");
 }
@@ -306,8 +305,8 @@ fn main() { println(Math::calculate(2)); }
 "#;
     for release in [false, true] {
         for env in [&[][..], &[("WILLOW_PANIC_EFFECTS", "0")][..]] {
-            let targets = compile_and_collect_relocation_targets_mode(source, env, release);
-            assert!(has_target(&targets, "willow_panic_depth"), "{targets:?}");
+            let targets = compile_and_collect_panic_events_mode(source, env, release);
+            assert!(has_target(&targets, "inline_panic_depth"), "{targets:?}");
             for name in ["willow_root_depth", "willow_pop_roots", "willow_push_root"] {
                 assert!(
                     !has_target(&targets, name),
@@ -341,7 +340,7 @@ fn pe_zero_root_proof_keeps_reference_and_unknown_cleanup() {
     for fixture in fixtures {
         let source = format!("{fixture}\nfn main() {{}}");
         for release in [false, true] {
-            let targets = compile_and_collect_relocation_targets_mode(
+            let targets = compile_and_collect_panic_events_mode(
                 &source,
                 &[("WILLOW_PANIC_EFFECTS", "0")],
                 release,
@@ -408,8 +407,8 @@ import std::collections::Array;
 fn first(xs: Array<i64>) -> i64 { return xs[0]; }
 fn main() { println(first([7])); }
 "#;
-    let targets = compile_and_collect_relocation_targets(source, &[]);
-    assert!(has_target(&targets, "willow_panic_depth"), "{targets:?}");
+    let targets = compile_and_collect_panic_events(source, &[]);
+    assert!(has_target(&targets, "inline_panic_depth"), "{targets:?}");
 }
 
 #[test]
@@ -419,8 +418,8 @@ fn plus_one(n: i64) -> i64 { return n + 1; }
 fn apply(f: fn(i64) -> i64, n: i64) -> i64 { return f(n); }
 fn main() { println(apply(plus_one, 41)); }
 "#;
-    let targets = compile_and_collect_relocation_targets(source, &[]);
-    assert!(has_target(&targets, "willow_panic_depth"), "{targets:?}");
+    let targets = compile_and_collect_panic_events(source, &[]);
+    assert!(has_target(&targets, "inline_panic_depth"), "{targets:?}");
 }
 
 #[test]
@@ -434,8 +433,8 @@ class Number implements Value {
 fn read(value: Value) -> i64 { return value.get(); }
 fn main() { println(read(new Number(42))); }
 "#;
-    let targets = compile_and_collect_relocation_targets(source, &[]);
-    assert!(has_target(&targets, "willow_panic_depth"), "{targets:?}");
+    let targets = compile_and_collect_panic_events(source, &[]);
+    assert!(has_target(&targets, "inline_panic_depth"), "{targets:?}");
 }
 
 #[test]
@@ -444,8 +443,8 @@ fn pe_08_safe_static_method_omits_its_call_check() {
 class Math { pub static fn twice(n: i64) -> i64 { return n * 2; } }
 fn main() { println(Math::twice(21)); }
 "#;
-    let targets = compile_and_collect_relocation_targets_mode(source, &[], true);
-    assert!(!has_target(&targets, "willow_panic_depth"), "{targets:?}");
+    let targets = compile_and_collect_panic_events_mode(source, &[], true);
+    assert!(!has_target(&targets, "inline_panic_depth"), "{targets:?}");
 }
 
 #[test]
@@ -457,8 +456,8 @@ class Crate {
 fn make() -> Crate { return new Crate(); }
 fn main() { let value = make(); println(42); }
 "#;
-    let targets = compile_and_collect_relocation_targets(source, &[]);
-    assert!(!has_target(&targets, "willow_panic_depth"), "{targets:?}");
+    let targets = compile_and_collect_panic_events(source, &[]);
+    assert!(!has_target(&targets, "inline_panic_depth"), "{targets:?}");
 }
 
 #[test]
@@ -479,16 +478,15 @@ fn main() { println(read(new Child())); }
         stderr.contains("[panic-effects] Child.value: no-panic"),
         "{stderr}"
     );
-    let optimized = compile_and_collect_relocation_targets_all(source, &[]);
-    let baseline =
-        compile_and_collect_relocation_targets_all(source, &[("WILLOW_PANIC_EFFECTS", "0")]);
+    let optimized = compile_and_collect_panic_events_all(source, &[]);
+    let baseline = compile_and_collect_panic_events_all(source, &[("WILLOW_PANIC_EFFECTS", "0")]);
     let optimized_checks = optimized
         .iter()
-        .filter(|target| target.as_str() == "willow_panic_depth")
+        .filter(|target| target.as_str() == "inline_panic_depth")
         .count();
     let baseline_checks = baseline
         .iter()
-        .filter(|target| target.as_str() == "willow_panic_depth")
+        .filter(|target| target.as_str() == "inline_panic_depth")
         .count();
     assert!(
         optimized_checks < baseline_checks,
@@ -506,8 +504,8 @@ class Child extends Base {
 fn read(value: Base) -> i64 { return value.value(); }
 fn main() { println(read(new Base())); }
 "#;
-    let targets = compile_and_collect_relocation_targets(source, &[]);
-    assert!(has_target(&targets, "willow_panic_depth"), "{targets:?}");
+    let targets = compile_and_collect_panic_events(source, &[]);
+    assert!(has_target(&targets, "inline_panic_depth"), "{targets:?}");
 }
 
 #[test]
@@ -686,16 +684,15 @@ fn main() { println(new Child().run()); }
         stderr.contains("[panic-effects] Base.run: no-panic"),
         "{stderr}"
     );
-    let optimized = compile_and_collect_relocation_targets_all(source, &[]);
-    let baseline =
-        compile_and_collect_relocation_targets_all(source, &[("WILLOW_PANIC_EFFECTS", "0")]);
+    let optimized = compile_and_collect_panic_events_all(source, &[]);
+    let baseline = compile_and_collect_panic_events_all(source, &[("WILLOW_PANIC_EFFECTS", "0")]);
     let optimized_checks = optimized
         .iter()
-        .filter(|target| target.as_str() == "willow_panic_depth")
+        .filter(|target| target.as_str() == "inline_panic_depth")
         .count();
     let baseline_checks = baseline
         .iter()
-        .filter(|target| target.as_str() == "willow_panic_depth")
+        .filter(|target| target.as_str() == "inline_panic_depth")
         .count();
     assert!(
         optimized_checks < baseline_checks,
@@ -1252,11 +1249,43 @@ fn concat(a: String, b: String) -> String { return a + b; }
 fn main() { println(concat("hello", " world")); }
 "#;
     for release in [false, true] {
-        let targets = compile_and_collect_relocation_targets_mode(source, &[], release);
+        let targets = compile_and_collect_panic_events_mode(source, &[], release);
         assert!(has_target(&targets, "willow_string_concat"));
-        assert!(has_target(&targets, "willow_panic_depth"));
+        assert!(has_target(&targets, "inline_panic_depth"));
     }
     let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", "alloc")]);
     assert!(ok, "{out}");
     assert_eq!(out, "hello world\n");
+}
+
+#[test]
+fn inline_panic_snapshots_have_zero_runtime_relocations() {
+    use super::support::compile_and_collect_relocation_targets_mode;
+    for release in [false, true] {
+        let targets = compile_and_collect_relocation_targets_mode(
+            include_str!("../../example/inline_panic_depth.wi"),
+            &[],
+            release,
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|name| matches!(name.as_str(), "willow_panic_depth" | "willow_panic_active")),
+            "{targets:?}"
+        );
+        for sites in [1, 2, 8, 32] {
+            let source = format!(
+                "fn step(n: i64) -> i64 {{ if n < 0 {{ panic(\"bad\"); }} return n; }} fn main() {{ let mut n = 1; {} println(n); }}",
+                "n = step(n);".repeat(sites)
+            );
+            let targets = compile_and_collect_relocation_targets_mode(&source, &[], release);
+            assert!(
+                !targets.iter().any(|name| matches!(
+                    name.as_str(),
+                    "willow_panic_depth" | "willow_panic_active"
+                )),
+                "{targets:?}"
+            );
+        }
+    }
 }

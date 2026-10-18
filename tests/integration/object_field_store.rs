@@ -220,7 +220,7 @@ fn object_field_store_sites_add_one_cold_barrier_and_phase_load_each() {
     const TRACKED: [&str; 5] = [
         "willow_push_root",
         "willow_pop_roots",
-        "willow_panic_depth",
+        "inline_panic_depth",
         "willow_gc_write_barrier",
         "willow_gc_mark_phase",
     ];
@@ -232,7 +232,7 @@ fn object_field_store_sites_add_one_cold_barrier_and_phase_load_each() {
              fn main() {{ work(new Box(new Node(1), 0), new Node(2), 3); }}",
             body.repeat(sites),
         );
-        let names = compile_and_collect_relocation_targets_mode(&source, &[], true);
+        let names = compile_and_collect_panic_events_mode(&source, &[], true);
         TRACKED.map(|target| names.iter().filter(|name| *name == target).count())
     };
     let scalar = [1, 8, 32].map(|sites| counts("b.i = i;", sites));

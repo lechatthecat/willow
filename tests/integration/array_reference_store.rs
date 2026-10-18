@@ -234,7 +234,7 @@ fn array_reference_store_sites_match_scalar_store_runtime_calls() {
     const TRACKED: [&str; 6] = [
         "willow_push_root",
         "willow_pop_roots",
-        "willow_panic_depth",
+        "inline_panic_depth",
         "willow_array_set",
         "willow_gc_write_barrier",
         "willow_gc_mark_phase",
@@ -246,7 +246,7 @@ fn array_reference_store_sites_match_scalar_store_runtime_calls() {
              fn main() {{ work({array}, {value}, 0); }}",
             "xs[i] = n;".repeat(sites),
         );
-        let names = compile_and_collect_relocation_targets_mode(&source, &[], true);
+        let names = compile_and_collect_panic_events_mode(&source, &[], true);
         TRACKED.map(|target| names.iter().filter(|name| *name == target).count())
     };
     let scalar = [1, 8, 32].map(|sites| counts("i64", "[1]", "2", sites));

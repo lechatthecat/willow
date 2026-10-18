@@ -822,7 +822,9 @@ mod bitmap_fingerprint_tests {
 pub mod generated_context {
     pub const HELPER_OFFSET: i32 = 0;
     pub const TLAB_OFFSET: i32 = 8;
-    pub const SIZE: usize = 16;
+    /// Pointer to an AtomicUsize, valid for the current execution context.
+    pub const PANIC_DEPTH_OFFSET: i32 = 16;
+    pub const SIZE: usize = 24;
     pub const HELPER_DESCRIPTOR_SIZE: usize = 16;
     pub const HELPER_LENGTH_OFFSET: usize = 8;
 }

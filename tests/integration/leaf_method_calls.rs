@@ -38,12 +38,12 @@
 //!   29 promoted calls evaluate reference arguments once
 //!   30 a promoted panicking target preserves its failure edge
 use super::support::{
-    compile_and_collect_relocation_targets_mode, compile_and_run, compile_and_run_gc_stress_all,
+    compile_and_collect_panic_events_mode, compile_and_run, compile_and_run_gc_stress_all,
     compile_and_run_release,
 };
 
 fn count(source: &str, env: &[(&str, &str)], release: bool, symbol: &str) -> usize {
-    compile_and_collect_relocation_targets_mode(source, env, release)
+    compile_and_collect_panic_events_mode(source, env, release)
         .iter()
         .filter(|name| name.as_str() == symbol)
         .count()
@@ -67,7 +67,7 @@ fn method_delta(signature: &str, body: &str, symbol: &str) -> [usize; 2] {
 
 const ROOT: &str = "willow_push_root";
 const POLL: &str = "willow_gc_stop_flag";
-const PANIC_DEPTH: &str = "willow_panic_depth";
+const PANIC_DEPTH: &str = "inline_panic_depth";
 const NO_EFFECTS: [(&str, &str); 1] = [("WILLOW_PANIC_EFFECTS", "0")];
 
 fn polymorphic_source(targets: usize, calls: usize) -> String {
@@ -533,7 +533,7 @@ fn main() {
 
 #[test]
 fn leaf_method_and_call_counts_scale_without_runtime_overhead() {
-    use super::support::compile_and_collect_relocation_targets_mode as relocations;
+    use super::support::compile_and_collect_panic_events_mode as relocations;
     for n in [1, 8, 64] {
         let methods: String = (0..n).map(|i| format!("pub fn m{i}(self, k: i64) -> i64 {{ if k > 0 {{ return self.n * k; }} return self.n; }}\n")).collect();
         let calls: String = (0..n)

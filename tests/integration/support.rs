@@ -548,6 +548,15 @@ pub(super) fn compile_and_collect_relocations_by_section(
     env: &[(&str, &str)],
     release: bool,
 ) -> Vec<(String, String)> {
+    collect_codegen_events(source, env, release, false)
+}
+
+fn collect_codegen_events(
+    source: &str,
+    env: &[(&str, &str)],
+    release: bool,
+    inline_reads: bool,
+) -> Vec<(String, String)> {
     use object::read::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
     let id = unique_test_id();
@@ -567,6 +576,9 @@ pub(super) fn compile_and_collect_relocations_by_section(
     }
     for (key, value) in env {
         command.env(key, value);
+    }
+    if inline_reads {
+        command.env("WILLOW_PANIC_DEPTH_LOAD_LOG", "1");
     }
     let output = command.output().expect("failed to run compiler");
     assert!(
@@ -610,6 +622,14 @@ pub(super) fn compile_and_collect_relocations_by_section(
                 names.push((role.to_string(), name.trim_start_matches('_').to_string()));
             }
         }
+    }
+    if inline_reads {
+        names.extend(
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter(|line| *line == "[panic-depth-load]")
+                .map(|_| ("inline-read".to_string(), "inline_panic_depth".to_string())),
+        );
     }
     names.sort();
     assert!(
@@ -1715,4 +1735,30 @@ fn main() {
         );
         assert_eq!(second_out, "ok\n");
     }
+}
+
+/// Codegen events, including inline panic-state reads (not runtime calls).
+/// Used by effect-analysis tests that formerly counted depth relocations.
+pub(super) fn compile_and_collect_panic_events_mode(
+    source: &str,
+    env: &[(&str, &str)],
+    release: bool,
+) -> Vec<String> {
+    let mut events: Vec<_> = collect_codegen_events(source, env, release, true)
+        .into_iter()
+        .map(|(_, event)| event)
+        .collect();
+    events.sort();
+    events
+}
+pub(super) fn compile_and_collect_panic_events_all(
+    source: &str,
+    env: &[(&str, &str)],
+) -> Vec<String> {
+    compile_and_collect_panic_events_mode(source, env, false)
+}
+pub(super) fn compile_and_collect_panic_events(source: &str, env: &[(&str, &str)]) -> Vec<String> {
+    let mut events = compile_and_collect_panic_events_all(source, env);
+    events.dedup();
+    events
 }

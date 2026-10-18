@@ -56,6 +56,25 @@ pub(super) fn sink_cold_regions(func: &mut Function) {
     for block in cold {
         func.layout.set_cold(block);
     }
+    if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                if let cranelift_codegen::ir::InstructionData::Load { offset, .. } =
+                    func.dfg.insts[inst]
+                    && i32::from(offset) == willow_abi::generated_context::PANIC_DEPTH_OFFSET
+                {
+                    let address = func.dfg.inst_args(inst)[0];
+                    if let cranelift_codegen::ir::ValueDef::Result(def, _) =
+                        func.dfg.value_def(address)
+                        && func.dfg.insts[def].opcode()
+                            == cranelift_codegen::ir::Opcode::GetPinnedReg
+                    {
+                        eprintln!("[panic-depth-load]");
+                    }
+                }
+            }
+        }
+    }
     #[cfg(test)]
     CAPTURE.with(|capture| {
         if let Some(functions) = capture.borrow_mut().as_mut() {
