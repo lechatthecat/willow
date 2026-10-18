@@ -1392,6 +1392,15 @@ struct EnumPayloadLayout {
     gc_layout: GcLayoutMetadata,
 }
 
+/// A patchable shadow-root capacity check; `base` is the static root count
+/// at the check, so the patched count covers pushes above it.
+#[derive(Clone, Copy)]
+struct RootReservation {
+    count: cranelift_codegen::ir::Inst,
+    check: cranelift_codegen::ir::Inst,
+    base: usize,
+}
+
 struct FuncGen<'a, 'b> {
     enum_payload_layouts: &'a mut HashMap<Type, HashMap<String, std::sync::Arc<EnumPayloadLayout>>>,
     builder: &'a mut FunctionBuilder<'b>,
@@ -1540,7 +1549,7 @@ struct FuncGen<'a, 'b> {
     terminated: bool,
     /// Number of GC roots currently on the root stack for this function invocation.
     gc_root_count: usize,
-    root_reservation: Option<(cranelift_codegen::ir::Inst, cranelift_codegen::ir::Inst)>,
+    root_reservation: Option<RootReservation>,
     root_peak_count: usize,
     /// Temporary roots indexed by live root depth and spill width.
     temporary_root_slots: HashMap<(usize, u32), cranelift_codegen::ir::StackSlot>,

@@ -1060,6 +1060,56 @@ fn inline_shadow_roots_example_in_relocation_modes() {
     );
 }
 
+/// Panic edges reach shared cleanup above the static root count. `main`
+/// reserves its exact static peak, so the deferred actions' pushes need their
+/// own capacity check on cleanup entry.
+#[test]
+fn inline_shadow_roots_reserve_panic_cleanup_pushes() {
+    assert_relocating_modes(
+        "inline_shadow_roots_panic_cleanup",
+        r#"class Root { pub n: i64; }
+fn main() {
+    let keep = new Root(1);
+    let mut seen = 0;
+    if true {
+        defer match recover() {
+            Some(info) => {
+                let f = new Root(10);
+                gc_minor_collect();
+                if info.message == "A" { seen = seen + f.n; }
+            },
+            None => {}
+        }
+        if true {
+            defer match recover() {
+                Some(info) => {
+                    let a = new Root(1);
+                    let b = new Root(2);
+                    let c = new Root(3);
+                    gc_minor_collect();
+                    if info.message == "B" { seen = seen + a.n + b.n + c.n; }
+                },
+                None => {}
+            }
+            defer {
+                let d = new Root(4);
+                let e = new Root(5);
+                gc_minor_collect();
+                if d.n + e.n == 9 { panic("B"); }
+            }
+            let x = new Root(6);
+            let y = new Root(7);
+            gc_minor_collect();
+            if x.n + y.n == 13 { panic("A"); }
+        }
+    }
+    println(keep.n + seen);
+}
+"#,
+        "17\n",
+    );
+}
+
 #[test]
 fn inline_shadow_roots_reserve_peak_depth_not_total_sites() {
     for release in [false, true] {

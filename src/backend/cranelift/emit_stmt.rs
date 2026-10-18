@@ -686,6 +686,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .active
                 .truncate(depth);
         }
+        let cleanup_reservation = self.begin_cleanup_root_reservation();
         let entries = self.defer_stack[scope.defer_depth].clone();
         let scope_can_recover = entries.iter().any(|entry| entry.recovery_capable);
 
@@ -821,6 +822,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_unhandled_panic_exit();
         }
         let _ = propagate;
+        self.finish_cleanup_root_reservation(cleanup_reservation);
         self.lir_call_frames = prepared_frames_before;
         self.lir_reference_scopes = reference_scopes_before;
         self.callstack_frame_depth = callstack_depth_before;

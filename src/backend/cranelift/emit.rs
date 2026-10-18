@@ -46,6 +46,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// count is the maximum live lexical root depth across all emitted paths,
     /// including cleanup. Loop scopes pop before their next iteration.
     pub(super) fn begin_root_reservation(&mut self) {
+        self.root_reservation = Some(self.emit_root_reservation_check());
+    }
+
+    fn emit_root_reservation_check(&mut self) -> RootReservation {
         let ty = reference_type(self.module.target_config());
         let count = self.builder.ins().iconst(ty, 0);
         let count_inst = self.builder.func.dfg.value_def(count).inst().unwrap();
@@ -67,10 +71,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .icmp(IntCC::UnsignedLessThanOrEqual, needed, limit);
-        self.root_reservation = Some((
-            count_inst,
-            self.builder.func.dfg.value_def(fits).inst().unwrap(),
-        ));
+        let reservation = RootReservation {
+            count: count_inst,
+            check: self.builder.func.dfg.value_def(fits).inst().unwrap(),
+            base: self.gc_root_count,
+        };
         let cold = self.builder.create_block();
         let ready = self.builder.create_block();
         self.builder.set_cold_block(cold);
@@ -83,27 +88,59 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(ready, &[]);
         self.builder.switch_to_block(ready);
         self.builder.seal_block(ready);
+        reservation
     }
 
     pub(super) fn finish_root_reservation(&mut self) {
-        if let Some((inst, check)) = self.root_reservation {
-            if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
-                eprintln!("[root-reservation:{}]", self.root_peak_count);
-            }
-            if let cranelift_codegen::ir::InstructionData::UnaryImm { imm, .. } =
-                &mut self.builder.func.dfg.insts[inst]
-            {
-                *imm = (self.root_peak_count as i64).into();
-            } else {
-                unreachable!("root reservation constant");
-            }
-            if self.root_peak_count == 0 {
-                self.builder.func.dfg.insts[check] =
-                    cranelift_codegen::ir::InstructionData::UnaryImm {
-                        opcode: cranelift_codegen::ir::Opcode::Iconst,
-                        imm: 1.into(),
-                    };
-            }
+        if let Some(reservation) = self.root_reservation {
+            self.patch_root_reservation(reservation, self.root_peak_count);
+        }
+    }
+
+    /// Panic edges reach a shared cleanup block with a path-dependent live
+    /// root depth above the static count, so the function-entry reservation
+    /// does not cover pushes made by deferred actions there. Check capacity
+    /// again on cleanup entry for the roots the cleanup itself pushes.
+    pub(super) fn begin_cleanup_root_reservation(&mut self) -> Option<(RootReservation, usize)> {
+        let outer = self.root_reservation?;
+        let outer_peak = std::mem::replace(&mut self.root_peak_count, self.gc_root_count);
+        self.root_reservation = Some(self.emit_root_reservation_check());
+        Some((outer, outer_peak))
+    }
+
+    pub(super) fn finish_cleanup_root_reservation(
+        &mut self,
+        saved: Option<(RootReservation, usize)>,
+    ) {
+        let Some((outer, outer_peak)) = saved else {
+            return;
+        };
+        let inner = self
+            .root_reservation
+            .replace(outer)
+            .expect("cleanup root reservation");
+        self.patch_root_reservation(inner, self.root_peak_count);
+        self.root_peak_count = self.root_peak_count.max(outer_peak);
+    }
+
+    fn patch_root_reservation(&mut self, reservation: RootReservation, peak: usize) {
+        let count = peak.saturating_sub(reservation.base);
+        if std::env::var_os("WILLOW_PANIC_DEPTH_LOAD_LOG").is_some() {
+            eprintln!("[root-reservation:{count}]");
+        }
+        if let cranelift_codegen::ir::InstructionData::UnaryImm { imm, .. } =
+            &mut self.builder.func.dfg.insts[reservation.count]
+        {
+            *imm = (count as i64).into();
+        } else {
+            unreachable!("root reservation constant");
+        }
+        if count == 0 {
+            self.builder.func.dfg.insts[reservation.check] =
+                cranelift_codegen::ir::InstructionData::UnaryImm {
+                    opcode: cranelift_codegen::ir::Opcode::Iconst,
+                    imm: 1.into(),
+                };
         }
     }
 
