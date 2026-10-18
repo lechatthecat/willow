@@ -51,6 +51,10 @@ pub(super) struct ConcurrentCycle {
     pub(super) active_drains: AtomicUsize,
     pub(super) deferred: Mutex<Vec<usize>>,
     pub(super) unindexed: Mutex<HashSet<usize>>,
+    /// False between the root handshake and late-extent publication, when an
+    /// unindexed value may still lie in an extent created after preparation.
+    /// Written only under the `unindexed` lock.
+    pub(super) late_published: std::sync::atomic::AtomicBool,
     /// Debug validation of a root outside the captured index, taken at the
     /// root stop; raised inside the cycle's recovery scope.
     #[cfg(debug_assertions)]
@@ -267,6 +271,7 @@ impl ConcurrentCycle {
             slices: IdMap::default(),
             deferred: Mutex::new(Vec::new()),
             unindexed: Mutex::new(HashSet::new()),
+            late_published: std::sync::atomic::AtomicBool::new(true),
             #[cfg(debug_assertions)]
             invalid_root: Mutex::new(None),
             queue,
@@ -284,6 +289,7 @@ impl ConcurrentCycle {
             return false;
         }
         self.pointer_checks.fetch_add(1, Ordering::Relaxed);
+        let late_published = self.late_published.load(Ordering::Acquire);
         if self.objects.claim(address) {
             return true;
         }
@@ -294,9 +300,22 @@ impl ConcurrentCycle {
             // Extents allocated after capture are implicitly black through
             // sweep and minor relocation. Only a captured extent can need a
             // delayed start publication; do not retain every new allocation in
-            // an additional address set.
+            // an additional address set. Before late publication, an extent
+            // created after preparation is not indexed yet but holds unmarked
+            // objects that roots and SATB values name: retain those until
+            // `publish_late` rechecks them.
             if self.objects.reader().needs_start_publication(address) {
                 self.unindexed.lock().unwrap().insert(address);
+            } else if !late_published {
+                let mut unindexed = self.unindexed.lock().unwrap();
+                if !self.late_published.load(Ordering::Relaxed) {
+                    unindexed.insert(address);
+                } else {
+                    // Published after this claim's lookup: decide again with
+                    // the complete index.
+                    drop(unindexed);
+                    return self.claim_or_defer(address);
+                }
             }
         } else {
             self.duplicate_discoveries.fetch_add(1, Ordering::Relaxed);
@@ -304,8 +323,14 @@ impl ConcurrentCycle {
         false
     }
 
-    pub(super) fn recheck_unindexed(&self) {
-        let pending = std::mem::take(&mut *self.unindexed.lock().unwrap());
+    /// Publish late extents, then recheck every value retained meanwhile.
+    pub(super) fn publish_late(&self, late: epoch_index::LatePreparation) {
+        self.objects.publish_late(late);
+        let pending = {
+            let mut unindexed = self.unindexed.lock().unwrap();
+            self.late_published.store(true, Ordering::Release);
+            std::mem::take(&mut *unindexed)
+        };
         for address in pending {
             self.enqueue(address as *mut u8);
         }

@@ -44,6 +44,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                 let (legacy, traces, slices) = trace_registry_snapshot();
                 let mut cycle =
                     ConcurrentCycle::with_epoch_index(objects, legacy, traces, 0, identity);
+                cycle.late_published = std::sync::atomic::AtomicBool::new(false);
                 let goal = state.soft_memory.decide(memory_inputs(&state)).goal;
                 cycle.slices = slices;
                 cycle.assist_rate = if !old_cycle::concurrent_enabled()
@@ -115,8 +116,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
         let state = runtime().heap.lock().unwrap();
         let late = cycle.objects.snapshot_late(&state);
         drop(state);
-        cycle.objects.publish_late(late);
-        cycle.recheck_unindexed();
+        cycle.publish_late(late);
     }
     result
 }

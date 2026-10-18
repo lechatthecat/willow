@@ -317,6 +317,9 @@ fn stress_region_05_minor_major_and_remembered_set_interleave() {
     let mut tls = new_tlab_state();
 
     for round in 0..1000i64 {
+        // Every cycle here has full survival; pin the default two-step tenure
+        // instead of letting adaptive tenuring skip the survivor copy.
+        runtime().heap.lock().unwrap().tenuring = Default::default();
         let young = willow_gc_alloc_slow(&mut tls, 2, 2, 8, 0);
         unsafe { *(young as *mut i64) = round };
         willow_gc_write_barrier(

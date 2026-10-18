@@ -853,6 +853,61 @@ mod tests {
     }
 
     #[test]
+    fn late_extent_root_enqueued_before_late_publication_is_marked() {
+        let _test = runtime_test_guard();
+        reset_internal_for_test();
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        let collector = cycle_wait::CollectorGuard::try_acquire().unwrap();
+        let mut anchor = willow_alloc_typed(8, 0);
+        willow_push_root(&mut anchor);
+        let (prepared, _) = {
+            let state = runtime().heap.lock().unwrap();
+            RegionIndex::snapshot(&state)
+        }
+        .build(true);
+        // Created after preparation at phase zero: unmarked and outside every
+        // captured extent until late publication.
+        let mut late_root = willow_gc_alloc_layout(0, 0, GC_OLD_REGION_SIZE as i64, 0);
+        willow_push_root(&mut late_root);
+        let mut cycle = ConcurrentCycle::with_index(
+            EpochIndex::regions(prepared),
+            IdSet::default(),
+            IdMap::default(),
+            2,
+        );
+        cycle.late_published = std::sync::atomic::AtomicBool::new(false);
+        let cycle = Arc::new(cycle);
+        let late = {
+            let mut state = runtime().heap.lock().unwrap();
+            marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+            GC_MARK_PHASE.store(1, Ordering::Release);
+            cycle.objects.snapshot_late(&state)
+        };
+        // Root snapshot precedes late publication, as in the root handshake.
+        cycle.enqueue(anchor);
+        cycle.enqueue(late_root);
+        assert!(
+            cycle
+                .unindexed
+                .lock()
+                .unwrap()
+                .contains(&(late_root as usize))
+        );
+        cycle.publish_late(late);
+        assert!(cycle.unindexed.lock().unwrap().is_empty());
+        let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
+        assert!(cycle.is_marked(late_root as usize));
+        sweep::concurrent(plan);
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            (2 * GC_HEADER_SIZE + 8 + GC_OLD_REGION_SIZE) as i64
+        );
+        willow_pop_roots(2);
+        drop(collector);
+        reset_internal_for_test();
+    }
+
+    #[test]
     fn initial_completion_publishes_late_extents_without_rebuilding_prepared_pages() {
         let _guard = runtime_test_guard();
         reset_internal_for_test();
