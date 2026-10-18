@@ -614,6 +614,41 @@ fn imported_interface_effects_use_completed_implementation_summaries() {
 }
 
 #[test]
+fn imported_interface_all_pure_implementations_have_no_waiting_evidence() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/players.wi"),
+        include_str!("../example/interface_effect_evidence/players.wi"),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/interface_effect_evidence/main.wi"),
+    )
+    .unwrap();
+    let result = f.json(&["effects", "main::serve"], 0);
+    let result = &result["result"];
+    assert_eq!(result["status"], "ok", "{result}");
+    use willow_compiler::semantic::effects::RuntimeEffects;
+    let waits = RuntimeEffects::MAY_BLOCK
+        .union(RuntimeEffects::MAY_SUSPEND)
+        .bits() as u64;
+    assert_eq!(
+        result["runtime_effects"].as_u64().unwrap() & waits,
+        0,
+        "{result}"
+    );
+    assert!(
+        result["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["effect"].as_u64().unwrap() & waits == 0),
+        "{result}"
+    );
+}
+
+#[test]
 fn imported_interface_lock_checks_allow_pure_and_reject_waiting_bodies() {
     for waiting in [false, true] {
         let f = Fixture::new();

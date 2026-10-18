@@ -1,0 +1,7 @@
+import players;
+
+fn serve(player: players::Player) -> i64 { return player.choose(); }
+
+fn main() {
+    println(serve(new players::First()) + serve(new players::Second()));
+}

@@ -1,0 +1,9 @@
+pub interface Player { fn choose(self) -> i64; }
+
+pub class First implements Player {
+    pub fn choose(self) -> i64 { return 3; }
+}
+
+pub class Second implements Player {
+    pub fn choose(self) -> i64 { return 4; }
+}

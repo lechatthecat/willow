@@ -433,8 +433,13 @@ impl EffectQueries {
 
     /// Imported dispatch uses completed capability queries; unavailable units
     /// still fail closed. These reads participate in revision invalidation.
-    pub(crate) fn external_waiting(&self, consumer: UnitId, target: &FunctionId) -> RuntimeEffects {
-        self.lookup_external_capabilities(consumer, target, &HashMap::new())
+    pub(crate) fn external_waiting(
+        &self,
+        consumer: UnitId,
+        target: &FunctionId,
+        imports: &HashMap<String, String>,
+    ) -> RuntimeEffects {
+        self.lookup_external_capabilities(consumer, target, imports)
             .map_or(LOCK_EFFECT_WAIT, |fact| {
                 fact.runtime.intersection(LOCK_EFFECT_WAIT)
             })
@@ -728,6 +733,7 @@ pub(crate) fn solve_unit<N>(
             Some(EffectWitness::Lock(LockEffectWitness {
                 owner: id,
                 cause: LockEffectCause {
+                    is_conservative: false,
                     span,
                     operation: "extern rust".into(),
                     kind: LockEffectKind::Block,
@@ -850,6 +856,7 @@ pub(crate) fn solve_unit<N>(
                     Some(EffectWitness::Lock(LockEffectWitness {
                         owner: direct.id,
                         cause: LockEffectCause {
+                            is_conservative: false,
                             span,
                             operation: "lock".into(),
                             kind: LockEffectKind::Suspend,
@@ -936,13 +943,17 @@ pub(crate) fn solve_unit<N>(
         }
     }
     for (&id, cause) in direct {
+        // Keep fail-closed capabilities for lock safety, but do not promote
+        // an unavailable imported body into a source-level compiler witness.
         problem = problem.seed(
             id,
             cause.kind.effects(),
-            Some(EffectWitness::Lock(LockEffectWitness {
-                owner: id,
-                cause: cause.clone(),
-            })),
+            (!cause.is_conservative).then(|| {
+                EffectWitness::Lock(LockEffectWitness {
+                    owner: id,
+                    cause: cause.clone(),
+                })
+            }),
         );
     }
     for id in graph.ids().chain(callables.keys()).chain(helpers.keys()) {
@@ -1470,6 +1481,9 @@ pub(crate) enum LockEffectKind {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LockEffectCause {
+    /// A fail-closed bound without a source-level waiting witness.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) is_conservative: bool,
     pub(crate) span: Span,
     pub(crate) operation: std::borrow::Cow<'static, str>,
     pub(crate) kind: LockEffectKind,
@@ -1707,6 +1721,7 @@ mod tests {
                 let direct = HashMap::from([(
                     acquire,
                     LockEffectCause {
+                        is_conservative: false,
                         span: Span::dummy(),
                         operation: "earlier wait".into(),
                         kind: LockEffectKind::SuspendOrBlock,
@@ -1878,6 +1893,7 @@ mod tests {
         let direct = HashMap::from([(
             leaf,
             LockEffectCause {
+                is_conservative: false,
                 span: Span::dummy(),
                 operation: "wait".into(),
                 kind: LockEffectKind::Block,
@@ -2093,6 +2109,7 @@ mod tests {
                 Some(EffectWitness::Lock(LockEffectWitness {
                     owner: FunctionId::free("wait"),
                     cause: LockEffectCause {
+                        is_conservative: false,
                         span: Span::new(offset, offset + 2, 1, offset + 1),
                         operation: "sleep".into(),
                         kind: LockEffectKind::Suspend,
@@ -2155,6 +2172,50 @@ mod tests {
             first.effect_evidence(UnitId::ENTRY, id),
             shifted.effect_evidence(UnitId::ENTRY, id)
         );
+    }
+
+    #[test]
+    fn imported_interface_missing_facts_keep_waits_without_fabricated_witnesses() {
+        for available in [false, true] {
+            let mut queries = EffectQueries::default();
+            let dependency = crate::module::ModuleId(7);
+            queries.names.insert("dependency".into(), dependency);
+            let worker = program(
+                "pub interface Player { fn choose(self); } pub class RandomPlayer implements Player { pub fn choose(self) {} }",
+            );
+            let queries = std::rc::Rc::new(queries);
+            if available {
+                let mut provider = crate::semantic::TypeChecker::new();
+                provider.set_effect_queries(queries.clone(), dependency);
+                provider.check_program(&worker);
+                assert!(provider.errors.is_empty(), "{:?}", provider.errors);
+            }
+            let mut checker = crate::semantic::TypeChecker::new();
+            checker.register_module("alias", "dependency", "dependency", &worker);
+            checker.set_effect_queries(queries.clone(), UnitId::ENTRY);
+            checker.check_program(&program("import dependency as alias; fn invoke(p: alias::Player) { p.choose(); } async fn main(p: alias::Player) { let m = Mutex::new(0); lock m as n { invoke(p); } }"));
+            assert_eq!(
+                checker.errors.len(),
+                usize::from(!available),
+                "{:?}",
+                checker.errors
+            );
+            if !available {
+                assert_eq!(checker.errors[0].code, crate::diagnostics::ErrorCode::E2604);
+            }
+            let fact = queries
+                .effect_evidence(UnitId::ENTRY, FunctionId::free("invoke"))
+                .unwrap();
+            assert_eq!(
+                fact.effects().intersection(LOCK_EFFECT_WAIT),
+                if available {
+                    RuntimeEffects::NONE
+                } else {
+                    LOCK_EFFECT_WAIT
+                }
+            );
+            assert!(fact.witness(LOCK_EFFECT_WAIT).is_none(), "{fact:?}");
+        }
     }
 
     #[test]
@@ -2239,6 +2300,10 @@ mod tests {
         let graph = crate::semantic::TypeChecker::resolved_effect_graph(&source);
         let imports = HashMap::from([("alias".to_owned(), "dependency".to_owned())]);
         let target = |name| FunctionId::method(TypeId::local("alias"), name);
+        assert_eq!(
+            queries.external_waiting(UnitId::ENTRY, &target("pure"), &imports),
+            LOCK_EFFECT_WAIT
+        );
         let missing = queries.external_capabilities(UnitId::ENTRY, &target("init"), &imports);
         assert!(missing.may_io);
         assert!(missing.runtime.intersects(PANIC));
@@ -2255,6 +2320,14 @@ mod tests {
                 )
             })
             .unwrap();
+        assert_eq!(
+            queries.external_waiting(UnitId::ENTRY, &target("pure"), &imports),
+            RuntimeEffects::NONE
+        );
+        assert_eq!(
+            queries.external_waiting(UnitId::ENTRY, &target("missing"), &imports),
+            LOCK_EFFECT_WAIT
+        );
         assert!(
             !queries
                 .external_capabilities(UnitId::ENTRY, &target("pure"), &imports)

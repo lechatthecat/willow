@@ -705,7 +705,11 @@ impl TypeChecker {
                             let waiting = self.effect_queries.as_ref().map_or(
                                 crate::compiler_db::effects::LOCK_EFFECT_WAIT,
                                 |(queries, unit)| {
-                                    queries.external_waiting(*unit, &implementation_id)
+                                    queries.external_waiting(
+                                        *unit,
+                                        &implementation_id,
+                                        &self.effect_index.imports,
+                                    )
                                 },
                             );
                             let suspend = waiting.intersects(RuntimeEffects::MAY_SUSPEND);
@@ -739,6 +743,7 @@ impl TypeChecker {
                                     evidence.witness(LOCK_EFFECT_WAIT)?.lock().cloned()
                                 })
                                 .unwrap_or_else(|| LockEffectCause {
+                                    is_conservative: true,
                                     span,
                                     operation: "interface dispatch to an imported implementation"
                                         .into(),
@@ -858,6 +863,7 @@ impl TypeChecker {
                 .direct
                 .entry(caller)
                 .or_insert(LockEffectCause {
+                    is_conservative: false,
                     span,
                     operation: operation.into(),
                     kind,
@@ -865,6 +871,7 @@ impl TypeChecker {
         }
         if self.local.lock_depth > 0 {
             self.effect_inputs.direct_sites.push(LockEffectCause {
+                is_conservative: false,
                 span,
                 operation: operation.into(),
                 kind,
@@ -1186,6 +1193,7 @@ impl TypeChecker {
                     .witness(LOCK_EFFECT_WAIT)
                     .and_then(|witness| witness.lock().cloned())
                     .unwrap_or_else(|| LockEffectCause {
+                        is_conservative: true,
                         span,
                         operation: "unavailable waiting evidence".into(),
                         kind: LockEffectKind::SuspendOrBlock,
@@ -1193,6 +1201,7 @@ impl TypeChecker {
             })
             .or_else(|| {
                 (!local && evidence.is_none()).then(|| LockEffectCause {
+                    is_conservative: true,
                     span,
                     operation: "unavailable imported effect evidence".into(),
                     kind: LockEffectKind::SuspendOrBlock,
