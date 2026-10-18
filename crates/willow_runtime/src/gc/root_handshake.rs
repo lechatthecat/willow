@@ -74,6 +74,23 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
             for root in &roots {
                 cycle.enqueue(*root);
             }
+            // Enqueue drops addresses outside every captured extent. Roots are
+            // all captured at this stop, so validate exactly those here.
+            #[cfg(debug_assertions)]
+            {
+                let reader = cycle.objects.reader();
+                let mut outside = roots.iter().copied().filter(|&root| {
+                    !root.is_null()
+                        && !cycle.objects.contains(root as usize)
+                        && !reader.needs_start_publication(root as usize)
+                });
+                if let Some(first) = outside.next() {
+                    let state = runtime().heap.lock().unwrap();
+                    *cycle.invalid_root.lock().unwrap() = std::iter::once(first)
+                        .chain(outside)
+                        .find_map(|root| validate_payload_pointer_locked(&state, root).err());
+                }
+            }
             {
                 let mut work = cycle.work.lock().unwrap();
                 work.root_scan_bytes = work

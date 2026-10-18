@@ -493,9 +493,7 @@ impl Cycle {
                 }
             }
         }
-        if self.previous_phase != 0 {
-            milestones::quiescent();
-        }
+        milestones::finished(self.epoch, self.previous_phase != 0);
         self.completed = true;
         measurement::completed(work, cycle.reclaimed_bytes);
         cycle

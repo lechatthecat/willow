@@ -1876,6 +1876,11 @@ fn try_collect_internal() -> bool {
         return true;
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(debug_assertions)]
+        if let Some(message) = marking.invalid_root.lock().unwrap().take() {
+            crate::gc_telemetry::failure_record::emit("invariant", &message);
+            panic!("willow gc: invalid GC pointer in root snapshot: {message}");
+        }
         // Bounded chunks allow a producer-heavy workload to reach remark;
         // finishing relies on quiescing producers, never a racy empty sample.
         let budget = marking.objects.len().saturating_mul(4).max(1024);

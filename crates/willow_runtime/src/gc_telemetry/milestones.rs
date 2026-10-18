@@ -38,9 +38,13 @@ pub enum WaitError {
     RegisteredMutator,
 }
 
+/// `active` holds unfinished cycles (at most a major plus its nested minor).
+/// A finished top-level cycle waits in `finished` for quiescent publication at
+/// election release, so repeated owned cycles in one election cannot nest.
 #[derive(Default)]
 struct State {
     active: Vec<u64>,
+    finished: Option<u64>,
     records: VecDeque<CycleMilestones>,
 }
 static STATE: LazyLock<(Mutex<State>, Condvar)> =
@@ -71,7 +75,7 @@ pub(crate) fn begin(epoch: u64) {
         let retired = state
             .records
             .iter()
-            .position(|r| !state.active.contains(&r.epoch))
+            .position(|r| !state.active.contains(&r.epoch) && state.finished != Some(r.epoch))
             .expect("bounded collector nesting leaves a retired record");
         state.records.remove(retired);
     }
@@ -126,8 +130,12 @@ pub(crate) fn abort(epoch: u64) {
 /// resets the collector phase, so no record may remain active across it.
 pub(crate) fn reset() {
     let mut state = STATE.0.lock().unwrap_or_else(|p| p.into_inner());
-    let State { active, records } = &mut *state;
-    for epoch in active.drain(..) {
+    let State {
+        active,
+        finished,
+        records,
+    } = &mut *state;
+    for epoch in active.drain(..).chain(finished.take()) {
         if let Some(record) = records.iter_mut().find(|r| r.epoch == epoch) {
             record.aborted = 1;
         }
@@ -135,24 +143,53 @@ pub(crate) fn reset() {
     STATE.1.notify_all();
 }
 
+/// A completed cycle leaves the active stack. Nested cycles have no election of
+/// their own and publish now; a top-level cycle publishes at election release.
+/// An unpublished predecessor in the same election is quiescent once a later
+/// cycle in that election completes.
+pub(crate) fn finished(epoch: u64, nested: bool) {
+    let mut state = STATE.0.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(index) = state.active.iter().position(|&active| active == epoch) {
+        state.active.remove(index);
+    }
+    let publish = if nested {
+        Some(epoch)
+    } else {
+        state.finished.replace(epoch)
+    };
+    if let Some(epoch) = publish {
+        publish_quiescent(&mut state, epoch);
+    }
+    STATE.1.notify_all();
+}
+
+fn publish_quiescent(state: &mut State, epoch: u64) {
+    // Bounded history may already have retired an unpublished record.
+    let Some(record) = state.records.iter_mut().find(|r| r.epoch == epoch) else {
+        return;
+    };
+    if record.stage == GcStage::SweepComplete as u32 {
+        set_stage(record, GcStage::Quiescent);
+        REQUEST.set(Some(GcTicket(record.epoch)));
+    } else {
+        record.aborted = 1;
+    }
+}
+
 /// Publication happens while releasing collector election, before a later
 /// collector can begin. Never attach quiescence to a newer epoch.
 pub(crate) fn quiescent() {
     let mut state = STATE.0.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(epoch) = state.active.pop() {
-        let record = state
-            .records
-            .iter_mut()
-            .find(|r| r.epoch == epoch)
-            .expect("active cycle has a record");
-        if record.stage == GcStage::SweepComplete as u32 {
-            set_stage(record, GcStage::Quiescent);
-            REQUEST.set(Some(GcTicket(record.epoch)));
-        } else {
-            record.aborted = 1;
-        }
-        STATE.1.notify_all();
+    // An unfinished cycle still active at release is published by its stage.
+    let unfinished = state.active.pop();
+    let finished = state.finished.take();
+    if unfinished.is_none() && finished.is_none() {
+        return;
     }
+    for epoch in unfinished.into_iter().chain(finished) {
+        publish_quiescent(&mut state, epoch);
+    }
+    STATE.1.notify_all();
 }
 
 pub fn snapshot() -> CycleMilestones {
@@ -228,25 +265,48 @@ mod tests {
     use crate::gc::*;
 
     #[test]
-    fn milestone_runtime_reset_retires_unpublished_active_cycles() {
+    fn milestone_repeated_owned_cycles_in_one_election_do_not_nest() {
         let _guard = runtime_test_guard();
         reset_internal_for_test();
-        // Owned minors outside an election complete without quiescent
-        // publication; the runtime reset must not carry them into later cycles.
-        let mut leaked = Vec::new();
-        for _ in 0..2 {
+        // Owned top-level cycles completing before election release (or with no
+        // election at all) must not accumulate as active nesting.
+        let mut epochs = Vec::new();
+        for _ in 0..4 {
             let minor = super::super::Cycle::begin(super::super::CycleKind::Minor);
-            leaked.push(snapshot().epoch);
+            epochs.push(snapshot().epoch);
+            reached(GcStage::MarkComplete);
+            reached(GcStage::SweepComplete);
             minor.finish(0, 0, Default::default());
+            assert!(STATE.0.lock().unwrap().active.is_empty());
         }
-        assert_eq!(STATE.0.lock().unwrap().active.len(), 2);
+        let last = epochs.pop().unwrap();
+        for &epoch in &epochs {
+            assert_eq!(record(epoch).unwrap().stage, GcStage::Quiescent as u32);
+        }
+        assert_eq!(record(last).unwrap().stage, GcStage::SweepComplete as u32);
+        quiescent();
+        assert_eq!(record(last).unwrap().stage, GcStage::Quiescent as u32);
         reset_internal_for_test();
-        assert!(STATE.0.lock().unwrap().active.is_empty());
-        for epoch in leaked {
+    }
+
+    #[test]
+    fn milestone_runtime_reset_retires_unpublished_cycles() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let major = super::super::Cycle::begin(super::super::CycleKind::Major);
+        let unfinished = snapshot().epoch;
+        std::mem::forget(major);
+        let minor = super::super::Cycle::begin(super::super::CycleKind::Minor);
+        let finished = snapshot().epoch;
+        minor.finish(0, 0, Default::default());
+        reset_internal_for_test();
+        let state = STATE.0.lock().unwrap();
+        assert!(state.active.is_empty() && state.finished.is_none());
+        drop(state);
+        for epoch in [unfinished, finished] {
             assert_eq!(record(epoch).unwrap().aborted, 1);
         }
         drop(super::super::Cycle::begin(super::super::CycleKind::Major));
-        assert!(STATE.0.lock().unwrap().active.is_empty());
         reset_internal_for_test();
     }
 

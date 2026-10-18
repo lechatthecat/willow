@@ -51,6 +51,10 @@ pub(super) struct ConcurrentCycle {
     pub(super) active_drains: AtomicUsize,
     pub(super) deferred: Mutex<Vec<usize>>,
     pub(super) unindexed: Mutex<HashSet<usize>>,
+    /// Debug validation of a root outside the captured index, taken at the
+    /// root stop; raised inside the cycle's recovery scope.
+    #[cfg(debug_assertions)]
+    pub(super) invalid_root: Mutex<Option<String>>,
     pub(super) queue: Arc<crate::gc_mark_queue::MarkWorkQueue>,
     pub(super) work: Mutex<crate::gc_telemetry::MarkWork>,
     /// Deletion buffers filled without the heap mutex while marking.
@@ -263,6 +267,8 @@ impl ConcurrentCycle {
             slices: IdMap::default(),
             deferred: Mutex::new(Vec::new()),
             unindexed: Mutex::new(HashSet::new()),
+            #[cfg(debug_assertions)]
+            invalid_root: Mutex::new(None),
             queue,
             work: Mutex::new(crate::gc_telemetry::MarkWork::roots(roots)),
             satb_shards: satb::SatbShards::default(),
