@@ -122,6 +122,19 @@ pub(crate) fn abort(epoch: u64) {
     }
 }
 
+/// The quiescent runtime reset ends every cycle without publication; it also
+/// resets the collector phase, so no record may remain active across it.
+pub(crate) fn reset() {
+    let mut state = STATE.0.lock().unwrap_or_else(|p| p.into_inner());
+    let State { active, records } = &mut *state;
+    for epoch in active.drain(..) {
+        if let Some(record) = records.iter_mut().find(|r| r.epoch == epoch) {
+            record.aborted = 1;
+        }
+    }
+    STATE.1.notify_all();
+}
+
 /// Publication happens while releasing collector election, before a later
 /// collector can begin. Never attach quiescence to a newer epoch.
 pub(crate) fn quiescent() {
@@ -213,6 +226,29 @@ pub fn wait_gc_for_test(
 mod tests {
     use super::*;
     use crate::gc::*;
+
+    #[test]
+    fn milestone_runtime_reset_retires_unpublished_active_cycles() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        // Owned minors outside an election complete without quiescent
+        // publication; the runtime reset must not carry them into later cycles.
+        let mut leaked = Vec::new();
+        for _ in 0..2 {
+            let minor = super::super::Cycle::begin(super::super::CycleKind::Minor);
+            leaked.push(snapshot().epoch);
+            minor.finish(0, 0, Default::default());
+        }
+        assert_eq!(STATE.0.lock().unwrap().active.len(), 2);
+        reset_internal_for_test();
+        assert!(STATE.0.lock().unwrap().active.is_empty());
+        for epoch in leaked {
+            assert_eq!(record(epoch).unwrap().aborted, 1);
+        }
+        drop(super::super::Cycle::begin(super::super::CycleKind::Major));
+        assert!(STATE.0.lock().unwrap().active.is_empty());
+        reset_internal_for_test();
+    }
 
     #[test]
     fn milestone_nested_minor_history_preserves_major_and_abort_restores_parent() {

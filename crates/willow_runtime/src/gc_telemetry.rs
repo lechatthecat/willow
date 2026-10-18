@@ -947,6 +947,7 @@ pub(crate) fn reset_for_test() {
     telemetry.stats.epoch = epoch;
     telemetry.stats.reset_generation = generation;
     stops::reset_for_test();
+    milestones::reset();
     native_trace::reset();
     measurement::reset();
 }
