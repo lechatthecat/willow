@@ -348,3 +348,6 @@ mod module_downcast_payload;
 
 #[path = "integration/imported_generic_callable.rs"]
 mod imported_generic_callable;
+
+#[path = "integration/async_frame_safepoints.rs"]
+mod async_frame_safepoints;

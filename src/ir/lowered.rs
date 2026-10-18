@@ -1401,6 +1401,22 @@ fn expression_needs_cfg(expr: &HirExpr) -> bool {
 
 fn expression_executes_call(expr: &HirExpr) -> bool {
     expr.walk_postorder(false).any(|expr| {
+        // Array reads/length are bounded runtime operations, not scheduling
+        // boundaries. Still visit their operands: f()[g()] must retain the
+        // call boundary. Loop backedges already provide the required poll.
+        if let HirExprKind::Index { array, .. } = &expr.kind
+            && (matches!(array.ty, Type::Array(_))
+                || builtin_types::unary_arg(&array.ty, B::FrozenArray).is_some())
+        {
+            return false;
+        }
+        if let HirExprKind::MethodCall { object, method, .. } = &expr.kind
+            && method == "len"
+            && (matches!(object.ty, Type::Array(_))
+                || builtin_types::unary_arg(&object.ty, B::FrozenArray).is_some())
+        {
+            return false;
+        }
         matches!(
             expr.kind,
             HirExprKind::Call { .. }
@@ -5113,6 +5129,64 @@ fn format_terminator(t: &SourceTerminator) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn async_array_reads_have_only_backedge_safepoints() {
+        for ty in ["Array<i64>", "FrozenArray<i64>"] {
+            for loops in [1, 4, 16, 64] {
+                let body =
+                    "let mut i = 0; while i < xs.len() { total = total + xs[i]; i = i + 1; }";
+                let source = format!(
+                    "async fn f(xs: {ty}) -> i64 {{ let mut total = 0; {} return total; }}",
+                    body.repeat(loops)
+                );
+                let program = lir(&source);
+                let f = func(&program, "f");
+                let polls = f
+                    .blocks
+                    .iter()
+                    .filter(|b| {
+                        matches!(
+                            b.terminator,
+                            SourceTerminator::Suspend {
+                                operation: SuspendOp::Preempt,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                assert_eq!(polls, loops, "one poll per loop, type={ty} loops={loops}");
+                println!(
+                    "type={ty} loops={loops} preempt_edges={polls} blocks={}",
+                    f.blocks.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn async_array_operand_calls_keep_their_safepoints() {
+        for expr in ["xs[index(i)]", "get(xs)[i]", "get(xs).len()"] {
+            let program = lir(&format!(
+                "fn index(i: i64) -> i64 {{ return i; }} fn get(xs: Array<i64>) -> Array<i64> {{ return xs; }} async fn f(xs: Array<i64>) -> i64 {{ let mut i = 0; let mut total = 0; while i < xs.len() {{ total = total + {expr}; i = i + 1; }} return total; }}"
+            ));
+            let f = func(&program, "f");
+            let polls = f
+                .blocks
+                .iter()
+                .filter(|b| {
+                    matches!(
+                        b.terminator,
+                        SourceTerminator::Suspend {
+                            operation: SuspendOp::Preempt,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(polls, 2, "operand call must keep its boundary: {expr}");
+        }
+    }
+
     #[test]
     fn sync_bodies_skip_final_async_analysis() {
         for n in [1, 8, 64] {

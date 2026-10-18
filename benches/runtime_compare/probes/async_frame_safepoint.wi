@@ -1,0 +1,11 @@
+// Reconstructed for willow-8hq4.41; not the unavailable historical probe.
+async fn main() {
+    let n = 4000000;
+    let mut i = 0;
+    let mut sum = 0;
+    await sleep(20); // Let the parent phase timer attach before timing begins.
+    println("@start scalar");
+    while i < n { sum = sum + i; i = i + 1; }
+    println("@end scalar");
+    println(sum);
+}

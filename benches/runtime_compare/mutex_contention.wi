@@ -1,0 +1,14 @@
+// Reconstructed workload for willow-8hq4.41; not historical benchmark source.
+async fn work(shared: Mutex<i64>, n: i64) {
+    let mut i = 0;
+    while i < n { lock shared as mut value { value = value + 1; } i = i + 1; }
+}
+async fn main() { let shared = Mutex::new(0);
+    println("@start work");
+    let a = work(shared, 50000); let b = work(shared, 50000);
+    let c = work(shared, 50000); let d = work(shared, 50000);
+    let e = work(shared, 50000); let f = work(shared, 50000);
+    let g = work(shared, 50000); let h = work(shared, 50000);
+    await a; await b; await c; await d; await e; await f; await g; await h;
+    println("@end work");
+lock shared as value { println(value); } }

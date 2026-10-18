@@ -91,6 +91,9 @@ pub fn runtime_preempt_config() -> PreemptConfig {
 /// flag is bound (budget/time still apply).
 struct QuantumState {
     budget: Cell<u64>,
+    direct_countdown: Cell<i32>,
+    direct_granted: Cell<i32>,
+    direct_saved: Cell<(i32, i32)>,
     deadline: Cell<Option<Instant>>,
     flag: Cell<*const AtomicBool>,
     /// Re-entrant no-preempt nesting depth (§22). While > 0, `willow_preempt_check`
@@ -102,6 +105,9 @@ thread_local! {
     static QUANTUM: QuantumState = const {
         QuantumState {
             budget: Cell::new(0),
+            direct_countdown: Cell::new(0),
+            direct_granted: Cell::new(0),
+            direct_saved: Cell::new((0, 0)),
             deadline: Cell::new(None),
             flag: Cell::new(std::ptr::null()),
             no_preempt_depth: Cell::new(0),
@@ -212,6 +218,8 @@ pub(crate) fn begin_quantum(config: PreemptConfig, flag: *const c_void) {
         q.budget.set(config.task_budget());
         q.deadline.set(deadline);
         q.no_preempt_depth.set(0);
+        q.direct_countdown.set(0);
+        q.direct_granted.set(0);
     });
     if let Some(flag) = unsafe { flag_ref(flag) } {
         flag.store(false, Ordering::Release);
@@ -243,6 +251,8 @@ pub extern "C" fn willow_preempt_end() {
         q.budget.set(0);
         q.deadline.set(None);
         q.no_preempt_depth.set(0);
+        q.direct_countdown.set(0);
+        q.direct_granted.set(0);
     });
 }
 
@@ -252,6 +262,23 @@ pub extern "C" fn willow_preempt_end() {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_enter_no_preempt() {
     QUANTUM.with(|q| {
+        if q.no_preempt_depth.get() == 0 {
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+            ))]
+            crate::native_stack::poll_no_preempt(true);
+            q.direct_saved
+                .set((q.direct_countdown.replace(0), q.direct_granted.replace(0)));
+        }
         q.no_preempt_depth
             .set(q.no_preempt_depth.get().saturating_add(1))
     });
@@ -262,6 +289,26 @@ pub extern "C" fn willow_preempt_enter_no_preempt() {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_leave_no_preempt() {
     QUANTUM.with(|q| {
+        // Preserve pre-region debt without sampling the clock, and discard
+        // inline work executed while suppressed.
+        if q.no_preempt_depth.get() == 1 {
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+            ))]
+            crate::native_stack::poll_no_preempt(false);
+            let (countdown, granted) = q.direct_saved.get();
+            q.direct_countdown.set(countdown);
+            q.direct_granted.set(granted);
+        }
         q.no_preempt_depth
             .set(q.no_preempt_depth.get().saturating_sub(1))
     });
@@ -319,7 +366,26 @@ pub extern "C" fn willow_preempt_check() -> i32 {
         crate::native_stack::poll_refill(sync_poll_grant());
         return result;
     }
-    charge_safepoints(1)
+    let result = charge_safepoints(1);
+    let grant = sync_poll_grant();
+    QUANTUM.with(|q| {
+        q.direct_countdown.set(grant);
+        q.direct_granted.set(grant);
+    });
+    result
+}
+
+/// Invocation-stable countdown for cooperative generated polls. Native polls
+/// share their stack's counter with sync callees; direct polls cannot migrate
+/// while their worker-stack invocation is live and use the quantum's Cell.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_async_poll_counter() -> *mut i32 {
+    let native = willow_sync_poll_counter();
+    if !native.is_null() {
+        return native;
+    }
+    QUANTUM.with(|q| q.direct_countdown.as_ptr())
 }
 
 /// [`willow_preempt_check`] for `count` safepoints executed since the last
@@ -329,6 +395,13 @@ pub extern "C" fn willow_preempt_check() -> i32 {
 /// debt before returning to a cooperative poll in the same quantum.
 pub(crate) fn charge_safepoints(count: u64) -> i32 {
     QUANTUM.with(|q| {
+        // A direct poll may call a native helper before exhausting its grant.
+        // Settle its debt at every runtime check and invalidate the old grant
+        // before a helper can consume the remaining shared quantum budget.
+        let pending = (i64::from(q.direct_granted.replace(0))
+            - i64::from(q.direct_countdown.replace(0)))
+        .max(0) as u64;
+        let count = count.saturating_add(pending);
         if q.no_preempt_depth.get() > 0 {
             return 0;
         }
@@ -378,18 +451,6 @@ pub const SYNC_POLL_STRIDE: u64 = 64;
 
 /// The next inline safepoint grant: never past the remaining budget, so the
 /// budget still trips at the exact safepoint it would without batching.
-#[cfg(any(
-    all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(
-        target_os = "macos",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
-))]
 fn sync_poll_grant() -> i32 {
     QUANTUM.with(|q| {
         let budget = q.budget.get();
@@ -581,6 +642,103 @@ mod tests {
     // tested separately through the pure `PreemptConfig::from_env_values`.
     fn cfg(budget: u64, quantum_ms: u64) -> PreemptConfig {
         PreemptConfig::from_env_values(Some(&budget.to_string()), Some(&quantum_ms.to_string()))
+    }
+
+    fn direct_check() -> i32 {
+        let counter = willow_async_poll_counter();
+        unsafe {
+            if *counter > 1 {
+                *counter -= 1;
+                0
+            } else {
+                willow_preempt_check()
+            }
+        }
+    }
+
+    #[test]
+    fn direct_async_batches_preserve_exact_budgets_and_bound_checks() {
+        for budget in [1, 2, 3, 63, 64, 65, 127, 1000, 4096] {
+            begin_quantum(cfg(budget, 100000), std::ptr::null());
+            let mut calls = 0;
+            for n in 1..=budget {
+                if unsafe { *willow_async_poll_counter() } <= 1 {
+                    calls += 1;
+                }
+                assert_eq!(
+                    direct_check(),
+                    i32::from(n == budget),
+                    "budget={budget} n={n}"
+                );
+            }
+            assert_eq!(calls, 1 + (budget - 1).div_ceil(SYNC_POLL_STRIDE));
+            willow_preempt_end();
+        }
+    }
+
+    #[test]
+    fn direct_async_partial_batch_settles_before_helper_checks() {
+        begin_quantum(cfg(100, 100000), std::ptr::null());
+        for _ in 0..20 {
+            assert_eq!(direct_check(), 0);
+        }
+        assert_eq!(charge_safepoints(79), 0);
+        assert_eq!(direct_check(), 1);
+        willow_preempt_end();
+    }
+
+    #[test]
+    fn direct_async_request_and_deadline_trip_within_one_batch() {
+        for explicit in [false, true] {
+            let flag = AtomicBool::new(false);
+            begin_quantum(cfg(10000, 100000), std::ptr::from_ref(&flag).cast());
+            assert_eq!(direct_check(), 0);
+            if explicit {
+                flag.store(true, Ordering::Release);
+            } else {
+                QUANTUM.with(|q| q.deadline.set(Some(Instant::now())));
+            }
+            let mut checks = 0;
+            loop {
+                checks += 1;
+                if direct_check() != 0 {
+                    break;
+                }
+                assert!(checks < SYNC_POLL_STRIDE);
+            }
+            assert_eq!(checks, SYNC_POLL_STRIDE);
+            willow_preempt_end();
+        }
+    }
+
+    #[test]
+    fn direct_async_suppressed_work_does_not_consume_budget() {
+        begin_quantum(cfg(100, 100000), std::ptr::null());
+        for _ in 0..20 {
+            assert_eq!(direct_check(), 0);
+        }
+        willow_preempt_enter_no_preempt();
+        for _ in 0..200 {
+            assert_eq!(direct_check(), 0);
+        }
+        willow_preempt_leave_no_preempt();
+        for n in 1..=80 {
+            assert_eq!(direct_check(), i32::from(n == 80));
+        }
+        willow_preempt_end();
+    }
+
+    #[test]
+    fn direct_async_new_quantum_discards_old_grant() {
+        begin_quantum(cfg(100, 100000), std::ptr::null());
+        for _ in 0..20 {
+            assert_eq!(direct_check(), 0);
+        }
+        willow_preempt_end();
+        begin_quantum(cfg(1, 100000), std::ptr::null());
+        assert_eq!(direct_check(), 1);
+        willow_preempt_end();
+        assert_eq!(direct_check(), 0);
     }
 
     // 1. Defaults when env is absent.

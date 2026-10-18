@@ -1373,6 +1373,13 @@ impl UnitCodegenContext<'_> {
             .declare_func_in_func(root_depth_id, builder.func);
         let root_depth_call = builder.ins().call(root_depth_ref, &[]);
         let poll_root_depth = builder.inst_results(root_depth_call)[0];
+        let counter_id = self.func_id("willow_async_poll_counter");
+        let counter_ref = self
+            .output
+            .module
+            .declare_func_in_func(counter_id, builder.func);
+        let counter_call = builder.ins().call(counter_ref, &[]);
+        let poll_counter = builder.inst_results(counter_call)[0];
         let dispatch = builder.create_block();
         builder.ins().jump(dispatch, &[]);
 
@@ -1462,7 +1469,10 @@ impl UnitCodegenContext<'_> {
                 root_peak_count: 0,
                 temporary_root_slots: HashMap::new(),
                 enum_payload_layouts: &mut self.output.enum_payload_layouts,
-                coop_shadow_roots: Some(CoopShadowRoots::default()),
+                coop_shadow_roots: Some(CoopShadowRoots {
+                    poll_counter: Some(poll_counter),
+                    ..CoopShadowRoots::default()
+                }),
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
                 diagnostic_function: f.name.clone(),
@@ -1901,6 +1911,38 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         frame: cranelift_codegen::ir::Value,
         resume: cranelift_codegen::ir::Block,
     ) {
+        // Leave the final safepoint uncounted: willow_preempt_check charges
+        // pending inline work PLUS the current safepoint and refills the shared
+        // grant. Sync callees use the same counter, so neither path can hide
+        // debt from the other. Direct polls receive a non-null quantum counter.
+        let counter = self
+            .coop_shadow_roots
+            .as_ref()
+            .unwrap()
+            .poll_counter
+            .unwrap();
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        self.builder.set_cold_block(slow);
+        let remaining = self
+            .builder
+            .ins()
+            .load(types::I32, MemFlagsData::trusted(), counter, 0);
+        let available = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::SignedGreaterThan, remaining, 1);
+        self.builder.ins().brif(available, fast, &[], slow, &[]);
+        self.builder.switch_to_block(fast);
+        let next = self.builder.ins().iadd_imm_s(remaining, -1);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), next, counter, 0);
+        self.builder.ins().jump(resume, &[]);
+        self.builder.switch_to_block(slow);
+        // Only the runtime call can report a fault. Publishing the trace on
+        // the fast edge would retain an out-of-line call on every iteration.
+        self.emit_fault_site();
         let check_id = self.func_id("willow_preempt_check");
         let check_ref = self
             .module

@@ -6661,7 +6661,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let Some((suspends, frame)) = coop.as_mut() else {
                     unreachable!("explicit LIR suspension reached the synchronous emitter")
                 };
-                self.emit_fault_site();
+                if !matches!(operation, SuspendOp::Preempt) {
+                    self.emit_fault_site();
+                }
                 self.emit_lir_suspend(function, operation, *resume, blocks, suspends, *frame);
             }
         }

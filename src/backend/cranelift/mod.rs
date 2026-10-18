@@ -1570,6 +1570,8 @@ struct FuncGen<'a, 'b> {
 
 #[derive(Default)]
 struct CoopShadowRoots {
+    /// Stable native-stack countdown shared with synchronous callees.
+    poll_counter: Option<cranelift_codegen::ir::Value>,
     /// Binding-root slots active at the current source position, in shadow-stack
     /// order. Temporary expression roots are deliberately excluded: reaching a
     /// suspension while one is active is a codegen invariant violation.

@@ -1,0 +1,10 @@
+// Reconstructed workload for willow-8hq4.41; not historical benchmark source.
+async fn producer(ch: Channel<i64>, n: i64) { let mut i = 0; while i < n { ch.send(i); i = i + 1; } }
+async fn consumer(ch: Channel<i64>, n: i64) -> i64 { let mut i = 0; let mut sum = 0; while i < n { sum = sum + ch.recv(); i = i + 1; } return sum; }
+async fn main() {
+    let ch = Channel<i64>::with_capacity(64);
+    println("@start work");
+    let p = producer(ch, 200000); let c = consumer(ch, 200000);
+    await p; let sum = await c;
+    println("@end work"); println(sum);
+}

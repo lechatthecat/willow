@@ -131,6 +131,8 @@ pub(crate) struct NativeStack {
     poll_countdown: i32,
     /// Safepoints granted by the last `willow_sync_safepoint` refill.
     poll_granted: i32,
+    /// Countdown/debt before the outermost no-preempt region.
+    poll_saved: (i32, i32),
     entry_panic_depth: i32,
     root_depth: usize,
     parked_roots: Option<u64>,
@@ -246,6 +248,7 @@ impl NativeStack {
             cleanup_depth: 0,
             poll_countdown: 0,
             poll_granted: 0,
+            poll_saved: (0, 0),
             entry_panic_depth: crate::panic_context::willow_panic_depth(),
             root_depth: 0,
             parked_roots: None,
@@ -503,6 +506,25 @@ pub(crate) fn poll_refill(grant: i32) {
         unsafe {
             (*stack).poll_granted = grant;
             (*stack).poll_countdown = grant;
+        }
+    }
+}
+
+/// Isolate inline polls inside an outermost no-preempt region. The quantum
+/// owns nesting; the saved grant belongs to this stable native stack.
+pub(crate) fn poll_no_preempt(enter: bool) {
+    let stack = CURRENT.with(Cell::get);
+    if !stack.is_null() {
+        unsafe {
+            if enter {
+                (*stack).poll_saved = ((*stack).poll_countdown, (*stack).poll_granted);
+                (*stack).poll_countdown = 0;
+                (*stack).poll_granted = 0;
+            } else {
+                let (countdown, granted) = (*stack).poll_saved;
+                (*stack).poll_countdown = countdown;
+                (*stack).poll_granted = granted;
+            }
         }
     }
 }
@@ -1180,6 +1202,133 @@ mod tests {
         sync_run: u64,
         trips: Vec<u64>,
         resumes: u64,
+    }
+
+    // Mirrors the generated async fast path; the last point is charged by
+    // the existing hook rather than decrementing it twice.
+    unsafe fn batched_async_check(counter: *mut i32) -> i32 {
+        unsafe {
+            if *counter > 1 {
+                *counter -= 1;
+                0
+            } else {
+                crate::preempt::willow_preempt_check()
+            }
+        }
+    }
+
+    unsafe extern "C" fn batched_mixed_poll(frame: *mut c_void) -> i32 {
+        let state = frame.cast::<MixedPolls>();
+        let counter = crate::preempt::willow_sync_poll_counter();
+        unsafe {
+            for index in 1..=(*state).total {
+                let before = (*state).resumes;
+                if index % ((*state).sync_run + 1) == 0 {
+                    if batched_async_check(counter) != 0 {
+                        suspend();
+                    }
+                } else {
+                    *counter -= 1;
+                    if *counter <= 0 {
+                        willow_sync_safepoint();
+                    }
+                }
+                if before != (*state).resumes {
+                    (*state).trips.push(index);
+                }
+            }
+        }
+        RUNTIME_POLL_READY
+    }
+
+    unsafe extern "C" fn suppressed_batched_native_poll(frame: *mut c_void) -> i32 {
+        let (prefix, suppressed, nested) = unsafe { *frame.cast::<(u64, u64, bool)>() };
+        let counter = crate::preempt::willow_async_poll_counter();
+        for _ in 0..prefix {
+            assert_eq!(unsafe { batched_async_check(counter) }, 0);
+        }
+        crate::preempt::willow_preempt_enter_no_preempt();
+        for _ in 0..suppressed {
+            assert_eq!(unsafe { batched_async_check(counter) }, 0);
+        }
+        if nested {
+            crate::preempt::willow_preempt_enter_no_preempt();
+            for _ in 0..130 {
+                assert_eq!(unsafe { batched_async_check(counter) }, 0);
+            }
+            crate::preempt::willow_preempt_leave_no_preempt();
+            for _ in 0..suppressed {
+                assert_eq!(unsafe { batched_async_check(counter) }, 0);
+            }
+        }
+        crate::preempt::willow_preempt_leave_no_preempt();
+        for n in 1..=100 - prefix {
+            assert_eq!(
+                unsafe { batched_async_check(counter) },
+                i32::from(n == 100 - prefix),
+                "prefix={prefix} suppressed={suppressed} nested={nested} remaining point={n}"
+            );
+        }
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn native_batched_no_preempt_preserves_partial_debt() {
+        let _guard = crate::gc::runtime_test_guard();
+        for prefix in [0u64, 1, 20, 63, 64, 65, 99] {
+            for suppressed in [0u64, 5, 63, 64, 65, 200] {
+                for nested in [false, true] {
+                    let mut state = (prefix, suppressed, nested);
+                    let mut stack = NativeStack::new(
+                        suppressed_batched_native_poll,
+                        std::ptr::from_mut(&mut state).cast(),
+                    );
+                    begin_quantum(
+                        PreemptConfig::from_env_values(Some("100"), Some("100000")),
+                        std::ptr::null(),
+                    );
+                    assert_eq!(
+                        unsafe { NativeStack::resume(&mut *stack) },
+                        RUNTIME_POLL_READY
+                    );
+                    willow_preempt_end();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_async_and_sync_share_exact_budget() {
+        let _guard = crate::gc::runtime_test_guard();
+        for budget in [1u64, 2, 3, 63, 64, 65, 127, 1024] {
+            for sync_run in [0, 1, 2, 7, 63, 64, 100] {
+                let mut state = MixedPolls {
+                    total: budget * 10,
+                    sync_run,
+                    trips: Vec::new(),
+                    resumes: 0,
+                };
+                let config =
+                    PreemptConfig::from_env_values(Some(&budget.to_string()), Some("100000"));
+                let mut stack =
+                    NativeStack::new(batched_mixed_poll, std::ptr::from_mut(&mut state).cast());
+                loop {
+                    begin_quantum(config, std::ptr::null());
+                    let result = unsafe { NativeStack::resume(&mut *stack) };
+                    willow_preempt_end();
+                    if result == RUNTIME_POLL_READY {
+                        break;
+                    }
+                    assert_eq!(result, RUNTIME_POLL_PREEMPTED);
+                    state.resumes += 1;
+                }
+                assert_eq!(
+                    state.trips,
+                    (1..=10).map(|n| n * budget).collect::<Vec<_>>(),
+                    "budget={budget} sync_run={sync_run}"
+                );
+            }
+        }
     }
 
     unsafe extern "C" fn mixed_poll(frame: *mut c_void) -> i32 {

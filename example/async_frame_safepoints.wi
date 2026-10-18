@@ -1,0 +1,27 @@
+// Batched async polls preserve array values, control flow and sync calls.
+import std::collections::Array;
+fn index(i: i64) -> i64 { return i; }
+fn sum_sync(n: i64) -> i64 { let mut i = 0; let mut sum = 0; while i < n { sum = sum + i; i = i + 1; } return sum; }
+async fn main() {
+    let values = [2, 4, 6, 8];
+    let frozen = values.freeze();
+    let mut sum = 0;
+    let mut i = 0;
+    while i < values.len() { sum = sum + values[index(i)]; i = i + 1; }
+    println(sum);
+    sum = 0; i = 0;
+    while i < frozen.len() { sum = sum + frozen[i]; i = i + 1; }
+    println(sum);
+    sum = 0; i = 0;
+    while i < 130 {
+        i = i + 1;
+        if i % 2 == 0 { continue; }
+        sum = sum + sum_sync(4);
+        if i == 129 { break; }
+    }
+    println(sum);
+    let strings = ["a", "bb", "ccc"];
+    i = 0; sum = 0;
+    while i < strings.len() { sum = sum + strings[i].len(); await yield(); i = i + 1; }
+    println(sum);
+}

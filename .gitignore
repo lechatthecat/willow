@@ -36,9 +36,20 @@ AGENTS.md
 # Local-only internal docs (reference private bd issues / requirements)
 /docs
 
-# Publish only the standalone compiler benchmark harness.
+# Publish the compiler harness and reconstructed async-safepoint workloads.
 /benches/*
 !/benches/compiler_bench.rs
+!/benches/runtime_compare/
+/benches/runtime_compare/*
+!/benches/runtime_compare/harness.js
+!/benches/runtime_compare/mutex_contention.wi
+!/benches/runtime_compare/producer_consumer.wi
+!/benches/runtime_compare/gc_scheduler.wi
+!/benches/runtime_compare/atomic_counter.wi
+!/benches/runtime_compare/probes/
+/benches/runtime_compare/probes/*
+!/benches/runtime_compare/probes/async_frame_safepoint.wi
+!/benches/runtime_compare/probes/run_probe.js
 
 # Local structured-edit candidates and recovery journals
 .willow-edits/
