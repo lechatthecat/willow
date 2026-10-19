@@ -566,11 +566,23 @@ impl<'a> Index<'a> {
             family.is_disjoint(&self.renamed),
             "duplicate rename of dispatch family"
         );
-        for &(start, end) in family
-            .iter()
-            .filter_map(|id| self.scopes.get(*id))
-            .flatten()
-        {
+        // Report collisions deterministically: the selected declaration's own
+        // scope (e.g. an interface's contract) first, then related members in
+        // source order. Keeping the minimum avoids sorting the family.
+        let location = |id: &str| {
+            self.symbols
+                .get(id)
+                .and_then(|s| s.location.as_ref())
+                .map(|l| (l.path.as_str(), l.start))
+        };
+        let mut collision = None;
+        for (member, &(start, end)) in family.iter().flat_map(|&id| {
+            self.scopes
+                .get(id)
+                .into_iter()
+                .flatten()
+                .map(move |scope| (id, scope))
+        }) {
             let Some(candidates) = self.destinations.get(name) else {
                 continue;
             };
@@ -584,28 +596,48 @@ impl<'a> Index<'a> {
             if let Some(&(_, other_end, candidate)) = before.checked_sub(1).map(|i| &candidates[i])
                 && other_end > start
             {
-                let l = self.symbols[candidate].location.as_ref().unwrap();
-                let (_, span) = self
-                    .source_tokens
-                    .get(&(l.path.as_str(), l.start, l.end))
-                    .context("collision declaration is not an editable identifier")?;
-                let path = Path::new(&l.path)
-                    .strip_prefix(root)?
-                    .to_str()
-                    .context("non UTF-8 source path")?;
-                let message = if selected.kind == "variant" {
-                    let owner = selected
-                        .source_name
-                        .as_deref()
-                        .unwrap_or(&selected.name)
-                        .rsplit_once("::")
-                        .map_or("selected enum", |(owner, _)| owner);
-                    format!("rename destination conflicts with a variant in enum {owner}")
-                } else {
-                    "rename destination conflicts with a member in the same hierarchy".to_owned()
-                };
-                return Err(reject(&message, path, span));
+                let key = (member != selected.id, location(member));
+                if collision.as_ref().is_none_or(|(best, _)| key < *best) {
+                    collision = Some((key, candidate));
+                }
             }
+        }
+        if let Some((_, candidate)) = collision {
+            let l = self.symbols[candidate].location.as_ref().unwrap();
+            let (_, span) = self
+                .source_tokens
+                .get(&(l.path.as_str(), l.start, l.end))
+                .context("collision declaration is not an editable identifier")?;
+            let path = Path::new(&l.path)
+                .strip_prefix(root)?
+                .to_str()
+                .context("non UTF-8 source path")?;
+            let owner = |symbol: &'a symbols::Symbol| {
+                symbol
+                    .source_name
+                    .as_deref()
+                    .unwrap_or(&symbol.name)
+                    .rsplit_once("::")
+                    .map(|(owner, _)| owner)
+            };
+            let message = if selected.kind == "variant" {
+                format!(
+                    "rename destination conflicts with a variant in enum {}",
+                    owner(selected).unwrap_or("selected enum")
+                )
+            } else {
+                let other = self.symbols[candidate];
+                match owner(other) {
+                    Some(o) if owner(selected) == Some(o) => {
+                        format!("rename destination conflicts with existing member {o}::{name}")
+                    }
+                    Some(o) => format!(
+                        "rename destination conflicts with member {o}::{name} in the same hierarchy"
+                    ),
+                    None => format!("rename destination conflicts with existing member {name}"),
+                }
+            };
+            return Err(reject(&message, path, span));
         }
         self.renamed.extend(&family);
         let mut allowed = HashSet::new();
@@ -924,6 +956,107 @@ mod tests {
                     patches["main.wi"].len()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn family_collisions_report_selected_scope_with_linear_probes() {
+        for n in [16, 64, 256, 1024] {
+            let root = std::env::temp_dir().join("willow-rename-collision");
+            let absolute = root.join("main.wi").to_str().unwrap().to_owned();
+            let source = "old dest ".repeat(n);
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            let spans: Vec<_> = tokens
+                .iter()
+                .filter(|t| matches!(t.kind, TokenKind::Ident(_)))
+                .map(|t| &t.span)
+                .collect();
+            let symbol = |id: String, name: &str, span: &Span| symbols::Symbol {
+                id,
+                identity: None,
+                source_name: None,
+                details: Default::default(),
+                name: name.into(),
+                kind: "method".into(),
+                ty: None,
+                location: Some(Location {
+                    path: absolute.clone(),
+                    start: span.start,
+                    end: span.end,
+                }),
+            };
+            // Every family member's scope holds a `dest` member, so every
+            // scope collides; HashSet order must not pick the reported one.
+            let symbols: Vec<_> = (0..n)
+                .flat_map(|i| {
+                    [
+                        symbol(format!("s{i}"), "old", spans[2 * i]),
+                        symbol(format!("d{i}"), "dest", spans[2 * i + 1]),
+                    ]
+                })
+                .collect();
+            let rename_scopes = (0..n)
+                .flat_map(|i| {
+                    [
+                        (format!("s{i}"), vec![(i, i + 1)]),
+                        (format!("d{i}"), vec![(i, i + 1)]),
+                    ]
+                })
+                .collect();
+            let snapshot = Snapshot {
+                edit_context: None,
+                version: 1,
+                compiler: String::new(),
+                compatibility: String::new(),
+                workspace: root.to_str().unwrap().into(),
+                revision: String::new(),
+                functions: vec![],
+                sources: BTreeMap::from([(absolute.clone(), String::new())]),
+                semantic: SemanticFacts {
+                    symbols,
+                    rename_links: (1..n).map(|i| ("s0".into(), format!("s{i}"))).collect(),
+                    rename_scopes,
+                    ..Default::default()
+                },
+            };
+            let identifiers = BTreeMap::from([
+                ("old", (0..n).map(|i| ("main.wi", spans[2 * i])).collect()),
+                (
+                    "dest",
+                    (0..n).map(|i| ("main.wi", spans[2 * i + 1])).collect(),
+                ),
+            ]);
+            let selected = n / 2;
+            let mut index = Index::new(&snapshot, &root, &identifiers, &HashSet::new());
+            let error = index
+                .plan(
+                    &format!("s{selected}"),
+                    "dest",
+                    &root,
+                    &mut BTreeMap::new(),
+                    &mut EditWork::default(),
+                )
+                .unwrap_err();
+            let rejection = error.downcast_ref::<Rejection>().unwrap();
+            assert_eq!(rejection.location.start, spans[2 * selected + 1].start);
+            assert!(
+                rejection
+                    .message
+                    .contains("conflicts with existing member dest"),
+                "{}",
+                rejection.message
+            );
+            // One binary search per family scope: n * O(log n), no family sort.
+            let bound = n * (n.ilog2() as usize + 2);
+            assert!(
+                index.collision_probes <= bound,
+                "n={n} probes={}",
+                index.collision_probes
+            );
+            println!(
+                "collision n={n} probes={} bound={bound}",
+                index.collision_probes
+            );
         }
     }
 }

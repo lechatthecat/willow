@@ -35,6 +35,7 @@ struct Options {
     dry_run: bool,
     diff: bool,
     verbose: bool,
+    warnings: bool,
     max_chars: Option<usize>,
 }
 impl Options {
@@ -54,6 +55,7 @@ impl Options {
             dry_run: false,
             diff: false,
             verbose: false,
+            warnings: false,
             max_chars: None,
         };
         let mut seen = std::collections::HashSet::new();
@@ -76,7 +78,7 @@ impl Options {
                 anyhow::ensure!(seen.insert(key), "duplicate option {key}");
                 match key {
                     "--all" | "--absolute-paths" | "--explain" | "--show-id" | "--dry-run"
-                    | "--verbose" | "--diff" => {
+                    | "--verbose" | "--diff" | "--warnings" => {
                         anyhow::ensure!(inline.is_none(), "unexpected value for {key}");
                         match key {
                             "--all" => result.all = true,
@@ -85,6 +87,7 @@ impl Options {
                             "--diff" => result.diff = true,
                             "--dry-run" => result.dry_run = true,
                             "--verbose" => result.verbose = true,
+                            "--warnings" => result.warnings = true,
                             _ => result.show_id = true,
                         }
                     }
@@ -145,7 +148,9 @@ impl Options {
         );
         Ok(result)
     }
-    fn execute(&self) -> Result<Value> {
+    /// `warnings` counts checker warnings even when analysis or the query
+    /// later fails, so every result can report the suppressed total.
+    fn execute(&self, warnings: &mut usize) -> Result<Value> {
         let (entry, root) = if let Some(source) = &self.source {
             (source.clone(), None)
         } else {
@@ -171,7 +176,7 @@ impl Options {
         );
         let mut human_emitter = willow_compiler::diagnostics::HumanEmitter;
         let mut project_emitter;
-        let emitter: &mut dyn willow_compiler::diagnostics::DiagnosticEmitter =
+        let inner: &mut dyn willow_compiler::diagnostics::DiagnosticEmitter =
             if let Some(root) = root.as_deref() {
                 project_emitter = willow_compiler::diagnostics::ProjectEmitter {
                     root,
@@ -181,6 +186,13 @@ impl Options {
             } else {
                 &mut human_emitter
             };
+        // Queries answer about symbols, not project hygiene: checker warnings
+        // are counted and shown only on request; errors always pass through.
+        let emitter = &mut WarningFilter {
+            inner,
+            show: self.warnings,
+            count: warnings,
+        };
         let snapshot = if self.command == "rename" {
             compiler.analysis_for_edit_with_emitter(emitter)?
         } else {
@@ -238,6 +250,28 @@ impl Options {
         Ok(
             json!({"schema":1,"kind":self.command,"status":result["status"],"revision":session.session.revision(),"result":result}),
         )
+    }
+}
+
+struct WarningFilter<'a> {
+    inner: &'a mut dyn willow_compiler::diagnostics::DiagnosticEmitter,
+    show: bool,
+    count: &'a mut usize,
+}
+impl willow_compiler::diagnostics::DiagnosticEmitter for WarningFilter<'_> {
+    fn emit(
+        &mut self,
+        diagnostic: &willow_compiler::diagnostics::Diagnostic,
+        sources: &dyn willow_compiler::diagnostics::source_map::SourceLookup,
+    ) -> std::io::Result<()> {
+        if diagnostic.severity != willow_compiler::diagnostics::Severity::Warning {
+            return self.inner.emit(diagnostic, sources);
+        }
+        *self.count += 1;
+        if self.show {
+            self.inner.emit(diagnostic, sources)?;
+        }
+        Ok(())
     }
 }
 
@@ -448,7 +482,12 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
         lines.push(format!("Affected functions: {}", nodes.len()));
         for node in nodes.iter().take(if options.all { usize::MAX } else { 50 }) {
             lines.push(format!(
-                "  {}",
+                "  {}{}",
+                if node["kind"] == "lambda" {
+                    "lambda "
+                } else {
+                    ""
+                },
                 node["selector"].as_str().unwrap_or("unknown symbol")
             ));
         }
@@ -913,8 +952,9 @@ pub(super) fn run(args: &[String]) -> Result<i32> {
             })
         })
         .unwrap_or("human");
-    let (value, code) = match &parsed {
-        Ok(options) => match options.execute() {
+    let mut warnings = 0;
+    let (mut value, code) = match &parsed {
+        Ok(options) => match options.execute(&mut warnings) {
             Ok(value) => {
                 let code = if value["status"] == "ok" { 0 } else { 1 };
                 (value, code)
@@ -935,12 +975,21 @@ pub(super) fn run(args: &[String]) -> Result<i32> {
         ),
     };
     if let Ok(options) = &parsed {
+        if warnings > 0 {
+            value["diagnostics"] = json!({"warnings": warnings});
+        }
         match render(&value, options) {
             Ok(output) => print!("{output}"),
             Err(error) => {
                 eprintln!("{error:#}");
                 return Ok(2);
             }
+        }
+        if warnings > 0 && !options.warnings && options.format == "human" {
+            eprintln!(
+                "note: {} suppressed; rerun with --warnings to show them",
+                counted(warnings as u64, "checker warning")
+            );
         }
     } else if format == "human"
         || args

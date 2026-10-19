@@ -929,14 +929,33 @@ impl DirectSession {
             )?;
             let mut impact = serde_json::to_value(impact)?;
             if let Some(nodes) = impact["nodes"].as_array_mut() {
-                for node in nodes {
-                    if let Some(name) = node["id"]
-                        .as_str()
-                        .and_then(|id| self.function_names.get(id))
-                    {
+                for node in nodes.iter_mut() {
+                    let id = node["id"].as_str().unwrap_or_default();
+                    let lambda = self.lambda_symbols.contains_key(id);
+                    if let Some(name) = self.function_names.get(id) {
                         node["selector"] = json!(name);
                     }
+                    if lambda {
+                        node["kind"] = json!("lambda");
+                    }
                 }
+                // Within one distance, named functions sort by selector and
+                // lambdas by source position (not by opaque id hash).
+                nodes.sort_by_cached_key(|node| {
+                    let lambda = node["id"]
+                        .as_str()
+                        .and_then(|id| self.lambda_symbols.get(id))
+                        .and_then(|s| s.location.as_ref());
+                    (
+                        node["distance"].as_u64(),
+                        lambda.is_some(),
+                        lambda.map_or_else(
+                            || node["selector"].as_str().unwrap_or_default().to_owned(),
+                            |l| l.path.clone(),
+                        ),
+                        lambda.map_or(0, |l| l.start),
+                    )
+                });
             }
             return Ok(json!({"status":"ok","impact":impact,"symbol":resolved["symbol"]}));
         }

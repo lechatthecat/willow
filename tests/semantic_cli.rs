@@ -83,17 +83,64 @@ fn direct_checker_warnings_use_check_project_paths() {
         vec!["rename", "main::main::item", "product", "--dry-run"],
     ] {
         for format in ["human", "json", "ndjson"] {
-            let mut args = args.clone();
-            args.extend(["--format", format]);
-            let output = f.run(&args);
+            // Default: warnings are counted, never printed in full.
+            let mut quiet = args.clone();
+            quiet.extend(["--format", format]);
+            let output = f.run(&quiet);
             let stderr = String::from_utf8(output.stderr).unwrap();
             assert!(
                 output.status.success(),
-                "{args:?}: {stderr}\n{}",
+                "{quiet:?}: {stderr}\n{}",
                 String::from_utf8_lossy(&output.stdout)
             );
-            assert_eq!(stderr, expected, "{args:?}");
+            assert!(!stderr.contains("warning["), "{quiet:?}: {stderr}");
+            if format == "human" {
+                assert_eq!(
+                    stderr,
+                    "note: 2 checker warnings suppressed; rerun with --warnings to show them\n",
+                    "{quiet:?}"
+                );
+            } else {
+                assert_eq!(stderr, "", "{quiet:?}");
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["diagnostics"], serde_json::json!({"warnings": 2}));
+            }
+            // Opt-in: identical to `willow check`, without the summary note.
+            let mut loud = quiet.clone();
+            loud.push("--warnings");
+            let output = f.run(&loud);
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "{loud:?}: {stderr}");
+            assert_eq!(stderr, expected, "{loud:?}");
+            if format != "human" {
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["diagnostics"]["warnings"], 2, "{loud:?}");
+            }
         }
+    }
+    // Clean projects report no diagnostics field and print nothing to stderr.
+    let clean = Fixture::new();
+    for format in ["human", "json"] {
+        let output = clean.run(&["symbol", "order::submit", "--format", format]);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty(), "{output:?}");
+        if format == "json" {
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(value.get("diagnostics").is_none(), "{value}");
+        }
+    }
+    // Errors that affect the answer are still printed in full.
+    fs::write(
+        f.0.join("src/order.wi"),
+        "module order;\npub fn submit(n: i64) -> i64 { return missing; }\n",
+    )
+    .unwrap();
+    for format in ["human", "json"] {
+        let output = f.run(&["symbol", "order::submit", "--format", format]);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("error["), "{stderr}");
+        assert!(!stderr.contains("warning["), "{stderr}");
     }
 }
 
@@ -2043,7 +2090,8 @@ fn lambda_human_anchors_and_legacy_selectors_round_trip() {
         } else {
             "src/main.wi:3:13".into()
         };
-        assert!(text.lines().any(|line| line.trim() == anchor), "{text}");
+        let labelled = format!("lambda {anchor}");
+        assert!(text.lines().any(|line| line.trim() == labelled), "{text}");
         assert!(!text.contains("<lambda "), "{text}");
         let resolved = f.json(&["effects", &anchor], 0);
         assert_eq!(resolved["result"]["selected"]["id"], node["id"]);
@@ -2102,7 +2150,8 @@ fn lambda_anchors_cover_imports_nested_siblings_and_unicode_crlf() {
                 .unwrap();
             let (line, column) = index.position(offset).unwrap();
             let anchor = format!("src/order.wi:{line}:{column}");
-            assert!(text.lines().any(|line| line.trim() == anchor), "{text}");
+            let labelled = format!("lambda {anchor}");
+            assert!(text.lines().any(|line| line.trim() == labelled), "{text}");
             for selector in [legacy, anchor.as_str()] {
                 let result = f.json(&["effects", selector], 0);
                 assert_eq!(result["result"]["selected"]["id"], node["id"]);
@@ -3849,7 +3898,7 @@ fn minor_semantic_cli_constructor_overloads_and_field_controls() {
             String::from_utf8_lossy(&collision.stdout),
             String::from_utf8_lossy(&collision.stderr)
         )
-        .contains("same hierarchy")
+        .contains("conflicts with existing member C::n")
     );
 }
 
@@ -4224,4 +4273,94 @@ fn local_selectors_symbol_line_order_and_rename_dry_run_counts() {
     );
     assert_eq!(dry["result"]["declarations"], 3, "{dry}");
     assert_eq!(dry["result"]["references"], 2, "{dry}");
+}
+
+#[test]
+fn rename_conflicts_name_owner_and_impact_labels_lambdas_in_order() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "interface Policy {\n    fn before(self) -> i64;\n    fn name(self) -> i64;\n}\nclass Fifo implements Policy {\n    pub fn before(self) -> i64 { return 1; }\n    pub fn name(self) -> i64 { return 2; }\n}\nclass Counter {\n    pub hits: i64;\n    pub misses: i64;\n    pub init(self) { self.hits = 0; self.misses = 0; }\n}\nopen class Base {\n    pub fn tag(self) -> i64 { return 1; }\n}\nclass Child extends Base {\n    pub fn label(self) -> i64 { return 2; }\n}\nfn has(xs: i64, k: i64) -> bool { return xs == k; }\nfn apply(f: fn(i64) -> bool) -> bool { return f(1); }\nfn main() {\n    let c = new Counter();\n    let p: Policy = new Fifo();\n    println(p.before());\n    println(p.name());\n    println(new Child().label());\n    println(apply(|x: i64| -> bool { return has(x, 2); }));\n    println(has(c.hits, 3));\n    println(apply(|y: i64| -> bool { return has(y, 4); }));\n}\n",
+    )
+    .unwrap();
+    let check = f.run(&["check"]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let rejected = |args: &[&str]| {
+        let result = f.json(args, 1);
+        let location = &result["location"];
+        (
+            result["message"].as_str().unwrap().to_owned(),
+            format!(
+                "{}:{}:{}",
+                location["path"].as_str().unwrap(),
+                location["line"],
+                location["column"]
+            ),
+        )
+    };
+    // (b) Plain class: no hierarchy wording; names the existing member.
+    let (message, at) = rejected(&["rename", "main::Counter::hits", "misses", "--dry-run"]);
+    assert!(
+        message.contains("conflicts with existing member Counter::misses"),
+        "{message}"
+    );
+    assert!(!message.contains("hierarchy"), "{message}");
+    assert_eq!(at, "src/main.wi:11:9");
+    // Inherited member: owner differs, so the hierarchy is named.
+    let (message, at) = rejected(&["rename", "main::Child::label", "tag", "--dry-run"]);
+    assert!(
+        message.contains("conflicts with member Base::tag in the same hierarchy"),
+        "{message}"
+    );
+    assert_eq!(at, "src/main.wi:15:12");
+    // (c) Interface rename points at the interface's own member, every run.
+    for _ in 0..4 {
+        let (message, at) = rejected(&["rename", "main::Policy::before", "name", "--dry-run"]);
+        assert!(
+            message.contains("conflicts with existing member Policy::name"),
+            "{message}"
+        );
+        assert_eq!(at, "src/main.wi:3:8");
+        let (message, at) = rejected(&["rename", "main::Fifo::before", "name", "--dry-run"]);
+        assert!(
+            message.contains("conflicts with existing member Fifo::name"),
+            "{message}"
+        );
+        assert_eq!(at, "src/main.wi:7:12");
+    }
+    // (d) Lambdas are labelled; entries sort by distance, then name/position.
+    let output = f.run(&["impact", "main::has"]);
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let listed: Vec<_> = text
+        .lines()
+        .skip_while(|line| !line.starts_with("Affected functions:"))
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            "main::has",
+            "main::main",
+            "lambda src/main.wi:28:19",
+            "lambda src/main.wi:30:19",
+            "main::apply",
+        ],
+        "{text}"
+    );
+    let impact = f.json(&["impact", "main::has"], 0);
+    let nodes = impact["result"]["impact"]["nodes"].as_array().unwrap();
+    assert_eq!(
+        nodes.iter().filter(|n| n["kind"] == "lambda").count(),
+        2,
+        "{impact}"
+    );
+    let distances: Vec<_> = nodes.iter().map(|n| n["distance"].as_u64()).collect();
+    assert!(distances.is_sorted(), "{impact}");
 }
