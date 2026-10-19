@@ -955,13 +955,43 @@ impl QuerySession {
                     let f = &self.snapshot.functions[i];
                     let mut seen = std::collections::HashSet::from([i]);
                     let mut queue = std::collections::VecDeque::from([(i, None)]);
+                    // Function values from outside `f` are caller-supplied code:
+                    // keep their effect bounds, but cite the indirect call site in
+                    // the reaching function rather than the foreign body. They are
+                    // visited only after every directly reachable function, so a
+                    // body reachable both ways keeps its own evidence.
+                    let mut foreign = std::collections::VecDeque::<(usize, usize, usize)>::new();
+                    let mut origins: HashMap<usize, usize> = HashMap::new();
+                    let mut call_sites: HashMap<usize, Option<Value>> = HashMap::new();
+                    let nested = |k: usize| {
+                        self.snapshot.functions[k].locations.iter().any(|inner| {
+                            f.locations.iter().any(|outer| {
+                                inner.path == outer.path
+                                    && outer.start <= inner.start
+                                    && inner.end <= outer.end
+                            })
+                        })
+                    };
                     let mut witness = vec![
                         json!({"function":f.id,"via":null,"reason":f.unknown_reason(),"unresolved":f.unresolved}),
                     ];
                     let mut evidence = BTreeMap::new();
                     let mut unknown_causes = Vec::new();
                     let mut suspension_sites = Vec::new();
-                    while let Some((j, via)) = queue.pop_front() {
+                    loop {
+                        let (j, via) = if let Some(next) = queue.pop_front() {
+                            next
+                        } else if let Some((k, j, origin)) = foreign.pop_front() {
+                            if !seen.insert(k) {
+                                continue;
+                            }
+                            origins.insert(k, origin);
+                            witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
+                            (k, Some(j))
+                        } else {
+                            break;
+                        };
+                        let origin = origins.get(&j).copied();
                         let cause = &self.snapshot.functions[j];
                         if cause.unknown
                             && (!cause.unresolved.is_empty()
@@ -984,6 +1014,33 @@ impl QuerySession {
                                 let Some(effect) = fact["effect"].as_u64() else {
                                     continue;
                                 };
+                                let (fact, via_function) = match origin {
+                                    None => (fact, j),
+                                    Some(origin) => {
+                                        let site = call_sites.entry(origin).or_insert_with(|| {
+                                            self.snapshot
+                                                .semantic
+                                                .witnesses
+                                                .get(&self.snapshot.functions[origin].id)?
+                                                .iter()
+                                                .find(|fact| {
+                                                    fact["witness"]["cause"]["operation"]
+                                                        == "indirect-call"
+                                                })
+                                                .map(|fact| {
+                                                    let mut witness = fact["witness"].clone();
+                                                    witness["reason"] = json!("Bound from function values reaching this indirect call; their bodies belong to the code that supplies them.");
+                                                    json!({"witness": witness})
+                                                })
+                                        });
+                                        // Without a recorded call site, the foreign
+                                        // body remains the only available citation.
+                                        match site {
+                                            Some(site) => (&*site, origin),
+                                            None => (fact, j),
+                                        }
+                                    }
+                                };
                                 if f.runtime_effects & effect as u8 == 0
                                     || fact["witness"]["kind"] == "unavailable"
                                 {
@@ -995,7 +1052,7 @@ impl QuerySession {
                                         .is_some_and(|op| op.starts_with("channel-"))
                                 {
                                     suspension_sites.push(json!({"effect":effect,"status":if fact["witness"]["cause"]["location"].is_object() {"conservative-bound"} else {"missing-source"},
-                                        "via_function":self.snapshot.functions[j].id,"witness":fact["witness"]}));
+                                        "via_function":self.snapshot.functions[via_function].id,"witness":fact["witness"]}));
                                     continue;
                                 }
                                 let entry = evidence.entry(effect).or_insert(Value::Null);
@@ -1012,12 +1069,18 @@ impl QuerySession {
                                     "status":if fact["witness"].get("cause").is_some() && !fact["witness"]["cause"]["location"].is_object() {"missing-source"}
                                         else if fact["witness"]["kind"]=="runtime-capability" {"conservative-bound"}
                                         else if fact["witness"]["kind"]=="external-boundary" {"external-boundary"}else{"compiler-fact"},
-                                    "via_function":self.snapshot.functions[j].id,"witness":fact["witness"]});
+                                    "via_function":self.snapshot.functions[via_function].id,"witness":fact["witness"]});
                             }
                         }
+                        let bucket = cause.id.starts_with("$indirect-arity:");
                         for &k in &self.callees[j] {
                             self.effect_edge_visits += 1;
-                            if seen.insert(k) {
+                            let origin = origin.or(via.filter(|_| bucket && !nested(k)));
+                            if let Some(origin) = origin {
+                                if !seen.contains(&k) {
+                                    foreign.push_back((k, j, origin));
+                                }
+                            } else if seen.insert(k) {
                                 queue.push_back((k, Some(j)));
                                 witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
                             }

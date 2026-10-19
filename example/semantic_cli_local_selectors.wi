@@ -1,0 +1,38 @@
+// willow symbol semantic_cli_local_selectors::search::evals --source example/semantic_cli_local_selectors.wi
+// willow symbol semantic_cli_local_selectors::shadow::x --source example/semantic_cli_local_selectors.wi
+// willow symbol semantic_cli_local_selectors::Base::score --source example/semantic_cli_local_selectors.wi
+// willow rename semantic_cli_local_selectors::Evaluator::score rate --source example/semantic_cli_local_selectors.wi --dry-run
+// willow effects semantic_cli_local_selectors::fold --source example/semantic_cli_local_selectors.wi
+// Local selectors omit byte offsets, symbol queries print Symbol before Type,
+// dry-run counts include declarations, and a generic higher-order function
+// cites its own indirect call rather than a caller's lambda body.
+import std::collections::Array;
+interface Evaluator { fn score(self) -> i64; }
+open class Base implements Evaluator {
+    pub init(self) {}
+    pub open fn score(self) -> i64 { return 1; }
+}
+class Child extends Base {
+    pub init(self) { super.init(); }
+    pub override fn score(self) -> i64 { return 2; }
+}
+fn search(e: Evaluator) -> i64 {
+    let evals = e.score();
+    return evals + 1;
+}
+fn shadow(n: i64) -> i64 {
+    let x = n;
+    if n > 0 { let x = n + 1; return x; }
+    return x;
+}
+fn fold<T>(xs: Array<T>, init: T, f: closure(T, T) -> T) -> T {
+    let mut acc = init;
+    for x in xs { acc = f(acc, x); }
+    return acc;
+}
+fn main() {
+    println(new Base().score());
+    println(search(new Child()));
+    println(shadow(4));
+    println(fold(["a", "b"], "", |a: String, b: String| a + b));
+}

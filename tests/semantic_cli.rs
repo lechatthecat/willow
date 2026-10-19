@@ -3949,3 +3949,128 @@ fn imported_constructor_effects_match_local_field_initialization() {
         "{waiting}"
     );
 }
+
+#[test]
+fn local_selectors_symbol_line_order_and_rename_dry_run_counts() {
+    // willow-25da.29.53: offsets are identities, not selectors.
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/semantic_cli_local_selectors.wi")
+            .replace("semantic_cli_local_selectors::", "main::"),
+    )
+    .unwrap();
+    let unique = f.json(&["symbol", "main::search::evals"], 0);
+    let selected = &unique["result"]["selected"];
+    assert_eq!(selected["selector"], "main::search::evals", "{unique}");
+    assert!(selected.get("qualified_name").is_none(), "{unique}");
+    let offset = selected["location"]["start"].as_u64().unwrap();
+    // Legacy offset spellings and parameter names still resolve.
+    let legacy = f.json(&["refs", &format!("main::search::evals@{offset}")], 0);
+    assert_eq!(
+        legacy["result"]["selected"]["selector"],
+        "main::search::evals"
+    );
+    let parameter = f.json(&["symbol", "main::search::e"], 0);
+    assert_eq!(
+        parameter["result"]["selected"]["selector"],
+        "main::search::e"
+    );
+    let shadowed = f.json(&["symbol", "main::shadow::x"], 1);
+    let candidates = shadowed["result"]["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "{shadowed}");
+    for candidate in candidates {
+        let selector = candidate["selector"].as_str().unwrap();
+        assert!(selector.starts_with("src/main.wi:"), "{shadowed}");
+        assert!(!selector.contains('@'), "{shadowed}");
+        assert_eq!(candidate["qualified_name"], "main::shadow::x", "{shadowed}");
+        let chosen = f.json(&["symbol", selector], 0);
+        assert_eq!(chosen["result"]["selected"]["selector"], selector);
+        assert_eq!(
+            chosen["result"]["selected"]["qualified_name"],
+            "main::shadow::x"
+        );
+        let text = String::from_utf8(f.run(&["symbol", selector]).stdout).unwrap();
+        assert!(
+            text.contains("Symbol: main::shadow::x (binding)\n"),
+            "{text}"
+        );
+    }
+    let text = String::from_utf8(f.run(&["symbol", "main::shadow::x"]).stdout).unwrap();
+    assert!(!text.contains('@'), "{text}");
+    assert!(
+        text.contains("  main::shadow::x (binding) src/main.wi:"),
+        "{text}"
+    );
+    for typo in ["main::shadow::y", "main::search::eval"] {
+        let missing = f.json(&["symbol", typo], 1);
+        let suggestions = missing["result"]["suggestions"].as_array().unwrap();
+        assert!(!suggestions.is_empty(), "{missing}");
+        for suggestion in suggestions {
+            assert!(!suggestion.as_str().unwrap().contains('@'), "{missing}");
+        }
+    }
+    // Every query prints Symbol, location, then Type.
+    for args in [
+        ["symbol", "main::Base::score"],
+        ["type", "main::Base::score"],
+        ["symbol", "main::search::evals"],
+        ["type", "main::search::evals"],
+        ["symbol", "main::search"],
+        ["type", "main::Evaluator::score"],
+    ] {
+        let text = String::from_utf8(f.run(&args).stdout).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        let symbol = lines.iter().position(|l| l.starts_with("Symbol: "));
+        let ty = lines.iter().position(|l| l.starts_with("Type: "));
+        assert!(
+            matches!((symbol, ty), (Some(s), Some(t)) if t == s + 2),
+            "{args:?}: {text}"
+        );
+    }
+    // Dry-run counts equal the applied edit counts, including declarations.
+    for selector in [
+        "main::Evaluator::score",
+        "main::Base::score",
+        "main::search::evals",
+    ] {
+        let dry = f.json(&["rename", selector, "renamed", "--dry-run"], 0);
+        let diff = f.json(&["rename", selector, "renamed", "--dry-run", "--diff"], 0);
+        for key in ["files", "edits", "declarations", "references"] {
+            assert_eq!(dry["result"][key], diff["result"][key], "{key}: {dry}");
+        }
+        let text =
+            String::from_utf8(f.run(&["rename", selector, "renamed", "--dry-run"]).stdout).unwrap();
+        let source = fs::read_to_string(f.0.join("src/main.wi")).unwrap();
+        let applied = f.json(&["rename", selector, "renamed"], 0);
+        for (dry_key, applied_key) in [
+            ("files", "files_changed"),
+            ("edits", "edits"),
+            ("declarations", "declarations_updated"),
+            ("references", "references_updated"),
+        ] {
+            assert_eq!(
+                dry["result"][dry_key], applied["result"][applied_key],
+                "{dry} {applied}"
+            );
+        }
+        let count = |key: &str| dry["result"][key].as_u64().unwrap();
+        assert!(count("declarations") > 0, "{dry}");
+        assert_eq!(count("edits"), count("declarations") + count("references"));
+        assert!(
+            text.contains(&format!(
+                "/ {} edits ({} declaration",
+                count("edits"),
+                count("declarations")
+            )),
+            "{text}"
+        );
+        fs::write(f.0.join("src/main.wi"), source).unwrap();
+    }
+    let dry = f.json(
+        &["rename", "main::Evaluator::score", "rate", "--dry-run"],
+        0,
+    );
+    assert_eq!(dry["result"]["declarations"], 3, "{dry}");
+    assert_eq!(dry["result"]["references"], 2, "{dry}");
+}

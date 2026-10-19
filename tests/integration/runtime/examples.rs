@@ -72,6 +72,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "5\n5\n7\n7\nkept\n",
         ),
         ("example/semantic_generic_queries.wi", "7\ngeneric\n11\n"),
+        ("example/semantic_cli_local_selectors.wi", "1\n3\n5\nab\n"),
         (
             "example/semantic_generic_closure_calls.wi",
             "4\nab\n12\nq!!\n",
@@ -1370,6 +1371,7 @@ fn test_recent_cli_and_language_examples() {
         "example/semantic_contract_queries.wi",
         "example/semantic_scope/main.wi",
         "example/semantic_local_lock_queries.wi",
+        "example/semantic_cli_local_selectors.wi",
     ] {
         let (_, expected) = runnable_example_cases()
             .iter()

@@ -371,3 +371,92 @@ fn closure_effects_unresolved_virtual_call_is_not_hidden_by_known_lambda() {
     assert_eq!(result["status"], "unknown", "{result}");
     assert_eq!(result["runtime_effects"], 63);
 }
+
+fn evidence_operation(result: &serde_json::Value, effect: u64) -> String {
+    result["effect_evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["effect"] == effect)
+        .unwrap_or_else(|| panic!("{result}"))["witness"]["cause"]["operation"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{result}"))
+        .to_owned()
+}
+
+#[test]
+fn closure_effects_cite_indirect_site_not_caller_lambda_body() {
+    // willow-25da.29.53: caller-supplied lambda bodies keep their bounds but
+    // are cited at the reaching indirect call; the lambda owner cites the body.
+    let source = "fn apply<T>(x: T, f: closure(T) -> T) -> T { return f(x); }\nfn relay(f: closure(i64) -> i64) -> i64 { return apply(1, f); }\nfn main() { let c = BlockingCell::new(false); relay(|x: i64| { c.get(); return x; }); }";
+    let snapshot = snapshot(source, "caller-lambda");
+    for name in ["apply", "relay"] {
+        let result = effects(snapshot.clone(), name);
+        assert_ne!(
+            result["runtime_effects"].as_u64().unwrap() & 2,
+            0,
+            "{result}"
+        );
+        assert_eq!(evidence_operation(&result, 2), "indirect-call", "{name}");
+        let blocking = result["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["effect"] == 2)
+            .unwrap();
+        assert_eq!(blocking["status"], "conservative-bound", "{result}");
+        assert_eq!(
+            blocking["witness"]["cause"]["location"]["start"], 52,
+            "{result}"
+        );
+    }
+    let main = effects(snapshot, "main");
+    assert_eq!(evidence_operation(&main, 2), "BlockingCell.get", "{main}");
+}
+
+#[test]
+fn closure_effects_direct_callee_keeps_evidence_beside_foreign_lambda() {
+    let source = "fn read(c: BlockingCell<bool>) -> bool { return c.get(); }\nfn apply(f: closure() -> bool, c: BlockingCell<bool>) -> bool { f(); return read(c); }\nfn own<T>(x: T, f: closure(T) -> T) -> T { let g = |y: T| f(y); return g(x); }\nfn main() { let cell = BlockingCell::new(false); apply(|| read(cell), cell); own(1, |x: i64| { cell.get(); return x; }); }";
+    let snapshot = snapshot(source, "direct-and-foreign");
+    let apply = effects(snapshot.clone(), "apply");
+    assert_eq!(evidence_operation(&apply, 2), "BlockingCell.get", "{apply}");
+    // A lambda nested in the queried generic body is its own code; the value
+    // it forwards to is still caller-supplied.
+    let own = effects(snapshot, "own");
+    assert_ne!(own["runtime_effects"].as_u64().unwrap() & 2, 0, "{own}");
+    assert_eq!(evidence_operation(&own, 2), "indirect-call", "{own}");
+}
+
+#[test]
+fn closure_effects_foreign_candidates_visit_each_edge_once() {
+    // Each foreign candidate is queued once per incoming edge and expanded
+    // once; the indirect call site is looked up once per reaching function.
+    for n in [8, 32, 128] {
+        let mut source = "fn apply<T>(x: T, f: closure(T) -> T) -> T { return f(x); }\n".to_owned();
+        for i in 0..n {
+            source.push_str(&format!(
+                "fn caller_{i}() -> String {{ return apply(\"{i}\", |x: String| x + \"!\"); }}\n"
+            ));
+        }
+        source.push_str("fn main() {");
+        for i in 0..n {
+            source.push_str(&format!("caller_{i}();"));
+        }
+        source.push('}');
+        let snapshot = snapshot(&source, &format!("foreign-scale-{n}"));
+        let function = snapshot
+            .functions
+            .iter()
+            .find(|f| f.name == "apply")
+            .unwrap()
+            .id
+            .clone();
+        let revision = snapshot.revision.clone();
+        let mut session = QuerySession::new(snapshot).unwrap();
+        let result = session.query(QueryRequest::Effects { revision, function })["result"].take();
+        assert_eq!(evidence_operation(&result, 1), "indirect-call", "{result}");
+        let visits = session.effect_edge_visits;
+        assert!(visits <= 2 * n + 2, "n={n} visits={visits}");
+        println!("foreign candidates n={n} effect_edge_visits={visits}");
+    }
+}

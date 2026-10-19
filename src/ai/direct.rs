@@ -319,10 +319,19 @@ impl DirectSession {
             preview["selected"] = selected;
             return Ok(preview);
         }
-        let rename_selector = resolved["symbol"]["selector"]
-            .as_str()
-            .context("rename selector")?
-            .to_owned();
+        // History keeps the internal selector (a local's `@byte` anchor
+        // included) rather than its displayed spelling.
+        let rename_selector = self
+            .session
+            .snapshot
+            .semantic
+            .symbols
+            .iter()
+            .chain(self.lambda_symbols.values())
+            .find(|symbol| resolved["symbol"]["id"] == symbol.id.as_str())
+            .map(|symbol| self.selector(symbol))
+            .or_else(|| resolved["symbol"]["selector"].as_str().map(str::to_owned))
+            .context("rename selector")?;
         let rename_location =
             serde_json::from_value::<super::Location>(resolved["symbol"]["location"].clone())?;
         let workspace = edit::Workspace::open(Path::new(self.workspace()))?;
@@ -632,13 +641,7 @@ impl DirectSession {
             } else {
                 &qualified
             };
-            let local_name = matches!(symbol.kind.as_str(), "binding" | "parameter")
-                .then(|| qualified.rsplit_once('@'))
-                .flatten()
-                .filter(|(_, offset)| {
-                    !offset.is_empty() && offset.bytes().all(|b| b.is_ascii_digit())
-                })
-                .map(|(name, _)| name);
+            let local_name = local_plain(&symbol.kind, &qualified);
             let matches_name = |name: &str| {
                 selector == name
                     || name
@@ -659,10 +662,17 @@ impl DirectSession {
                 let name = local_name.unwrap_or(qualified);
                 // Lambda pseudo-names expose byte offsets; rank them after
                 // declarations and label them by source position below.
-                let lambda = self
-                    .lambda_symbols
-                    .contains_key(&symbol.id)
-                    .then(|| symbol.id.clone());
+                let lambda = self.lambda_symbols.contains_key(&symbol.id);
+                // Lambdas and shadowed locals display a source position, never
+                // their internal byte-offset pseudo-names.
+                let anchor = (lambda || local_name.is_some())
+                    .then(|| {
+                        symbol
+                            .location
+                            .as_ref()
+                            .map(|loc| (loc.path.clone(), loc.start))
+                    })
+                    .flatten();
                 let (owner, _) = name.rsplit_once("::").unwrap_or(("", name));
                 let same_scope = selector_scope.is_none_or(|scope| {
                     owner == scope || owner.strip_suffix(scope).is_some_and(|p| p.ends_with("::"))
@@ -674,13 +684,8 @@ impl DirectSession {
                 }
                 if local_name.is_none() && same_scope && selector_scope.is_some() {
                     // Declarations sort by name; lambdas follow in source order.
-                    let anchor = lambda.as_ref().and_then(|_| {
-                        symbol
-                            .location
-                            .as_ref()
-                            .map(|loc| (loc.path.clone(), loc.start))
-                    });
-                    scope_fallback.push((anchor, qualified.to_owned(), lambda.clone()));
+                    let order = anchor.clone().filter(|_| lambda);
+                    scope_fallback.push((order, qualified.to_owned(), anchor.clone()));
                     scope_fallback.sort_unstable();
                     scope_fallback.dedup();
                     scope_fallback.truncate(5);
@@ -696,11 +701,11 @@ impl DirectSession {
                     let position = symbol.location.as_ref().map_or(usize::MAX, |loc| loc.start);
                     suggestions.push((
                         !previous,
-                        lambda.is_some(),
+                        lambda,
                         score.unwrap_or(usize::MAX),
                         position,
                         qualified.to_owned(),
-                        lambda,
+                        anchor,
                     ));
                     suggestions.sort_unstable();
                     suggestions.dedup();
@@ -714,15 +719,15 @@ impl DirectSession {
             scope_fallback.insert(0, (None, local, None));
             scope_fallback.truncate(5);
         }
-        let (mut suggestions, lambdas): (Vec<_>, Vec<_>) = if suggestions.is_empty() {
+        let (mut suggestions, anchors): (Vec<_>, Vec<_>) = if suggestions.is_empty() {
             scope_fallback
                 .into_iter()
-                .map(|(_, name, lambda)| (name, lambda))
+                .map(|(_, name, anchor)| (name, anchor))
                 .unzip()
         } else {
             suggestions
                 .into_iter()
-                .map(|(_, _, _, _, name, lambda)| (name, lambda))
+                .map(|(_, _, _, _, name, anchor)| (name, anchor))
                 .unzip()
         };
         normalize_local_suggestions(
@@ -735,12 +740,14 @@ impl DirectSession {
                 .filter(|symbol| matches!(symbol.kind.as_str(), "binding" | "parameter"))
                 .map(|symbol| self.selector(symbol)),
         );
-        // At most five lambda labels are resolved, against cached sources.
-        for (suggestion, id) in suggestions.iter_mut().zip(lambdas) {
-            if let Some(loc) = id.and_then(|id| self.lambda_symbols[&id].location.clone()) {
-                *suggestion = self.source_label(&loc.path, loc.start)?;
+        // At most five labels are resolved, against cached sources. Lambda
+        // names and shadowed locals still carry a byte-offset anchor here.
+        for (suggestion, anchor) in suggestions.iter_mut().zip(anchors) {
+            if let Some((path, start)) = anchor.filter(|_| suggestion.contains('@')) {
+                *suggestion = self.source_label(&path, start)?;
             }
         }
+        self.display_local_candidates(&mut candidates)?;
         let mut spellings = HashMap::new();
         for candidate in &candidates {
             *spellings
@@ -774,6 +781,53 @@ impl DirectSession {
             1 => json!({"status":"ok","symbol":candidates.remove(0)}),
             _ => json!({"status":"ambiguous","candidates":candidates}),
         })
+    }
+    /// Byte offsets anchor local identities but are not source spellings. A
+    /// unique local is selected by its scoped name; a shadowed one by position.
+    fn display_local_candidates(&mut self, candidates: &mut [Value]) -> Result<()> {
+        let mut counts: HashMap<String, usize> = candidates
+            .iter()
+            .filter_map(|c| local_plain(c["kind"].as_str()?, c["selector"].as_str()?))
+            .map(|plain| (plain.to_owned(), 0))
+            .collect();
+        if counts.is_empty() {
+            return Ok(());
+        }
+        for symbol in self
+            .session
+            .snapshot
+            .semantic
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind.as_str(), "binding" | "parameter"))
+        {
+            if let Some(count) = local_plain(&symbol.kind, &self.selector(symbol))
+                .and_then(|plain| counts.get_mut(plain))
+            {
+                *count += 1;
+            }
+        }
+        for candidate in candidates {
+            let Some(plain) = candidate["kind"]
+                .as_str()
+                .zip(candidate["selector"].as_str())
+                .and_then(|(kind, selector)| local_plain(kind, selector))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if counts[&plain] == 1 {
+                candidate["selector"] = json!(plain);
+            } else if let (Some(path), Some(start)) = (
+                candidate["location"]["path"].as_str(),
+                candidate["location"]["start"].as_u64(),
+            ) {
+                let label = self.source_label(path, start.try_into()?)?;
+                candidate["qualified_name"] = json!(plain);
+                candidate["selector"] = json!(label);
+            }
+        }
+        Ok(())
     }
     pub fn query(
         &mut self,
@@ -1207,6 +1261,15 @@ mod tests {
         assert_eq!(split_location("order::Order::qty"), None);
         assert_eq!(SourceIndex::new(String::new()).byte(1, 1).unwrap(), 0);
     }
+}
+
+/// A local's scoped name without its internal `@byte` identity anchor.
+fn local_plain<'a>(kind: &str, selector: &'a str) -> Option<&'a str> {
+    matches!(kind, "binding" | "parameter")
+        .then(|| selector.rsplit_once('@'))
+        .flatten()
+        .filter(|(_, offset)| !offset.is_empty() && offset.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(name, _)| name)
 }
 
 /// Only the bounded final candidates need ambiguity counts. Keep offsets for

@@ -1018,16 +1018,21 @@ fn rename_dry_run_reports_counts_with_singular_and_plural_nouns() {
     assert_eq!(preview["result"]["files"], 1);
     assert_eq!(preview["result"]["references"], 1);
     let text = f.human(&["rename", "value", "answer", "--dry-run"], 0);
-    assert_eq!(text, "1 file / 1 reference / 0 collisions / 0 unresolved\n");
+    assert_eq!(
+        text,
+        "1 file / 2 edits (1 declaration, 1 reference) / 0 collisions / 0 unresolved\n"
+    );
     let summary = f.run(&["rename", "value", "answer", "--dry-run"], 0);
     assert_eq!(
         summary["result"],
-        serde_json::json!({"files":1,"references":1,"collisions":0,"unresolved":0})
+        serde_json::json!({"files":1,"edits":2,"declarations":1,"references":1,"collisions":0,"unresolved":0})
     );
     let text = f.human(&["rename", "value", "answer", "--dry-run", "--diff"], 0);
     assert!(text.contains("-fn value()"), "{text}");
     assert!(text.contains("+fn answer()"), "{text}");
-    assert!(text.ends_with("1 file / 1 reference / 0 collisions / 0 unresolved\n"));
+    assert!(text.ends_with(
+        "1 file / 2 edits (1 declaration, 1 reference) / 0 collisions / 0 unresolved\n"
+    ));
     let text = f.human(&["rename", "value", "answer"], 0);
     assert!(
         text.starts_with("Renamed value -> answer\n1 file changed\n2 edits (1 declaration, 1 reference)\nValidation: passed"),
@@ -1046,7 +1051,9 @@ fn rename_dry_run_reports_counts_with_singular_and_plural_nouns() {
         0,
     );
     assert!(
-        text.ends_with("2 files / 1 reference / 0 collisions / 0 unresolved\n"),
+        text.ends_with(
+            "2 files / 3 edits (2 declarations, 1 reference) / 0 collisions / 0 unresolved\n"
+        ),
         "{text}"
     );
 }
@@ -1229,7 +1236,7 @@ fn rename_diff_option_validation_and_help() {
     let help = String::from_utf8(out.stdout).unwrap();
     assert!(help.contains("--dry-run [--diff]"), "{help}");
     assert!(
-        help.contains("files / references / collisions / unresolved"),
+        help.contains("files / edits (declarations, references) / collisions / unresolved"),
         "{help}"
     );
 }

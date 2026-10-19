@@ -205,6 +205,8 @@ impl Options {
             if self.dry_run && result["status"] == "ok" {
                 let mut summary = json!({
                     "files": result["files_changed"],
+                    "edits": result["edits"],
+                    "declarations": result["declarations_updated"],
                     "references": result["references_updated"],
                     "collisions": 0,
                     "unresolved": 0,
@@ -288,9 +290,12 @@ fn human(value: &Value, options: &Options) -> String {
 fn human_items(value: &Value, options: &Options) -> Vec<String> {
     let result = &value["result"];
     if options.command == "rename" && options.dry_run && value["status"] == "ok" {
+        // Match the applied rename's counts, including declaration edits.
         let summary = format!(
-            "{} / {} / {} / {} unresolved",
+            "{} / {} ({}, {}) / {} / {} unresolved",
             counted(result["files"].as_u64().unwrap(), "file"),
+            counted(result["edits"].as_u64().unwrap_or(0), "edit"),
+            counted(result["declarations"].as_u64().unwrap_or(0), "declaration"),
             counted(result["references"].as_u64().unwrap(), "reference"),
             counted(result["collisions"].as_u64().unwrap(), "collision"),
             result["unresolved"]
@@ -354,7 +359,10 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
         for candidate in candidates {
             lines.push(format!(
                 "  {} ({}) {}",
-                candidate["selector"].as_str().unwrap_or("?"),
+                candidate["qualified_name"]
+                    .as_str()
+                    .or_else(|| candidate["selector"].as_str())
+                    .unwrap_or("?"),
                 candidate["kind"].as_str().unwrap_or("?"),
                 location(&candidate["location"])
             ));
@@ -399,11 +407,13 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
             ));
         }
     }
-    if let Some(ty) = result["type_display"].as_str() {
-        lines.push(format!("Type: {ty}"));
-    }
+    // Every query prints its symbol, then location, then type.
     if let Some(selected) = result.get("selected").or_else(|| result.get("symbol")) {
-        if let Some(name) = selected["selector"].as_str() {
+        // A position selector already repeats the location line below.
+        if let Some(name) = selected["qualified_name"]
+            .as_str()
+            .or_else(|| selected["selector"].as_str())
+        {
             lines.push(format!(
                 "Symbol: {name} ({})",
                 selected["kind"].as_str().unwrap_or("function")
@@ -416,9 +426,9 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
             lines.push(format!("ID: {}", selected["id"].as_str().unwrap_or("?")));
         }
     }
-    if let Some(ty) = result["symbol"]["type_display"]
+    if let Some(ty) = result["type_display"]
         .as_str()
-        .filter(|_| result["type_display"].is_null())
+        .or_else(|| result["symbol"]["type_display"].as_str())
     {
         lines.push(format!("Type: {ty}"));
     }
@@ -1061,10 +1071,12 @@ mod tests {
             (vec!["", ""], "\n"),
             (vec!["one", "", "two\n\n"], "one\ntwo\n\n"),
         ] {
-            let value = json!({"status":"ok","result":{"files":1,"references":2,"collisions":0,"unresolved":0,"changes":diffs.into_iter().map(|diff| json!({"diff":diff})).collect::<Vec<_>>()}});
+            let value = json!({"status":"ok","result":{"files":1,"edits":3,"declarations":1,"references":2,"collisions":0,"unresolved":0,"changes":diffs.into_iter().map(|diff| json!({"diff":diff})).collect::<Vec<_>>()}});
             assert_eq!(
                 human(&value, &options),
-                format!("{expected}1 file / 2 references / 0 collisions / 0 unresolved")
+                format!(
+                    "{expected}1 file / 3 edits (1 declaration, 2 references) / 0 collisions / 0 unresolved"
+                )
             );
         }
     }
