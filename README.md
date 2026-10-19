@@ -82,8 +82,8 @@ https://github.com/lechatthecat/willow/tree/main/example
 Prebuilt archives for Linux (x86_64), macOS (arm64, x86_64) and Windows (x86_64) are on the [latest release](https://github.com/lechatthecat/willow/releases/latest) page.
 
 ```bash
-tar xzf willow-v0.0.3-linux-x86_64.tar.gz
-./willow-v0.0.3-linux-x86_64/bin/willow
+tar xzf willow-v0.1.4-linux-x86_64.tar.gz
+./willow-v0.1.4-linux-x86_64/bin/willow
 ```
 
 Run `willow --version` (also `-V` or `version`) to report the package version and build commit. See the [bundled installation guide](RELEASE_README.md) for shell and Windows PATH setup.
@@ -103,7 +103,7 @@ sha256sum --check --ignore-missing SHA256SUMS
 On macOS, for example:
 
 ```bash
-grep 'willow-v0.0.1-macos-arm64.tar.gz
+grep 'willow-v0.1.4-macos-arm64.tar.gz
 
 ### Build from source
 
