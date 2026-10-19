@@ -433,6 +433,16 @@ impl DirectSession {
             symbol.name.clone()
         }
     }
+    /// Workspace-relative `path:line:column`, itself a valid position selector.
+    fn source_label(&mut self, path: &str, byte: usize) -> Result<String> {
+        let (line, column) = self.source(path)?.position(byte)?;
+        let display = Path::new(path)
+            .strip_prefix(self.workspace())
+            .unwrap_or(Path::new(path))
+            .to_string_lossy()
+            .replace('\\', "/");
+        Ok(format!("{display}:{line}:{column}"))
+    }
     fn missing_symbol_reason(&mut self, path: &str, byte: usize) -> Result<String> {
         let source = self.source(path)?;
         let (line, _) = source.position(byte)?;
@@ -642,9 +652,17 @@ impl DirectSession {
                 || selector == symbol.name
             {
                 candidates.push(json!({"id":symbol.id,"selector":qualified,"name":symbol.name,"kind":symbol.kind,"location":symbol.location,"identity":symbol.identity}));
-            } else {
+            } else if symbol.kind != "import" {
+                // Imports alias declarations owned elsewhere; suggest those
+                // declarations rather than the importing module's alias.
                 let qualified = source_selector;
                 let name = local_name.unwrap_or(qualified);
+                // Lambda pseudo-names expose byte offsets; rank them after
+                // declarations and label them by source position below.
+                let lambda = self
+                    .lambda_symbols
+                    .contains_key(&symbol.id)
+                    .then(|| symbol.id.clone());
                 let (owner, _) = name.rsplit_once("::").unwrap_or(("", name));
                 let same_scope = selector_scope.is_none_or(|scope| {
                     owner == scope || owner.strip_suffix(scope).is_some_and(|p| p.ends_with("::"))
@@ -655,7 +673,14 @@ impl DirectSession {
                     sole_local = (scoped_locals == 1).then(|| qualified.to_owned());
                 }
                 if local_name.is_none() && same_scope && selector_scope.is_some() {
-                    scope_fallback.push(qualified.to_owned());
+                    // Declarations sort by name; lambdas follow in source order.
+                    let anchor = lambda.as_ref().and_then(|_| {
+                        symbol
+                            .location
+                            .as_ref()
+                            .map(|loc| (loc.path.clone(), loc.start))
+                    });
+                    scope_fallback.push((anchor, qualified.to_owned(), lambda.clone()));
                     scope_fallback.sort_unstable();
                     scope_fallback.dedup();
                     scope_fallback.truncate(5);
@@ -671,9 +696,11 @@ impl DirectSession {
                     let position = symbol.location.as_ref().map_or(usize::MAX, |loc| loc.start);
                     suggestions.push((
                         !previous,
+                        lambda.is_some(),
                         score.unwrap_or(usize::MAX),
                         position,
                         qualified.to_owned(),
+                        lambda,
                     ));
                     suggestions.sort_unstable();
                     suggestions.dedup();
@@ -684,16 +711,19 @@ impl DirectSession {
         // Preserve a useful unambiguous same-scope fallback, without choosing
         // arbitrary locals when several declarations could have been renamed.
         if let Some(local) = sole_local {
-            scope_fallback.insert(0, local);
+            scope_fallback.insert(0, (None, local, None));
             scope_fallback.truncate(5);
         }
-        let mut suggestions: Vec<_> = if suggestions.is_empty() {
+        let (mut suggestions, lambdas): (Vec<_>, Vec<_>) = if suggestions.is_empty() {
             scope_fallback
+                .into_iter()
+                .map(|(_, name, lambda)| (name, lambda))
+                .unzip()
         } else {
             suggestions
                 .into_iter()
-                .map(|(_, _, _, name)| name)
-                .collect()
+                .map(|(_, _, _, _, name, lambda)| (name, lambda))
+                .unzip()
         };
         normalize_local_suggestions(
             &mut suggestions,
@@ -705,6 +735,12 @@ impl DirectSession {
                 .filter(|symbol| matches!(symbol.kind.as_str(), "binding" | "parameter"))
                 .map(|symbol| self.selector(symbol)),
         );
+        // At most five lambda labels are resolved, against cached sources.
+        for (suggestion, id) in suggestions.iter_mut().zip(lambdas) {
+            if let Some(loc) = id.and_then(|id| self.lambda_symbols[&id].location.clone()) {
+                *suggestion = self.source_label(&loc.path, loc.start)?;
+            }
+        }
         let mut spellings = HashMap::new();
         for candidate in &candidates {
             *spellings
@@ -718,15 +754,9 @@ impl DirectSession {
                     candidate["location"]["start"].as_u64(),
                 )
             {
-                let path = path.to_owned();
-                let (line, column) = self.source(&path)?.position(start.try_into()?)?;
-                let display = Path::new(&path)
-                    .strip_prefix(self.workspace())
-                    .unwrap_or(Path::new(&path))
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let label = self.source_label(path, start.try_into()?)?;
                 candidate["qualified_name"] = candidate["selector"].take();
-                candidate["selector"] = json!(format!("{display}:{line}:{column}"));
+                candidate["selector"] = json!(label);
             }
         }
         Ok(match candidates.len() {
@@ -1226,8 +1256,9 @@ fn selector_suggestion_score(name: &str, segments: &[(&str, Vec<char>)]) -> Opti
     Some(score)
 }
 
-/// Banded edit distance, bounded to two edits. O(a+b) work and O(1)
-/// distance-band storage, plus O(a+b) Unicode scalar storage.
+/// Banded optimal-string-alignment distance (Levenshtein plus adjacent
+/// transpositions), bounded to two edits. O(a+b) work and O(1) distance-band
+/// storage, plus O(a+b) Unicode scalar storage.
 fn selector_typo_distance(a: &str, b: &[char]) -> Option<usize> {
     let a: Vec<_> = a.chars().collect();
     let limit = if a.len().min(b.len()) < 4 { 1 } else { 2 };
@@ -1239,6 +1270,8 @@ fn selector_typo_distance(a: &str, b: &[char]) -> Option<usize> {
     for j in 0..=limit.min(b.len()) {
         previous[j + limit] = j;
     }
+    // Row i-2 shares band index k with cell (i-2, j-2).
+    let mut before = [3usize; 5];
     for i in 1..=a.len() {
         let mut current = [3usize; 5];
         for j in i.saturating_sub(limit)..=b.len().min(i + limit) {
@@ -1252,8 +1285,14 @@ fn selector_typo_distance(a: &str, b: &[char]) -> Option<usize> {
             let diagonal = previous[k] + usize::from(a[i - 1] != b[j - 1]);
             let deletion = if k + 1 < 5 { previous[k + 1] + 1 } else { 3 };
             let insertion = if k > 0 { current[k - 1] + 1 } else { 3 };
-            current[k] = diagonal.min(deletion).min(insertion);
+            let transposition = if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                before[k] + 1
+            } else {
+                3
+            };
+            current[k] = diagonal.min(deletion).min(insertion).min(transposition);
         }
+        before = previous;
         previous = current;
     }
     let distance = previous[b.len() + limit - a.len()];
@@ -1341,6 +1380,13 @@ mod typo_tests {
             ("eval::Recursive::cell", "eval::cell", None),
             ("eval::Recursive::cell", "eval::Recursive::unrelated", None),
             ("a::B::c", "a::C::c", Some(3)),
+            ("sim::run", "sim::rnu", Some(3)),
+            ("sim::run", "sim::urn", Some(3)),
+            ("sim::run", "smi::run", Some(3)),
+            ("sim::run", "sim::nur", None),
+            ("eval::Recursive::cell", "eval::Recursive::clel", Some(3)),
+            ("eval::Recursive::cell", "eval::Rceursive::cell", Some(3)),
+            ("eval::Recursive::cell", "eval::Rceursive::clel", Some(6)),
             ("日本語::計算式", "日本::計算式", Some(1)),
             ("日本語::計算式", "日本語::計算値", Some(3)),
         ] {
@@ -1386,26 +1432,39 @@ mod typo_tests {
     }
     #[test]
     fn bounded_distance_matches_full_distance() {
+        // Full-matrix optimal string alignment distance.
         fn full(a: &str, b: &str) -> usize {
-            let b: Vec<_> = b.chars().collect();
-            let mut row: Vec<_> = (0..=b.len()).collect();
-            for (i, a) in a.chars().enumerate() {
-                let mut diagonal = row[0];
-                row[0] = i + 1;
-                for (j, &b) in b.iter().enumerate() {
-                    let old = row[j + 1];
-                    row[j + 1] = (diagonal + usize::from(a != b))
-                        .min(row[j] + 1)
-                        .min(old + 1);
-                    diagonal = old;
+            let (a, b): (Vec<_>, Vec<_>) = (a.chars().collect(), b.chars().collect());
+            let mut d = vec![vec![0; b.len() + 1]; a.len() + 1];
+            for i in 0..=a.len() {
+                for j in 0..=b.len() {
+                    d[i][j] = if i == 0 || j == 0 {
+                        i + j
+                    } else {
+                        let mut v = (d[i - 1][j - 1] + usize::from(a[i - 1] != b[j - 1]))
+                            .min(d[i - 1][j] + 1)
+                            .min(d[i][j - 1] + 1);
+                        if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                            v = v.min(d[i - 2][j - 2] + 1);
+                        }
+                        v
+                    };
                 }
             }
-            row[b.len()]
+            d[a.len()][b.len()]
         }
         let words = [
             "",
             "a",
             "abc",
+            "acb",
+            "bac",
+            "run",
+            "rnu",
+            "urn",
+            "ca",
+            "abcd",
+            "badc",
             "slot",
             "slto",
             "transfer",

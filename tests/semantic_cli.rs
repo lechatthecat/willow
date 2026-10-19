@@ -1212,6 +1212,81 @@ fn await_block_bounds_explain_lowering_without_blaming_locks() {
 }
 
 #[test]
+fn transposed_typos_rank_declarations_above_lambdas_and_skip_imports() {
+    let f = Fixture::new();
+    let lambdas: String = (0..6)
+        .map(|i| format!("    let f{i} = |x: i64| x + {i};\n    total = f{i}(total);\n"))
+        .collect();
+    fs::write(
+        f.0.join("src/sim.wi"),
+        format!("module sim;\nimport std::collections::Array;\npub fn run(n: i64) -> i64 {{\n    let mut total = n;\n{lambdas}    return total;\n}}\n"),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import sim;\nfn main() { println(sim::run(2)); }\n",
+    )
+    .unwrap();
+    // Adjacent transpositions are one edit, including in short leaves and scopes.
+    for typo in [
+        "sim::rnu",
+        "sim::urn",
+        "smi::run",
+        "sim::rn",
+        "sim::runn",
+        "rnu",
+    ] {
+        for command in ["refs", "symbol"] {
+            let value = f.json(&[command, typo], 1);
+            assert_eq!(
+                value["result"]["suggestions"][0], "sim::run",
+                "{typo}: {value}"
+            );
+        }
+    }
+    // Same-scope fallback: declarations first, then lambdas by source position,
+    // labelled `path:line:column`; the import alias is not a sim declaration.
+    let value = f.json(&["refs", "sim::zzz"], 1);
+    let suggestions: Vec<_> = value["result"]["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        suggestions,
+        [
+            "sim::run",
+            "src/sim.wi:5:14",
+            "src/sim.wi:7:14",
+            "src/sim.wi:9:14",
+            "src/sim.wi:11:14"
+        ],
+        "{value}"
+    );
+    for label in &suggestions[1..] {
+        let resolved = f.json(&["refs", label], 0);
+        assert_eq!(resolved["status"], "ok", "{label}: {resolved}");
+    }
+    for typo in ["sim::Arary", "sim::Aray", "sim::<lambda"] {
+        let value = f.json(&["refs", typo], 1);
+        assert!(
+            value["result"]["suggestions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| {
+                    let s = s.as_str().unwrap();
+                    s != "sim::Array" && !s.contains("<lambda") && !s.contains('@')
+                }),
+            "{typo}: {value}"
+        );
+    }
+    // Exact import selectors still resolve.
+    f.json(&["symbol", "sim::Array"], 0);
+}
+
+#[test]
 fn buildgraph_typo_suggestions_stay_in_scope() {
     let f = Fixture::new();
     fs::write(f.0.join("src/main.wi"), "class Bank { pub fn transfer(self) {} } fn serve() { let running = true; let slot = 1; println(slot); } fn unrelated() { let r = 1; } fn main() {} ").unwrap();
