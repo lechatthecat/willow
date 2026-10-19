@@ -334,7 +334,7 @@ impl TypeChecker {
             expected_return,
             expected_closure,
         );
-        self.record_function_value(callable, l.params.len(), l.span);
+        self.record_function_value(callable, l.params.len(), l.span, &result.0);
         result
     }
 

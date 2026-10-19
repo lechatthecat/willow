@@ -33,6 +33,24 @@ pub(crate) struct FunctionValue {
     pub(crate) target: Option<FunctionId>,
     pub(crate) bit: u64,
     pub(crate) span: Span,
+    /// Nominal identity of the value's parameter and return types (see
+    /// [`IndirectCall::key`]); `None` when some part has no stable identity.
+    #[serde(default)]
+    pub(crate) key: Option<String>,
+}
+
+/// An indirect call made by `caller` itself.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IndirectCall {
+    pub(crate) caller: FunctionId,
+    pub(crate) bit: u64,
+    /// The called function type keyed by declaration identities, so that AI
+    /// impact can narrow candidates beyond arity. Function types are
+    /// invariant, so a value can only be called through an equal key; `None`
+    /// (a type parameter, builtin container or unresolved name) matches every
+    /// value of the arity. The lock check keeps using `bit` alone.
+    #[serde(default)]
+    pub(crate) key: Option<String>,
 }
 
 /// What one body contributes, kept in source order so that replaying a cached
@@ -40,8 +58,8 @@ pub(crate) struct FunctionValue {
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IndirectInputs {
     pub(crate) values: Vec<FunctionValue>,
-    /// Arity bits of the indirect calls each callable makes itself.
-    pub(crate) calls: Vec<(FunctionId, u64)>,
+    /// The indirect calls each callable makes itself.
+    pub(crate) calls: Vec<IndirectCall>,
     /// Indirect calls made while holding a lock.
     pub(crate) lock_sites: Vec<(Span, u64)>,
 }

@@ -9,31 +9,39 @@ use crate::parser::ast::{CallArg, Expr, Type};
 use crate::semantic::call_graph::CallGraph;
 use crate::semantic::effects::EffectFacts;
 use crate::semantic::ids::FunctionId;
-use crate::semantic::indirect_lock::{FunctionValue, ValueMasks, arity_bit, close_reach};
+use crate::semantic::indirect_lock::{
+    FunctionValue, IndirectCall, ValueMasks, arity_bit, close_reach,
+};
 
 use super::TypeChecker;
 
 impl TypeChecker {
-    /// A named function or a lambda became a value that indirect calls can
-    /// reach.
+    /// A named function or a lambda of type `ty` became a value that
+    /// indirect calls can reach.
     pub(super) fn record_function_value(
         &mut self,
         target: Option<FunctionId>,
         arity: usize,
         span: Span,
+        ty: &Type,
     ) {
+        let key = self.symbols.function_type_key(ty);
         self.indirect_lock.values.push(FunctionValue {
             target,
             bit: arity_bit(arity),
             span,
+            key,
         });
     }
 
-    /// A call through a function value with `arity` arguments.
-    fn record_indirect_call(&mut self, arity: usize, span: Span) {
+    /// A call through a function value of type `ty` with `arity` arguments.
+    fn record_indirect_call(&mut self, arity: usize, span: Span, ty: Option<&Type>) {
         let bit = arity_bit(arity);
         if let Some(caller) = self.local.current_effect_callable {
-            self.indirect_lock.calls.push((caller, bit));
+            let key = ty.and_then(|ty| self.symbols.function_type_key(ty));
+            self.indirect_lock
+                .calls
+                .push(IndirectCall { caller, bit, key });
             self.resolved_calls
                 .entry(caller)
                 .or_default()
@@ -54,8 +62,9 @@ impl TypeChecker {
     pub(super) fn record_indirect_uses(&mut self, expr: &Expr, targets: &[FunctionId]) {
         let args: &[CallArg] = match expr {
             Expr::Call(call) => {
-                if self.symbols.lookup_var(&call.callee).is_some() {
-                    self.record_indirect_call(call.args.len(), call.span);
+                if let Some(var) = self.symbols.lookup_var(&call.callee) {
+                    let ty = var.ty.clone();
+                    self.record_indirect_call(call.args.len(), call.span, Some(&ty));
                 }
                 &call.args
             }
@@ -71,10 +80,11 @@ impl TypeChecker {
             return;
         }
         for arg in args {
-            if let Some(Type::Fn(params, _) | Type::Closure(params, _)) =
+            if let Some(ty @ (Type::Fn(params, _) | Type::Closure(params, _))) =
                 self.expr_types.get(&arg.expr.id())
             {
-                self.record_indirect_call(params.len(), arg.span);
+                let (arity, ty) = (params.len(), ty.clone());
+                self.record_indirect_call(arity, arg.span, Some(&ty));
             }
         }
     }
@@ -124,8 +134,8 @@ impl TypeChecker {
         // Each callable's own indirect calls, plus those its synchronous
         // callees in earlier units can make.
         let mut seed: HashMap<FunctionId, u64> = HashMap::new();
-        for (caller, bit) in &inputs.calls {
-            *seed.entry(*caller).or_default() |= bit;
+        for call in &inputs.calls {
+            *seed.entry(call.caller).or_default() |= call.bit;
         }
         let mut edges = Vec::new();
         for (caller, sites) in graph.iter() {

@@ -1,0 +1,3 @@
+module policy;
+import data::Patient;
+pub fn before(a: Patient, b: Patient) -> bool { return a.id < b.id; }

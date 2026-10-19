@@ -693,6 +693,8 @@ mod tests {
             let captured = CapturedUnit {
                 graph: CallGraph::default(),
                 indirect: Default::default(),
+                interfaces: Default::default(),
+                templates: Default::default(),
                 semantic: semantic::Captured::default(),
                 symbols: facts,
                 symbol_owners: vec![(span, "Source".into())],
@@ -784,6 +786,8 @@ mod tests {
                 let captured = CapturedUnit {
                     graph: CallGraph::default(),
                     indirect: Default::default(),
+                    interfaces: Default::default(),
+                    templates: Default::default(),
                     semantic: semantic::Captured::default(),
                     symbols: facts,
                     symbol_owners: owner

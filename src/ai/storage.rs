@@ -97,6 +97,21 @@ impl Snapshot {
                 ensure!(ids.contains(target), "dangling call edge");
             }
         }
+        let instances = &self.semantic.instances;
+        ensure!(
+            instances.callees.len() == instances.owners.len()
+                && instances
+                    .owners
+                    .iter()
+                    .flatten()
+                    .all(|&owner| (owner as usize) < self.functions.len())
+                && instances
+                    .callees
+                    .iter()
+                    .flatten()
+                    .all(|&target| (target as usize) < instances.owners.len()),
+            "invalid instance graph"
+        );
         let mut bridges = std::collections::HashSet::new();
         for bridge in &self.semantic.interop.bridges {
             ensure!(
@@ -603,6 +618,47 @@ mod tests {
         let restored: Snapshot =
             serde_json::from_slice(&serde_json::to_vec(&old).unwrap()).unwrap();
         assert!(restored.validate().is_ok());
+    }
+
+    #[test]
+    fn instance_graph_indices_are_validated() {
+        let base = || {
+            let mut s = snapshot("/w", "/");
+            s.compiler = compiler_stamp();
+            s.functions = vec![Function {
+                identity: None,
+                body_id: None,
+                body_location: None,
+                rename_calls: vec![],
+                rename_imports: vec![],
+                id: "f".into(),
+                module: "/w/src/main.wi".into(),
+                name: "f".into(),
+                locations: vec![],
+                synthetic: false,
+                fingerprint: String::new(),
+                body_fingerprint: String::new(),
+                callees: vec![],
+                runtime_effects: 0,
+                unknown: false,
+                unresolved: vec![],
+            }];
+            s
+        };
+        type Case = (Vec<Option<u32>>, Vec<Vec<u32>>, bool);
+        let cases: [Case; 5] = [
+            (vec![Some(0), None], vec![vec![1], vec![]], true),
+            (vec![], vec![], true),
+            (vec![Some(1)], vec![vec![]], false),
+            (vec![Some(0)], vec![vec![1]], false),
+            (vec![Some(0)], vec![], false),
+        ];
+        for (owners, callees, valid) in cases {
+            let mut s = base();
+            s.semantic.instances = graph::Instances { owners, callees };
+            s.revision = s.digest().unwrap();
+            assert_eq!(s.validate().is_ok(), valid, "{:?}", s.semantic.instances);
+        }
     }
 
     fn snapshot(workspace: &str, sep: &str) -> Snapshot {

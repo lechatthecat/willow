@@ -1,0 +1,11 @@
+module sim;
+import pq::{Heap, Queue};
+import data::Patient;
+import policy::before;
+
+fn admit(q: Queue<Patient>, p: Patient) -> bool { return q.offer(p); }
+
+pub fn run(bias: i64) -> bool {
+    let less = |a: Patient, b: Patient| before(a, b) && bias >= 0;
+    return admit(new Heap<Patient>(less), new Patient(1));
+}

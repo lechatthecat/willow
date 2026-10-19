@@ -7,6 +7,7 @@ pub mod edit;
 pub(crate) mod generics;
 mod graph;
 mod indirect;
+mod interfaces;
 pub mod interop;
 pub mod overview;
 mod packages;
@@ -142,6 +143,9 @@ pub(crate) struct CapturedUnit {
     direct: HashMap<FunctionId, u8>,
     dispatches: HashMap<FunctionId, BTreeSet<FunctionId>>,
     dispatch_sites: HashMap<Span, FunctionId>,
+    interfaces: interfaces::Captured,
+    /// Never-instantiated generic templates, which no execution can enter.
+    templates: std::collections::HashSet<FunctionId>,
 }
 
 pub(crate) struct CaptureInputs<'a> {
@@ -188,7 +192,7 @@ pub(crate) fn capture(
             values: indirect
                 .values
                 .iter()
-                .map(|value| (value.target, value.bit))
+                .map(|value| (value.target, value.bit, value.key.clone()))
                 .collect(),
             calls: indirect.calls.clone(),
         },
@@ -203,7 +207,10 @@ pub(crate) fn capture(
         direct: HashMap::new(),
         dispatches: HashMap::new(),
         dispatch_sites: HashMap::new(),
+        interfaces: Default::default(),
+        templates: Default::default(),
     };
+    result.interfaces.targets(symbols, &result.graph);
     symbols::declarations(program, &mut result.symbols, symbols);
     result.semantic.rename_relations = rename::relations(program, symbols);
     let mut pending = Vec::new();
@@ -595,6 +602,13 @@ pub(crate) fn capture(
                         } else {
                             initializer_calls.has_unknown = true;
                         }
+                    }
+                    if let Some(Some(target)) = calls.get(&e.id()) {
+                        let receiver = match e {
+                            Expr::MethodCall(call) => types.get(&call.object.id()),
+                            _ => None,
+                        };
+                        result.interfaces.site(symbols, id, *target, receiver);
                     }
                     if let Expr::MethodCall(call) = e
                         && let Some(Type::Named(name) | Type::Generic(name, _)) =
@@ -1027,7 +1041,11 @@ pub(crate) fn snapshot(
             let mut unknown = sites.has_unknown && !inferred;
             let mut unresolved = BTreeSet::new();
             if unknown {
-                unresolved.insert("indirect-or-unresolved".to_string());
+                unresolved.insert(if capture.templates.contains(&id) {
+                    generics::UNINSTANTIATED.to_string()
+                } else {
+                    "indirect-or-unresolved".to_string()
+                });
             }
             let mut bits = 0;
             for target in &sites.targets {
@@ -1059,6 +1077,14 @@ pub(crate) fn snapshot(
             }
         }
     }
+    let interface_functions = interfaces::route(
+        captured
+            .iter()
+            .map(|(&unit, capture)| (unit, &capture.interfaces)),
+        &nodes,
+        &resolve,
+        &mut edges,
+    );
     // A dependency checker cannot see subclasses declared by its consumers.
     // Complete virtual dispatch from all checked declarations. Group identical
     // receiver/method queries and share each union, avoiding Q * D new edges.
@@ -1160,6 +1186,7 @@ pub(crate) fn snapshot(
         .into_values()
         .chain(dispatch.functions)
         .chain(indirect_functions)
+        .chain(interface_functions)
         .collect();
     for node in &mut functions {
         if node.synthetic && node.callees.is_empty() {
@@ -1167,7 +1194,9 @@ pub(crate) fn snapshot(
             node.runtime_effects = RuntimeEffects::ALL.bits();
         }
     }
-    generics::aggregate(
+    let instance_ids: Vec<String> = functions.iter().map(|f| f.id.clone()).collect();
+    let instance_callees: Vec<Vec<String>> = functions.iter().map(|f| f.callees.clone()).collect();
+    let merged = generics::aggregate(
         &frontend.db.generic_sources,
         &paths,
         &mut functions,
@@ -1245,6 +1274,8 @@ pub(crate) fn snapshot(
         &mut functions,
         &semantic.references,
     );
+    semantic.instances =
+        graph::Instances::new(&instance_ids, &instance_callees, &merged, &functions);
     graph::propagate(&mut functions);
     packages::attach(frontend, &paths, &captured, &mut functions, &mut semantic)?;
     semantic.rust_bridges = frontend

@@ -337,7 +337,7 @@ fn closure_effects_repeated_values_do_not_duplicate_edges() {
         let bucket = snapshot
             .functions
             .iter()
-            .find(|f| f.id == "$indirect-arity:1")
+            .find(|f| f.id.starts_with("$indirect-arity:1:"))
             .unwrap();
         assert_eq!(bucket.callees.len(), 1);
         let uses = snapshot

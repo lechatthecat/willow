@@ -59,6 +59,19 @@ impl Drop for SymbolReadCapture {
         });
     }
 }
+/// Position-free key of one nominal declaration: its file and declared name
+/// (without module qualification or a `$mono$` instance suffix). Reused
+/// bodies keep the keys they were checked with, so the key must not move
+/// when an edit shifts the declaration's offsets.
+fn nominal_key_into(span: Span, declared: &str, key: &mut String) {
+    use std::fmt::Write;
+    let base = declared
+        .split_once("$mono$")
+        .map_or(declared, |(base, _)| base);
+    let base = base.rsplit_once("::").map_or(base, |(_, name)| name);
+    let _ = write!(key, "@{}:{base}", span.file_id.0);
+}
+
 pub(crate) fn record_read(make: impl FnOnce() -> SymbolRead) {
     BODY_READS.with(|reads| {
         if let Some(reads) = reads.borrow_mut().last_mut() {
@@ -402,6 +415,92 @@ mod declaration_rc {
 }
 
 impl SymbolTable {
+    /// The identity of a function type that is equal exactly when the checker
+    /// considers the types the same (see [`Self::type_key`]); `None` for a
+    /// non-function type or a function type without a full key.
+    pub(crate) fn function_type_key(&self, ty: &Type) -> Option<String> {
+        matches!(ty, Type::Fn(..) | Type::Closure(..))
+            .then(|| self.type_key(ty))
+            .flatten()
+    }
+
+    /// A key of `ty` that equal types share: nominal types are keyed by
+    /// declaration without type arguments, so every spelling, import alias,
+    /// `$type$mono$` alias and `Name$mono$` instance of one declaration
+    /// agrees (an instance name carries no arguments to compare). Dropping
+    /// arguments and sharing keys between `fn` and `closure` only merges
+    /// keys. A part without a declaration (a type parameter, `Self`, a
+    /// builtin container, an error or placeholder type) yields `None`, which
+    /// callers treat as matching every key. Linear in the size of the type.
+    pub(crate) fn type_key(&self, ty: &Type) -> Option<String> {
+        let mut key = String::new();
+        self.type_key_into(ty, &mut key)?;
+        Some(key)
+    }
+
+    /// The key of a generic interface instantiation written `I<A, ..>`:
+    /// the interface declaration plus each argument's [`Self::type_key`].
+    /// Interfaces keep this spelling for receivers and `implements` clauses;
+    /// any other spelling has no key.
+    pub(crate) fn interface_instance_key(&self, ty: &Type) -> Option<String> {
+        let Type::Generic(name, args) = ty else {
+            return None;
+        };
+        let interface = self.lookup_interface(name)?;
+        let mut key = String::new();
+        nominal_key_into(interface.declaration_span, &interface.name, &mut key);
+        key.push('<');
+        for arg in args {
+            self.type_key_into(arg, &mut key)?;
+            key.push(',');
+        }
+        key.push('>');
+        Some(key)
+    }
+
+    fn type_key_into(&self, ty: &Type, key: &mut String) -> Option<()> {
+        match ty {
+            Type::I64 => key.push('i'),
+            Type::F64 => key.push('f'),
+            Type::Bool => key.push('b'),
+            Type::String => key.push('s'),
+            Type::Array(element) => {
+                key.push('[');
+                self.type_key_into(element, key)?;
+                key.push(']');
+            }
+            Type::Fn(params, ret) | Type::Closure(params, ret) => {
+                key.push('(');
+                for param in params {
+                    self.type_key_into(param, key)?;
+                    key.push(',');
+                }
+                key.push_str(")->");
+                if **ret == Type::Void {
+                    key.push('v');
+                } else {
+                    self.type_key_into(ret, key)?;
+                }
+            }
+            Type::Named(name) | Type::Generic(name, _) => {
+                let (span, declared) = self
+                    .lookup_class(name)
+                    .map(|info| (info.declaration_span, info.name.as_str()))
+                    .or_else(|| {
+                        self.lookup_enum(name)
+                            .map(|info| (info.declaration_span, info.name.as_str()))
+                    })
+                    .or_else(|| {
+                        self.lookup_interface(name)
+                            .map(|info| (info.declaration_span, info.name.as_str()))
+                    })?;
+                nominal_key_into(span, declared, key);
+            }
+            Type::Void | Type::Never => return None,
+        }
+        Some(())
+    }
+
     /// Current normalized value of one recorded lookup. Evaluated once per
     /// revision/key by the body reuse scheduler, never by scanning the scope.
     pub(crate) fn symbol_value(&self, read: &SymbolRead) -> serde_json::Value {

@@ -1,0 +1,8 @@
+import sim;
+import fuzz;
+
+fn main() {
+    println(sim::run(0).toString());
+    println(fuzz::run(0).toString());
+    println(fuzz::ints(1).toString());
+}

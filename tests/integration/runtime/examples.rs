@@ -1143,6 +1143,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/self_capture.wi", "11\n12\n42\n51\n"),
         ("example/module_downcast_payload/main.wi", "2\n2\n2\n"),
         ("example/impact_override_family/src/main.wi", "3\n"),
+        ("example/closure_impact/src/main.wi", "false\nfalse\ntrue\n"),
         ("example/lock_project_methods/src/main.wi", "1\n7\n"),
         ("example/semantic_cli_minor/src/main.wi", "1\n1\n2\n"),
         (

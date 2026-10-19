@@ -245,8 +245,9 @@ impl StaticInitQueries {
                     None => unknown[node] = true,
                 }
             }
-            for &(caller, mask) in &inputs.indirect.calls {
-                if let Some(&caller) = positions.get(&(unit, caller)) {
+            for call in &inputs.indirect.calls {
+                let mask = call.bit;
+                if let Some(&caller) = positions.get(&(unit, call.caller)) {
                     for bit in 0..64 {
                         if mask & (1 << bit) != 0 {
                             edges[caller].push(arities + bit);

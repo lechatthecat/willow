@@ -1,0 +1,14 @@
+module pq;
+
+pub interface Queue<T> {
+    fn offer(self, x: T) -> bool;
+}
+
+pub class Heap<T> implements Queue<T> {
+    less: closure(T, T) -> bool;
+    pub init(self, less: closure(T, T) -> bool) { self.less = less; }
+    pub fn offer(self, x: T) -> bool { return self.check(x); }
+    fn check(self, x: T) -> bool { let less = self.less; return less(x, x); }
+}
+
+pub fn merge_sort<T>(x: T, less: closure(T, T) -> bool) -> bool { return less(x, x); }

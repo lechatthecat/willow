@@ -1,0 +1,12 @@
+module fuzz;
+import pq::{Heap, Queue, merge_sort};
+import data::Item;
+
+fn feed(q: Queue<Item>, x: Item) -> bool { return q.offer(x); }
+
+pub fn run(k: i64) -> bool {
+    let h = new Heap<Item>(|a: Item, b: Item| a.key < b.key + k);
+    return feed(h, new Item(1)) && merge_sort(new Item(2), |a: Item, b: Item| a.key == b.key + k);
+}
+
+pub fn ints(k: i64) -> bool { return merge_sort(3, |a: i64, b: i64| a < b + k); }

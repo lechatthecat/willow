@@ -2656,12 +2656,15 @@ impl TypeChecker {
                         };
                         return Type::Fn(params, Box::new(ret));
                     }
+                    let arity = params.len();
+                    let ty = Type::Fn(params, Box::new(ret));
                     self.record_function_value(
                         Some(FunctionId::free_from_source_name(name)),
-                        params.len(),
+                        arity,
                         *span,
+                        &ty,
                     );
-                    return Type::Fn(params, Box::new(ret));
+                    return ty;
                 }
                 // Give a specialized error for receiver keywords used outside instance methods.
                 if name == "self" {

@@ -43,6 +43,118 @@ pub struct Impact {
     pub edge_visits: usize,
 }
 
+/// The call graph before generic instantiations were merged into their
+/// source functions. Caller impact walks it, so a function value made for one
+/// instantiation does not reach the callers of another (callers of
+/// `Heap<B>::push` never run `Heap<A>`'s comparator). Empty when nothing was
+/// merged, where the source graph is already exact.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Instances {
+    /// Snapshot function index of each node; `None` for a union of every
+    /// instance of one function, standing in for a source-level edge that no
+    /// instance edge carries (references in never-instantiated templates).
+    pub owners: Vec<Option<u32>>,
+    pub callees: Vec<Vec<u32>>,
+}
+impl Instances {
+    pub fn is_empty(&self) -> bool {
+        self.owners.is_empty()
+    }
+
+    /// `ids`/`callees` describe the graph before `aggregate`, `merged` maps
+    /// each id to its merged id. Linear in nodes + edges: each source edge
+    /// missing from the instance graph adds one union per target function and
+    /// one edge per instance of the caller (a never-instantiated template has
+    /// a single one).
+    pub(super) fn new(
+        ids: &[String],
+        callees: &[Vec<String>],
+        merged: &HashMap<String, String>,
+        functions: &[Function],
+    ) -> Self {
+        if ids.len() == functions.len() {
+            return Self::default();
+        }
+        let function_index: HashMap<&str, u32> = functions
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.id.as_str(), i as u32))
+            .collect();
+        let node_index: HashMap<&str, u32> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i as u32))
+            .collect();
+        let mut owners: Vec<Option<u32>> = ids
+            .iter()
+            .map(|id| {
+                let id = merged.get(id).unwrap_or(id);
+                function_index.get(id.as_str()).copied()
+            })
+            .collect();
+        let mut instances = vec![vec![]; functions.len()];
+        for (node, owner) in owners.iter().enumerate() {
+            if let Some(owner) = owner {
+                instances[*owner as usize].push(node as u32);
+            }
+        }
+        let mut covered = std::collections::HashSet::new();
+        let mut edges: Vec<Vec<u32>> = callees
+            .iter()
+            .enumerate()
+            .map(|(caller, targets)| {
+                targets
+                    .iter()
+                    .filter_map(|target| node_index.get(target.as_str()).copied())
+                    .inspect(|&target| {
+                        if let (Some(a), Some(b)) = (owners[caller], owners[target as usize]) {
+                            covered.insert((a, b));
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        // A function added after aggregation keeps its source edges below.
+        for (function, nodes) in instances.iter_mut().enumerate() {
+            if nodes.is_empty() {
+                nodes.push(owners.len() as u32);
+                owners.push(Some(function as u32));
+                edges.push(vec![]);
+            }
+        }
+        let mut unions = HashMap::new();
+        for (caller, f) in functions.iter().enumerate() {
+            for target in &f.callees {
+                let Some(&target) = function_index.get(target.as_str()) else {
+                    continue;
+                };
+                if !covered.insert((caller as u32, target)) {
+                    continue;
+                }
+                let union = *unions.entry(target).or_insert_with(|| {
+                    owners.push(None);
+                    edges.push(instances[target as usize].clone());
+                    (owners.len() - 1) as u32
+                });
+                for &node in &instances[caller] {
+                    edges[node as usize].push(union);
+                }
+            }
+        }
+        Self {
+            owners,
+            callees: edges,
+        }
+    }
+}
+
+/// Whether `f` is a never-instantiated template: it never runs, so its
+/// incomplete summary cannot hide a caller.
+fn dead_template(f: &Function) -> bool {
+    !f.unresolved.is_empty() && f.unresolved.iter().all(|r| r == generics::UNINSTANTIATED)
+}
+
 pub(super) struct Index<'a> {
     pub by_id: HashMap<&'a str, usize>,
     pub callers: Vec<Vec<usize>>,
@@ -149,68 +261,62 @@ impl Snapshot {
         self.check_revision(revision)?;
         ensure!(limits.max_nodes > 0, "max_nodes must be positive");
         let index = Index::new(&self.functions);
-        let adjacency = match direction {
-            Direction::Callers => &index.callers,
-            Direction::Callees => &index.callees,
-        };
-        let mut distance = vec![usize::MAX; self.functions.len()];
-        let mut graph_distance = vec![0; self.functions.len()];
-        let mut queue = VecDeque::new();
-        let mut count = 0;
-        let mut truncated = false;
+        let instances = &self.semantic.instances;
+        let mut seed_ids = Vec::new();
         for seed in seeds {
-            let &i = index
-                .by_id
-                .get(seed.as_str())
-                .context("unknown FunctionId")?;
-            if distance[i] == usize::MAX {
-                ensure!(count < limits.max_nodes, "seed count exceeds node limit");
-                distance[i] = 0;
-                count += 1;
-                queue.push_back((i, 0));
-            }
+            seed_ids.push(
+                *index
+                    .by_id
+                    .get(seed.as_str())
+                    .context("unknown FunctionId")?,
+            );
         }
-        ensure!(!queue.is_empty(), "at least one seed is required");
-        let mut edge_visits = 0;
-        while let Some((i, queued_distance)) = queue.pop_front() {
-            if queued_distance != distance[i] {
-                continue;
-            }
-            for &j in &adjacency[i] {
-                edge_visits += 1;
-                // Synthetic dispatch unions do not introduce a display level.
-                let cost = usize::from(!self.functions[j].synthetic);
-                let next = distance[i] + cost;
-                if next >= distance[j] {
-                    continue;
-                }
-                if next > limits.max_depth
-                    || (distance[j] == usize::MAX && count == limits.max_nodes)
-                {
-                    truncated = true;
-                    continue;
-                }
-                if distance[j] == usize::MAX {
-                    count += 1;
-                }
-                distance[j] = next;
-                graph_distance[j] = graph_distance[i] + 1;
-                if cost == 0 {
-                    queue.push_front((j, next));
-                } else {
-                    queue.push_back((j, next));
+        let walk = if matches!(direction, Direction::Callers) && !instances.is_empty() {
+            let mut callers = vec![vec![]; instances.owners.len()];
+            for (node, targets) in instances.callees.iter().enumerate() {
+                for &target in targets {
+                    callers[target as usize].push(node);
                 }
             }
-        }
+            let mut by_function = vec![vec![]; self.functions.len()];
+            for (node, owner) in instances.owners.iter().enumerate() {
+                if let Some(owner) = owner {
+                    by_function[*owner as usize].push(node);
+                }
+            }
+            self.walk(
+                &seed_ids,
+                &callers,
+                |f| by_function[f].iter().copied(),
+                |node| instances.owners[node].map(|f| f as usize),
+                limits,
+            )?
+        } else {
+            let adjacency = match direction {
+                Direction::Callers => &index.callers,
+                Direction::Callees => &index.callees,
+            };
+            self.walk(&seed_ids, adjacency, std::iter::once, Some, limits)?
+        };
+        let Walk {
+            distance,
+            graph_distance,
+            truncated,
+            edge_visits,
+        } = walk;
         let mut nodes = Vec::new();
         // An unresolved caller outside the discovered component could still
         // call a seed through a function value. Do not present a closed reverse
         // graph as complete without a points-to proof.
-        let mut unknown = matches!(direction, Direction::Callers)
-            && self.functions.iter().any(|f| !f.synthetic && f.unknown);
+        let callers = matches!(direction, Direction::Callers);
+        let mut unknown = callers
+            && self
+                .functions
+                .iter()
+                .any(|f| !f.synthetic && f.unknown && !dead_template(f));
         for (i, f) in self.functions.iter().enumerate() {
             if distance[i] != usize::MAX {
-                unknown |= f.unknown;
+                unknown |= f.unknown && !(callers && dead_template(f));
                 if !f.synthetic {
                     nodes.push(ImpactNode {
                         identity: f.identity.clone(),
@@ -252,6 +358,88 @@ impl Snapshot {
             edge_visits,
         })
     }
+
+    /// 0-1 BFS over `adjacency` from every node of each seed function.
+    /// Nodes belong to at most one function (`owner`); a function's distance
+    /// is that of its nearest node, and `max_nodes` counts functions. Each
+    /// reachable edge is relaxed at most twice (cost 0 or 1).
+    fn walk<N: Iterator<Item = usize>>(
+        &self,
+        seeds: &[usize],
+        adjacency: &[Vec<usize>],
+        nodes_of: impl Fn(usize) -> N,
+        owner: impl Fn(usize) -> Option<usize>,
+        limits: Limits,
+    ) -> Result<Walk> {
+        let mut node_distance = vec![usize::MAX; adjacency.len()];
+        let mut node_graph_distance = vec![0; adjacency.len()];
+        let mut distance = vec![usize::MAX; self.functions.len()];
+        let mut graph_distance = vec![0; self.functions.len()];
+        let mut queue = VecDeque::new();
+        let mut count = 0;
+        let mut truncated = false;
+        for &seed in seeds {
+            if distance[seed] == usize::MAX {
+                ensure!(count < limits.max_nodes, "seed count exceeds node limit");
+                distance[seed] = 0;
+                count += 1;
+                for node in nodes_of(seed) {
+                    node_distance[node] = 0;
+                    queue.push_back((node, 0));
+                }
+            }
+        }
+        ensure!(!seeds.is_empty(), "at least one seed is required");
+        let mut edge_visits = 0;
+        while let Some((i, queued_distance)) = queue.pop_front() {
+            if queued_distance != node_distance[i] {
+                continue;
+            }
+            for &j in &adjacency[i] {
+                edge_visits += 1;
+                let function = owner(j);
+                // Synthetic dispatch unions do not introduce a display level.
+                let cost = function.map_or(0, |f| usize::from(!self.functions[f].synthetic));
+                let next = node_distance[i] + cost;
+                if next >= node_distance[j] {
+                    continue;
+                }
+                let new = function.is_some_and(|f| distance[f] == usize::MAX);
+                if next > limits.max_depth || (new && count == limits.max_nodes) {
+                    truncated = true;
+                    continue;
+                }
+                count += usize::from(new);
+                node_distance[j] = next;
+                // An instance union is not a call: it adds no graph hop.
+                node_graph_distance[j] = node_graph_distance[i] + usize::from(function.is_some());
+                if let Some(f) = function
+                    && next < distance[f]
+                {
+                    distance[f] = next;
+                    graph_distance[f] = node_graph_distance[j];
+                }
+                if cost == 0 {
+                    queue.push_front((j, next));
+                } else {
+                    queue.push_back((j, next));
+                }
+            }
+        }
+        Ok(Walk {
+            distance,
+            graph_distance,
+            truncated,
+            edge_visits,
+        })
+    }
+}
+
+struct Walk {
+    distance: Vec<usize>,
+    graph_distance: Vec<usize>,
+    truncated: bool,
+    edge_visits: usize,
 }
 
 #[cfg(test)]

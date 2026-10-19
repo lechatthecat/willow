@@ -285,6 +285,7 @@ pub(super) fn restore(
             for (&span, (name, body)) in &source.callables {
                 if !instantiated.contains(&span) {
                     let id = callable(name);
+                    capture.templates.insert(id);
                     capture.declarations.insert(id, vec![(span, *body)]);
                     capture.graph.merge(
                         id,
@@ -303,6 +304,10 @@ pub(super) fn restore(
         }
     }
 }
+/// Unresolved reason of a never-instantiated template: its effects are
+/// unknown, but it never runs, so it cannot call anything at runtime.
+pub(super) const UNINSTANTIATED: &str = "uninstantiated-generic-template";
+
 fn callable(name: &str) -> FunctionId {
     name.rsplit_once("::").map_or_else(
         || FunctionId::free(name),
@@ -324,14 +329,16 @@ fn source_spelling(name: &str) -> String {
         .join("::")
 }
 
+/// Merge instantiations into their source functions. Returns each original
+/// id's merged id, or nothing when no function was renamed.
 pub(super) fn aggregate(
     sources: &HashMap<UnitId, Source>,
     paths: &HashMap<UnitId, String>,
     functions: &mut Vec<Function>,
     semantic: &mut SemanticFacts,
-) {
+) -> HashMap<String, String> {
     if sources.is_empty() && !functions.iter().any(|f| f.name.contains("$mono$")) {
-        return;
+        return HashMap::new();
     }
     let callables: HashMap<_, _> = sources
         .values()
@@ -484,6 +491,7 @@ pub(super) fn aggregate(
         });
     }
     semantic.witnesses = witnesses;
+    ids
 }
 
 /// Source references in a never-instantiated body still form caller edges.

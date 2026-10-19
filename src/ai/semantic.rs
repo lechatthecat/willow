@@ -24,6 +24,8 @@ pub struct SemanticFacts {
     pub compiler_effects: BTreeMap<String, u8>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unresolved_calls: BTreeMap<String, Vec<UnresolvedCall>>,
+    #[serde(default, skip_serializing_if = "graph::Instances::is_empty")]
+    pub instances: graph::Instances,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

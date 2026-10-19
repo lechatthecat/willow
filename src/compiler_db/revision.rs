@@ -1184,6 +1184,38 @@ mod tests {
     }
 
     #[test]
+    fn revision_shifted_type_declaration_keeps_function_value_keys() {
+        // willow-25da.29.57: indirect-call keys must not depend on declaration
+        // offsets, since a reused body keeps the keys it was checked with
+        // while a re-checked one gets fresh keys.
+        let f = Fixture::new();
+        f.write("main.wi", "import sim; fn main() { println(sim::run(0)); }");
+        f.write("data.wi", "pub class Patient { pub id: i64; }");
+        f.write(
+            "pq.wi",
+            "import data::Patient; pub fn check(less: closure(Patient, Patient) -> bool) -> bool { let p = new Patient(1); return less(p, p); }",
+        );
+        let sim = |bias: i64| {
+            format!(
+                "import pq; import data::Patient; fn target(p: Patient) -> bool {{ return p.id > 0; }} fn make(b: i64) -> closure(Patient, Patient) -> bool {{ return |a: Patient, c: Patient| target(a) && b >= {bias}; }} pub fn run(b: i64) -> bool {{ return pq::check(make(b)); }}"
+            )
+        };
+        f.write("sim.wi", &sim(0));
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        assert!(f.compare(&mut warm));
+        // Shift `Patient`, then re-check only `make` (and its lambda).
+        f.write(
+            "data.wi",
+            "\n// moved\n\npub class Patient { pub id: i64; }",
+        );
+        f.write("sim.wi", &sim(1));
+        assert!(f.compare(&mut warm));
+        assert!(warm.reused_bodies > 0);
+        assert!(warm.typechecks > 0);
+    }
+
+    #[test]
     fn revision_whitespace_and_offset_edits_keep_semantic_bodies() {
         let f = Fixture::new();
         f.write(
