@@ -1011,7 +1011,58 @@ impl DirectSession {
             result["shown"] = json!(shown);
             result["truncated"] = json!(shown < total);
         }
+        if command == "effects" {
+            self.spell_lock_targets(&mut result)?;
+        }
         Ok(result)
+    }
+    /// Name each acquired lock by its operand's source text, so evidence reads
+    /// `locked=table: Mutex<..>` without a source lookup. Whitespace collapses
+    /// and long operands are shortened; the location keeps the exact range.
+    /// Linear in the operand text of the reported witnesses.
+    fn spell_lock_targets(&mut self, result: &mut Value) -> Result<()> {
+        const LIMIT: usize = 80;
+        for key in ["effect_evidence", "compiler_witnesses"] {
+            let Some(facts) = result[key].as_array_mut() else {
+                continue;
+            };
+            for fact in facts {
+                let Some(lock) = fact.pointer_mut("/witness/cause/lock") else {
+                    continue;
+                };
+                let target = &lock["target"];
+                let (Some(path), Some(start), Some(end)) = (
+                    target["path"].as_str(),
+                    target["start"].as_u64(),
+                    target["end"].as_u64(),
+                ) else {
+                    continue;
+                };
+                let path = path.to_owned();
+                let text = self
+                    .source(&path)?
+                    .text
+                    .get(usize::try_from(start)?..usize::try_from(end)?)
+                    .context("invalid-location: lock operand is outside its source")?;
+                // A member chain split across lines reads as `a.b`, not `a .b`.
+                let mut expression = String::with_capacity(text.len());
+                for piece in text.split_whitespace() {
+                    if !expression.is_empty()
+                        && !expression.ends_with('.')
+                        && !piece.starts_with(['.', '?'])
+                    {
+                        expression.push(' ');
+                    }
+                    expression.push_str(piece);
+                }
+                if let Some((cut, _)) = expression.char_indices().nth(LIMIT) {
+                    expression.truncate(cut);
+                    expression.push('…');
+                }
+                lock["expression"] = json!(expression);
+            }
+        }
+        Ok(())
     }
     /// Human-only labels. Persisted names (and their IDs, fingerprints and legacy
     /// selectors) retain byte offsets; displayed lambda anchors are selectors too.

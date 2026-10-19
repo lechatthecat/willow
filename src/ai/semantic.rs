@@ -282,6 +282,14 @@ pub(super) fn finish(
                             .ok()
                             .map_or(Value::Null, |l| serde_json::to_value(l).unwrap()),
                     );
+                    // A `lock` statement's operand span becomes a location the
+                    // direct layer spells from source.
+                    if let Some(target) = cause.pointer_mut("/lock/target") {
+                        let span: Span = serde_json::from_value(target.take())?;
+                        *target = location(span)
+                            .ok()
+                            .map_or(Value::Null, |l| serde_json::to_value(l).unwrap());
+                    }
                 }
             }
             result
@@ -687,6 +695,26 @@ impl QuerySession {
             }
         } else {
             json!({"status":if symbols.is_empty(){"unknown"}else{"unanalyzed"}})
+        }
+    }
+    /// Spell each acquired lock's operand type like `type` does, in the module
+    /// of the locking body: one decode and render per lock witness.
+    fn present_lock_types(&self, facts: &mut [Value]) {
+        for fact in facts {
+            let module = fact["witness"]["owner"]
+                .as_str()
+                .and_then(|owner| self.functions.get(owner))
+                .and_then(|&i| self.snapshot.functions[i].identity.as_ref())
+                .map(|identity| identity.module.as_str());
+            let Some(lock) = fact.pointer_mut("/witness/cause/lock") else {
+                continue;
+            };
+            if let Some(ty) = lock
+                .get("type")
+                .and_then(|ty| serde_json::from_value::<Type>(ty.clone()).ok())
+            {
+                lock["type_display"] = json!(self.names.render(&ty, module));
+            }
         }
     }
     /// Module of the function owning expression record `index`.
@@ -1128,9 +1156,15 @@ impl QuerySession {
                     }
                     let mut evidence: Vec<_> = evidence.into_values().collect();
                     evidence.extend(suspension_sites);
+                    self.present_lock_types(&mut evidence);
+                    let mut compiler_witnesses =
+                        self.snapshot.semantic.witnesses.get(&f.id).cloned();
+                    if let Some(facts) = &mut compiler_witnesses {
+                        self.present_lock_types(facts);
+                    }
                     json!({"status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
                         "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence,
-                        "witness":witness, "compiler_witnesses":self.snapshot.semantic.witnesses.get(&f.id),
+                        "witness":witness, "compiler_witnesses":compiler_witnesses,
                         "meaning":"compiler facts and conservative runtime capability bounds; indirect-call bounds cover checked function values in this workspace, not arbitrary values supplied by future callers; external business effects and predicate feasibility are not implied"})
                 }
             },

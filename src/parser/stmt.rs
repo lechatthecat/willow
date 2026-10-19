@@ -298,7 +298,9 @@ impl Parser {
             _ => LockMode::Mutex,
         };
 
+        let target_start = self.current_span();
         let target = self.parse_expr_before_as()?;
+        let target_span = target_start.to(self.previous_span());
         self.expect(TokenKind::As)?;
 
         let mut_span = self.current_span();
@@ -325,6 +327,7 @@ impl Parser {
         Ok(Stmt::Lock(LockStmt {
             mode,
             target,
+            target_span,
             binding,
             binding_span,
             mutable,

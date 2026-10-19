@@ -748,6 +748,7 @@ impl TypeChecker {
                                     operation: "interface dispatch to an imported implementation"
                                         .into(),
                                     kind,
+                                    lock: None,
                                 });
                             self.effect_inputs
                                 .direct
@@ -867,6 +868,7 @@ impl TypeChecker {
                     span,
                     operation: operation.into(),
                     kind,
+                    lock: None,
                 });
         }
         if self.local.lock_depth > 0 {
@@ -875,6 +877,7 @@ impl TypeChecker {
                 span,
                 operation: operation.into(),
                 kind,
+                lock: None,
             });
         }
     }
@@ -1197,6 +1200,7 @@ impl TypeChecker {
                         span,
                         operation: "unavailable waiting evidence".into(),
                         kind: LockEffectKind::SuspendOrBlock,
+                        lock: None,
                     })
             })
             .or_else(|| {
@@ -1205,6 +1209,7 @@ impl TypeChecker {
                     span,
                     operation: "unavailable imported effect evidence".into(),
                     kind: LockEffectKind::SuspendOrBlock,
+                    lock: None,
                 })
             })
     }

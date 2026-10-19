@@ -595,6 +595,10 @@ impl LockMode {
 pub struct LockStmt {
     pub mode: LockMode,
     pub target: Expr,
+    /// Source range of the whole target, from its first token through the
+    /// token before `as`. `target.span()` may name only a trailing token
+    /// (a field access is anchored at its field name).
+    pub target_span: Span,
     pub binding: String,
     pub binding_span: Span,
     pub mutable: bool,

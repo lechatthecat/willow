@@ -1149,6 +1149,71 @@ fn locks_have_suspend_compiler_evidence_after_await_and_in_callers() {
 }
 
 #[test]
+fn lock_evidence_names_locked_value_type_and_mode_end_to_end() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/store.wi"), "module store;\npub enum Level { Low, High(i64) }\npub class Holder {\n    pub cache: Mutex<i64>;\n    pub init(self, cache: Mutex<i64>) { self.cache = cache; }\n}\n").unwrap();
+    let long = "a_lock_operand_name_that_is_deliberately_much_longer_than_the_eighty_character_cap";
+    fs::write(f.0.join("src/main.wi"), format!("import store;\nimport store::Level;\nasync fn plain(m: Mutex<i64>) {{\n    lock m as v {{ }}\n}}\nasync fn reader(read: RwLock<Level>) {{\n    lock read read as v {{ }}\n}}\nasync fn writer(cache: RwLock<Level>) {{\n    lock write cache as mut v {{ v = Level::High(2); }}\n}}\nasync fn field(h: store::Holder) {{\n    lock h\n        .cache as v {{ }}\n}}\nasync fn wide({long}: Mutex<i64>) {{\n    lock {long} as v {{ }}\n}}\nfn relay(m: Mutex<i64>) {{ plain(m); }}\nfn same<T>(x: T) -> T {{ return x; }}\nfn main() {{ println(same(1)); }}\n")).unwrap();
+    // `same<T>` keeps generic presentation active; displays must not depend on it.
+    let truncated = format!("{}…", &long[..80]);
+    for (name, expression, mode, ty, line, column) in [
+        ("plain", "m", "lock", "Mutex<i64>", 4, 10),
+        ("relay", "m", "lock", "Mutex<i64>", 4, 10),
+        ("reader", "read", "lock read", "RwLock<store::Level>", 7, 15),
+        (
+            "writer",
+            "cache",
+            "lock write",
+            "RwLock<store::Level>",
+            10,
+            16,
+        ),
+        ("field", "h.cache", "lock", "Mutex<i64>", 13, 10),
+        ("wide", truncated.as_str(), "lock", "Mutex<i64>", 17, 10),
+    ] {
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+        let evidence = value["result"]["effect_evidence"].as_array().unwrap();
+        let lock = evidence
+            .iter()
+            .map(|e| &e["witness"]["cause"]["lock"])
+            .find(|lock| lock.is_object())
+            .unwrap_or_else(|| panic!("{name}: {value}"));
+        assert_eq!(lock["expression"], expression, "{name}: {lock}");
+        assert_eq!(lock["mode"], mode, "{name}: {lock}");
+        assert_eq!(lock["type_display"], ty, "{name}: {lock}");
+        assert_eq!(lock["target"]["path"], "src/main.wi", "{name}: {lock}");
+        assert_eq!(lock["target"]["line"], line, "{name}: {lock}");
+        assert_eq!(lock["target"]["column"], column, "{name}: {lock}");
+        // `type` keeps the compiler's exact value; only the display is canonical.
+        assert!(lock["type"].is_array(), "{name}: {lock}");
+        // A caller's own witnesses exclude the callee's lock; it arrives via evidence.
+        let witnesses = value["result"]["compiler_witnesses"].to_string();
+        assert_eq!(
+            witnesses.contains(&format!("\"type_display\":\"{ty}\"")),
+            name != "relay",
+            "{name}: {witnesses}"
+        );
+        let human = f.run(&["effects", &format!("main::{name}")]);
+        let text = String::from_utf8_lossy(&human.stdout);
+        let suffix = match mode {
+            "lock read" => " (read)",
+            "lock write" => " (write)",
+            _ => "",
+        };
+        assert!(
+            text.contains(&format!("locked={expression}: {ty}{suffix}")),
+            "{name}: {text}"
+        );
+        let explain = f.run(&["effects", &format!("main::{name}"), "--explain"]);
+        let text = String::from_utf8_lossy(&explain.stdout);
+        assert!(
+            text.contains(&format!("{expression}: {ty}{suffix}")),
+            "{name}: {text}"
+        );
+    }
+}
+
+#[test]
 fn mismatch_diagnostics_keep_dependency_type_names_distinct() {
     let f = Fixture::new();
     fs::create_dir_all(f.0.join("ledger/src")).unwrap();

@@ -3125,6 +3125,39 @@ class ProtectedCtor { prot init(self) {} }
         );
     }
 
+    // Perspective 26: `target_span` covers the whole operand, from its first
+    // token through the token before `as`, in every mode and across lines,
+    // even where `target.span()` names only a trailing field token.
+    #[test]
+    fn lock_parse_26_target_span_covers_the_whole_operand() {
+        for (source, operand) in [
+            ("async fn main() { lock m as value { } }", "m"),
+            (
+                "async fn main() { lock read self.cache as value { } }",
+                "self.cache",
+            ),
+            (
+                "async fn main() { lock write a.b.c as mut value { } }",
+                "a.b.c",
+            ),
+            (
+                "async fn main() { lock next_mutex() as value { } }",
+                "next_mutex()",
+            ),
+            ("async fn main() { lock read as value { } }", "read"),
+            (
+                "async fn main() { lock h\n        .cache as value { } }",
+                "h\n        .cache",
+            ),
+            ("async fn main() { lock items[0] as value { } }", "items[0]"),
+        ] {
+            let lock = first_stmt_lock(source);
+            let span = lock.target_span;
+            assert_eq!(&source[span.start..span.end], operand, "{source}");
+            assert!(span.start >= lock.span.start && span.end < lock.binding_span.start);
+        }
+    }
+
     // Node identity (willow-njot). The checker and the backend key their side
     // tables by `Expr::id`/`Pattern::id` rather than by `Span`, so these pin
     // what an ID promises: unique per parsed node, stable across a clone, and

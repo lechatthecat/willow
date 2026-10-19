@@ -1,0 +1,30 @@
+// Lock evidence names the locked value, its type and the RwLock mode:
+// willow effects tally --source example/lock_effect_targets.wi
+//   ... operation=lock; locked=seen: Mutex<i64>; at ...
+// willow effects peek --source example/lock_effect_targets.wi --explain
+//   ... operation=lock; locked=board.scores: RwLock<i64> (read) at ...
+class Board {
+    pub scores: RwLock<i64>;
+    pub init(self, scores: RwLock<i64>) { self.scores = scores; }
+}
+async fn tally(seen: Mutex<i64>) -> i64 {
+    lock seen as mut count { count = count + 1; }
+    let mut out = 0;
+    lock seen as count { out = count; }
+    return out;
+}
+async fn peek(board: Board) -> i64 {
+    let mut out = 0;
+    lock read board
+        .scores as value { out = value; }
+    return out;
+}
+async fn bump(board: Board) {
+    lock write board.scores as mut value { value = value + 10; }
+}
+async fn main() {
+    println(await tally(Mutex::new(1))); // 2
+    let board = new Board(RwLock::new(5));
+    await bump(board);
+    println(await peek(board)); // 15
+}

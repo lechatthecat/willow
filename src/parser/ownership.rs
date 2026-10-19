@@ -532,7 +532,7 @@ clone_shell_struct!(DeferStmt {
     syntax: [body]
 });
 clone_shell_struct!(LockStmt {
-    metadata: [mode, binding, binding_span, mutable, span],
+    metadata: [mode, target_span, binding, binding_span, mutable, span],
     syntax: [target, body]
 });
 clone_shell_struct!(ForStmt {

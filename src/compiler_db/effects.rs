@@ -616,7 +616,7 @@ fn default_external(target: &FunctionId) -> RuntimeEffects {
 /// One body inventory and one fixpoint. Helper membership is intentionally
 /// narrower than lock membership; masks prevent a constructor, lambda, dispatch
 /// union, or eager async call from broadening the historical helper contract.
-pub(crate) fn solve_unit<N>(
+pub(crate) fn solve_unit<N: std::fmt::Display>(
     program: &Program,
     graph: &CallGraph,
     types: &HashMap<ExprId, Type<N>>,
@@ -756,6 +756,7 @@ pub(crate) fn solve_unit<N>(
                     span,
                     operation: "extern rust".into(),
                     kind: LockEffectKind::Block,
+                    lock: None,
                 },
             })),
         );
@@ -879,6 +880,7 @@ pub(crate) fn solve_unit<N>(
                             span,
                             operation: "lock".into(),
                             kind: LockEffectKind::Suspend,
+                            lock: direct.lock_target.clone().map(Box::new),
                         },
                     })),
                 );
@@ -1176,13 +1178,15 @@ struct DirectBodyEffects {
     checked_span: Option<crate::diagnostics::Span>,
     panic_span: Option<crate::diagnostics::Span>,
     lock_span: Option<crate::diagnostics::Span>,
+    #[serde(default)]
+    lock_target: Option<LockTarget>,
     loop_span: Option<crate::diagnostics::Span>,
     #[serde(default)]
     preemption_loop: bool,
     may_io: bool,
 }
 
-fn scan_direct_effects<N>(
+fn scan_direct_effects<N: std::fmt::Display>(
     id: FunctionId,
     body_id: BodyId,
     body: &Block,
@@ -1206,6 +1210,7 @@ fn scan_direct_effects<N>(
         let mut preemption_loop = false;
         let mut may_io = false;
         let mut lock_span = None;
+        let mut lock_target = None;
         let mut defer_depth = 0;
         let mut walk = AstWalk::new(AstEvent::Block(body));
         while let Some(event) = walk.next() {
@@ -1228,6 +1233,13 @@ fn scan_direct_effects<N>(
                             // Keep an AST-native span: coordinate-only edits
                             // remap cached evidence by exact syntax spans.
                             lock_span = Some(lock.span);
+                            lock_target = Some(LockTarget {
+                                mode: lock.mode.keyword().into(),
+                                target: lock.target_span,
+                                r#type: types
+                                    .get(&lock.target.id())
+                                    .map(|ty| ty.map_names(ToString::to_string)),
+                            });
                         }
                         Stmt::Defer(_) => defer_depth += 1,
                         Stmt::While(_) | Stmt::For(_) if defer_depth == 0 => {
@@ -1252,6 +1264,7 @@ fn scan_direct_effects<N>(
             checked_span: hazards.checked_span,
             panic_span: hazards.panic_span,
             lock_span,
+            lock_target,
             loop_span,
             preemption_loop,
             may_io,
@@ -1506,6 +1519,20 @@ pub(crate) struct LockEffectCause {
     pub(crate) span: Span,
     pub(crate) operation: std::borrow::Cow<'static, str>,
     pub(crate) kind: LockEffectKind,
+    /// The value a `lock` statement acquires, when the wait is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lock: Option<Box<LockTarget>>,
+}
+
+/// The locked operand of a `lock` statement: its source spelling of the mode
+/// (`lock`, `lock read`, `lock write`), operand span and checked type, so
+/// effect evidence can name what is acquired.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LockTarget {
+    pub(crate) mode: std::borrow::Cow<'static, str>,
+    pub(crate) target: Span,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) r#type: Option<Type>,
 }
 
 impl LockEffectKind {
@@ -1817,6 +1844,7 @@ mod tests {
                         span: Span::dummy(),
                         operation: "earlier wait".into(),
                         kind: LockEffectKind::SuspendOrBlock,
+                        lock: None,
                     },
                 )]);
                 let lock_only = solve_unit(
@@ -1917,6 +1945,90 @@ mod tests {
         assert_eq!(relocated[0].lock_span, Some(lock.span));
         assert_ne!(relocated[0].lock_span, cached[0].lock_span);
         assert_eq!(relocated[0].lock_span.unwrap().line, 3);
+        // The operand range moves with its statement.
+        let target = relocated[0].lock_target.as_ref().unwrap();
+        assert_eq!(target.target, lock.target_span);
+        assert_eq!(target.target.line, 3);
+    }
+
+    #[test]
+    fn lock_scan_records_operand_mode_range_and_checked_type() {
+        for (mode, keyword, ty) in [
+            ("", "lock", "Mutex"),
+            ("read ", "lock read", "RwLock"),
+            ("write ", "lock write", "RwLock"),
+        ] {
+            let source = format!(
+                "async fn f(h: Holder) {{ lock {mode}h\n  .cache as value {{}} lock {mode}other as v {{}} }}"
+            );
+            let program = program(&source);
+            let Item::Function(function) = &program.items[0] else {
+                panic!("function");
+            };
+            let Stmt::Lock(first) = &function.body.stmts[0] else {
+                panic!("lock");
+            };
+            let checked = Type::Generic(
+                ty.into(),
+                vec![Type::Generic("Map".into(), vec![Type::I64, Type::I64])],
+            );
+            let types = HashMap::from([(first.target.id(), checked.clone())]);
+            let direct = scan_direct_effects(
+                FunctionId::free("f"),
+                function.body.id,
+                &function.body,
+                &types,
+                None,
+                true,
+            );
+            // The first acquisition is the witness; its operand is the whole
+            // member chain, not only the field token `target.span()` names.
+            let target = direct[0].lock_target.as_ref().unwrap();
+            assert_eq!(target.mode, keyword);
+            assert_eq!(
+                &source[target.target.start..target.target.end],
+                "h\n  .cache"
+            );
+            assert_eq!(target.r#type.as_ref(), Some(&checked));
+            // Serialized cause carries the operand; caches round-trip it.
+            let encoded = serde_json::to_value(&direct).unwrap();
+            assert_eq!(encoded[0]["lock_target"]["mode"], keyword);
+            let restored: Vec<DirectBodyEffects> = serde_json::from_value(encoded).unwrap();
+            assert_eq!(
+                restored[0].lock_target.as_ref().unwrap().target,
+                target.target
+            );
+        }
+        // An untyped operand still names its range; the type is omitted.
+        let program = program("async fn f() { lock m as v {} }");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("function");
+        };
+        let direct = scan_direct_effects(
+            FunctionId::free("f"),
+            function.body.id,
+            &function.body,
+            &HashMap::<ExprId, Type>::new(),
+            None,
+            true,
+        );
+        let target = direct[0].lock_target.as_ref().unwrap();
+        assert!(target.r#type.is_none());
+        let cause = LockEffectCause {
+            is_conservative: false,
+            span: target.target,
+            operation: "lock".into(),
+            kind: LockEffectKind::Suspend,
+            lock: Some(Box::new(target.clone())),
+        };
+        let wire = serde_json::to_value(&cause).unwrap();
+        assert!(wire["lock"].get("type").is_none(), "{wire}");
+        // Non-lock waits serialize without a `lock` member.
+        let wait = LockEffectCause {
+            lock: None,
+            ..cause
+        };
+        assert!(serde_json::to_value(&wait).unwrap().get("lock").is_none());
     }
 
     #[test]
@@ -1989,6 +2101,7 @@ mod tests {
                 span: Span::dummy(),
                 operation: "wait".into(),
                 kind: LockEffectKind::Block,
+                lock: None,
             },
         )]);
         let effects = solve_unit(
@@ -2205,6 +2318,7 @@ mod tests {
                         span: Span::new(offset, offset + 2, 1, offset + 1),
                         operation: "sleep".into(),
                         kind: LockEffectKind::Suspend,
+                        lock: None,
                     },
                 })),
             )

@@ -621,11 +621,13 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
                     .or_else(|| witness["kind"].as_str())
                     .unwrap_or("unavailable")
             );
+            let locked = locked_label(&witness["cause"]);
             for (name, value) in [
                 ("via", &fact["via_function"]),
                 ("target", &witness["target"]),
                 ("owner", &witness["owner"]),
                 ("operation", &witness["cause"]["operation"]),
+                ("locked", &locked),
                 ("reason", fact.get("reason").unwrap_or(&witness["reason"])),
             ] {
                 if let Some(value) = value.as_str() {
@@ -647,12 +649,39 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
     lines.push(result["meaning"].as_str().unwrap_or("").into());
 }
 
+/// `table: Mutex<Map<i64, i64>>` for the value a `lock` statement acquires,
+/// with the RwLock mode (`(read)`/`(write)`) when it is not a Mutex lock.
+fn locked_label(cause: &Value) -> Value {
+    let lock = &cause["lock"];
+    if !lock.is_object() {
+        return Value::Null;
+    }
+    let mut label = match (lock["expression"].as_str(), lock["type_display"].as_str()) {
+        (Some(expression), Some(ty)) => format!("{expression}: {ty}"),
+        (Some(expression), None) => expression.to_owned(),
+        (None, Some(ty)) => ty.to_owned(),
+        (None, None) => "unknown".to_owned(),
+    };
+    if let Some(mode) = lock["mode"].as_str().and_then(|m| m.strip_prefix("lock ")) {
+        label.push_str(&format!(" ({mode})"));
+    }
+    Value::from(label)
+}
+
 // Preserve input order while indexing identities and reasons: expected O(input bytes).
 fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut Vec<String>) {
     use std::collections::{HashMap, HashSet};
     // Facts merged at one site keep one field per key; distinct values of a
     // key are listed together so a merged line never repeats `status=`/`kind=`.
-    const KEYS: [&str; 6] = ["status", "kind", "via", "target", "owner", "operation"];
+    const KEYS: [&str; 7] = [
+        "status",
+        "kind",
+        "via",
+        "target",
+        "owner",
+        "operation",
+        "locked",
+    ];
     #[derive(Default)]
     struct Entry {
         bits: u64,
@@ -703,6 +732,7 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
         }
         let entry = &mut entries[index];
         entry.bits |= fact["effect"].as_u64().unwrap_or(0);
+        let locked = locked_label(cause);
         for (key, value) in [
             &fact["status"],
             &witness["kind"],
@@ -710,6 +740,7 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
             &witness["target"],
             &witness["owner"],
             &cause["operation"],
+            &locked,
         ]
         .into_iter()
         .enumerate()
@@ -1226,6 +1257,76 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn lock_evidence_names_locked_value_type_and_mode() {
+        let at = json!({"path":"arena.wi","line":116,"column":9});
+        let lock = |mode: &str, expression: Option<&str>, ty: Option<&str>| {
+            let mut lock = json!({"mode":mode,"target":at});
+            if let Some(expression) = expression {
+                lock["expression"] = json!(expression);
+            }
+            if let Some(ty) = ty {
+                lock["type_display"] = json!(ty);
+            }
+            json!({"operation":"lock","location":at,"lock":lock})
+        };
+        for (cause, label) in [
+            (
+                lock("lock", Some("seen"), Some("Mutex<Map<i64, i64>>")),
+                "seen: Mutex<Map<i64, i64>>",
+            ),
+            (
+                lock("lock read", Some("self.cache"), Some("RwLock<Cfg>")),
+                "self.cache: RwLock<Cfg> (read)",
+            ),
+            (
+                lock("lock write", Some("h.cache"), Some("RwLock<Cfg>")),
+                "h.cache: RwLock<Cfg> (write)",
+            ),
+            (lock("lock", Some("m"), None), "m"),
+            (lock("lock", None, Some("Mutex<i64>")), "Mutex<i64>"),
+            (lock("lock read", None, None), "unknown (read)"),
+        ] {
+            assert_eq!(locked_label(&cause), json!(label));
+            // Compact and explained renderings both name the value once,
+            // even when runtime and compiler evidence merge at one site.
+            let fact = json!({"effect":4,"status":"compiler-fact",
+                "witness":{"kind":"wait","owner":"arena::play","cause":cause}});
+            let value = json!({"effect_evidence":[fact],"compiler_witnesses":[fact],
+                "runtime_effects":4,"compiler_effects":4,"meaning":""});
+            let mut lines = Vec::new();
+            compact_effect_evidence(&value, "arena::play", false, &mut lines);
+            let line = &lines[1];
+            assert!(
+                line.contains(&format!(
+                    "operation=lock; locked={label}; at arena.wi:116:9"
+                )),
+                "{line}"
+            );
+            assert_eq!(line.matches("locked=").count(), 1, "{line}");
+            let mut lines = Vec::new();
+            effect_lines(&value, false, true, &mut lines);
+            let explained: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("operation=lock"))
+                .collect();
+            assert_eq!(explained.len(), 2, "{lines:?}");
+            assert!(
+                explained
+                    .iter()
+                    .all(|l| l.contains(&format!("; locked={label} at arena.wi:116:9"))),
+                "{lines:?}"
+            );
+        }
+        // Other waits carry no lock and render no `locked=` field.
+        assert!(locked_label(&json!({"operation":"await"})).is_null());
+        let fact = json!({"effect":4,"witness":{"kind":"wait",
+            "cause":{"operation":"await","location":at}}});
+        let mut lines = Vec::new();
+        compact_effect_evidence(&json!({"effect_evidence":[fact]}), "f", false, &mut lines);
+        assert!(!lines.join("\n").contains("locked="), "{lines:?}");
+    }
+
     #[test]
     fn compact_effect_evidence_merges_sites_and_interns_reasons() {
         for count in [1, 16, 64, 256, 1024] {

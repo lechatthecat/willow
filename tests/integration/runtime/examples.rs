@@ -165,6 +165,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/semantic_contract_queries.wi", "3\n"),
         ("example/semantic_scope/main.wi", "19\n"),
         ("example/semantic_local_lock_queries.wi", "1\n2\n"),
+        ("example/lock_effect_targets.wi", "2\n15\n"),
         (
             "example/else_if_chains.wi",
             "A\nB\nC\nF\nfizzbuzz\n1\n2\nfizz\n4\nbuzz\nfizz\n7\n8\nfizz\nbuzz\ndone\n",
@@ -1387,6 +1388,17 @@ fn test_recent_cli_and_language_examples() {
         assert!(ok, "{path} failed to compile or run");
         assert_eq!(out, *expected, "{path} output mismatch");
     }
+}
+
+#[test]
+fn test_lock_effect_targets_example() {
+    let (path, expected) = runnable_example_cases()
+        .iter()
+        .find(|(path, _)| *path == "example/lock_effect_targets.wi")
+        .expect("lock effect targets example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected);
 }
 
 #[test]
