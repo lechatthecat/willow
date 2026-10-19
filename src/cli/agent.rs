@@ -273,6 +273,8 @@ mod tests {
                 } else {
                     assert!(text.contains("willow refs"));
                     assert!(text.contains("willow rename"));
+                    assert!(text.contains("module::Type::member"));
+                    assert!(text.contains("module::function::local"));
                     assert!(!text.contains("Before semantic"));
                     assert!(!text.contains("REVISION"));
                     assert!(!text.contains("queries.json"));
