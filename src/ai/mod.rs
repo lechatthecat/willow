@@ -435,6 +435,30 @@ pub(crate) fn capture(
                                 .union(RuntimeEffects::MAY_PREEMPT)
                                 .bits()
                         }
+                        // An async function lowers `await` of a Task/JoinHandle/
+                        // TaskResult value to `SuspendOp::AwaitTask`: the task
+                        // parks in `willow_frame_await` and reads the terminal
+                        // value through `willow_frame_await_check` (plain await:
+                        // a cancelled task panics) or a `Result` allocation
+                        // (`TaskResult`). No OS thread blocks. `Future<T>`
+                        // values still lower to a blocking runtime call.
+                        Expr::Await(a)
+                            if is_async
+                                && types.get(&a.expr.id()).is_some_and(|ty| {
+                                    crate::semantic::type_checker::awaitable_task_type(ty).is_some()
+                                }) =>
+                        {
+                            ["willow_frame_await", "willow_frame_await_check"]
+                                .into_iter()
+                                .map(|name| {
+                                    willow_abi::runtime_symbol(name)
+                                        .expect("task await ABI")
+                                        .effects()
+                                })
+                                .fold(RuntimeEffects::MAY_PREEMPT, RuntimeEffects::union)
+                                .intersection(RuntimeEffects::ALL)
+                                .bits()
+                        }
                         Expr::Await(_) | Expr::Select(_) | Expr::Print(..) => {
                             RuntimeEffects::ALL.bits()
                         }
@@ -528,10 +552,13 @@ pub(crate) fn capture(
                 if effects != 0 {
                     result.semantic.capability(id, effects, span, reason);
                     if let AstEvent::Expr(Expr::Await(a)) = event {
-                        let operand = types
-                            .get(&a.expr.id())
-                            .map(crate::semantic::type_checker::type_name);
-                        result.semantic.await_type(id, span, operand.as_deref());
+                        let operand = types.get(&a.expr.id()).map(awaited_type_name);
+                        result.semantic.await_type(
+                            id,
+                            span,
+                            operand.as_deref(),
+                            effects & RuntimeEffects::MAY_BLOCK.bits() == 0,
+                        );
                     }
                 }
             }
@@ -601,6 +628,21 @@ pub(crate) fn capture(
         *result.direct.entry(id).or_default() |= bits;
     }
     result
+}
+
+/// Spell an awaited operand type for AI output. A task with no value is
+/// written `Task<()>` (likewise `JoinHandle<()>`/`TaskResult<()>`), the unit
+/// spelling users annotate, instead of the checker's internal `void` payload.
+fn awaited_type_name(ty: &Type) -> String {
+    match ty {
+        Type::Generic(name, args)
+            if matches!(args.as_slice(), [Type::Void])
+                && crate::semantic::type_checker::awaitable_task_type(ty).is_some() =>
+        {
+            format!("{name}<()>")
+        }
+        _ => crate::semantic::type_checker::type_name(ty),
+    }
 }
 
 pub(crate) fn snapshot(

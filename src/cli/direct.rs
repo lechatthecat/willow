@@ -611,11 +611,16 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
 // Preserve input order while indexing identities and reasons: expected O(input bytes).
 fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut Vec<String>) {
     use std::collections::{HashMap, HashSet};
+    // Facts merged at one site keep one field per key; distinct values of a
+    // key are listed together so a merged line never repeats `status=`/`kind=`.
+    const KEYS: [&str; 6] = ["status", "kind", "via", "target", "owner", "operation"];
     #[derive(Default)]
     struct Entry {
         bits: u64,
-        details: Vec<String>,
-        seen: HashSet<String>,
+        fields: [Vec<String>; KEYS.len()],
+        location: Option<String>,
+        reasons: Vec<usize>,
+        seen: HashSet<(usize, String)>,
     }
     let mut identities = HashMap::new();
     let mut entries: Vec<Entry> = Vec::new();
@@ -659,26 +664,25 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
         }
         let entry = &mut entries[index];
         entry.bits |= fact["effect"].as_u64().unwrap_or(0);
-        for (name, value) in [
-            ("status", &fact["status"]),
-            ("kind", &witness["kind"]),
-            ("via", &fact["via_function"]),
-            ("target", &witness["target"]),
-            ("owner", &witness["owner"]),
-            ("operation", &cause["operation"]),
-        ] {
-            if let Some(value) = value.as_str() {
-                let detail = format!("{name}={value}");
-                if entry.seen.insert(detail.clone()) {
-                    entry.details.push(detail);
-                }
+        for (key, value) in [
+            &fact["status"],
+            &witness["kind"],
+            &fact["via_function"],
+            &witness["target"],
+            &witness["owner"],
+            &cause["operation"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(value) = value.as_str()
+                && entry.seen.insert((key, value.to_string()))
+            {
+                entry.fields[key].push(value.to_string());
             }
         }
-        if cause["location"].is_object() {
-            let detail = format!("at {}", location(&cause["location"]));
-            if entry.seen.insert(detail.clone()) {
-                entry.details.push(detail);
-            }
+        if entry.location.is_none() && cause["location"].is_object() {
+            entry.location = Some(location(&cause["location"]));
         }
         for reason in [fact["reason"].as_str(), witness["reason"].as_str()]
             .into_iter()
@@ -688,9 +692,8 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
                 reasons.push(reason);
                 reasons.len()
             });
-            let detail = format!("reason=[{id}]");
-            if entry.seen.insert(detail.clone()) {
-                entry.details.push(detail);
+            if entry.seen.insert((KEYS.len(), id.to_string())) {
+                entry.reasons.push(id);
             }
         }
     }
@@ -701,10 +704,18 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
         entries.len().min(50)
     };
     for entry in &entries[..shown] {
+        let mut details: Vec<String> = KEYS
+            .iter()
+            .zip(&entry.fields)
+            .filter(|(_, values)| !values.is_empty())
+            .map(|(key, values)| format!("{key}={}", values.join(", ")))
+            .collect();
+        details.extend(entry.location.iter().map(|at| format!("at {at}")));
+        details.extend(entry.reasons.iter().map(|id| format!("reason=[{id}]")));
         lines.push(format!(
             "  {}: {}",
             effect_names(&Value::from(entry.bits)),
-            entry.details.join("; ")
+            details.join("; ")
         ));
     }
     if shown < entries.len() {
@@ -1215,6 +1226,51 @@ mod tests {
         assert_eq!(text.matches("inner").count(), 1);
         assert_eq!(text.matches("reason=[1]; reason=[2]").count(), 4);
         assert_eq!(text.matches("missing-witness").count(), 2);
+    }
+
+    #[test]
+    fn compact_effect_evidence_lists_each_key_once_per_merged_site() {
+        let at = json!({"path":"m.wi","line":2,"column":5});
+        let runtime = json!({"effect":8,"status":"conservative-bound","via_function":"m::f",
+            "witness":{"kind":"runtime-capability","reason":"parks",
+                "cause":{"operation":"await","location":at}}});
+        let wait = json!({"effect":4,"status":"compiler-fact","via_function":"m::f",
+            "witness":{"kind":"wait","owner":"m::f","reason":"parks",
+                "cause":{"operation":"await","location":at}}});
+        for (first, second) in [(&runtime, &wait), (&wait, &runtime)] {
+            let value =
+                json!({"effect_evidence":[first, second, first],"compiler_witnesses":[second]});
+            let mut lines = Vec::new();
+            compact_effect_evidence(&value, "m::f", false, &mut lines);
+            assert_eq!(lines.len(), 3, "{lines:?}");
+            assert_eq!(lines[0], "Evidence for m::f: 1");
+            let line = &lines[1];
+            assert!(
+                line.starts_with("  may-suspend, may-preempt: status="),
+                "{line}"
+            );
+            for key in [
+                "status=",
+                "kind=",
+                "via=",
+                "owner=",
+                "operation=",
+                " at ",
+                "reason=[1]",
+            ] {
+                assert_eq!(line.matches(key).count(), 1, "{key}: {line}");
+            }
+            assert!(
+                line.contains("status=conservative-bound, compiler-fact")
+                    || line.contains("status=compiler-fact, conservative-bound"),
+                "{line}"
+            );
+            assert!(
+                line.ends_with("operation=await; at m.wi:2:5; reason=[1]"),
+                "{line}"
+            );
+            assert_eq!(lines[2], "  [1] parks");
+        }
     }
 
     #[test]

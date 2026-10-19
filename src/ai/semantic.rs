@@ -165,7 +165,26 @@ impl Captured {
         }
         witnesses.sort_by_key(|w| w["effect"].as_u64().unwrap());
     }
-    pub fn await_type(&mut self, function: FunctionId, span: Span, operand: Option<&str>) {
+    /// Attach the awaited operand type and explain the await's bound. `parks`
+    /// is true when the async lowering is known to suspend the task instead of
+    /// blocking an OS thread.
+    pub fn await_type(
+        &mut self,
+        function: FunctionId,
+        span: Span,
+        operand: Option<&str>,
+        parks: bool,
+    ) {
+        let operand_name = operand.unwrap_or("an unresolved operand type");
+        let reason = if parks {
+            format!(
+                "In an async function, await of {operand_name} lowers to a scheduler suspension: the task parks until the awaited operation completes; no OS thread blocks."
+            )
+        } else {
+            format!(
+                "Conservative await bound for {operand_name}; waiting may park or block depending on the selected lowering. This summary does not establish which path executes."
+            )
+        };
         if let Some(witnesses) = self.witnesses.get_mut(&function) {
             for entry in witnesses {
                 let witness = &mut entry["witness"];
@@ -173,10 +192,7 @@ impl Captured {
                     && witness["cause"]["span"] == json!(span)
                 {
                     witness["awaited_type"] = json!(operand);
-                    witness["reason"] = json!(format!(
-                        "Conservative await bound for {}; waiting may park or block depending on the selected lowering. This summary does not establish which path executes.",
-                        operand.unwrap_or("an unresolved operand type")
-                    ));
+                    witness["reason"] = json!(reason);
                 }
             }
         }

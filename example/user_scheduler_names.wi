@@ -1,0 +1,21 @@
+// A program may declare its own `async fn sleep` or `async fn yield`. Such a
+// function returns a Task like any other async fn, so `await sleep(n)` runs the
+// user function instead of the runtime scheduler builtin. Awaiting a Task inside
+// an async function parks the task; it does not block an OS thread.
+
+async fn sleep(n: i64) -> i64 {
+    println("user sleep");
+    return n * 2;
+}
+
+async fn yield() {
+    println("user yield");
+}
+
+async fn main() {
+    let doubled = await sleep(21);
+    println(doubled);
+    await yield();
+    let stored = sleep(5);
+    println(await stored);
+}

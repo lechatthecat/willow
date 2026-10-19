@@ -1212,6 +1212,153 @@ fn await_block_bounds_explain_lowering_without_blaming_locks() {
 }
 
 #[test]
+fn async_task_await_parks_instead_of_blocking() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import std::collections::Array;\n\
+         class Svc { pub async fn run(self) -> i64 { return 3; } pub async fn twice(self) -> i64 { let t = n(); return 2 * await t; } }\n\
+         async fn n() -> i64 { return 1; }\n\
+         async fn u() { }\n\
+         async fn s() -> String { return \"x\"; }\n\
+         async fn b() -> bool { return true; }\n\
+         async fn a1() -> i64 { let t = n(); return await t; }\n\
+         async fn a2() { let t = u(); await t; }\n\
+         async fn a3() { let t: Task<()> = u(); await t; }\n\
+         async fn a4() -> i64 { return await n(); }\n\
+         async fn a5() { let t = n(); let r = await t.result(); }\n\
+         async fn a6() -> i64 { let h: JoinHandle<i64> = n(); return await h; }\n\
+         async fn a7(t: Task<i64>) -> i64 { return await t; }\n\
+         async fn a8() -> i64 { let t = n(); return 1 + await t; }\n\
+         async fn a9() -> i64 { let mut x = 0; for i in 0..3 { x = x + await n(); } return x; }\n\
+         async fn a10() -> String { return await s(); }\n\
+         async fn a11(c: Svc) -> i64 { return await c.run(); }\n\
+         async fn a12() -> i64 { let t = n(); if (await t > 0) { return 1; } return 0; }\n\
+         async fn a13() -> i64 { let x = await n(); let y = await n(); return x + y; }\n\
+         async fn a14() { await a1(); }\n\
+         async fn a15() -> i64 { let mut x = 0; while (x < 3) { x = x + await n(); } return x; }\n\
+         async fn a16() -> i64 { let t = n(); match 1 { 1 => { return await t; }, _ => { return 0; } } }\n\
+         async fn a17() -> bool { return await b(); }\n\
+         async fn a18() -> i64 { let ts: Array<Task<i64>> = [n(), n()]; return await ts[0]; }\n\
+         async fn a19() -> bool { let t = b(); return true && await t; }\n\
+         async fn a20() -> i64 { let t = n(); let r = await t.result(); return match r { Ok(v) => v, Err(_) => 0 }; }\n\
+         fn relay() { a1(); }\n\
+         async fn printed() -> i64 { let t = n(); println(\"x\"); return await t; }\n\
+         async fn future(f: Future<i64>) -> i64 { return await f; }\n\
+         async fn timer() { let t = sleep(0); await t; }\n\
+         fn main() {}\n",
+    )
+    .unwrap();
+    let check = f.run(&["check"]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let parks = E::MAY_SUSPEND.union(E::MAY_PREEMPT).bits();
+    let excluded = E::MAY_BLOCK.union(E::NO_PREEMPT_REGION).bits();
+    let await_witnesses = |value: &Value| -> Vec<Value> {
+        ["effect_evidence", "compiler_witnesses"]
+            .iter()
+            .flat_map(|key| value["result"][key].as_array().cloned().unwrap_or_default())
+            .filter(|w| w["witness"]["cause"]["operation"] == "await")
+            .collect()
+    };
+    for (name, awaited) in [
+        ("a1", "Task<i64>"),
+        ("a2", "Task<()>"),
+        ("a3", "Task<()>"),
+        ("a4", "Task<i64>"),
+        ("a5", "TaskResult<i64>"),
+        ("a6", "Task<i64>"),
+        ("a7", "Task<i64>"),
+        ("a8", "Task<i64>"),
+        ("a9", "Task<i64>"),
+        ("a10", "Task<String>"),
+        ("a11", "Task<i64>"),
+        ("a12", "Task<i64>"),
+        ("a13", "Task<i64>"),
+        ("a14", "Task<i64>"),
+        ("a15", "Task<i64>"),
+        ("a16", "Task<i64>"),
+        ("a17", "Task<bool>"),
+        ("a18", "Task<i64>"),
+        ("a19", "Task<bool>"),
+        ("a20", "TaskResult<i64>"),
+        ("Svc::twice", "Task<i64>"),
+    ] {
+        let selector = format!("main::{name}");
+        let value = f.json(&["effects", &selector, "--explain"], 0);
+        let runtime = value["result"]["runtime_effects"].as_u64().unwrap();
+        assert_eq!(runtime & u64::from(excluded), 0, "{name}: {value}");
+        assert_eq!(
+            runtime & u64::from(parks),
+            u64::from(parks),
+            "{name}: {value}"
+        );
+        let witnesses = await_witnesses(&value);
+        assert!(!witnesses.is_empty(), "{name}: {value}");
+        for w in &witnesses {
+            assert_ne!(w["effect"], E::MAY_BLOCK.bits(), "{name}: {value}");
+            assert_eq!(w["witness"]["awaited_type"], awaited, "{name}: {value}");
+            let reason = w["witness"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains(&format!("await of {awaited}"))
+                    && reason.contains("parks")
+                    && reason.contains("no OS thread blocks"),
+                "{name}: {value}"
+            );
+        }
+        let output = f.run(&["effects", &selector]);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("may-block"), "{name}: {text}");
+        for line in text.lines().filter(|l| l.contains("operation=await")) {
+            assert_eq!(line.matches("status=").count(), 1, "{name}: {text}");
+            assert_eq!(line.matches("kind=").count(), 1, "{name}: {text}");
+        }
+    }
+    // Creating a task in a synchronous caller does not run the await.
+    let relay = f.json(&["effects", "main::relay"], 0);
+    assert_eq!(
+        relay["result"]["runtime_effects"].as_u64().unwrap() & u64::from(excluded),
+        0,
+        "{relay}"
+    );
+    // A blocking print elsewhere in the body keeps its own evidence; the await
+    // is still not blamed for blocking.
+    let printed = f.json(&["effects", "main::printed", "--explain"], 0);
+    assert_ne!(
+        printed["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
+        0,
+        "{printed}"
+    );
+    assert!(
+        await_witnesses(&printed)
+            .iter()
+            .all(|w| w["effect"] != E::MAY_BLOCK.bits()),
+        "{printed}"
+    );
+    // Future<T> values lower to a blocking runtime call and stay conservative.
+    for (name, awaited) in [("future", "Future<i64>"), ("timer", "Future<void>")] {
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+        let block = await_witnesses(&value)
+            .into_iter()
+            .find(|w| w["effect"] == E::MAY_BLOCK.bits())
+            .unwrap_or_else(|| panic!("{name}: {value}"));
+        assert_eq!(block["witness"]["awaited_type"], awaited, "{value}");
+        assert!(
+            block["witness"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("does not establish which path executes"),
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn transposed_typos_rank_declarations_above_lambdas_and_skip_imports() {
     let f = Fixture::new();
     let lambdas: String = (0..6)
@@ -2672,22 +2819,26 @@ fn effect_witness_precision_literals_scheduler_and_unknown_origins() {
 }
 
 #[test]
-fn effect_witness_precision_shadowed_scheduler_names_stay_conservative() {
+fn effect_witness_precision_shadowed_scheduler_names_are_task_awaits() {
     use willow_compiler::semantic::effects::RuntimeEffects as E;
     let f = Fixture::new();
+    // A user `sleep` is not the scheduler builtin: awaiting it awaits its Task.
     fs::write(
         f.0.join("src/main.wi"),
         "async fn sleep(n: i64) {}\nasync fn custom() { await sleep(1); }\nasync fn main() {}\n",
     )
     .unwrap();
     let value = f.json(&["effects", "main::custom", "--explain"], 0);
-    let block = value["result"]["effect_evidence"]
-        .as_array()
-        .unwrap()
+    let evidence = value["result"]["effect_evidence"].as_array().unwrap();
+    assert!(
+        evidence.iter().all(|e| e["effect"] != E::MAY_BLOCK.bits()),
+        "{value}"
+    );
+    let suspend = evidence
         .iter()
-        .find(|e| e["effect"] == E::MAY_BLOCK.bits())
+        .find(|e| e["witness"]["cause"]["operation"] == "await")
         .unwrap();
-    assert_eq!(block["witness"]["cause"]["operation"], "await", "{value}");
+    assert_eq!(suspend["witness"]["awaited_type"], "Task<()>", "{value}");
 }
 
 #[test]

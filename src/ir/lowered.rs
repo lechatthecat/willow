@@ -1824,15 +1824,18 @@ impl Builder {
                 return None;
             }
             HirExprKind::Await { inner } => {
+                // Only the runtime builtins return `Future<void>`; a user async
+                // fn named `sleep`/`yield` returns a `Task` and is awaited as one.
+                let builtin = builtin_types::unary_arg(&inner.ty, B::Future).is_some();
                 if let HirExprKind::Call { callee, args } = &inner.kind {
                     match (callee.name().as_ref(), args.as_slice()) {
-                        ("sleep", [millis]) if value.ty == Type::Void => {
+                        ("sleep", [millis]) if builtin && value.ty == Type::Void => {
                             let millis = self.lower_operand_before_suspend(millis)?;
                             let name = self.synthetic_name("sleep_millis");
                             let millis = self.push_synth_let(&name, false, millis);
                             SuspendOp::Sleep { millis }
                         }
-                        ("yield", []) if value.ty == Type::Void => SuspendOp::Yield,
+                        ("yield", []) if builtin && value.ty == Type::Void => SuspendOp::Yield,
                         _ => {
                             let awaited = self.lower_operand_before_suspend(inner)?;
                             let name = self.synthetic_name("task");

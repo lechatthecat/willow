@@ -29,6 +29,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/interface_effect_evidence/main.wi", "7\n"),
         ("example/gc_old_cycle.wi", "499500\n499500\n499500\n"),
         ("example/generic_nominal_bindings.wi", "17\n79\n80\n"),
+        ("example/generic_receiver_type_queries.wi", "1\n3\n9\n5\n"),
         ("example/standalone_generic_aliases/main.wi", "17\n"),
         (
             "example/assignable_representations.wi",
@@ -657,6 +658,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "hits 800\ntotal 1600\nboxed 1600\n",
         ),
         ("example/spawn_await.wi", "9\n16\n25\n42\n"),
+        (
+            "example/user_scheduler_names.wi",
+            "user sleep\n42\nuser yield\nuser sleep\n10\n",
+        ),
         ("example/static_inheritance.wi", "base\nbase\n3\nok\n"),
         ("example/static_members.wi", "3\n25\n40\n42\n"),
         ("example/static_mut.wi", "0\n10\n42\nstart\ndone\n"),

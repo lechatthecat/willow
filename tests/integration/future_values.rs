@@ -159,3 +159,53 @@ fn future_value_all_producers_avoid_legacy_handles() {
         "{calls:?}"
     );
 }
+
+// A user async fn named `sleep`/`yield` returns a `Task`, so a direct await
+// must run that function instead of the runtime scheduler builtin.
+#[test]
+fn future_value_user_scheduler_names_await_their_task() {
+    // Covers call shapes, arities, return types, await positions, a method
+    // named `sleep`, and builtin `sleep`/`yield` beside user functions.
+    const USER_SLEEP: &str = "async fn sleep(n: i64) { println(\"user sleep\"); }\n";
+    let cases: [(&str, String, &str); 25] = [
+        ("direct", format!("{USER_SLEEP}async fn main() {{ await sleep(1); println(\"ok\"); }}\n"), "user sleep\nok\n"),
+        ("stored", format!("{USER_SLEEP}async fn main() {{ let t = sleep(1); await t; println(\"ok\"); }}\n"), "user sleep\nok\n"),
+        ("annotated", format!("{USER_SLEEP}async fn main() {{ let t: Task<()> = sleep(1); await t; println(\"ok\"); }}\n"), "user sleep\nok\n"),
+        ("yield", "async fn yield() { println(\"user yield\"); }\nasync fn main() { await yield(); println(\"ok\"); }\n".to_string(), "user yield\nok\n"),
+        ("value", "async fn sleep(n: i64) -> i64 { return n * 2; }\nasync fn main() { println(await sleep(21)); }\n".to_string(), "42\n"),
+        ("zero_args", "async fn sleep() { println(\"user sleep\"); }\nasync fn main() { await sleep(); println(\"ok\"); }\n".to_string(), "user sleep\nok\n"),
+        ("two_args", "async fn sleep(a: i64, b: i64) -> i64 { return a + b; }\nasync fn main() { println(await sleep(1, 2)); }\n".to_string(), "3\n"),
+        ("yield_arg", "async fn yield(n: i64) -> i64 { return n + 1; }\nasync fn main() { println(await yield(4)); }\n".to_string(), "5\n"),
+        ("yield_value", "async fn yield() -> String { return \"y\"; }\nasync fn main() { println(await yield()); }\n".to_string(), "y\n"),
+        ("join_handle", "async fn sleep(n: i64) -> i64 { return n; }\nasync fn main() { let h: JoinHandle<i64> = sleep(7); println(await h); }\n".to_string(), "7\n"),
+        ("array_element", "import std::collections::Array;\nasync fn sleep(n: i64) -> i64 { return n; }\nasync fn main() { let ts: Array<Task<i64>> = [sleep(1), sleep(2)]; println(await ts[1] + await ts[0]); }\n".to_string(), "3\n"),
+        ("string_param", "async fn sleep(s: String) -> String { return s + \"!\"; }\nasync fn main() { println(await sleep(\"hi\")); }\n".to_string(), "hi!\n"),
+        ("result", "async fn sleep(n: i64) -> i64 { return n; }\nasync fn main() { match await sleep(9).result() { Ok(v) => println(v), Err(_) => println(\"cancelled\") } }\n".to_string(), "9\n"),
+        ("condition", "async fn sleep(n: i64) -> bool { return n > 0; }\nasync fn main() { if (await sleep(1)) { println(\"yes\"); } else { println(\"no\"); } }\n".to_string(), "yes\n"),
+        ("while", "async fn sleep(n: i64) -> i64 { return n; }\nasync fn main() { let mut x = 0; while (x < 3) { x = x + await sleep(1); } println(x); }\n".to_string(), "3\n"),
+        ("for", "async fn sleep(n: i64) -> i64 { return n; }\nasync fn main() { let mut x = 0; for i in 0..4 { x = x + await sleep(i); } println(x); }\n".to_string(), "6\n"),
+        ("match_arm", "async fn sleep(n: i64) -> i64 { return n; }\nasync fn main() { match 1 { 1 => { println(await sleep(5)); }, _ => { println(0); } } }\n".to_string(), "5\n"),
+        ("binary", "async fn sleep(n: i64) -> i64 { return n; }\nasync fn main() { println(await sleep(2) + await sleep(3)); }\n".to_string(), "5\n"),
+        ("transitive", format!("{USER_SLEEP}async fn outer() {{ await sleep(1); println(\"outer\"); }}\nasync fn main() {{ await outer(); }}\n"), "user sleep\nouter\n"),
+        ("sync_caller", "async fn sleep(n: i64) -> i64 { return n; }\nasync fn run() -> i64 { return await sleep(8); }\nfn main() { let t = run(); }\n".to_string(), ""),
+        ("method", "class Svc { pub async fn sleep(self, n: i64) -> i64 { return n + 10; } }\nasync fn main() { let s = new Svc(); println(await s.sleep(1)); }\n".to_string(), "11\n"),
+        ("builtin_beside_user", "async fn nap() { println(\"nap\"); }\nasync fn main() { await sleep(1); await nap(); await yield(); println(\"ok\"); }\n".to_string(), "nap\nok\n"),
+        ("builtin_stored", "async fn main() { let t = sleep(1); await t; await yield(); println(\"ok\"); }\n".to_string(), "ok\n"),
+        ("both_user", format!("{USER_SLEEP}async fn yield() {{ println(\"user yield\"); }}\nasync fn main() {{ await sleep(1); await yield(); await sleep(2); println(\"ok\"); }}\n"), "user sleep\nuser yield\nuser sleep\nok\n"),
+        ("repeat", format!("{USER_SLEEP}async fn main() {{ for i in 0..3 {{ await sleep(i); }} println(\"ok\"); }}\n"), "user sleep\nuser sleep\nuser sleep\nok\n"),
+    ];
+    for (name, source, expected) in &cases {
+        let (out, ok) = compile_and_run(source);
+        assert!(
+            ok,
+            "{name}
+{source}
+{out}"
+        );
+        assert_eq!(
+            &out, expected,
+            "{name}
+{source}"
+        );
+    }
+}
