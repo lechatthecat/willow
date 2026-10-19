@@ -838,6 +838,143 @@ fn contract_impact_and_effects_explain_bodyless_declarations() {
 }
 
 #[test]
+fn impact_groups_definitions_direct_and_indirect_callers() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "interface Ev { fn score(self, n: i64) -> i64; }\nclass A implements Ev { pub fn score(self, n: i64) -> i64 { return n; } }\nclass B implements Ev { pub fn score(self, n: i64) -> i64 { return new A().score(n) + 1; } }\nclass C implements Ev { pub fn score(self, n: i64) -> i64 { return 3; } }\nclass Other { pub fn score(self, n: i64) -> i64 { return 9; } }\nfn dispatch(e: Ev) -> i64 { return e.score(1); }\nfn concrete() -> i64 { return new C().score(2); }\nfn both(e: Ev) -> i64 { return e.score(3) + dispatch(e); }\nfn via<T>(x: T, e: Ev) -> i64 { return e.score(4); }\nfn recurse(e: Ev, k: i64) -> i64 { if k == 0 { return e.score(5); } return recurse(e, k - 1); }\nfn apply(f: closure(i64) -> i64) -> i64 { return f(6); }\nfn hop1(e: Ev) -> i64 { return dispatch(e) + concrete(); }\nfn hop2(e: Ev) -> i64 { return hop1(e); }\nfn unrelated() -> i64 { return new Other().score(7); }\nfn main() {\n    let e: Ev = new B();\n    println(hop2(e));\n    println(both(e));\n    println(via(1, e));\n    println(via(true, e));\n    println(recurse(e, 2));\n    println(apply(|n: i64| -> i64 { return e.score(n); }));\n    println(unrelated());\n}\n",
+    )
+    .unwrap();
+    let listing = |args: &[&str]| {
+        let output = f.run(args);
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let mut groups: Vec<(String, Vec<String>)> = vec![];
+        for line in text
+            .lines()
+            .skip_while(|line| !line.starts_with("Affected functions:"))
+            .skip(1)
+            .take_while(|line| !line.starts_with("total="))
+        {
+            match line.strip_prefix("  ") {
+                Some(name) => groups.last_mut().unwrap().1.push(name.into()),
+                None => groups.push((line.into(), vec![])),
+            }
+        }
+        (text, groups)
+    };
+    let names = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // Interface method, any implementation and its own selector agree: the
+    // implementations are definitions; dispatch, concrete-receiver, generic,
+    // recursive and lambda bodies are direct; reach only through those is
+    // indirect; a same-named unrelated method is absent.
+    for selected in ["main::Ev::score", "main::A::score", "main::C::score"] {
+        let (text, groups) = listing(&["impact", selected]);
+        assert_eq!(
+            groups,
+            [
+                (
+                    "Definitions (the method, its overrides and implementations): 3".into(),
+                    names(&["main::A::score", "main::B::score", "main::C::score"])
+                ),
+                (
+                    "Direct callers: 6".into(),
+                    names(&[
+                        "main::both",
+                        "main::concrete",
+                        "main::dispatch",
+                        "main::recurse",
+                        "main::via",
+                        "lambda src/main.wi:22:19",
+                    ])
+                ),
+                (
+                    "Indirect callers (only through another affected function): 4".into(),
+                    names(&["main::apply", "main::hop1", "main::main", "main::hop2"])
+                ),
+            ],
+            "{selected}: {text}"
+        );
+        assert!(
+            !text.contains("Other") && !text.contains("unrelated"),
+            "{text}"
+        );
+        // JSON marks the same relation on every node, consistent with distance.
+        let result = f.json(&["impact", selected], 0);
+        for node in result["result"]["impact"]["nodes"].as_array().unwrap() {
+            let expected = match node["distance"].as_u64().unwrap() {
+                0 => "definition",
+                1 => "direct-caller",
+                _ => "indirect-caller",
+            };
+            assert_eq!(node["relation"], expected, "{result}");
+        }
+    }
+    // A plain function has a single definition; a caller that is both direct
+    // and indirect (`both`) is listed once, as direct.
+    let (text, groups) = listing(&["impact", "main::dispatch"]);
+    assert_eq!(
+        groups,
+        [
+            ("Definition: 1".into(), names(&["main::dispatch"])),
+            (
+                "Direct callers: 2".into(),
+                names(&["main::both", "main::hop1"])
+            ),
+            (
+                "Indirect callers (only through another affected function): 2".into(),
+                names(&["main::hop2", "main::main"])
+            ),
+        ],
+        "{text}"
+    );
+    // A same-named method of an unrelated class is its own family.
+    let (text, groups) = listing(&["impact", "main::Other::score"]);
+    assert_eq!(groups.len(), 3, "{text}");
+    assert_eq!(
+        groups[0].0,
+        "Definitions (the method, its overrides and implementations): 1"
+    );
+    assert_eq!(
+        groups[1],
+        ("Direct callers: 1".into(), names(&["main::unrelated"])),
+        "{text}"
+    );
+    // Truncation keeps whole-group counts in each header.
+    let callers: String = (0..60)
+        .map(|i| format!("fn c{i:02}() -> i64 {{ return leaf(); }}\n"))
+        .collect();
+    fs::write(
+        f.0.join("src/main.wi"),
+        format!("fn leaf() -> i64 {{ return 1; }}\n{callers}fn main() {{ println(c00()); }}\n"),
+    )
+    .unwrap();
+    let (text, groups) = listing(&["impact", "main::leaf"]);
+    assert_eq!(groups[0].0, "Definition: 1", "{text}");
+    assert_eq!(groups[1].0, "Direct callers: 60", "{text}");
+    assert_eq!(groups[1].1.len(), 49, "{text}");
+    assert_eq!(groups.len(), 2, "{text}");
+    assert!(text.contains("total=62 shown=50 truncated=true"), "{text}");
+    let (text, groups) = listing(&["impact", "main::leaf", "--all"]);
+    assert_eq!(groups[1].1.len(), 60, "{text}");
+    assert_eq!(
+        groups[2],
+        (
+            "Indirect callers (only through another affected function): 1".into(),
+            names(&["main::main"])
+        ),
+        "{text}"
+    );
+    // No caller: only the definition group is printed.
+    let (text, groups) = listing(&["impact", "main::main"]);
+    assert_eq!(
+        groups,
+        [("Definition: 1".into(), names(&["main::main"]))],
+        "{text}"
+    );
+}
+
+#[test]
 fn class_method_impact_includes_override_family_and_callers() {
     let f = Fixture::new();
     fs::write(
@@ -895,6 +1032,7 @@ fn class_method_impact_includes_override_family_and_callers() {
                 .is_some_and(|s| s.ends_with("::label"))
         }) {
             assert_eq!(node["distance"], 0, "{result}");
+            assert_eq!(node["relation"], "definition", "{result}");
         }
     }
     for (selected, excluded) in [
@@ -2577,7 +2715,7 @@ fn references_sort_source_positions_and_show_roles() {
     );
     assert_eq!(
         f.json(&["refs", "order::Order::value"], 0)["result"]["coverage"],
-        "compiler-resolved; override and implementation declarations are excluded; use impact to include their executable bodies"
+        "compiler-resolved; override and implementation declarations are excluded; impact lists them with direct and indirect callers"
     );
 }
 
@@ -4404,9 +4542,8 @@ fn rename_conflicts_name_owner_and_impact_labels_lambdas_in_order() {
     let listed: Vec<_> = text
         .lines()
         .skip_while(|line| !line.starts_with("Affected functions:"))
-        .skip(1)
-        .take_while(|line| line.starts_with("  "))
-        .map(str::trim)
+        .take_while(|line| !line.starts_with("total="))
+        .filter_map(|line| line.strip_prefix("  "))
         .collect();
     assert_eq!(
         listed,

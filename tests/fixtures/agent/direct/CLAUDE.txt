@@ -28,6 +28,8 @@ Use effects or impact when the question needs transitive behavior or cross-file 
 - Effects: `willow effects module::function`.
 - Impact: `willow impact module::function`.
 
+Impact lists definitions (for a method: its overrides and implementations), then direct callers, then indirect callers. When a signature changes, the definitions and direct callers are the code to edit.
+
 Use query/edit --help for advanced batch integrations. Keep project context consistent (including --project where required), use compiler-returned IDs and UTF-8 byte offsets, and reject stale results. Query the current source again after changes. Never bypass stale checks.
 
 <!-- END WILLOW MANAGED -->

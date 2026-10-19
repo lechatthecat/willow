@@ -480,7 +480,40 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
     }
     if let Some(nodes) = result["impact"]["nodes"].as_array() {
         lines.push(format!("Affected functions: {}", nodes.len()));
+        // Nodes arrive sorted by distance; label each relation group once so
+        // the code to edit for a signature change (definitions plus direct
+        // callers) reads without a second query.
+        let method = result["symbol"]["kind"] == "method";
+        let mut counts = [0usize; 3];
+        let group = |node: &Value| match node["relation"].as_str() {
+            Some("definition") => Some(0),
+            Some("direct-caller") => Some(1),
+            Some("indirect-caller") => Some(2),
+            _ => None,
+        };
+        for node in nodes {
+            if let Some(g) = group(node) {
+                counts[g] += 1;
+            }
+        }
+        let mut current = None;
         for node in nodes.iter().take(if options.all { usize::MAX } else { 50 }) {
+            if let Some(g) = group(node)
+                && current != Some(g)
+            {
+                current = Some(g);
+                lines.push(format!(
+                    "{}: {}",
+                    match g {
+                        0 if method =>
+                            "Definitions (the method, its overrides and implementations)",
+                        0 => "Definition",
+                        1 => "Direct callers",
+                        _ => "Indirect callers (only through another affected function)",
+                    },
+                    counts[g]
+                ));
+            }
             lines.push(format!(
                 "  {}{}",
                 if node["kind"] == "lambda" {

@@ -134,6 +134,9 @@ pub fn render_agent_instructions(agent: Agent, caps: AgentCapabilities) -> Strin
                 text.push_str(&format!("- {label}: `{command}`.\n"));
             }
         }
+        if caps.direct_impact.is_some() {
+            text.push_str("\nImpact lists definitions (for a method: its overrides and implementations), then direct callers, then indirect callers. When a signature changes, the definitions and direct callers are the code to edit.\n");
+        }
         text.push_str("\nUse query/edit --help for advanced batch integrations. Keep project context consistent (including --project where required), use compiler-returned IDs and UTF-8 byte offsets, and reject stale results. Query the current source again after changes. Never bypass stale checks.\n");
         text.push_str(&format!("\n{END}\n"));
         return text;

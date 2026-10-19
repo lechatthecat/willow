@@ -938,6 +938,13 @@ impl DirectSession {
                     if lambda {
                         node["kind"] = json!("lambda");
                     }
+                    // Seeds are the definitions whose signature changes; distance 1
+                    // bodies call one of them directly (dispatch unions add no hop).
+                    node["relation"] = json!(match node["distance"].as_u64() {
+                        Some(0) => "definition",
+                        Some(1) => "direct-caller",
+                        _ => "indirect-caller",
+                    });
                 }
                 // Within one distance, named functions sort by selector and
                 // lambdas by source position (not by opaque id hash).
@@ -969,7 +976,7 @@ impl DirectSession {
         if matches!(command, "refs" | "references") && resolved["symbol"]["kind"] == "method" {
             let coverage = result["coverage"].as_str().unwrap_or("compiler-resolved");
             result["coverage"] = json!(format!(
-                "{coverage}; override and implementation declarations are excluded; use impact to include their executable bodies"
+                "{coverage}; override and implementation declarations are excluded; impact lists them with direct and indirect callers"
             ));
         }
         if command == "symbol" && result["symbol"].get("type_display").is_none() {
