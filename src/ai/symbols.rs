@@ -123,6 +123,11 @@ pub struct Reference {
     pub target: String,
     pub location: Location,
     pub role: String,
+    /// A member call's callee type as seen through its receiver (generic
+    /// owner type arguments substituted). Absent when the target's declared
+    /// type already answers, or when instantiations disagree at this token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ty: Option<Type>,
 }
 
 /// Source owners, captured before module bodies are offloaded. Inherited/default
@@ -606,6 +611,7 @@ pub(super) fn finish(
                             target,
                             location,
                             role: "variant".into(),
+                            ty: None,
                         },
                     );
                 }
@@ -629,16 +635,35 @@ pub(super) fn finish(
                     target.clone(),
                     role.to_owned(),
                 );
-                references.insert(
-                    key,
-                    Reference {
-                        identity: None,
-                        target,
-                        location,
-                        role: role.to_owned(),
-                    },
-                );
+                // One source token checked in several generic instances keeps
+                // a receiver type only when every instance agrees on it.
+                match references.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(Reference {
+                            identity: None,
+                            target,
+                            location,
+                            role: role.to_owned(),
+                            ty: r.ty.clone(),
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let existing = entry.get_mut();
+                        if existing.ty != r.ty {
+                            existing.ty = None;
+                        }
+                    }
+                }
             }
+        }
+    }
+    // A receiver type equal to the declaration's (any non-generic owner) adds
+    // nothing over the target symbol; keep the snapshot free of the copy.
+    for reference in references.values_mut() {
+        if reference.ty.is_some()
+            && symbols.get(&reference.target).map(|s| &s.ty) == Some(&reference.ty)
+        {
+            reference.ty = None;
         }
     }
     (

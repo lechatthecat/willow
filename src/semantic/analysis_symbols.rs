@@ -25,6 +25,10 @@ pub(crate) struct Reference {
     pub target: Declaration,
     pub role: String,
     pub last: bool,
+    /// A member call's callee type with the receiver's type arguments
+    /// substituted; the declaration keeps its generic signature.
+    #[serde(default)]
+    pub ty: Option<Type>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MemberReference {
@@ -78,6 +82,7 @@ impl Facts {
             target,
             role: role.into(),
             last,
+            ty: None,
         });
     }
 }

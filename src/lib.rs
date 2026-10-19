@@ -906,6 +906,8 @@ fn run_frontend_revision(
             if inputs.capture_analysis {
                 let mut metadata = ai::generics::Source::capture(&source);
                 metadata.logical_types = checkers[index].generics.logical_types.clone();
+                metadata.nominal_aliases =
+                    std::mem::take(&mut checkers[index].generics.nominal_aliases);
                 metadata.symbols = std::mem::take(&mut checkers[index].generics.source_symbols);
                 generic_sources.insert(module.id, metadata);
             }
@@ -917,6 +919,8 @@ fn run_frontend_revision(
         if inputs.capture_analysis {
             let mut metadata = ai::generics::Source::capture(&body);
             metadata.logical_types = checkers[entry].generics.logical_types.clone();
+            metadata.nominal_aliases =
+                std::mem::take(&mut checkers[entry].generics.nominal_aliases);
             metadata.symbols = std::mem::take(&mut checkers[entry].generics.source_symbols);
             generic_sources.insert(module::UnitId::ENTRY, metadata);
         }

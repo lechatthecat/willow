@@ -7,6 +7,7 @@ use crate::semantic::analysis_symbols::{Declaration, Facts};
 pub(crate) struct Source {
     pub imports: Vec<ImportDecl>,
     pub logical_types: HashMap<String, Type>,
+    pub nominal_aliases: HashMap<String, String>,
     pub symbols: Facts,
     written: HashMap<(u32, usize), String>,
     pub(super) declarations: Vec<Declaration>,
@@ -78,6 +79,7 @@ impl Source {
         Self {
             imports: program.imports.clone(),
             logical_types: HashMap::new(),
+            nominal_aliases: HashMap::new(),
             symbols: Facts::default(),
             written,
             owners: symbols::owners_of(items.iter().copied()),
@@ -132,6 +134,14 @@ pub(super) fn restore(
                 .or_insert(Some(ty));
         }
     }
+    // Alias names hash their module-qualified identity, the recorded value, so
+    // units cannot disagree and one global index serves every unit, including
+    // instances checked outside the alias's creator.
+    let aliases: HashMap<&str, &str> = sources
+        .values()
+        .flat_map(|s| &s.nominal_aliases)
+        .map(|(alias, name)| (alias.as_str(), name.as_str()))
+        .collect();
     let imports: HashMap<_, _> = sources
         .values()
         .flat_map(|s| &s.imports)
@@ -146,10 +156,20 @@ pub(super) fn restore(
     let owners: HashMap<_, _> = sources.values().flat_map(|s| &s.owners).cloned().collect();
     for (&unit, capture) in captures.iter_mut() {
         if let Some(source) = sources.get(&unit) {
-            capture.symbols.extend(source.symbols.clone());
+            // Template facts go first: a template-body declaration then keeps
+            // its source type (`T`) instead of whichever instance registered
+            // first, since instances of one template may disagree.
+            let mut symbols = source.symbols.clone();
+            symbols.extend(std::mem::take(&mut capture.symbols));
+            capture.symbols = symbols;
         }
         let normalize = |ty: &Type| {
-            ty.substitute_names(|name| {
+            ty.map_names(|name| {
+                aliases
+                    .get(name.as_str())
+                    .map_or_else(|| name.clone(), |&source| source.to_owned())
+            })
+            .substitute_names(|name| {
                 sources
                     .get(&unit)
                     .and_then(|s| s.logical_types.get(name))
@@ -208,6 +228,9 @@ pub(super) fn restore(
                     source_spelling(&r.target.name),
                 ));
             restore(&mut r.target);
+            if let Some(ty) = &mut r.ty {
+                *ty = normalize(ty);
+            }
             if generic_callable && r.role == "member" {
                 r.role = "call".into();
             }
@@ -686,6 +709,7 @@ mod tests {
                             identity: None,
                             target: "f0".into(),
                             role: "call".into(),
+                            ty: None,
                             location: Location {
                                 path: path.into(),
                                 start: i * 10 + 5,
@@ -698,6 +722,7 @@ mod tests {
                             identity: None,
                             target: "f1".into(),
                             role: "call".into(),
+                            ty: None,
                             location: Location {
                                 path: path.into(),
                                 start: i * 10 + 9,

@@ -848,6 +848,7 @@ mod tests {
                         target: format!("s{i}"),
                         identity: None,
                         role: "member".into(),
+                        ty: None,
                         location: Location {
                             path: absolute.clone(),
                             start: spans[if shape == "shared" { i + 1 } else { 2 * i + 1 }].start,

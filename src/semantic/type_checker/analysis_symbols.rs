@@ -279,9 +279,22 @@ impl TypeChecker {
         &mut self,
         name: &str,
         kind: &str,
+        span: Span,
+        declaration: Span,
+        args: &[CallArg],
+    ) {
+        self.record_typed_method_use(name, kind, span, declaration, args, None);
+    }
+    /// `signature` is the callee's parameters and return as seen through this
+    /// receiver, so generic owners report their instantiated member type.
+    pub(super) fn record_typed_method_use(
+        &mut self,
+        name: &str,
+        kind: &str,
         mut span: Span,
         declaration: Span,
         args: &[CallArg],
+        signature: Option<(&[Type], &Type)>,
     ) {
         if let Some(arg) = args.first() {
             span.end = arg.span.start;
@@ -298,6 +311,10 @@ impl TypeChecker {
                 "member",
                 true,
             );
+            if let Some((params, result)) = signature {
+                self.analysis_symbols.references.last_mut().unwrap().ty =
+                    Some(Type::Fn(params.to_vec(), Box::new(result.clone())));
+            }
         }
     }
     /// A successfully checked member call that recorded no source method is a

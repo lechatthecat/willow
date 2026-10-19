@@ -108,6 +108,9 @@ pub(crate) struct Generics {
     pub imported_types: HashMap<String, Rc<InstantiationType>>,
     pub emitted: Vec<Item>,
     pub logical_types: HashMap<String, Type>,
+    /// Instantiation nominal aliases (`$type$mono$...`) to the module-qualified
+    /// identity they hash, so analysis can spell an instance's types.
+    pub nominal_aliases: HashMap<String, String>,
     pub active_class_depth: usize,
     pub calls: HashMap<ExprId, String>,
     pub function_paths: HashMap<String, String>,
@@ -911,7 +914,13 @@ impl TypeChecker {
                     // Carry every nominal argument through the shared type
                     // table instead of leaving an owner-local bare name.
                     let canonical = self.generic_nominal_identity(identity, declaration_span);
-                    let alias = symbol("$type", &[Type::Named(canonical)]);
+                    let alias = symbol("$type", &[Type::Named(canonical.clone())]);
+                    // The alias hashes `canonical`, so every unit records the
+                    // same module-qualified value for it.
+                    self.generics
+                        .nominal_aliases
+                        .entry(alias.clone())
+                        .or_insert(canonical);
                     classes.entry(alias.clone()).or_insert_with(|| {
                         self.generics
                             .registry

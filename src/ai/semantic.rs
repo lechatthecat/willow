@@ -390,6 +390,9 @@ pub struct QuerySession {
     symbol_positions: HashMap<String, Vec<(usize, usize, String)>>,
     references: HashMap<String, Vec<usize>>,
     positions: HashMap<String, Vec<Segment>>,
+    /// Callee tokens with a receiver-instantiated member type, per file,
+    /// sorted by `(start, end)`; values index `semantic.references`.
+    typed_calls: HashMap<String, Vec<(usize, usize, usize)>>,
     callees: Vec<Vec<usize>>,
     dispatch_callers: Vec<Vec<usize>>,
     indirect_references: HashMap<Type, Vec<usize>>,
@@ -580,6 +583,18 @@ impl QuerySession {
             .collect();
         let callees = graph.callees;
         let packages = packages::PackageIndex::new(&snapshot);
+        let mut typed_calls: HashMap<String, Vec<(usize, usize, usize)>> = HashMap::new();
+        for (i, r) in snapshot.semantic.references.iter().enumerate() {
+            if r.role == "call" && r.ty.is_some() && r.location.start < r.location.end {
+                typed_calls
+                    .entry(r.location.path.clone())
+                    .or_default()
+                    .push((r.location.start, r.location.end, i));
+            }
+        }
+        for calls in typed_calls.values_mut() {
+            calls.sort_unstable();
+        }
         let names = display::TypeNames::new(&snapshot);
         Ok(Self {
             packages,
@@ -591,6 +606,7 @@ impl QuerySession {
             symbol_references,
             symbol_positions,
             positions,
+            typed_calls,
             callees,
             dispatch_callers,
             indirect_references,
@@ -654,6 +670,29 @@ impl QuerySession {
         } else {
             json!({"status":if symbols.is_empty(){"unknown"}else{"unanalyzed"}})
         }
+    }
+    /// Module of the function owning expression record `index`.
+    fn expression_module(&self, index: usize) -> Option<&str> {
+        self.functions
+            .get(&self.snapshot.semantic.expressions[index].function)
+            .and_then(|&i| self.snapshot.functions[i].identity.as_ref())
+            .map(|i| i.module.as_str())
+    }
+    /// A member callee token answers with its receiver-instantiated type
+    /// (`fn() -> Option<Patient>` through `PQueue<Patient>`), not the
+    /// declaration's generic signature. Callee tokens never nest, so the
+    /// nearest token starting at or before `byte` is the only candidate.
+    fn typed_call_at(&self, file: &str, byte: usize, module: Option<&str>) -> Option<Value> {
+        let calls = self.typed_calls.get(file)?;
+        let p = calls.partition_point(|&(start, _, _)| start <= byte);
+        let &(_, end, i) = calls.get(p.checked_sub(1)?)?;
+        if byte >= end {
+            return None;
+        }
+        let r = &self.snapshot.semantic.references[i];
+        let ty = r.ty.as_ref()?;
+        let display = self.names.render(ty, module);
+        Some(json!({"status":"ok","type":ty,"type_display":display,"location":r.location}))
     }
     pub fn revision(&self) -> &str {
         &self.snapshot.revision
@@ -741,6 +780,16 @@ impl QuerySession {
                 // let) can lie inside an expression; report its declared type
                 // unless the symbol itself is untyped.
                 if let Some(write) = segment.declared {
+                    // The instantiated type is spelled in the calling body,
+                    // whose enclosing expression names its module.
+                    let caller = segment
+                        .expression
+                        .flatten()
+                        .map(|i| self.expression_module(i));
+                    if !write && let Some(typed) = self.typed_call_at(&file, byte, caller.flatten())
+                    {
+                        return json!({"revision":self.revision(),"result":typed});
+                    }
                     let declared = self.declared_type_at(&file, byte);
                     if write || matches!(declared["status"].as_str(), Some("ok" | "ambiguous")) {
                         return json!({"revision":self.revision(),"result":declared});
@@ -754,11 +803,7 @@ impl QuerySession {
                 };
                 let e = &self.snapshot.semantic.expressions[index];
                 if let Some(ty) = &e.ty {
-                    let module = self
-                        .functions
-                        .get(&e.function)
-                        .and_then(|&i| self.snapshot.functions[i].identity.as_ref())
-                        .map(|i| i.module.as_str());
+                    let module = self.expression_module(index);
                     let display = self.names.render(ty, module);
                     json!({"status":"ok","type":ty,"type_display":display,"location":e.location})
                 } else {

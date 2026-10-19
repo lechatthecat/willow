@@ -1727,7 +1727,14 @@ impl TypeChecker {
                 Type::Void
             }
             Some((owner, mi)) => {
-                self.record_method_use(method_name, "method", span, mi.declaration_span, args);
+                self.record_typed_method_use(
+                    method_name,
+                    "method",
+                    span,
+                    mi.declaration_span,
+                    args,
+                    Some((&mi.params, &mi.return_type)),
+                );
                 if mi.is_static {
                     self.push(
                         Diagnostic::new(
@@ -1841,7 +1848,14 @@ impl TypeChecker {
             return Type::Void;
         };
 
-        self.record_method_use(method_name, "method", span, m.declaration_span, args);
+        self.record_typed_method_use(
+            method_name,
+            "method",
+            span,
+            m.declaration_span,
+            args,
+            Some((&m.params, &m.return_type)),
+        );
         if m.params.len() != args.len() {
             self.push(
                 Diagnostic::new(

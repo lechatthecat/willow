@@ -1,0 +1,79 @@
+// `willow type` on member calls through generic receivers reports the
+// receiver-instantiated member type, and locals inside generic bodies never
+// show compiler-internal instantiation aliases (willow-25da.29.55).
+
+interface PQueue<T> {
+    fn pop(self) -> Option<T>;
+    fn push(self, value: T);
+    fn peek_or(self, fallback: T) -> T {
+        let found = self.pop();
+        return match found {
+            Some(v) => v,
+            None => fallback,
+        };
+    }
+}
+
+class Heap<T> implements PQueue<T> {
+    item: Option<T>;
+    less: closure(T, T) -> bool;
+    pub init(self, less: closure(T, T) -> bool) {
+        self.item = None;
+        self.less = less;
+    }
+    pub fn pop(self) -> Option<T> {
+        let less = self.less;
+        let current = self.item;
+        self.item = None;
+        return current;
+    }
+    pub fn push(self, value: T) {
+        let less = self.less;
+        let current = self.item;
+        self.item = match current {
+            Some(old) => if less(old, value) { Some(old) } else { Some(value) },
+            None => Some(value),
+        };
+    }
+    pub fn pair(self, other: T) -> Pair<T, T> {
+        let held = self.pop();
+        return new Pair<T, T>(other, other);
+    }
+}
+
+class Pair<A, B> {
+    pub first: A;
+    pub second: B;
+    pub fn swap(self) -> Pair<B, A> {
+        return new Pair<B, A>(self.second, self.first);
+    }
+}
+
+class Patient {
+    pub id: i64;
+}
+
+fn drain<T>(queue: PQueue<T>, fallback: T) -> T {
+    let next = queue.pop();
+    return queue.peek_or(fallback);
+}
+
+fn main() {
+    let heap = new Heap<Patient>(|a: Patient, b: Patient| a.id < b.id);
+    heap.push(new Patient(2));
+    let mut waiting: PQueue<Patient> = heap;
+    waiting.push(new Patient(1));
+    let first = waiting.pop().unwrap();
+    let direct = heap.pop();
+    let numbers = new Heap<i64>(|a: i64, b: i64| a < b);
+    numbers.push(7);
+    let pair = numbers.pair(3);
+    let swapped = pair.swap();
+    let nested = new Heap<Option<Patient>>(|a: Option<Patient>, b: Option<Patient>| true);
+    let maybe = nested.pop();
+    let fallback = drain(waiting, new Patient(9));
+    println(first.id);
+    println(swapped.first);
+    println(fallback.id);
+    println(numbers.peek_or(5));
+}
