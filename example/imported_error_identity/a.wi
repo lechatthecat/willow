@@ -1,0 +1,6 @@
+module a;
+pub class E1 { pub msg: String; }
+pub fn get(x: i64) -> Result<i64, E1> {
+    if x < 0 { return Err(new E1("neg")); }
+    return Ok(x);
+}

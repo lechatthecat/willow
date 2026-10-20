@@ -351,3 +351,6 @@ mod imported_generic_callable;
 
 #[path = "integration/async_frame_safepoints.rs"]
 mod async_frame_safepoints;
+
+#[path = "integration/imported_error_identity.rs"]
+mod imported_error_identity;

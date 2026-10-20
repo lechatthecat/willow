@@ -92,3 +92,9 @@ AGENTS.md
 /docs/audits/willow-jz15.115/*
 !/docs/audits/willow-jz15.115/audit.md
 !/docs/audits/willow-jz15.115/count_lir.py
+
+# Public imported-error identity audit and focused reproducer.
+!/docs/audits/willow-jz15.114/
+/docs/audits/willow-jz15.114/*
+!/docs/audits/willow-jz15.114/audit.md
+!/docs/audits/willow-jz15.114/verify.sh

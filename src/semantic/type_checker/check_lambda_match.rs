@@ -66,7 +66,11 @@ impl TypeChecker {
         let return_ty = self.local.current_return_type.clone();
         match builtin_types::binary_args(&return_ty, B::Result) {
             Some((_, return_err)) => {
-                if *return_err == err_ty || *return_err == Type::Void || err_ty == Type::Void {
+                // Imported aliases name the same declaration, without implying subtyping.
+                if self.same_type_identity(return_err, &err_ty)
+                    || *return_err == Type::Void
+                    || err_ty == Type::Void
+                {
                     // ok_ty is the success value type
                     ok_ty
                 } else if self.err_converts_via_into(&err_ty, return_err) {

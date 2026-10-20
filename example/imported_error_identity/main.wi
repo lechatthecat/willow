@@ -1,0 +1,9 @@
+import a::{E1, get};
+fn once(x: i64) -> Result<i64, E1> {
+    let v = get(x)?;
+    return Ok(v);
+}
+fn main() {
+    println(match once(3) { Ok(v) => v, Err(e) => 0 });
+    println(match once(-1) { Ok(v) => "unexpected", Err(e) => e.msg });
+}
