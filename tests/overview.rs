@@ -397,6 +397,55 @@ fn typo_suggestions_correct_each_qualified_segment() {
 }
 
 #[test]
+fn dotted_member_selectors_suggest_the_qualified_member_path() {
+    let f = Fixture::new(true);
+    f.source("src/board.wi", "pub enum Dir { Up, Down } pub class Board { pub ep: i64; pub init(self, ep: i64) { self.ep = ep; } pub fn eps(self) -> i64 { return self.ep; } pub fn step(self) -> i64 { return self.ep + 1; } } ");
+    // Field, method and variant: every selector command rejects the dotted
+    // spelling and suggests the canonical member path.
+    for (dotted, member) in [
+        ("board::Board.ep", "board::Board::ep"),
+        ("Board.step", "board::Board::step"),
+        ("board::Dir.Up", "board::Dir::Up"),
+    ] {
+        assert_eq!(f.json(&["symbol", member], 0)["status"], "ok", "{member}");
+        for command in [
+            vec!["refs", dotted],
+            vec!["symbol", dotted],
+            vec!["type", dotted],
+            vec!["effects", dotted],
+            vec!["impact", dotted],
+            vec!["rename", dotted, "renamed", "--dry-run"],
+        ] {
+            let v = f.json(&command, 1);
+            assert_eq!(v["status"], "unknown", "{command:?}: {v}");
+            assert_eq!(v["result"]["suggestions"][0], member, "{command:?}: {v}");
+        }
+    }
+    for (dotted, member) in [
+        ("Board.ep", "board::Board::ep"),
+        ("board::Board.step", "board::Board::step"),
+        ("Dir.Down", "board::Dir::Down"),
+        ("Board.stpe", "board::Board::step"),
+    ] {
+        let v = f.json(&["refs", dotted], 1);
+        assert_eq!(v["result"]["suggestions"][0], member, "{dotted}: {v}");
+    }
+    // A nonexistent member still offers the type's own members, not the type.
+    let v = f.json(&["refs", "board::Board.zzz"], 1);
+    let suggestions = v["result"]["suggestions"].as_array().unwrap();
+    assert!(
+        !suggestions.is_empty()
+            && suggestions
+                .iter()
+                .all(|s| s.as_str().unwrap().starts_with("board::Board::")),
+        "{v}"
+    );
+    let out = f.run(&["refs", "board::Board.ep"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("suggestion: board::Board::ep"), "{text}");
+}
+
+#[test]
 fn overview_preserves_async_and_generic_declaration_details() {
     let f = Fixture::new(false);
     f.source("src/main.wi", "interface Source<T, U> { fn get(self) -> T; } enum Pair<T, U> { Left(T), Right(U) } async fn editor() {} class Worker { pub async fn run(self) -> i64 { return 1; } } fn main() {} ");

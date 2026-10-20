@@ -583,11 +583,20 @@ impl DirectSession {
         {
             hints.entry(hint.path).or_default().insert(hint.start);
         }
-        let segments: Vec<_> = selector
+        // Selectors separate members only with `::`. A `Type.member` spelling
+        // never resolves, but its suggestions rank the `Type::member` path.
+        let suggestion_selector = if located.is_none() && selector.contains('.') {
+            std::borrow::Cow::Owned(selector.replace('.', "::"))
+        } else {
+            std::borrow::Cow::Borrowed(selector)
+        };
+        let segments: Vec<_> = suggestion_selector
             .split("::")
             .map(|s| (s, s.chars().collect::<Vec<_>>()))
             .collect();
-        let selector_scope = selector.rsplit_once("::").map(|(scope, _)| scope);
+        let selector_scope = suggestion_selector
+            .rsplit_once("::")
+            .map(|(scope, _)| scope);
         for symbol in self
             .session
             .snapshot
