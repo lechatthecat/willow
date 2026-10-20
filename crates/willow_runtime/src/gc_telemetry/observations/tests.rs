@@ -225,6 +225,8 @@ fn enabled_runtime_lifecycle_assist_unwind_and_lock_capture() {
                         .contains("gc_observation_checkpoint")
                 );
                 assert!(text.contains("\"aborted\":1"));
+                assert!(text.contains("\"role\":1,\"op\":3"));
+                assert!(text.contains("\"role\":1,\"op\":4"));
                 assert!(
                     !text.contains("\"op\":5"),
                     "safepoint polls must not be events"
@@ -245,14 +247,28 @@ fn enabled_runtime_lifecycle_assist_unwind_and_lock_capture() {
             let _s = Span::new(Kind::Assist);
             panic!("injected unwind");
         });
-        let mutex = HeapMutex::new(());
+        let mutex = GcMutex::new(());
         drop(mutex.lock().unwrap());
     })
     .join()
     .unwrap();
+    // The same role scope used by worker_loop must cover registration,
+    // progress and retirement, including unwind restoration.
+    std::thread::spawn(|| {
+        assert_eq!(ROLE.get(), 0);
+        {
+            let _role = MarkerRole::new();
+            let _registration = crate::gc::MutatorRegistration::new();
+            crate::gc::willow_gc_safepoint();
+            assert_eq!(event(7, 0).role, 1);
+        }
+        assert_eq!(ROLE.get(), 0);
+    })
+    .join()
+    .unwrap();
     let after = snapshot();
-    assert_eq!(after.registered - before.registered, 1);
-    assert_eq!(after.unregistered - before.unregistered, 1);
+    assert_eq!(after.registered - before.registered, 2);
+    assert_eq!(after.unregistered - before.unregistered, 2);
     assert!(after.progress - before.progress >= 2 * CAPACITY as u64);
     assert!(
         after.intervals[Kind::Assist as usize].count
@@ -281,4 +297,108 @@ fn enabled_runtime_lifecycle_assist_unwind_and_lock_capture() {
         );
     }
     crate::gc_telemetry::flush_observations();
+}
+
+#[test]
+fn concurrent_progress_saturates_instead_of_wrapping() {
+    let count = AtomicU64::new(u64::MAX - 10);
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            let count = &count;
+            scope.spawn(move || accumulate_progress(count, 256));
+        }
+    });
+    assert_eq!(count.load(Ordering::Relaxed), u64::MAX);
+}
+
+#[test]
+fn nested_phase_scope_restores_after_unwind() {
+    assert_eq!(STOP_PHASE.get(), None);
+    {
+        let _phase = StopPhase::new(1);
+        let _ = std::panic::catch_unwind(|| {
+            let _nested = StopPhase::new(2);
+            assert_eq!(STOP_PHASE.get(), Some(2));
+            panic!("nested phase");
+        });
+        assert_eq!(STOP_PHASE.get(), Some(1));
+    }
+    assert_eq!(STOP_PHASE.get(), None);
+}
+
+#[test]
+fn progress_batch_flushes_on_unregister_and_is_per_thread() {
+    let before = PROGRESS.load(Ordering::Relaxed);
+    std::thread::spawn(|| {
+        LOCAL_PROGRESS.set(7);
+        PENDING_PROGRESS.set(7);
+        flush_progress();
+        assert_eq!(PENDING_PROGRESS.get(), 0);
+        assert_eq!(event(4, 0).progress, 7);
+        flush_progress();
+    })
+    .join()
+    .unwrap();
+    assert!(PROGRESS.load(Ordering::Relaxed) >= before + 7);
+    assert_eq!(LOCAL_PROGRESS.get(), 0);
+}
+
+#[test]
+fn cycle_wait_events_do_not_grow_or_pollute_histogram_abi() {
+    let mut s = State::default();
+    s.begin(e(1, Kind::CycleWait as u64, 1));
+    s.end(e(2, Kind::CycleWait as u64, 5), 1);
+    assert_eq!(s.stats.active_intervals, 0);
+    assert!(s.stats.intervals.iter().all(|h| h.count == 0));
+    assert_eq!(s.events.len(), 2);
+}
+
+#[test]
+fn nested_cycle_restores_parent_epoch_on_completion_and_unwind() {
+    use crate::gc_telemetry::{Cycle, CycleKind};
+    let _guard = crate::gc::runtime_test_guard();
+    crate::gc::reset_internal_for_test();
+    let before = EPOCH.load(Ordering::Relaxed);
+    {
+        let outer = Cycle::begin(CycleKind::Major);
+        let parent = EPOCH.load(Ordering::Relaxed);
+        {
+            let _nested = Cycle::begin(CycleKind::Minor);
+            assert!(EPOCH.load(Ordering::Relaxed) > parent);
+        }
+        assert_eq!(EPOCH.load(Ordering::Relaxed), parent);
+        outer.finish(0, 0, Default::default());
+    }
+    assert_eq!(EPOCH.load(Ordering::Relaxed), before);
+}
+
+#[test]
+fn aborted_interval_invalidates_snapshot_even_with_complete_endpoints() {
+    let mut s = State::default();
+    s.begin(e(1, 0, 1));
+    let mut end = e(2, 0, 2);
+    end.aborted = 1;
+    s.end(end, 1);
+    assert_eq!(s.stats.active_intervals, 0);
+    assert_ne!(s.stats.flags & INVALID, 0);
+}
+
+#[test]
+fn concurrent_batch_saturation_is_visible_before_cycle_publication() {
+    let mut s = State::default();
+    let mut batch = e(7, 0, 1);
+    batch.work.bytes = u64::MAX;
+    s.event(batch);
+    assert_ne!(s.stats.flags & SATURATED, 0);
+}
+
+#[test]
+fn marker_role_restores_after_unwind_and_does_not_reclassify_application_assist() {
+    assert_eq!(ROLE.get(), 0);
+    let _ = std::panic::catch_unwind(|| {
+        let _role = MarkerRole::new();
+        assert_eq!(event(1, Kind::Assist as u64).role, 1);
+        panic!("marker role fixture");
+    });
+    assert_eq!(event(1, Kind::Assist as u64).role, 0);
 }

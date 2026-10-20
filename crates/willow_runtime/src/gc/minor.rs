@@ -1077,6 +1077,7 @@ impl<'a> MinorCollector<'a> {
             cycle.termination.restart();
         }
         crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::SweepComplete);
+        crate::gc_telemetry::observations::graph_work(self.work);
         (reclaimed_bytes, std::mem::take(&mut self.work))
     }
 

@@ -706,3 +706,21 @@ fn nested_minor_preserves_major_phase_and_monotonic_epoch() {
     drop(major);
     assert_eq!(snapshot().phase, 0);
 }
+
+#[test]
+fn platform_provider_fakes_preserve_scope_and_clear_stale_validity() {
+    for resident in [None, Some(0), Some(4096), Some(u64::MAX)] {
+        let mut baseline = WillowGcStatsV1 {
+            resident_valid: 1,
+            process_resident_bytes: 99,
+            ..Default::default()
+        };
+        baseline.heap.committed_bytes = 123;
+        baseline.heap.occupied_bytes = 17;
+        let sample = with_resident_sample(baseline, resident);
+        assert_eq!(sample.resident_valid, u32::from(resident.is_some()));
+        assert_eq!(sample.process_resident_bytes, resident.unwrap_or(0));
+        assert_eq!(sample.heap.committed_bytes, 123);
+        assert_eq!(sample.heap.occupied_bytes, 17);
+    }
+}

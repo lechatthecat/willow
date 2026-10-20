@@ -826,7 +826,7 @@ struct GcCoord {
 /// coordinator behind one explicit owner makes lock ordering visible and keeps
 /// runtime entry points from reaching into unrelated globals.
 struct GcRuntime {
-    heap: crate::gc_telemetry::observations::HeapMutex<GcState>,
+    heap: crate::gc_telemetry::observations::GcMutex<GcState>,
     write_barrier_calls: AtomicU64,
     /// Conservative nursery-presence gate: set before the first TLAB can
     /// publish an object, and cleared only by the quiescent runtime reset.
@@ -844,7 +844,7 @@ struct GcRuntime {
     pin_lease_slots: RuntimeRootSet,
     parked_stack_roots: Mutex<HashMap<u64, PublishedRoots>>,
     next_parked_stack: AtomicU64,
-    coord: (Mutex<GcCoord>, Condvar),
+    coord: (crate::gc_telemetry::observations::GcMutex<GcCoord>, Condvar),
     /// Only cycle/participation transitions wake budget waiters. Mutator
     /// acknowledgements use coord.1, avoiding quadratic wakeup fan-out.
     budget_cv: Condvar,
@@ -865,7 +865,7 @@ struct GcRuntime {
 impl Default for GcRuntime {
     fn default() -> Self {
         Self {
-            heap: crate::gc_telemetry::observations::HeapMutex::new(GcState::default()),
+            heap: crate::gc_telemetry::observations::GcMutex::new(GcState::default()),
             write_barrier_calls: AtomicU64::new(0),
             tlab_ever_allocated: std::sync::atomic::AtomicBool::new(false),
             collect_lock: Mutex::new(()),
@@ -876,7 +876,10 @@ impl Default for GcRuntime {
             pin_lease_slots: RuntimeRootSet::default(),
             parked_stack_roots: Mutex::new(HashMap::new()),
             next_parked_stack: AtomicU64::new(1),
-            coord: (Mutex::new(GcCoord::default()), Condvar::new()),
+            coord: (
+                crate::gc_telemetry::observations::GcMutex::coordination(GcCoord::default()),
+                Condvar::new(),
+            ),
             budget_cv: Condvar::new(),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
             poll_requested: std::sync::atomic::AtomicBool::new(false),

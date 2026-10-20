@@ -194,6 +194,7 @@ fn worker_main(shared: Arc<(Mutex<State>, Condvar)>) {
 }
 
 fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
+    let _role = crate::gc_telemetry::observations::MarkerRole::new();
     let _lifetime = crate::gc_telemetry::measurement::WorkerLifetime::new();
     let (lock, cv) = &*shared;
     let mut generation = 0;

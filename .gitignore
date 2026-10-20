@@ -78,3 +78,11 @@ AGENTS.md
 
 # Reconstructed Mutex acceptance probe (willow-8hq4.42).
 !/benches/runtime_compare/probes/mutex_split.wi
+
+# Public telemetry implementation audit and source-only measurement reproducers.
+!/docs/audits/willow-6fv.5.8.2-completion/
+/docs/audits/willow-6fv.5.8.2-completion/*
+!/docs/audits/willow-6fv.5.8.2-completion/audit.md
+!/docs/audits/willow-6fv.5.8.2-completion/gc_observation_check.py
+!/docs/audits/willow-6fv.5.8.2-completion/gc_observation_repro.py
+!/docs/audits/willow-6fv.5.8.2-completion/costs.json

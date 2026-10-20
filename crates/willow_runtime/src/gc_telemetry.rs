@@ -351,11 +351,15 @@ pub(crate) struct Cycle {
     previous_phase: u32,
     cpu_start: Option<u64>,
     minor_cpu_before: u64,
+    previous_epoch: u64,
+    _interval: observations::Span,
 }
 
 impl Drop for Cycle {
     fn drop(&mut self) {
+        observations::epoch(self.previous_epoch);
         if !self.completed {
+            self._interval.abort();
             // An aborted collection has no completed work to publish. Keep its
             // epoch consumed while allowing the next elected collector to start.
             let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
@@ -383,7 +387,7 @@ impl Cycle {
             .expect("GC cycle identity exhausted");
         stats.phase = kind as u32;
         milestones::begin(stats.epoch);
-        observations::epoch(stats.epoch);
+        let previous_epoch = observations::epoch(stats.epoch);
         Self {
             kind,
             epoch: stats.epoch,
@@ -392,6 +396,8 @@ impl Cycle {
             previous_phase,
             cpu_start: profiling().then(workers::thread_cpu_ns).flatten(),
             minor_cpu_before,
+            previous_epoch,
+            _interval: observations::Span::new(observations::Kind::Cycle),
         }
     }
     /// Called after resuming mutators; returns the trace record for publication
@@ -477,7 +483,7 @@ impl Cycle {
             if let Some(writer) = trace.writer.as_mut() {
                 let result = writeln!(
                     writer,
-                    "{{\"event\":\"gc_work\",\"epoch\":{},\"kind\":{},\"root_slots\":{},\"remembered_owners\":{},\"frame_scans\":{},\"mark_cpu_ns\":{},\"cpu_incomplete\":{},\"gc_cpu_ns\":{}}}",
+                    "{{\"version\":3,\"event\":\"gc_work\",\"epoch\":{},\"kind\":{},\"root_slots\":{},\"remembered_owners\":{},\"frame_scans\":{},\"mark_cpu_ns\":{},\"cpu_incomplete\":{},\"gc_cpu_ns\":{}}}",
                     cycle.epoch,
                     cycle.kind,
                     work.root_scan_bytes / std::mem::size_of::<usize>() as u64,
@@ -554,11 +560,14 @@ pub extern "C" fn willow_gc_stats_snapshot_v1(out: *mut WillowGcStatsV1) -> i32 
 }
 
 fn snapshot_with_resident() -> WillowGcStatsV1 {
-    let mut stats = snapshot();
-    if let Some(resident) = resident_bytes() {
-        stats.process_resident_bytes = resident;
-        stats.resident_valid = 1;
-    }
+    with_resident_sample(snapshot(), resident_bytes())
+}
+
+// One platform-neutral validity boundary; fake providers exercise success and
+// failure on every target without requiring OS APIs to fail in a real process.
+fn with_resident_sample(mut stats: WillowGcStatsV1, resident: Option<u64>) -> WillowGcStatsV1 {
+    stats.process_resident_bytes = resident.unwrap_or(0);
+    stats.resident_valid = u32::from(resident.is_some());
     stats
 }
 
@@ -764,6 +773,10 @@ fn write_stop(writer: &mut dyn Write, e: &stops::StopEventV2) -> io::Result<()> 
         e.work.root_values,
         e.work.swept_objects
     )
+}
+/// Non-allocating error sample for consumers after their final trace flush.
+pub fn trace_errors() -> u64 {
+    TRACE_ERRORS.load(Ordering::Relaxed)
 }
 fn trace_error() {
     let _ = TRACE_ERRORS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {

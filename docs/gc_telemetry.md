@@ -1,7 +1,7 @@
-# GC telemetry contract (M0, version 3)
+# GC telemetry contract (versions 1–4)
 
-This document describes public source behavior at baseline c1888af and this M0
-change. V1 and V2 retain their sizes and symbols. Request version 3 through
+The M0 groups below describe the existing public V1–V3 behavior; the V4
+extension is documented at the end. V1, V2 and V3 retain their sizes and symbols. Request version 3 through
 `willow_gc_stats_size` / `willow_gc_stats_snapshot`; short buffers are untouched,
 null/unknown requests fail, and unaligned output is supported. The public C
 layout is `crates/willow_runtime/include/willow_gc_stats.h`. The reproduction
@@ -119,3 +119,101 @@ test panic hook. It uses the same bounded formatter and nonblocking metadata
 try-locks; unavailable accounting stays null. Recovery, failed-cycle suppression,
 and authoritative stopped tracing retain their existing behavior. Stderr I/O may
 block, as for other failure records.
+
+## V4 detailed intervals and measurement consumers
+
+V4 preserves the V1–V3 layouts and the existing V4 size. Enable aggregate
+observations with `WILLOW_GC_MEASURE=1`; enable their bounded event transport with
+`WILLOW_GC_TRACE_VERSION=4` and `WILLOW_GC_TRACE=<path>`. Disabled observations have
+flags=0, so zero counts do not establish coverage. Flags are enabled=1, lost=2,
+saturated=4, invalid/aborted=8. Flags are sticky for the process lifetime. V4
+counters saturate, never wrap or reset; V1's test reset generation must still
+match across a measurement window. Unavailable OS residency remains zero with
+`resident_valid=0`; allocator committed bytes are not process commit or RSS.
+
+The nine fixed histogram slots (each with log2 nanosecond buckets) are:
+
+| Kind | Interval |
+|---|---|
+| 0 | Cooperative safepoint slow path, including coordination acquisition |
+| 1 | Mutator mark Assist, including its wrapper overhead |
+| 2 | Allocation-budget stall, including collection performed for allocation |
+| 3 | Barrier slow path requiring the heap lock |
+| 4 | Heap lock acquisition attempt, including uncontended acquisition overhead |
+| 5 | Root scan span |
+| 6 | Fused minor traversal/evacuation span |
+| 7 | Stop callback return through gate clear, notify and coordination unlock |
+| 8 | Stopped collector callback, excluding rendezvous and resume |
+
+Event-only kinds 9 (cycle join, including explicit `gc()` and lifecycle waits),
+10 (complete collector cycle elapsed time), and 11 (coordination mutex acquisition)
+do not enlarge the histogram ABI. Kind 11 starts before acquiring the mutex,
+including registration, unregister, cycle election/join entry and reacquisition.
+It measures acquisition overhead even without contention, not time holding the
+mutex. Condition-variable waits retain their enclosing handshake/cycle spans.
+An already-completed join emits no wait. These intervals overlap: neither their
+histogram totals nor their maxima may be added to derive wall time. V2 retains
+per-reason request/rendezvous/stopped measurements and fallback classification.
+The collector's kind-8 span isolates actual stopped work; kind 7 isolates resume;
+kind 10 measures the cycle, including concurrent periods and nested stops.
+
+Every V4 event has a sequence, monotonic timestamp, opaque thread identity,
+role and cycle epoch. Role 0 is an application mutator; role 1 is a background
+GC marker, assigned before its first registration and retained through its last
+unregister. Application threads performing Assist or elected collection remain
+role 0. Roles are required and immutable within an observed thread lifetime. A nested minor restores the parent epoch on return or unwind;
+interval ends retain their beginning epoch. Sequence orders insertion into the
+transport, not timestamps across threads. Per-thread timestamp streams can be
+merged. Begin events are identified by their sequence; ends reference that
+identity. Operations 3/4 are register/unregister; 6 is work publication; 7 is a
+completed concurrent graph batch. Aborted intervals remain paired and invalidate
+coverage. Early-aborted cycles are marked aborted even without a Rust panic.
+
+Thread-local safepoint progress is included in lifecycle/begin events. Aggregate
+progress is published every 256 polls, before an interval begins, and on
+unregister. Thus an active thread can have at most 255 unpublished polls; retired
+threads lose none. Polls do not acquire a telemetry mutex or allocate. Shared
+progress publication uses saturating atomic update. No event is generated per
+poll. Existing allocation counts remain TLAB-local and reconcile at refill,
+retirement and heap snapshots; this extension does not instrument each allocation.
+
+Work groups 0–3 correspond to initial/remark/minor/recovery stops. Objects count
+visits (including existing metadata enumeration and sweep visits); slots count
+root values plus traversed reference slots, including nulls. Bytes count traced
+header+payload bytes; metadata_bytes includes recorded header/descriptor work.
+V2 retains the separate metadata/sweep components. Repeated graph visits count
+again. Remark budget checks/yields and explicit termination restarts are exposed.
+Groups 4/5 remain completed-major/minor summaries, published only on completion;
+major marked bytes retain the existing unique-live-byte fallback convention.
+Concurrent graph batch events expose actual scanned work separately, so they
+must not be added to completed-cycle summaries. Publication occurs per batch or
+traversal, never through a per-object shared lock. Aborted partial traversals
+cannot serve as complete work evidence.
+
+The ring retains at most 4096 events. Overflow increments dropped and sets lost;
+aggregate-only mode keeps no ring and does not manufacture loss. Flush drains
+and checkpoints under the sink serialization lock, then writes outside the
+observation mutex. Collection completion and runtime exit flush automatically;
+standalone producers may call `flush_observations()` outside GC locks. I/O errors
+disable the sink, increment `trace_errors()`, and never fail GC. Read the error
+counter after the final flush when making an independent endpoint.
+
+The source-only consumer in
+`docs/audits/willow-6fv.5.8.2-completion/gc_observation_check.py` requires independent
+before/after snapshots, complete thread lifetimes, individual progress evidence,
+matching reset generation, no active intervals, intact flags and zero trace errors.
+It rejects gaps, duplicate events, unmatched/aborted intervals, missing final
+checkpoints and truncation. It computes the union of simultaneous GC-attributed
+blocking across registered application mutators, including an application thread
+acting as collector and nested waits. Background markers remain validated for
+lifecycle, interval pairing and progress, but cannot dilute the application
+population. The consumer reports application_progress and marker_progress
+separately; marker-only progress cannot validate an application measurement.
+Their sum must equal the independent endpoint progress delta: all threads are
+unregistered at both boundaries, so no unpublished TLS batches remain.
+The ABI-stable aggregate progress counter continues to include both roles.
+Its window boundary restriction is deliberate; it does not infer missing initial
+thread state or claim that uninstrumented scheduler/native waits are GC pauses.
+Use the separate V2 stop checker for global stop requests and per-stop maxima.
+Transport validation and measured costs do not certify the collector's final
+zero-STW or latency acceptance gates.

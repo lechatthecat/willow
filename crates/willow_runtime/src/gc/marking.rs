@@ -143,6 +143,7 @@ impl Drop for MarkBatch<'_> {
             && self.work.scanned_bytes == 0
             && self.work.descriptor_bytes == 0;
         if !idle {
+            crate::gc_telemetry::observations::graph_work(self.work);
             let cpu = self.cpu_start.and_then(|start| {
                 crate::gc_telemetry::workers::thread_cpu_ns()?.checked_sub(start)
             });
@@ -1128,5 +1129,6 @@ pub(super) fn mark_worklist(
         .and_then(|(a, b)| b.checked_sub(a));
     work.cpu_ns = cpu.unwrap_or(0);
     work.cpu_incomplete = cpu.is_none();
+    crate::gc_telemetry::observations::graph_work(work);
     work
 }

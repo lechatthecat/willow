@@ -133,12 +133,18 @@ pub(super) fn take_recovery_request() -> bool {
 /// Shared by allocation, explicit `gc()` and unregister waits; callers own any
 /// interval attribution.
 pub(super) fn wait_for_cycle(mut coord: std::sync::MutexGuard<'_, GcCoord>, generation: u64) {
+    let mut interval = None;
     loop {
         #[cfg(test)]
         CHECKS.fetch_add(1, Ordering::Relaxed);
         if coord.cycle_generation != generation || coord.cycle_collector.is_none() {
             return;
         }
+        interval.get_or_insert_with(|| {
+            crate::gc_telemetry::observations::Span::new(
+                crate::gc_telemetry::observations::Kind::CycleWait,
+            )
+        });
         if participation_required(&coord) {
             // Never sleep through a request that needs this mutator. The
             // safepoint owns root publication and the STW parking protocol.
@@ -167,6 +173,109 @@ pub(super) fn wait_for_cycle(mut coord: std::sync::MutexGuard<'_, GcCoord>, gene
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn coordination_contention_is_observed_before_registration_and_cycle_join() {
+        const CHILD: &str = "WILLOW_COORD_OBSERVATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let path =
+                std::env::temp_dir().join(format!("willow-coord-{}.jsonl", std::process::id()));
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gc::cycle_wait::tests::coordination_contention_is_observed_before_registration_and_cycle_join", "--nocapture"])
+                .env(CHILD, "1")
+                .env("WILLOW_GC_MEASURE", "1")
+                .env("WILLOW_GC_TRACE_VERSION", "4")
+                .env("WILLOW_GC_TRACE", &path)
+                .status().unwrap();
+            let _ = std::fs::remove_file(path);
+            assert!(status.success());
+            return;
+        }
+        use crate::gc_telemetry::observations::{self, Kind};
+        let _test = runtime_test_guard();
+        reset_internal_for_test();
+        for explicit in [false, true] {
+            let _collector = (!explicit).then(MutatorRegistration::new);
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (go_tx, go_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                // Explicit collection enters as an existing registered mutator;
+                // registration enters while the stopped callback owns coord.
+                let registration = explicit.then(MutatorRegistration::new);
+                ready_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                if explicit {
+                    collect_explicit();
+                } else {
+                    let _registration = MutatorRegistration::new();
+                    willow_gc_safepoint();
+                }
+                drop(registration);
+            });
+            ready_rx.recv().unwrap();
+            // Existing mutators must park before the callback, so use the actual
+            // stopped callback with registration; for explicit entry hold the
+            // same mutex directly without requesting an impossible rendezvous.
+            reset_counts();
+            let elected = explicit.then(|| CollectorGuard::try_acquire().unwrap());
+            let mut observed = None;
+            let mut held_until = 0;
+            let mut contend = || {
+                observations::take_events();
+                go_tx.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let (events, _) = observations::take_events();
+                    if let Some(begin) = events
+                        .iter()
+                        .find(|e| e.event == 1 && e.kind == Kind::CoordLock as u64)
+                    {
+                        assert!(
+                            !events
+                                .iter()
+                                .any(|e| e.event == 2 && e.identity == begin.sequence)
+                        );
+                        observed = Some(*begin);
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "coordination wait was not observed"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(!worker.is_finished());
+                held_until = crate::gc_telemetry::timestamp_ns();
+            };
+            if explicit {
+                let _coord = runtime().coord.0.lock().unwrap();
+                contend();
+            } else {
+                with_stw(crate::gc_telemetry::stops::StopReason::Remark, |_, _| {
+                    contend()
+                });
+            }
+            let events = if explicit {
+                await_sleeps(1);
+                let (events, _) = observations::take_events();
+                drop(elected);
+                worker.join().unwrap();
+                events
+            } else {
+                worker.join().unwrap();
+                observations::take_events().0
+            };
+            let begin = observed.unwrap();
+            let end = events
+                .iter()
+                .find(|e| e.event == 2 && e.identity == begin.sequence)
+                .unwrap();
+            assert_eq!(end.kind, Kind::CoordLock as u64);
+            assert_eq!(end.thread, begin.thread);
+            assert!(begin.timestamp_ns <= held_until);
+            assert!(end.timestamp_ns >= held_until);
+        }
+    }
 
     fn await_sleeps(count: usize) {
         let deadline = Instant::now() + Duration::from_secs(10);

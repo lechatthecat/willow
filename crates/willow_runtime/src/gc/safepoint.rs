@@ -484,6 +484,7 @@ pub(super) fn with_stw<R>(
     measurement.stopped();
     let collector_start = crate::gc_telemetry::timestamp_ns();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _phase = crate::gc_telemetry::observations::StopPhase::new(reason as usize - 1);
         let _interval = crate::gc_telemetry::observations::Span::new(
             crate::gc_telemetry::observations::Kind::Collector,
         );

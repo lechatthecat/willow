@@ -55,6 +55,13 @@ impl Termination {
     }
 
     pub(super) fn restart(&self) {
+        crate::gc_telemetry::observations::work(
+            1,
+            crate::gc_telemetry::observations::Work {
+                restarts: 1,
+                ..Default::default()
+            },
+        );
         self.0
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
                 Some(Self::advance(state))
