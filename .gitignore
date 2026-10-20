@@ -102,3 +102,10 @@ AGENTS.md
 # Public memberwise-owner visibility audit and focused reproducer.
 !/docs/audits/willow-jz15.104-memberwise-owner.md
 !/docs/audits/willow-jz15.104-checks.sh
+
+# Public pending-minor budget regression audit and measurement evidence.
+!/docs/audits/willow-23fv/
+/docs/audits/willow-23fv/*
+!/docs/audits/willow-23fv/audit.md
+!/docs/audits/willow-23fv/measurements.json
+!/docs/audits/willow-23fv/verify.sh

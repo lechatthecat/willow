@@ -371,3 +371,198 @@ fn minor_deferral_first_request_during_sweep_waits_before_refill() {
     willow_gc_collect();
     reset_internal();
 }
+
+#[test]
+fn minor_deferral_pending_refill_budget_boundaries() {
+    let _guard = runtime_test_guard();
+    for budget in [
+        1,
+        GC_TLAB_CHUNK_SIZE - 1,
+        GC_TLAB_CHUNK_SIZE,
+        4 * GC_TLAB_CHUNK_SIZE,
+    ] {
+        for hard_cap in [false, true] {
+            for saturated in [false, true] {
+                reset_internal();
+                PENDING.store(true, Ordering::Release);
+                let mut state = runtime().heap.lock().unwrap();
+                state.nursery_threshold_bytes = budget;
+                state.young_allocated_bytes = budget;
+                state.young_allocation_clock = if saturated { u64::MAX } else { 123 };
+                state.memory_limit_bytes = hard_cap.then_some(1024 * 1024);
+                let can_refill = !hard_cap && !saturated && budget >= GC_TLAB_CHUNK_SIZE;
+                assert_eq!(minor_refill_should_wait(&mut state), !can_refill);
+                assert_eq!(state.minor_deferral_start_bytes.is_some(), can_refill);
+                if can_refill {
+                    assert_eq!(state.minor_deferral_start_bytes, Some(123));
+                    assert_eq!(state.minor_deferral_budget_bytes, budget as u64);
+                    assert_eq!(state.minor_retry_bytes, 123 + GC_TLAB_CHUNK_SIZE as u64);
+                    // Sweep reclamation and policy changes cannot reset the debt.
+                    state.young_allocated_bytes = 0;
+                    state.nursery_threshold_bytes = usize::MAX;
+                    state.young_allocation_clock = 123 + budget as u64 - 1;
+                    assert!(!minor_refill_should_wait(&mut state));
+                    state.young_allocation_clock += 1;
+                    assert!(minor_refill_should_wait(&mut state));
+                    assert_eq!(state.minor_deferral_start_bytes, Some(123));
+                    assert_eq!(state.minor_deferral_budget_bytes, budget as u64);
+                }
+            }
+        }
+    }
+    reset_internal();
+    let mut state = runtime().heap.lock().unwrap();
+    state.young_allocated_bytes = state.nursery_threshold_bytes;
+    // No queued owner request: do not manufacture an epoch after a skipped scan.
+    assert!(minor_refill_should_wait(&mut state));
+    assert_eq!(state.minor_deferral_start_bytes, None);
+    // A completed collection does not wait merely because its epoch is clear.
+    state.young_allocated_bytes = 0;
+    PENDING.store(true, Ordering::Release);
+    assert!(!minor_refill_should_wait(&mut state));
+    assert_eq!(state.minor_deferral_start_bytes, None);
+    drop(state);
+    reset_internal();
+}
+
+#[test]
+fn minor_deferral_pending_sweep_uses_fixed_runway_then_waits() {
+    let _guard = runtime_test_guard();
+    reset_internal();
+    let mut tls = tlab_state_for_test();
+    let payload = (GC_TLAB_MAX_OBJECT_SIZE - GC_HEADER_SIZE) as i64;
+    let objects = GC_TLAB_CHUNK_SIZE / GC_TLAB_MAX_OBJECT_SIZE;
+    let root = willow_gc_alloc_slow(&mut tls, 1, 0, payload, 0);
+    unsafe { *root.cast::<u64>() = 91 };
+    for _ in 1..objects {
+        assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, payload, 0).is_null());
+    }
+    let mut slot = root;
+    let depth = gc_thread_root_depth();
+    willow_push_root(&mut slot);
+    let token = unsafe { park_current_roots(depth) };
+    let clock = {
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_unindexed(&mut state);
+        state.nursery_threshold_bytes = GC_TLAB_CHUNK_SIZE;
+        assert_eq!(state.young_allocated_bytes, GC_TLAB_CHUNK_SIZE);
+        state.young_allocation_clock
+    };
+    cycle_wait::SLEEPS.store(0, Ordering::Release);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let root_address = root as usize;
+        let owner = scope.spawn(move || {
+            let _owner = cycle_wait::CollectorGuard::try_acquire().unwrap();
+            let plan = {
+                let mut state = runtime().heap.lock().unwrap();
+                unsafe { (*payload_to_header(root_address as *mut u8)).marked = true };
+                sweep::prepare(&mut state, None)
+            };
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            sweep::concurrent(plan);
+            service_pending();
+        });
+        ready_rx.recv().unwrap();
+        let allocator = scope.spawn(|| {
+            let mut tls = tlab_state_for_test();
+            // Exactly one captured budget can pass the held sweep. The next
+            // refill must wait even though all these objects are dead.
+            for _ in 0..=objects {
+                assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, payload, 0).is_null());
+            }
+            tlab::unregister_tlab_state(&raw mut tls as usize);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while cycle_wait::SLEEPS.load(Ordering::Acquire) == 0 {
+            if allocator.is_finished() || std::time::Instant::now() >= deadline {
+                release_tx.send(()).unwrap();
+                owner.join().unwrap();
+                allocator.join().unwrap();
+                panic!("pending refill did not stop at its fixed budget");
+            }
+            std::thread::yield_now();
+        }
+        {
+            let state = runtime().heap.lock().unwrap();
+            assert!(state.sweeping.is_some());
+            assert_eq!(state.minor_deferral_start_bytes, Some(clock));
+            assert_eq!(state.minor_deferral_budget_bytes, GC_TLAB_CHUNK_SIZE as u64);
+            assert_eq!(minor_deferral_age(&state), GC_TLAB_CHUNK_SIZE as u64);
+        }
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        allocator.join().unwrap();
+    });
+    let state = runtime().heap.lock().unwrap();
+    // Owner serviced the request. The waiter must not collect a second time.
+    assert_eq!(state.minor_collections, 1);
+    assert_eq!(state.minor_deferral_start_bytes, None);
+    assert_eq!(
+        state.young_allocation_clock,
+        clock + GC_TLAB_CHUNK_SIZE as u64 + GC_TLAB_MAX_OBJECT_SIZE as u64
+    );
+    assert_eq!(slot, root);
+    assert_eq!(unsafe { *root.cast::<u64>() }, 91);
+    assert_eq!(
+        unsafe { (*payload_to_header(root)).generation },
+        GC_GENERATION_OLD
+    );
+    drop(state);
+    unsafe { resume_parked_roots(token) };
+    willow_pop_root();
+    willow_gc_collect();
+    reset_internal();
+}
+
+#[test]
+fn minor_deferral_waiters_share_owner_collection() {
+    let _guard = runtime_test_guard();
+    for workers in [1, 4, 16, 64] {
+        reset_internal();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.young_allocation_clock = 32;
+            state.minor_deferral_start_bytes = Some(0);
+            state.minor_deferral_budget_bytes = 32;
+            state.minor_retry_bytes = 32;
+        }
+        cycle_wait::SLEEPS.store(0, Ordering::Release);
+        let owner = cycle_wait::CollectorGuard::try_acquire().unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    let mut tls = tlab_state_for_test();
+                    assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
+                    tlab::unregister_tlab_state(&raw mut tls as usize);
+                });
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while cycle_wait::SLEEPS.load(Ordering::Acquire) < workers {
+                if std::time::Instant::now() >= deadline {
+                    drop(owner);
+                    panic!("refill waiters did not join owner");
+                }
+                std::thread::yield_now();
+            }
+            assert!(requested());
+            service_pending();
+            drop(owner);
+        });
+        let state = runtime().heap.lock().unwrap();
+        assert_eq!(state.minor_collections, 1);
+        assert_eq!(
+            state.young_allocation_clock,
+            32 + (workers * (GC_HEADER_SIZE + 8)) as u64
+        );
+        assert_eq!(state.minor_deferral_start_bytes, None);
+        eprintln!(
+            "pending_waiters={workers} owner_minor_cycles={} refill_objects={workers}",
+            state.minor_collections
+        );
+        drop(state);
+    }
+    reset_internal();
+}

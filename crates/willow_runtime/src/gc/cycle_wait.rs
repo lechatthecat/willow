@@ -83,7 +83,7 @@ pub(super) fn wait_for_current_cycle() {
     wait_for_cycle(coord, generation);
 }
 
-/// Unassessed or debt-exhausted young refills join an elected owner instead of
+/// Young refills without remaining debt budget join an elected owner instead of
 /// growing the nursery while their pending minor waits behind its sweep. Native collector
 /// callbacks must retain the existing non-waiting/reentrant behavior.
 pub(super) fn wait_for_minor_budget() -> bool {

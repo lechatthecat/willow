@@ -323,7 +323,7 @@ struct GcState {
     scheduler_runway_initialized: bool,
     /// Saturating young-mutator byte clock. Reclamation and copying never alter it.
     young_allocation_clock: u64,
-    /// Clock at the first deferral; budget is captured once for that epoch.
+    /// Clock at the first pending request or root deferral; captured once per epoch.
     minor_deferral_start_bytes: Option<u64>,
     minor_deferral_budget_bytes: u64,
     minor_retry_bytes: u64,
@@ -1013,6 +1013,31 @@ fn minor_deferral_age(state: &GcState) -> u64 {
     })
 }
 
+/// A queued minor may use one fixed nursery budget before joining its owner.
+/// Start the clock at the request, not at the eventual root scan: otherwise
+/// repeated refills during a major sweep would have unbounded, uncharged debt.
+fn minor_refill_should_wait(state: &mut GcState) -> bool {
+    if !minor_allocation_due(state) {
+        return false;
+    }
+    if state.minor_deferral_start_bytes.is_none()
+        && minor::requested()
+        && state.memory_limit_bytes.is_none()
+        // Do not grant an unassessed refill whose full runway exceeds the budget.
+        && state.nursery_threshold_bytes >= GC_TLAB_CHUNK_SIZE
+        && state.young_allocation_clock != u64::MAX
+    {
+        state.minor_deferral_start_bytes = Some(state.young_allocation_clock);
+        state.minor_deferral_budget_bytes = state.nursery_threshold_bytes as u64;
+        state.minor_retry_bytes = state
+            .young_allocation_clock
+            .saturating_add(GC_TLAB_CHUNK_SIZE as u64);
+    }
+    state.minor_deferral_start_bytes.is_none()
+        || state.young_allocation_clock == u64::MAX
+        || minor_deferral_age(state) >= state.minor_deferral_budget_bytes
+}
+
 // ---------------------------------------------------------------------------
 // Public runtime API
 // ---------------------------------------------------------------------------
@@ -1174,19 +1199,20 @@ fn tlab_alloc_slow(
 
     if !stress && allocation_should_minor_collect() {
         minor_collect_internal();
-        // A busy major owner may only have queued the request. Before its first
-        // root scan there is no deferral epoch yet: join the owner before any
-        // further refill. An established epoch may use its remaining budget.
+        // A busy owner may only have queued the request. Account for its debt
+        // immediately; join only when no bounded refill runway remains.
         while small
             && {
-                let state = runtime().heap.lock().unwrap();
-                state.minor_deferral_start_bytes.is_none()
-                    || state.young_allocation_clock == u64::MAX
-                    || minor_deferral_age(&state) >= state.minor_deferral_budget_bytes
+                let mut state = runtime().heap.lock().unwrap();
+                minor_refill_should_wait(&mut state)
             }
             && cycle_wait::wait_for_minor_budget()
         {
-            minor_collect_internal();
+            // The owner can satisfy the request before publishing completion.
+            // Recheck rather than start another minor for every waiting refill.
+            if allocation_should_minor_collect() {
+                minor_collect_internal();
+            }
         }
     }
 

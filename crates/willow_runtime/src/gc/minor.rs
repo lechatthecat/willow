@@ -1209,7 +1209,7 @@ fn verify_no_pin_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 /// allocation slow path retries, one TLAB chunk later (`minor_retry_bytes`).
 /// Deferring instead of pinning keeps every nursery object movable. The
 /// deferral is bounded: once young mutator allocation reaches the captured nursery
-/// byte budget since the first consecutive deferral, or under a hard memory
+/// byte budget since the first pending request or root deferral, or under a hard memory
 /// budget that cannot grow the nursery, the collection runs and promotes only
 /// those runtime-held referents in place.
 fn minor_collect_with_roots(
@@ -1307,8 +1307,10 @@ fn minor_collect_with_roots(
 /// Whether a runtime frame parked outside a relocation-safe scope holds a
 /// young value root and the collection may still wait for it to resume. The
 /// wait is bounded by one captured nursery threshold of young allocation,
-/// measured from the first consecutive deferral. Collection is requested at a
-/// refill boundary; concurrent active TLABs can overshoot by their bump runway.
+/// measured from the first pending request or consecutive root deferral.
+/// A pending request's captured budget is never restarted by the root scan.
+/// Collection is requested at a refill boundary; concurrent active TLABs can
+/// overshoot by their bump runway.
 /// Reservation caps remain independently enforced by the allocation paths.
 fn should_defer_minor(state: &mut super::GcState, roots: &MinorRoots) -> bool {
     #[cfg(test)]
