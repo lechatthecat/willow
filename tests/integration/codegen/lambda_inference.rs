@@ -171,3 +171,108 @@ fn main() {
     assert!(ok);
     assert_eq!(out, "2\n");
 }
+
+// willow-jz15.115: the callable signature and body constructor must agree.
+#[test]
+fn test_lambda_result_expression_context_matrix() {
+    for callable in ["fn", "closure"] {
+        for params in ["a: i64", "a"] {
+            for constructor in [
+                "Ok(a + 1)",
+                "Err(\"failed\")",
+                "Result::Ok(a + 1)",
+                "Result::Err(\"failed\")",
+            ] {
+                let source = format!(
+                    r#"
+fn main() {{
+    let g: {callable}(i64) -> Result<i64, String> = |{params}| {constructor};
+    match g(1) {{ Ok(v) => println(v), Err(e) => println(e) }}
+}}
+"#
+                );
+                let project = TestProject::new("lambda_result_context", &[("main.wi", &source)]);
+                let check = project.check("main.wi");
+                assert!(
+                    check.status.success(),
+                    "{source}\n{}",
+                    String::from_utf8_lossy(&check.stderr)
+                );
+                let (out, ok) = compile_and_run(&source);
+                assert!(ok, "{source}");
+                assert_eq!(
+                    out,
+                    if constructor.contains("Ok") {
+                        "2\n"
+                    } else {
+                        "failed\n"
+                    },
+                    "{source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_lambda_result_expression_context_variations() {
+    let cases = [
+        (
+            "let offset = 1; let g: closure(i64) -> Result<i64, String> = |a| Ok(a + offset);",
+            "2\n",
+        ),
+        ("let g = |a: i64| -> Result<i64, String> Ok(a + 1);", "2\n"),
+        (
+            "let g: closure(i64) -> Result<i64, String> = |a| a > 0 ? Ok(a + 1) : Err(\"failed\");",
+            "2\n",
+        ),
+        (
+            "let g: closure(i64) -> Result<i64, String> = |a| match a { 1 => Ok(2), _ => Err(\"failed\") };",
+            "2\n",
+        ),
+        (
+            "let mut g: closure(i64) -> Result<i64, String> = |a| Ok(a); g = |a| Err(\"failed\");",
+            "failed\n",
+        ),
+        (
+            "let g: closure(i64) -> Result<i64, String> = |a| { return Ok(a + 1); };",
+            "2\n",
+        ),
+    ];
+    for (binding, expected) in cases {
+        let source = format!(
+            "fn main() {{ {binding} match g(1) {{ Ok(v) => println(v), Err(e) => println(e) }} }}"
+        );
+        let project = TestProject::new("lambda_result_variation", &[("main.wi", &source)]);
+        let check = project.check("main.wi");
+        assert!(
+            check.status.success(),
+            "{source}\n{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+        let (out, ok) = compile_and_run(&source);
+        assert!(ok, "{source}");
+        assert_eq!(out, expected, "{source}");
+    }
+}
+
+#[test]
+fn test_lambda_result_expression_rejects_wrong_payload() {
+    for constructor in [
+        "Ok(\"wrong\")",
+        "Err(1)",
+        "Result::Ok(\"wrong\")",
+        "Result::Err(1)",
+    ] {
+        let source = format!(
+            "fn main() {{ let g: closure(i64) -> Result<i64, String> = |a| {constructor}; }}"
+        );
+        let project = TestProject::new("lambda_result_bad_payload", &[("main.wi", &source)]);
+        for result in [project.check("main.wi"), project.compile("main.wi")] {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(!result.status.success(), "{source}");
+            assert!(stderr.contains("E0201"), "{source}\n{stderr}");
+            assert!(!stderr.contains("E0800"), "{stderr}");
+        }
+    }
+}

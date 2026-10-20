@@ -460,7 +460,12 @@ impl TypeChecker {
         self.local.lexical_block_depth = 0;
 
         let body_ty = match &l.body {
-            LambdaBody::Expr(e) => self.check_expr(e),
+            LambdaBody::Expr(e) => match expected_ret {
+                // Constructors need the complete return type before their
+                // expression type is recorded for lowering, just like `return`.
+                Some(expected) => self.check_expr_expecting(e, expected),
+                None => self.check_expr(e),
+            },
             LambdaBody::Block(b) => {
                 if let Some(ann) = expected_ret {
                     // Annotation provided: validate return stmts against it.

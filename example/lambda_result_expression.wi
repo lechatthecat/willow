@@ -1,0 +1,6 @@
+fn main() {
+    let g: closure(i64) -> Result<i64, String> = |a: i64| Ok(a + 1);
+    let fail: closure(i64) -> Result<i64, String> = |a: i64| Err("failed");
+    match g(1) { Ok(v) => println(v), Err(e) => println(e) }
+    match fail(1) { Ok(v) => println(v), Err(e) => println(e) }
+}
