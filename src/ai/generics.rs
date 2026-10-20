@@ -83,7 +83,7 @@ impl Source {
             symbols: Facts::default(),
             written,
             owners: symbols::owners_of(items.iter().copied()),
-            details: symbols::details_of(items.iter().copied()),
+            details: symbols::details_of(items.iter().copied(), &Default::default()),
             items: facts
                 .declarations
                 .iter()
@@ -298,7 +298,12 @@ pub(super) fn restore(
             }
         }
         for details in capture.symbol_details.values_mut() {
-            for ty in details.extends.iter_mut().chain(&mut details.implements) {
+            for ty in details
+                .extends
+                .iter_mut()
+                .chain(&mut details.implements)
+                .chain(&mut details.payload)
+            {
                 *ty = normalize(ty);
             }
         }
@@ -606,6 +611,7 @@ pub(super) fn present_types(snapshot: &mut Snapshot) {
             .extends
             .iter_mut()
             .chain(&mut symbol.details.implements)
+            .chain(&mut symbol.details.payload)
         {
             *ty = present(ty, module);
         }

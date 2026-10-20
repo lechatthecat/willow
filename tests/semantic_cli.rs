@@ -4566,3 +4566,127 @@ fn rename_conflicts_name_owner_and_impact_labels_lambdas_in_order() {
     let distances: Vec<_> = nodes.iter().map(|n| n["distance"].as_u64()).collect();
     assert!(distances.is_sorted(), "{impact}");
 }
+
+#[test]
+fn variant_symbol_and_type_report_module_qualified_payloads() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/shapes.wi"),
+        "module shapes;\npub class Rect { pub w: i64; }\npub class Label { pub text: String; }\n",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/scene.wi"),
+        "module scene;\n\
+         import shapes;\n\
+         import shapes::Rect;\n\
+         import shapes::Label as Caption;\n\
+         pub enum Node {\n\
+         \x20   Box(Rect),\n\
+         \x20   Titled(Rect, Caption),\n\
+         \x20   Note(shapes::Label),\n\
+         \x20   Maybe(Option<Rect>),\n\
+         \x20   Pair((i64, f64)),\n\
+         \x20   Empty,\n\
+         }\n\
+         pub enum Wrap<T> {\n\
+         \x20   Some(T),\n\
+         \x20   Nothing,\n\
+         }\n\
+         pub fn caption(c: Caption) -> Caption { return c; }\n",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import scene;\n\
+         enum Condition {\n\
+         \x20   Fever(f64),\n\
+         \x20   Many(i64, String, bool),\n\
+         \x20   Healthy,\n\
+         }\n\
+         fn main() {\n\
+         \x20   let c = Condition::Fever(1.5);\n\
+         \x20   let n = scene::Node::Empty;\n\
+         \x20   match c {\n\
+         \x20       Condition::Fever(t) => println(t),\n\
+         \x20       _ => println(0),\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let cases: [(&str, &str, &[&str]); 12] = [
+        ("main::Condition::Fever", "main::Condition", &["f64"]),
+        (
+            "main::Condition::Many",
+            "main::Condition",
+            &["i64", "String", "bool"],
+        ),
+        ("main::Condition::Healthy", "main::Condition", &[]),
+        // Item import, aliased item import and module-qualified spellings
+        // present the declaration's canonical name.
+        ("scene::Node::Box", "scene::Node", &["shapes::Rect"]),
+        (
+            "scene::Node::Titled",
+            "scene::Node",
+            &["shapes::Rect", "shapes::Label"],
+        ),
+        ("scene::Node::Note", "scene::Node", &["shapes::Label"]),
+        (
+            "scene::Node::Maybe",
+            "scene::Node",
+            &["Option<shapes::Rect>"],
+        ),
+        ("scene::Node::Pair", "scene::Node", &["(i64, f64)"]),
+        ("scene::Node::Empty", "scene::Node", &[]),
+        ("scene::Wrap::Some", "scene::Wrap", &["T"]),
+        ("scene::Wrap::Nothing", "scene::Wrap", &[]),
+        // A position selector on the declaration reports the same payload.
+        ("src/main.wi:3:5", "main::Condition", &["f64"]),
+    ];
+    for (selector, ty, payload) in cases {
+        for command in ["symbol", "type"] {
+            let value = f.json(&[command, selector], 0);
+            let result = &value["result"];
+            let typed = if command == "symbol" {
+                &result["symbol"]
+            } else {
+                result
+            };
+            assert_eq!(typed["type_display"], ty, "{command} {selector}: {value}");
+            if payload.is_empty() {
+                assert!(typed.get("payload").is_none(), "{value}");
+                assert!(typed.get("payload_display").is_none(), "{value}");
+            } else {
+                assert_eq!(typed["payload_display"], serde_json::json!(payload));
+                assert_eq!(
+                    typed["payload"].as_array().map(Vec::len),
+                    Some(payload.len()),
+                    "{value}"
+                );
+            }
+            let output = f.run(&[command, selector]);
+            assert!(output.status.success(), "{output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.contains(&format!("Type: {ty}\n")), "{text}");
+            if payload.is_empty() {
+                assert!(!text.contains("Payload:"), "{text}");
+            } else {
+                let line = format!("Payload: ({})\n", payload.join(", "));
+                assert!(text.contains(&line), "{text}");
+            }
+        }
+    }
+    // A constructor use site keeps the expression's enum type, without payload.
+    let value = f.json(&["type", "src/main.wi:8:24"], 0);
+    assert_eq!(
+        value["result"]["type_display"], "main::Condition",
+        "{value}"
+    );
+    assert!(value["result"].get("payload").is_none(), "{value}");
+    // The aliased import also presents canonically in ordinary signatures.
+    let caption = f.json(&["symbol", "scene::caption"], 0);
+    assert_eq!(
+        caption["result"]["type_display"],
+        "fn(shapes::Label) -> shapes::Label"
+    );
+}

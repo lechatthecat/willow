@@ -199,7 +199,7 @@ pub(crate) fn capture(
         semantic: semantic::Captured::default(),
         symbols: symbol_facts.clone(),
         symbol_owners: symbols::owners(program),
-        symbol_details: symbols::details(program),
+        symbol_details: symbols::details(program, symbols),
         declarations: HashMap::new(),
         identities: HashMap::new(),
         lambda_names: HashMap::new(),

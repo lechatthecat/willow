@@ -466,6 +466,13 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
     {
         lines.push(format!("Type: {ty}"));
     }
+    if let Some(payload) = result["payload_display"]
+        .as_array()
+        .or_else(|| result["symbol"]["payload_display"].as_array())
+    {
+        let payload: Vec<_> = payload.iter().filter_map(Value::as_str).collect();
+        lines.push(format!("Payload: ({})", payload.join(", ")));
+    }
     if options.command == "type" {
         match result["status"].as_str() {
             Some("unknown") if willow_compiler::ai::direct::split_location(&options.selector).is_none() => lines.push("No symbol matches this selector and its filters. Use a qualified symbol name or file:line:column on an identifier or expression.".into()),

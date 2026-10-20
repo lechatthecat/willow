@@ -41,6 +41,7 @@ impl TypeNames {
             |s: &symbols::Symbol| matches!(s.kind.as_str(), "class" | "enum" | "interface");
         let mut local = HashMap::new();
         let mut imports = HashMap::new();
+        let mut import_ids = HashMap::new();
         for s in &snapshot.semantic.symbols {
             let Some(identity) = &s.identity else {
                 continue;
@@ -50,10 +51,11 @@ impl TypeNames {
                     (identity.module.clone(), s.name.clone()),
                     canonical(identity),
                 );
-            } else if s.kind == "import"
-                && let Some(l) = &s.location
-            {
-                imports.insert((&l.path, l.start, l.end), (&identity.module, &s.name));
+            } else if s.kind == "import" {
+                if let Some(l) = &s.location {
+                    imports.insert((&l.path, l.start, l.end), (&identity.module, &s.name));
+                }
+                import_ids.insert(s.id.as_str(), (&identity.module, &s.name));
             }
         }
         // An item import's token resolves to its target declaration.
@@ -64,13 +66,30 @@ impl TypeNames {
             .filter(|s| is_type(s))
             .map(|s| (s.id.as_str(), s))
             .collect();
+        // An aliased item import (`import m::T as U`) declares `U` on the alias
+        // token while its target is referenced on `T`; a use of `U` carries both
+        // the import and the type reference on one token.
+        let mut used_imports = Vec::new();
+        let mut used_types = HashMap::new();
         for r in &snapshot.semantic.references {
             let l = &r.location;
-            if let Some(&(module, name)) = imports.get(&(&l.path, l.start, l.end))
-                && let Some(target) = targets.get(r.target.as_str())
+            let key = (&l.path, l.start, l.end);
+            if let Some(target) = targets.get(r.target.as_str())
                 && let Some(identity) = &target.identity
             {
-                local.insert((module.clone(), name.clone()), canonical(identity));
+                if let Some(&(module, name)) = imports.get(&key) {
+                    local.insert((module.clone(), name.clone()), canonical(identity));
+                }
+                used_types.insert(key, identity);
+            } else if let Some(&import) = import_ids.get(r.target.as_str()) {
+                used_imports.push((key, import));
+            }
+        }
+        for (key, (module, name)) in used_imports {
+            if let Some(identity) = used_types.get(&key) {
+                local
+                    .entry((module.clone(), name.clone()))
+                    .or_insert_with(|| canonical(identity));
             }
         }
         Self { packages, local }
@@ -169,7 +188,24 @@ impl TypeNames {
             let module = symbol.identity.as_ref().map(|i| i.module.as_str());
             value["type_display"] = self.render(ty, module).into();
         }
+        self.payload(symbol, &mut value);
         value
+    }
+
+    /// A payload variant's value type is its enum; its payload types travel
+    /// beside it as exact `payload` and readable `payload_display` lists.
+    pub(super) fn payload(&self, symbol: &symbols::Symbol, value: &mut serde_json::Value) {
+        let payload = &symbol.details.payload;
+        if payload.is_empty() {
+            return;
+        }
+        let module = symbol.identity.as_ref().map(|i| i.module.as_str());
+        value["payload"] = serde_json::to_value(payload).expect("types serialize");
+        value["payload_display"] = payload
+            .iter()
+            .map(|ty| self.render(ty, module))
+            .collect::<Vec<_>>()
+            .into();
     }
 }
 

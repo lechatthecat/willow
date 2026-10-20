@@ -28,13 +28,21 @@ pub struct DeclarationDetails {
     pub type_params: Vec<String>,
     pub extends: Vec<Type>,
     pub implements: Vec<Type>,
+    /// Payload types of an enum variant; empty for unit variants.
+    pub payload: Vec<Type>,
 }
 
-pub(super) fn details(program: &Program) -> HashMap<Span, DeclarationDetails> {
-    details_of(program.items.iter())
+pub(super) fn details(
+    program: &Program,
+    checked: &crate::semantic::symbols::SymbolTable,
+) -> HashMap<Span, DeclarationDetails> {
+    details_of(program.items.iter(), checked)
 }
+/// `checked` supplies resolved payload types; generic template sources pass an
+/// empty table and keep the source spelling, like `declarations_of`.
 pub(super) fn details_of<'a>(
     items: impl Iterator<Item = &'a Item>,
+    checked: &crate::semantic::symbols::SymbolTable,
 ) -> HashMap<Span, DeclarationDetails> {
     let mut result = HashMap::new();
     for item in items {
@@ -100,14 +108,34 @@ pub(super) fn details_of<'a>(
                     },
                 );
             }
-            Item::Enum(e) if !e.type_params.is_empty() => {
-                result.insert(
-                    e.span,
-                    DeclarationDetails {
-                        type_params: e.type_params.clone(),
-                        ..Default::default()
-                    },
-                );
+            Item::Enum(e) => {
+                if !e.type_params.is_empty() {
+                    result.insert(
+                        e.span,
+                        DeclarationDetails {
+                            type_params: e.type_params.clone(),
+                            ..Default::default()
+                        },
+                    );
+                }
+                // Checked variants keep declaration order; pair them by index.
+                let info = checked.lookup_enum(&e.name);
+                for (i, v) in e.variants.iter().enumerate() {
+                    if v.payload.is_empty() {
+                        continue;
+                    }
+                    let payload = info
+                        .and_then(|info| info.variants.get(i))
+                        .filter(|c| c.name == v.name && c.payload_types.len() == v.payload.len())
+                        .map_or_else(|| v.payload.clone(), |c| c.payload_types.clone());
+                    result.insert(
+                        v.span,
+                        DeclarationDetails {
+                            payload,
+                            ..Default::default()
+                        },
+                    );
+                }
             }
             _ => {}
         }
@@ -556,7 +584,7 @@ pub(super) fn finish(
             // clone the whole generic parameter list onto each parameter.
             details: if matches!(
                 d.kind.as_str(),
-                "function" | "method" | "class" | "interface" | "enum"
+                "function" | "method" | "class" | "interface" | "enum" | "variant"
             ) {
                 captures
                     .get(&crate::module::ModuleId(d.span.file_id.0))

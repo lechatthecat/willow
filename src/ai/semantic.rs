@@ -689,7 +689,11 @@ impl QuerySession {
             if typed.iter().all(|s| s.ty == first.ty) {
                 let module = first.identity.as_ref().map(|i| i.module.as_str());
                 let display = self.names.render(first.ty.as_ref().unwrap(), module);
-                json!({"status":"ok","type":first.ty,"type_display":display,"location":first.location})
+                let mut result = json!({"status":"ok","type":first.ty,"type_display":display,"location":first.location});
+                if let [only] = typed[..] {
+                    self.names.payload(only, &mut result);
+                }
+                result
             } else {
                 json!({"status":"ambiguous","symbols":self.symbol_values(&symbols)})
             }
