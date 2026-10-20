@@ -37,6 +37,9 @@ pub(crate) struct MemberReference {
     /// The member token itself, excluding its qualifier and any payload.
     pub span: Span,
     pub kind: String,
+    /// Matched by a pattern rather than constructed or read.
+    #[serde(default)]
+    pub pattern: bool,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Facts {

@@ -2478,6 +2478,8 @@ impl TypeChecker {
                         fi.declaration_span,
                         args,
                     );
+                    // `m::f(..)` is a call, unlike a `m::CONST` member read.
+                    self.mark_last_member_use_call();
                     if !fi.public {
                         let defined_at = fi
                             .module_path

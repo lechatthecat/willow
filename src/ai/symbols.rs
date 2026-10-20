@@ -625,12 +625,14 @@ pub(super) fn finish(
                         start: r.span.start,
                         end: r.span.end,
                     };
+                    // `variant` constructs or reads it; `pattern` matches it.
+                    let role = if r.pattern { "pattern" } else { "variant" };
                     let key = (
                         location.path.clone(),
                         location.start,
                         location.end,
                         target.clone(),
-                        "variant".into(),
+                        role.into(),
                     );
                     references.insert(
                         key,
@@ -638,7 +640,7 @@ pub(super) fn finish(
                             identity: None,
                             target,
                             location,
-                            role: "variant".into(),
+                            role: role.into(),
                             ty: None,
                         },
                     );

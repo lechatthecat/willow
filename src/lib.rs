@@ -905,6 +905,7 @@ fn run_frontend_revision(
             let mut source = storage.hydrate(&module.program, module.id.file_id())?;
             if inputs.capture_analysis {
                 let mut metadata = ai::generics::Source::capture(&source);
+                metadata.class_templates = checkers[index].generics.class_template_spans();
                 metadata.logical_types = checkers[index].generics.logical_types.clone();
                 metadata.nominal_aliases =
                     std::mem::take(&mut checkers[index].generics.nominal_aliases);
@@ -918,6 +919,7 @@ fn run_frontend_revision(
         let mut body = storage.hydrate(&program, diagnostics::FileId::ENTRY)?;
         if inputs.capture_analysis {
             let mut metadata = ai::generics::Source::capture(&body);
+            metadata.class_templates = checkers[entry].generics.class_template_spans();
             metadata.logical_types = checkers[entry].generics.logical_types.clone();
             metadata.nominal_aliases =
                 std::mem::take(&mut checkers[entry].generics.nominal_aliases);
@@ -927,6 +929,7 @@ fn run_frontend_revision(
         checkers[entry].expand_generics(&mut body, &mut fresh_ids);
         storage.offload(&mut body)?;
         program = body.into_inner();
+        storage.inherit_generated_owners(&fresh_ids, &registry.borrow().origins);
         graph.artifacts = Some(storage);
     }
     let mut artifacts = graph.artifacts.take().expect("spooled import graph");

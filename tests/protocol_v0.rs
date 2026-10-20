@@ -230,6 +230,12 @@ fn human_check_and_legacy_cli_still_work() {
         let output = f.run(env!("CARGO_BIN_EXE_willow"), &args);
         assert!(output.status.success());
         assert!(output.stdout.is_empty());
+        // Success ends with a summary instead of silence.
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.ends_with("check ok: no errors, 0 warnings\n"),
+            "{stderr}"
+        );
     }
     let output = f.run(
         env!("CARGO_BIN_EXE_willow"),

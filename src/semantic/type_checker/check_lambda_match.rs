@@ -862,7 +862,7 @@ impl TypeChecker {
                 ..
             } = pattern
             {
-                self.record_variant_use(enum_name, variant, *variant_span);
+                self.record_variant_pattern(enum_name, variant, *variant_span);
             }
             if let Pattern::ClassDowncast {
                 class_name, span, ..

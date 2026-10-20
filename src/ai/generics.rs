@@ -5,6 +5,10 @@ use crate::semantic::analysis_symbols::{Declaration, Facts};
 
 #[derive(Default)]
 pub(crate) struct Source {
+    /// Declaration span of each generic class template this unit can name,
+    /// by its spelling here (`Box`, imported `Bag`, aliased `w::Bag`), as the
+    /// checker resolved it before expansion removed the templates.
+    pub class_templates: HashMap<String, Span>,
     pub imports: Vec<ImportDecl>,
     pub logical_types: HashMap<String, Type>,
     pub nominal_aliases: HashMap<String, String>,
@@ -77,6 +81,7 @@ impl Source {
             }
         }
         Self {
+            class_templates: HashMap::new(),
             imports: program.imports.clone(),
             logical_types: HashMap::new(),
             nominal_aliases: HashMap::new(),
@@ -109,6 +114,12 @@ pub(super) fn restore(
         .map(|d| ((d.span, d.kind.as_str(), source_spelling(&d.name)), d))
         .collect();
     let written: HashMap<_, _> = sources.values().flat_map(|s| &s.written).collect();
+    let class_declarations: HashMap<_, _> = sources
+        .values()
+        .flat_map(|s| &s.declarations)
+        .filter(|d| d.kind == "class")
+        .map(|d| (d.span, d))
+        .collect();
     // Local generated names can coincide in different modules. Index fully
     // qualified identities globally, and use a leaf only when unambiguous.
     let mut qualified_types = HashMap::new();
@@ -227,7 +238,18 @@ pub(super) fn restore(
                     r.target.kind.as_str(),
                     source_spelling(&r.target.name),
                 ));
-            restore(&mut r.target);
+            // Expanded programs drop their templates, so an annotation such as
+            // `Box<i64>` resolves to no checked class; it names the template.
+            let template = (r.role == "type" && r.target.kind == "builtin-type")
+                .then(|| {
+                    let span = sources.get(&unit)?.class_templates.get(&r.target.name)?;
+                    class_declarations.get(span).copied()
+                })
+                .flatten();
+            match template {
+                Some(template) => r.target = template.clone(),
+                None => restore(&mut r.target),
+            }
             if let Some(ty) = &mut r.ty {
                 *ty = normalize(ty);
             }

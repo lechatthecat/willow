@@ -208,11 +208,27 @@ impl Captured {
         self.bodies.push(Body::build(function, root, types));
     }
 }
+/// Status of one effect witness: a witness without a source location is
+/// `missing-source`; runtime capabilities are conservative bounds.
+fn evidence_status(witness: &Value) -> &'static str {
+    if witness["kind"] == "unavailable" {
+        "missing-witness"
+    } else if witness.get("cause").is_some() && !witness["cause"]["location"].is_object() {
+        "missing-source"
+    } else if witness["kind"] == "runtime-capability" {
+        "conservative-bound"
+    } else if witness["kind"] == "external-boundary" {
+        "external-boundary"
+    } else {
+        "compiler-fact"
+    }
+}
 pub(super) fn finish(
     captures: &HashMap<UnitId, CapturedUnit>,
     paths: &HashMap<UnitId, String>,
     functions: &HashMap<(UnitId, FunctionId), Function>,
     resolve: &impl Fn(UnitId, FunctionId) -> (UnitId, FunctionId),
+    bodyless: &impl Fn(UnitId, &FunctionId) -> bool,
     fingerprints: &HashMap<Span, String>,
 ) -> Result<SemanticFacts> {
     let location = |span: Span| -> Result<Location> {
@@ -230,7 +246,11 @@ pub(super) fn finish(
     units.sort();
     for unit in units {
         for (caller, span, target, operation) in &captures[&unit].semantic.call_sites {
-            if target.is_some_and(|target| functions.contains_key(&resolve(unit, target))) {
+            // Calls whose effects are already known without a body (variant
+            // constructors, intrinsics) do not explain an unknown caller.
+            if target.is_some_and(|target| {
+                functions.contains_key(&resolve(unit, target)) || bodyless(unit, &target)
+            }) {
                 continue;
             }
             if let Some(caller) = functions.get(&resolve(unit, *caller)) {
@@ -474,9 +494,10 @@ impl QuerySession {
         for (i, r) in snapshot.semantic.references.iter().enumerate() {
             if matches!(r.role.as_str(), "write" | "write-element") {
                 span(&r.location, WRITE, i);
-            } else if r.role == "call" {
-                // Only the callee token gets its callable type. Preserve the
-                // call expression and fall back to it for untyped targets.
+            } else if matches!(r.role.as_str(), "call" | "variant" | "pattern" | "type") {
+                // Only the callee, variant or type token gets its declared type
+                // (a pattern variant has no expression of its own). Preserve
+                // the call expression and fall back to it for untyped targets.
                 span(&r.location, DECLARATION, i);
             }
         }
@@ -841,7 +862,24 @@ impl QuerySession {
                         return json!({"revision":self.revision(),"result":typed});
                     }
                     let declared = self.declared_type_at(&file, byte);
-                    if write || matches!(declared["status"].as_str(), Some("ok" | "ambiguous")) {
+                    // A type token of `new Box<i64>(..)` keeps the
+                    // instantiation its expression carries; the declaration
+                    // only knows `Box<T>`.
+                    let instantiated = !write
+                        && segment.expression.flatten().is_some_and(|i| {
+                            let Some(Type::Generic(name, _)) =
+                                &self.snapshot.semantic.expressions[i].ty
+                            else {
+                                return false;
+                            };
+                            self.symbols_at(&file, byte).iter().any(|s| {
+                                matches!(&s.ty, Some(Type::Named(head) | Type::Generic(head, _)) if head == name)
+                            })
+                        });
+                    if !instantiated
+                        && (write
+                            || matches!(declared["status"].as_str(), Some("ok" | "ambiguous")))
+                    {
                         return json!({"revision":self.revision(),"result":declared});
                     }
                 }
@@ -1116,9 +1154,7 @@ impl QuerySession {
                                     continue;
                                 }
                                 *entry = json!({"effect":effect,
-                                    "status":if fact["witness"].get("cause").is_some() && !fact["witness"]["cause"]["location"].is_object() {"missing-source"}
-                                        else if fact["witness"]["kind"]=="runtime-capability" {"conservative-bound"}
-                                        else if fact["witness"]["kind"]=="external-boundary" {"external-boundary"}else{"compiler-fact"},
+                                    "status":evidence_status(&fact["witness"]),
                                     "via_function":self.snapshot.functions[via_function].id,"witness":fact["witness"]});
                             }
                         }
@@ -1165,6 +1201,10 @@ impl QuerySession {
                         self.snapshot.semantic.witnesses.get(&f.id).cloned();
                     if let Some(facts) = &mut compiler_witnesses {
                         self.present_lock_types(facts);
+                        // Every evidence line carries a status, local ones too.
+                        for fact in facts.iter_mut() {
+                            fact["status"] = json!(evidence_status(&fact["witness"]));
+                        }
                     }
                     json!({"status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
                         "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence,

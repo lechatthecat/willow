@@ -481,6 +481,47 @@ impl UnitArtifacts {
         Ok(())
     }
 
+    /// Generic expansion renumbers every body and expression, and instances
+    /// copy their template's. Bind each fresh id to the source syntax its
+    /// original (or its template's) id was parsed with. Linear in the owner
+    /// tables plus the recorded instance origins.
+    pub(crate) fn inherit_generated_owners(
+        &mut self,
+        fresh: &crate::semantic::type_checker::generics::FreshIds,
+        origins: &crate::semantic::type_checker::generics::GeneratedOrigins,
+    ) {
+        if self.syntax_owners.is_empty() && self.initializer_owners.is_empty() {
+            return;
+        }
+        let renumbered = fresh.bodies();
+        let generated = origins
+            .bodies
+            .iter()
+            .map(|(instance, template)| (template, instance));
+        let bodies: Vec<_> = renumbered
+            .iter()
+            .chain(generated)
+            .filter_map(|(source, fresh)| {
+                // Expansion renumbers an instance once more after creation.
+                let fresh = renumbered.get(fresh).unwrap_or(fresh);
+                Some((*fresh, self.syntax_owners.get(source)?.clone()))
+            })
+            .collect();
+        self.syntax_owners.extend(bodies);
+        // A renumbered initializer keeps its StaticId; only an instance's
+        // initializer needs its template's owner.
+        let renumbered = fresh.expressions();
+        let initializers: Vec<_> = origins
+            .initializers
+            .iter()
+            .filter_map(|(instance, template)| {
+                let owner = self.initializer_owners.get(template)?;
+                Some((*renumbered.get(instance).unwrap_or(instance), owner.clone()))
+            })
+            .collect();
+        self.initializer_owners.extend(initializers);
+    }
+
     pub(crate) fn snapshot_source(&mut self, id: FileId, source: &str) -> Result<()> {
         if !self.sources.contains_key(&id) {
             let artifact = self.write(&source)?;

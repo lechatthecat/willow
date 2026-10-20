@@ -872,6 +872,16 @@ pub(crate) fn snapshot(
                     ),
                 );
             }
+            // `import m::Item` alone still lets the checker call `m::f`: the
+            // module path resolves without a module import.
+            if !captured[&unit].declarations.contains_key(&id)
+                && let Some(target) = frontend
+                    .db
+                    .dependencies()
+                    .unit_for_path(unit, owner.as_ref())
+            {
+                return (target, FunctionId::free(id.name()));
+            }
         } else if !captured[&unit].declarations.contains_key(&id)
             && let Some((target, Some(item))) = aliases[&unit].get(id.name().as_ref())
         {
@@ -966,6 +976,15 @@ pub(crate) fn snapshot(
             _ => None,
         }
     };
+    // Effects of call targets with no Willow body: intrinsics, implicit
+    // initializers, variant constructors and builtin statics.
+    let bodyless_target_effects = |unit: UnitId, target: &FunctionId| {
+        crate::semantic::intrinsics::builtin_target_effects(target)
+            .or_else(|| bodyless_effects(&resolve(unit, *target)))
+            .or_else(|| {
+                crate::semantic::intrinsics::builtin_static_effects(target, &module_aliases[&unit])
+            })
+    };
     let (indirect_functions, indirect_calls) = indirect::infer(&captured, &nodes, &resolve);
     let incomplete_indirect: std::collections::HashSet<_> = indirect_functions
         .iter()
@@ -1052,16 +1071,7 @@ pub(crate) fn snapshot(
                 let key_target = resolve(unit, *target);
                 if let Some(node) = nodes.get(&key_target) {
                     edges.entry(key).or_default().insert(node.id.clone());
-                } else if let Some(effects) =
-                    crate::semantic::intrinsics::builtin_target_effects(target)
-                {
-                    bits |= effects.bits();
-                } else if let Some(effects) = bodyless_effects(&key_target).or_else(|| {
-                    crate::semantic::intrinsics::builtin_static_effects(
-                        target,
-                        &module_aliases[&unit],
-                    )
-                }) {
+                } else if let Some(effects) = bodyless_target_effects(unit, target) {
                     bits |= effects.bits();
                 } else {
                     unknown = true;
@@ -1159,7 +1169,14 @@ pub(crate) fn snapshot(
             }
         }
     }
-    let mut semantic = semantic::finish(&captured, &paths, &nodes, &resolve, &fingerprints)?;
+    let mut semantic = semantic::finish(
+        &captured,
+        &paths,
+        &nodes,
+        &resolve,
+        &|unit, target| bodyless_target_effects(unit, target).is_some(),
+        &fingerprints,
+    )?;
     let mut dispatch_sites = HashMap::new();
     for (&unit, capture) in &captured {
         for (&span, &target) in &capture.dispatch_sites {

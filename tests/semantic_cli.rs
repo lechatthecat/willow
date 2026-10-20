@@ -890,7 +890,12 @@ fn impact_groups_definitions_direct_and_indirect_callers() {
                 ),
                 (
                     "Indirect callers (only through another affected function): 4".into(),
-                    names(&["main::apply", "main::hop1", "main::main", "main::hop2"])
+                    names(&[
+                        "main::apply (distance 2)",
+                        "main::hop1 (distance 2)",
+                        "main::main (distance 2)",
+                        "main::hop2 (distance 3)",
+                    ])
                 ),
             ],
             "{selected}: {text}"
@@ -923,7 +928,7 @@ fn impact_groups_definitions_direct_and_indirect_callers() {
             ),
             (
                 "Indirect callers (only through another affected function): 2".into(),
-                names(&["main::hop2", "main::main"])
+                names(&["main::hop2 (distance 2)", "main::main (distance 2)"])
             ),
         ],
         "{text}"
@@ -961,7 +966,7 @@ fn impact_groups_definitions_direct_and_indirect_callers() {
         groups[2],
         (
             "Indirect callers (only through another affected function): 1".into(),
-            names(&["main::main"])
+            names(&["main::main (distance 2)"])
         ),
         "{text}"
     );
@@ -4689,4 +4694,197 @@ fn variant_symbol_and_type_report_module_qualified_payloads() {
         caption["result"]["type_display"],
         "fn(shapes::Label) -> shapes::Label"
     );
+}
+
+#[test]
+fn module_qualified_calls_and_unit_variants_resolve_in_effects_impact_and_refs() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/v.wi"),
+        "module v;\npub enum V { Nil, Num(i64) }\npub fn wrap(x: V) -> V { return x; }\n",
+    )
+    .unwrap();
+    // `import v::V` alone: `v::wrap` resolves through the module path.
+    for import in ["import v::V;", "import v;\nimport v::V;"] {
+        fs::write(
+            f.0.join("src/main.wi"),
+            format!(
+                "module main;\n{import}\nfn both() -> V {{\n    let t = V::Nil;\n    return v::wrap(t);\n}}\nfn main() {{ both(); }}\n"
+            ),
+        )
+        .unwrap();
+        let effects = f.json(&["effects", "main::both"], 0);
+        assert_eq!(effects["result"]["runtime_effects"], 1, "{effects}");
+        let effects = String::from_utf8(f.run(&["effects", "main::both"]).stdout).unwrap();
+        assert!(effects.starts_with("effects main::both: ok"), "{effects}");
+        assert!(!effects.contains("Unresolved call"), "{effects}");
+        let impact = f.json(&["impact", "v::wrap"], 0);
+        let nodes = impact["result"]["impact"]["nodes"].as_array().unwrap();
+        let relations: Vec<_> = nodes
+            .iter()
+            .map(|n| {
+                (
+                    n["selector"].as_str().unwrap(),
+                    n["relation"].as_str().unwrap(),
+                    n["unknown"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert!(
+            relations.contains(&("main::both", "direct-caller", false)),
+            "{relations:?}"
+        );
+        let refs = f.json(&["refs", "v::wrap"], 0);
+        let roles: Vec<_> = refs["result"]["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["call"], "{refs}");
+    }
+    // An unknown caller lists only the call that lacks a summary, not the
+    // variant constructor whose effect is known without a body.
+    fs::write(
+        f.0.join("src/main.wi"),
+        "module main;\nimport v::V;\npub interface Sh { fn go(self) -> V; }\npub fn both(s: Sh) -> V {\n    let t = V::Nil;\n    s.go();\n    return v::wrap(t);\n}\nfn main() { }\n",
+    )
+    .unwrap();
+    let effects = String::from_utf8(f.run(&["effects", "main::both"]).stdout).unwrap();
+    assert!(effects.contains("Unresolved call `go`"), "{effects}");
+    assert!(!effects.contains("V::Nil"), "{effects}");
+    assert!(!effects.contains("v::wrap"), "{effects}");
+}
+
+#[test]
+fn pattern_variant_tokens_report_enum_type_and_pattern_role() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/v.wi"),
+        "module v;\npub enum V { Nil, Num(i64) }\n",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "module main;\nimport v::V;\nclass Box<T> {\n    pub v: T;\n    pub init(self, v: T) { self.v = v; }\n}\nfn f(x: V) -> i64 {\n    match x {\n        V::Num(n) => { return n; }\n        V::Nil => { return 0; }\n    }\n    return 1;\n}\nfn main() { let k = V::Num(3); let b = new Box<i64>(1); println(f(k) + b.v); }\n",
+    )
+    .unwrap();
+    let human = |args: &[&str]| {
+        let output = f.run(args);
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    // Pattern enum and variant tokens, construction tokens: the enum type,
+    // with the payload on a payload variant; never the enclosing `match`.
+    for (position, payload) in [
+        ("src/main.wi:9:9", None),
+        ("src/main.wi:9:12", Some("Payload: (i64)")),
+        ("src/main.wi:10:12", None),
+        ("src/main.wi:14:24", Some("Payload: (i64)")),
+    ] {
+        let text = human(&["type", position]);
+        assert!(text.contains("Type: v::V\n"), "{position}: {text}");
+        assert_eq!(
+            payload.is_some_and(|p| text.contains(p)),
+            payload.is_some(),
+            "{position}: {text}"
+        );
+    }
+    // A pattern binding keeps its own type.
+    assert!(human(&["type", "src/main.wi:9:16"]).contains("Type: i64\n"));
+    // A generic class token keeps the instantiation of its `new` expression.
+    let text = human(&["type", "src/main.wi:14:44"]);
+    assert!(text.contains("Type: main::Box<i64>\n"), "{text}");
+    // Human --explain stays line-oriented: the answering expression, no JSON.
+    let text = human(&["type", "src/main.wi:14:44", "--explain"]);
+    assert!(text.contains("Typed at: src/main.wi:14:"), "{text}");
+    assert!(!text.contains('{'), "{text}");
+    // Construction and pattern references are distinguished.
+    let refs = f.json(&["refs", "v::V::Num"], 0);
+    let roles: Vec<_> = refs["result"]["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["location"]["line"].as_u64().unwrap(),
+                r["role"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(roles, [(9, "pattern"), (14, "variant")], "{refs}");
+    let text = human(&["refs", "v::V::Nil"]);
+    assert!(text.contains("src/main.wi:10:12 pattern"), "{text}");
+}
+
+#[test]
+fn generic_class_annotations_reference_the_template() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/v.wi"),
+        "module v;\npub class Bag<T> {\n    pub v: T;\n    pub init(self, v: T) { self.v = v; }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "module main;\nimport v::Bag;\nimport v as w;\nclass Box<T> {\n    pub v: T;\n    pub init(self, v: T) { self.v = v; }\n    pub fn same(self) -> Box<T> { return self; }\n}\nfn g(b: Box<i64>) -> Box<i64> { return b; }\nfn h(b: Bag<i64>, c: w::Bag<i64>) -> i64 { return b.v + c.v; }\nfn main() { let b = new Box<i64>(3); let c = new Bag<i64>(4); println(g(b).same().v + h(c, c)); }\n",
+    )
+    .unwrap();
+    let locations = |selector: &str| -> Vec<String> {
+        let refs = f.json(&["refs", selector], 0);
+        refs["result"]["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["role"] == "type")
+            .map(|r| format!("{}:{}", r["location"]["line"], r["location"]["column"]))
+            .collect()
+    };
+    // Template body, parameter, return and `new` annotations of a local
+    // generic class all name its declaration.
+    assert_eq!(
+        locations("main::Box"),
+        ["7:26", "9:9", "9:22", "11:25"],
+        "local generic class"
+    );
+    // An imported template, spelled through a direct import or a module alias.
+    assert_eq!(
+        locations("v::Bag"),
+        ["10:9", "10:25", "11:50"],
+        "imported generic class"
+    );
+    let output = f.run(&["symbol", "src/main.wi:10:25"]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Symbol: v::Bag (class)"), "{text}");
+}
+
+#[test]
+fn every_effect_evidence_line_has_a_status() {
+    let f = Fixture::new();
+    // The callee's allocation is the cited evidence, so the local send's
+    // allocation witness is listed on its own line.
+    fs::write(
+        f.0.join("src/main.wi"),
+        "module main;\nclass Box { pub n: i64; }\nfn make(k: i64) -> Box { return new Box(10 / k); }\nasync fn worker(out: Channel<Box>, k: i64) {\n    out.send(make(k));\n}\nfn main() { }\n",
+    )
+    .unwrap();
+    let output = f.run(&["effects", "main::worker"]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    let evidence: Vec<_> = text
+        .lines()
+        .filter(|line| line.starts_with("  may-"))
+        .collect();
+    assert!(
+        evidence
+            .iter()
+            .any(|line| line.contains("operation=builtin-method-call")),
+        "{text}"
+    );
+    for line in evidence {
+        assert!(line.contains(": status="), "{text}");
+    }
+    let value = f.json(&["effects", "main::worker", "--explain"], 0);
+    for fact in value["result"]["compiler_witnesses"].as_array().unwrap() {
+        assert!(fact["status"].is_string(), "{value}");
+    }
 }

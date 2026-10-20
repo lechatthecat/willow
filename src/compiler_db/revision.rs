@@ -272,18 +272,27 @@ pub(crate) fn tracked_body_owners(
         )))
         .collect();
     let index = &artifacts.bodies;
+    // Keyed by StaticId: generic expansion renumbers initializer expressions,
+    // and both the parsed and the expanded initializer body stay indexed.
+    let statics: HashMap<_, _> = artifacts
+        .initializer_owners
+        .iter()
+        .filter_map(|(expr, (file, owner))| {
+            Some((index.static_id(*expr)?, (paths.get(file)?, owner)))
+        })
+        .collect();
     let mut result = HashMap::new();
     for (body, _) in index.entries() {
-        if let Some((file, owner)) = artifacts.syntax_owners.get(&index.source_body(body))
-            && let Some(path) = paths.get(file)
-        {
-            result.insert(body, (path.clone(), owner.clone()));
-        }
-    }
-    for (expr, (file, owner)) in &artifacts.initializer_owners {
-        if let Some(body) = index.initializer_body(*expr)
-            && let Some(path) = paths.get(file)
-        {
+        let owner = match index.owner(body) {
+            Some((_, crate::compiler_db::ids::BodyOwner::StaticInitializer(id))) => {
+                statics.get(&id).copied()
+            }
+            _ => artifacts
+                .syntax_owners
+                .get(&index.source_body(body))
+                .and_then(|(file, owner)| Some((paths.get(file)?, owner))),
+        };
+        if let Some((path, owner)) = owner {
             result.insert(body, (path.clone(), owner.clone()));
         }
     }
@@ -1947,5 +1956,58 @@ mod tests {
         );
         assert!(f.compare(&mut warm));
         assert_eq!(warm.reused_bodies, 2);
+    }
+    #[test]
+    fn revision_lambda_edit_in_generic_instantiation_keeps_effect_bindings() {
+        let f = Fixture::new();
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        f.write("main.wi", "import sim; fn main() { println(sim::run(0)); }");
+        f.write("data.wi", "pub class Patient { pub id: i64; }");
+        f.write(
+            "pq.wi",
+            "pub class Heap<T> { less: closure(T, T) -> bool; pub init(self, less: closure(T, T) -> bool) { self.less = less; } pub fn check(self, x: T) -> bool { let less = self.less; return less(x, x); } }",
+        );
+        let sim = |bias: i64| {
+            format!(
+                "import pq::Heap; import data::Patient; fn target(p: Patient) -> bool {{ return p.id > 0; }} pub fn run(b: i64) -> bool {{ let h = new Heap<Patient>(|a: Patient, c: Patient| target(a) && b >= {bias}); return h.check(new Patient(1)); }}"
+            )
+        };
+        f.write("sim.wi", &sim(0));
+        assert!(f.compare(&mut warm));
+        f.write("sim.wi", &sim(1));
+        assert!(f.compare(&mut warm));
+        f.write("sim.wi", &sim(0));
+        assert!(f.compare(&mut warm));
+    }
+    #[test]
+    fn revision_generic_instances_bind_template_syntax() {
+        let f = Fixture::new();
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        f.write("main.wi", "import lib; fn main() { println(lib::run()); }");
+        let lib = |template: &str, user: &str| {
+            format!(
+                "interface Show<T> {{ fn get(self) -> T; fn show(self) -> T {{ return self.get(); }} }} class Num implements Show<i64> {{ pub fn get(self) -> i64 {{ return 1; }} }} class Counter {{ pub static base: i64 = 7; }} class Box<T> {{ pub static made: i64 = 3; pub v: T; pub fn get(self) -> T {{ {template} }} pub fn made(self) -> i64 {{ return Box::made; }} }} fn twice<T>(x: T, f: closure(T) -> T) -> T {{ return f(f(x)); }} pub fn run() -> i64 {{ let b = new Box<i64>(Counter::base); return twice(b.get(), |x: i64| x + {user}) + new Num().show() + b.made(); }}"
+            )
+        };
+        f.write("lib.wi", &lib("return self.v;", "1"));
+        assert!(f.compare(&mut warm));
+        assert!(f.compare(&mut warm));
+        // A user-body edit and a template-body edit both match a cold build.
+        f.write("lib.wi", &lib("return self.v;", "2"));
+        assert!(f.compare(&mut warm));
+        f.write("lib.wi", &lib("let v = self.v; return v;", "2"));
+        assert!(f.compare(&mut warm));
+        f.write(
+            "lib.wi",
+            &lib("let v = self.v; return v;", "2").replace("= 7", "= 8"),
+        );
+        assert!(f.compare(&mut warm));
+        f.write(
+            "lib.wi",
+            &lib("let v = self.v; return v;", "2").replace("= 3", "= 4"),
+        );
+        assert!(f.compare(&mut warm));
     }
 }

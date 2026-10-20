@@ -206,7 +206,22 @@ impl CliCommand {
             Self::Package(command) => command.execute(),
             Self::Build(command) => command.execute(),
             Self::Check(command) => {
-                command.execute_with(&mut willow_compiler::diagnostics::HumanEmitter, false)
+                let mut emitter = CountingEmitter {
+                    inner: &mut willow_compiler::diagnostics::HumanEmitter,
+                    warnings: 0,
+                };
+                let emits_ir = command.emit_hir || command.emit_lir;
+                command.execute_with(&mut emitter, false)?;
+                // Success is otherwise silent after the `checking` header.
+                // IR emission prints its dump and runs no check.
+                if !emits_ir {
+                    eprintln!(
+                        "check ok: no errors, {} warning{}",
+                        emitter.warnings,
+                        if emitter.warnings == 1 { "" } else { "s" }
+                    );
+                }
+                Ok(())
             }
             Self::Run(command) => command.execute(),
             Self::Debug(command) => command.execute(),
@@ -747,6 +762,24 @@ fn temp_path(path: impl AsRef<std::path::Path>) -> String {
         .join(path)
         .to_string_lossy()
         .into_owned()
+}
+
+/// Forwards diagnostics while counting warnings for the human summary.
+struct CountingEmitter<'a> {
+    inner: &'a mut dyn willow_compiler::diagnostics::DiagnosticEmitter,
+    warnings: usize,
+}
+impl willow_compiler::diagnostics::DiagnosticEmitter for CountingEmitter<'_> {
+    fn emit(
+        &mut self,
+        diagnostic: &willow_compiler::diagnostics::Diagnostic,
+        sources: &dyn willow_compiler::diagnostics::source_map::SourceLookup,
+    ) -> std::io::Result<()> {
+        if diagnostic.severity == willow_compiler::diagnostics::Severity::Warning {
+            self.warnings += 1;
+        }
+        self.inner.emit(diagnostic, sources)
+    }
 }
 
 fn execute_compiler(

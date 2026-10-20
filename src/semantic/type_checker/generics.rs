@@ -44,6 +44,16 @@ pub(crate) struct TemplateRegistry {
     function_copies: usize,
     #[cfg(test)]
     class_copies: usize,
+    /// Template provenance of instantiated bodies and field initializers,
+    /// instance id -> template id. Revision tracking binds each generated
+    /// body to its template's source syntax.
+    pub origins: GeneratedOrigins,
+}
+
+#[derive(Default)]
+pub(crate) struct GeneratedOrigins {
+    pub bodies: HashMap<BodyId, BodyId>,
+    pub initializers: HashMap<ExprId, ExprId>,
 }
 
 impl TemplateRegistry {
@@ -121,6 +131,17 @@ pub(crate) struct Generics {
     /// by the default at that method index of the instance checked in that
     /// unit (willow-s71l).
     pub default_copies: HashMap<String, HashMap<String, (Rc<InterfaceDecl>, usize)>>,
+}
+
+impl Generics {
+    /// Each generic class template this checker can name, by spelling, to its
+    /// declaration span. Analysis needs it after expansion drops templates.
+    pub(crate) fn class_template_spans(&self) -> HashMap<String, Span> {
+        self.classes
+            .iter()
+            .map(|(name, template)| (name.clone(), template.span))
+            .collect()
+    }
 }
 
 enum InstantiationTypeRef<'a> {
@@ -697,6 +718,21 @@ pub(crate) struct FreshIds {
     patterns: HashMap<PatternId, PatternId>,
 }
 impl FreshIds {
+    /// Original id -> fresh id of every renumbered block.
+    pub(crate) fn bodies(&self) -> &HashMap<BodyId, BodyId> {
+        &self.bodies
+    }
+    /// Original id -> fresh id of every renumbered expression.
+    pub(crate) fn expressions(&self) -> &HashMap<ExprId, ExprId> {
+        &self.expressions
+    }
+    fn record_bodies(&self, origins: &mut GeneratedOrigins) {
+        origins.bodies.extend(
+            self.bodies
+                .iter()
+                .map(|(&template, &instance)| (instance, template)),
+        );
+    }
     fn body(&mut self, id: BodyId) -> BodyId {
         *self.bodies.entry(id).or_insert_with(BodyId::fresh)
     }
@@ -1407,7 +1443,8 @@ impl TypeChecker {
                 f.type_params.clear();
                 let (bindings, classes) = self.instantiation_bindings(span, &bindings);
                 let mut item = Item::Function(f);
-                substitute_item(&mut item, &bindings);
+                substitute_item(&mut item, &bindings)
+                    .record_bodies(&mut self.generics.registry.borrow_mut().origins);
                 self.generics
                     .pending
                     .push_back(Instantiation { item, classes });
@@ -1577,6 +1614,7 @@ impl TypeChecker {
         let (bindings, classes) = self.instantiation_bindings(span, &bindings);
         self.register_shared_instantiation_types(&classes);
         let mut item = Item::Class(class);
+        let mut ids = FreshIds::default();
         visit_item(
             &mut item,
             &mut |ty| crate::semantic::generic_inference::substitute(ty, &bindings),
@@ -1584,8 +1622,22 @@ impl TypeChecker {
             true,
             true,
             Some((&template.name, &local_name)),
-            &mut FreshIds::default(),
+            &mut ids,
         );
+        {
+            let mut registry = self.generics.registry.borrow_mut();
+            ids.record_bodies(&mut registry.origins);
+            for field in &template.fields {
+                if let Some(initializer) = &field.initializer
+                    && let Some(&instance) = ids.expressions.get(&initializer.id())
+                {
+                    registry
+                        .origins
+                        .initializers
+                        .insert(instance, initializer.id());
+                }
+            }
+        }
         let Item::Class(mut class) = item else {
             unreachable!()
         };
@@ -1823,7 +1875,8 @@ impl TypeChecker {
             span: template.span,
         };
         let mut item = Item::Interface(instance);
-        substitute_item(&mut item, &bindings);
+        substitute_item(&mut item, &bindings)
+            .record_bodies(&mut self.generics.registry.borrow_mut().origins);
         let Item::Interface(instance) = item else {
             unreachable!()
         };
@@ -2071,7 +2124,8 @@ impl TypeChecker {
     }
 }
 
-fn substitute_item(item: &mut Item, bindings: &HashMap<String, Type>) {
+fn substitute_item(item: &mut Item, bindings: &HashMap<String, Type>) -> FreshIds {
+    let mut ids = FreshIds::default();
     visit_item(
         item,
         &mut |ty| crate::semantic::generic_inference::substitute(ty, bindings),
@@ -2079,8 +2133,9 @@ fn substitute_item(item: &mut Item, bindings: &HashMap<String, Type>) {
         true,
         true,
         None,
-        &mut FreshIds::default(),
+        &mut ids,
     );
+    ids
 }
 
 fn visit_item(

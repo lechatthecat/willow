@@ -107,6 +107,12 @@ impl TypeChecker {
         }
     }
     pub(super) fn record_variant_use(&mut self, owner: &str, name: &str, span: Span) {
+        self.record_variant_reference(owner, name, span, false);
+    }
+    pub(super) fn record_variant_pattern(&mut self, owner: &str, name: &str, span: Span) {
+        self.record_variant_reference(owner, name, span, true);
+    }
+    fn record_variant_reference(&mut self, owner: &str, name: &str, span: Span, pattern: bool) {
         if self.capture_call_sites
             && let Some(info) = self.symbols.lookup_enum(owner)
         {
@@ -116,6 +122,7 @@ impl TypeChecker {
                     name: name.into(),
                     span,
                     kind: "variant".into(),
+                    pattern,
                 },
             );
         }
@@ -315,6 +322,14 @@ impl TypeChecker {
                 self.analysis_symbols.references.last_mut().unwrap().ty =
                     Some(Type::Fn(params.to_vec(), Box::new(result.clone())));
             }
+        }
+    }
+    /// Re-role the member use just recorded as a call.
+    pub(super) fn mark_last_member_use_call(&mut self) {
+        if self.capture_call_sites
+            && let Some(r) = self.analysis_symbols.references.last_mut()
+        {
+            r.role = "call".into();
         }
     }
     /// A successfully checked member call that recorded no source method is a

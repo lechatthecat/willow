@@ -521,14 +521,20 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
                     counts[g]
                 ));
             }
+            // Indirect callers are ordered by call distance, then name; the
+            // distance makes that order visible.
             lines.push(format!(
-                "  {}{}",
+                "  {}{}{}",
                 if node["kind"] == "lambda" {
                     "lambda "
                 } else {
                     ""
                 },
-                node["selector"].as_str().unwrap_or("unknown symbol")
+                node["selector"].as_str().unwrap_or("unknown symbol"),
+                match (group(node), node["distance"].as_u64()) {
+                    (Some(2), Some(distance)) => format!(" (distance {distance})"),
+                    _ => String::new(),
+                }
             ));
         }
         lines.push(format!(
@@ -546,8 +552,10 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
     if let Some(reason) = result["impact"]["reason"].as_str() {
         lines.push(reason.into());
     }
-    if options.explain {
-        lines.push(serde_json::to_string_pretty(result).unwrap());
+    // Human `--explain` stays line-oriented; `--format json --explain` keeps
+    // the full facts (fingerprints, flow, witnesses).
+    if options.explain && options.command == "type" && result["location"].is_object() {
+        lines.push(format!("Typed at: {}", location(&result["location"])));
     }
     lines
 }
