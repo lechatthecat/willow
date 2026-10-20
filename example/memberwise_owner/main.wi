@@ -1,0 +1,8 @@
+import secrets::Plain;
+import secrets::Gen;
+
+fn main() {
+    println(Plain::make(1).copy().get());
+    println(Gen<i64>::make(2).copy().get());
+    println(Gen<String>::make("kept").copy().get());
+}

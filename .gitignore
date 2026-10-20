@@ -98,3 +98,7 @@ AGENTS.md
 /docs/audits/willow-jz15.114/*
 !/docs/audits/willow-jz15.114/audit.md
 !/docs/audits/willow-jz15.114/verify.sh
+
+# Public memberwise-owner visibility audit and focused reproducer.
+!/docs/audits/willow-jz15.104-memberwise-owner.md
+!/docs/audits/willow-jz15.104-checks.sh

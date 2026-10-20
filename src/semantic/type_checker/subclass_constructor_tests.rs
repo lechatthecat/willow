@@ -201,3 +201,118 @@ fn subclass_constructor_recovery_preserves_real_arity_errors() {
         assert_eq!(missing(&errors), 0, "{errors:?}");
     }
 }
+
+#[test]
+fn memberwise_owner_private_factory_matrix() {
+    for module in [false, true] {
+        for generic in [false, true] {
+            for instance in [false, true] {
+                let (params, ty, own) = if generic {
+                    ("<T>", "T", "Secret<T>")
+                } else {
+                    ("", "i64", "Secret")
+                };
+                let (modifier, receiver) = if instance {
+                    ("", "self, ")
+                } else {
+                    ("static ", "")
+                };
+                let source = format!(
+                    "pub class Secret{params} {{ value: {ty}; pub {modifier}fn make({receiver}x: {ty}) -> {own} {{ return new {own}(x); }} }}"
+                );
+                let errors = check(&source, module);
+                assert!(
+                    errors.is_empty(),
+                    "module={module} generic={generic} instance={instance}: {errors:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn memberwise_owner_external_access_matrix() {
+    for module in [false, true] {
+        for generic in [false, true] {
+            for other_class in [false, true] {
+                let (params, ty, own) = if generic {
+                    ("<T>", "T", "Secret<i64>")
+                } else {
+                    ("", "i64", "Secret")
+                };
+                let body = format!("let x = new {own}(1);");
+                let caller = if other_class {
+                    format!("class Other {{ pub static fn make() {{ {body} }} }}")
+                } else {
+                    format!("fn external() {{ {body} }}")
+                };
+                let source = format!("pub class Secret{params} {{ value: {ty}; }} {caller}");
+                let errors = check(&source, module);
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(errors[0].code, ErrorCode::E0501, "{errors:?}");
+                assert!(errors[0].helps.iter().any(|h| h.contains("factory method")));
+            }
+        }
+    }
+}
+
+#[test]
+fn memberwise_owner_visibility_and_inheritance() {
+    for module in [false, true] {
+        for visibility in ["pub", "prot"] {
+            let source = format!(
+                "pub class C {{ {visibility} x: i64; pub static fn make(x: i64) -> C {{ return new C(x); }} }}"
+            );
+            let errors = check(&source, module);
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+        for visibility in ["", "prot", "pub"] {
+            let source = format!(
+                "open class Base {{ {visibility} x: i64; }} class Child extends Base {{ pub static fn make() -> Child {{ return new Child(1); }} }}"
+            );
+            let errors = check(&source, module);
+            if visibility.is_empty() {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(errors[0].code, ErrorCode::E0501);
+            } else {
+                assert!(errors.is_empty(), "{errors:?}");
+            }
+        }
+        for (arg, code) in [("", ErrorCode::E0845), ("true", ErrorCode::E0201)] {
+            let source = format!(
+                "class C {{ x: i64; pub static fn make() -> C {{ return new C({arg}); }} }}"
+            );
+            let errors = check(&source, module);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].code, code);
+        }
+    }
+}
+
+#[test]
+fn memberwise_owner_repeated_calls_field_walk_counts() {
+    for module in [false, true] {
+        for fields in [1, 8, 32] {
+            for calls in [1, 8, 32] {
+                let mut source = String::from("class C {");
+                for i in 0..fields {
+                    source.push_str(&format!("x{i}: i64;"));
+                }
+                source.push_str("pub static fn exercise() {");
+                let args = vec!["1"; fields].join(",");
+                for i in 0..calls {
+                    source.push_str(&format!("let c{i} = new C({args});"));
+                }
+                source.push_str("} }");
+                FIELD_CHAIN_VISITS.with(|n| n.set(0));
+                let errors = check(&source, module);
+                assert!(errors.is_empty(), "{errors:?}");
+                let visits = FIELD_CHAIN_VISITS.with(|n| n.get());
+                assert_eq!(visits, calls);
+                eprintln!(
+                    "memberwise module={module} fields={fields} calls={calls} chain_visits={visits}"
+                );
+            }
+        }
+    }
+}

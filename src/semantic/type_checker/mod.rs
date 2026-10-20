@@ -866,7 +866,10 @@ impl TypeChecker {
                         .map(|field| (field_name.clone(), field))
                 })
                 .collect::<Vec<_>>();
-            chain.push((class.name.clone(), class_fields));
+            // Keep the lookup owner, as lookup_field_in_hierarchy does: module
+            // bodies bind their receiver under a local alias, while ClassInfo::name
+            // can be qualified. Visibility compares against that receiver key.
+            chain.push((name, class_fields));
             current = class.base_class.clone();
         }
 

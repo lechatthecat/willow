@@ -354,3 +354,6 @@ mod async_frame_safepoints;
 
 #[path = "integration/imported_error_identity.rs"]
 mod imported_error_identity;
+
+#[path = "integration/memberwise_owner.rs"]
+mod memberwise_owner;
