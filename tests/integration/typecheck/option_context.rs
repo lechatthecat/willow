@@ -183,7 +183,10 @@ fn option_context_17_nested_variant_wrong_arity_is_rejected() {
 fn option_context_18_bare_none_without_context_stays_unresolved() {
     assert_compile_error_contains(
         "fn main() { let value = None; }",
-        &["error[E0350]", "cannot find variable `None`"],
+        &[
+            "error[E0202]",
+            "shorthand `None` needs an expected `Option` type",
+        ],
     );
 }
 

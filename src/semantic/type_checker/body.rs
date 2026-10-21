@@ -714,6 +714,7 @@ mod tests {
             return;
         }
         let mut checker = TypeChecker::new();
+        crate::register_prelude(&mut checker).unwrap();
         checker.check_program(program);
         let mut seen = HashSet::new();
         while let Some(instance) = checker.generics.pending.pop_front() {
@@ -1461,6 +1462,9 @@ mod tests {
             {
                 continue;
             }
+            // Interface defaults are injected before checking, as in the driver.
+            let desugared = crate::desugar::DesugarPass::run(&mut program, &mut []);
+            assert!(desugared.diagnostics.is_empty(), "{}", path.display());
             expand_generics(&mut program);
             let (checker, _, _) = compare_program(program);
             assert_eq!(checker.inline_lambda_rechecks, 0, "{}", path.display());

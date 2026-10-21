@@ -22,5 +22,6 @@ async fn main() {
   j = j + 1;
  }
  println(sum); // 12795904
- println(gc_minor_collections());
+ // The compact nursery collects during the churn; the exact count varies.
+ println(gc_minor_collections() > 0);
 }

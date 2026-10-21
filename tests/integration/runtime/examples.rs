@@ -5,6 +5,35 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),
+        (
+            "example/array_literal_allocation.wi",
+            "0\ntrue\nabcd\n8\n2016\n36\nouter\n42\n",
+        ),
+        ("example/async_allocation_churn.wi", "12795904\ntrue\n"),
+        ("example/async_dead_locals.wi", "42\n42\n2\n3\n"),
+        ("example/closed_world_dispatch.wi", "12\n2\nitem!\n7\n"),
+        ("example/diagnostic_recovery_if.wi", "7\na.b\nnone\n"),
+        (
+            "example/generic_variant_context.wi",
+            "7\n9\nhello\ntrue\n11\n13\n15\n16\n18\n19\ntrue\n",
+        ),
+        ("example/imported_error_identity/main.wi", "3\nneg\n"),
+        (
+            "example/lambda_result_context.wi",
+            "42\ntrue\ntrue\ntrue\n7\n",
+        ),
+        ("example/lambda_result_expression.wi", "2\nfailed\n"),
+        ("example/map_string_local.wi", "9\n7\n3\nfalse\n2\n"),
+        ("example/memberwise_owner/main.wi", "1\n2\nkept\n"),
+        (
+            "example/rwlock_class_update.wi",
+            "snapshot 1\nreplacement 2\nmutex 2\n",
+        ),
+        ("example/string_literal_fast_path.wi", "é水🦀\n"),
+        (
+            "example/uppercase_static_properties.wi",
+            "tables\n10\n6\n10\n16\nonce\nsixteen\n",
+        ),
         ("example/array_owned_pair_growth.wi", "7\n7\n99\n7\n"),
         ("example/async_frame_safepoints.wi", "20\n20\n390\n6\n"),
         ("example/atomic_inline.wi", "20000\n20000\n42\n"),

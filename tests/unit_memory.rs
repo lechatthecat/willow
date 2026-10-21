@@ -99,17 +99,44 @@ fn normalized_unit_provenance_preserves_lambdas_before_await_and_builtin_aliases
         for captures in [false, true] {
             let project = Project::new();
             let callable = if captures { "closure" } else { "fn" };
-            let extra = if captures { "extra" } else { "2" };
-            let source = format!(
-                "import std::collections::Array as Values;\n\
-                 fn apply(f: {callable}(i64) -> i64, value: i64) -> i64 {{ return f(value); }}\n\
-                 async fn fetch(value: i64) -> i64 {{ await yield(); return value; }}\n\
-                 pub async fn run() -> i64 {{\n\
-                     let values: Values<i64> = [40];\n\
-                     let extra = 2;\n\
-                     return apply(|n: i64| n + {extra}, await fetch(values[0]));\n\
-                 }}\n"
-            );
+            let source = |tail: &str| {
+                format!(
+                    "import std::collections::Array as Values;\n\
+                     fn apply(f: {callable}(i64) -> i64, value: i64) -> i64 {{ return f(value); }}\n\
+                     async fn fetch(value: i64) -> i64 {{ await yield(); return value; }}\n\
+                     pub async fn run() -> i64 {{\n\
+                         let values: Values<i64> = [40];\n\
+                         let extra = 2;\n\
+                         {tail}\n\
+                     }}\n"
+                )
+            };
+            let before_await = source(&format!(
+                "return apply(|n: i64| n + {}, await fetch(values[0]));",
+                if captures { "extra" } else { "2" }
+            ));
+            // A closure value is not `Send`, so it cannot stay live across the
+            // operand's suspension; capturing lambdas follow the await instead.
+            let source = if captures {
+                let project = Project::new();
+                std::fs::write(
+                    project.0.join("main.wi"),
+                    format!("{before_await} async fn main() {{ println(await run()); }}"),
+                )
+                .unwrap();
+                let output = project.build(false);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    !output.status.success() && stderr.contains("error[E2402]"),
+                    "{stderr}"
+                );
+                source(
+                    "let fetched = await fetch(values[0]);\n\
+                     return apply(|n: i64| n + extra, fetched);",
+                )
+            } else {
+                before_await
+            };
             if module {
                 std::fs::write(project.0.join("worker.wi"), source).unwrap();
                 std::fs::write(

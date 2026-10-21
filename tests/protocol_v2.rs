@@ -1177,7 +1177,7 @@ fn symbol_filters_readable_types_and_compact_query_paths() {
     assert_eq!(results[6]["total"], all.len());
     assert!(all.contains(&"Box".to_owned()));
     assert_eq!(results[7]["status"], "ok");
-    assert_eq!(results[7]["type_display"], "shapes::Box");
+    assert_eq!(results[7]["type_display"], "fn(i64) -> shapes::Box");
 
     // Returned identities and paths can be reused without saving analysis state.
     let all_symbols = results[6]["symbols"].as_array().unwrap();

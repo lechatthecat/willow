@@ -68,6 +68,10 @@ fn direct_checker_warnings_use_check_project_paths() {
     );
     let check_stderr = String::from_utf8(check.stderr).unwrap();
     let expected = &check_stderr[check_stderr.find("warning[W2003]").unwrap()..];
+    // `check` alone ends with its success summary; queries print none.
+    let expected = expected
+        .strip_suffix("check ok: no errors, 2 warnings\n")
+        .unwrap_or_else(|| panic!("{expected}"));
     assert!(expected.contains("warning[W2003]"), "{expected}");
     for file in ["main.wi", "order.wi"] {
         assert!(expected.contains(file), "{expected}");
@@ -2359,7 +2363,17 @@ fn lambda_anchors_cover_imports_nested_siblings_and_unicode_crlf() {
             let (line, column) = index.position(offset).unwrap();
             let anchor = format!("src/order.wi:{line}:{column}");
             let labelled = format!("lambda {anchor}");
-            assert!(text.lines().any(|line| line.trim() == labelled), "{text}");
+            // Indirect callers carry their distance after the label.
+            assert!(
+                text.lines().any(|line| {
+                    let line = line.trim();
+                    line == labelled
+                        || line
+                            .strip_prefix(labelled.as_str())
+                            .is_some_and(|rest| rest.starts_with(" (distance "))
+                }),
+                "{text}"
+            );
             for selector in [legacy, anchor.as_str()] {
                 let result = f.json(&["effects", selector], 0);
                 assert_eq!(result["result"]["selected"]["id"], node["id"]);
@@ -4557,7 +4571,7 @@ fn rename_conflicts_name_owner_and_impact_labels_lambdas_in_order() {
             "main::main",
             "lambda src/main.wi:28:19",
             "lambda src/main.wi:30:19",
-            "main::apply",
+            "main::apply (distance 2)",
         ],
         "{text}"
     );
@@ -4681,13 +4695,18 @@ fn variant_symbol_and_type_report_module_qualified_payloads() {
             }
         }
     }
-    // A constructor use site keeps the expression's enum type, without payload.
+    // A constructor variant token reports the enum type with its payload,
+    // like a pattern variant token.
     let value = f.json(&["type", "src/main.wi:8:24"], 0);
     assert_eq!(
         value["result"]["type_display"], "main::Condition",
         "{value}"
     );
-    assert!(value["result"].get("payload").is_none(), "{value}");
+    assert_eq!(
+        value["result"]["payload_display"],
+        serde_json::json!(["f64"]),
+        "{value}"
+    );
     // The aliased import also presents canonically in ordinary signatures.
     let caption = f.json(&["symbol", "scene::caption"], 0);
     assert_eq!(
@@ -5327,9 +5346,10 @@ fn sentinel_diagnostics_range_and_try() {
             "",
         ),
         (
+            // The unannotated shorthand lacks context independently of `bad`.
             "fn f() -> Result<i64, String> { let bad = absent; let x = Ok(bad); let y = x?; return Ok(1); } fn main() {}",
-            1,
-            "",
+            2,
+            "E0202",
         ),
         (
             "fn f() -> Result<i64, String> { let bad = absent; let x: Result<i64, i64> = Ok(bad); let y = x?; return Ok(1); } fn main() {}",

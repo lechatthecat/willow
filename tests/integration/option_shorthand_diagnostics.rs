@@ -81,7 +81,10 @@ fn option_short_07_type_declaration_named_none_shadows_shorthand() {
 fn option_short_08_bare_some_is_not_a_first_class_constructor() {
     assert_compile_error_contains(
         "fn main() { let constructor = Some; }",
-        &["error[E0350]", "cannot find variable `Some`"],
+        &[
+            "error[E0202]",
+            "shorthand `Some` needs an expected `Option` type",
+        ],
     );
 }
 

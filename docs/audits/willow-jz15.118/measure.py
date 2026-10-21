@@ -23,6 +23,8 @@ a = p.parse_args()
 if a.repeats < 1:
     p.error("--repeats must be positive")
 source = (ROOT / "example/async_allocation_churn.wi").read_text()
+# The example prints a stable bound; measurements record the exact count.
+source = source.replace("println(gc_minor_collections() > 0);", "println(gc_minor_collections());")
 env = {k: v for k, v in os.environ.items()
        if not k.startswith("WILLOW_GC_") and k != "WILLOW_WORKERS"}
 cases = [(n, "default", "call") for n in (0, 1000000, 10000000, 40000000, 120000000)]

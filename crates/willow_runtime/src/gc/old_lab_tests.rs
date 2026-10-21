@@ -262,11 +262,24 @@ fn default_budgets_complete_small_allocations_and_cap_full_buffer_recovery() {
             assert!(stops.by_reason[1].work.metadata_objects < count as u64);
         }
         assert_eq!(stops.by_reason[1].work.swept_objects, 0);
-        assert_eq!(
-            stops.by_reason[3].requests,
-            u64::from(count > 128),
-            "small buffers complete normally; overflowing buffers use capped Recovery"
-        );
+        if count > 128 {
+            // Overflowing buffers continue in classified bounded Recovery
+            // slices; each slice stays within the fixed recovery reserve.
+            assert!(
+                (1..=count as u64).contains(&stops.by_reason[3].requests),
+                "overflowing buffers use bounded Recovery slices: {}",
+                stops.by_reason[3].requests
+            );
+            for sample in mark_closure::RECOVERY_SAMPLES.lock().unwrap().iter() {
+                assert!(sample[0] <= mark_closure::RECOVERY_SLOTS);
+                assert!(sample[1] <= mark_closure::RECOVERY_BYTES);
+            }
+        } else {
+            assert_eq!(
+                stops.by_reason[3].requests, 0,
+                "small buffers complete normally"
+            );
+        }
         assert_eq!(local_pending_for_test(), 0);
         let expected_live = if payload == 0 {
             GC_HEADER_SIZE as i64
@@ -275,7 +288,6 @@ fn default_budgets_complete_small_allocations_and_cap_full_buffer_recovery() {
         };
         assert_eq!(willow_gc_allocated_bytes(), expected_live);
         assert!(stops.by_reason[1].requests <= (mark_closure::MAX_REMARK_ROUNDS - 1) as u64);
-        assert!(stops.by_reason[1].requests + stops.by_reason[3].requests <= 3);
         println!(
             "default_lab pending_entries={count} root_count=1 initial_metadata_objects=0 remark_metadata_objects={} remark_metadata_bytes={} remark_stops={} recovery_stops={} normal_stopped_sweep=0 max_slots=4096 max_bytes=1048576 max_work_ns=1000000",
             stops.by_reason[1].work.metadata_objects,

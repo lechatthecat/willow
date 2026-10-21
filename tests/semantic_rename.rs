@@ -1175,13 +1175,26 @@ fn rename_summary_modes_scale_and_preserve_sources() {
             "value(); ".repeat(references)
         );
         let f = Fixture::new(&source);
-        let expected =
-            serde_json::json!({"files":1,"references":references,"collisions":0,"unresolved":0});
+        let expected = serde_json::json!({
+            "files":1,
+            "edits":references + 1,
+            "declarations":1,
+            "references":references,
+            "collisions":0,
+            "unresolved":0
+        });
         for extra in [vec![], vec!["--verbose"], vec!["--diff"]] {
             let mut args = vec!["rename", "value", "answer", "--dry-run"];
             args.extend(extra);
             let result = f.run(&args, 0);
-            for key in ["files", "references", "collisions", "unresolved"] {
+            for key in [
+                "files",
+                "edits",
+                "declarations",
+                "references",
+                "collisions",
+                "unresolved",
+            ] {
                 assert_eq!(result["result"][key], expected[key]);
             }
             if args.contains(&"--diff") {
