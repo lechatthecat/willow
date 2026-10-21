@@ -26,15 +26,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn emit_flat_array_alloc(&mut self, len: usize, element_ty: &Type) -> Value {
-        let len = self.builder.ins().iconst(types::I64, len as i64);
-        let refs = self.builder.ins().iconst(
-            types::I64,
-            i64::from(super::type_helpers::storage_is_gc_managed(
-                element_ty,
-                self.enum_infos,
-            )),
-        );
-        self.emit_value_runtime_call("willow_array_new_literal", &[len, refs])
+        let is_ref = super::type_helpers::storage_is_gc_managed(element_ty, self.enum_infos);
+        self.emit_array_literal_alloc(len, is_ref)
     }
 
     pub(super) fn emit_flat_array_store(

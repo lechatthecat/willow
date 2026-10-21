@@ -122,7 +122,7 @@ const ARRAY_GC_TYPES: &[crate::gc::NativeGcType] =
             .with_concurrent_slice(snapshot_array_ref_slice),
     ];
 
-fn ensure_trace_registered() {
+pub(crate) fn ensure_trace_registered() {
     ARRAY_REGISTRATION.ensure(ARRAY_GC_TYPES);
 }
 

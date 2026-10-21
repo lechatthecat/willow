@@ -340,6 +340,41 @@ mod tests {
     }
 
     #[test]
+    fn array_literal_inline_trace_is_ready_after_every_gc_init() {
+        let _guard = runtime_test_guard();
+        for _ in 0..2 {
+            willow_gc_init();
+            let _owner = RuntimeTlabOwner::enter();
+            prime_runtime_tlab();
+            // Model generated allocation: no array runtime entry registers a hook.
+            let [mut handle, buffer] = try_alloc_young([
+                array_handle_layout(),
+                array_buffer_layout(16, true).unwrap(),
+            ])
+            .unwrap();
+            let [child] = try_alloc_young([array_pair_layout(0).unwrap()]).unwrap();
+            unsafe {
+                child.cast::<i64>().write(73);
+                handle.cast::<i64>().write(1);
+                handle.cast::<i64>().add(1).write(1);
+                handle.cast::<i64>().add(2).write(1);
+                handle.cast::<*mut u8>().add(3).write(buffer);
+                buffer.cast::<i64>().write(1);
+                buffer.cast::<*mut u8>().add(1).write(child);
+            }
+            willow_push_root(&mut handle);
+            let old = handle;
+            willow_gc_minor_collect();
+            assert_ne!(handle, old);
+            let moved_child = willow_array_get(handle, 0) as *mut i64;
+            assert_ne!(moved_child.cast::<u8>(), child);
+            assert_eq!(unsafe { moved_child.read() }, 73);
+            willow_pop_roots(1);
+        }
+        reset_internal();
+    }
+
+    #[test]
     fn unregistered_threads_never_use_the_runtime_tlab() {
         let _guard = runtime_test_guard();
         reset_internal();

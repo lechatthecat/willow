@@ -372,6 +372,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .ins()
             .store(MemFlagsData::trusted(), new_cursor, tlab, 0);
 
+        self.emit_young_header(cursor, &layout, total_size);
+        emit_tlab_start_publication(self.builder, tlab, cursor, limit, pointer_bytes);
+        let payload = self.builder.ins().iadd_imm_s(cursor, header_size);
+        self.builder.ins().jump(done_block, &[payload.into()]);
+
+        self.builder.switch_to_block(slow_block);
+        self.builder.seal_block(slow_block);
+        let slow_payload = self.emit_gc_alloc_slow(layout);
+        self.builder.ins().jump(done_block, &[slow_payload.into()]);
+
+        self.builder.switch_to_block(done_block);
+        self.builder.seal_block(done_block);
+        self.builder.block_params(done_block)[0]
+    }
+
+    /// Initialize the shared descriptor/header ABI in fresh zeroed TLAB storage.
+    fn emit_young_header(&mut self, cursor: Value, layout: &GcLayoutMetadata, total_size: i64) {
+        let ptr_ty = reference_type(self.module.target_config());
         // Fresh TLAB chunks are zero-filled and never reuse swept holes. Write
         // every nonzero/semantic header field before the payload is exposed.
         let zero8 = self.builder.ins().iconst(types::I8, 0);
@@ -423,18 +441,117 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             cursor,
             GC_HEADER_DESCRIPTOR_OFFSET,
         );
-        emit_tlab_start_publication(self.builder, tlab, cursor, limit, pointer_bytes);
+    }
+
+    /// Reserve both array objects atomically with respect to GC points. Neither
+    /// object can be observed until both headers and the handle edge are ready.
+    pub(super) fn emit_array_literal_alloc(&mut self, len: usize, is_ref: bool) -> Value {
+        use willow_abi::array_layout as array;
+        let ptr_ty = reference_type(self.module.target_config());
+        let pointer_bytes = ptr_ty.bytes();
+        let header_size = willow_abi::gc_header::size(pointer_bytes) as i64;
+        let length = self.builder.ins().iconst(types::I64, len as i64);
+        let refs = self.builder.ins().iconst(types::I64, i64::from(is_ref));
+        let buffer_size = len
+            .checked_add(array::BUFFER_HEADER_WORDS)
+            .and_then(|words| words.checked_mul(array::WORD_BYTES as usize))
+            .and_then(|bytes| i64::try_from(bytes).ok());
+        let Some(buffer_size) =
+            buffer_size.filter(|size| *size <= GC_TLAB_MAX_OBJECT_SIZE - header_size)
+        else {
+            return self.emit_value_runtime_call("willow_array_new_literal", &[length, refs]);
+        };
+        let handle = GcLayoutMetadata::new(
+            GcObjectKind::ArrayHandle,
+            array::HANDLE_WORDS * i64::from(array::WORD_BYTES),
+            0,
+            array::HANDLE_MASK,
+        );
+        let buffer = GcLayoutMetadata::new(
+            GcObjectKind::ArrayBuffer,
+            buffer_size,
+            if is_ref {
+                willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID as i64
+            } else {
+                0
+            },
+            0,
+        );
+        let handle_size = header_size + handle.payload_size;
+        let total = handle_size + header_size + buffer_size;
+        let context = self.builder.ins().get_pinned_reg(ptr_ty);
+        let tlab = self.builder.ins().load(
+            ptr_ty,
+            MemFlagsData::trusted(),
+            context,
+            willow_abi::generated_context::TLAB_OFFSET,
+        );
+        let cursor = self
+            .builder
+            .ins()
+            .load(ptr_ty, MemFlagsData::trusted(), tlab, 0);
+        let limit = self.builder.ins().load(
+            ptr_ty,
+            MemFlagsData::trusted(),
+            tlab,
+            willow_abi::tlab::limit_offset(pointer_bytes) as i32,
+        );
+        let next = self.builder.ins().iadd_imm_s(cursor, total);
+        let nonempty = self.builder.ins().icmp_imm_s(IntCC::NotEqual, cursor, 0);
+        let no_overflow = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, next, cursor);
+        let fits = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, next, limit);
+        let usable = self.builder.ins().band(nonempty, no_overflow);
+        let usable = self.builder.ins().band(usable, fits);
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        self.builder.set_cold_block(slow);
+        let done = self.builder.create_block();
+        self.builder.append_block_param(done, ptr_ty);
+        self.builder.ins().brif(usable, fast, &[], slow, &[]);
+        self.builder.switch_to_block(fast);
+        self.builder.seal_block(fast);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), next, tlab, 0);
+        let buffer_header = self.builder.ins().iadd_imm_s(cursor, handle_size);
+        self.emit_young_header(cursor, &handle, handle_size);
+        self.emit_young_header(buffer_header, &buffer, header_size + buffer_size);
         let payload = self.builder.ins().iadd_imm_s(cursor, header_size);
-        self.builder.ins().jump(done_block, &[payload.into()]);
-
-        self.builder.switch_to_block(slow_block);
-        self.builder.seal_block(slow_block);
-        let slow_payload = self.emit_gc_alloc_slow(layout);
-        self.builder.ins().jump(done_block, &[slow_payload.into()]);
-
-        self.builder.switch_to_block(done_block);
-        self.builder.seal_block(done_block);
-        self.builder.block_params(done_block)[0]
+        let buffer_payload = self.builder.ins().iadd_imm_s(buffer_header, header_size);
+        for (field, value) in [
+            (array::H_LEN, length),
+            (array::H_CAP, length),
+            (array::H_IS_REF, refs),
+            (array::H_BUF, buffer_payload),
+        ] {
+            self.builder.ins().store(
+                MemFlagsData::trusted(),
+                value,
+                payload,
+                array::handle_offset(field),
+            );
+        }
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), length, buffer_payload, 0);
+        // Fresh storage is zeroed. Publish both starts after initialization;
+        // no call/safepoint or insertion barrier is needed for young objects.
+        emit_tlab_start_publication(self.builder, tlab, cursor, limit, pointer_bytes);
+        emit_tlab_start_publication(self.builder, tlab, buffer_header, limit, pointer_bytes);
+        self.builder.ins().jump(done, &[payload.into()]);
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(slow);
+        let result = self.emit_value_runtime_call("willow_array_new_literal", &[length, refs]);
+        self.builder.ins().jump(done, &[result.into()]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+        self.builder.block_params(done)[0]
     }
 
     fn emit_gc_alloc_slow(&mut self, layout: GcLayoutMetadata) -> Value {

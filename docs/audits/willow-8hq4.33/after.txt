@@ -1,0 +1,6 @@
+label after ns/iteration [12.234695, 12.61283825, 12.77035975, 12.21954925, 12.17426475, 12.43579025, 12.35035575, 12.2985615, 12.284405] median 12.2985615
+generated function sizes:
+000000000040ea40 0000000000000434 t literal
+   text	   data	    bss	    dec	    hex	filename
+1096496	  56000	  18440	1170936	 11ddf8	/tmp/tmp2e4d46p3/probe
+

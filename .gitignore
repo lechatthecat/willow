@@ -230,3 +230,15 @@ AGENTS.md
 !/docs/audits/willow-8hq4.30/audit.md
 !/docs/audits/willow-8hq4.30/count_calls.py
 !/docs/audits/willow-8hq4.30/call-counts.txt
+
+# Public inline Array TLAB audit and source-only reproducers (willow-8hq4.33).
+!/docs/audits/willow-8hq4.33/
+/docs/audits/willow-8hq4.33/*
+!/docs/audits/willow-8hq4.33/audit.md
+!/docs/audits/willow-8hq4.33/probe.wi
+!/docs/audits/willow-8hq4.33/measure.py
+!/docs/audits/willow-8hq4.33/verify_codegen.py
+!/docs/audits/willow-8hq4.33/before.txt
+!/docs/audits/willow-8hq4.33/after.txt
+!/docs/audits/willow-8hq4.33/codegen.txt
+!/docs/audits/willow-8hq4.33/grow_after_ref_registration.wi

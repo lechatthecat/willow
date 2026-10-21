@@ -224,3 +224,33 @@ async fn main() {
         assert_eq!(out, "7\n9\nhello\n");
     }
 }
+
+// willow-8hq4.33: the maximum inline buffer and the first old-generation
+// buffer must preserve contents/roots in both optimization modes.
+#[test]
+fn array_literal_tlab_size_boundary_preserves_elements() {
+    for length in [0, 1, 3, 509, 510, 1024] {
+        let elements = std::iter::repeat_n("17", length)
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!(
+            "import std::collections::Array; fn make() -> Array<i64> {{ return [{elements}]; }} \
+             fn main() {{ let a=make(); gc_minor_collect(); println(a.len()); {} }}",
+            if length == 0 {
+                String::new()
+            } else {
+                format!("println(a[{}]);", length - 1)
+            }
+        );
+        for run in [compile_and_run, compile_and_run_release] {
+            let (out, ok) = run(&source);
+            assert!(ok, "length={length}: {out}");
+            let expected = if length == 0 {
+                "0\n".to_string()
+            } else {
+                format!("{length}\n17\n")
+            };
+            assert_eq!(out, expected);
+        }
+    }
+}

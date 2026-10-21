@@ -1068,6 +1068,9 @@ pub extern "C" fn willow_gc_set_memory_limit(bytes: u64) -> u64 {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_init() {
     reset_internal();
+    // Generated array fast paths can allocate a reference buffer before any
+    // runtime array call. Re-register after every heap/registry reset.
+    crate::array::ensure_trace_registered();
     DIAGNOSTIC_READY.store(true, Ordering::Release);
 }
 
