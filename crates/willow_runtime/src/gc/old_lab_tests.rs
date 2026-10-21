@@ -264,11 +264,22 @@ fn default_budgets_complete_small_allocations_and_cap_full_buffer_recovery() {
         assert_eq!(stops.by_reason[1].work.swept_objects, 0);
         if count > 128 {
             // Overflowing buffers continue in classified bounded Recovery
-            // slices; each slice stays within the fixed recovery reserve.
+            // slices; each slice stays within the fixed recovery reserve. Each
+            // remaining entry costs two slots, so full slices need
+            // ceil(2 * remaining / RECOVERY_SLOTS) stops. The 1 ms work budget
+            // can end slices early on slow hosts, so allow a constant factor,
+            // which still rejects per-object Recovery stops.
+            let remaining = count as u64 - stops.by_reason[1].work.metadata_objects;
+            let slices = (2 * remaining).div_ceil(mark_closure::RECOVERY_SLOTS);
+            let recovery_cap = 4 * slices + 4;
             assert!(
-                (1..=count as u64).contains(&stops.by_reason[3].requests),
-                "overflowing buffers use bounded Recovery slices: {}",
+                (1..=recovery_cap).contains(&stops.by_reason[3].requests),
+                "overflowing buffers use bounded Recovery slices: {} > {recovery_cap}",
                 stops.by_reason[3].requests
+            );
+            assert!(
+                stops.by_reason[1].requests + stops.by_reason[3].requests
+                    <= (mark_closure::MAX_REMARK_ROUNDS - 1) as u64 + recovery_cap
             );
             for sample in mark_closure::RECOVERY_SAMPLES.lock().unwrap().iter() {
                 assert!(sample[0] <= mark_closure::RECOVERY_SLOTS);
