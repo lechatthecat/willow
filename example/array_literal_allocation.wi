@@ -1,0 +1,32 @@
+// willow-8hq4.30: allocation-only literals, including allocation during unwind.
+import std::collections::Array;
+class Item { pub value: i64; }
+fn make(n: i64) -> Array<i64> { return [n, n]; }
+fn pending() {
+    defer {
+        let values = [new Item(17), new Item(19)];
+        gc_minor_collect();
+        println(values[0].value + values[1].value);
+        match recover() { Some(info) => println(info.message), None => {} }
+    }
+    panic("outer");
+}
+fn main() {
+    let empty: Array<i64> = [];
+    let constructed: Array<i64> = Array::new();
+    println(empty.len() + constructed.len());
+    let floats = [1.5, 2.5];
+    let flags = [true, false];
+    println(floats[0] + floats[1] == 4.0 && flags[0] && !flags[1]);
+    let strings = ["a" + "b", "c" + "d"];
+    let nested = [make(3), make(5)];
+    gc_minor_collect();
+    println(strings[0] + strings[1]);
+    println(nested[0][1] + nested[1][0]);
+    let mut i = 0;
+    let mut sum = 0;
+    while i < 64 { let a = make(i); sum = sum + a[0]; i = i + 1; }
+    println(sum);
+    pending();
+    println(42);
+}

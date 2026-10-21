@@ -546,7 +546,7 @@ pub(crate) fn builtin_static_effects(
     // Array construction has its own typed lowering, but the same runtime
     // preemption/effect contract as its allocation ABI entry.
     if (owner, method) == ("Array", "new") {
-        return Some(symbol_effects("willow_array_new"));
+        return Some(symbol_effects("willow_array_new_literal"));
     }
     if let Some(runtime) = builtin_static_constructor(owner, method) {
         return Some(symbol_effects(runtime));

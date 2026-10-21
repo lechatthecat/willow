@@ -200,6 +200,14 @@ mod tests {
                 .effects()
         };
 
+        assert_eq!(
+            effects("willow_array_new_literal"),
+            RuntimeEffects::MAY_ALLOCATE
+        );
+        assert_eq!(
+            effects("willow_array_new"),
+            RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_PANIC)
+        );
         assert!(effects("willow_alloc").contains(RuntimeEffects::MAY_ALLOCATE));
         for name in ["willow_string_concat", "willow_string_concat_n"] {
             assert!(
@@ -482,6 +490,7 @@ mod alloc_effects_tests {
         "willow_gc_alloc_slow",
         "willow_gc_alloc_bitmap",
         "willow_array_new",
+        "willow_array_new_literal",
         "willow_array_copy",
         "willow_array_copy_scalar_pairs",
         "willow_array_len",
@@ -695,6 +704,7 @@ mod alloc_effects_tests {
             "willow_string_concat",
             "willow_string_concat_n",
             "willow_array_new",
+            "willow_array_new_literal",
             "willow_array_to_string",
             "willow_map_new",
             "willow_map_new_local",

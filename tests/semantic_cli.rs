@@ -5560,3 +5560,36 @@ fn sentinel_diagnostics_lock_targets() {
         "absent",
     );
 }
+
+#[test]
+fn array_literal_effect_queries_match_allocation_only_abi() {
+    use willow_compiler::semantic::effects::RuntimeEffects;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        r#"
+import std::collections::Array;
+fn empty() -> Array<i64> { return []; }
+fn scalar() -> Array<i64> { return [1, 2, 3]; }
+fn constructor() -> Array<i64> { return Array::new(); }
+fn child() -> i64 { panic("element"); return 0; }
+fn risky() -> Array<i64> { return [child()]; }
+fn main() {}
+"#,
+    )
+    .unwrap();
+    for name in ["empty", "scalar", "constructor", "risky"] {
+        let result = f.json(&["effects", &format!("main::{name}")], 0);
+        let bits = result["result"]["runtime_effects"].as_u64().unwrap();
+        assert_ne!(
+            bits & u64::from(RuntimeEffects::MAY_ALLOCATE.bits()),
+            0,
+            "{result}"
+        );
+        assert_eq!(
+            bits & u64::from(RuntimeEffects::MAY_PANIC.bits()) != 0,
+            name == "risky",
+            "{result}"
+        );
+    }
+}

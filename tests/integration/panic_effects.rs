@@ -1289,3 +1289,88 @@ fn inline_panic_snapshots_have_zero_runtime_relocations() {
         }
     }
 }
+
+// willow-8hq4.30: literals have allocation effects, without recoverable panic.
+#[test]
+fn array_literal_allocation_only_calls_and_effects() {
+    for release in [false, true] {
+        for expression in ["[]", "[1, 2, 3]", "Array::new()"] {
+            let source = format!(
+                "import std::collections::Array; fn make() -> Array<i64> {{ return {expression}; }} fn main() {{ let a = make(); }}"
+            );
+            let events = compile_and_collect_panic_events_mode(&source, &[], release);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|name| *name == "willow_array_new_literal")
+                    .count(),
+                1,
+                "{events:?}"
+            );
+            assert!(!has_target(&events, "willow_array_new"), "{events:?}");
+            // Cold scalar-store fault paths retain their checked ABI calls.
+            // Only those calls may need panic snapshots, never allocation.
+            let stores = events
+                .iter()
+                .filter(|name| *name == "willow_array_set")
+                .count();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|name| *name == "inline_panic_depth")
+                    .count(),
+                stores * 2,
+                "{events:?}"
+            );
+            assert!(!has_target(&events, "willow_panic_depth"), "{events:?}");
+            let compile = if release {
+                compile_release_with_compiler_env
+            } else {
+                compile_with_compiler_env
+            };
+            let (ok, stderr) = compile(&source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+            assert!(ok, "{stderr}");
+            assert!(
+                stderr.contains("[panic-effects] make: no-panic"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn array_literal_child_panics_still_propagate() {
+    let source = r#"
+fn fail() -> i64 { panic("element"); return 0; }
+fn main() {
+    if true {
+        defer match recover() { Some(info) => println(info.message), None => {} }
+        let a = [1, fail(), 3];
+        println(999);
+    }
+    println(42);
+}
+"#;
+    let (out, ok) = super::support::compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "element\n42\n");
+    let (out, ok) = compile_and_run_release(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "element\n42\n");
+}
+
+#[test]
+fn array_literal_allocation_example_preserves_roots_and_active_panic() {
+    let source = include_str!("../../example/array_literal_allocation.wi");
+    let expected = "0\ntrue\nabcd\n8\n2016\n36\nouter\n42\n";
+    for run in [super::support::compile_and_run, compile_and_run_release] {
+        let (out, ok) = run(source);
+        assert!(ok, "{out}");
+        assert_eq!(out, expected);
+    }
+    for stress in ["minor", "relocate", "alloc"] {
+        let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", stress)]);
+        assert!(ok, "{stress}: {out}");
+        assert_eq!(out, expected, "{stress}");
+    }
+}

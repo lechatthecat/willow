@@ -536,7 +536,7 @@ mod tests {
         let _guard = runtime_test_guard();
         reset_internal();
         let fast_before = willow_gc_tlab_fast_allocations();
-        let arr = willow_array_new(3, 0);
+        let arr = crate::array::willow_array_new_literal(3, 0);
         assert_eq!(willow_array_len(arr), 3);
         assert_eq!(
             generation(arr),
@@ -556,7 +556,7 @@ mod tests {
         prime_runtime_tlab();
         let fast_before = willow_gc_tlab_fast_allocations();
         for (len, is_ref) in [(3i64, 0i64), (0, 0), (2, 1), (64, 0)] {
-            let arr = willow_array_new(len, is_ref);
+            let arr = crate::array::willow_array_new_literal(len, is_ref);
             let buf = buffer(arr);
             assert_eq!(generation(arr), Some(GC_GENERATION_YOUNG));
             assert_eq!(generation(buf), Some(GC_GENERATION_YOUNG));
@@ -570,7 +570,7 @@ mod tests {
         }
         assert_eq!(willow_gc_tlab_fast_allocations() - fast_before, 8);
         // A buffer too large for a TLAB takes the old path.
-        let big = willow_array_new(1000, 0);
+        let big = crate::array::willow_array_new_literal(1000, 0);
         assert_eq!(willow_array_len(big), 1000);
         assert_eq!(generation(big), None);
         assert_eq!(generation(buffer(big)), None);
@@ -588,15 +588,15 @@ mod tests {
         let _owner = RuntimeTlabOwner::enter();
         // One object per TLAB: every literal reaches the collecting miss path.
         let _stress = StressModes::set("relocate");
-        let mut outer = willow_array_new(2, 1);
+        let mut outer = crate::array::willow_array_new_literal(2, 1);
         willow_push_root(&mut outer);
-        let mut inner = willow_array_new(1, 0);
+        let mut inner = crate::array::willow_array_new_literal(1, 0);
         willow_push_root(&mut inner);
         willow_array_set(inner, 0, 99);
         willow_array_set(outer, 0, inner as i64);
         let before = [outer, inner];
         let minor_before = runtime().heap.lock().unwrap().minor_collections;
-        let fresh = willow_array_new(4, 1);
+        let fresh = crate::array::willow_array_new_literal(4, 1);
         assert!(runtime().heap.lock().unwrap().minor_collections > minor_before);
         assert_ne!(
             [outer, inner],

@@ -200,6 +200,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_gc_stop_flag" => ([] -> Some(Ptr));
     PREEMPT; "willow_gc_safepoint" => ([] -> None);
     // --- arrays (std::collections::Array) ---
+    ALLOC; "willow_array_new_literal" => ([I64, I64] -> Some(Ptr));
     PANIC_ALLOC; "willow_array_new" => ([I64, I64] -> Some(Ptr));
     PANIC_ALLOC; "willow_array_copy" => ([Ptr] -> Some(Ptr));
     PANIC_ALLOC; "willow_array_copy_scalar_pairs" => ([Ptr] -> Some(Ptr));

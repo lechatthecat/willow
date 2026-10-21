@@ -254,6 +254,8 @@ fn payload_free_collection_and_lock_rows_stay_i64() {
     let _: extern "C" fn(i64, i64) -> *mut u8 = array::willow_array_new;
     let _: extern "C" fn(*mut u8, i64) -> *mut u8 = array::willow_array_element_addr;
     let _: extern "C" fn(i64, i64, i64) -> *mut u8 = map::willow_map_new;
+    let _: extern "C" fn(i64, i64) -> *mut u8 = array::willow_array_new_literal;
+    assert_schema("willow_array_new_literal", &[I64, I64], Some(Ptr));
     assert_schema("willow_array_new", &[I64, I64], Some(Ptr));
     assert_schema("willow_array_len", &[Ptr], Some(I64));
     assert_schema("willow_array_element_addr", &[Ptr, I64], Some(Ptr));

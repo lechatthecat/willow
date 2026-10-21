@@ -34,7 +34,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.enum_infos,
             )),
         );
-        self.emit_value_runtime_call("willow_array_new", &[len, refs])
+        self.emit_value_runtime_call("willow_array_new_literal", &[len, refs])
     }
 
     pub(super) fn emit_flat_array_store(

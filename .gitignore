@@ -223,3 +223,10 @@ AGENTS.md
 !/docs/audits/willow-8hq4.31/object_churn-relocate.txt
 !/docs/audits/willow-8hq4.31/array_literal_churn-minor.txt
 !/docs/audits/willow-8hq4.31/array_literal_churn-relocate.txt
+
+# Allocation-only array literal audit (willow-8hq4.30).
+!/docs/audits/willow-8hq4.30/
+/docs/audits/willow-8hq4.30/*
+!/docs/audits/willow-8hq4.30/audit.md
+!/docs/audits/willow-8hq4.30/count_calls.py
+!/docs/audits/willow-8hq4.30/call-counts.txt

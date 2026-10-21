@@ -815,6 +815,35 @@ mod tests {
     }
 
     #[test]
+    fn array_dynamic_lengths_preserve_recoverable_panics() {
+        let _heap = runtime_test_guard();
+        willow_gc_init();
+        let _context = ContextTestGuard::install(30);
+        for len in [-1, i64::MIN, i64::MAX] {
+            let array = crate::array::willow_array_new(std::hint::black_box(len), 0);
+            assert!(array.is_null());
+            assert_eq!(willow_panic_depth(), 1);
+            let info = recover_one();
+            let message = unsafe { panic_info_message(info) };
+            assert!(
+                message.contains(if len < 0 {
+                    "negative length"
+                } else {
+                    "capacity too large"
+                }),
+                "{message}"
+            );
+            willow_panic_release_recovered(info);
+            assert_eq!(willow_panic_depth(), 0);
+        }
+        for len in [0, 1, 64, 1000] {
+            let array = crate::array::willow_array_new(std::hint::black_box(len), 0);
+            assert_eq!(crate::array::willow_array_len(array), len);
+            assert_eq!(willow_panic_depth(), 0);
+        }
+    }
+
+    #[test]
     fn panic_context_01_normal_path_is_inactive_and_recover_is_null() {
         let _heap = runtime_test_guard();
         willow_gc_init();

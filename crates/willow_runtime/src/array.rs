@@ -201,10 +201,9 @@ pub(crate) unsafe fn scalar_slot_unchecked(arr: *mut u8, index: i64) -> *mut i64
 }
 
 /// Allocate an array of `len` elements (all zero). `elem_is_ref` marks
-/// GC-managed element types. Returns the handle, or aborts on a negative length.
+/// GC-managed element types. Raises a language panic on a negative length.
 ///
-/// Called directly by generated code (array literals, `[]`). A handle and a
-/// buffer that fit a TLAB are bump-allocated young together, with no lock,
+/// A handle and a buffer that fit a TLAB are bump-allocated young together, with no lock,
 /// root registration or old-region work (willow-jz15.94). Only a TLAB miss
 /// reaches a GC point, which may move this thread's root-slot referents like
 /// any generated allocation; generated code reloads its values after the call.
@@ -214,6 +213,28 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
     if len < 0 {
         return raise_negative_length(len);
     }
+    allocate_array(len, elem_is_ref)
+}
+
+/// Allocation-only entry for compiler-proven constant-length array literals.
+/// Invalid ABI lengths are fatal; allocation exhaustion uses the runtime's
+/// non-recoverable resource failure policy. No language panic can return.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_array_new_literal(len: i64, elem_is_ref: i64) -> *mut u8 {
+    if !(0..=i64::MAX / WORD - BUFFER_HEADER_WORDS as i64).contains(&len) {
+        crate::failure::fatal_invariant("invalid constant array literal length");
+    }
+    let array = allocate_array(len, elem_is_ref);
+    if array.is_null() {
+        crate::failure::resource_exhausted(format_args!("array literal allocation failed"));
+    }
+    array
+}
+
+// Shared allocation/GC/rooting path. Both callers validate non-negative length;
+// the literal entry also proves the old buffer payload cannot overflow.
+fn allocate_array(len: i64, elem_is_ref: i64) -> *mut u8 {
     let Some(buffer_layout) = young_buffer_layout(len, elem_is_ref != 0) else {
         return new_old_array(len, elem_is_ref);
     };
@@ -844,6 +865,46 @@ mod tests {
         runtime_test_guard, willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root,
     };
     use crate::string::{willow_string_as_str, willow_string_from_str};
+
+    #[test]
+    fn array_literal_invalid_lengths_and_exhaustion_never_return() {
+        const KEY: &str = "WILLOW_TEST_LITERAL_FAILURE";
+        if let Ok(case) = std::env::var(KEY) {
+            willow_gc_init();
+            let len = match case.as_str() {
+                "negative" => -1,
+                "overflow" => i64::MAX,
+                "exhaustion" => 1000,
+                _ => unreachable!(),
+            };
+            willow_array_new_literal(len, 0);
+            eprintln!("LITERAL_FAILURE_RETURNED");
+            return;
+        }
+        for case in ["negative", "overflow", "exhaustion"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "array::tests::array_literal_invalid_lengths_and_exhaustion_never_return",
+                    "--nocapture",
+                ])
+                .env(KEY, case)
+                .env("WILLOW_GC_MEMORY_LIMIT", "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{case}: {stderr}");
+            assert!(!stderr.contains("LITERAL_FAILURE_RETURNED"), "{stderr}");
+            assert!(
+                stderr.contains(if case == "exhaustion" {
+                    "runtime resource exhausted:"
+                } else {
+                    "invalid constant array literal length"
+                }),
+                "{case}: {stderr}"
+            );
+        }
+    }
 
     #[test]
     fn array_shared_layout_matches_allocated_payload() {

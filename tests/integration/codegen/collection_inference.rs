@@ -149,7 +149,7 @@ fn contextual_empty_array_allocation_sites_scale_linearly() {
         let names = compile_and_collect_relocation_targets_all(&source, &[]);
         let allocations = names
             .iter()
-            .filter(|name| *name == "willow_array_new")
+            .filter(|name| *name == "willow_array_new_literal")
             .count();
         assert_eq!(allocations, sites * 2);
         println!("sites={sites} literal_allocations={allocations}");
@@ -181,12 +181,19 @@ fn freeze_inference_allocation_sites_scale_linearly() {
         source.push('}');
         let names = compile_and_collect_relocation_targets_all(&source, &[]);
         for symbol in [
-            "willow_array_new",
+            "willow_array_new_literal",
             "willow_array_copy",
             "willow_map_new",
             "willow_map_copy",
         ] {
-            let count = names.iter().filter(|name| *name == symbol).count();
+            // Non-escaping maps may use the existing local-map constructor.
+            let count = names
+                .iter()
+                .filter(|name| {
+                    *name == symbol
+                        || (symbol == "willow_map_new" && *name == "willow_map_new_local")
+                })
+                .count();
             assert_eq!(count, n, "{symbol}/{n}");
             println!("freeze sites={n} {symbol}={count}");
         }
