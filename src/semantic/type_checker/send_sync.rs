@@ -523,7 +523,7 @@ impl TypeChecker {
             let help = match ty {
                 Type::Generic(name, _) if matches!(name.as_str(), "RwLock" | "BlockingRwCell") => {
                     Some(
-                        "RwLock<T> and BlockingRwCell<T> require T: Send + Sync because readers share it; use Mutex<T> when T is Send, or freeze mutable data so it is Sync",
+                        "RwLock<T> and BlockingRwCell<T> require T: Send + Sync because readers share it; use Mutex<T> when T is Send, or freeze mutable data so it is Sync; for class updates, replace the whole value through the write binding (w = new C(...)) and keep all fields free of post-construction writes, or use Mutex<T> for field mutation",
                     )
                 }
                 Type::Array(_) if !send => Some(

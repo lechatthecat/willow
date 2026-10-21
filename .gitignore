@@ -136,3 +136,9 @@ AGENTS.md
 
 # Reviewed lambda generic annotation audit (public source/test evidence only).
 !/docs/audits/willow-6d6o-lambda-generic-annotations.md
+
+# Public RwLock class-update decision and source-derived implementation audit.
+!/docs/audits/willow-jz15.110/
+/docs/audits/willow-jz15.110/*
+!/docs/audits/willow-jz15.110/decision.md
+!/docs/audits/willow-jz15.110/implementation-audit.md

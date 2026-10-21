@@ -1,0 +1,26 @@
+// RwLock requires Send + Sync even inside an exclusive write section.
+// w.seed += 1 would make Knobs non-Sync throughout the program (E2402).
+// Replace the entire value; no Knobs field is written after construction.
+class Knobs { pub seed: i64; }
+// Use a distinct mutable class with Mutex when field mutation is needed.
+class Counter { pub count: i64; }
+
+async fn replace(knobs: RwLock<Knobs>) {
+    lock write knobs as mut w { w = new Knobs(w.seed + 1); }
+}
+async fn increment(counter: Mutex<Counter>) {
+    lock counter as mut w { w.count += 1; }
+}
+async fn main() {
+    let knobs = RwLock::new(new Knobs(1));
+    // A class reference can outlive the read section. Replacement preserves
+    // that old snapshot; mutating its fields would change the same object.
+    let mut snapshot = new Knobs(0);
+    lock read knobs as r { snapshot = r; }
+    await replace(knobs);
+    println("snapshot " + snapshot.seed.toString());
+    lock read knobs as r { println("replacement " + r.seed.toString()); }
+    let counter = Mutex::new(new Counter(1));
+    await increment(counter);
+    lock counter as r { println("mutex " + r.count.toString()); }
+}

@@ -820,3 +820,49 @@ fn test_jz15_81_sync_same_module_path_in_distinct_packages() {
         }
     }
 }
+
+// willow-jz15.110: exclusive sections do not exempt class field writes.
+#[test]
+fn test_jz15_110_write_binding_field_updates_rejected_with_remedies() {
+    for write in ["w.n = w.n + 1;", "w.n += 1;"] {
+        let source = format!(
+            r#"
+class C {{ pub n: i64; }}
+async fn bump(x: RwLock<C>) {{ lock write x as mut w {{ {write} }} }}
+async fn main() {{ await bump(RwLock::new(new C(1))); }}
+"#
+        );
+        assert_not_sync(
+            &source,
+            &[
+                "E2402",
+                REASSIGNED,
+                "replace the whole value through the write binding",
+                "w = new C(...)",
+                "keep all fields free of post-construction writes",
+                "use Mutex<T> for field mutation",
+            ],
+        );
+    }
+}
+
+#[test]
+fn test_jz15_110_replacement_does_not_hide_other_field_writes() {
+    assert_not_sync(
+        r#"
+class C { pub n: i64; pub fn bump(self) { self.n += 1; } }
+async fn update(x: RwLock<C>) { lock write x as mut w { w = new C(w.n + 1); } }
+async fn main() { await update(RwLock::new(new C(1))); }
+"#,
+        &["E2402", REASSIGNED, "replace the whole value", "Mutex<T>"],
+    );
+}
+
+#[test]
+fn test_jz15_110_runnable_example() {
+    let source = include_str!("../../../example/rwlock_class_update.wi");
+    assert_accepted(source);
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "snapshot 1\nreplacement 2\nmutex 2\n");
+}
