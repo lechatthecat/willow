@@ -1,6 +1,6 @@
 // Run with WILLOW_WORKERS=2 WILLOW_TASK_BUDGET=1 WILLOW_GC_STRESS=relocate.
 // Each recursive synchronous frame retains a young object and a string while
-// safepoints let the scheduler transfer its stack between workers.
+// safepoints let other tasks run while this stack remains on its worker.
 class Token { pub value: i64; }
 
 fn rooted(depth: i64, total: &mut i64) {

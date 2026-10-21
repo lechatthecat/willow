@@ -1402,8 +1402,18 @@ impl TypeChecker {
         // and the cancel entry need: the evaluated lock handle, this
         // acquisition's registration token, and its phase (willow-38w.1.4).
         if self.local.current_async_context {
-            self.local.async_local_types.push(binding_ty.clone());
-            self.local.async_local_types.push(target_ty.clone());
+            self.record_async_local(
+                binding_ty.clone(),
+                &s.binding,
+                s.span,
+                super::async_retention::Key::binding(&s.binding),
+            );
+            self.record_async_local(
+                target_ty.clone(),
+                "lock handle",
+                s.target.span(),
+                super::async_retention::Key::Value(s.target.id()),
+            );
             self.local.async_local_types.push(Type::I64);
             self.local.async_local_types.push(Type::I64);
         }
@@ -1580,9 +1590,14 @@ impl TypeChecker {
                 // backend can frame-back unannotated live-across-await locals
                 // (willow-lpn.5c).
                 if self.local.current_async_context {
-                    self.local
-                        .async_local_bindings
-                        .insert(self.local.async_local_types.len(), (s.name.clone(), s.span));
+                    self.local.async_local_bindings.insert(
+                        self.local.async_local_types.len(),
+                        (
+                            s.name.clone(),
+                            s.span,
+                            super::async_retention::Key::binding(&s.name),
+                        ),
+                    );
                     self.local.async_local_types.push(ty.clone());
                 }
                 // `_` is a wildcard: evaluate the initializer for side effects but do
@@ -1940,10 +1955,20 @@ impl TypeChecker {
                     } else {
                         iterable_ty.clone()
                     };
-                    self.local.async_local_types.push(iter_slot_ty);
+                    self.record_async_local(
+                        iter_slot_ty,
+                        "for iterator",
+                        s.iterable.span(),
+                        super::async_retention::Key::Value(s.iterable.id()),
+                    );
                     self.local.async_local_types.push(Type::I64);
                     if s.name != "_" {
-                        self.local.async_local_types.push(elem_ty.clone());
+                        self.record_async_local(
+                            elem_ty.clone(),
+                            &s.name,
+                            s.name_span,
+                            super::async_retention::Key::binding(&s.name),
+                        );
                     }
                 }
 
@@ -2147,7 +2172,12 @@ impl TypeChecker {
                             .get(&expr.id())
                             .cloned()
                             .unwrap_or(Type::I64);
-                        self.local.async_local_types.push(ty);
+                        self.record_async_local(
+                            ty,
+                            "deferred operand",
+                            expr.span(),
+                            super::async_retention::Key::Value(expr.id()),
+                        );
                     };
                     match &d.body {
                         DeferBody::Expr(Expr::Call(c)) => {
@@ -2160,6 +2190,17 @@ impl TypeChecker {
                         DeferBody::Expr(Expr::Print(arg, ..)) => record(arg),
                         _ => {}
                     }
+                }
+                if self.local.current_async_context
+                    && let DeferBody::Expr(Expr::Call(c)) = &d.body
+                    && let Some(info) = self.symbols.lookup_var(&c.callee)
+                {
+                    self.record_async_local(
+                        info.ty.clone(),
+                        "deferred callee",
+                        c.span,
+                        super::async_retention::Key::DeferredCallee(c.id),
+                    );
                 }
                 // An ASYNC callee would only SPAWN a task at scope exit — the
                 // cleanup body would never be driven to completion. Reject

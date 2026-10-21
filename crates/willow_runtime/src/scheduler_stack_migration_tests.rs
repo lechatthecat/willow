@@ -63,8 +63,8 @@ unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
                 usize::from(MODE.load(Ordering::Relaxed) == 1)
             );
             assert_eq!(cancelled, i32::from(MODE.load(Ordering::Relaxed) == 2));
-            assert_eq!(current_worker(), 2);
-            assert_ne!(
+            assert_eq!(current_worker(), 1);
+            assert_eq!(
                 Some(std::thread::current().id()),
                 *ORIGINAL_THREAD.lock().unwrap()
             );
@@ -85,7 +85,7 @@ unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
                 i32::from(MODE.load(Ordering::Relaxed) == 1)
             );
             crate::stack_trace::willow_callstack_pop();
-            // Allocation after migration must acquire this worker's TLAB.
+            // Allocation after resumption must acquire the current TLAB.
             let fresh = willow_gc_alloc_slow(willow_gc_current_tlab(), 21, 0, 8, 0);
             unsafe { *fresh.cast::<u64>() = 123 };
             assert_eq!(unsafe { *fresh.cast::<u64>() }, 123);
@@ -123,7 +123,7 @@ unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
 }
 
 unsafe extern "C" fn cached_helper(_: *mut c_void) -> i32 {
-    assert_eq!(current_worker(), 2);
+    assert_eq!(current_worker(), 1);
     assert_eq!(willow_root_depth(), 0);
     assert!(crate::reference_debug::current_reference_call().is_none());
     assert_eq!(
@@ -140,15 +140,15 @@ unsafe extern "C" fn cached_poll(_: *mut c_void) -> i32 {
 }
 
 fn run_claim(id: u64, worker: usize, prefix: usize, terminal: bool) {
-    std::thread::spawn(move || {
+    {
         CURRENT_WORKER.with(|slot| slot.set(worker));
         let _registration = MutatorRegistration::new();
         let mut outer = vec![std::ptr::null_mut(); prefix];
         for slot in &mut outer {
             willow_push_root(slot);
         }
-        let (claimed, work) = claim_global_ready_for_worker(worker, None)
-            .expect("claim must not reroute migratable stack");
+        let (claimed, work) =
+            claim_global_ready_for_worker(worker, None).expect("owner must claim its pinned stack");
         assert_eq!(claimed, id);
         assert!(work.direct_poll);
         let (poll, frame, flag) = work.poll.unwrap();
@@ -185,12 +185,11 @@ fn run_claim(id: u64, worker: usize, prefix: usize, terminal: bool) {
         } else {
             assert_eq!(result, RUNTIME_POLL_PREEMPTED);
             assert!(!FINISHED.load(Ordering::Relaxed));
-            finish_global_poll_boundary(id, GlobalPollBoundary::Runnable);
+            finish_global_poll_boundary(id, GlobalPollBoundary::Preempted);
         }
         set_current_task(None);
         if terminal {
-            // Reuse the migrated coroutine while its destination worker stays
-            // alive. The trampoline must not reuse its original TLS address.
+            // Reuse the coroutine on its owning worker after completion.
             let next = willow_sched_spawn_cooperative(cached_poll, std::ptr::null_mut()) as u64;
             let (claimed, work) = claim_global_ready_for_worker(worker, None).unwrap();
             assert_eq!(claimed, next);
@@ -207,45 +206,53 @@ fn run_claim(id: u64, worker: usize, prefix: usize, terminal: bool) {
         }
         willow_pop_roots(prefix as i32);
         assert_eq!(willow_root_depth(), 0);
-    })
-    .join()
-    .unwrap();
+    }
 }
 
 #[test]
-fn generated_stack_migrates_roots_and_context_after_moving_collection() {
+fn generated_stack_preserves_affinity_roots_and_context_after_moving_collection() {
     let _guard = runtime_test_guard();
     for mode in 0..3 {
         for count in [0, 1, 8, 64] {
             for depth in [0, 7] {
-                reset_global_scheduler_for_test();
-                replace_global_scheduler_for_test(3);
-                MODE.store(mode, Ordering::Relaxed);
-                ROOTS.store(count, Ordering::Relaxed);
-                DEPTH.store(depth, Ordering::Relaxed);
-                FINISHED.store(false, Ordering::Relaxed);
-                VISITED.store(0, Ordering::Relaxed);
-                let baseline = runtime_root_count();
-                let parked = parked_root_counts_for_test();
-                let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
-                run_claim(id, 1, 1, false);
-                assert_eq!(
-                    parked_root_counts_for_test(),
-                    (parked.0 + 1, parked.1 + count * (depth + 1))
-                );
-                minor_collect_internal();
-                if mode == 2 {
-                    willow_sched_cancel(id);
-                }
-                run_claim(id, 2, 5, true);
-                assert_eq!(VISITED.load(Ordering::Relaxed), count * (depth + 1));
-                assert_eq!(parked_root_counts_for_test(), parked);
-                assert_eq!(runtime_root_count(), baseline);
-                assert_eq!(crate::native_stack::required_workers(), 0);
-                println!(
-                    "mode={mode} depth={depth} roots_per_frame={count} rewritten_slots={}",
-                    VISITED.load(Ordering::Relaxed)
-                );
+                std::thread::spawn(move || {
+                    reset_global_scheduler_for_test();
+                    replace_global_scheduler_for_test(3);
+                    MODE.store(mode, Ordering::Relaxed);
+                    ROOTS.store(count, Ordering::Relaxed);
+                    DEPTH.store(depth, Ordering::Relaxed);
+                    FINISHED.store(false, Ordering::Relaxed);
+                    VISITED.store(0, Ordering::Relaxed);
+                    let baseline = runtime_root_count();
+                    let parked = parked_root_counts_for_test();
+                    let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
+                    run_claim(id, 1, 1, false);
+                    assert_eq!(
+                        parked_root_counts_for_test(),
+                        (parked.0 + 1, parked.1 + count * (depth + 1))
+                    );
+                    minor_collect_internal();
+                    if mode == 2 {
+                        willow_sched_cancel(id);
+                    }
+                    std::thread::spawn(|| {
+                        CURRENT_WORKER.with(|slot| slot.set(2));
+                        assert!(claim_global_ready_for_worker(2, None).is_none());
+                    })
+                    .join()
+                    .unwrap();
+                    run_claim(id, 1, 5, true);
+                    assert_eq!(VISITED.load(Ordering::Relaxed), count * (depth + 1));
+                    assert_eq!(parked_root_counts_for_test(), parked);
+                    assert_eq!(runtime_root_count(), baseline);
+                    assert_eq!(crate::native_stack::required_workers(), 0);
+                    println!(
+                        "mode={mode} depth={depth} roots_per_frame={count} rewritten_slots={}",
+                        VISITED.load(Ordering::Relaxed)
+                    );
+                })
+                .join()
+                .unwrap();
             }
         }
     }

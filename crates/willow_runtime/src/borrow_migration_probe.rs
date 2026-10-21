@@ -81,7 +81,7 @@ fn owned_slot(frames: &HashMap<usize, Allocation>, base: usize, offset: usize) -
         .flatten()
 }
 
-pub(crate) fn claimed(frame: usize, worker: usize, task: u64, native: bool) {
+pub(crate) fn claimed(frame: usize, worker: usize, task: u64, native: bool, pinned: bool) {
     let mut frames = FRAMES.lock().unwrap();
     if !is_fixture(&frames, frame) {
         return;
@@ -104,6 +104,24 @@ pub(crate) fn claimed(frame: usize, worker: usize, task: u64, native: bool) {
     });
     let thread = std::thread::current().id();
     let previous = allocation.probe;
+    if pinned {
+        let previous = previous.expect("pinned continuation must follow an initial claim");
+        assert_eq!(
+            previous.worker, worker,
+            "implicit preemption migrated workers"
+        );
+        assert_eq!(
+            previous.thread, thread,
+            "implicit preemption migrated OS threads"
+        );
+        assert_eq!(previous.address, address, "borrow changed caller slot");
+        if native {
+            eprintln!("native-stack-preemption task={task} worker={worker} checked=1");
+        } else {
+            eprintln!("cooperative-preemption task={task} worker={worker} checked=1");
+        }
+        return;
+    }
     if let Some(previous) = previous {
         assert_ne!(previous.worker, worker, "task did not migrate");
         assert_ne!(

@@ -31,7 +31,7 @@ fn probe_runtime() -> PathBuf {
 }
 
 #[test]
-fn task_owned_shadow_roots_forced_native_migration() {
+fn task_owned_shadow_roots_forced_native_preemption() {
     let runtime = probe_runtime();
     let runtime = runtime.to_str().unwrap();
     let project = TestProject::new(
@@ -64,15 +64,18 @@ fn task_owned_shadow_roots_forced_native_migration() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(out.status.success(), "{stderr}");
             assert_eq!(String::from_utf8_lossy(&out.stdout), "76\n");
-            let migrations = stderr
+            let preemptions = stderr
                 .lines()
-                .filter(|line| line.starts_with("native-stack-migration "))
+                .filter(|line| line.starts_with("native-stack-preemption "))
                 .count();
             assert!(
-                migrations >= 8,
-                "missing actual native migrations: {stderr}"
+                preemptions >= 8,
+                "missing actual native preemptions: {stderr}"
             );
-            println!("release={release} stress={stress:?} checked_native_migrations={migrations}");
+            assert!(!stderr.contains("native-stack-migration "), "{stderr}");
+            println!(
+                "release={release} stress={stress:?} checked_native_preemptions={preemptions}"
+            );
         }
     }
     let compiled = project.compile_with_env("main.wi", &[("WILLOW_RUNTIME_LIB", runtime)]);

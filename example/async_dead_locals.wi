@@ -1,0 +1,100 @@
+import std::collections::Array;
+
+interface Value {
+    fn get(self) -> i64;
+}
+
+class Number implements Value {
+    pub value: i64;
+    pub fn get(self) -> i64 { return self.value; }
+}
+
+fn total(values: Array<Value>) -> i64 {
+    let mut result = 0;
+    for value in values { result = result + value.get(); }
+    return result;
+}
+
+async fn never_called() -> bool { return true; }
+
+// A closure used entirely within one non-suspending body is permitted.
+async fn immediate() -> i64 {
+    let twice: closure(i64) -> i64 = |x| x * 2;
+    defer twice(0);
+    return match twice { f => f(21) };
+}
+
+async fn overwritten_cleanup(flag: bool) {
+    let mut op: closure(i64) -> i64 = |x| x;
+    defer { match flag { true => { op = |x| x + 1; }, false => { op = |x| x + 2; } } op(0); }
+    await sleep(0);
+}
+
+enum CallbackTag { A, B }
+async fn bare_variant(tag: CallbackTag) {
+    let mut f: closure(i64) -> i64 = |x| x;
+    await sleep(0);
+    match tag { A => { f = |x| x + 1; }, B => { f = |x| x + 2; } }
+    f(0);
+}
+
+async fn recovered_before_unreachable_await() {
+    let callback: closure(i64) -> i64 = |x| x;
+    if true {
+        defer { recover(); }
+        panic("recovered before an unreachable suspension");
+        await sleep(0);
+        callback(0);
+    }
+}
+
+fn cleanup_failure() { panic("recovered cleanup failure"); }
+
+async fn overwritten_before_cleanup_failure() {
+    let mut callback: closure(i64) -> i64 = |x| x;
+    defer { recover(); }
+    defer { callback(0); }
+    defer { callback = |x| x + 1; cleanup_failure(); }
+    await sleep(0);
+}
+
+async fn select_commit_recovery() {
+    let t = immediate();
+    let mut callback: closure(i64) -> i64 = |x| x;
+    await sleep(0);
+    if true {
+        defer { recover(); }
+        callback = |x| x + 1;
+        select {
+            await t => { callback = |x| x + 2; }
+            default => { callback = |x| x + 3; }
+        }
+    }
+    callback(0);
+}
+
+async fn main() {
+    await select_commit_recovery();
+    await overwritten_before_cleanup_failure();
+    await recovered_before_unreachable_await();
+    await bare_variant(CallbackTag::B);
+    await overwritten_cleanup(true);
+    let mut callback: closure(i64) -> i64 = |x| x;
+    await sleep(0);
+    if true { defer { callback = |x| x + 1; } }
+    let skipped = false && await never_called();
+    match true { _ if false => { await sleep(0); callback(0); }, _ => {} }
+    callback(0);
+    let values: Array<Value> = [new Number(19), new Number(23)];
+    let answer = total(values);
+    // `values` is dead here; only the scalar answer crosses this await.
+    await sleep(0);
+    println(answer);
+    println(await immediate());
+
+    let mut op: closure(i64) -> i64 = |x| x + 1;
+    match op { f => { println(f(1)); await sleep(0); } }
+    // The old value is killed before the next read.
+    op = |x| x + 2;
+    println(op(1));
+}

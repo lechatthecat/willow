@@ -2,18 +2,16 @@
 //! call chain; the scheduler can run another task without recursive re-entry.
 //!
 //! Context objects and stack mappings stay at stable addresses. No TLS borrow,
-//! scheduler lock, or GC registry lock crosses a context switch. Generated code
-//! may migrate only at an audited generated-code safepoint, with no native
-//! callback frame live. Other suspensions retain their scheduler worker.
+//! scheduler lock, or GC registry lock crosses a context switch. Implicit
+//! safepoints retain worker affinity: source locals need not be Send. Completed
+//! cooperative polls can migrate after a source suspension, once this native
+//! stack has returned and the compiler has checked the surviving frame.
 
 #[cfg(unix)]
 use corosensei::stack::Stack;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use std::cell::Cell;
-use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::stack_trace::RuntimeStackTrace;
 use crate::task::{RUNTIME_POLL_PREEMPTED, RuntimeCancelFn, RuntimePollFn};
@@ -25,95 +23,16 @@ thread_local! {
     static IDLE_STACKS: std::cell::RefCell<Vec<Box<NativeStack>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Counts only checked-out stacks, including stacks temporarily removed from a
-/// task record while running. Idle TLS cache entries must not pin workers.
-/// Writers never hold this lock across a context switch or acquire task locks.
-#[derive(Default)]
-struct WorkerAffinities {
-    counts: Mutex<BTreeMap<usize, usize>>,
-    bound: AtomicUsize,
-    #[cfg(test)]
-    queries: AtomicUsize,
-    #[cfg(test)]
-    updates: AtomicUsize,
-}
-
-impl WorkerAffinities {
-    fn acquire(&self, worker: usize) -> WorkerAffinity<'_> {
-        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
-        *counts.entry(worker).or_default() += 1;
-        self.bound.fetch_max(worker + 1, Ordering::Release);
-        #[cfg(test)]
-        self.updates.fetch_add(1, Ordering::Relaxed);
-        WorkerAffinity {
-            registry: self,
-            worker,
-        }
-    }
-
-    fn required_workers(&self) -> usize {
-        #[cfg(test)]
-        self.queries.fetch_add(1, Ordering::Relaxed);
-        self.bound.load(Ordering::Acquire)
-    }
-}
-
-struct WorkerAffinity<'a> {
-    registry: &'a WorkerAffinities,
-    worker: usize,
-}
-
-impl Drop for WorkerAffinity<'_> {
-    fn drop(&mut self) {
-        let mut counts = self
-            .registry
-            .counts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let count = counts
-            .get_mut(&self.worker)
-            .expect("missing native stack affinity");
-        *count -= 1;
-        if *count == 0 {
-            counts.remove(&self.worker);
-            if self.registry.bound.load(Ordering::Relaxed) == self.worker + 1 {
-                self.registry.bound.store(
-                    counts.last_key_value().map_or(0, |(&worker, _)| worker + 1),
-                    Ordering::Release,
-                );
-            }
-        }
-        #[cfg(test)]
-        self.registry.updates.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-static WORKER_AFFINITIES: std::sync::LazyLock<WorkerAffinities> =
-    std::sync::LazyLock::new(WorkerAffinities::default);
-
-/// The outer drive owns the persistent-worker lock, so no previous drive can
-/// still create a stack when it reads this bound. Running/nested drives retain
-/// their leases; completion and cancellation release them through recycle/drop.
-pub(crate) fn required_workers() -> usize {
-    WORKER_AFFINITIES.required_workers()
-}
-
+use crate::worker_affinity::{WorkerAffinity, acquire};
 #[cfg(test)]
-pub(crate) fn affinity_counts_for_test() -> (usize, usize) {
-    (
-        WORKER_AFFINITIES.queries.load(Ordering::Relaxed),
-        WORKER_AFFINITIES.updates.load(Ordering::Relaxed),
-    )
-}
+pub(crate) use crate::worker_affinity::{affinity_counts_for_test, required_workers};
 
 pub(crate) struct NativeStack {
     context: crate::generated_context::Context,
     pub(crate) worker: usize,
     affinity: Option<WorkerAffinity<'static>>,
     owner_thread: std::thread::ThreadId,
-    generated: bool,
     native_frames: usize,
-    migratable: bool,
     coroutine: Coroutine<(), (), ()>,
     yielder: *const Yielder<(), ()>,
     #[cfg(unix)]
@@ -149,24 +68,20 @@ impl std::fmt::Debug for NativeStack {
     }
 }
 
-// SAFETY: ownership transfers only while suspended, at stable addresses. Native
-// callbacks remain pinned. Generated entry opts into the ABI's migration contract:
-// no thread-bound values in generated frames, no cached TLS allocation pointer,
-// and no native frame below a migrating safepoint. ffi_boundary tracks native
-// extents; only the audited sync safepoint is transparent. A suspension outside
-// that boundary remains pinned. Roots, trace, reference state and overflow state
-// are restored before execution; the scheduler installs the task panic context.
-// Rust panics never unwind through a migrated C frame (ffi_boundary aborts).
+// SAFETY: the allocation has a stable address and is owned by one task.
+// Scheduler claims honor required_worker before resuming or cancelling a live
+// stack, and resume independently verifies its OS-thread owner. Thus moving a
+// suspended allocation through the shared task table never executes or drops
+// its thread-bound frames on another worker. Completed stacks contain only the
+// idle trampoline; roots, trace and reference state are restored before entry.
 unsafe impl Send for NativeStack {}
 
 impl NativeStack {
     pub(crate) fn acquire(poll: RuntimePollFn, frame: *mut c_void) -> Box<Self> {
         if let Some(mut stack) = IDLE_STACKS.with(|pool| pool.borrow_mut().pop()) {
-            stack.affinity = Some(WORKER_AFFINITIES.acquire(stack.worker));
+            stack.affinity = Some(acquire(stack.worker));
             stack.context.clear_helper();
-            stack.generated = false;
             stack.native_frames = 0;
-            stack.migratable = false;
             stack.poll = poll;
             stack.cancel_entry = None;
             stack.frame = frame;
@@ -184,13 +99,8 @@ impl NativeStack {
         }
     }
 
-    /// Caller guarantees the generated helper ABI, including native entry guards.
-    pub(crate) unsafe fn allow_generated_migration(&mut self) {
-        self.generated = true;
-    }
-
     pub(crate) fn required_worker(&self) -> Option<usize> {
-        (!self.migratable).then_some(self.worker)
+        Some(self.worker)
     }
 
     pub(crate) fn entry_panic_depth(&self) -> i32 {
@@ -230,11 +140,9 @@ impl NativeStack {
         Box::new(Self {
             context: crate::generated_context::Context::new(),
             worker: crate::scheduler::current_worker(),
-            affinity: Some(WORKER_AFFINITIES.acquire(crate::scheduler::current_worker())),
+            affinity: Some(acquire(crate::scheduler::current_worker())),
             owner_thread: std::thread::current().id(),
-            generated: false,
             native_frames: 0,
-            migratable: false,
             coroutine: Coroutine::with_stack(storage, |yielder, ()| trampoline(yielder)),
             yielder: std::ptr::null(),
             #[cfg(unix)]
@@ -273,22 +181,14 @@ impl NativeStack {
     /// spans the context switch: generated code and safepoint hooks access CURRENT via
     /// raw pointers while the scheduler's Rust activation is suspended.
     pub(crate) unsafe fn resume(stack: *mut Self) -> i32 {
-        // A migrated stack can arrive on a worker which has never allocated a
-        // native stack, including Windows' per-thread overflow protection.
+        // Ensure per-thread overflow protection before entering a task stack.
         crate::stack_overflow::protect_current_thread();
         unsafe {
-            if (*stack).migratable {
-                (*stack).worker = crate::scheduler::current_worker();
-                (*stack).owner_thread = std::thread::current().id();
-                (*stack).affinity = Some(WORKER_AFFINITIES.acquire((*stack).worker));
-                (*stack).migratable = false;
-            } else {
-                assert_eq!(
-                    (*stack).owner_thread,
-                    std::thread::current().id(),
-                    "thread-bound native task stack resumed on a different OS worker"
-                );
-            }
+            assert_eq!(
+                (*stack).owner_thread,
+                std::thread::current().id(),
+                "thread-bound native task stack resumed on a different OS worker"
+            );
             // Every scheduler resume starts a fresh quantum, including a
             // return from a blocking runtime operation or an async poll. Old
             // inline debt belongs to the completed quantum, not the new one.
@@ -412,16 +312,16 @@ pub(crate) fn suspend() -> bool {
 /// Suspend a synchronous runtime operation on its existing task stack. The
 /// scheduler must preserve the wait reason rather than immediately requeue it.
 pub(crate) fn suspend_with_result(result: i32) -> bool {
-    suspend_impl(result, false)
+    suspend_impl(result)
 }
 
-/// Only the generated synchronous safepoint may opt into migration. Runtime
-/// wait paths and direct native callbacks keep their original affinity.
+/// A generated safepoint is not a source suspension. Synchronous locals
+/// (including non-Send values) stay on their original worker until return.
 pub(crate) fn suspend_generated() -> bool {
-    suspend_impl(RUNTIME_POLL_PREEMPTED, true)
+    suspend_impl(RUNTIME_POLL_PREEMPTED)
 }
 
-fn suspend_impl(result: i32, generated_safepoint: bool) -> bool {
+fn suspend_impl(result: i32) -> bool {
     let stack = CURRENT.with(Cell::get);
     if stack.is_null() {
         return false;
@@ -430,18 +330,13 @@ fn suspend_impl(result: i32, generated_safepoint: bool) -> bool {
         (*stack).parked_roots = Some(crate::gc::park_current_roots((*stack).root_depth));
         (*stack).result = result;
         (*stack).suspended = true;
-        (*stack).migratable =
-            generated_safepoint && (*stack).generated && (*stack).native_frames == 0;
-        if (*stack).migratable {
-            (*stack).affinity = None;
-        }
         (*(*stack).yielder).suspend(());
     }
     true
 }
 
-/// Captures the stack identity, not TLS: a nested scheduler can temporarily
-/// replace CURRENT. A live guard prevents migration of the captured stack.
+/// Tracks native callback nesting by stack identity: a nested scheduler can
+/// temporarily replace CURRENT. Both native and generated extents stay affine.
 pub(crate) struct NativeFrameGuard(*mut NativeStack);
 
 impl NativeFrameGuard {
@@ -570,9 +465,10 @@ mod tests {
     use super::*;
     use crate::preempt::{PreemptConfig, begin_quantum, willow_preempt_end, willow_sync_safepoint};
     use crate::task::RUNTIME_POLL_READY;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn generated_stack_pins_native_callback_then_releases_affinity() {
+    fn generated_stack_keeps_affinity_across_implicit_preemption() {
         unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
             // A runtime entry may hold !Send state and call generated code.
             // Its guard pins the entire extent, including nested callbacks.
@@ -590,9 +486,7 @@ mod tests {
         }
         let _guard = crate::gc::runtime_test_guard();
         let mut stack = NativeStack::new(helper, std::ptr::null_mut());
-        // SAFETY: the fixture guards every non-migratable native frame.
-        unsafe { stack.allow_generated_migration() };
-        for expected_owner in [Some(stack.worker), None] {
+        for expected_owner in [Some(stack.worker), Some(stack.worker)] {
             begin_quantum(
                 PreemptConfig::from_env_values(Some("1"), Some("100000")),
                 std::ptr::null(),
@@ -664,7 +558,6 @@ mod tests {
     fn owned_work_backpressure_cancellation_drops_unsubmitted_jobs() {
         use crate::blocking::test_support::*;
         use crate::scheduler::*;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         static DROPS: AtomicUsize = AtomicUsize::new(0);
         static RAN: AtomicUsize = AtomicUsize::new(0);
         struct Owned;
@@ -780,48 +673,6 @@ mod tests {
         willow_sched_cancel(task);
         willow_sched_run_until(task);
         reset_global_scheduler_for_test();
-    }
-
-    #[test]
-    fn affinity_bound_counts_shared_and_sparse_workers() {
-        let registry = WorkerAffinities::default();
-        assert_eq!(registry.required_workers(), 0);
-        let low = registry.acquire(1);
-        let high = registry.acquire(1_000_000);
-        let shared = registry.acquire(1_000_000);
-        assert_eq!(registry.required_workers(), 1_000_001);
-        assert_eq!(registry.counts.lock().unwrap().len(), 2);
-        drop(high);
-        assert_eq!(registry.required_workers(), 1_000_001);
-        drop(shared);
-        assert_eq!(registry.required_workers(), 2);
-        drop(low);
-        assert_eq!(registry.required_workers(), 0);
-    }
-
-    #[test]
-    fn affinity_queries_do_not_visit_stacks_or_update_counts() {
-        println!("stacks,workers,queries,updates");
-        for count in [16, 128, 1024] {
-            for workers in [1, 8, count] {
-                let registry = WorkerAffinities::default();
-                let leases: Vec<_> = (0..count).map(|i| registry.acquire(i % workers)).collect();
-                let queries = count * 4;
-                // Holding the writer lock also proves queries cannot inspect
-                // the counts map, regardless of its size or shape.
-                let counts = registry.counts.lock().unwrap();
-                for _ in 0..queries {
-                    assert_eq!(registry.required_workers(), workers);
-                }
-                drop(counts);
-                assert_eq!(registry.queries.load(Ordering::Relaxed), queries);
-                assert_eq!(registry.updates.load(Ordering::Relaxed), count);
-                drop(leases);
-                assert_eq!(registry.updates.load(Ordering::Relaxed), count * 2);
-                assert_eq!(registry.bound.load(Ordering::Relaxed), 0);
-                println!("{count},{workers},{queries},{}", count * 2);
-            }
-        }
     }
 
     #[test]

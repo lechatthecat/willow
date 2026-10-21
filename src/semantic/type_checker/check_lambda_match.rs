@@ -1265,6 +1265,24 @@ impl TypeChecker {
                     },
                 );
             }
+            if self.local.current_async_context && !invalid_pattern {
+                // Use original AST name addresses, not normalized pattern clones.
+                for (source, resolved) in super::async_retention::pattern_bindings(&arm.pattern)
+                    .iter()
+                    .zip(super::async_retention::pattern_bindings(pattern))
+                {
+                    if resolved != "_"
+                        && let Some(info) = self.symbols.lookup_var(resolved)
+                    {
+                        self.record_async_local(
+                            info.ty.clone(),
+                            source,
+                            arm.pattern.span(),
+                            super::async_retention::Key::binding(source),
+                        );
+                    }
+                }
+            }
             if let Some(guard) = &arm.guard {
                 self.check_match_guard(guard);
             }
@@ -1420,6 +1438,19 @@ impl TypeChecker {
         // All arms have been checked, so independent diagnostics are retained.
         if self.error_generation != errors_before_match {
             return Self::error_type();
+        }
+        // Reuse the coverage check above; guards only contribute when an
+        // unguarded fallback covers the remaining values.
+        if has_wildcard
+            || scrutinee_ty == Type::Bool
+            || match &scrutinee_ty {
+                Type::Named(name) | Type::Generic(name, _) => {
+                    self.symbols.lookup_enum(name).is_some()
+                }
+                _ => false,
+            }
+        {
+            self.local.exhaustive_matches.insert(m.id);
         }
         let result = result_type.unwrap_or(Type::Void);
         self.resolve_empty_array_values(&m.arms, &result);

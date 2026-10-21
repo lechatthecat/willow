@@ -176,6 +176,10 @@ pub enum RuntimePollResult {
     Pending = 0,
     Ready = 1,
     Yield = 2,
+    /// Quantum expiration preserves worker ownership of source locals. The
+    /// runtime must resume on the same worker until a source-level Pending or
+    /// Yield boundary (or terminal completion). Unlike an await, generated
+    /// preemption does not imply that live locals satisfy Send.
     Preempted = 3,
     Panicked = 4,
     BlockedSyscall = 5,

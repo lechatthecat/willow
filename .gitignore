@@ -123,3 +123,9 @@ AGENTS.md
 !/docs/audits/willow-jz15.118/measure.py
 !/docs/audits/willow-jz15.118/before.jsonl
 !/docs/audits/willow-jz15.118/after.jsonl
+
+# Public source-liveness audit; no private specification content.
+!/docs/audits/willow-jz15.117/
+/docs/audits/willow-jz15.117/*
+!/docs/audits/willow-jz15.117/implementation-audit.md
+!/docs/audits/willow-jz15.117/reproduce.sh

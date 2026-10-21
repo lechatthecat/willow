@@ -9,6 +9,7 @@ mod check_decls;
 mod check_lambda_match;
 pub(crate) mod generics;
 pub use check_lambda_match::LambdaCapture;
+mod async_retention;
 mod check_ops;
 #[cfg(test)]
 mod class_cycle_tests;
@@ -1994,8 +1995,8 @@ mod tests {
                     format!("{scalars}{bad}")
                 };
                 let source = format!(
-                    "async fn first() {{ {body} }} \
-                     async fn second() {{ {body} }} \
+                    "async fn first() {{ {body} await sleep(0); println(op(1)); }} \
+                     async fn second() {{ {body} await sleep(0); println(op(1)); }} \
                      async fn clean() {{ let value = 1; }}"
                 );
                 let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();

@@ -208,3 +208,5 @@ mod tests {
 mod native_memory;
 
 mod rust_bridge;
+
+mod worker_affinity;

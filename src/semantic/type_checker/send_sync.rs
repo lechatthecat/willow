@@ -150,6 +150,20 @@ impl TypeChecker {
         matches!(ty, Type::Named(n) if self.symbols.lookup_interface(n).is_some())
     }
 
+    pub(super) fn record_async_local(
+        &mut self,
+        ty: Type,
+        name: &str,
+        span: Span,
+        key: super::async_retention::Key,
+    ) {
+        self.local.async_local_bindings.insert(
+            self.local.async_local_types.len(),
+            (name.to_owned(), span, key),
+        );
+        self.local.async_local_types.push(ty);
+    }
+
     /// The `Task<T>` Send rule (willow-dgwo.5, spec §9): a task produced by an
     /// async fn may be moved between workers only if its worker-movable frame —
     /// the return value, parameters, and locals live across `await` — is entirely
@@ -174,8 +188,19 @@ impl TypeChecker {
         if !self.enforce_send_sync {
             return;
         }
+        // Parameters cross the initial scheduling boundary and results cross the
+        // completion boundary even in a body without await. Only local values
+        // need a live-across-suspension proof.
+        let retention = super::async_retention::analyze(
+            body,
+            &self.lambda_captures,
+            &self.expr_types,
+            &self.local.exhaustive_matches,
+            &self.pattern_resolutions,
+        );
         // Classify frame slots once, retaining the offending slot for its label.
         let mut bad_slot = None;
+        let mut send = std::collections::HashMap::new();
         for (index, ty) in params
             .iter()
             .map(|(ty, _)| *ty)
@@ -183,12 +208,70 @@ impl TypeChecker {
             .chain(std::iter::once(ret))
             .enumerate()
         {
-            if !self.is_send(ty) {
+            if index >= params.len() && index < params.len() + locals.len() {
+                let binding = bindings.get(&(locals_offset + index - params.len()));
+                if binding.map_or(!retention.has_suspend, |(_, _, id)| {
+                    !retention.locals.contains_key(id)
+                }) {
+                    continue;
+                }
+            }
+            let ok = if let Some(ok) = send.get(ty) {
+                *ok
+            } else {
+                let ok = self.is_send(ty);
+                send.insert(ty, ok);
+                ok
+            };
+            if !ok {
                 bad_slot = Some((index, ty));
                 break;
             }
         }
         let Some((index, first_bad)) = bad_slot else {
+            let mut bad_value: Option<(&Type, Span, Span)> = None;
+            for (id, origin, wait) in &retention.values {
+                let Some(ty) = self.expr_types.get(id) else {
+                    continue;
+                };
+                let ok = if let Some(ok) = send.get(ty) {
+                    *ok
+                } else {
+                    let ok = self.is_send(ty);
+                    send.insert(ty, ok);
+                    ok
+                };
+                if !ok
+                    && bad_value.is_none_or(|(_, previous, _)| {
+                        (origin.start, origin.end) < (previous.start, previous.end)
+                    })
+                {
+                    bad_value = Some((ty, *origin, *wait));
+                }
+            }
+            if let Some((ty, origin, wait)) = bad_value {
+                let (note, help) = self.marker_failure(ty, Marker::Send);
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E2402,
+                        format!(
+                            "async task frame is not `Send`: `{}` cannot move between workers",
+                            type_name(ty)
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        origin,
+                        "this intermediate value is retained during operand evaluation",
+                    ))
+                    .with_label(Label::secondary(
+                        wait,
+                        "operand evaluation can suspend here",
+                    ))
+                    .with_note(note)
+                    .with_help(help),
+                );
+            }
             return;
         };
         let binding = if index >= params.len() && index < params.len() + locals.len() {
@@ -208,30 +291,21 @@ impl TypeChecker {
             ),
         )
         .with_label(Label::primary(
-            binding.map_or(primary_span, |(_, span)| *span),
+            binding.map_or(primary_span, |(_, span, _)| *span),
             binding.map_or_else(
                 || "this async task may be scheduled on another worker".into(),
-                |(name, _)| format!("`{name}` is retained in this async task frame"),
+                |(name, _, _)| format!("`{name}` is retained in this async task frame"),
             ),
         ))
         .with_note(note)
         .with_help(help);
-        if let Some((name, binding_span)) = binding {
-            use crate::parser::iter::{AstEvent, AstWalk};
-            let mut walk = AstWalk::new(AstEvent::Block(body));
-            while let Some(event) = walk.next() {
-                match event {
-                    AstEvent::Lambda(_) => walk.skip_children(),
-                    AstEvent::Expr(Expr::Await(wait)) if wait.span.start >= binding_span.start => {
-                        diagnostic = diagnostic.with_label(Label::secondary(
-                            wait.span,
-                            format!("the frame containing `{name}` can suspend here"),
-                        ));
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+        if let Some((name, _, id)) = binding
+            && let Some(wait) = retention.locals.get(id)
+        {
+            diagnostic = diagnostic.with_label(Label::secondary(
+                *wait,
+                format!("the frame containing `{name}` can suspend here"),
+            ));
         }
         self.push(diagnostic);
     }
@@ -1107,7 +1181,7 @@ mod tests {
                 ("Holder", "new Holder(new A())"),
             ] {
                 let source = format!(
-                    "import std::collections::Array; enum Option<T> {{ Some(T), None }} interface Send {{}} interface Sync extends Send {{}} interface Moving extends Send {{}} interface Sharing extends Sync {{}} interface Named {contract} {{ fn label(self) -> String; }} class A implements Named {{ pub fn label(self) -> String {{ return \"a\"; }} }} class Holder {{ pub value: Named; }} async fn main() {{\nlet value: {ty} = {init};\nawait sleep(0);\nprintln(1);\n}}"
+                    "import std::collections::Array; enum Option<T> {{ Some(T), None }} interface Send {{}} interface Sync extends Send {{}} interface Moving extends Send {{}} interface Sharing extends Sync {{}} interface Named {contract} {{ fn label(self) -> String; }} class A implements Named {{ pub fn label(self) -> String {{ return \"a\"; }} }} class Holder {{ pub value: Named; }} async fn main() {{\nlet value: {ty} = {init};\nawait sleep(0);\nlet _ = value;\n}}"
                 );
                 let (program, errors) =
                     Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();

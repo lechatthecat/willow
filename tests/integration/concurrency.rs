@@ -282,3 +282,6 @@ mod task_traces;
 
 #[path = "concurrency/interface_contracts.rs"]
 mod interface_contracts;
+
+#[path = "concurrency/async_retention.rs"]
+mod async_retention;

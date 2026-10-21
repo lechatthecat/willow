@@ -2323,6 +2323,7 @@ fn wake_global_due_timers(now: Instant) -> usize {
 enum GlobalPollBoundary {
     Pending,
     Runnable,
+    Preempted,
     BlockedSyscall,
 }
 
@@ -2337,10 +2338,26 @@ fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) 
         let before = task.state.lifecycle();
         let yielded = task.yield_requested;
         task.yield_requested = false;
+        // Source suspension permits transfer of the compiler-checked Send
+        // frame. Quantum expiration does not transfer source-local ownership.
+        // Install/release the lease under the existing boundary shard lock,
+        // before making the task stealable again.
+        match boundary {
+            GlobalPollBoundary::Preempted => {
+                task.worker_affinity
+                    .get_or_insert_with(|| crate::worker_affinity::acquire(current_worker()));
+            }
+            GlobalPollBoundary::Pending | GlobalPollBoundary::Runnable => {
+                task.worker_affinity = None
+            }
+            GlobalPollBoundary::BlockedSyscall => {}
+        }
         let outcome = match boundary {
             GlobalPollBoundary::Pending if yielded => task.state.requeue_after_poll(),
             GlobalPollBoundary::Pending => task.state.park_after_poll(),
-            GlobalPollBoundary::Runnable => task.state.requeue_after_poll(),
+            GlobalPollBoundary::Runnable | GlobalPollBoundary::Preempted => {
+                task.state.requeue_after_poll()
+            }
             GlobalPollBoundary::BlockedSyscall => task.state.block_on_syscall(),
         };
         #[cfg(feature = "borrow-migration-probe")]
@@ -3740,19 +3757,7 @@ fn willow_sched_run_parallel(
         }
     };
     let workers = workers.max(1);
-    #[cfg(any(
-        all(
-            target_os = "linux",
-            target_env = "gnu",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ),
-        all(
-            target_os = "macos",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ),
-        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
-    ))]
-    let workers = workers.max(crate::native_stack::required_workers());
+    let workers = workers.max(crate::worker_affinity::required_workers());
     if !static_mut_workers_allowed(SINGLE_WORKER_STATICS.load(Ordering::Acquire), workers) {
         crate::panic_context::fatal_invariant(
             "static mut requires single-worker execution; set WILLOW_WORKERS=1 or use immutable static Atomic/Mutex values",
@@ -4038,6 +4043,11 @@ fn claim_global_ready_for_worker(
         }
         let claim = tasks
             .with_mut(id, |task| {
+                if let Some(affinity) = &task.worker_affinity
+                    && affinity.worker() != worker
+                {
+                    return Claim::Reroute(affinity.worker());
+                }
                 #[cfg(feature = "borrow-migration-probe")]
                 let probe_poll = std::cell::Cell::new(task.cooperative_poll);
                 #[cfg(feature = "borrow-migration-probe")]
@@ -4063,8 +4073,8 @@ fn claim_global_ready_for_worker(
                     {
                         return Claim::Reroute(owner);
                     }
-                    // Native callbacks stay pinned; generated safe suspensions
-                    // participate in the same forced-migration probe as polls.
+                    // Native stacks remain pinned across implicit preemption;
+                    // the probe verifies ownership as well as source-await migration.
                     #[cfg(feature = "borrow-migration-probe")]
                     {
                         probe_poll.set(
@@ -4083,6 +4093,7 @@ fn claim_global_ready_for_worker(
                 }
                 #[cfg(feature = "borrow-migration-probe")]
                 if probe_poll.get()
+                    && task.worker_affinity.is_none()
                     && task.state.lifecycle() == TaskLifecycle::Ready
                     && let Some(owner) = crate::borrow_migration_probe::route(
                         task.frame as usize,
@@ -4096,12 +4107,13 @@ fn claim_global_ready_for_worker(
                     ClaimOutcome::Drop => Claim::Drop,
                     ClaimOutcome::Poll => {
                         #[cfg(feature = "borrow-migration-probe")]
-                        if probe_poll.get() {
+                        if task.cooperative_poll {
                             crate::borrow_migration_probe::claimed(
                                 task.frame as usize,
                                 worker,
                                 id,
                                 probe_native.get(),
+                                task.worker_affinity.is_some() || !probe_poll.get(),
                             );
                         }
                         task.yield_requested = false;
@@ -4557,6 +4569,7 @@ fn scheduler_run_loop(
                         let boundary = match result {
                             RUNTIME_POLL_PENDING => GlobalPollBoundary::Pending,
                             RUNTIME_POLL_BLOCKED_SYSCALL => GlobalPollBoundary::BlockedSyscall,
+                            RUNTIME_POLL_PREEMPTED => GlobalPollBoundary::Preempted,
                             _ => GlobalPollBoundary::Runnable,
                         };
                         finish_global_poll_boundary(id, boundary);
@@ -4732,7 +4745,14 @@ fn scheduler_run_loop(
                 // Runnable outcome (spec §7): gave up the worker but is not
                 // waiting on an event. This hot boundary stays off the global
                 // scheduler metadata lock.
-                finish_global_poll_boundary(id, GlobalPollBoundary::Runnable);
+                finish_global_poll_boundary(
+                    id,
+                    if matches!(outcome, PollOutcome::Preempted) {
+                        GlobalPollBoundary::Preempted
+                    } else {
+                        GlobalPollBoundary::Runnable
+                    },
+                );
             }
             PollOutcome::BlockedSyscall => {
                 finish_global_poll_boundary(id, GlobalPollBoundary::BlockedSyscall);
@@ -4875,22 +4895,21 @@ fn replace_global_scheduler_for_test(worker_count: usize) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_task_stack_enter(callback: RuntimePollFn, frame: *mut c_void) -> i32 {
-    task_stack_enter(callback, frame, false)
+    task_stack_enter(callback, frame)
 }
 
-/// Generated-helper ABI: callback frames must contain no thread-bound values.
-/// All native calls use guarded runtime entry points; foreign Rust calls are
-/// rejected inside tasks. Allocation TLS is acquired afresh at each use.
+/// Generated-helper ABI: synchronous frames remain on their owning OS thread
+/// across implicit preemption, including frames holding non-Send local values.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_task_stack_enter_generated(
     callback: RuntimePollFn,
     frame: *mut c_void,
 ) -> i32 {
-    task_stack_enter(callback, frame, true)
+    task_stack_enter(callback, frame)
 }
 
-fn task_stack_enter(callback: RuntimePollFn, frame: *mut c_void, generated: bool) -> i32 {
+fn task_stack_enter(callback: RuntimePollFn, frame: *mut c_void) -> i32 {
     #[cfg(any(
         all(
             target_os = "linux",
@@ -4909,10 +4928,6 @@ fn task_stack_enter(callback: RuntimePollFn, frame: *mut c_void, generated: bool
             .with_mut(id, |task| task.native_stack.take())
             .flatten()
             .unwrap_or_else(|| crate::native_stack::NativeStack::acquire(callback, frame));
-        if generated {
-            // SAFETY: the compiler-only entry carries the generated-helper ABI.
-            unsafe { stack.allow_generated_migration() };
-        }
         let panic_depth = stack.entry_panic_depth();
         let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
         // A recovered cleanup panic must not revoke sticky cancellation, and
@@ -5046,3 +5061,7 @@ mod stack_migration_tests;
 #[cfg(test)]
 #[path = "scheduler_yield_accounting_tests.rs"]
 mod yield_accounting_tests;
+
+#[cfg(test)]
+#[path = "scheduler_cooperative_affinity_tests.rs"]
+mod cooperative_affinity_tests;

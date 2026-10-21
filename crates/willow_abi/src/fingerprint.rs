@@ -7,7 +7,9 @@
 use crate::schema::RuntimeAbiSchema;
 use crate::*;
 
-pub const CONTRACT_REVISION: u64 = 3;
+// Revision 4 requires worker-affine implicit preemption. A compiler that
+// accepts dead/no-await non-Send locals must reject older migrating runtimes.
+pub const CONTRACT_REVISION: u64 = 4;
 
 /// All currently supported executable targets use 64-bit pointers.
 pub const ABI_HASH_64: u64 = abi_hash(&RUNTIME_ABI, 8, CONTRACT_CONSTANTS);
@@ -218,6 +220,13 @@ const fn hash_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_preemption_affinity_rejects_revision_three_runtime() {
+        let mut old = CONTRACT_CONSTANTS.to_vec();
+        old[0] = 3;
+        assert_ne!(ABI_HASH_64, abi_hash(&RUNTIME_ABI, 8, &old));
+    }
 
     #[test]
     fn abi_hash_covers_every_contract_constant() {

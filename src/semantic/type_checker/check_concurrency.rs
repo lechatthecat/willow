@@ -30,7 +30,12 @@ impl TypeChecker {
                         // Include the received binding in the task's Send check,
                         // independently of other bindings at the same source span.
                         if self.local.current_async_context {
-                            self.local.async_local_types.push(elem.clone());
+                            self.record_async_local(
+                                elem.clone(),
+                                binding,
+                                case.span,
+                                super::async_retention::Key::binding(binding),
+                            );
                         }
                         self.define_var(
                             binding.clone(),
@@ -50,7 +55,12 @@ impl TypeChecker {
                     // A bounded send can suspend while holding the value,
                     // so its type participates in the task's Send check.
                     if self.local.current_async_context && elem != Type::Void {
-                        self.local.async_local_types.push(elem.clone());
+                        self.record_async_local(
+                            elem.clone(),
+                            "select send value",
+                            value.span(),
+                            super::async_retention::Key::Value(value.id()),
+                        );
                     }
                     if elem != Type::Void && v_ty != elem {
                         self.push(
@@ -135,7 +145,12 @@ impl TypeChecker {
                     if binding != "_" {
                         // Include the join binding just like a received binding.
                         if self.local.current_async_context {
-                            self.local.async_local_types.push(result_ty.clone());
+                            self.record_async_local(
+                                result_ty.clone(),
+                                binding,
+                                case.span,
+                                super::async_retention::Key::binding(binding),
+                            );
                         }
                         self.define_var(
                             binding.clone(),
@@ -1148,7 +1163,12 @@ impl TypeChecker {
                     // point, so the lowering frame-backs channel + value and
                     // carries the value into the task (willow-o038).
                     if self.local.current_async_context && element_ty != Type::Void {
-                        self.local.async_local_types.push(element_ty.clone());
+                        self.record_async_local(
+                            element_ty.clone(),
+                            "channel send value",
+                            arg.expr.span(),
+                            super::async_retention::Key::Value(arg.expr.id()),
+                        );
                     }
                     if matches!(arg.mode, CallArgMode::Reference { .. }) {
                         self.push(

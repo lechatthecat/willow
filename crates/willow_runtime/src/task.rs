@@ -253,6 +253,9 @@ pub struct RuntimeTask {
     pub poll: Option<RuntimePollFn>,
     /// Generated polls manage their own lazy synchronous stack boundaries.
     pub(crate) cooperative_poll: bool,
+    /// An implicit quantum yield does not transfer source-local ownership.
+    /// Retained until a source suspension or terminal cleanup.
+    pub(crate) worker_affinity: Option<crate::worker_affinity::WorkerAffinity<'static>>,
     /// Cancellation cleanup entry running the frame's pending defers, or
     /// `None` when the async fn has no defer sites (willow-vynv.3).
     pub cancel: Option<RuntimeCancelFn>,
@@ -311,6 +314,7 @@ impl RuntimeTask {
             state: AtomicTaskState::new(),
             poll: None,
             cooperative_poll: false,
+            worker_affinity: None,
             cancel: None,
             native_cancel_cleanup: true,
             frame: std::ptr::null_mut(),
