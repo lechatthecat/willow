@@ -731,9 +731,11 @@ impl Parser {
             }));
         }
         // `ClassName::property = value;` — static property assignment. Detected
-        // after parsing the lvalue (a StaticField). The type checker enforces
+        // after parsing the lvalue (StaticField, or a bare uppercase StaticCall).
+        // The type checker enforces
         // mutability (immutable → E0832); codegen stores into global storage.
-        if matches!(expr, Expr::StaticField(_))
+        if (matches!(expr, Expr::StaticField(_))
+            || matches!(&expr, Expr::StaticCall(call) if call.is_bare_member()))
             && matches!(self.peek_kind(), TokenKind::Eq)
             && !matches!(
                 self.tokens.get(self.pos + 1).map(|t| &t.kind),
@@ -743,14 +745,16 @@ impl Parser {
             self.advance(); // consume `=`
             let value = self.parse_expr()?;
             self.expect(TokenKind::Semicolon)?;
-            let Expr::StaticField(sf) = &mut expr else {
-                unreachable!("checked Expr::StaticField above");
+            let (class, field, span) = match &mut expr {
+                Expr::StaticField(sf) => (&mut sf.class, &mut sf.field, sf.span),
+                Expr::StaticCall(call) => (&mut call.class, &mut call.method, call.span),
+                _ => unreachable!("checked static member above"),
             };
             return Ok(Stmt::StaticFieldAssign(StaticFieldAssignStmt {
-                class: std::mem::take(&mut sf.class),
-                field: std::mem::take(&mut sf.field),
+                class: std::mem::take(class),
+                field: std::mem::take(field),
                 value,
-                span: sf.span,
+                span,
             }));
         }
         // `obj.field = value;` where `obj` is an arbitrary place expression

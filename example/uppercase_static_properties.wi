@@ -1,0 +1,20 @@
+class Tables {
+    pub static KNIGHT: FrozenArray<i64> = [6, 10].freeze();
+    pub static ENABLED: bool = true;
+    pub static mut RUNNING: bool = true;
+    pub static MESSAGE: String = "tables";
+    pub static TOTAL: i64 = Tables::KNIGHT[0] + Tables::KNIGHT[1];
+    pub static fn total() -> i64 { return Self::TOTAL; }
+}
+
+fn main() {
+    println(Tables::MESSAGE);
+    println(Tables::KNIGHT[1]);
+    for d in Tables::KNIGHT { println(d); }
+    if Tables::ENABLED { println(Tables::total()); }
+    while Tables::RUNNING {
+        println("once");
+        Tables::RUNNING = false;
+    }
+    match Tables::TOTAL { 16 => println("sixteen"), _ => println("unexpected"), }
+}

@@ -2362,6 +2362,20 @@ impl TypeChecker {
         ty
     }
 
+    /// The parser cannot distinguish uppercase class properties from enum variants.
+    /// A known class makes a bare member a field; parentheses still mean a call.
+    /// Classify by receiver only, so the field resolver walks inheritance once.
+    fn is_static_field_call(&self, call: &StaticCallExpr) -> bool {
+        call.is_bare_member()
+            && (self
+                .symbols
+                .lookup_module_func(&call.class, &call.method)
+                .is_some_and(|info| info.constant.is_some())
+                || self
+                    .resolve_static_call_class_quiet(&call.class)
+                    .is_some_and(|name| self.symbols.lookup_class(&name).is_some()))
+    }
+
     /// Record resolution at the checked expression, while lexical bindings and
     /// receiver types are still available. Unknown is explicit for panic safety.
     fn record_resolved_call(&mut self, expr: &Expr) {
@@ -2410,6 +2424,9 @@ impl TypeChecker {
                     targets
                 })
                 .unwrap_or_default(),
+            // Bare class properties/module constants do not invoke a method.
+            // Their initializer dependencies are recorded by the field resolver.
+            Expr::StaticCall(call) if self.is_static_field_call(call) => return,
             Expr::StaticCall(call) => vec![
                 self.static_method_effect_id(&call.class, &call.method)
                     .unwrap_or_else(|| {
@@ -2962,13 +2979,7 @@ impl TypeChecker {
                 self.resolve_field(&obj_ty, field_name, *span, true, "read")
             }
             Expr::MethodCall(m) => self.check_method_call_expecting(m, None),
-            Expr::StaticCall(s)
-                if s.is_bare_member()
-                    && self
-                        .symbols
-                        .lookup_module_func(&s.class, &s.method)
-                        .is_some_and(|info| info.constant.is_some()) =>
-            {
+            Expr::StaticCall(s) if self.is_static_field_call(s) => {
                 self.resolve_static_field_read(&s.class, &s.method, s.span)
             }
             Expr::StaticCall(s) => {

@@ -2337,6 +2337,32 @@ fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirE
     {
         return Ok(const_literal(value, s.span));
     }
+    // A bare uppercase member on a class is a property, just like a
+    // lowercase StaticField. Keep explicit `Member()` calls distinct.
+    if s.is_bare_member() {
+        let resolved = ctx.tables.static_call_class(&s.id, &s.class);
+        let class = if resolved == "Self" {
+            ctx.current_class.as_deref().unwrap_or(&resolved)
+        } else {
+            &resolved
+        };
+        if ctx.classes.map.contains_key(class)
+            || ctx
+                .tables
+                .symbols
+                .is_some_and(|symbols| symbols.lookup_class(class).is_some())
+        {
+            return lower_static_field_expr(
+                &StaticFieldExpr {
+                    id: s.id,
+                    class: s.class.clone(),
+                    field: s.method.clone(),
+                    span: s.span,
+                },
+                ctx,
+            );
+        }
+    }
     // `Enum::Variant(args)` construction parses like a static call.
     let class = if s.class == "Self" {
         ctx.current_class.as_deref().unwrap_or(&s.class)

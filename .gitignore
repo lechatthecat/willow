@@ -193,3 +193,6 @@ AGENTS.md
 !/docs/audits/willow-8hq4.34/benchmark.jsonl
 !/docs/audits/willow-8hq4.34/analysis.txt
 !/docs/audits/willow-8hq4.34/reproduce.sh
+
+# Public uppercase static property implementation audit.
+!/docs/audits/willow-jz15.103-uppercase-static-properties.md
