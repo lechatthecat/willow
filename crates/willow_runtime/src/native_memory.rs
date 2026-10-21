@@ -133,6 +133,44 @@ impl<T: Footprint> Drop for MutexGuard<'_, T> {
     }
 }
 
+/// Native accounting for a compiler-proven confined owner. Callers must keep
+/// concurrent GC away from the contents and disable preemption while borrowed.
+pub(crate) struct Local<T: Footprint>(std::cell::RefCell<Owner<T>>);
+impl<T: Footprint> Local<T> {
+    pub(crate) fn new(value: T) -> Self {
+        let mut owner = Owner {
+            value,
+            base: 0,
+            charge: Charge(0),
+        };
+        owner.reconcile();
+        Self(std::cell::RefCell::new(owner))
+    }
+    pub(crate) fn access(&self) -> LocalGuard<'_, T> {
+        LocalGuard(self.0.borrow_mut(), false)
+    }
+}
+pub(crate) struct LocalGuard<'a, T: Footprint>(std::cell::RefMut<'a, Owner<T>>, bool);
+impl<T: Footprint> Deref for LocalGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0.value
+    }
+}
+impl<T: Footprint> DerefMut for LocalGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.1 = true;
+        &mut self.0.value
+    }
+}
+impl<T: Footprint> Drop for LocalGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.1 {
+            self.0.reconcile();
+        }
+    }
+}
+
 /// Per-table high water marks prevent one table's tombstones from hiding
 /// growth in a different table in the same owner. No table scanning is needed.
 pub(crate) fn retain_capacity(slot: &mut usize, current: usize) -> usize {

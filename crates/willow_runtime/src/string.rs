@@ -367,12 +367,21 @@ fn require_utf8(bytes: &[u8]) -> &str {
 /// `s` must be null or a valid pointer to a WillowString allocated by this
 /// runtime; the returned slice borrows that allocation for `'a`.
 pub unsafe fn willow_string_as_str<'a>(s: *const u8) -> &'a str {
+    require_utf8(unsafe { willow_string_as_bytes(s) })
+}
+
+/// Borrow immutable string bytes for content hashing/equality without a second
+/// UTF-8 scan. Byte operations do not require constructing a Rust `str`.
+///
+/// # Safety
+/// `s` must be null or a valid live WillowString for the returned lifetime.
+#[inline]
+pub(crate) unsafe fn willow_string_as_bytes<'a>(s: *const u8) -> &'a [u8] {
     if s.is_null() {
-        return "";
+        return &[];
     }
     let len = unsafe { *(s as *const i64) } as usize;
-    let bytes = unsafe { std::slice::from_raw_parts(s.add(8), len) };
-    require_utf8(bytes)
+    unsafe { std::slice::from_raw_parts(s.add(8), len) }
 }
 
 // ---------------------------------------------------------------------------

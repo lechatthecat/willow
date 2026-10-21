@@ -14,6 +14,13 @@ if (process.argv[2] === 'run' && process.argv[3] === 'parallel_map') {
   if (result.error) throw result.error;
   process.exit(result.status ?? 1);
 }
+if (process.argv[2] === 'run' && ['word_count','map_lookup_insert'].includes(process.argv[3])) {
+  const result = spawnSync(process.execPath,
+    [path.resolve(__dirname, '../../docs/audits/willow-8hq4.45/measure.js'), ...process.argv.slice(3)],
+    {stdio: 'inherit'});
+  if (result.error) throw result.error;
+  process.exit(result.status ?? 1);
+}
 const args = process.argv.slice(2);
 if(args.shift() !== 'run') throw Error('usage: harness.js run CASE... --trials N');
 let trials = 5; const ti = args.indexOf('--trials');

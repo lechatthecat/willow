@@ -162,3 +162,18 @@ AGENTS.md
 !/docs/audits/willow-8hq4.46/zero-counts.txt
 !/docs/audits/willow-8hq4.46/validation.txt
 !/docs/audits/willow-8hq4.46/poll-chunk.txt
+
+# Public string-map performance audit and focused reproducible evidence.
+!/docs/audits/willow-8hq4.45/
+/docs/audits/willow-8hq4.45/*
+!/docs/audits/willow-8hq4.45/audit.md
+!/docs/audits/willow-8hq4.45/word_count.wi
+!/docs/audits/willow-8hq4.45/map_lookup_insert.wi
+!/docs/audits/willow-8hq4.45/maps.go
+!/docs/audits/willow-8hq4.45/Maps.java
+!/docs/audits/willow-8hq4.45/measure.js
+!/docs/audits/willow-8hq4.45/check_examples.py
+!/docs/audits/willow-8hq4.45/validate.py
+!/docs/audits/willow-8hq4.45/baseline.jsonl
+!/docs/audits/willow-8hq4.45/final.jsonl
+!/docs/audits/willow-8hq4.45/validation.txt

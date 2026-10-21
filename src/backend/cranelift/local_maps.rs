@@ -32,8 +32,9 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
         .collect();
     if !maps.iter().any(|&map| map)
         || f.locals.iter().any(|local| {
-            is_map(&local.ty)
-                .is_some_and(|(key, value)| local.parameter || !scalar(key) || !scalar(value))
+            is_map(&local.ty).is_some_and(|(key, value)| {
+                local.parameter || !(scalar(key) || matches!(key, Type::String)) || !scalar(value)
+            })
         })
     {
         return false;

@@ -1,0 +1,22 @@
+// Reconstructed from the public ticket workload; not historical source.
+import std::collections::Map;
+import std::collections::Array;
+fn main() {
+ let words: Array<String> = [];
+ let mut i = 0;
+ while i < 4096 { words.push("token_" + i.toString() + "_" + (i * 31).toString()); i = i + 1; }
+ let counts: Map<String, i64> = Map::new();
+ println("@start work");
+ i = 0;
+ while i < 6000000 {
+  let word = words[i % 4096];
+  let count = match counts.get(word) { Some(v) => v, None => 0 };
+  counts.insert(word, count + 1);
+  i = i + 1;
+ }
+ println("@end work");
+ let mut sum = 0;
+ i = 0;
+ while i < 4096 { sum = sum + counts.get(words[i]).unwrap(); i = i + 1; }
+ println(sum);
+}

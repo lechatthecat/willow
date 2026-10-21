@@ -1,7 +1,8 @@
 //! GC-managed hash map `Map<K, V>`.
 //!
 //! Scalar word maps store a compact, atomically guarded table in their non-moving
-//! payload. Other maps store a `Mutex<MapData>` for concurrent GC tracing.
+//! payload. Confined string-key maps with scalar values use checked local
+//! storage; other maps store a `Mutex<MapData>` for concurrent GC tracing.
 //! Two GC hooks keep it correct:
 //!
 //! * a trace function reports reference-typed *values* so they stay alive while
@@ -18,8 +19,7 @@ use crate::gc::{
     GcObjectKind, GcStoreDestination, willow_alloc_with_layout, write_barrier_object_owner,
 };
 use crate::native_memory::{Mutex, MutexGuard};
-use crate::string::willow_string_as_str;
-use std::borrow::Borrow;
+use crate::string::willow_string_as_bytes;
 use std::cell::{RefCell, RefMut, UnsafeCell};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -58,6 +58,7 @@ struct MapStorage {
 enum MapState {
     Words(ScalarStorage),
     Traced(Mutex<MapData>),
+    Local(crate::native_memory::Local<MapData>),
 }
 
 /// Local storage is selected only by the compiler's whole-function confinement
@@ -183,6 +184,7 @@ impl Drop for WordGuard<'_> {
 
 #[cfg(test)]
 thread_local! {
+    static STRING_HASH_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WORD_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WORD_SHARED_ACQUIRES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -262,7 +264,9 @@ struct MapData {
     layout: MapLayout,
     /// Hash buckets may move on growth; dense value indices never do. This
     /// permits bounded GC slices without restarting/skipping a hash iterator.
-    entries: HashMap<MapKey, usize>,
+    // Randomized non-cryptographic foldhash; this is not a cryptographic or
+    // adaptive HashDoS defense. Owned and borrowed keys use the same encoder.
+    entries: hashbrown::HashMap<MapKey, usize>,
     values: Vec<i64>,
     /// Major cycles are serialized. Appends after the first slice are covered
     /// by insertion barriers and must not extend this epoch's finite scan.
@@ -285,59 +289,59 @@ impl crate::native_memory::Footprint for MapData {
 }
 
 impl MapData {
-    fn get(&self, key: &dyn KeyView) -> Option<i64> {
+    #[inline]
+    fn get(&self, key: &KeyRef<'_>) -> Option<i64> {
         self.entries.get(key).map(|&index| self.values[index])
     }
 }
 
 /// The owned and borrowed keys share exactly the same hash/equality encoding.
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum KeyRef<'a> {
     Word(i64),
-    Str(&'a str),
+    Str(&'a [u8]),
 }
 
-trait KeyView {
-    fn key_ref(&self) -> KeyRef<'_>;
-}
-
-impl KeyView for MapKey {
-    fn key_ref(&self) -> KeyRef<'_> {
+impl Hash for KeyRef<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
-            Self::Word(word) => KeyRef::Word(*word),
-            Self::Str(text) => KeyRef::Str(text),
+            Self::Word(word) => {
+                word.hash(state);
+            }
+            Self::Str(text) => {
+                #[cfg(test)]
+                STRING_HASH_BYTES.with(|bytes| bytes.set(bytes.get() + text.len()));
+                // MapKey is a standalone, private key, never a component of
+                // a compound hash. The byte hasher incorporates its length;
+                // equality still distinguishes key kinds and all content.
+                state.write(text);
+            }
         }
     }
 }
 
-impl KeyView for KeyRef<'_> {
+impl MapKey {
+    #[inline]
     fn key_ref(&self) -> KeyRef<'_> {
-        *self
+        match self {
+            Self::Word(word) => KeyRef::Word(*word),
+            Self::Str(text) => KeyRef::Str(text.as_bytes()),
+        }
     }
 }
 
 impl Hash for MapKey {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.key_ref().hash(state);
     }
 }
 
-impl Hash for dyn KeyView + '_ {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.key_ref().hash(state);
-    }
-}
-
-impl PartialEq for dyn KeyView + '_ {
-    fn eq(&self, other: &Self) -> bool {
-        self.key_ref() == other.key_ref()
-    }
-}
-impl Eq for dyn KeyView + '_ {}
-
-impl<'a> Borrow<dyn KeyView + 'a> for MapKey {
-    fn borrow(&self) -> &(dyn KeyView + 'a) {
-        self
+impl hashbrown::Equivalent<MapKey> for KeyRef<'_> {
+    #[inline]
+    fn equivalent(&self, other: &MapKey) -> bool {
+        *self == other.key_ref()
     }
 }
 
@@ -350,7 +354,7 @@ impl<'a> Borrow<dyn KeyView + 'a> for MapKey {
 unsafe fn key_from_word<'a>(word: i64, key_kind: i64) -> Option<KeyRef<'a>> {
     if key_kind == 3 {
         Some(KeyRef::Str(unsafe {
-            willow_string_as_str(word as *const u8)
+            willow_string_as_bytes(word as *const u8)
         }))
     } else {
         word_key(word, key_kind).map(KeyRef::Word)
@@ -361,20 +365,53 @@ fn raise_nan_key() {
     crate::panic_context::raise_language_message("NaN cannot be used as a Map key");
 }
 
-/// Lock the inline `MapData` at a map payload pointer.
+/// Release the local borrow before reenabling task preemption.
+enum MapGuard<'a> {
+    Shared(MutexGuard<'a, MapData>),
+    Local(
+        crate::native_memory::LocalGuard<'a, MapData>,
+        crate::preempt::NoPreemptGuard,
+    ),
+}
+impl Deref for MapGuard<'_> {
+    type Target = MapData;
+    fn deref(&self) -> &MapData {
+        match self {
+            Self::Shared(data) => data,
+            Self::Local(data, _) => data,
+        }
+    }
+}
+impl DerefMut for MapGuard<'_> {
+    fn deref_mut(&mut self) -> &mut MapData {
+        match self {
+            Self::Shared(data) => data,
+            Self::Local(data, _) => data,
+        }
+    }
+}
+/// Access inline MapData, keeping local borrows within a no-preempt region.
 ///
 /// # Safety
-/// `map` must be a non-null, non-scalar map payload produced by [`willow_map_new`].
-unsafe fn map_data<'a>(map: *mut u8) -> MutexGuard<'a, MapData> {
+/// `map` must be a live map payload with MapData (not Words) storage.
+#[inline]
+unsafe fn map_data<'a>(map: *mut u8) -> MapGuard<'a> {
     match &unsafe { storage(map) }.state {
-        MapState::Traced(data) => data.lock().unwrap(),
+        MapState::Traced(data) => MapGuard::Shared(data.lock().unwrap()),
+        MapState::Local(data) => {
+            let guard = crate::preempt::NoPreemptGuard::enter();
+            MapGuard::Local(data.access(), guard)
+        }
         MapState::Words(_) => unreachable!("scalar maps have no traced storage"),
     }
 }
 
 /// Trace hook: report reference-typed values as GC children.
 unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
-    if matches!(unsafe { storage(payload) }.state, MapState::Words(_)) {
+    if matches!(
+        unsafe { storage(payload) }.state,
+        MapState::Words(_) | MapState::Local(_)
+    ) {
         return;
     }
     let mut data = unsafe { map_data(payload) };
@@ -386,7 +423,10 @@ unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
 }
 
 unsafe fn snapshot_map(payload: *mut u8, children: &mut Vec<*mut u8>) {
-    if matches!(unsafe { storage(payload) }.state, MapState::Words(_)) {
+    if matches!(
+        unsafe { storage(payload) }.state,
+        MapState::Words(_) | MapState::Local(_)
+    ) {
         return;
     }
     let data = unsafe { map_data(payload) };
@@ -500,14 +540,19 @@ fn map_new(key_kind: i64, value_kind: i64, value_is_ref: i64, confined: bool) ->
             ScalarStorage::Shared(WordStorage::default())
         })
     } else {
-        MapState::Traced(Mutex::new(MapData {
+        let data = MapData {
             layout,
-            entries: HashMap::new(),
+            entries: hashbrown::HashMap::default(),
             values: Vec::new(),
             scan_limit: 0,
             key_bytes: 0,
             native_table_bytes: 0,
-        }))
+        };
+        if confined && !layout.value_is_ref {
+            MapState::Local(crate::native_memory::Local::new(data))
+        } else {
+            MapState::Traced(Mutex::new(data))
+        }
     };
     // No GC allocation occurs between reserving the payload and initializing it.
     unsafe {
@@ -552,49 +597,50 @@ pub extern "C" fn willow_map_insert(
         raise_nan_key();
         return;
     };
-    // Borrowed lookup avoids allocating a duplicate string on replacement.
-    if let Some(&index) = data.entries.get(&key as &dyn KeyView) {
-        if data.layout.value_is_ref {
-            write_barrier_object_owner(
-                map,
-                data.values[index] as *mut u8,
-                val_word as *mut u8,
-                GcStoreDestination::MapValue as i64,
-            );
-        }
-        data.values[index] = val_word;
-        return;
-    }
-    let owned_key = match key {
-        KeyRef::Word(word) => MapKey::Word(word),
-        KeyRef::Str(text) => MapKey::Str(text.to_owned()),
-    };
-    if let MapKey::Str(text) = &owned_key {
-        data.key_bytes += text.capacity();
-    }
+    // One borrowed probe for both insertion and replacement. Only vacancies
+    // allocate owned key bytes; the entry retains its computed hash on growth.
     let is_ref = data.layout.value_is_ref;
     let MapData {
-        entries, values, ..
+        entries,
+        values,
+        key_bytes,
+        ..
     } = &mut *data;
-    let entry = entries.entry(owned_key);
-    if is_ref {
-        let old = match &entry {
-            std::collections::hash_map::Entry::Occupied(slot) => values[*slot.get()],
-            std::collections::hash_map::Entry::Vacant(_) => 0,
-        };
-        write_barrier_object_owner(
-            map,
-            old as *mut u8,
-            val_word as *mut u8,
-            GcStoreDestination::MapValue as i64,
-        );
-    }
-    match entry {
-        std::collections::hash_map::Entry::Occupied(slot) => values[*slot.get()] = val_word,
-        std::collections::hash_map::Entry::Vacant(slot) => {
+    match entries.entry_ref(&key) {
+        hashbrown::hash_map::EntryRef::Occupied(slot) => {
+            let index = *slot.get();
+            if is_ref {
+                write_barrier_object_owner(
+                    map,
+                    values[index] as *mut u8,
+                    val_word as *mut u8,
+                    GcStoreDestination::MapValue as i64,
+                );
+            }
+            values[index] = val_word;
+        }
+        hashbrown::hash_map::EntryRef::Vacant(slot) => {
+            let owned_key = match key {
+                KeyRef::Word(word) => MapKey::Word(word),
+                KeyRef::Str(text) => {
+                    let text = String::from_utf8(text.to_vec()).unwrap_or_else(|_| {
+                        crate::failure::fatal_invariant("invalid UTF-8 in Map string key")
+                    });
+                    *key_bytes += text.capacity();
+                    MapKey::Str(text)
+                }
+            };
+            if is_ref {
+                write_barrier_object_owner(
+                    map,
+                    std::ptr::null_mut(),
+                    val_word as *mut u8,
+                    GcStoreDestination::MapValue as i64,
+                );
+            }
             let index = values.len();
             values.push(val_word);
-            slot.insert(index);
+            slot.insert_with_key(owned_key, index);
         }
     }
 }
@@ -773,7 +819,7 @@ pub extern "C" fn willow_map_len(map: *mut u8) -> i64 {
     }
     match &unsafe { storage(map) }.state {
         MapState::Words(words) => words.access().entries.len() as i64,
-        MapState::Traced(_) => unsafe { map_data(map) }.entries.len() as i64,
+        MapState::Traced(_) | MapState::Local(_) => unsafe { map_data(map) }.entries.len() as i64,
     }
 }
 
@@ -800,7 +846,7 @@ pub extern "C" fn willow_map_contains(map: *mut u8, key_word: i64, key_is_ref: i
         raise_nan_key();
         return 0;
     };
-    i64::from(data.entries.contains_key(&key as &dyn KeyView))
+    i64::from(data.entries.contains_key(&key))
 }
 
 // Willow `Option` layout (must match the compiler's enum lowering):
@@ -877,6 +923,96 @@ pub extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confined_string_maps_scale_without_lookup_allocation_and_skip_gc_borrows() {
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+        let _guard = crate::gc::runtime_test_guard();
+        for count in [16, 128, 1024, 8192] {
+            for length in [20, 128] {
+                willow_gc_init();
+                let baseline = crate::gc_telemetry::external_bytes();
+                let mut map = unsafe { willow_map_new_local(3, 0, 0) };
+                willow_push_root(&mut map);
+                assert!(matches!(unsafe { &storage(map).state }, MapState::Local(_)));
+                let mut keys = vec![std::ptr::null_mut(); count];
+                STRING_HASH_BYTES.set(0);
+                for (i, key) in keys.iter_mut().enumerate() {
+                    *key = willow_string_from_str(&format!("{i:0length$}"));
+                    willow_push_root(key);
+                    willow_map_insert(map, *key as i64, 1, i as i64, 0);
+                }
+                let insertion_bytes = STRING_HASH_BYTES.get();
+                assert!(insertion_bytes <= 6 * count * length);
+                let allocated = counter::thread_allocations();
+                let gc_bytes = crate::gc::willow_gc_allocated_bytes();
+                let retained = crate::gc_telemetry::external_bytes();
+                STRING_HASH_BYTES.set(0);
+                for (i, &key) in keys.iter().enumerate() {
+                    let mut payload = -1;
+                    assert_eq!(willow_map_get_into(map, key as i64, 1, &mut payload), 0);
+                    assert_eq!(payload, i as i64);
+                    willow_map_insert(map, key as i64, 1, !payload, 0);
+                }
+                assert_eq!(STRING_HASH_BYTES.get(), 2 * count * length);
+                assert_eq!(counter::thread_allocations(), allocated);
+                assert_eq!(crate::gc::willow_gc_allocated_bytes(), gc_bytes);
+                assert_eq!(crate::gc_telemetry::external_bytes(), retained);
+                // A concurrent tracer must not borrow confined scalar-value state.
+                let borrowed = unsafe { map_data(map) };
+                let mut slots = Vec::new();
+                let mut children = Vec::new();
+                unsafe {
+                    trace_map(map, &mut slots);
+                    snapshot_map(map, &mut children);
+                }
+                assert!(matches!(
+                    unsafe { snapshot_map_slice(map, 0, 1, &mut children) },
+                    crate::gc::TraceSliceProgress::Done
+                ));
+                assert!(slots.is_empty() && children.is_empty());
+                drop(borrowed);
+                eprintln!(
+                    "strings count={count} length={length} insertion_bytes={insertion_bytes} lookup_update_bytes={} allocations=0",
+                    2 * count * length
+                );
+                willow_pop_roots(count as i32);
+                willow_gc_collect();
+                let mut copy = willow_map_copy(map);
+                willow_push_root(&mut copy);
+                let key = willow_string_from_str(&format!("{:0length$}", count - 1));
+                let mut payload = 0;
+                assert_eq!(willow_map_get_into(copy, key as i64, 1, &mut payload), 0);
+                assert_eq!(payload, !((count - 1) as i64));
+                willow_pop_roots(2);
+                willow_gc_collect();
+                assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn confined_constructor_keeps_reference_values_synchronized() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let mut map = unsafe { willow_map_new_local(3, 3, 1) };
+        willow_push_root(&mut map);
+        assert!(matches!(
+            unsafe { &storage(map).state },
+            MapState::Traced(_)
+        ));
+        let mut key = willow_string_from_str("key");
+        willow_push_root(&mut key);
+        let value = willow_string_from_str("value");
+        willow_map_insert(map, key as i64, 1, value as i64, 1);
+        willow_gc_collect();
+        let found = willow_map_get(map, key as i64, 1, 1);
+        assert_eq!(
+            unsafe { crate::string::willow_string_as_str(found) },
+            "value"
+        );
+        willow_pop_roots(2);
+    }
 
     #[test]
     fn confined_scalar_accesses_never_acquire_mutual_exclusion() {
@@ -1344,35 +1480,47 @@ mod tests {
     #[test]
     fn borrowed_string_keys_survive_copy_update_and_collection() {
         let _guard = runtime_test_guard();
-        willow_gc_init();
-        let mut map = willow_map_new(3, 0, 0);
-        willow_push_root(&mut map);
-        for (i, text) in ["", "日本語🦀", "ordinary"].into_iter().enumerate() {
-            let key = willow_string_from_str(text);
-            willow_map_insert(map, key as i64, 1, i as i64, 0);
+        for local in [false, true] {
+            willow_gc_init();
+            let mut map = if local {
+                unsafe { willow_map_new_local(3, 0, 0) }
+            } else {
+                willow_map_new(3, 0, 0)
+            };
+            willow_push_root(&mut map);
+            for (i, text) in ["", "日本語🦀", "ordinary", "embedded\0nul"]
+                .into_iter()
+                .enumerate()
+            {
+                let key = willow_string_from_str(text);
+                willow_map_insert(map, key as i64, 1, i as i64, 0);
+            }
+            let mut copy = willow_map_copy(map);
+            willow_push_root(&mut copy);
+            // No source key is rooted: map keys own their bytes independently.
+            willow_gc_collect();
+            for (i, text) in ["", "日本語🦀", "ordinary", "embedded\0nul"]
+                .into_iter()
+                .enumerate()
+            {
+                let mut key = willow_string_from_str(text);
+                willow_push_root(&mut key);
+                assert_eq!(willow_map_contains(map, key as i64, 1), 1);
+                assert_eq!(
+                    opt_payload(willow_map_get(copy, key as i64, 1, 0)),
+                    i as i64
+                );
+                willow_map_insert(map, key as i64, 1, 99, 0);
+                assert_eq!(
+                    opt_payload(willow_map_get(copy, key as i64, 1, 0)),
+                    i as i64
+                );
+                assert_eq!(opt_payload(willow_map_get(map, key as i64, 1, 0)), 99);
+                willow_pop_roots(1);
+            }
+            assert_eq!(willow_map_len(map), 4);
+            willow_pop_roots(2);
         }
-        let mut copy = willow_map_copy(map);
-        willow_push_root(&mut copy);
-        // No source key is rooted: map keys own their bytes independently.
-        willow_gc_collect();
-        for (i, text) in ["", "日本語🦀", "ordinary"].into_iter().enumerate() {
-            let mut key = willow_string_from_str(text);
-            willow_push_root(&mut key);
-            assert_eq!(willow_map_contains(map, key as i64, 1), 1);
-            assert_eq!(
-                opt_payload(willow_map_get(copy, key as i64, 1, 0)),
-                i as i64
-            );
-            willow_map_insert(map, key as i64, 1, 99, 0);
-            assert_eq!(
-                opt_payload(willow_map_get(copy, key as i64, 1, 0)),
-                i as i64
-            );
-            assert_eq!(opt_payload(willow_map_get(map, key as i64, 1, 0)), 99);
-            willow_pop_roots(1);
-        }
-        assert_eq!(willow_map_len(map), 3);
-        willow_pop_roots(2);
     }
 
     #[test]

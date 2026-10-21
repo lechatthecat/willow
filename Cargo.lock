@@ -776,6 +776,7 @@ version = "0.1.4"
 dependencies = [
  "corosensei",
  "crossbeam-deque",
+ "hashbrown 0.17.1",
  "libc",
  "ryu",
  "socket2",

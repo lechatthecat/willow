@@ -13,6 +13,7 @@ crate-type = ["staticlib", "rlib"]
 borrow-migration-probe = []
 
 [dependencies]
+hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }
 crossbeam-deque = "0.8.8"
 libc = "0.2.190"
 ryu = "1.0.23"

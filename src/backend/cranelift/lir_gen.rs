@@ -10590,25 +10590,27 @@ mod tests {
 
     #[test]
     fn local_maps_confinement_visits_each_instruction_once() {
-        for count in [16, 128, 1024] {
-            let source = format!(
-                "import std::collections::Map; fn probe() {{ let m: Map<i64,i64> = Map::new(); {} }}",
-                "m.len();".repeat(count)
-            );
-            let (program, _) = checked_lowering(&source, &[]);
-            let f = program
-                .functions
-                .iter()
-                .find(|f| f.name.to_string() == "probe")
-                .unwrap();
-            super::super::local_maps::take_visits();
-            assert!(super::super::local_maps::confined_scalar_maps(f));
-            let visits = super::super::local_maps::take_visits();
-            assert_eq!(
-                visits,
-                f.blocks.iter().map(|b| b.instrs.len() + 1).sum::<usize>()
-            );
-            eprintln!("local-map call_sites={count} analysis_visits={visits}");
+        for key in ["i64", "String"] {
+            for count in [16, 128, 1024] {
+                let source = format!(
+                    "import std::collections::Map; fn probe() {{ let m: Map<{key},i64> = Map::new(); {} }}",
+                    "m.len();".repeat(count)
+                );
+                let (program, _) = checked_lowering(&source, &[]);
+                let f = program
+                    .functions
+                    .iter()
+                    .find(|f| f.name.to_string() == "probe")
+                    .unwrap();
+                super::super::local_maps::take_visits();
+                assert!(super::super::local_maps::confined_scalar_maps(f));
+                let visits = super::super::local_maps::take_visits();
+                assert_eq!(
+                    visits,
+                    f.blocks.iter().map(|b| b.instrs.len() + 1).sum::<usize>()
+                );
+                eprintln!("local-map key={key} call_sites={count} analysis_visits={visits}");
+            }
         }
     }
 
@@ -10664,7 +10666,6 @@ mod tests {
             "fn probe(m: Map<i64,i64>) { m.insert(1,2); }",
             "fn probe() -> Map<i64,i64> { return Map::new(); }",
             "fn consume(m: Map<i64,i64>) {} fn probe() { let m: Map<i64,i64> = Map::new(); consume(m); }",
-            "fn probe() { let m: Map<String,i64> = Map::new(); m.insert(\"x\",1); }",
             "fn probe() { let m: Map<i64,String> = Map::new(); m.insert(1,\"x\"); }",
             "async fn probe() { let m: Map<i64,i64> = Map::new(); m.insert(1,2); }",
         ] {
@@ -10680,6 +10681,84 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn local_string_maps_confinement_twenty_perspectives() {
+        let declaration = "let mut m: Map<String, i64> = Map::new();";
+        for body in [
+            r#"m.insert("x", 2);"#,
+            r#"m.get("x");"#,
+            r#"m.contains("x");"#,
+            "m.len();",
+            "m.toString();",
+            "m.freeze();",
+            r#"let a = m; a.insert("x", 2);"#,
+            r#"m = Map::new(); m.insert("x", 2);"#,
+            "let a = m; m = a;",
+            r#"let mut i = 0; while i < 10 { m.insert(i.toString(), i); i = i + 1; }"#,
+            r#"println(match m.get("x") { Some(x) => x, None => 0 });"#,
+            r#"if true { m.insert("x", 2); } else { m.insert("y", 4); }"#,
+        ] {
+            let source =
+                format!("import std::collections::Map; fn probe() {{ {declaration} {body} }}");
+            let (program, _) = checked_lowering(&source, &[]);
+            let f = program
+                .functions
+                .iter()
+                .find(|f| f.name.to_string() == "probe")
+                .unwrap();
+            assert!(super::super::local_maps::confined_scalar_maps(f), "{body}");
+        }
+        for body in [
+            "Mutex::new(m);",
+            "BlockingCell::new(m);",
+            "let xs = [m];",
+            "Option::Some(m);",
+            "let f = || m.len();",
+            "defer { m.len(); }",
+        ] {
+            let source =
+                format!("import std::collections::Map; fn probe() {{ {declaration} {body} }}");
+            let (program, _) = checked_lowering(&source, &[]);
+            let f = program
+                .functions
+                .iter()
+                .find(|f| f.name.to_string() == "probe")
+                .unwrap();
+            assert!(!super::super::local_maps::confined_scalar_maps(f), "{body}");
+        }
+        for source in [
+            r#"fn probe(m: Map<String,i64>) { m.insert("x",2); }"#,
+            "fn probe() -> Map<String,i64> { return Map::new(); }",
+            "fn consume(m: Map<String,i64>) {} fn probe() { let m: Map<String,i64> = Map::new(); consume(m); }",
+            r#"fn probe() { let m: Map<String,String> = Map::new(); m.insert("x","y"); }"#,
+            r#"async fn probe() { let m: Map<String,i64> = Map::new(); m.insert("x",2); }"#,
+        ] {
+            let source = format!("import std::collections::Map; {source}");
+            let (program, _) = checked_lowering(&source, &[]);
+            let f = program
+                .functions
+                .iter()
+                .find(|f| f.name.to_string() == "probe")
+                .unwrap();
+            assert!(
+                !super::super::local_maps::confined_scalar_maps(f),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_string_maps_word_count_confinement() {
+        let source = include_str!("../../../docs/audits/willow-8hq4.45/word_count.wi");
+        let (program, _) = checked_lowering(source, &[]);
+        let f = program
+            .functions
+            .iter()
+            .find(|f| f.name.to_string() == "main")
+            .unwrap();
+        assert!(super::super::local_maps::confined_scalar_maps(f));
     }
 
     fn lir_fn_and_tables(src: &str, name: &str, fns: &[&str]) -> (LirFunction, TestTables) {
