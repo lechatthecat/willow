@@ -102,7 +102,8 @@ unsafe fn alloc_validated_bytes(bytes: *const u8, len_usize: usize, payload_size
 static INITIALIZED_LITERAL_SLOTS: Mutex<Vec<&'static AtomicPtr<u8>>> = Mutex::new(Vec::new());
 
 // GC payloads are aligned and can never have this address.
-const INITIALIZING: *mut u8 = std::ptr::without_provenance_mut(1);
+const INITIALIZING: *mut u8 =
+    std::ptr::without_provenance_mut(willow_abi::STRING_LITERAL_INITIALIZING);
 
 /// Reset is quiescent: no compiled code or literal initializer may be running.
 /// Registered slots have process lifetime, including across GC lifetimes.

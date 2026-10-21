@@ -177,3 +177,10 @@ AGENTS.md
 !/docs/audits/willow-8hq4.45/baseline.jsonl
 !/docs/audits/willow-8hq4.45/final.jsonl
 !/docs/audits/willow-8hq4.45/validation.txt
+
+# Public literal-slot fast-path audit; no private specifications.
+!/docs/audits/willow-8hq4.39/
+/docs/audits/willow-8hq4.39/*
+!/docs/audits/willow-8hq4.39/audit.md
+!/docs/audits/willow-8hq4.39/measure.py
+!/docs/audits/willow-8hq4.39/results.json

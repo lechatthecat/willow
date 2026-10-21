@@ -110,3 +110,54 @@ fn main() {
     assert!(ok, "{out}");
     assert_eq!(out, "shared\n");
 }
+
+#[test]
+fn literal_slots_inline_fast_path_value_and_control_flow_matrix() {
+    // Each expression exercises a separate literal shape or control-flow use;
+    // run both before and after collections, with every allocation stressed.
+    let source = r#"
+fn choose(flag: bool) -> String { if flag { return "left"; } return "right"; }
+fn identity(value: String) -> String { return value; }
+fn main() {
+    let mut i = 0;
+    while i < 8 {
+        println("");
+        println("ascii");
+        println("日本語");
+        println("🦀");
+        println("é");
+        println("line\nbreak");
+        println("tab\there");
+        println("quote\"slash\\");
+        println("a");
+        println("ab");
+        println("abc");
+        println("same" == "same");
+        println("same" != "different");
+        println("".len());
+        println("日本語".len());
+        println("a" + "b");
+        println(identity("argument"));
+        println(choose(true));
+        println(choose(false));
+        let f = || "closure";
+        println(f());
+        let values = ["array-first", "array-last"];
+        println(values[0]);
+        println(values[1]);
+        gc_collect();
+        i = i + 1;
+    }
+}
+"#;
+    let expected = "\nascii\n日本語\n🦀\né\nline\nbreak\ntab\there\nquote\"slash\\\na\nab\nabc\ntrue\ntrue\n0\n9\nab\nargument\nleft\nright\nclosure\narray-first\narray-last\n".repeat(8);
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(source);
+        assert!(ok, "{out}");
+        assert_eq!(out, expected);
+    }
+}

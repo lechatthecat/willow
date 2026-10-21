@@ -21,6 +21,11 @@ pub use schema::RUNTIME_ABI;
 // Keep the existing descriptor-type import path available to ABI consumers.
 pub use runtime_type_ids::GC_BITMAP_TYPE_ID;
 
+/// Reserved non-null value while a compiler-owned string literal slot is being
+/// initialized. GC payloads are aligned and cannot have this address. Readers
+/// must acquire-load the slot and call the runtime for zero or this value.
+pub const STRING_LITERAL_INITIALIZING: usize = 1;
+
 /// Maximum number of payload words represented by the inline GC reference mask.
 pub const GC_REF_MASK_BITS: usize = u64::BITS as usize;
 

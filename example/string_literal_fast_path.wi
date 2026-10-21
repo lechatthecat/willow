@@ -1,0 +1,17 @@
+// Repeated initialized reads in sync, closure and async contexts, across GC.
+class Text { pub static value: String = "é水🦀"; }
+fn literal() -> String { return "é水🦀"; }
+async fn read() -> String { await sleep(1); return "é水🦀"; }
+async fn main() {
+    let mut i = 0;
+    while i < 32 {
+        let f = || "é水🦀";
+        let value = await read();
+        gc_collect();
+        if value != literal() { panic("async mismatch"); }
+        if f() != Text::value { panic("closure mismatch"); }
+        if "".len() != 0 { panic("empty mismatch"); }
+        i = i + 1;
+    }
+    println(Text::value);
+}

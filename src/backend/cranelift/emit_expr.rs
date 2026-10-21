@@ -15,17 +15,39 @@ pub(super) const INT_OVERFLOW_SHR: i64 = 6;
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_string_literal(&mut self, value: &str) -> cranelift_codegen::ir::Value {
         if let Some(data_id) = self.string_literals.get(value) {
-            // Load the address of the static raw bytes.
-            let gv = self
-                .module
-                .declare_data_in_func(data_id.bytes, self.builder.func);
+            let data_id = *data_id;
             let ptr_ty = reference_type(self.module.target_config());
-            let bytes_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
             let slot_gv = self
                 .module
                 .declare_data_in_func(data_id.slot, self.builder.func);
             let slot_ptr = self.builder.ins().symbol_value(ptr_ty, slot_gv);
-            // The helper performs an acquire load on hits; only first use allocates.
+            // Cranelift's atomic_load is SeqCst (stronger than the required
+            // Acquire). This pairs with runtime Release publication of rooted,
+            // initialized bytes; an ordinary load would race initialization.
+            let cached = self
+                .builder
+                .ins()
+                .atomic_load(ptr_ty, MemFlagsData::trusted(), slot_ptr);
+            let empty = self.builder.ins().icmp_imm_u(IntCC::Equal, cached, 0);
+            let initializing = self.builder.ins().icmp_imm_u(
+                IntCC::Equal,
+                cached,
+                willow_abi::STRING_LITERAL_INITIALIZING as i64,
+            );
+            let miss = self.builder.ins().bor(empty, initializing);
+            let slow = self.builder.create_block();
+            let ready = self.builder.create_block();
+            self.builder.append_block_param(ready, ptr_ty);
+            self.builder
+                .ins()
+                .brif(miss, slow, &[], ready, &[cached.into()]);
+            self.builder.switch_to_block(slow);
+            self.builder.seal_block(slow);
+            self.builder.set_cold_block(slow);
+            let gv = self
+                .module
+                .declare_data_in_func(data_id.bytes, self.builder.func);
+            let bytes_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
             let len_val = self.builder.ins().iconst(types::I64, value.len() as i64);
             let fid = self.func_id("willow_string_literal_slot");
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
@@ -33,7 +55,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .builder
                 .ins()
                 .call(fref, &[slot_ptr, bytes_ptr, len_val]);
-            return self.builder.inst_results(call)[0];
+            let initialized = self.builder.inst_results(call)[0];
+            self.builder.ins().jump(ready, &[initialized.into()]);
+            self.builder.switch_to_block(ready);
+            self.builder.seal_block(ready);
+            return self.builder.block_params(ready)[0];
         }
         self.builder
             .ins()
