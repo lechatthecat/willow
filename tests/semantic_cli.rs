@@ -4518,7 +4518,7 @@ fn rename_conflicts_name_owner_and_impact_labels_lambdas_in_order() {
             result["message"].as_str().unwrap().to_owned(),
             format!(
                 "{}:{}:{}",
-                location["path"].as_str().unwrap(),
+                location["path"].as_str().unwrap().replace('\\', "/"),
                 location["line"],
                 location["column"]
             ),
