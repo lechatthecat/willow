@@ -90,7 +90,15 @@ fn transfer_bounded(
     // most one chunk before the next deadline/work admission check.
     const CHUNK: usize = 32;
     while !entries.is_empty() {
-        let count = entries.len().min(CHUNK);
+        let count = budget.entry_capacity(
+            entries.len().min(CHUNK),
+            std::mem::size_of::<usize>() as u64,
+        );
+        if count == 0 {
+            // Account the rejected smallest unit, retaining the untouched tail.
+            budget.reserve(1, std::mem::size_of::<usize>() as u64, now());
+            return false;
+        }
         if !budget.reserve(
             count as u64,
             (count * std::mem::size_of::<usize>()) as u64,
@@ -135,6 +143,7 @@ pub(super) struct SatbBuffers {
     capacity: usize,
     entries: HashMap<ThreadId, EntryBuffer>,
     pending_entries: usize,
+    pending_owners: super::pending_registry::Pending<ThreadId>,
 }
 
 impl Default for SatbBuffers {
@@ -156,6 +165,7 @@ impl SatbBuffers {
             capacity,
             entries: HashMap::new(),
             pending_entries: 0,
+            pending_owners: Default::default(),
         }
     }
 
@@ -168,6 +178,8 @@ impl SatbBuffers {
         if value == 0 {
             return;
         }
+        // Enrol before publication: an unwinding callback retains ownership.
+        self.pending_owners.insert(thread);
         let entries = self
             .entries
             .entry(thread)
@@ -184,6 +196,9 @@ impl SatbBuffers {
                 entries.clear();
             }
         });
+        if entries.is_empty() {
+            self.pending_owners.remove(thread);
+        }
     }
 
     pub(super) fn flush_thread(
@@ -200,6 +215,7 @@ impl SatbBuffers {
                 entries.clear();
             });
         }
+        self.pending_owners.remove(thread);
         if retire {
             self.entries.remove(&thread);
         }
@@ -230,26 +246,31 @@ impl SatbBuffers {
             return false;
         }
         assert_stopped_owners(coord);
-        for entries in self.entries.values_mut() {
-            if !budget.reserve(1, 0, now())
-                || !account_pending(entries, &mut self.pending_entries, |entries| {
-                    transfer_bounded(entries, budget, &mut now, &mut publish)
-                })
-            {
+        while let Some(owner) = self.pending_owners.front() {
+            if !budget.reserve(1, 0, now()) {
                 return false;
             }
+            let entries = self.entries.get_mut(&owner).expect("pending SATB owner");
+            if !account_pending(entries, &mut self.pending_entries, |entries| {
+                transfer_bounded(entries, budget, &mut now, &mut publish)
+            }) {
+                return false;
+            }
+            self.pending_owners.remove(owner);
         }
         true
     }
 
     pub(super) fn flush_all(&mut self, mut publish: impl FnMut(&[usize])) {
-        for entries in self.entries.values_mut() {
+        while let Some(owner) = self.pending_owners.front() {
+            let entries = self.entries.get_mut(&owner).expect("pending SATB owner");
             if !entries.is_empty() {
                 account_pending(entries, &mut self.pending_entries, |entries| {
                     publish(entries);
                     entries.clear();
                 });
             }
+            self.pending_owners.remove(owner);
         }
     }
 }
@@ -282,11 +303,35 @@ pub(super) struct SatbShards {
     #[cfg(test)]
     drain_visits: AtomicUsize,
     shards: Box<[Shard]>,
+    seal_cursor: Mutex<(usize, bool)>,
 }
 
 /// Padded so neighbouring threads' shard locks do not share a cache line.
 #[repr(align(128))]
-struct Shard(Mutex<HashMap<ThreadId, Arc<MutatorBuffer>>>);
+struct Shard(Mutex<BufferRegistry>);
+
+#[derive(Default)]
+struct BufferRegistry {
+    entries: HashMap<ThreadId, Arc<MutatorBuffer>>,
+    owners: super::pending_registry::Pending<ThreadId>,
+}
+impl BufferRegistry {
+    fn insert(&mut self, owner: ThreadId, buffer: Arc<MutatorBuffer>) {
+        self.owners.insert(owner);
+        self.entries.insert(owner, buffer);
+    }
+    fn remove(&mut self, owner: &ThreadId) {
+        self.owners.remove(*owner);
+        self.entries.remove(owner);
+    }
+    fn get(&self, owner: &ThreadId) -> Option<&Arc<MutatorBuffer>> {
+        self.entries.get(owner)
+    }
+    #[cfg(test)]
+    fn values(&self) -> impl Iterator<Item = &Arc<MutatorBuffer>> {
+        self.entries.values()
+    }
+}
 
 /// The registration record owns the buffer; a cycle retains an Arc until its
 /// final stopped drain. Only the owner publishes while running; foreign reads
@@ -317,8 +362,9 @@ impl SatbShards {
             #[cfg(test)]
             drain_visits: AtomicUsize::new(0),
             shards: (0..SATB_SHARDS)
-                .map(|_| Shard(Mutex::new(HashMap::new())))
+                .map(|_| Shard(Mutex::new(BufferRegistry::default())))
                 .collect(),
+            seal_cursor: Mutex::new((0, false)),
         }
     }
 
@@ -338,22 +384,20 @@ impl SatbShards {
             if self.sealed.load(Ordering::Acquire) {
                 return None;
             }
-            Arc::clone(
-                buffers
-                    .entry(std::thread::current().id())
-                    .or_insert_with(|| {
-                        let buffer = super::safepoint::current_satb_buffer().unwrap_or_default();
-                        assert!(
-                            buffer
-                                .0
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .is_empty(),
-                            "initial epoch registration found undrained SATB entries"
-                        );
-                        buffer
-                    }),
-            )
+            let owner = std::thread::current().id();
+            if buffers.get(&owner).is_none() {
+                let buffer = super::safepoint::current_satb_buffer().unwrap_or_default();
+                assert!(
+                    buffer
+                        .0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty(),
+                    "initial epoch registration found undrained SATB entries"
+                );
+                buffers.insert(owner, buffer);
+            }
+            Arc::clone(buffers.get(&owner).unwrap())
         };
         let mut entries = buffer.0.lock().unwrap_or_else(|error| error.into_inner());
         if self.sealed.load(Ordering::Acquire) || !valid() {
@@ -431,20 +475,38 @@ impl SatbShards {
         if self.drained.load(Ordering::Acquire) {
             return true;
         }
-        for shard in &self.shards {
-            if !budget.reserve(1, 0, now()) {
-                return false;
-            }
-            let buffers = shard.0.lock().unwrap_or_else(|error| error.into_inner());
-            for buffer in buffers.values() {
+        let mut cursor = self.seal_cursor.lock().unwrap_or_else(|e| e.into_inner());
+        while cursor.0 < self.shards.len() {
+            if !cursor.1 {
                 if !budget.reserve(1, 0, now()) {
                     return false;
                 }
-                let mut entries = buffer.0.lock().unwrap_or_else(|error| error.into_inner());
+                cursor.1 = true;
+            }
+            let mut buffers = self.shards[cursor.0]
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            while let Some(owner) = buffers.owners.front() {
+                if !budget.reserve(1, 0, now()) {
+                    return false;
+                }
+                #[cfg(test)]
+                self.drain_visits.fetch_add(1, Ordering::Relaxed);
+                let mut entries = buffers
+                    .get(&owner)
+                    .unwrap()
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if !transfer_bounded(&mut entries, budget, &mut now, &mut publish) {
                     return false;
                 }
+                drop(entries);
+                buffers.remove(&owner);
             }
+            cursor.0 += 1;
+            cursor.1 = false;
         }
         self.drained.store(true, Ordering::Release);
         true
@@ -463,6 +525,7 @@ impl SatbShards {
                 .all(|id| *id == current || coord.parked.contains(id))
         );
         assert!(self.drained.load(Ordering::Acquire));
+        *self.seal_cursor.lock().unwrap_or_else(|e| e.into_inner()) = (0, false);
         self.drained.store(false, Ordering::Release);
         self.sealed.store(false, Ordering::Release);
     }
@@ -472,17 +535,30 @@ impl SatbShards {
             return;
         }
         self.sealed.store(true, Ordering::SeqCst);
-        for shard in &self.shards {
-            let buffers = shard.0.lock().unwrap_or_else(|error| error.into_inner());
-            for buffer in buffers.values() {
+        let mut cursor = self.seal_cursor.lock().unwrap_or_else(|e| e.into_inner());
+        while cursor.0 < self.shards.len() {
+            let mut buffers = self.shards[cursor.0]
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            while let Some(owner) = buffers.owners.front() {
                 #[cfg(test)]
                 self.drain_visits.fetch_add(1, Ordering::Relaxed);
-                let mut entries = buffer.0.lock().unwrap_or_else(|error| error.into_inner());
+                let mut entries = buffers
+                    .get(&owner)
+                    .unwrap()
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if !entries.is_empty() {
                     publish(&entries);
                     entries.clear();
                 }
+                drop(entries);
+                buffers.remove(&owner);
             }
+            cursor.0 += 1;
+            cursor.1 = false;
         }
         self.drained.store(true, Ordering::Release);
     }
@@ -625,7 +701,7 @@ mod tests {
             !buffers.seal_stopped_bounded(&coord, &mut budget, |values| published
                 .extend_from_slice(values))
         );
-        assert!(published.is_empty(), "whole rejected batch remains owned");
+        assert_eq!(published, [7], "only the admitted entry is published");
         assert!(!buffers.is_drained());
         buffers.seal_stopped(&coord, |values| published.extend_from_slice(values));
         assert_eq!(published, [7, 9]);
@@ -708,6 +784,181 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn satb_registry_resume_scales_with_pending_owners_not_retry_prefixes() {
+        let ids: Vec<_> = (0..257)
+            .map(|_| {
+                std::thread::spawn(|| std::thread::current().id())
+                    .join()
+                    .unwrap()
+            })
+            .collect();
+        let coord = super::super::GcCoord {
+            stop_requested: true,
+            ..Default::default()
+        };
+        for count in [1, 16, 257] {
+            for sharded in [false, true] {
+                let mut legacy = SatbBuffers::new(256);
+                let shards = SatbShards::new(256);
+                for (value, &id) in ids[..count].iter().enumerate() {
+                    legacy.record(id, value + 1, |_| unreachable!());
+                    let buffer = Arc::new(MutatorBuffer::default());
+                    buffer.0.lock().unwrap().push(value + 1);
+                    // All owners collide in one shard: retries must resume inside it.
+                    shards.shards[0].0.lock().unwrap().insert(id, buffer);
+                }
+                let mut delivered = Vec::new();
+                let checks = std::cell::Cell::new(0);
+                let mut rounds = 0;
+                loop {
+                    rounds += 1;
+                    assert!(
+                        rounds <= 2 * count + SATB_SHARDS + 3,
+                        "registry did not progress"
+                    );
+                    let mut budget = super::super::old_cycle::RemarkBudget::new(4, 8, 10, 0);
+                    let now = || {
+                        checks.set(checks.get() + 1);
+                        0
+                    };
+                    let before = delivered.len();
+                    let done = if sharded {
+                        shards.seal_stopped_bounded_with_clock(&coord, &mut budget, now, |v| {
+                            delivered.extend_from_slice(v)
+                        })
+                    } else {
+                        legacy.flush_all_bounded_with_clock(&coord, &mut budget, now, |v| {
+                            delivered.extend_from_slice(v)
+                        })
+                    };
+                    assert!(
+                        delivered.len() - before <= 1,
+                        "per-stop byte budget exceeded"
+                    );
+                    if done {
+                        break;
+                    }
+                }
+                delivered.sort_unstable();
+                assert_eq!(delivered, (1..=count).collect::<Vec<_>>());
+                assert!(checks.get() <= 12 * count + 6 * SATB_SHARDS);
+                assert!(shards.drain_visits.load(Ordering::Relaxed) <= 2 * count + 1);
+                println!(
+                    "registry_resume owners={count} sharded={sharded} rounds={rounds} budget_checks={} delivered={count}",
+                    checks.get()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn satb_registry_resume_subchunk_budgets_finish_large_buffers() {
+        let coord = super::super::GcCoord {
+            stop_requested: true,
+            ..Default::default()
+        };
+        for sharded in [false, true] {
+            let mut legacy = SatbBuffers::new(256);
+            let shards = SatbShards::new(256);
+            for value in 1..=65 {
+                legacy.record(std::thread::current().id(), value, |_| unreachable!());
+                shards
+                    .with_current(|| true, |b| b.record(value, |_| unreachable!()))
+                    .unwrap();
+            }
+            let mut values = Vec::new();
+            let mut rounds = 0;
+            loop {
+                rounds += 1;
+                assert!(rounds <= 65 + SATB_SHARDS + 3);
+                let mut budget = super::super::old_cycle::RemarkBudget::new(4, 8, 10, 0);
+                let before = values.len();
+                let done = if sharded {
+                    shards.seal_stopped_bounded_with_clock(
+                        &coord,
+                        &mut budget,
+                        || 0,
+                        |v| values.extend_from_slice(v),
+                    )
+                } else {
+                    legacy.flush_all_bounded_with_clock(
+                        &coord,
+                        &mut budget,
+                        || 0,
+                        |v| values.extend_from_slice(v),
+                    )
+                };
+                assert!(values.len() - before <= 1);
+                if done {
+                    break;
+                }
+            }
+            assert_eq!(values, (1..=65).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn satb_registry_resume_handles_unregister_reregister_and_reopen() {
+        let ids: Vec<_> = (0..3)
+            .map(|_| {
+                std::thread::spawn(|| std::thread::current().id())
+                    .join()
+                    .unwrap()
+            })
+            .collect();
+        let coord = super::super::GcCoord {
+            stop_requested: true,
+            ..Default::default()
+        };
+        let mut legacy = SatbBuffers::new(256);
+        let mut delivered = Vec::new();
+        for (i, &id) in ids.iter().enumerate() {
+            legacy.record(id, i + 1, |_| unreachable!());
+        }
+        assert!(!legacy.flush_all_bounded_with_clock(
+            &coord,
+            &mut super::super::old_cycle::RemarkBudget::new(3, 8, 10, 0),
+            || 0,
+            |v| delivered.extend_from_slice(v)
+        ));
+        assert_eq!(delivered, [1]);
+        legacy.flush_thread(ids[1], true, |v| delivered.extend_from_slice(v));
+        legacy.record(ids[0], 4, |_| unreachable!());
+        legacy.record(ids[1], 5, |_| unreachable!());
+        while !legacy.flush_all_bounded_with_clock(
+            &coord,
+            &mut super::super::old_cycle::RemarkBudget::new(3, 8, 10, 0),
+            || 0,
+            |v| delivered.extend_from_slice(v),
+        ) {}
+        assert_eq!(delivered, [1, 2, 3, 4, 5]);
+        assert!(legacy.is_empty());
+        let shards = SatbShards::new(256);
+        shards
+            .with_current(|| true, |b| b.record(7, |_| unreachable!()))
+            .unwrap();
+        let mut rounds = 0;
+        while !shards.seal_stopped_bounded_with_clock(
+            &coord,
+            &mut super::super::old_cycle::RemarkBudget::new(4, 8, 10, 0),
+            || 0,
+            |v| delivered.extend_from_slice(v),
+        ) {
+            rounds += 1;
+            assert!(rounds < SATB_SHARDS + 4);
+            shards.retire_current(|v| delivered.extend_from_slice(v));
+            assert!(shards.with_current(|| true, |_| ()).is_none());
+        }
+        assert_eq!(delivered, [1, 2, 3, 4, 5, 7]);
+        shards.reopen_stopped(&coord);
+        shards
+            .with_current(|| true, |b| b.record(8, |_| unreachable!()))
+            .unwrap();
+        shards.seal_stopped(&coord, |v| delivered.extend_from_slice(v));
+        assert_eq!(delivered, [1, 2, 3, 4, 5, 7, 8]);
     }
 
     #[test]
@@ -1072,7 +1323,7 @@ mod tests {
                 let registered_count: usize = buffers
                     .shards
                     .iter()
-                    .map(|shard| shard.0.lock().unwrap().len())
+                    .map(|shard| shard.0.lock().unwrap().entries.len())
                     .sum();
                 assert_eq!(registered_count, count);
                 finish.wait();
@@ -1089,7 +1340,7 @@ mod tests {
                 buffers
                     .shards
                     .iter()
-                    .all(|shard| shard.0.lock().unwrap().is_empty())
+                    .all(|shard| shard.0.lock().unwrap().entries.is_empty())
             );
         }
     }

@@ -220,7 +220,15 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
             cycle.enqueue(object);
         }
         if runtime().tlab_ever_allocated.load(Ordering::Acquire) {
-            barrier::remember_owner(&mut state, object as usize);
+            // Debug root diagnostics belong to collection. Do not dereference
+            // an invalid root while remembering it merely because a TLAB exists.
+            #[cfg(debug_assertions)]
+            let valid = validate_payload_pointer_locked(&state, object).is_ok();
+            #[cfg(not(debug_assertions))]
+            let valid = true;
+            if valid {
+                barrier::remember_owner(&mut state, object as usize);
+            }
         }
     }
     runtime().runtime_roots.add(object);

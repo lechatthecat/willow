@@ -7,6 +7,25 @@ unsafe fn reference_callback(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     slots.push(unsafe { payload.add(GC_STORAGE_WORD_BYTES) }.cast());
 }
 
+unsafe fn reference_slice(
+    payload: *mut u8,
+    cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    CALLBACK_TRACES.fetch_add(1, Ordering::Relaxed);
+    let end = cursor.saturating_add(limit).min(2);
+    for index in cursor..end {
+        children
+            .push(unsafe { load_gc_reference(payload.add(index * GC_STORAGE_WORD_BYTES).cast()) });
+    }
+    if end < 2 {
+        TraceSliceProgress::Continue(end)
+    } else {
+        TraceSliceProgress::Done
+    }
+}
+
 #[test]
 fn m0_all_destination_barriers_publish_deletions_in_open_and_sealed_marking() {
     let _guard = runtime_test_guard();
@@ -235,7 +254,11 @@ fn m0_differential_reference_tracer_randomized_heaps() {
             for round in 0..8 {
                 reset_internal_for_test();
                 const CALLBACK_TYPE: u32 = 0x70701;
-                willow_register_type(CALLBACK_TYPE, reference_callback);
+                willow_register_type_capability(
+                    CALLBACK_TYPE,
+                    reference_callback,
+                    NativeTraceCapability::SliceConcurrentSafe(reference_slice),
+                );
                 crate::gc_telemetry::failure_record::reproduction(
                     SEED,
                     ((shape as u64) << 48) | ((count as u64) << 16) | round,

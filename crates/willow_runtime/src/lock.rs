@@ -72,6 +72,29 @@ unsafe fn trace_blocking_cell(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
 /// # Safety
 /// `payload` must be a [`WillowBlockingCell`] allocated by
 /// [`willow_blocking_cell_new`].
+unsafe fn snapshot_blocking_cell_slice(
+    payload: *mut u8,
+    _cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> crate::gc::TraceSliceProgress {
+    use crate::gc::TraceSliceProgress;
+    assert!(
+        limit > 0,
+        "native trace slice requires positive work credit"
+    );
+    let cell = unsafe { &*payload.cast::<WillowBlockingCell>() };
+    if cell.is_ref {
+        let word = match cell.value.try_lock() {
+            Ok(word) => word,
+            Err(std::sync::TryLockError::WouldBlock) => return TraceSliceProgress::Retry,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        children.push(*word as *mut u8);
+    }
+    TraceSliceProgress::Done
+}
+
 unsafe fn snapshot_blocking_cell(payload: *mut u8, children: &mut Vec<*mut u8>) {
     let cell = unsafe { &*(payload as *const WillowBlockingCell) };
     if cell.is_ref {
@@ -109,6 +132,29 @@ unsafe fn trace_blocking_rw_cell(payload: *mut u8, slots: &mut Vec<*mut *mut u8>
 /// # Safety
 /// `payload` must be a [`WillowBlockingRwCell`] allocated by
 /// [`willow_blocking_rw_cell_new`].
+unsafe fn snapshot_blocking_rw_cell_slice(
+    payload: *mut u8,
+    _cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> crate::gc::TraceSliceProgress {
+    use crate::gc::TraceSliceProgress;
+    assert!(
+        limit > 0,
+        "native trace slice requires positive work credit"
+    );
+    let cell = unsafe { &*payload.cast::<WillowBlockingRwCell>() };
+    if cell.is_ref {
+        let word = match cell.value.try_read() {
+            Ok(word) => word,
+            Err(std::sync::TryLockError::WouldBlock) => return TraceSliceProgress::Retry,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        children.push(*word as *mut u8);
+    }
+    TraceSliceProgress::Done
+}
+
 unsafe fn snapshot_blocking_rw_cell(payload: *mut u8, children: &mut Vec<*mut u8>) {
     let cell = unsafe { &*(payload as *const WillowBlockingRwCell) };
     if cell.is_ref {
@@ -142,13 +188,15 @@ const BLOCKING_CELL_GC_TYPES: &[NativeGcType] = &[
         Some(trace_blocking_cell),
         Some(drop_blocking_cell),
     )
-    .with_concurrent_trace(snapshot_blocking_cell),
+    .with_concurrent_trace(snapshot_blocking_cell)
+    .with_concurrent_slice(snapshot_blocking_cell_slice),
     NativeGcType::new(
         BLOCKING_RW_CELL_TYPE_ID,
         Some(trace_blocking_rw_cell),
         Some(drop_blocking_rw_cell),
     )
-    .with_concurrent_trace(snapshot_blocking_rw_cell),
+    .with_concurrent_trace(snapshot_blocking_rw_cell)
+    .with_concurrent_slice(snapshot_blocking_rw_cell_slice),
 ];
 
 /// Install both cells' GC hooks once per registry generation; the common
@@ -297,6 +345,47 @@ mod tests {
         willow_gc_allocated_bytes, willow_gc_collect, willow_pop_roots, willow_push_root,
     };
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn bounded_cell_snapshots_retry_busy_locks_without_waiting() {
+        use crate::gc::TraceSliceProgress;
+        let cell = WillowBlockingCell {
+            value: StdMutex::new(17),
+            is_ref: true,
+        };
+        let rw = WillowBlockingRwCell {
+            value: StdRwLock::new(19),
+            is_ref: true,
+        };
+        let mut children = Vec::new();
+        let cell_ptr = (&cell as *const WillowBlockingCell).cast_mut().cast();
+        let rw_ptr = (&rw as *const WillowBlockingRwCell).cast_mut().cast();
+        let held = cell.value.lock().unwrap();
+        assert!(matches!(
+            unsafe { snapshot_blocking_cell_slice(cell_ptr, 0, 1, &mut children) },
+            TraceSliceProgress::Retry
+        ));
+        assert!(children.is_empty());
+        drop(held);
+        let held = rw.value.write().unwrap();
+        assert!(matches!(
+            unsafe { snapshot_blocking_rw_cell_slice(rw_ptr, 0, 1, &mut children) },
+            TraceSliceProgress::Retry
+        ));
+        assert!(children.is_empty());
+        drop(held);
+        assert!(matches!(
+            unsafe { snapshot_blocking_cell_slice(cell_ptr, 0, 1, &mut children) },
+            TraceSliceProgress::Done
+        ));
+        assert_eq!(children, [17usize as *mut u8]);
+        children.clear();
+        assert!(matches!(
+            unsafe { snapshot_blocking_rw_cell_slice(rw_ptr, 0, 1, &mut children) },
+            TraceSliceProgress::Done
+        ));
+        assert_eq!(children, [19usize as *mut u8]);
+    }
 
     /// A GC object holding one scalar word, allocated in the old generation.
     fn old_object(word: i64) -> *mut u8 {

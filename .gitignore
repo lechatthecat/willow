@@ -109,3 +109,9 @@ AGENTS.md
 !/docs/audits/willow-23fv/audit.md
 !/docs/audits/willow-23fv/measurements.json
 !/docs/audits/willow-23fv/verify.sh
+
+# Stage 6 source-derived recovery diagnostic and audit only.
+!/docs/audits/willow-6fv.5.6/
+/docs/audits/willow-6fv.5.6/*
+!/docs/audits/willow-6fv.5.6/audit.md
+!/docs/audits/willow-6fv.5.6/reproduce.sh

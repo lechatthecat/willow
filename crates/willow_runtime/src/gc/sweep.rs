@@ -1,5 +1,5 @@
-//! Bounded normal old sweep with a shared resumable cursor; the classified
-//! stopped Recovery path retains its compatibility sweep. New reclaimed spans
+//! Bounded old sweep with a shared resumable cursor, including recovery after
+//! authoritative stopped graph tracing. New reclaimed spans
 //! wait for completion and the next mark epoch before allocator reuse.
 use super::*;
 mod batches;

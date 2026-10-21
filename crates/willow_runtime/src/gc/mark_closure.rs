@@ -24,8 +24,8 @@ pub(super) fn finish_with_wait(
 }
 
 // The first seal and one optimistic recheck are the only normal remark stops.
-// The third round is reserved for authoritative classified Recovery, including
-// metadata exhaustion; it cannot acquire a separate stopped retry allowance.
+// Exhaustion then enters separately observed, budgeted Recovery slices. Recovery
+// preserves its cursors and resumes mutators between stops; it has no full walk.
 pub(super) const MAX_REMARK_ROUNDS: usize = 3;
 pub(super) const MAX_DRAIN_WAVES: usize = 128;
 
@@ -285,8 +285,235 @@ pub(super) fn finish_with_hooks(
     require_stopped_completion(cycle)
 }
 
-/// Authoritative stopped completion shared by the collector and cap tests.
+/// Recovery keeps the original SATB epoch alive. Only ownership transfer and
+/// publication run stopped; graph work (including native slices) runs resumed.
+/// A fixed reserve independent of normal remark tuning guarantees that tiny
+/// diagnostic settings cannot force an unbounded authoritative fallback.
+pub(super) const RECOVERY_SLOTS: u64 = 256;
+pub(super) const RECOVERY_BYTES: u64 = 16 * 1024;
+/// Maximum consecutive Retry results at one native cursor during recovery.
+/// Each admitted retry is separated by a resumed 1 ms collector wait.
+pub(super) const MAX_NATIVE_RECOVERY_RETRIES: usize = 128;
+#[cfg(test)]
+pub(super) static RECOVERY_SAMPLES: Mutex<Vec<[u64; 4]>> = Mutex::new(Vec::new());
+
 pub(super) fn finish_stopped(
+    marking: &Arc<ConcurrentCycle>,
+    started: std::time::Instant,
+) -> (
+    crate::gc_telemetry::MarkWork,
+    Option<sweep::SweepPlan>,
+    usize,
+) {
+    finish_recovery_with_wait(marking, started, std::thread::sleep)
+}
+
+pub(super) fn finish_recovery_with_wait(
+    marking: &Arc<ConcurrentCycle>,
+    started: std::time::Instant,
+    mut wait: impl FnMut(std::time::Duration),
+) -> (
+    crate::gc_telemetry::MarkWork,
+    Option<sweep::SweepPlan>,
+    usize,
+) {
+    if !old_cycle::concurrent_enabled() {
+        return finish_feature_off(marking, started);
+    }
+    marking.recovering.store(true, Ordering::Release);
+    marking.closing.store(true, Ordering::Release);
+    loop {
+        // An unwound consumer may have lost its in-hand item. Continuing would
+        // collect reachable children; unrestricted legacy retracing is forbidden.
+        if marking.worker_failed.load(Ordering::Acquire) {
+            crate::failure::fatal_invariant(
+                "concurrent GC native tracing failed; bounded recovery cannot retry a partial callback",
+            );
+        }
+        if !marking.deferred.lock().unwrap().is_empty() {
+            crate::failure::fatal_invariant(
+                "concurrent GC requires SliceConcurrentSafe native tracing",
+            );
+        }
+        marking
+            .phase
+            .lock()
+            .unwrap()
+            .transition(old_cycle::Phase::RemarkRequested);
+        let plan = with_stw(
+            crate::gc_telemetry::stops::StopReason::Recovery,
+            |coord, stop_work| {
+                marking
+                    .phase
+                    .lock()
+                    .unwrap()
+                    .transition(old_cycle::Phase::RemarkSTW);
+                GC_MARK_PHASE.store(2, Ordering::Release);
+                let mut budget = old_cycle::RemarkBudget::new(
+                    RECOVERY_SLOTS,
+                    RECOVERY_BYTES,
+                    1_000_000,
+                    crate::gc_telemetry::timestamp_ns(),
+                );
+                let mut state = runtime().heap.lock().unwrap();
+                let sealed =
+                    marking
+                        .satb_shards
+                        .seal_stopped_bounded(coord, &mut budget, |values| {
+                            marking.enqueue_satb_batch(values)
+                        })
+                        && state.satb.flush_all_bounded(coord, &mut budget, |values| {
+                            marking.enqueue_satb_batch(values)
+                        });
+                marking.termination.restart();
+                let plan = if sealed && request_remark(marking) {
+                    // Final readers publish their error before releasing ownership.
+                    if marking.worker_failed.load(Ordering::Acquire)
+                        || !marking.deferred.lock().unwrap().is_empty()
+                    {
+                        crate::failure::fatal_invariant(
+                            "concurrent GC requires a successful bounded native trace",
+                        );
+                    }
+                    sweep::prepare_bounded(&mut state, marking.clone(), &mut budget, stop_work)
+                } else {
+                    None
+                };
+                if plan.is_some() {
+                    GC_MARK_PHASE.store(0, Ordering::Release);
+                    marking::set_concurrent_cycle(&mut state, None);
+                    assert_eq!(marking.queue.end_epoch(), 0, "recovery lost a publisher");
+                    marking
+                        .phase
+                        .lock()
+                        .unwrap()
+                        .transition(old_cycle::Phase::Sweep);
+                    crate::gc_telemetry::milestones::reached(
+                        crate::gc_telemetry::GcStage::MarkComplete,
+                    );
+                } else {
+                    GC_MARK_PHASE.store(1, Ordering::Release);
+                    marking
+                        .phase
+                        .lock()
+                        .unwrap()
+                        .transition(old_cycle::Phase::ConcurrentMark);
+                }
+                #[cfg(test)]
+                {
+                    let [slots, bytes, regions] = budget.counts();
+                    RECOVERY_SAMPLES.lock().unwrap().push([
+                        slots,
+                        bytes,
+                        regions,
+                        stop_work.metadata_objects,
+                    ]);
+                }
+                plan
+            },
+        );
+        if let Some(plan) = plan {
+            let mut work = *marking.work.lock().unwrap();
+            work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
+            return (work, Some(plan), 0);
+        }
+        // Keep mutators resumed while graph work is pending. A Retry cannot
+        // trigger another global stop or monopolize a drain of 256 attempts.
+        while !marking.queue.snapshot().is_drained()
+            || marking.active_drains.load(Ordering::Acquire) != 0
+        {
+            minor::service_pending();
+            if marking.worker_failed.load(Ordering::Acquire)
+                || !marking.deferred.lock().unwrap().is_empty()
+            {
+                crate::failure::fatal_invariant(
+                    "concurrent GC requires a successful bounded native trace",
+                );
+            }
+            let before = marking.recovery_retry_generation.load(Ordering::Acquire);
+            marking.drain_checked_until(
+                256,
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(1)),
+            );
+            if marking.recovery_retry_generation.load(Ordering::Acquire) != before
+                || marking.active_drains.load(Ordering::Acquire) != 0
+            {
+                wait(std::time::Duration::from_millis(1));
+            }
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Cancel an unwinding epoch without an unbounded cleanup stop. There is no
+/// reclamation: once publishers/readers leave, header cleanup can run resumed
+/// under the heap lock while collector serialization excludes another cycle.
+pub(super) fn cancel(marking: &Arc<ConcurrentCycle>) {
+    marking.closing.store(true, Ordering::Release);
+    let mut region_cursor = 0;
+    loop {
+        let done = with_stw(
+            crate::gc_telemetry::stops::StopReason::Recovery,
+            |coord, work| {
+                let mut budget = old_cycle::RemarkBudget::new(
+                    RECOVERY_SLOTS,
+                    RECOVERY_BYTES,
+                    1_000_000,
+                    crate::gc_telemetry::timestamp_ns(),
+                );
+                let mut state = runtime().heap.lock().unwrap();
+                if state.sweeping.is_some() {
+                    crate::failure::fatal_invariant("cannot cancel a partially reclaimed GC sweep");
+                }
+                let mut done = marking
+                    .satb_shards
+                    .seal_stopped_bounded(coord, &mut budget, |_| {})
+                    && state.satb.flush_all_bounded(coord, &mut budget, |_| {})
+                    && old_lab::retire_bounded(&mut state, &mut budget, work)
+                    && marking.active_drains.load(Ordering::Acquire) == 0;
+                if done {
+                    // Undo partial publication before dropping the epoch. Retire
+                    // cached LAB flags first; resumed refills see the new flags.
+                    while region_cursor < state.old_regions.len() {
+                        if !budget.reserve(
+                            1,
+                            sweep::REGION_PUBLICATION_BYTES,
+                            crate::gc_telemetry::timestamp_ns(),
+                        ) {
+                            done = false;
+                            break;
+                        }
+                        let region = &mut state.old_regions[region_cursor];
+                        region.sweep_pending = false;
+                        region.sweep_quarantined = false;
+                        index_old_region(&mut state, region_cursor);
+                        region_cursor += 1;
+                    }
+                }
+                if done {
+                    GC_MARK_PHASE.store(0, Ordering::Release);
+                    marking::set_concurrent_cycle(&mut state, None);
+                }
+                done
+            },
+        );
+        if done {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    marking.queue.end_epoch();
+    let state = runtime().heap.lock().unwrap();
+    // Concurrent tracing never marks TLAB headers. Old allocations made after
+    // partial sweep publication can have header marks; clear only those indexed
+    // old objects. Generated TLABs may still be active or deliberately unindexed.
+    for object in old_region_objects(&state) {
+        object.clear_mark();
+    }
+}
+
+/// Explicit feature-off baseline retains its stopped native tracing semantics.
+fn finish_feature_off(
     marking: &Arc<ConcurrentCycle>,
     started: std::time::Instant,
 ) -> (
@@ -419,22 +646,11 @@ pub(super) fn finish_stopped(
                 .unwrap()
                 .transition(old_cycle::Phase::Sweep);
             crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::MarkComplete);
-            if fallback {
-                let freed = sweep_with_work(stop_work);
-                crate::gc_telemetry::milestones::reached(
-                    crate::gc_telemetry::GcStage::SweepComplete,
-                );
-                marking
-                    .phase
-                    .lock()
-                    .unwrap()
-                    .transition(old_cycle::Phase::Idle);
-                (work, None, freed)
-            } else {
-                let plan =
-                    sweep::prepare(&mut runtime().heap.lock().unwrap(), Some(marking.clone()));
-                (work, Some(plan), 0)
-            }
+            // Both closure paths have authoritative liveness now. Publish the
+            // quarantine before resuming, then use the shared bounded sweep
+            // cursor outside this stop, including native destructor execution.
+            let plan = sweep::prepare(&mut runtime().heap.lock().unwrap(), Some(marking.clone()));
+            (work, Some(plan), 0)
         },
     )
 }

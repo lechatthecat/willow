@@ -169,15 +169,17 @@ mod tests {
     static RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     unsafe fn legacy(_: *mut u8, _: &mut Vec<*mut *mut u8>) {}
-    unsafe fn paused_trace(_: *mut u8, _: &mut Vec<*mut u8>) {
+    unsafe fn paused_trace(
+        _: *mut u8,
+        _: usize,
+        _: usize,
+        _: &mut Vec<*mut u8>,
+    ) -> TraceSliceProgress {
         ENTERED.store(true, Ordering::Release);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !RELEASE.load(Ordering::Acquire) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "coordinator test did not release trace"
-            );
-            std::thread::yield_now();
+        if RELEASE.load(Ordering::Acquire) {
+            TraceSliceProgress::Done
+        } else {
+            TraceSliceProgress::Retry
         }
     }
 
@@ -286,12 +288,11 @@ mod tests {
         ENTERED.store(false, Ordering::Relaxed);
         RELEASE.store(false, Ordering::Relaxed);
         const TYPE: u32 = 0xFA88;
-        willow_register_type(TYPE, legacy);
-        runtime()
-            .concurrent_trace_registry
-            .lock()
-            .unwrap()
-            .insert(TYPE, paused_trace);
+        willow_register_type_capability(
+            TYPE,
+            legacy,
+            NativeTraceCapability::SliceConcurrentSafe(paused_trace),
+        );
         let mut root = willow_alloc_object(TYPE as i64, 8);
         willow_push_root(&mut root);
         willow_gc_register_mutator();
@@ -330,12 +331,11 @@ mod tests {
         RELEASE.store(false, Ordering::Relaxed);
         cycle_wait::SLEEPS.store(0, Ordering::Relaxed);
         const TYPE: u32 = 0xFA89;
-        willow_register_type(TYPE, legacy);
-        runtime()
-            .concurrent_trace_registry
-            .lock()
-            .unwrap()
-            .insert(TYPE, paused_trace);
+        willow_register_type_capability(
+            TYPE,
+            legacy,
+            NativeTraceCapability::SliceConcurrentSafe(paused_trace),
+        );
         let _mutator = MutatorRegistration::new();
         let mut root = willow_alloc_object(TYPE as i64, 8);
         willow_push_root(&mut root);

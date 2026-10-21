@@ -49,10 +49,10 @@ fn satb_deleted_subgraph_survives_then_dies_in_the_next_epoch() {
             MUTATION_DONE.store(false, Ordering::Relaxed);
             const CONTROL: u32 = 0xFC11;
             const SOURCE: u32 = 0xFC12;
-            willow_register_type(CONTROL, trace_slot);
-            willow_register_type(SOURCE, trace_slot);
+            register_slot_type(CONTROL);
+            register_slot_type(SOURCE);
             runtime()
-                .concurrent_trace_registry
+                .concurrent_slice_registry
                 .lock()
                 .unwrap()
                 .insert(CONTROL, snapshot_before_mutation);
@@ -563,16 +563,40 @@ unsafe fn trace_slot(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     slots.push(payload.cast());
 }
 
-unsafe fn snapshot_before_mutation(payload: *mut u8, children: &mut Vec<*mut u8>) {
+unsafe fn snapshot_slot_slice(
+    payload: *mut u8,
+    _: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    assert!(limit > 0);
+    assert!(!runtime().stop_requested.load(Ordering::Acquire));
     children.push(unsafe { load_gc_reference(payload.cast()) });
-    SNAPSHOT_READY.store(true, Ordering::Release);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !MUTATION_DONE.load(Ordering::Acquire) {
-        assert!(
-            Instant::now() < deadline,
-            "mutator could not execute during marking"
-        );
-        std::thread::yield_now();
+    TraceSliceProgress::Done
+}
+
+fn register_slot_type(id: u32) {
+    willow_register_type_capability(
+        id,
+        trace_slot,
+        NativeTraceCapability::SliceConcurrentSafe(snapshot_slot_slice),
+    );
+}
+
+unsafe fn snapshot_before_mutation(
+    payload: *mut u8,
+    cursor: usize,
+    _: usize,
+    children: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    if cursor == 0 {
+        children.push(unsafe { load_gc_reference(payload.cast()) });
+        SNAPSHOT_READY.store(true, Ordering::Release);
+        TraceSliceProgress::Continue(1)
+    } else if MUTATION_DONE.load(Ordering::Acquire) {
+        TraceSliceProgress::Done
+    } else {
+        TraceSliceProgress::Retry
     }
 }
 
@@ -584,10 +608,10 @@ fn concurrent_edge_publication_and_new_allocation_survive_remark() {
     MUTATION_DONE.store(false, Ordering::Relaxed);
     const SNAPSHOT_TYPE: u32 = 0xFC01;
     const LEGACY_TYPE: u32 = 0xFC02;
-    willow_register_type(SNAPSHOT_TYPE, trace_slot);
-    willow_register_type(LEGACY_TYPE, trace_slot);
+    register_slot_type(SNAPSHOT_TYPE);
+    register_slot_type(LEGACY_TYPE);
     runtime()
-        .concurrent_trace_registry
+        .concurrent_slice_registry
         .lock()
         .unwrap()
         .insert(SNAPSHOT_TYPE, snapshot_before_mutation);
@@ -734,7 +758,6 @@ static ASSIST_ABORT: AtomicBool = AtomicBool::new(false);
 // and a thread that unwinds out of the fixture cannot report anything itself,
 // so every failure becomes a flag the main thread asserts on (willow-utqy).
 const MARKER_NEVER_TRACED: usize = 1;
-const ASSIST_NEVER_STARTED: usize = 2;
 const REMARK_NEVER_REQUESTED: usize = 4;
 const CYCLE_MISSING: usize = 8;
 const CLAIM_REFUSED: usize = 16;
@@ -769,24 +792,28 @@ fn await_assist_step(cause: usize, mut poll: impl FnMut(), done: impl Fn() -> bo
     true
 }
 
-unsafe fn hold_marker_for_assistant(_: *mut u8, _: &mut Vec<*mut u8>) {
+unsafe fn hold_marker_for_assistant(
+    payload: *mut u8,
+    _: usize,
+    _: usize,
+    children: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
     ASSIST_READY.store(true, Ordering::Release);
-    await_assist_step(
-        ASSIST_NEVER_STARTED,
-        || {},
-        || ASSIST_IN_FLIGHT.load(Ordering::Acquire),
-    );
+    if ASSIST_IN_FLIGHT.load(Ordering::Acquire) {
+        children.push(unsafe { load_gc_reference(payload.cast()) });
+        TraceSliceProgress::Done
+    } else {
+        TraceSliceProgress::Retry
+    }
 }
 
-unsafe fn assist_overlaps_remark(_: *mut u8, _: &mut Vec<*mut u8>) {
-    ASSIST_IN_FLIGHT.store(true, Ordering::Release);
-    if await_assist_step(
-        REMARK_NEVER_REQUESTED,
-        || {},
-        || runtime().stop_requested.load(Ordering::Acquire),
-    ) {
-        ASSIST_SAW_REMARK.store(true, Ordering::Release);
-    }
+unsafe fn assist_overlaps_remark(
+    _: *mut u8,
+    _: usize,
+    _: usize,
+    _: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    TraceSliceProgress::Done
 }
 
 /// Run the mutator-side assist that must overlap the collector's final remark.
@@ -823,7 +850,26 @@ fn run_mutator_assist(child: *mut u8) {
         assist_failed(ASSIST_PUSH_FAILED);
         return;
     }
+    // Explicit test ownership models the reader lifetime outside the callback:
+    // native slices remain bounded while final remark must await this owner.
+    struct ReaderHold<'a>(&'a ConcurrentCycle);
+    impl Drop for ReaderHold<'_> {
+        fn drop(&mut self) {
+            self.0.active_drains.fetch_sub(1, Ordering::Release);
+        }
+    }
+    cycle.active_drains.fetch_add(1, Ordering::AcqRel);
+    let hold = ReaderHold(&cycle);
+    ASSIST_IN_FLIGHT.store(true, Ordering::Release);
     cycle.drain_worker(1, &mut Vec::new(), &mut consumer);
+    if await_assist_step(
+        REMARK_NEVER_REQUESTED,
+        || willow_gc_safepoint(),
+        || mark_closure::READER_WAIT_OBSERVED.load(Ordering::Acquire),
+    ) {
+        ASSIST_SAW_REMARK.store(true, Ordering::Release);
+    }
+    drop(hold);
 }
 
 #[test]
@@ -835,18 +881,22 @@ fn remark_waits_for_an_in_flight_mutator_assist() {
     ASSIST_SAW_REMARK.store(false, Ordering::Relaxed);
     ASSIST_ABORT.store(false, Ordering::Relaxed);
     ASSIST_FAILURES.store(0, Ordering::Relaxed);
+    mark_closure::READER_WAIT_OBSERVED.store(false, Ordering::Relaxed);
     for (id, callback) in [
-        (0xFD01, hold_marker_for_assistant as ConcurrentTraceFn),
-        (0xFD02, assist_overlaps_remark as ConcurrentTraceFn),
+        (0xFD01, hold_marker_for_assistant as ConcurrentTraceSliceFn),
+        (0xFD02, assist_overlaps_remark as ConcurrentTraceSliceFn),
     ] {
-        willow_register_type(id, trace_slot);
-        runtime()
-            .concurrent_trace_registry
-            .lock()
-            .unwrap()
-            .insert(id, callback);
+        willow_register_type_capability(
+            id,
+            trace_slot,
+            NativeTraceCapability::SliceConcurrentSafe(callback),
+        );
     }
-    willow_register_type(0xFD03, trace_slot);
+    willow_register_type_capability(
+        0xFD03,
+        trace_slot,
+        NativeTraceCapability::SliceConcurrentSafe(hold_marker_for_assistant),
+    );
     let mut marker = willow_alloc_object(0xFD01, 8);
     let mut source = willow_alloc_object(0xFD03, 8);
     let assisted = willow_alloc_object(0xFD02, 8);
@@ -1244,38 +1294,66 @@ fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
 }
 
 #[test]
-fn concurrent_trace_panic_completes_with_stopped_graph_tracing() {
+fn concurrent_native_contract_failures_reject_before_reclamation() {
+    const KEY: &str = "WILLOW_TEST_NATIVE_CONTRACT_FAILURE";
+    let Ok(case) = std::env::var(KEY) else {
+        for case in ["legacy", "snapshot", "panic"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gc::concurrent_tests::concurrent_native_contract_failures_reject_before_reclamation", "--nocapture"])
+                .env(KEY, case).output().unwrap();
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("runtime fatal:"), "{stderr}");
+            assert!(!stderr.contains("UNREACHABLE_DROP"), "{stderr}");
+            assert!(!stderr.contains("UNBOUNDED_HOOK"), "{stderr}");
+            assert!(!stderr.contains("COLLECTION_RETURNED"), "{stderr}");
+        }
+        return;
+    };
     let _guard = runtime_test_guard();
     reset_internal_for_test();
-    willow_register_type(0xFA72, trace_slot);
-    runtime()
-        .concurrent_trace_registry
-        .lock()
-        .unwrap()
-        .insert(0xFA72, failing_concurrent_trace);
-    let mut parent = willow_alloc_object(0xFA72, 8);
-    let child = willow_alloc_typed(8, 1);
-    let leaf = willow_alloc(8);
-    unsafe {
-        store_gc_reference(parent.cast(), child);
-        store_gc_reference(child.cast(), leaf);
+    unsafe fn failing_slice(
+        _: *mut u8,
+        _: usize,
+        _: usize,
+        _: &mut Vec<*mut u8>,
+    ) -> TraceSliceProgress {
+        panic!("injected bounded callback failure")
     }
+    unsafe fn drop_probe(_: *mut u8) {
+        eprintln!("UNREACHABLE_DROP");
+    }
+    unsafe fn rejected_stopped(_: *mut u8, _: &mut Vec<*mut *mut u8>) {
+        eprintln!("UNBOUNDED_HOOK");
+    }
+    unsafe fn rejected_snapshot(_: *mut u8, _: &mut Vec<*mut u8>) {
+        eprintln!("UNBOUNDED_HOOK");
+    }
+    willow_register_type(0xFA72, rejected_stopped);
+    if case == "snapshot" {
+        willow_register_type_capability(
+            0xFA72,
+            rejected_stopped,
+            NativeTraceCapability::ConcurrentSafe(rejected_snapshot),
+        );
+    }
+    if case == "panic" {
+        willow_register_type_capability(
+            0xFA72,
+            trace_slot,
+            NativeTraceCapability::SliceConcurrentSafe(failing_slice),
+        );
+    }
+    willow_register_drop(0xFA73, drop_probe);
+    let mut parent = willow_alloc_object(0xFA72, 8);
     willow_push_root(&mut parent);
-    let before = crate::gc_telemetry::workers::snapshot();
+    willow_alloc_object(0xFA73, 8);
     willow_gc_collect();
-    let after = crate::gc_telemetry::workers::snapshot();
-    assert!(after.marker_panics > before.marker_panics);
-    assert_eq!(after.fallback_cycles, before.fallback_cycles + 1);
-    assert_eq!(willow_gc_allocated_bytes(), 3 * (GC_HEADER_SIZE + 8) as i64);
-    assert_eq!(registered_mutator_count(), 0);
-    willow_pop_roots(1);
-    willow_gc_collect();
-    assert_eq!(willow_gc_allocated_bytes(), 0);
-    reset_internal_for_test();
+    eprintln!("COLLECTION_RETURNED");
 }
 
 #[test]
-fn disabled_mark_workers_use_stopped_graph_tracing() {
+fn disabled_mark_workers_use_collector_queue_tracing() {
     let _guard = runtime_test_guard();
     reset_internal_for_test();
     shutdown_mark_workers();
@@ -1294,11 +1372,11 @@ fn disabled_mark_workers_use_stopped_graph_tracing() {
         crate::gc_telemetry::stops::snapshot_stops().by_reason[3]
             .work
             .swept_objects,
-        2
+        0
     );
     assert_eq!(
         crate::gc_telemetry::workers::snapshot().fallback_cycles,
-        before + 1
+        before
     );
     willow_pop_roots(1);
     willow_gc_collect();
@@ -1417,9 +1495,22 @@ fn m2_await_allocation_with_frame_quarantined(index: usize) {
 
 #[test]
 fn concurrent_sweep_retains_new_allocations_and_quarantines_processed_spans() {
+    assert_sweep_retains_new_allocations(false);
+}
+
+#[test]
+fn recovery_sweep_retains_new_allocations_and_quarantines_processed_spans() {
+    assert_sweep_retains_new_allocations(true);
+}
+
+fn assert_sweep_retains_new_allocations(recovery: bool) {
     let _guard = runtime_test_guard();
     for allocate_in_pending_region in [true, false] {
         reset_internal_for_test();
+        if recovery {
+            old_cycle::REMARK_WORK_NS_FOR_TEST.store(1, Ordering::Relaxed);
+            *MARK_WORKERS.lock().unwrap() = Some(mark_workers::Pool::new(0).unwrap());
+        }
         SWEEP_MUTATOR_READY.store(false, Ordering::Relaxed);
         SWEEP_MUTATOR_DONE.store(false, Ordering::Relaxed);
         let large = (GC_LARGE_OBJECT_THRESHOLD + 8) as i64;
@@ -1498,6 +1589,10 @@ fn concurrent_sweep_retains_new_allocations_and_quarantines_processed_spans() {
         assert!(dead.sweep_epoch > 0);
         let stops = crate::gc_telemetry::stops::snapshot_stops();
         assert_eq!(stops.by_reason[1].work.swept_objects, 0);
+        assert_eq!(stops.by_reason[3].work.swept_objects, 0);
+        if recovery {
+            assert_eq!(stops.by_reason[3].requests, 1);
+        }
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
     }
@@ -1674,17 +1769,18 @@ static SATB_MUTATORS_READY: AtomicBool = AtomicBool::new(false);
 static SATB_MUTATORS_DONE: AtomicUsize = AtomicUsize::new(0);
 static SATB_MUTATORS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
 
-unsafe fn hold_snapshot_for_deleting_mutators(_: *mut u8, _: &mut Vec<*mut u8>) {
+unsafe fn hold_snapshot_for_deleting_mutators(
+    _: *mut u8,
+    _: usize,
+    _: usize,
+    _: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
     SATB_MUTATORS_READY.store(true, Ordering::Release);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while SATB_MUTATORS_DONE.load(Ordering::Acquire)
-        != SATB_MUTATORS_EXPECTED.load(Ordering::Relaxed)
+    if SATB_MUTATORS_DONE.load(Ordering::Acquire) == SATB_MUTATORS_EXPECTED.load(Ordering::Relaxed)
     {
-        assert!(
-            Instant::now() < deadline,
-            "registered mutators could not delete during marking"
-        );
-        std::thread::yield_now();
+        TraceSliceProgress::Done
+    } else {
+        TraceSliceProgress::Retry
     }
 }
 
@@ -1700,10 +1796,10 @@ fn satb_parallel_mutators_retain_deleted_subgraphs_across_phase_flips() {
             SATB_MUTATORS_EXPECTED.store(count, Ordering::Relaxed);
             const CONTROL: u32 = 0xFA81;
             const SOURCE: u32 = 0xFA82;
-            willow_register_type(CONTROL, trace_slot);
-            willow_register_type(SOURCE, trace_slot);
+            register_slot_type(CONTROL);
+            register_slot_type(SOURCE);
             runtime()
-                .concurrent_trace_registry
+                .concurrent_slice_registry
                 .lock()
                 .unwrap()
                 .insert(CONTROL, hold_snapshot_for_deleting_mutators);
@@ -2725,9 +2821,9 @@ fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_after_stopped_ownersh
     SNAPSHOT_READY.store(false, Ordering::Relaxed);
     MUTATION_DONE.store(false, Ordering::Relaxed);
     const CONTROL: u32 = 0xFE12;
-    willow_register_type(CONTROL, trace_slot);
+    register_slot_type(CONTROL);
     runtime()
-        .concurrent_trace_registry
+        .concurrent_slice_registry
         .lock()
         .unwrap()
         .insert(CONTROL, snapshot_before_mutation);
@@ -3519,6 +3615,9 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
                 ));
                 for owner in &owners {
                     assert!(cycle.objects.claim(*owner));
+                    // Model an already completed owner scan. Recovery retains
+                    // epoch accounting instead of retracing claimed objects.
+                    cycle.work.lock().unwrap().object(GC_HEADER_SIZE + 8, 1);
                 }
                 marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
                 GC_MARK_PHASE.store(1, Ordering::Release);
@@ -3603,8 +3702,8 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
                 2
             );
             let (work, plan, freed) = mark_closure::finish_stopped(&cycle, Instant::now());
-            assert!(plan.is_none());
-            assert_eq!(freed, GC_HEADER_SIZE + 8);
+            assert_eq!(freed, 0);
+            assert_eq!(sweep::concurrent(plan.unwrap()), GC_HEADER_SIZE + 8);
             assert_eq!(work.marked_bytes, (3 * count * (GC_HEADER_SIZE + 8)) as u64);
             assert_eq!(
                 willow_gc_allocated_bytes(),
@@ -3629,14 +3728,29 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
 }
 
 #[test]
-fn satb_closure_wave_cap_completes_perpetually_retrying_work_with_stopped_trace() {
+fn satb_closure_wave_cap_resumes_retrying_work_with_bounded_recovery() {
+    unsafe fn retry_slot_slice(
+        object: *mut u8,
+        cursor: usize,
+        budget: usize,
+        output: &mut Vec<*mut u8>,
+    ) -> TraceSliceProgress {
+        if matches!(
+            unsafe { budget_retry_slice(object, cursor, budget, output) },
+            TraceSliceProgress::Retry
+        ) {
+            TraceSliceProgress::Retry
+        } else {
+            unsafe { snapshot_slot_slice(object, cursor, budget, output) }
+        }
+    }
     let _guard = runtime_test_guard();
     for count in [1, 16, 257] {
         reset_internal_for_test();
         BUDGET_RETRY_CALLS.store(0, Ordering::Relaxed);
         BUDGET_RETRY_LIMIT.store(usize::MAX, Ordering::Relaxed);
         const TYPE: u32 = 0xFA79;
-        willow_register_type(TYPE, trace_slot);
+        register_slot_type(TYPE);
         let mut parents = Vec::new();
         for _ in 0..count {
             let parent = willow_alloc_object(TYPE as i64, 8);
@@ -3654,7 +3768,7 @@ fn satb_closure_wave_cap_completes_perpetually_retrying_work_with_stopped_trace(
                 IdMap::default(),
                 0,
             );
-            cycle.slices.insert(TYPE, budget_retry_slice);
+            cycle.slices.insert(TYPE, retry_slot_slice);
             let cycle = Arc::new(cycle);
             for parent in parents {
                 cycle.enqueue(parent);
@@ -3677,12 +3791,28 @@ fn satb_closure_wave_cap_completes_perpetually_retrying_work_with_stopped_trace(
         );
         assert!(cycle.stopped_completion_required.load(Ordering::Acquire));
         assert!(!cycle.queue.snapshot().is_drained());
-        let (work, plan, _) = mark_closure::finish_stopped(&cycle, Instant::now());
-        assert!(plan.is_none());
+        let mut recovery_waits = 0;
+        // Still Retry on entry: release contention only after recovery actually
+        // yields twice with mutators resumed, without requesting another stop.
+        let (work, plan, freed) =
+            mark_closure::finish_recovery_with_wait(&cycle, Instant::now(), |delay| {
+                assert_eq!(delay, Duration::from_millis(1));
+                assert!(!runtime().stop_requested.load(Ordering::Acquire));
+                assert_eq!(
+                    crate::gc_telemetry::stops::snapshot_stops().by_reason[3].requests,
+                    1
+                );
+                recovery_waits += 1;
+                if recovery_waits == 2 {
+                    BUDGET_RETRY_LIMIT.store(0, Ordering::Relaxed);
+                }
+            });
+        assert_eq!(recovery_waits, 2);
+        assert_eq!(freed, 0);
+        sweep::concurrent(plan.expect("recovery publishes a sweep plan"));
         assert_eq!(
             BUDGET_RETRY_CALLS.load(Ordering::Relaxed),
-            calls,
-            "stopped completion must not retry the concurrent hook"
+            calls + count + 2
         );
         assert_eq!(work.marked_bytes, (2 * count * (GC_HEADER_SIZE + 8)) as u64);
         assert_eq!(
@@ -3693,15 +3823,14 @@ fn satb_closure_wave_cap_completes_perpetually_retrying_work_with_stopped_trace(
             crate::gc_telemetry::stops::snapshot_stops().by_reason[1].requests,
             1
         );
-        assert_eq!(
-            crate::gc_telemetry::stops::snapshot_stops().by_reason[3].requests,
-            1
-        );
+        let recovery = crate::gc_telemetry::stops::snapshot_stops().by_reason[3];
+        assert!(recovery.requests >= 1);
+        assert_eq!(recovery.work.swept_objects, 0);
         assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         println!(
-            "closure_cap objects={count} waves=128 concurrent_retry_calls={calls} remark_rounds=2 stopped_trace_completed=true"
+            "closure_cap objects={count} waves=128 concurrent_retry_calls={calls} bounded_recovery_completed=true"
         );
     }
     BUDGET_RETRY_LIMIT.store(0, Ordering::Relaxed);
@@ -3709,7 +3838,22 @@ fn satb_closure_wave_cap_completes_perpetually_retrying_work_with_stopped_trace(
 }
 
 #[test]
-fn satb_deferred_legacy_and_retry_slice_complete_with_snapshot_retention() {
+fn satb_bounded_native_and_retry_slice_complete_with_snapshot_retention() {
+    unsafe fn retry_slot_slice(
+        object: *mut u8,
+        cursor: usize,
+        budget: usize,
+        output: &mut Vec<*mut u8>,
+    ) -> TraceSliceProgress {
+        if matches!(
+            unsafe { budget_retry_slice(object, cursor, budget, output) },
+            TraceSliceProgress::Retry
+        ) {
+            TraceSliceProgress::Retry
+        } else {
+            unsafe { snapshot_slot_slice(object, cursor, budget, output) }
+        }
+    }
     let _guard = runtime_test_guard();
     for (count, predrain) in [
         (1, true),
@@ -3753,7 +3897,8 @@ fn satb_deferred_legacy_and_retry_slice_complete_with_snapshot_retention() {
                 IdMap::default(),
                 0,
             );
-            cycle.slices.insert(RETRY, budget_retry_slice);
+            cycle.slices.insert(RETRY, retry_slot_slice);
+            cycle.slices.insert(LEGACY, snapshot_slot_slice);
             let cycle = Arc::new(cycle);
             for parent in parents {
                 cycle.enqueue(parent);
@@ -3765,12 +3910,9 @@ fn satb_deferred_legacy_and_retry_slice_complete_with_snapshot_retention() {
         if predrain {
             cycle.drain_checked(4 * count);
         }
-        assert_eq!(
-            cycle.deferred.lock().unwrap().len(),
-            if predrain { count } else { 0 }
-        );
+        assert!(cycle.deferred.lock().unwrap().is_empty());
         assert!(!cycle.queue.snapshot().is_drained());
-        for (parent, child) in deleted.into_iter().filter(|_| predrain) {
+        for (parent, child) in deleted {
             willow_gc_write_barrier(
                 parent,
                 child,
@@ -3782,24 +3924,32 @@ fn satb_deferred_legacy_and_retry_slice_complete_with_snapshot_retention() {
             }
         }
         let calls = BUDGET_RETRY_CALLS.load(Ordering::Relaxed);
-        assert_eq!(calls, if predrain { 3 * count } else { 0 });
+        assert_eq!(calls == 0, !predrain);
         let mut waits = 0;
         if predrain {
             assert!(
                 mark_closure::finish_with_wait(&cycle, Instant::now(), |_| waits += 1).is_none()
             );
         }
-        assert_eq!(waits, 0);
-        assert!(!cycle.stopped_completion_required.load(Ordering::Acquire));
+        assert_eq!(
+            waits,
+            if predrain {
+                mark_closure::MAX_DRAIN_WAVES - 1
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            cycle.stopped_completion_required.load(Ordering::Acquire),
+            predrain
+        );
         assert!(!cycle.worker_failed.load(Ordering::Acquire));
-        let (work, plan, _) = mark_closure::finish_stopped(&cycle, Instant::now());
-        assert!(plan.is_none());
+        BUDGET_RETRY_LIMIT.store(0, Ordering::Relaxed);
+        let (work, plan, freed) = mark_closure::finish_stopped(&cycle, Instant::now());
+        assert_eq!(freed, 0);
+        sweep::concurrent(plan.expect("recovery publishes a sweep plan"));
         let stopped_calls = BUDGET_RETRY_CALLS.load(Ordering::Relaxed);
-        if predrain {
-            assert_eq!(stopped_calls, calls);
-        } else {
-            assert!(stopped_calls <= 256);
-        }
+        assert!(stopped_calls >= calls + count);
         assert_eq!(work.marked_bytes, (6 * count * (GC_HEADER_SIZE + 8)) as u64);
         assert_eq!(
             willow_gc_allocated_bytes(),
@@ -3809,15 +3959,14 @@ fn satb_deferred_legacy_and_retry_slice_complete_with_snapshot_retention() {
             crate::gc_telemetry::stops::snapshot_stops().by_reason[1].requests,
             if predrain { 1 } else { 0 }
         );
-        assert_eq!(
-            crate::gc_telemetry::stops::snapshot_stops().by_reason[3].requests,
-            1
-        );
+        let recovery = crate::gc_telemetry::stops::snapshot_stops().by_reason[3];
+        assert!(recovery.requests >= 1);
+        assert_eq!(recovery.work.swept_objects, 0);
         assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         println!(
-            "mixed_legacy_retry graphs={count} predrain={predrain} retry_calls={calls} stopped_calls={stopped_calls} snapshot_retained_then_reclaimed=true"
+            "mixed_bounded_retry graphs={count} predrain={predrain} retry_calls={calls} stopped_calls={stopped_calls} snapshot_retained_then_reclaimed=true"
         );
     }
     BUDGET_RETRY_LIMIT.store(0, Ordering::Relaxed);
@@ -3876,25 +4025,28 @@ static ENGINE_READER_ENTERED: AtomicBool = AtomicBool::new(false);
 static ENGINE_MUTATORS_DONE: AtomicUsize = AtomicUsize::new(0);
 static ENGINE_MUTATORS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
 
-unsafe fn await_engine_mutators(payload: *mut u8, children: &mut Vec<*mut u8>) {
-    assert!(
-        std::thread::current()
-            .name()
-            .unwrap()
-            .starts_with("willow-gc-mark-")
-    );
-    ENGINE_READER_ENTERED.store(true, Ordering::Release);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while ENGINE_MUTATORS_DONE.load(Ordering::Acquire)
+unsafe fn await_engine_mutators(
+    payload: *mut u8,
+    _: usize,
+    _: usize,
+    children: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    if !ENGINE_READER_ENTERED.load(Ordering::Acquire) {
+        assert!(
+            std::thread::current()
+                .name()
+                .unwrap()
+                .starts_with("willow-gc-mark-")
+        );
+        ENGINE_READER_ENTERED.store(true, Ordering::Release);
+    }
+    if ENGINE_MUTATORS_DONE.load(Ordering::Acquire)
         != ENGINE_MUTATORS_EXPECTED.load(Ordering::Relaxed)
     {
-        assert!(
-            Instant::now() < deadline,
-            "mutators did not progress during background scan"
-        );
-        std::thread::yield_now();
+        return TraceSliceProgress::Retry;
     }
     children.push(unsafe { load_gc_reference(payload.cast()) });
+    TraceSliceProgress::Done
 }
 
 #[test]
@@ -3906,9 +4058,9 @@ fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations(
         ENGINE_MUTATORS_DONE.store(0, Ordering::Relaxed);
         ENGINE_MUTATORS_EXPECTED.store(count, Ordering::Relaxed);
         const TYPE: u32 = 0xFA99;
-        willow_register_type(TYPE, trace_slot);
+        register_slot_type(TYPE);
         runtime()
-            .concurrent_trace_registry
+            .concurrent_slice_registry
             .lock()
             .unwrap()
             .insert(TYPE, await_engine_mutators);
@@ -3919,12 +4071,14 @@ fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations(
         }
         let cycle = {
             let mut state = runtime().heap.lock().unwrap();
-            let cycle = Arc::new(ConcurrentCycle::with_index(
+            let mut cycle = ConcurrentCycle::with_index(
                 epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
                 IdSet::from_iter([TYPE]),
                 runtime().concurrent_trace_registry.lock().unwrap().clone(),
                 1,
-            ));
+            );
+            cycle.slices = runtime().concurrent_slice_registry.lock().unwrap().clone();
+            let cycle = Arc::new(cycle);
             marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
             GC_MARK_PHASE.store(1, Ordering::Release);
             cycle
@@ -3942,7 +4096,7 @@ fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations(
                     std::thread::yield_now();
                 }
                 // Mutation cannot invalidate the captured callback registry.
-                willow_register_type(TYPE, trace_slot);
+                register_slot_type(TYPE);
                 let new = willow_alloc(8) as usize;
                 assert!(
                     cycle.objects.retains_allocated(new),
@@ -4294,4 +4448,241 @@ fn m0_marker_slice_recovery_emits_without_panic_hook() {
         cycle.queue.end_epoch();
     }
     reset_internal_for_test();
+}
+
+/// Recovery bounds each stop independently of graph and heap size. Graph
+/// callbacks and exactly-once native cleanup execute only after resume.
+#[test]
+fn stage6_recovery_sweep_is_outside_stop() {
+    if std::env::var("WILLOW_STAGE6_RECOVERY_CHILD").as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gc::concurrent_tests::stage6_recovery_sweep_is_outside_stop",
+                "--nocapture",
+            ])
+            .env("WILLOW_STAGE6_RECOVERY_CHILD", "1")
+            .env("WILLOW_GC_REMARK_MAX_SLOTS", "1")
+            .env("WILLOW_GC_REMARK_MAX_BYTES", "1")
+            .env("WILLOW_GC_REMARK_MAX_WORK_NS", "1")
+            .output()
+            .unwrap();
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("stage6_recovery nodes=4096"));
+        return;
+    }
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    static DROPPED: std::sync::LazyLock<Mutex<HashSet<usize>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+    unsafe fn dropped(payload: *mut u8) {
+        assert!(!runtime().stop_requested.load(Ordering::Acquire));
+        assert!(DROPPED.lock().unwrap().insert(payload as usize));
+        DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+    let _guard = runtime_test_guard();
+    for count in [16, 256, 4096] {
+        reset_internal_for_test();
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        old_lab::OLD_LABS_FOR_TEST.store(true, Ordering::Release);
+        mark_closure::RECOVERY_SAMPLES.lock().unwrap().clear();
+        DROPS.store(0, Ordering::Relaxed);
+        DROPPED.lock().unwrap().clear();
+        const TYPE: u32 = 0xFA90;
+        register_slot_type(TYPE);
+        willow_register_drop(TYPE, dropped);
+        let mut root = std::ptr::null_mut();
+        willow_push_root(&mut root);
+        for _ in 0..count {
+            let next = willow_alloc_object(TYPE as i64, 8);
+            unsafe { store_gc_reference(next.cast(), root) };
+            root = next;
+        }
+        let before = willow_gc_allocated_bytes();
+        for index in 0..count {
+            willow_alloc_object(TYPE as i64, 8);
+            if index % 16 == 0 {
+                willow_alloc((GC_LARGE_OBJECT_THRESHOLD + 8) as i64);
+            }
+        }
+        // Start with an entirely undrained graph, so every chain edge is
+        // processed by recovery between stopped ownership/publication slices.
+        let (_, cycle) = root_handshake::begin().unwrap();
+        let (work, plan, _) = mark_closure::finish_stopped(&cycle, Instant::now());
+        sweep::concurrent(plan.unwrap());
+        assert_eq!(work.objects, count as u64);
+        assert_eq!(DROPS.load(Ordering::Relaxed), count);
+        let stops = crate::gc_telemetry::stops::snapshot_stops();
+        let recovery = &stops.by_reason[3];
+        assert_eq!(willow_gc_allocated_bytes(), before);
+        assert!(recovery.requests >= 1);
+        let samples = mark_closure::RECOVERY_SAMPLES.lock().unwrap();
+        assert_eq!(samples.len() as u64, recovery.requests);
+        for &[slots, bytes, regions, metadata] in samples.iter() {
+            assert!(slots <= mark_closure::RECOVERY_SLOTS);
+            assert!(bytes <= mark_closure::RECOVERY_BYTES);
+            assert!(regions <= mark_closure::RECOVERY_SLOTS);
+            assert!(metadata <= mark_closure::RECOVERY_SLOTS / 2);
+        }
+        assert!(samples.iter().map(|sample| sample[2]).sum::<u64>() >= (count / 16) as u64);
+        let max_slots = samples.iter().map(|s| s[0]).max().unwrap();
+        let max_bytes = samples.iter().map(|s| s[1]).max().unwrap();
+        let max_metadata = samples.iter().map(|s| s[3]).max().unwrap();
+        let published = samples.iter().map(|s| s[2]).sum::<u64>();
+        println!(
+            "stage6_bounds nodes={count} max_slots={max_slots} max_bytes={max_bytes} max_metadata={max_metadata} published_regions={published} stopped_callbacks=0 stopped_trace=0"
+        );
+        drop(samples);
+        assert_eq!(recovery.work.swept_objects, 0);
+        println!(
+            "stage6_recovery nodes={count} roots=1 configured_slots=1 configured_bytes=1 configured_work_ns=1 recovery_stops={} recovery_metadata_objects={} recovery_swept_objects={} recovery_stopped_ns={}",
+            recovery.requests,
+            recovery.work.metadata_objects,
+            recovery.work.swept_objects,
+            recovery.stopped.total_ns,
+        );
+        willow_pop_roots(1);
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        assert_eq!(DROPS.load(Ordering::Relaxed), 2 * count);
+        assert_eq!(
+            crate::gc_telemetry::stops::snapshot_stops().by_reason[3]
+                .work
+                .swept_objects,
+            0,
+        );
+    }
+    old_lab::OLD_LABS_FOR_TEST.store(false, Ordering::Release);
+    reset_internal_for_test();
+}
+
+#[test]
+fn bounded_cancellation_clears_partial_publication_without_touching_active_tlabs() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        state.threshold_bytes = usize::MAX;
+        state.pacer_trigger = u64::MAX;
+        state.pacer.disable_for_test();
+        state.nursery_threshold_bytes = usize::MAX;
+    }
+    let mut root = willow_alloc_typed(8, 1);
+    let child = willow_alloc(8);
+    unsafe { store_gc_reference(root.cast(), child) };
+    willow_push_root(&mut root);
+    let (_, cycle) = root_handshake::begin().unwrap();
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        for region in &mut state.old_regions {
+            region.sweep_pending = true;
+            region.sweep_quarantined = true;
+        }
+    }
+    let black = willow_alloc(8);
+    // Model a black header published from a cached pending-region LAB.
+    HeapObject::from_payload(GcPayload::from_raw(black).unwrap()).begin_trace();
+    assert!(HeapObject::from_payload(GcPayload::from_raw(black).unwrap()).marked());
+    let mut tls = tlab_state_for_test();
+    let generated = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+    assert!(!generated.is_null());
+    mark_closure::cancel(&cycle);
+    assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+    assert!(!HeapObject::from_payload(GcPayload::from_raw(black).unwrap()).marked());
+    {
+        let state = runtime().heap.lock().unwrap();
+        assert!(
+            state
+                .old_regions
+                .iter()
+                .all(|r| !r.sweep_pending && !r.sweep_quarantined)
+        );
+        assert!(
+            state
+                .tlab_chunks
+                .iter()
+                .any(|chunk| chunk.owner_state.is_some())
+        );
+    }
+    willow_gc_collect();
+    assert_eq!(unsafe { load_gc_reference(root.cast()) }, child);
+    willow_pop_root();
+    willow_gc_collect();
+    reset_internal_for_test();
+}
+
+#[test]
+fn native_retry_exhaustion_resolves_recovery_without_reclamation() {
+    const KEY: &str = "WILLOW_TEST_NATIVE_RETRY_EXHAUSTION";
+    if std::env::var_os(KEY).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gc::concurrent_tests::native_retry_exhaustion_resolves_recovery_without_reclamation", "--nocapture"])
+            .env(KEY, "1").output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(
+            stderr.contains(
+                "native trace Retry exhausted bounded recovery allowance; graph not reclaimed"
+            ),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("RETRY_LIMIT_REACHED attempts=128 waits=127 recovery_stops=1"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("UNSAFE_RECLAMATION"), "{stderr}");
+        assert!(!stderr.contains("RECOVERY_RETURNED"), "{stderr}");
+        return;
+    }
+    static RECOVERY: AtomicBool = AtomicBool::new(false);
+    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static WAITS: AtomicUsize = AtomicUsize::new(0);
+    unsafe fn retry(_: *mut u8, _: usize, _: usize, _: &mut Vec<*mut u8>) -> TraceSliceProgress {
+        assert!(!runtime().stop_requested.load(Ordering::Acquire));
+        if RECOVERY.load(Ordering::Acquire) {
+            let attempts = ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
+            assert!(attempts <= mark_closure::MAX_NATIVE_RECOVERY_RETRIES);
+            if attempts == mark_closure::MAX_NATIVE_RECOVERY_RETRIES {
+                let waits = WAITS.load(Ordering::Relaxed);
+                let stops = crate::gc_telemetry::stops::snapshot_stops().by_reason[3].requests;
+                assert_eq!(waits, attempts - 1);
+                assert_eq!(stops, 1);
+                eprintln!(
+                    "RETRY_LIMIT_REACHED attempts={attempts} waits={waits} recovery_stops={stops}"
+                );
+            }
+        }
+        TraceSliceProgress::Retry
+    }
+    unsafe fn drop_probe(_: *mut u8) {
+        eprintln!("UNSAFE_RECLAMATION");
+    }
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+    const TYPE: u32 = 0xFA98;
+    willow_register_type_capability(
+        TYPE,
+        trace_slot,
+        NativeTraceCapability::SliceConcurrentSafe(retry),
+    );
+    willow_register_drop(TYPE, drop_probe);
+    let mut parent = willow_alloc_object(TYPE as i64, 8);
+    let child = willow_alloc_object(TYPE as i64, 8);
+    unsafe { store_gc_reference(parent.cast(), child) };
+    willow_push_root(&mut parent);
+    willow_alloc_object(TYPE as i64, 8); // unreachable drop probe must not run either
+    let (_, cycle) = root_handshake::begin().unwrap();
+    assert!(mark_closure::finish_with_wait(&cycle, Instant::now(), |_| {}).is_none());
+    assert!(cycle.stopped_completion_required.load(Ordering::Acquire));
+    RECOVERY.store(true, Ordering::Release);
+    mark_closure::finish_recovery_with_wait(&cycle, Instant::now(), |_| {
+        assert!(!runtime().stop_requested.load(Ordering::Acquire));
+        WAITS.fetch_add(1, Ordering::Relaxed);
+    });
+    eprintln!("RECOVERY_RETURNED");
 }

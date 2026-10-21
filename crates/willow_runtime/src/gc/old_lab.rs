@@ -229,6 +229,7 @@ pub(super) fn refill_and_allocate(
         };
         let object = lab.bump(&mut inner, type_id, layout_id, gc_ref_mask, total, span);
         drop(inner);
+        state.old_lab_pending.insert(index);
         sync_record(state, index);
         object
     })
@@ -351,6 +352,9 @@ fn flush(state: &mut GcState, index: usize, deactivate: bool) {
     // Objects counted after sweep could otherwise be freed before their bytes
     // were added, underflowing `allocated_bytes`.
     sync_record(state, index);
+    if deactivate {
+        state.old_lab_pending.remove(index);
+    }
 }
 
 fn retire(state: &mut GcState, index: usize) {
@@ -392,8 +396,8 @@ fn retire_bounded_with_clock(
     work: &mut crate::gc_telemetry::stops::StopWorkV2,
     mut now: impl FnMut() -> u64,
 ) -> bool {
-    for index in 0..state.old_labs.len() {
-        if !budget.reserve(0, 0, now()) {
+    while let Some(index) = state.old_lab_pending.front() {
+        if !budget.reserve(1, 0, now()) {
             return false;
         }
         let complete = {
@@ -406,9 +410,11 @@ fn retire_bounded_with_clock(
             } = &mut *state;
             let mut inner = old_labs[index].lab.inner.lock().unwrap();
             if !inner.active && inner.pending_index == inner.pending.len() {
-                continue; // No capacity charge, retirement, or redundant sync.
+                drop(inner);
+                state.old_lab_pending.remove(index);
+                continue;
             }
-            if !budget.reserve(1, std::mem::size_of::<(usize, usize)>() as u64, now()) {
+            if !budget.reserve(0, std::mem::size_of::<(usize, usize)>() as u64, now()) {
                 return false;
             }
             inner.region = old_addresses.exact(inner.base).expect("live buffer region");
@@ -460,6 +466,7 @@ fn retire_bounded_with_clock(
         if !complete {
             return false;
         }
+        state.old_lab_pending.remove(index);
     }
     // Exited empty records are pruned by the existing post-resume sweep owner,
     // not an extra unchunked registry walk inside bounded normal remark.
@@ -498,7 +505,12 @@ fn prune(state: &mut GcState) {
     while index < state.old_labs.len() {
         if Arc::strong_count(&state.old_labs[index].lab) == 1 {
             retire(state, index);
+            let last = state.old_labs.len() - 1;
+            let moved_pending = state.old_lab_pending.remove(last);
             state.old_labs.swap_remove(index);
+            if index != last && moved_pending {
+                state.old_lab_pending.insert(index);
+            }
         } else {
             index += 1;
         }
@@ -512,6 +524,7 @@ pub(super) fn reset(state: &mut GcState) {
         retire(state, index);
     }
     state.old_labs.clear();
+    state.old_lab_pending = Default::default();
 }
 
 #[cfg(test)]

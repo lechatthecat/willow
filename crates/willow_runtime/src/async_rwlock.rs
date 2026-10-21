@@ -227,6 +227,21 @@ unsafe fn snapshot_async_rwlock(payload: *mut u8, children: &mut Vec<*mut u8>) {
     }
 }
 
+unsafe fn snapshot_async_rwlock_slice(
+    payload: *mut u8,
+    _cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> crate::gc::TraceSliceProgress {
+    assert!(
+        limit > 0,
+        "native trace slice requires positive work credit"
+    );
+    // One atomic reference load is the complete snapshot.
+    unsafe { snapshot_async_rwlock(payload, children) };
+    crate::gc::TraceSliceProgress::Done
+}
+
 unsafe fn trace_async_rwlock(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     let lock = unsafe { &*(payload as *const AsyncRwLock) };
     lock.validated_state();
@@ -256,7 +271,8 @@ const ASYNC_RWLOCK_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcT
     Some(trace_async_rwlock),
     Some(drop_async_rwlock),
 )
-.with_concurrent_trace(snapshot_async_rwlock)];
+.with_concurrent_trace(snapshot_async_rwlock)
+.with_concurrent_slice(snapshot_async_rwlock_slice)];
 
 fn ensure_async_rwlock_registered() {
     ASYNC_RWLOCK_REGISTRATION.ensure(ASYNC_RWLOCK_GC_TYPES);

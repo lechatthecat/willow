@@ -2369,6 +2369,8 @@ fn test_gc_foreign_thread_collect_skips_live_root_stack_owner() {
 fn test_gc_debug_validation_rejects_invalid_runtime_root_pointer() {
     let _guard = gc_test_guard();
     reset_gc();
+    let mut tls = tlab_state_for_test();
+    assert!(!willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0).is_null());
     willow_gc_add_runtime_root(std::ptr::dangling_mut::<u8>());
 
     let result = std::panic::catch_unwind(collect_internal);
@@ -3474,6 +3476,89 @@ const TYPE_MSG: u32 = 210; // enum: [tag: i64, data: i64|*mut u8]    (16 bytes)
 
 // テスト用 trace 関数 (naked unsafe fn → TraceFn として使用)
 
+// Test payloads are immutable while their bounded concurrent snapshots run.
+unsafe fn snapshot_test_range(
+    payload: *mut u8,
+    cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+    start: usize,
+    len: usize,
+) -> TraceSliceProgress {
+    let end = cursor.saturating_add(limit).min(len);
+    for index in cursor..end {
+        children.push(unsafe { load_gc_reference(payload.add((start + index) * 8).cast()) });
+    }
+    if end < len {
+        TraceSliceProgress::Continue(end)
+    } else {
+        TraceSliceProgress::Done
+    }
+}
+
+unsafe fn slice_node(
+    payload: *mut u8,
+    cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    unsafe { snapshot_test_range(payload, cursor, limit, children, 0, 1) }
+}
+
+unsafe fn slice_node2(
+    payload: *mut u8,
+    cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    unsafe { snapshot_test_range(payload, cursor, limit, children, 0, 2) }
+}
+
+unsafe fn slice_class(
+    payload: *mut u8,
+    cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    unsafe { snapshot_test_range(payload, cursor, limit, children, 1, 1) }
+}
+
+unsafe fn slice_array(
+    payload: *mut u8,
+    cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    unsafe {
+        snapshot_test_range(
+            payload,
+            cursor,
+            limit,
+            children,
+            1,
+            *payload.cast::<i64>() as usize,
+        )
+    }
+}
+
+unsafe fn slice_msg(
+    payload: *mut u8,
+    cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    unsafe {
+        snapshot_test_range(
+            payload,
+            cursor,
+            limit,
+            children,
+            1,
+            usize::from(*payload.cast::<i64>() == 0),
+        )
+    }
+}
+
 unsafe fn trace_node(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     // payload[0..8] = child pointer
     slots.push(payload.cast::<*mut u8>());
@@ -3515,7 +3600,11 @@ unsafe fn trace_msg(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
 fn test_gc_typeinfo_root_child_survives() {
     let _guard = gc_test_guard();
     reset_gc();
-    willow_register_type(TYPE_NODE, trace_node);
+    willow_register_type_capability(
+        TYPE_NODE,
+        trace_node,
+        NativeTraceCapability::SliceConcurrentSafe(slice_node),
+    );
 
     let child = willow_alloc_object(TYPE_LEAF as i64, 8);
     let parent = willow_alloc_object(TYPE_NODE as i64, 8);
@@ -3546,7 +3635,11 @@ fn test_gc_typeinfo_root_child_survives() {
 fn test_gc_typeinfo_root_child_grandchild_survives() {
     let _guard = gc_test_guard();
     reset_gc();
-    willow_register_type(TYPE_NODE, trace_node);
+    willow_register_type_capability(
+        TYPE_NODE,
+        trace_node,
+        NativeTraceCapability::SliceConcurrentSafe(slice_node),
+    );
 
     let grandchild = willow_alloc_object(TYPE_LEAF as i64, 8);
     let child = willow_alloc_object(TYPE_NODE as i64, 8);
@@ -3581,7 +3674,11 @@ fn test_gc_typeinfo_root_child_grandchild_survives() {
 fn test_gc_typeinfo_rootless_cycle_collected() {
     let _guard = gc_test_guard();
     reset_gc();
-    willow_register_type(TYPE_NODE, trace_node);
+    willow_register_type_capability(
+        TYPE_NODE,
+        trace_node,
+        NativeTraceCapability::SliceConcurrentSafe(slice_node),
+    );
 
     let a = willow_alloc_object(TYPE_NODE as i64, 8);
     let b = willow_alloc_object(TYPE_NODE as i64, 8);
@@ -3606,7 +3703,11 @@ fn test_gc_typeinfo_rootless_cycle_collected() {
 fn test_gc_typeinfo_rooted_cycle_survives() {
     let _guard = gc_test_guard();
     reset_gc();
-    willow_register_type(TYPE_NODE, trace_node);
+    willow_register_type_capability(
+        TYPE_NODE,
+        trace_node,
+        NativeTraceCapability::SliceConcurrentSafe(slice_node),
+    );
 
     let a = willow_alloc_object(TYPE_NODE as i64, 8);
     let b = willow_alloc_object(TYPE_NODE as i64, 8);
@@ -3638,7 +3739,11 @@ fn test_gc_typeinfo_rooted_cycle_survives() {
 fn test_gc_typeinfo_class_field_traced() {
     let _guard = gc_test_guard();
     reset_gc();
-    willow_register_type(TYPE_CLASS, trace_class);
+    willow_register_type_capability(
+        TYPE_CLASS,
+        trace_class,
+        NativeTraceCapability::SliceConcurrentSafe(slice_class),
+    );
 
     let field_obj = willow_alloc_object(TYPE_LEAF as i64, 8);
     // payload: [i64_field: 8, gc_ptr: 8] = 16 bytes
@@ -3671,7 +3776,11 @@ fn test_gc_typeinfo_class_field_traced() {
 fn test_gc_typeinfo_two_children_traced() {
     let _guard = gc_test_guard();
     reset_gc();
-    willow_register_type(TYPE_NODE2, trace_node2);
+    willow_register_type_capability(
+        TYPE_NODE2,
+        trace_node2,
+        NativeTraceCapability::SliceConcurrentSafe(slice_node2),
+    );
 
     let child0 = willow_alloc_object(TYPE_LEAF as i64, 8);
     let child1 = willow_alloc_object(TYPE_LEAF as i64, 8);
@@ -3705,7 +3814,11 @@ fn test_gc_typeinfo_two_children_traced() {
 fn test_gc_typeinfo_array_elements_traced() {
     let _guard = gc_test_guard();
     reset_gc();
-    willow_register_type(TYPE_ARRAY, trace_array);
+    willow_register_type_capability(
+        TYPE_ARRAY,
+        trace_array,
+        NativeTraceCapability::SliceConcurrentSafe(slice_array),
+    );
 
     const N: usize = 4;
     // Stable slots keep earlier elements alive during later allocations.
@@ -3751,7 +3864,11 @@ fn test_gc_typeinfo_array_elements_traced() {
 fn test_gc_typeinfo_enum_text_variant_traced() {
     let _guard = gc_test_guard();
     reset_gc();
-    willow_register_type(TYPE_MSG, trace_msg);
+    willow_register_type_capability(
+        TYPE_MSG,
+        trace_msg,
+        NativeTraceCapability::SliceConcurrentSafe(slice_msg),
+    );
 
     let text_obj = willow_alloc_object(TYPE_LEAF as i64, 8);
     // payload: [tag=0: i64, ptr: *mut u8] = 16 bytes
@@ -3784,7 +3901,11 @@ fn test_gc_typeinfo_enum_text_variant_traced() {
 fn test_gc_typeinfo_enum_number_variant_not_traced() {
     let _guard = gc_test_guard();
     reset_gc();
-    willow_register_type(TYPE_MSG, trace_msg);
+    willow_register_type_capability(
+        TYPE_MSG,
+        trace_msg,
+        NativeTraceCapability::SliceConcurrentSafe(slice_msg),
+    );
 
     // payload: [tag=1: i64, data=12345: i64] = 16 bytes
     let msg = willow_alloc_object(TYPE_MSG as i64, 16);
@@ -3817,7 +3938,11 @@ fn test_gc_typeinfo_enum_number_variant_not_traced() {
 fn test_gc_typeinfo_unrooted_parent_child_both_collected() {
     let _guard = gc_test_guard();
     reset_gc();
-    willow_register_type(TYPE_NODE, trace_node);
+    willow_register_type_capability(
+        TYPE_NODE,
+        trace_node,
+        NativeTraceCapability::SliceConcurrentSafe(slice_node),
+    );
 
     let child = willow_alloc_object(TYPE_LEAF as i64, 8);
     let parent = willow_alloc_object(TYPE_NODE as i64, 8);

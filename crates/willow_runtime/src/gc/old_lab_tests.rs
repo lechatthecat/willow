@@ -544,3 +544,143 @@ fn cumulative_allocation_bytes_merge_old_lab_without_indexing() {
     }
     reset_internal_for_test();
 }
+
+#[test]
+fn bounded_retirement_registry_resume_scales_without_prefix_visits() {
+    let _guard = runtime_test_guard();
+    let _labs = LabsOn::new();
+    for count in [1, 16, 257] {
+        reset_internal_for_test();
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        let owners: Vec<_> = (0..count)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let object = willow_alloc(8) as usize;
+                    (object, LOCAL.with(Arc::clone))
+                })
+                .join()
+                .unwrap()
+            })
+            .collect();
+        let mut state = runtime().heap.lock().unwrap();
+        let mut work = crate::gc_telemetry::stops::StopWorkV2::default();
+        let checks = std::cell::Cell::new(0);
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            assert!(rounds <= count + 1);
+            let before = work.metadata_objects;
+            let done = retire_bounded_with_clock(
+                &mut state,
+                &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
+                &mut work,
+                || {
+                    checks.set(checks.get() + 1);
+                    0
+                },
+            );
+            assert!(work.metadata_objects - before <= 1);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(work.metadata_objects, count as u64);
+        assert!(checks.get() <= 4 * count + 1);
+        for &(object, _) in &owners {
+            assert!(indexed(&state, object as *mut u8));
+        }
+        println!(
+            "old_lab_registry owners={count} rounds={rounds} metadata_objects={} budget_checks={}",
+            work.metadata_objects,
+            checks.get()
+        );
+        drop(state);
+        drop(owners);
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn bounded_retirement_fifo_keeps_refilled_prefix_behind_pending_owner() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let _labs = LabsOn::new();
+    runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+    let first = willow_alloc(8);
+    let (second, owner) = std::thread::spawn(|| (willow_alloc(8) as usize, LOCAL.with(Arc::clone)))
+        .join()
+        .unwrap();
+    let mut work = crate::gc_telemetry::stops::StopWorkV2::default();
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        assert!(!retire_bounded_with_clock(
+            &mut state,
+            &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
+            &mut work,
+            || 0
+        ));
+        assert!(indexed(&state, first));
+        assert!(!indexed(&state, second as *mut u8));
+    }
+    let third = willow_alloc(8); // Reactivates record zero, behind record one.
+    let mut state = runtime().heap.lock().unwrap();
+    assert!(!retire_bounded_with_clock(
+        &mut state,
+        &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
+        &mut work,
+        || 0
+    ));
+    assert!(indexed(&state, second as *mut u8));
+    assert!(!indexed(&state, third));
+    drop(owner);
+    // Prune the completed peer while another owner remains pending.
+    prune(&mut state);
+    assert!(retire_bounded_with_clock(
+        &mut state,
+        &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
+        &mut work,
+        || 0
+    ));
+    assert!(indexed(&state, third));
+    assert_eq!(work.metadata_objects, 3);
+    drop(state);
+    reset_internal_for_test();
+}
+
+#[test]
+fn bounded_retirement_pending_key_follows_pruned_record_swap() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let _labs = LabsOn::new();
+    runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+    let owner = std::thread::spawn(|| {
+        willow_alloc(8);
+        LOCAL.with(Arc::clone)
+    })
+    .join()
+    .unwrap();
+    let local = willow_alloc(8);
+    let mut state = runtime().heap.lock().unwrap();
+    let mut work = crate::gc_telemetry::stops::StopWorkV2::default();
+    assert!(!retire_bounded_with_clock(
+        &mut state,
+        &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
+        &mut work,
+        || 0
+    ));
+    assert_eq!(state.old_lab_pending.front(), Some(1));
+    drop(owner);
+    prune(&mut state);
+    assert_eq!(state.old_labs.len(), 1);
+    assert_eq!(state.old_lab_pending.front(), Some(0));
+    assert!(retire_bounded_with_clock(
+        &mut state,
+        &mut old_cycle::RemarkBudget::new(3, 1024, 10, 0),
+        &mut work,
+        || 0
+    ));
+    assert!(indexed(&state, local));
+    assert_eq!(work.metadata_objects, 2);
+    drop(state);
+    reset_internal_for_test();
+}

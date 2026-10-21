@@ -575,3 +575,64 @@ fn overlap_minor_inline_credit_publishes_old_descendants() {
     }
     reset_internal_for_test();
 }
+
+#[test]
+fn overlap_native_recovery_retry_history_follows_minor_relocation() {
+    static RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    unsafe fn stopped(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+        slots.push(payload.cast());
+    }
+    unsafe fn slice(
+        payload: *mut u8,
+        _: usize,
+        _: usize,
+        children: &mut Vec<*mut u8>,
+    ) -> TraceSliceProgress {
+        if RELEASE.load(Ordering::Acquire) {
+            children.push(unsafe { load_gc_reference(payload.cast()) });
+            TraceSliceProgress::Done
+        } else {
+            TraceSliceProgress::Retry
+        }
+    }
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    RELEASE.store(false, Ordering::Release);
+    const TYPE: u32 = 0xFA97;
+    willow_register_type_capability(
+        TYPE,
+        stopped,
+        NativeTraceCapability::SliceConcurrentSafe(slice),
+    );
+    let mut tls = tlab_state_for_test();
+    let mut root = willow_gc_alloc_slow(&mut tls, 0, TYPE as i64, 8, 0);
+    let child = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+    unsafe { store_gc_reference(root.cast(), child) };
+    let slot = (&mut root as *mut *mut u8).cast();
+    runtime().runtime_root_slots.add(slot);
+    let (_, cycle) = root_handshake::begin().unwrap();
+    cycle.recovering.store(true, Ordering::Release);
+    cycle.drain_checked(1);
+    assert_eq!(cycle.recovery_native_retry_count(root as usize), 1);
+    for expected in [2, 3] {
+        let before = root as usize;
+        collect_owned();
+        assert_ne!(root as usize, before);
+        assert_eq!(cycle.recovery_native_retry_count(before), 0);
+        assert_eq!(
+            cycle.recovery_native_retry_count(root as usize),
+            expected - 1
+        );
+        cycle.drain_checked(1);
+        assert_eq!(cycle.recovery_native_retry_count(root as usize), expected);
+    }
+    RELEASE.store(true, Ordering::Release);
+    let (_, plan, _) = mark_closure::finish_stopped(&cycle, std::time::Instant::now());
+    sweep::concurrent(plan.unwrap());
+    assert_eq!(cycle.recovery_native_retry_count(root as usize), 0);
+    assert!(!unsafe { load_gc_reference(root.cast()) }.is_null());
+    runtime().runtime_root_slots.remove(slot);
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_internal_for_test();
+}

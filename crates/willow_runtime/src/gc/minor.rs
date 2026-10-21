@@ -819,6 +819,7 @@ impl<'a> MinorCollector<'a> {
                 already_queued.insert(address);
                 crate::gc_mark_queue::ObjectRef::from_addr(address)
             });
+            cycle.remap_recovery_native_retries(remap);
             let mut deferred = cycle.deferred.lock().unwrap();
             *deferred = deferred.iter().copied().filter_map(&remap).collect();
             let mut unindexed = cycle.unindexed.lock().unwrap();

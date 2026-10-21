@@ -178,6 +178,20 @@ impl RemarkBudget {
         }
     }
 
+    /// Maximum divisible entries that fit the remaining work dimensions.
+    /// Admission still checks the clock through reserve before publication.
+    pub(super) fn entry_capacity(&self, maximum: usize, bytes_per_entry: u64) -> usize {
+        assert!(bytes_per_entry > 0);
+        (maximum as u64)
+            .min(self.max_slots - self.slots)
+            .min((self.max_bytes - self.bytes) / bytes_per_entry) as usize
+    }
+
+    #[cfg(test)]
+    pub(super) fn counts(&self) -> [u64; 3] {
+        [self.slots, self.bytes, self.regions]
+    }
+
     pub(super) fn record_region_publication(&mut self) {
         self.regions += 1;
     }
@@ -324,10 +338,14 @@ mod integration_tests {
             assert_eq!(stops.by_reason[1].work.swept_objects, 0);
             assert!(stops.by_reason[1].requests <= 2);
             if mib == 1024 {
-                assert_eq!(
-                    stops.by_reason[3].requests, 1,
-                    "default slots require classified Recovery within the third round"
+                assert!(
+                    stops.by_reason[3].requests >= 1,
+                    "region publication must continue in classified bounded Recovery slices"
                 );
+                for sample in mark_closure::RECOVERY_SAMPLES.lock().unwrap().iter() {
+                    assert!(sample[0] <= mark_closure::RECOVERY_SLOTS);
+                    assert!(sample[1] <= mark_closure::RECOVERY_BYTES);
+                }
             } else {
                 assert_eq!(
                     stops.by_reason[3].requests, 0,
@@ -556,7 +574,8 @@ mod integration_tests {
                 .iter()
                 .any(BumpChunk::needs_index)
         );
-        mark_closure::finish_stopped(&cycle, std::time::Instant::now());
+        let (_, plan, _) = mark_closure::finish_stopped(&cycle, std::time::Instant::now());
+        sweep::concurrent(plan.expect("recovery publishes a sweep plan"));
         willow_pop_roots(1);
         reset_internal_for_test();
     }

@@ -65,6 +65,7 @@ mod nursery;
 mod old_cycle;
 mod old_lab;
 mod pacer;
+mod pending_registry;
 mod region_candidates;
 mod root_handshake;
 mod runtime_roots;
@@ -300,6 +301,7 @@ struct GcState {
     old_reserved_bytes: usize,
     /// Per-thread old allocation buffers used by runtime-side allocation.
     old_labs: Vec<old_lab::OldLabRecord>,
+    old_lab_pending: pending_registry::Pending<usize>,
     /// Generated TLS states observed on allocation slow paths.
     tlab_states: HashMap<usize, TlabStateRecord>,
     tlab_owners: HashMap<ThreadId, HashSet<usize>>,
@@ -725,6 +727,7 @@ impl Default for GcState {
             old_region_candidates: region_candidates::RegionCandidates::default(),
             old_reserved_bytes: 0,
             old_labs: Vec::new(),
+            old_lab_pending: Default::default(),
             tlab_states: HashMap::new(),
             tlab_owners: HashMap::new(),
             allocated_bytes: 0,
@@ -1924,9 +1927,16 @@ fn try_collect_internal() -> bool {
             {
                 pool.run(&marking, budget);
             } else {
-                // Disabled/unavailable background workers use the stopped
-                // graph tracer. Never silently substitute unregistered readers.
-                marking.worker_failed.store(true, Ordering::Release);
+                // The elected collector is a registered, slotless queue reader.
+                // Missing background workers must not force unrestricted STW work.
+                if old_cycle::concurrent_enabled() {
+                    marking.drain_checked_until(
+                        256,
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(1)),
+                    );
+                } else {
+                    marking.worker_failed.store(true, Ordering::Release);
+                }
             }
         }
         minor::service_pending();
@@ -1995,6 +2005,10 @@ fn try_collect_internal() -> bool {
     let (heap_after, freed, work, pause_ns) = match result {
         Ok(result) => result,
         Err(payload) => {
+            if old_cycle::concurrent_enabled() {
+                mark_closure::cancel(&marking);
+                std::panic::resume_unwind(payload);
+            }
             // Failure leaves the graph allocated. Remove transient marks under
             // another stop so the next collection can safely retry.
             with_stw(

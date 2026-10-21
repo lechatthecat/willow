@@ -46,6 +46,9 @@ pub(super) struct ConcurrentCycle {
     pub(super) slices: IdMap<u32, ConcurrentTraceSliceFn>,
     pub(super) worker_failed: std::sync::atomic::AtomicBool,
     pub(super) stopped_completion_required: std::sync::atomic::AtomicBool,
+    pub(super) recovering: std::sync::atomic::AtomicBool,
+    pub(super) recovery_retry_generation: AtomicU64,
+    recovery_native_retries: Mutex<IdMap<usize, (usize, usize)>>,
     pub(super) closing: std::sync::atomic::AtomicBool,
     pub(super) tracing_enabled: std::sync::atomic::AtomicBool,
     pub(super) active_drains: AtomicUsize,
@@ -272,6 +275,9 @@ impl ConcurrentCycle {
             objects,
             worker_failed: std::sync::atomic::AtomicBool::new(false),
             stopped_completion_required: std::sync::atomic::AtomicBool::new(false),
+            recovering: std::sync::atomic::AtomicBool::new(false),
+            recovery_retry_generation: AtomicU64::new(0),
+            recovery_native_retries: Mutex::new(IdMap::default()),
             closing: std::sync::atomic::AtomicBool::new(false),
             tracing_enabled: std::sync::atomic::AtomicBool::new(true),
             active_drains: AtomicUsize::new(0),
@@ -399,13 +405,10 @@ impl ConcurrentCycle {
         // active drain prevents minor relocation or sweep reclamation.
         let metadata = metadata.unwrap_or_else(|| unsafe { self.objects.claimed_metadata(value) });
         if self.legacy_traces.contains(&metadata.type_id)
-            && trace_mode(
-                self.traces.contains_key(&metadata.type_id),
-                self.slices.contains_key(&metadata.type_id),
-            ) == TraceMode::StopOnly
+            && !self.slices.contains_key(&metadata.type_id)
         {
-            // Legacy extension callbacks expose mutable slots with an STW-only
-            // contract. Preserve that contract instead of racing their payloads.
+            // Never invoke an unrestricted callback in a concurrent epoch.
+            // Completion rejects the unsupported live type before reclamation.
             batch.native_counts.deferred(metadata.type_id);
             batch.deferred.push(value);
             return;
@@ -561,6 +564,25 @@ impl ConcurrentCycle {
             .expect("bitmap continuation belongs to active cycle");
     }
 
+    #[cfg(test)]
+    pub(super) fn recovery_native_retry_count(&self, address: usize) -> usize {
+        self.recovery_native_retries
+            .lock()
+            .unwrap()
+            .get(&address)
+            .map_or(0, |entry| entry.1)
+    }
+
+    /// Minor owns all readers and transports pending continuations before source
+    /// reclamation. Move retry history with them: relocation is not progress.
+    pub(super) fn remap_recovery_native_retries(&self, remap: impl Fn(usize) -> Option<usize>) {
+        let mut retries = self.recovery_native_retries.lock().unwrap();
+        *retries = std::mem::take(&mut *retries)
+            .into_iter()
+            .filter_map(|(address, history)| remap(address).map(|target| (target, history)))
+            .collect();
+    }
+
     pub(super) fn snapshot_native_slice(
         &self,
         value: usize,
@@ -576,10 +598,32 @@ impl ConcurrentCycle {
         let next = unsafe { trace(value as *mut u8, offset, MAX_SLOTS, children) };
         let slots = children.len() - before;
         assert!(slots <= MAX_SLOTS, "native trace exceeded its slot budget");
+        if self.recovering.load(Ordering::Acquire) {
+            let mut retries = self.recovery_native_retries.lock().unwrap();
+            if matches!(next, TraceSliceProgress::Retry) {
+                let entry = retries.entry(value).or_insert((offset, 0));
+                assert_eq!(entry.0, offset, "retry cursor changed without progress");
+                entry.1 += 1;
+                if entry.1 >= super::mark_closure::MAX_NATIVE_RECOVERY_RETRIES {
+                    drop(retries);
+                    crate::failure::fatal_invariant(
+                        "native trace Retry exhausted bounded recovery allowance; graph not reclaimed",
+                    );
+                }
+                self.recovery_retry_generation
+                    .fetch_add(1, Ordering::Release);
+            } else {
+                retries.remove(&value);
+            }
+        }
         match next {
             TraceSliceProgress::Done => {}
             TraceSliceProgress::Continue(next) => {
                 assert!(next > offset, "native trace did not advance its cursor");
+                assert!(
+                    next - offset <= MAX_SLOTS,
+                    "native trace exceeded its cursor budget"
+                );
                 self.enqueue_trace_slice(value, next);
             }
             TraceSliceProgress::Retry => {
@@ -794,7 +838,16 @@ impl ConcurrentCycle {
         // Drop before native/bitmap work, callbacks, or returning to a safepoint.
         // Declared after `batch`, so it drops before active_drains is released.
         let mut inline_reader: Option<epoch_index::EpochReader<'_>> = None;
+        let retry_generation = self.recovery_retry_generation.load(Ordering::Acquire);
         while scanned < limit {
+            // Recovery owns retry pacing. Mutator assists/background consumers
+            // relinquish work so they cannot consume the allowance while the
+            // collector is giving a contended owner time to run.
+            if self.recovering.load(Ordering::Acquire)
+                && std::thread::current().id() != self.collector
+            {
+                break;
+            }
             // Always permit one work item, even after descheduling at entry.
             if scanned != 0 && (expired() || minor::requested()) {
                 break;
@@ -905,6 +958,11 @@ impl ConcurrentCycle {
             batch.publish_branches();
             if batch.local_child.is_none() {
                 worker.complete_current();
+            }
+            if self.recovery_retry_generation.load(Ordering::Acquire) != retry_generation {
+                // Preserve batching for successful graph work, but return to
+                // resumed recovery pacing before consuming a Retry continuation.
+                break;
             }
         }
         // Retain the original queue claim while following inline descendants.

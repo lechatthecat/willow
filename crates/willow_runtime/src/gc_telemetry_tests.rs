@@ -197,7 +197,20 @@ fn registered_trace_callbacks_contribute_reference_scan_bytes() {
     unsafe fn trace(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
         slots.push(payload.cast());
     }
-    willow_register_type(901, trace);
+    unsafe fn slice(
+        payload: *mut u8,
+        _: usize,
+        _: usize,
+        children: &mut Vec<*mut u8>,
+    ) -> TraceSliceProgress {
+        children.push(unsafe { load_gc_reference(payload.cast()) });
+        TraceSliceProgress::Done
+    }
+    willow_register_type_capability(
+        901,
+        trace,
+        NativeTraceCapability::SliceConcurrentSafe(slice),
+    );
     let mut parent = willow_alloc_object(901, 8);
     willow_push_root(&mut parent);
     let child = willow_alloc(8);

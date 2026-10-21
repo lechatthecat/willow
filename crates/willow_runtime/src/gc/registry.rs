@@ -85,7 +85,8 @@ pub type TraceFn = unsafe fn(payload: *mut u8, slots: &mut Vec<*mut *mut u8>);
 /// Snapshot child VALUES while holding any required container locks. Unlike
 /// TraceFn this callback must be safe while mutators run; exported slots cannot
 /// outlive a lock guard. It must not allocate GC memory or reach a safepoint.
-/// Objects without this hook are traced during remark.
+/// Legacy compatibility hook for collectors without concurrent old generation.
+/// Concurrent old-generation collection requires `ConcurrentTraceSliceFn`.
 pub type ConcurrentTraceFn = unsafe fn(payload: *mut u8, children: &mut Vec<*mut u8>);
 
 /// Bounded concurrent snapshot. Append at most `limit` child values and return
@@ -95,6 +96,17 @@ pub type ConcurrentTraceFn = unsafe fn(payload: *mut u8, children: &mut Vec<*mut
 /// a mutable hash iterator or skipping a changing prefix is not. The callback
 /// must bound all work (including empty slots) and may not allocate GC memory,
 /// safepoint, retain a lock across calls or return mutable slot addresses.
+/// `limit` is positive; Continue must advance by at most `limit` inspected
+/// positions. Retry must append nothing. Every callback invocation, including
+/// its synchronization, must complete with bounded work: use try-lock, never
+/// wait for a mutator. A panic or invalid progress is a fatal contract violation;
+/// the collector must never retry the object through an unrestricted hook.
+/// These unsafe native callbacks are trusted to honor the work bound; the
+/// collector additionally checks returned progress and child counts.
+/// Recovery rejects the 128th consecutive Retry for the same object/cursor.
+/// Successful progress resets that cursor's allowance. Retry must therefore be
+/// transient; an indefinitely contended or non-progressing callback is fatal
+/// before reclamation rather than eligible for unrestricted stopped tracing.
 pub type ConcurrentTraceSliceFn = unsafe fn(
     payload: *mut u8,
     cursor: usize,
