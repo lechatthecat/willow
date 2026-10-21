@@ -1378,6 +1378,43 @@ mod tests {
     }
 
     #[test]
+    fn result_lambda_context_records_scale_linearly() {
+        for count in [4usize, 16, 64] {
+            for nested in [false, true] {
+                let mut body = "return Result::Ok(x);".to_string();
+                for level in (0..count).rev() {
+                    let inner = if nested {
+                        body.as_str()
+                    } else {
+                        "return Result::Ok(x);"
+                    };
+                    let declaration = format!(
+                        "let f{level}: closure(i64) -> Result<i64, String> = |x| {{ {inner} }};"
+                    );
+                    body = if nested {
+                        format!("{declaration} return Result::Ok(f{level}(x)?);")
+                    } else {
+                        format!("{declaration} {body}")
+                    };
+                }
+                let source =
+                    format!("fn f(x: i64) -> Result<i64, String> {{ {body} }} fn main() {{}}");
+                let mut program = parse(&source);
+                let queries = queries(&mut program);
+                let mut checker = TypeChecker::new();
+                crate::register_prelude(&mut checker).unwrap();
+                checker.set_body_queries(Rc::clone(&queries));
+                checker.check_program(&program);
+                checker.finish_body_queries().unwrap();
+                assert_eq!(checker.inline_lambda_rechecks, 0);
+                assert_eq!(queries.stats().computations, count + 2);
+                assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                assert_eq!(checker.lambda_captures.len(), count);
+            }
+        }
+    }
+
+    #[test]
     fn lambda_body_records_scale_linearly_with_nesting_depth() {
         for depth in [4usize, 16, 64] {
             let mut body = "return x;".to_string();

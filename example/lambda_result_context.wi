@@ -1,0 +1,16 @@
+fn g(a: i64) -> Result<i64, String> { if a < 0 { return Err("bad"); } return Ok(a); }
+fn apply(f: closure(i64) -> Result<i64, String>, a: i64) -> Result<i64, String> {
+    return f(a);
+}
+fn main() {
+    let checked: closure(i64) -> Result<i64, String> = |a| Ok(g(a)?);
+    println(checked(42).unwrap());
+    println(checked(-1).is_err());
+    println(apply(|a| Err("expected"), 1).is_err());
+    let nested = |a: i64| {
+        let inner: closure(i64) -> Result<i64, String> = |b| { return Ok(g(b)?); };
+        println(inner(a).is_ok());
+        return a;
+    };
+    println(nested(7));
+}

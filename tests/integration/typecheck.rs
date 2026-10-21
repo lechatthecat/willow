@@ -26,3 +26,6 @@ mod variant_diagnostics;
 mod variants;
 #[path = "typecheck/wrapper_methods.rs"]
 mod wrapper_methods;
+
+#[path = "typecheck/lambda_result_context.rs"]
+mod lambda_result_context;

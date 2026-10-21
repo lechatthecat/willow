@@ -459,7 +459,13 @@ impl TypeChecker {
 
         // Save/restore outer return type so `return` stmts in the lambda body
         // are checked against the lambda's return type, not the enclosing function's.
-        let saved_ret_ty = self.local.current_return_type.clone();
+        let saved_ret_ty = std::mem::replace(
+            &mut self.local.current_return_type,
+            expected_ret.cloned().unwrap_or(Type::Void),
+        );
+        // Inference belongs to this callable too: an explicitly typed inner
+        // lambda must not feed its returns into an inferred outer lambda.
+        let saved_return_stack = std::mem::take(&mut self.local.lambda_return_stack);
         let saved_block_depth = self.local.lexical_block_depth;
         self.local.lexical_block_depth = 0;
 
@@ -473,7 +479,6 @@ impl TypeChecker {
             LambdaBody::Block(b) => {
                 if let Some(ann) = expected_ret {
                     // Annotation provided: validate return stmts against it.
-                    self.local.current_return_type = ann.clone();
                     for stmt in &b.stmts {
                         self.check_stmt(stmt);
                     }
@@ -520,6 +525,7 @@ impl TypeChecker {
         self.local.current_capture_declarations = saved_capture_declarations;
         self.local.lexical_block_depth = saved_block_depth;
         self.local.current_return_type = saved_ret_ty;
+        self.local.lambda_return_stack = saved_return_stack;
         self.symbols.pop_scope();
 
         let ret_ty = match &annotated_return {

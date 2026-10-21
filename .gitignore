@@ -129,3 +129,7 @@ AGENTS.md
 /docs/audits/willow-jz15.117/*
 !/docs/audits/willow-jz15.117/implementation-audit.md
 !/docs/audits/willow-jz15.117/reproduce.sh
+
+# Public lambda Result context audit and focused reproduction commands.
+!/docs/audits/willow-jz15.116.md
+!/docs/audits/willow-jz15.116-check.sh
