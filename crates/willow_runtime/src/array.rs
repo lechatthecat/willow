@@ -191,6 +191,15 @@ unsafe fn handle_buffer(arr: *mut u8) -> *mut u8 {
     unsafe { handle_word(arr, H_BUF) as *mut u8 }
 }
 
+/// Unchecked scalar slot for runtime-owned parallel chunks. The caller proves
+/// the index is in range, the array contains scalar words, and writes are
+/// exclusive to this index. Do not retain the pointer across a mapper call or
+/// any safepoint; reload the rooted handle first after such a call.
+#[inline]
+pub(crate) unsafe fn scalar_slot_unchecked(arr: *mut u8, index: i64) -> *mut i64 {
+    unsafe { buf_slot(handle_buffer(arr), index) }
+}
+
 /// Allocate an array of `len` elements (all zero). `elem_is_ref` marks
 /// GC-managed element types. Returns the handle, or aborts on a negative length.
 ///

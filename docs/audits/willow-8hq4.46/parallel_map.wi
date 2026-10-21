@@ -1,0 +1,30 @@
+import std::collections::Array;
+import std::parallel;
+
+fn mix(value: i64) -> i64 {
+    let mut x = value;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    return x & 65535;
+}
+
+async fn main() {
+    let mut values: Array<i64> = [];
+    let mut i = 0;
+    while i < 4000000 { values.push(i); i = i + 1; }
+    let frozen = values.freeze();
+    let mut result: Array<i64> = [];
+    await sleep(20);
+    println("@start work");
+    let mut round = 0;
+    while round < 5 {
+        result = await parallel::map(frozen, mix);
+        round = round + 1;
+    }
+    println("@end work");
+    let mut checksum = 0;
+    i = 0;
+    while i < result.len() { checksum = checksum + result[i]; i = i + 1; }
+    println(checksum);
+}

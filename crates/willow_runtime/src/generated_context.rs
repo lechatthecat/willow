@@ -271,6 +271,7 @@ pub(crate) unsafe extern "C" fn invoke(entry: *const (), frame: *mut c_void) -> 
 /// # Safety
 /// The callback must satisfy its own contract and must not unwind.
 #[inline]
+#[cfg(test)]
 pub(crate) unsafe fn invoke_i64(entry: unsafe extern "C" fn(i64) -> i64, value: i64) -> i64 {
     unsafe { invoke_word(entry as *const (), value as usize) as i64 }
 }
@@ -285,13 +286,57 @@ pub(crate) unsafe fn invoke_i64(entry: unsafe extern "C" fn(i64) -> i64, value: 
 /// one ABI word, and never unwind. Float/aggregate callbacks are not supported.
 #[inline(never)]
 unsafe extern "C" fn invoke_word(entry: *const (), argument: usize) -> usize {
-    let context = active();
-    unsafe { &*context }.refresh();
-    // Runtime callbacks must not leak a nested generated callee's name into
-    // their generated caller. The pointer is stable even if the callback migrates.
-    let state = unsafe { &*context };
-    state.bridge_depth.set(state.bridge_depth.get() + 1);
-    let helper = state.helper.load(Ordering::Relaxed);
+    let bridge = ScalarBridge::enter();
+    unsafe { call_word(entry, argument, bridge.context) }
+}
+
+/// One native poll may call many scalar mappers. Keep bridge ownership for
+/// that poll instead of registering/leaving generated execution per element.
+/// This must not outlive its running execution context or cross a poll return.
+pub(crate) struct ScalarBridge {
+    context: *const Context,
+    helper: *mut Helper,
+}
+
+impl ScalarBridge {
+    pub(crate) fn enter() -> Self {
+        let context = active();
+        let state = unsafe { &*context };
+        state.refresh();
+        state.bridge_depth.set(state.bridge_depth.get() + 1);
+        Self {
+            context,
+            helper: state.helper.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The mapper must obey the scalar generated C ABI and never unwind.
+    #[inline]
+    pub(crate) unsafe fn call(&self, entry: unsafe extern "C" fn(i64) -> i64, value: i64) -> i64 {
+        unsafe { call_word(entry as *const (), value as usize, self.context) as i64 }
+    }
+
+    #[inline]
+    pub(crate) fn panicked(&self) -> bool {
+        let depth = unsafe { &*self.context }
+            .panic_depth
+            .load(Ordering::Relaxed);
+        unsafe { &*depth }.load(Ordering::Relaxed) != 0
+    }
+}
+
+impl Drop for ScalarBridge {
+    fn drop(&mut self) {
+        // A nested generated callee must not leak its name into the caller.
+        let state = unsafe { &*self.context };
+        state.helper.store(self.helper, Ordering::Relaxed);
+        state.bridge_depth.set(state.bridge_depth.get() - 1);
+        crate::gc::leave_generated_roots();
+    }
+}
+
+#[inline]
+unsafe fn call_word(entry: *const (), argument: usize, context: *const Context) -> usize {
     let result: usize;
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     unsafe {
@@ -313,9 +358,6 @@ unsafe extern "C" fn invoke_word(entry: *const (), argument: usize) -> usize {
             in("x9") entry, inlateout("x0") argument => result,
             in("x21") context, clobber_abi("C"));
     }
-    unsafe { &*context }.helper.store(helper, Ordering::Relaxed);
-    state.bridge_depth.set(state.bridge_depth.get() - 1);
-    crate::gc::leave_generated_roots();
     result
 }
 
@@ -556,6 +598,31 @@ mod tests {
             );
             assert_eq!(context.helper(), Some(&b"scalar caller"[..]));
         }
+        let initial_depth = context.bridge_depth.get();
+        {
+            let bridge = ScalarBridge::enter();
+            assert_eq!(context.bridge_depth.get(), initial_depth + 1);
+            for value in [i64::MIN, i64::MAX, -4294967297, 4294967297, -1, 0, 1] {
+                assert_eq!(
+                    unsafe { bridge.call(scalar_echo_and_clear_helper, value) },
+                    value
+                );
+                assert!(!bridge.panicked());
+                assert_eq!(context.bridge_depth.get(), initial_depth + 1);
+            }
+            // Read the current context depth pointer, including replacements
+            // by nested panic contexts; do not cache its old pointee.
+            let depth = AtomicUsize::new(1);
+            let previous = context
+                .panic_depth
+                .swap((&raw const depth).cast_mut(), Ordering::Relaxed);
+            assert!(bridge.panicked());
+            depth.store(0, Ordering::Relaxed);
+            assert!(!bridge.panicked());
+            context.panic_depth.store(previous, Ordering::Relaxed);
+        }
+        assert_eq!(context.bridge_depth.get(), initial_depth);
+        assert_eq!(context.helper(), Some(&b"scalar caller"[..]));
         replace(old);
     }
 

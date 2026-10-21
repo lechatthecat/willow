@@ -1,0 +1,181 @@
+
+<audit-binary>:     file format elf64-x86-64
+
+
+Disassembly of section .init:
+
+Disassembly of section .plt:
+
+Disassembly of section .text:
+
+00000000004836c0 <willow_runtime::parallel::poll_chunk>:
+  4836c0:	55                   	push   %rbp
+  4836c1:	41 57                	push   %r15
+  4836c3:	41 56                	push   %r14
+  4836c5:	41 55                	push   %r13
+  4836c7:	41 54                	push   %r12
+  4836c9:	53                   	push   %rbx
+  4836ca:	48 83 ec 38          	sub    $0x38,%rsp
+  4836ce:	49 89 fc             	mov    %rdi,%r12
+  4836d1:	66 66 66 64 48 8b 04 	data16 data16 data16 mov %fs:0x0,%rax
+  4836d8:	25 00 00 00 00 
+  4836dd:	48 89 c1             	mov    %rax,%rcx
+  4836e0:	4c 8b a8 a0 fd ff ff 	mov    -0x260(%rax),%r13
+  4836e7:	4d 85 ed             	test   %r13,%r13
+  4836ea:	74 07                	je     4836f3 <willow_runtime::parallel::poll_chunk+0x33>
+  4836ec:	49 ff 85 f0 01 00 00 	incq   0x1f0(%r13)
+  4836f3:	4d 8b 74 24 38       	mov    0x38(%r12),%r14
+  4836f8:	4d 85 f6             	test   %r14,%r14
+  4836fb:	0f 84 ea 00 00 00    	je     4837eb <willow_runtime::parallel::poll_chunk+0x12b>
+  483701:	48 89 4c 24 10       	mov    %rcx,0x10(%rsp)
+  483706:	b8 00 00 01 00       	mov    $0x10000,%eax
+  48370b:	49 03 46 08          	add    0x8(%r14),%rax
+  48370f:	48 bd ff ff ff ff ff 	movabs $0x7fffffffffffffff,%rbp
+  483716:	ff ff 7f 
+  483719:	48 0f 41 e8          	cmovno %rax,%rbp
+  48371d:	49 8b 46 10          	mov    0x10(%r14),%rax
+  483721:	48 39 e8             	cmp    %rbp,%rax
+  483724:	48 0f 4c e8          	cmovl  %rax,%rbp
+  483728:	e8 33 2d fa ff       	call   426460 <willow_runtime::generated_context::ScalarBridge::enter>
+  48372d:	49 89 c7             	mov    %rax,%r15
+  483730:	49 8b 5e 08          	mov    0x8(%r14),%rbx
+  483734:	49 8b 46 10          	mov    0x10(%r14),%rax
+  483738:	48 89 44 24 28       	mov    %rax,0x28(%rsp)
+  48373d:	48 39 eb             	cmp    %rbp,%rbx
+  483740:	0f 8d b0 00 00 00    	jge    4837f6 <willow_runtime::parallel::poll_chunk+0x136>
+  483746:	48 89 54 24 08       	mov    %rdx,0x8(%rsp)
+  48374b:	4c 89 6c 24 18       	mov    %r13,0x18(%rsp)
+  483750:	4c 89 74 24 20       	mov    %r14,0x20(%rsp)
+  483755:	4d 8b 2e             	mov    (%r14),%r13
+  483758:	48 ff c3             	inc    %rbx
+  48375b:	48 89 6c 24 30       	mov    %rbp,0x30(%rsp)
+  483760:	49 89 ee             	mov    %rbp,%r14
+  483763:	49 f7 de             	neg    %r14
+  483766:	bd 40 00 00 00       	mov    $0x40,%ebp
+  48376b:	eb 17                	jmp    483784 <willow_runtime::parallel::poll_chunk+0xc4>
+  48376d:	0f 1f 00             	nopl   (%rax)
+  483770:	49 8d 04 1e          	lea    (%r14,%rbx,1),%rax
+  483774:	48 ff c0             	inc    %rax
+  483777:	48 ff c3             	inc    %rbx
+  48377a:	48 83 f8 01          	cmp    $0x1,%rax
+  48377e:	0f 84 cd 00 00 00    	je     483851 <willow_runtime::parallel::poll_chunk+0x191>
+  483784:	49 8b 44 24 28       	mov    0x28(%r12),%rax
+  483789:	48 8b 40 18          	mov    0x18(%rax),%rax
+  48378d:	48 8b 3c d8          	mov    (%rax,%rbx,8),%rdi
+  483791:	4c 89 e8             	mov    %r13,%rax
+  483794:	ff d0                	call   *%rax
+  483796:	49 8b 4f 10          	mov    0x10(%r15),%rcx
+  48379a:	48 8b 09             	mov    (%rcx),%rcx
+  48379d:	48 85 c9             	test   %rcx,%rcx
+  4837a0:	75 6f                	jne    483811 <willow_runtime::parallel::poll_chunk+0x151>
+  4837a2:	49 8b 4c 24 30       	mov    0x30(%r12),%rcx
+  4837a7:	48 8b 49 18          	mov    0x18(%rcx),%rcx
+  4837ab:	48 89 04 d9          	mov    %rax,(%rcx,%rbx,8)
+  4837af:	48 3b 5c 24 28       	cmp    0x28(%rsp),%rbx
+  4837b4:	0f 9c c0             	setl   %al
+  4837b7:	48 ff cd             	dec    %rbp
+  4837ba:	0f 94 c1             	sete   %cl
+  4837bd:	84 c8                	test   %cl,%al
+  4837bf:	74 af                	je     483770 <willow_runtime::parallel::poll_chunk+0xb0>
+  4837c1:	ff 15 31 b2 0c 00    	call   *0xcb231(%rip)        # 54e9f8 <_DYNAMIC+0xd70>
+  4837c7:	bd 40 00 00 00       	mov    $0x40,%ebp
+  4837cc:	85 c0                	test   %eax,%eax
+  4837ce:	74 a0                	je     483770 <willow_runtime::parallel::poll_chunk+0xb0>
+  4837d0:	48 8b 44 24 20       	mov    0x20(%rsp),%rax
+  4837d5:	48 89 58 08          	mov    %rbx,0x8(%rax)
+  4837d9:	41 be 03 00 00 00    	mov    $0x3,%r14d
+  4837df:	4c 8b 6c 24 18       	mov    0x18(%rsp),%r13
+  4837e4:	48 8b 44 24 10       	mov    0x10(%rsp),%rax
+  4837e9:	eb 5f                	jmp    48384a <willow_runtime::parallel::poll_chunk+0x18a>
+  4837eb:	41 be 01 00 00 00    	mov    $0x1,%r14d
+  4837f1:	e9 07 01 00 00       	jmp    4838fd <willow_runtime::parallel::poll_chunk+0x23d>
+  4837f6:	48 8b 44 24 10       	mov    0x10(%rsp),%rax
+  4837fb:	49 89 5e 08          	mov    %rbx,0x8(%r14)
+  4837ff:	41 be 03 00 00 00    	mov    $0x3,%r14d
+  483805:	48 3b 5c 24 28       	cmp    0x28(%rsp),%rbx
+  48380a:	7c 6f                	jl     48387b <willow_runtime::parallel::poll_chunk+0x1bb>
+  48380c:	e9 8b 00 00 00       	jmp    48389c <willow_runtime::parallel::poll_chunk+0x1dc>
+  483811:	49 8b 7c 24 38       	mov    0x38(%r12),%rdi
+  483816:	49 c7 44 24 38 00 00 	movq   $0x0,0x38(%r12)
+  48381d:	00 00 
+  48381f:	41 be 04 00 00 00    	mov    $0x4,%r14d
+  483825:	48 85 ff             	test   %rdi,%rdi
+  483828:	4c 8b 6c 24 18       	mov    0x18(%rsp),%r13
+  48382d:	48 8b 44 24 10       	mov    0x10(%rsp),%rax
+  483832:	74 16                	je     48384a <willow_runtime::parallel::poll_chunk+0x18a>
+  483834:	be 18 00 00 00       	mov    $0x18,%esi
+  483839:	ba 08 00 00 00       	mov    $0x8,%edx
+  48383e:	48 89 c3             	mov    %rax,%rbx
+  483841:	ff 15 29 a8 0c 00    	call   *0xca829(%rip)        # 54e070 <_DYNAMIC+0x3e8>
+  483847:	48 89 d8             	mov    %rbx,%rax
+  48384a:	48 8b 54 24 08       	mov    0x8(%rsp),%rdx
+  48384f:	eb 2a                	jmp    48387b <willow_runtime::parallel::poll_chunk+0x1bb>
+  483851:	48 8b 5c 24 30       	mov    0x30(%rsp),%rbx
+  483856:	4c 8b 6c 24 18       	mov    0x18(%rsp),%r13
+  48385b:	48 8b 44 24 10       	mov    0x10(%rsp),%rax
+  483860:	48 8b 54 24 08       	mov    0x8(%rsp),%rdx
+  483865:	4c 8b 74 24 20       	mov    0x20(%rsp),%r14
+  48386a:	49 89 5e 08          	mov    %rbx,0x8(%r14)
+  48386e:	41 be 03 00 00 00    	mov    $0x3,%r14d
+  483874:	48 3b 5c 24 28       	cmp    0x28(%rsp),%rbx
+  483879:	7d 21                	jge    48389c <willow_runtime::parallel::poll_chunk+0x1dc>
+  48387b:	49 89 17             	mov    %rdx,(%r15)
+  48387e:	49 ff 4f 68          	decq   0x68(%r15)
+  483882:	48 8b 80 10 ff ff ff 	mov    -0xf0(%rax),%rax
+  483889:	48 85 c0             	test   %rax,%rax
+  48388c:	74 6a                	je     4838f8 <willow_runtime::parallel::poll_chunk+0x238>
+  48388e:	48 8b 0d 93 0a 0d 00 	mov    0xd0a93(%rip),%rcx        # 554328 <willow_runtime::gc::safepoint::MUTATOR_EPOCH>
+  483895:	48 39 c8             	cmp    %rcx,%rax
+  483898:	75 5e                	jne    4838f8 <willow_runtime::parallel::poll_chunk+0x238>
+  48389a:	eb 61                	jmp    4838fd <willow_runtime::parallel::poll_chunk+0x23d>
+  48389c:	49 8b 7c 24 38       	mov    0x38(%r12),%rdi
+  4838a1:	49 c7 44 24 38 00 00 	movq   $0x0,0x38(%r12)
+  4838a8:	00 00 
+  4838aa:	48 85 ff             	test   %rdi,%rdi
+  4838ad:	74 1c                	je     4838cb <willow_runtime::parallel::poll_chunk+0x20b>
+  4838af:	be 18 00 00 00       	mov    $0x18,%esi
+  4838b4:	48 89 d3             	mov    %rdx,%rbx
+  4838b7:	ba 08 00 00 00       	mov    $0x8,%edx
+  4838bc:	49 89 c6             	mov    %rax,%r14
+  4838bf:	ff 15 ab a7 0c 00    	call   *0xca7ab(%rip)        # 54e070 <_DYNAMIC+0x3e8>
+  4838c5:	4c 89 f0             	mov    %r14,%rax
+  4838c8:	48 89 da             	mov    %rbx,%rdx
+  4838cb:	49 89 17             	mov    %rdx,(%r15)
+  4838ce:	49 ff 4f 68          	decq   0x68(%r15)
+  4838d2:	48 8b 80 10 ff ff ff 	mov    -0xf0(%rax),%rax
+  4838d9:	48 85 c0             	test   %rax,%rax
+  4838dc:	74 14                	je     4838f2 <willow_runtime::parallel::poll_chunk+0x232>
+  4838de:	48 8b 0d 43 0a 0d 00 	mov    0xd0a43(%rip),%rcx        # 554328 <willow_runtime::gc::safepoint::MUTATOR_EPOCH>
+  4838e5:	41 be 01 00 00 00    	mov    $0x1,%r14d
+  4838eb:	48 39 c8             	cmp    %rcx,%rax
+  4838ee:	75 08                	jne    4838f8 <willow_runtime::parallel::poll_chunk+0x238>
+  4838f0:	eb 0b                	jmp    4838fd <willow_runtime::parallel::poll_chunk+0x23d>
+  4838f2:	41 be 01 00 00 00    	mov    $0x1,%r14d
+  4838f8:	e8 c3 bb fc ff       	call   44f4c0 <willow_runtime::gc::root::clear_root_stack_owner_if_empty>
+  4838fd:	4d 85 ed             	test   %r13,%r13
+  483900:	74 07                	je     483909 <willow_runtime::parallel::poll_chunk+0x249>
+  483902:	49 ff 8d f0 01 00 00 	decq   0x1f0(%r13)
+  483909:	44 89 f0             	mov    %r14d,%eax
+  48390c:	48 83 c4 38          	add    $0x38,%rsp
+  483910:	5b                   	pop    %rbx
+  483911:	41 5c                	pop    %r12
+  483913:	41 5d                	pop    %r13
+  483915:	41 5e                	pop    %r14
+  483917:	41 5f                	pop    %r15
+  483919:	5d                   	pop    %rbp
+  48391a:	c3                   	ret
+  48391b:	48 89 c7             	mov    %rax,%rdi
+  48391e:	ff 15 f4 b5 0c 00    	call   *0xcb5f4(%rip)        # 54ef18 <_DYNAMIC+0x1290>
+  483924:	48 89 d1             	mov    %rdx,%rcx
+  483927:	48 8d 3d 47 9d 09 00 	lea    0x99d47(%rip),%rdi        # 51d675 <willow_runtime::gc::runtime_tlab::REF_ARRAY_BUFFER_DESCRIPTORS+0x541d>
+  48392e:	be 0a 00 00 00       	mov    $0xa,%esi
+  483933:	48 89 c2             	mov    %rax,%rdx
+  483936:	e8 95 ea f7 ff       	call   4023d0 <willow_runtime::failure::abort_panic>
+  48393b:	0f 0b                	ud2
+  48393d:	4d 85 ed             	test   %r13,%r13
+  483940:	74 07                	je     483949 <willow_runtime::parallel::poll_chunk+0x289>
+  483942:	49 ff 8d f0 01 00 00 	decq   0x1f0(%r13)
+  483949:	ff 15 e1 a9 0c 00    	call   *0xca9e1(%rip)        # 54e330 <_DYNAMIC+0x6a8>
+  48394f:	ff 15 db a9 0c 00    	call   *0xca9db(%rip)        # 54e330 <_DYNAMIC+0x6a8>
+
+Disassembly of section .fini:

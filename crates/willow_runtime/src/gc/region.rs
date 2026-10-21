@@ -81,6 +81,9 @@ pub(super) struct OldRegion {
     pub(super) base: *mut u8,
     pub(super) capacity: usize,
     pub(super) used: usize,
+    /// Storage comes from alloc_zeroed. Only its first allocation may omit
+    /// clearing; never reset this on sweep/tail trimming or span reuse.
+    pristine: bool,
     pub(super) kind: RegionKind,
     pub(super) live_bytes: usize,
     pub(super) allocations: BTreeMap<usize, usize>,
@@ -94,6 +97,8 @@ pub(super) struct OldRegion {
     pub(super) active_labs: usize,
     #[cfg(test)]
     pub(super) allocation_attempts: usize,
+    #[cfg(test)]
+    cleared_bytes: usize,
     pub(super) mark_bitmap: RegionMarkBitmap,
     pub(super) concurrent_marks: Arc<concurrent_bitmap::ConcurrentMarkBits>,
 }
@@ -165,6 +170,7 @@ impl OldRegion {
             base,
             capacity,
             used: 0,
+            pristine: true,
             kind,
             live_bytes: 0,
             allocations: BTreeMap::new(),
@@ -177,6 +183,8 @@ impl OldRegion {
             active_labs: 0,
             #[cfg(test)]
             allocation_attempts: 0,
+            #[cfg(test)]
+            cleared_bytes: 0,
             mark_bitmap: RegionMarkBitmap::new(bitmap_capacity),
             concurrent_marks: Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(
                 bitmap_capacity.div_ceil(GC_REGION_MARK_GRANULE),
@@ -269,10 +277,18 @@ impl OldRegion {
         let raw = unsafe { self.base.add(offset) };
         // Evacuation initializes the header and copies every payload byte
         // before the stopped collector publishes the destination. Zeroing the
-        // same bytes first is redundant. Ordinary allocations still start zeroed.
-        if source.is_none() {
+        // same bytes first is redundant. A fresh region is already zeroed by
+        // its allocator; eagerly touching a large scalar buffer again would
+        // serialize page faults before parallel writers can fill their chunks.
+        // Every later allocation clears its span, even after used returns to 0.
+        if source.is_none() && !self.pristine {
             unsafe { std::ptr::write_bytes(raw, 0, span_size) };
+            #[cfg(test)]
+            {
+                self.cleared_bytes += span_size;
+            }
         }
+        self.pristine = false;
         let object = if let Some(source) = source {
             debug_assert_eq!(source.size(), total_size);
             HeapObject::initialize_moved_at(raw, source, GC_GENERATION_OLD)
@@ -338,6 +354,7 @@ impl OldRegion {
         }
         let offset = self.used;
         // The validated young span is aligned and this cursor owns its tail.
+        self.pristine = false;
         let object = HeapObject::initialize_moved_at(
             unsafe { self.base.add(offset) },
             source,
@@ -376,6 +393,9 @@ impl OldRegion {
             })
         };
         self.largest_free_span = self.free_spans.largest();
+        if carved.is_some() {
+            self.pristine = false;
+        }
         carved
     }
 
@@ -508,5 +528,107 @@ impl Drop for OldRegion {
             .expect("old-region allocation layout remains valid");
         // SAFETY: each region owns one block and `Drop` runs exactly once.
         unsafe { dealloc(self.base, layout) };
+    }
+}
+
+#[cfg(test)]
+mod zero_initialization_tests {
+    use super::*;
+
+    fn assert_zero(object: HeapObject, bytes: usize) {
+        let payload = unsafe { std::slice::from_raw_parts(object.payload().as_ptr(), bytes) };
+        assert!(payload.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn fresh_and_reused_regions_preserve_zero_initialization() {
+        let _guard = runtime_test_guard();
+        for kind in [RegionKind::Old, RegionKind::LargeObject] {
+            for bytes in [0, 8, 64, 512, 4096, 65536] {
+                let mut region = OldRegion::new(kind, 131072).unwrap();
+                assert!(region.pristine);
+                let (first, _) = region.allocate_object(0, 0, 0, bytes).unwrap();
+                assert!(!region.pristine);
+                assert_zero(first, bytes);
+                assert_eq!(region.cleared_bytes, 0);
+                unsafe { std::ptr::write_bytes(first.payload().as_ptr(), 0xa5, bytes) };
+                region.release_object(first);
+                assert_eq!(region.used, 0);
+                assert!(
+                    !region.pristine,
+                    "tail trimming must not restore pristine state"
+                );
+                let (second, _) = region.allocate_object(0, 0, 0, bytes).unwrap();
+                assert_zero(second, bytes);
+                assert_eq!(
+                    region.cleared_bytes,
+                    (GC_HEADER_SIZE + bytes).next_multiple_of(GC_REGION_MARK_GRANULE)
+                );
+                println!(
+                    "kind={kind:?} bytes={bytes} fresh_clear_bytes=0 reused_clear_bytes={}",
+                    region.cleared_bytes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reclaimed_middle_hole_is_cleared() {
+        let _guard = runtime_test_guard();
+        let mut region = OldRegion::new(RegionKind::Old, 4096).unwrap();
+        let (first, _) = region.allocate_object(0, 0, 0, 64).unwrap();
+        let (_last, _) = region.allocate_object(0, 0, 0, 64).unwrap();
+        unsafe { std::ptr::write_bytes(first.payload().as_ptr(), 0xa5, 64) };
+        region.release_object(first);
+        let (replacement, reused) = region.allocate_object(0, 0, 0, 64).unwrap();
+        assert!(reused);
+        assert_zero(replacement, 64);
+    }
+
+    #[test]
+    fn lab_carving_and_promotion_consume_pristine_state() {
+        let _guard = runtime_test_guard();
+        let mut carved = OldRegion::new(RegionKind::Old, 4096).unwrap();
+        assert!(carved.carve(4096, 4096).is_some());
+        assert!(!carved.pristine);
+        // Model a dirty retired LAB whose whole span became the bump tail.
+        unsafe { std::ptr::write_bytes(carved.base, 0xa5, carved.capacity) };
+        carved.used = 0;
+        let (object, _) = carved.allocate_object(0, 0, 0, 64).unwrap();
+        assert_zero(object, 64);
+
+        let mut source_region = OldRegion::new(RegionKind::Old, 4096).unwrap();
+        let (source, _) = source_region.allocate_object(0, 0, 0, 64).unwrap();
+        unsafe { std::ptr::write_bytes(source.payload().as_ptr(), 0xa5, 64) };
+        for buffered in [false, true] {
+            let mut destination = OldRegion::new(RegionKind::Old, 4096).unwrap();
+            let copied = if buffered {
+                let mut pending = Vec::new();
+                let copied = destination
+                    .allocate_fresh_promotion(source, source.size(), &mut pending)
+                    .unwrap();
+                destination.allocations.extend(pending);
+                copied
+            } else {
+                destination
+                    .allocate_object_for_move(0, 0, 0, 64, Some(source))
+                    .unwrap()
+                    .0
+            };
+            // Evacuation's caller copies payload bytes after the region has
+            // initialized the destination header and before publication.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source.payload().as_ptr(),
+                    copied.payload().as_ptr(),
+                    64,
+                )
+            };
+            assert!(!destination.pristine);
+            assert_eq!(unsafe { copied.payload().as_ptr().read() }, 0xa5);
+            destination.release_object(copied);
+            let (replacement, _) = destination.allocate_object(0, 0, 0, 64).unwrap();
+            assert_zero(replacement, 64);
+        }
     }
 }

@@ -460,6 +460,7 @@ pub enum SlotKind {
 }
 
 impl SlotKind {
+    #[inline]
     pub const fn word_count(self) -> u32 {
         match self {
             Self::ScalarPair | Self::InterfacePair => 2,
@@ -483,12 +484,14 @@ impl<'a> WordLayout<'a> {
         Self { slots }
     }
 
+    #[inline]
     pub const fn word_count(self) -> u32 {
         self.word_offset(self.slots.len())
     }
 
     /// Physical word offset of a logical slot; the end index yields total size.
     /// This prefix scan is linear in `logical_index`.
+    #[inline]
     pub const fn word_offset(self, logical_index: usize) -> u32 {
         assert!(logical_index <= self.slots.len(), "invalid logical slot");
         let mut index = 0;
@@ -571,6 +574,7 @@ impl<'a> NativeFrameLayout<'a> {
         }
     }
 
+    #[inline]
     pub const fn slot_count(self) -> u32 {
         self.slots.word_count()
     }
@@ -589,6 +593,7 @@ impl<'a> NativeFrameLayout<'a> {
         self.slots.gc_ref_mask(0)
     }
 
+    #[inline]
     pub const fn slot_offset(self, slot: u32, pointer_bytes: u32) -> u32 {
         assert!(slot < self.slot_count(), "native frame slot out of bounds");
         async_frame::data_slot_offset(slot, pointer_bytes)

@@ -55,10 +55,14 @@ unsafe fn chunk_frame(frame: *mut c_void) -> NativeTaskFrame<ChunkFrame> {
 unsafe fn coordinator_frame(frame: *mut c_void) -> NativeTaskFrame<CoordinatorFrame> {
     unsafe { NativeTaskFrame::from_raw(frame) }
 }
-/// Hard upper bound for one native poll. Scheduler budget/time checks normally
-/// stop the chunk earlier; this cap remains as a fail-safe if no quantum is
-/// active or a future preemption policy is accidentally disabled.
-const MAX_ELEMENTS_PER_POLL: i64 = 256;
+// A native scalar loop has one safepoint per bounded batch, like the amortized
+// checks in generated loops. The mapper's own safepoints still consume the
+// shared quantum. Do not make one cheap scalar operation a scheduler quantum:
+// requeue/claim contention would otherwise dominate eight-worker mapping.
+const ELEMENTS_PER_SAFEPOINT: i64 = crate::preempt::SYNC_POLL_STRIDE as i64;
+/// Hard upper bound for one native poll, even without an active quantum.
+const MAX_ELEMENTS_PER_POLL: i64 =
+    ELEMENTS_PER_SAFEPOINT * crate::preempt::DEFAULT_TASK_BUDGET as i64;
 
 pub type I64Mapper = unsafe extern "C" fn(i64) -> i64;
 
@@ -98,8 +102,6 @@ fn chunk_ranges(len: i64, workers: usize) -> Vec<(i64, i64)> {
 #[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
     let frame_view = unsafe { chunk_frame(frame) };
-    let input = frame_view.load_gc(CHUNK_INPUT_SLOT);
-    let output = frame_view.load_gc(CHUNK_OUTPUT_SLOT);
     let state_ptr = frame_view.load_native::<ChunkState>(CHUNK_STATE_SLOT);
     let Some(state) = (unsafe { state_ptr.as_mut() }) else {
         return crate::task::RUNTIME_POLL_READY;
@@ -109,32 +111,44 @@ unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
         .next
         .saturating_add(MAX_ELEMENTS_PER_POLL)
         .min(state.end);
-    while state.next < stop {
-        let input_value = crate::array::willow_array_get(input, state.next);
-        if crate::panic_context::willow_panic_active() != 0 {
-            unsafe { drop_chunk_state(frame) };
-            return crate::task::RUNTIME_POLL_PANICKED;
-        }
+    let bridge = crate::generated_context::ScalarBridge::enter();
+    let mapper = state.mapper;
+    let end = state.end;
+    let mut next = state.next;
+    let mut until_check = ELEMENTS_PER_SAFEPOINT;
+    while next < stop {
+        // Chunk construction proves bounds and scalar element type. Reload
+        // the rooted handles: a mapper may allocate and collect between reads.
+        let input_value = unsafe {
+            crate::array::scalar_slot_unchecked(frame_view.load_gc(CHUNK_INPUT_SLOT), next).read()
+        };
         // This native frame can repurpose the pinned register even when its
         // scheduler entry installed one. Re-establish it at the mapper boundary.
-        let mapped = unsafe { crate::generated_context::invoke_i64(state.mapper, input_value) };
+        let mapped = unsafe { bridge.call(mapper, input_value) };
         // A mapper panic follows the ordinary Task policy. Stop immediately so
         // neutral ABI return values are never committed as successful output.
-        if crate::panic_context::willow_panic_active() != 0 {
+        if bridge.panicked() {
             unsafe { drop_chunk_state(frame) };
             return crate::task::RUNTIME_POLL_PANICKED;
         }
-        crate::array::willow_array_set(output, state.next, mapped);
-        if crate::panic_context::willow_panic_active() != 0 {
-            unsafe { drop_chunk_state(frame) };
-            return crate::task::RUNTIME_POLL_PANICKED;
+        unsafe {
+            crate::array::scalar_slot_unchecked(frame_view.load_gc(CHUNK_OUTPUT_SLOT), next)
+                .write(mapped);
         }
-        state.next += 1;
-        if state.next < state.end && crate::preempt::willow_preempt_check() != 0 {
-            return crate::task::RUNTIME_POLL_PREEMPTED;
+        next += 1;
+        until_check -= 1;
+        if next < end && until_check == 0 {
+            // Also settles pending safepoint debt from generated helpers.
+            // Flags and time are sampled every batch, not every quantum.
+            if crate::preempt::willow_preempt_check() != 0 {
+                state.next = next;
+                return crate::task::RUNTIME_POLL_PREEMPTED;
+            }
+            until_check = ELEMENTS_PER_SAFEPOINT;
         }
     }
-    if state.next < state.end {
+    state.next = next;
+    if next < end {
         return crate::task::RUNTIME_POLL_PREEMPTED;
     }
 
@@ -351,6 +365,124 @@ mod tests {
     #[test]
     fn parallel_04_zero_workers_is_treated_as_one() {
         assert_eq!(chunk_ranges(10, 0), vec![(0, 10)]);
+    }
+
+    thread_local! {
+        static MAPPED_ELEMENTS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    }
+
+    unsafe extern "C" fn increment(value: i64) -> i64 {
+        MAPPED_ELEMENTS.set(MAPPED_ELEMENTS.get() + 1);
+        value.wrapping_add(1)
+    }
+
+    #[test]
+    fn parallel_06_scalar_loop_exact_work_and_poll_bounds() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        // Growing, non-aligned lengths include both countdown and poll edges.
+        for len in [
+            0, 1, 2, 63, 64, 65, 255, 256, 257, 1023, 1024, 1025, 4097, 65535, 65536, 65537, 131073,
+        ] {
+            for budget in [1, 2, 64, 4096] {
+                MAPPED_ELEMENTS.set(0);
+                let input = crate::array::new_old_array(len, 0);
+                let _input_root = crate::gc::GcRootHandle::new(input);
+                let output = crate::array::new_old_array(len, 0);
+                let _output_root = crate::gc::GcRootHandle::new(output);
+                for index in 0..len {
+                    crate::array::willow_array_set(input, index, index);
+                }
+                let frame = NativeTaskFrame::<ChunkFrame>::allocate().unwrap();
+                frame.store_gc(CHUNK_INPUT_SLOT, input);
+                frame.store_gc(CHUNK_OUTPUT_SLOT, output);
+                frame.store_native(
+                    CHUNK_STATE_SLOT,
+                    Box::into_raw(Box::new(ChunkState {
+                        mapper: increment,
+                        next: 0,
+                        end: len,
+                    })),
+                );
+                let mut processed = 0;
+                let mut polls = 0;
+                loop {
+                    crate::preempt::begin_quantum(
+                        crate::preempt::PreemptConfig::from_env_values(
+                            Some(&budget.to_string()),
+                            Some("100000"),
+                        ),
+                        std::ptr::null(),
+                    );
+                    let result = unsafe { poll_chunk(frame.as_raw()) };
+                    crate::preempt::willow_preempt_end();
+                    polls += 1;
+                    if result == crate::task::RUNTIME_POLL_READY {
+                        assert!(frame.load_native::<ChunkState>(CHUNK_STATE_SLOT).is_null());
+                        break;
+                    }
+                    assert_eq!(result, crate::task::RUNTIME_POLL_PREEMPTED);
+                    let next = unsafe { (*frame.load_native::<ChunkState>(CHUNK_STATE_SLOT)).next };
+                    assert_eq!(
+                        next - processed,
+                        (budget * ELEMENTS_PER_SAFEPOINT).min(MAX_ELEMENTS_PER_POLL)
+                    );
+                    processed = next;
+                }
+                let quantum = (budget * ELEMENTS_PER_SAFEPOINT).min(MAX_ELEMENTS_PER_POLL);
+                assert_eq!(polls, ((len + quantum - 1) / quantum).max(1));
+                assert_eq!(MAPPED_ELEMENTS.get(), len);
+                for index in 0..len {
+                    assert_eq!(crate::array::willow_array_get(output, index), index + 1);
+                }
+                println!("len={len} budget={budget} mapped={len} polls={polls}");
+            }
+        }
+        crate::gc::reset_internal_for_test();
+    }
+
+    #[test]
+    fn parallel_07_pending_preemption_stops_within_one_batch() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        MAPPED_ELEMENTS.set(0);
+        let input = crate::array::new_old_array(1024, 0);
+        let _input = crate::gc::GcRootHandle::new(input);
+        let output = crate::array::new_old_array(1024, 0);
+        let _output = crate::gc::GcRootHandle::new(output);
+        let frame = NativeTaskFrame::<ChunkFrame>::allocate().unwrap();
+        frame.store_gc(CHUNK_INPUT_SLOT, input);
+        frame.store_gc(CHUNK_OUTPUT_SLOT, output);
+        frame.store_native(
+            CHUNK_STATE_SLOT,
+            Box::into_raw(Box::new(ChunkState {
+                mapper: increment,
+                next: 0,
+                end: 1024,
+            })),
+        );
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        crate::preempt::begin_quantum(
+            crate::preempt::PreemptConfig::from_env_values(Some("4096"), Some("100000")),
+            (&raw const flag).cast(),
+        );
+        // Beginning a quantum clears stale requests; simulate a request that
+        // arrives after the scheduler has installed this quantum.
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            unsafe { poll_chunk(frame.as_raw()) },
+            crate::task::RUNTIME_POLL_PREEMPTED
+        );
+        crate::preempt::willow_preempt_end();
+        assert_eq!(MAPPED_ELEMENTS.get(), ELEMENTS_PER_SAFEPOINT);
+        unsafe { cancel_chunk(frame.as_raw()) };
+        assert!(frame.load_native::<ChunkState>(CHUNK_STATE_SLOT).is_null());
+        // Cleanup is idempotent and cannot map another element or publish success.
+        unsafe { cancel_chunk(frame.as_raw()) };
+        assert_eq!(MAPPED_ELEMENTS.get(), ELEMENTS_PER_SAFEPOINT);
+        drop(_input);
+        drop(_output);
+        crate::gc::reset_internal_for_test();
     }
 
     unsafe extern "C" fn pending_forever(_frame: *mut c_void) -> i32 {

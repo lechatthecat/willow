@@ -5,6 +5,15 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 const crypto = require('node:crypto');
+// This public, reproducible case lives beside its audit evidence. Preserve the
+// existing reconstructed cases and the ticket's documented entry point.
+if (process.argv[2] === 'run' && process.argv[3] === 'parallel_map') {
+  const result = spawnSync(process.execPath,
+    [path.resolve(__dirname, '../../docs/audits/willow-8hq4.46/measure.js'), ...process.argv.slice(4)],
+    {stdio: 'inherit'});
+  if (result.error) throw result.error;
+  process.exit(result.status ?? 1);
+}
 const args = process.argv.slice(2);
 if(args.shift() !== 'run') throw Error('usage: harness.js run CASE... --trials N');
 let trials = 5; const ti = args.indexOf('--trials');
