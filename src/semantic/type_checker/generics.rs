@@ -152,6 +152,7 @@ enum InstantiationTypeRef<'a> {
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static GENERIC_ENUM_ARGUMENT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GENERIC_CALL_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INSTANTIATION_METADATA_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1097,6 +1098,190 @@ impl TypeChecker {
         );
     }
 
+    /// Preserve the enum head as context while its payload parameters are still
+    /// unknown. Each payload is checked once; absent constraints remain holes
+    /// until all call arguments have contributed to inference.
+    pub(super) fn check_generic_enum_argument(
+        &mut self,
+        expr: &Expr,
+        expected: &Type,
+        parameters: &HashSet<&str>,
+    ) -> Type {
+        #[cfg(test)]
+        GENERIC_ENUM_ARGUMENT_CHECKS.with(|count| count.set(count.get() + 1));
+        if !uses_parameters(expected, parameters) {
+            return self.check_expr_expecting(expr, expected);
+        }
+        let Type::Generic(enum_name, expected_args) = expected else {
+            return self.check_expr(expr);
+        };
+        if matches!(expr, Expr::Ternary(_) | Expr::Match(_)) {
+            let context = expected.substitute_names(|name| {
+                parameters
+                    .contains(name.as_str())
+                    .then(crate::semantic::generic_inference::enum_hole)
+            });
+            let ty = match expr {
+                Expr::Ternary(t) => self.check_ternary_expecting(t, &context),
+                Expr::Match(m) => {
+                    let previous = self.local.match_expected.replace(context);
+                    let ty = self.check_match_expr(m);
+                    self.local.match_expected = previous;
+                    ty
+                }
+                _ => unreachable!(),
+            };
+            self.expr_types.insert(expr.id(), ty.clone());
+            return ty;
+        }
+        // Only enum constructors produce inference holes. Ordinary values keep
+        // their own type, even when their formal parameter is a generic enum.
+        let (variant, args) = match expr {
+            Expr::Call(call)
+                if self.prelude_variant_name_is_unshadowed(&call.callee)
+                    && self.enum_nameable_bare(enum_name) =>
+            {
+                (call.callee.as_str(), call.args.as_slice())
+            }
+            Expr::Var(name, _, _)
+                if self.prelude_variant_name_is_unshadowed(name)
+                    && self.enum_nameable_bare(enum_name) =>
+            {
+                (name.as_str(), &[][..])
+            }
+            Expr::StaticCall(call)
+                if call.type_args.is_empty()
+                    && self.static_call_enum_key(&call.class).as_deref()
+                        == Some(enum_name.as_str()) =>
+            {
+                (call.method.as_str(), call.args.as_slice())
+            }
+            _ => return self.check_expr(expr),
+        };
+        let Some(info) = self.symbols.lookup_enum(enum_name) else {
+            return self.check_expr(expr);
+        };
+        let Some(definition) = info.variants.iter().find(|v| v.name == variant) else {
+            return self.check_expr(expr);
+        };
+        let type_params = info.type_params.clone();
+        let payload_templates = definition.payload_types.clone();
+        let bindings: HashMap<_, _> = type_params.iter().zip(expected_args).collect();
+        let payloads: Vec<_> = payload_templates
+            .iter()
+            .map(|ty| ty.substitute_names(|name| bindings.get(name).map(|ty| (*ty).clone())))
+            .collect();
+        let omitted_void_payload = args.is_empty() && matches!(payloads.as_slice(), [Type::Void]);
+        if payloads.len() != args.len() && !omitted_void_payload {
+            self.generic_error(
+                expr.span(),
+                format!(
+                    "enum variant `{enum_name}::{variant}` takes {} argument(s), got {}",
+                    payloads.len(),
+                    args.len()
+                ),
+            );
+            for arg in args {
+                self.check_expr(&arg.expr);
+            }
+            return Self::error_type();
+        }
+        let actual: Vec<_> = args
+            .iter()
+            .zip(&payloads)
+            .map(|(arg, ty)| self.check_generic_enum_argument(&arg.expr, ty, parameters))
+            .collect();
+        let mut payload_inference =
+            crate::semantic::generic_inference::Inference::new(&type_params, &[])
+                .expect("registered enum parameters");
+        let constraints = payload_templates
+            .iter()
+            .zip(&actual)
+            .try_for_each(|(formal, actual)| payload_inference.constrain_partial(formal, actual));
+        let inferred = match constraints.and_then(|()| payload_inference.finish(true)) {
+            Ok(inferred) => inferred,
+            Err(message) => {
+                self.generic_error(expr.span(), message);
+                return Self::error_type();
+            }
+        };
+        let result = Type::Generic(
+            enum_name.clone(),
+            type_params
+                .iter()
+                .zip(expected_args)
+                .map(|(name, expected)| {
+                    let actual = &inferred[name];
+                    if *actual == Type::Void {
+                        expected.substitute_names(|name| {
+                            parameters
+                                .contains(name.as_str())
+                                .then(crate::semantic::generic_inference::enum_hole)
+                        })
+                    } else {
+                        actual.clone()
+                    }
+                })
+                .collect(),
+        );
+        self.record_variant_use(enum_name, variant, expr.span());
+        if matches!(expr, Expr::Call(_) | Expr::Var(..)) {
+            self.enum_variant_resolutions
+                .insert(expr.id(), enum_name.clone());
+        }
+        if let Expr::StaticCall(call) = expr {
+            self.record_type_use(&call.class, &result, call.span);
+            self.check_source_type_name(&call.class, call.span);
+            if call.class != *enum_name {
+                self.static_call_classes.insert(call.id, enum_name.clone());
+            }
+        }
+        self.expr_types.insert(expr.id(), result.clone());
+        result
+    }
+
+    fn is_inferred_enum_constructor(&self, expr: &Expr) -> bool {
+        self.enum_variant_resolutions.contains_key(&expr.id())
+            || matches!(expr, Expr::StaticCall(call)
+                if call.type_args.is_empty() && self.static_call_enum_key(&call.class).is_some())
+    }
+
+    /// Complete constructor metadata after successful structural inference,
+    /// without checking payloads again. Each nested constructor owns a type
+    /// entry, including holes below more than one generic enum head.
+    fn resolve_generic_argument(&mut self, expr: &Expr, expected: &Type) {
+        let mut pending = vec![(expr, expected.clone())];
+        while let Some((expr, expected)) = pending.pop() {
+            match expr {
+                Expr::Ternary(t) => {
+                    self.expr_types.insert(expr.id(), expected.clone());
+                    pending.push((&t.then_expr, expected.clone()));
+                    pending.push((&t.else_expr, expected));
+                    continue;
+                }
+                Expr::Match(m) => {
+                    self.expr_types.insert(expr.id(), expected.clone());
+                    pending.extend(m.arms.iter().filter_map(|arm| match &arm.body {
+                        MatchBody::Expr(expr) => Some((expr.as_ref(), expected.clone())),
+                        _ => None,
+                    }));
+                    continue;
+                }
+                _ if !self.is_inferred_enum_constructor(expr) => continue,
+                _ => {}
+            }
+            self.expr_types.insert(expr.id(), expected.clone());
+            let (variant, args) = match expr {
+                Expr::Call(call) => (call.callee.as_str(), call.args.as_slice()),
+                Expr::StaticCall(call) => (call.method.as_str(), call.args.as_slice()),
+                _ => continue,
+            };
+            if let Some((_, payloads, _)) = self.expected_qualified_variant(variant, &expected) {
+                pending.extend(args.iter().zip(payloads).map(|(arg, ty)| (&arg.expr, ty)));
+            }
+        }
+    }
+
     pub(super) fn check_generic_call(&mut self, c: &CallExpr) -> Option<Type> {
         self.check_generic_call_parts(&c.callee, &c.type_args, &c.args, c.span, c.id)
     }
@@ -1198,6 +1383,8 @@ impl TypeChecker {
                         .map_or_else(Self::error_type, |place| place.ty.clone())
                 } else if let Some(Some(expected)) = contextual_params.get(i) {
                     self.check_expr_expecting(&a.expr, expected)
+                } else if let Some(expected) = params.get(i) {
+                    self.check_generic_enum_argument(&a.expr, expected, &parameter_names)
                 } else {
                     self.check_expr(&a.expr)
                 };
@@ -1265,10 +1452,20 @@ impl TypeChecker {
                 poisoned = true;
             } else if !mismatched
                 && let Some(formal) = inferred_params.get(i)
-                && let Err(message) = inference.constrain(formal, &ty)
+                && let Err(message) = inference.constrain_partial(formal, &ty)
             {
                 mismatched = true;
-                failure.get_or_insert(message);
+                failure.get_or_insert_with(|| {
+                    format!(
+                        "argument {} (`{}`): expected `{}`, found `{}`; {message}",
+                        i + 1,
+                        template.params[i].name,
+                        type_name(
+                            &params[i].substitute_names(|name| inference.binding(name).cloned())
+                        ),
+                        type_name(&ty)
+                    )
+                });
             }
         }
         for i in (0..call_args.len()).filter(|&i| deferred[i]) {
@@ -1344,7 +1541,17 @@ impl TypeChecker {
                 && let Err(message) = inference.constrain(&inferred_params[i], &canonical)
             {
                 mismatched = true;
-                failure.get_or_insert(message);
+                failure.get_or_insert_with(|| {
+                    format!(
+                        "argument {} (`{}`): expected `{}`, found `{}`; {message}",
+                        i + 1,
+                        template.params[i].name,
+                        type_name(
+                            &params[i].substitute_names(|name| inference.binding(name).cloned())
+                        ),
+                        type_name(&lambda_ty)
+                    )
+                });
             }
             actual[i] = Some(lambda_ty);
         }
@@ -1376,6 +1583,23 @@ impl TypeChecker {
                 return Some(Self::error_type());
             }
         };
+        let actual: Vec<_> = actual
+            .into_iter()
+            .zip(call_args)
+            .zip(&params)
+            .map(|((actual, arg), formal)| {
+                let expected = formal.substitute_names(|name| bindings.get(name).cloned());
+                let expected = self.normalize_type(&expected, arg.span);
+                if self.is_inferred_enum_constructor(&arg.expr)
+                    || matches!(arg.expr, Expr::Ternary(_) | Expr::Match(_))
+                {
+                    self.resolve_generic_argument(&arg.expr, &expected);
+                    expected
+                } else {
+                    actual
+                }
+            })
+            .collect();
         let param_infos: Vec<_> = template
             .params
             .iter()

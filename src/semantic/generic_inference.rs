@@ -6,6 +6,61 @@ use std::collections::HashMap;
 
 use crate::parser::ast::Type;
 
+/// Compiler-only unresolved constructor slot; source syntax cannot spell it.
+/// Unlike `Void`, this carries no concrete type constraint.
+pub(crate) const ENUM_HOLE: &str = "\0enum-inference-hole";
+
+pub(crate) fn enum_hole() -> Type {
+    Type::Named(ENUM_HOLE.into())
+}
+
+pub(crate) fn is_enum_hole(ty: &Type) -> bool {
+    matches!(ty, Type::Named(name) if name == ENUM_HOLE)
+}
+
+pub(crate) fn has_enum_hole(ty: &Type) -> bool {
+    let mut pending = vec![ty];
+    while let Some(ty) = pending.pop() {
+        if is_enum_hole(ty) {
+            return true;
+        }
+        push_children(ty, &mut pending);
+    }
+    false
+}
+
+/// Merge only explicitly marked missing constraints. Concrete void is exact.
+/// Visit each pair once; the result owns the type nodes it records.
+pub(crate) fn merge_enum_holes(left: &Type, right: &Type) -> Option<Type> {
+    let mut result = left.clone();
+    let mut pending = vec![(&mut result, right)];
+    while let Some((left, right)) = pending.pop() {
+        if is_enum_hole(left) {
+            *left = right.clone();
+            continue;
+        }
+        if is_enum_hole(right) {
+            continue;
+        }
+        if shape(left) != shape(right) {
+            return None;
+        }
+        match (left, right) {
+            (Type::Generic(_, aa), Type::Generic(_, bb)) => {
+                pending.extend(aa.iter_mut().zip(bb));
+            }
+            (Type::Array(a), Type::Array(b)) => pending.push((a, b)),
+            (Type::Fn(aa, ar), Type::Fn(ba, br))
+            | (Type::Closure(aa, ar), Type::Closure(ba, br)) => {
+                pending.push((ar, br));
+                pending.extend(aa.iter_mut().zip(ba));
+            }
+            _ => {}
+        }
+    }
+    Some(result)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Shape<'a> {
     Param(usize),
@@ -194,16 +249,51 @@ impl<'a> Inference<'a> {
 
     /// Match one formal parameter type against one actual argument type.
     pub(crate) fn constrain(&mut self, formal: &Type, actual: &Type) -> Result<(), String> {
+        self.constrain_inner(formal, actual, false)
+    }
+
+    /// An inferred enum constructor may leave absent payload slots as holes.
+    /// Only compiler-marked slots are holes; concrete void always constrains.
+    pub(crate) fn constrain_partial(&mut self, formal: &Type, actual: &Type) -> Result<(), String> {
+        self.constrain_inner(formal, actual, true)
+    }
+
+    fn constrain_inner(
+        &mut self,
+        formal: &Type,
+        actual: &Type,
+        partial: bool,
+    ) -> Result<(), String> {
         let signature = Signature::new(std::slice::from_ref(formal), &self.parameters);
         let mut pending = vec![actual];
-        for node in signature.nodes {
+        let mut nodes = signature.nodes.into_iter();
+        while let Some(node) = nodes.next() {
             let ty = pending
                 .pop()
                 .expect("matching shapes preserve child counts");
+            let hole = partial && is_enum_hole(ty);
+            if hole {
+                let children = |node: &Shape<'_>| match node {
+                    Shape::Array => 1,
+                    Shape::Generic(_, n) => *n,
+                    Shape::Function(n) | Shape::Closure(n) => n + 1,
+                    _ => 0,
+                };
+                let mut remaining = children(&node);
+                while remaining != 0 {
+                    remaining = remaining - 1 + children(&nodes.next().expect("signature subtree"));
+                }
+                continue;
+            }
             if let Shape::Param(index) = node {
                 validate_argument(&self.type_params[index], ty)?;
                 if let Some(previous) = &self.bindings[index] {
-                    if previous != ty {
+                    if previous == ty {
+                        continue;
+                    }
+                    if partial && let Some(merged) = merge_enum_holes(previous, ty) {
+                        self.bindings[index] = Some(merged);
+                    } else {
                         return Err(format!(
                             "conflicting types for type parameter `{}`",
                             self.type_params[index]
@@ -231,7 +321,8 @@ impl<'a> Inference<'a> {
             .iter()
             .zip(self.bindings)
             .map(|(name, ty)| {
-                ty.or_else(|| allow_unresolved.then_some(Type::Void))
+                ty.filter(|ty| allow_unresolved || !has_enum_hole(ty))
+                    .or_else(|| allow_unresolved.then_some(Type::Void))
                     .map(|ty| (name.clone(), ty))
                     .ok_or_else(|| {
                         format!("cannot infer type parameter `{name}`; supply type arguments")
@@ -286,6 +377,109 @@ mod tests {
             actual,
             explicit,
         )
+    }
+
+    #[test]
+    fn partial_constraints_preserve_concrete_void() {
+        let params = vec!["T".into()];
+        let mut inference = Inference::new(&params, &[]).unwrap();
+        assert!(
+            inference
+                .constrain_partial(
+                    &generic("Result", vec![Type::I64, named("T")]),
+                    &generic("Result", vec![Type::Void, Type::String]),
+                )
+                .is_err()
+        );
+        let mut inference = Inference::new(&params, &[]).unwrap();
+        inference
+            .constrain_partial(
+                &generic("Result", vec![Type::Void, named("T")]),
+                &generic("Result", vec![Type::Void, Type::String]),
+            )
+            .unwrap();
+        assert_eq!(inference.finish(false).unwrap()["T"], Type::String);
+    }
+
+    #[test]
+    fn partial_binding_merges_only_marked_holes() {
+        let params = vec!["T".into()];
+        let mut inference = Inference::new(&params, &[]).unwrap();
+        inference
+            .constrain_partial(&named("T"), &generic("Option", vec![enum_hole()]))
+            .unwrap();
+        inference
+            .constrain_partial(&named("T"), &generic("Option", vec![Type::I64]))
+            .unwrap();
+        assert_eq!(
+            inference.finish(false).unwrap()["T"],
+            generic("Option", vec![Type::I64])
+        );
+        assert!(
+            merge_enum_holes(
+                &generic("Result", vec![Type::Void, Type::String]),
+                &generic("Result", vec![Type::I64, Type::String])
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn partial_enum_holes_skip_whole_formal_subtrees() {
+        let params = vec!["T".into()];
+        let mut inference = Inference::new(&params, &[]).unwrap();
+        inference
+            .constrain_partial(
+                &generic(
+                    "Result",
+                    vec![generic("Option", vec![named("T")]), Type::String],
+                ),
+                &generic("Result", vec![enum_hole(), Type::String]),
+            )
+            .unwrap();
+        inference.constrain(&named("T"), &Type::I64).unwrap();
+        assert_eq!(inference.finish(false).unwrap()["T"], Type::I64);
+    }
+
+    #[test]
+    fn partial_enum_holes_do_not_hide_other_mismatches() {
+        let params = vec!["T".into()];
+        let mut inference = Inference::new(&params, &[]).unwrap();
+        assert!(
+            inference
+                .constrain_partial(
+                    &generic(
+                        "Result",
+                        vec![generic("Option", vec![named("T")]), Type::String]
+                    ),
+                    &generic("Result", vec![enum_hole(), Type::Bool]),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_enum_does_not_erase_callable_void_return() {
+        let mut inference = Inference::new(&[], &[]).unwrap();
+        assert!(
+            inference
+                .constrain_partial(
+                    &generic("Option", vec![Type::Fn(vec![], Box::new(Type::I64))]),
+                    &generic("Option", vec![Type::Fn(vec![], Box::new(Type::Void))]),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_inference_rejects_void_value_arguments() {
+        let params = vec!["T".into()];
+        let mut inference = Inference::new(&params, &[]).unwrap();
+        assert!(
+            inference
+                .constrain_partial(&named("T"), &Type::Void)
+                .is_err()
+        );
     }
 
     #[test]

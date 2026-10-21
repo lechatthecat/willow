@@ -142,3 +142,6 @@ AGENTS.md
 /docs/audits/willow-jz15.110/*
 !/docs/audits/willow-jz15.110/decision.md
 !/docs/audits/willow-jz15.110/implementation-audit.md
+
+# Public generic enum context audit; contains only source-derived evidence.
+!/docs/audits/willow-jz15.105-generic-variant-context.md

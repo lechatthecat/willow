@@ -1406,3 +1406,28 @@ fn sentinel_diagnostics_valid_example_runs() {
         "7\na.b\nnone\n",
     );
 }
+
+#[test]
+fn generic_variant_context_example_runs() {
+    runs(
+        include_str!("../../example/generic_variant_context.wi"),
+        "7\n9\nhello\ntrue\n11\n13\n15\n16\n18\n19\ntrue\n",
+    );
+}
+
+#[test]
+fn generic_variant_context_imported_function_runs() {
+    custom_module_runs(
+        "pub fn choose<T>(o: Option<T>, d: T) -> T { return match o { Some(v) => v, None => d }; }",
+        "import util; fn main() { println(util::choose(Some(21), 0)); println(util::choose(None, 22)); }",
+        "21\n22\n",
+    );
+}
+
+#[test]
+fn generic_variant_context_rejects_concrete_void_payload() {
+    rejects(
+        "fn f<T>(o: Option<Result<i64,T>>, e: T) -> bool { return true; } fn main() { let r: Result<void,String> = Ok(); let x = f(Some(r), \"error\"); }",
+        "argument 1",
+    );
+}

@@ -1,0 +1,23 @@
+// Generic enum parameters supply context before all payload types are known.
+fn value_or<T>(value: Option<T>, fallback: T) -> T {
+    return match value { Some(v) => v, None => fallback };
+}
+fn is_success<T>(value: Result<T, String>) -> bool { return value.is_ok(); }
+fn nested_or<T>(value: Option<Option<T>>, fallback: T) -> T {
+    return match value { Some(inner) => value_or(inner, fallback), None => fallback };
+}
+fn void_success<E>(value: Result<void, E>, error: E) -> bool { return value.is_ok(); }
+fn main() {
+    println(value_or(Some(7), 0));
+    println(value_or(None, 9));
+    println(value_or(Some("hello"), "fallback"));
+    println(is_success(Ok(4)));
+    println(nested_or(Some(None), 11));
+    println(nested_or(Some(Some(13)), 0));
+    let increment: closure(i64) -> Option<i64> = |n: i64| Some(n + 1);
+    println(value_or(increment(14), 0));
+    println(value_or(true ? Some(16) : None, 0));
+    println(value_or(match false { true => Some(17), false => None }, 18));
+    println(nested_or(match true { true => Some(None), false => None }, 19));
+    println(void_success(true ? Ok() : Err("bad"), "error"));
+}

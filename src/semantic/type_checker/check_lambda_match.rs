@@ -762,6 +762,9 @@ impl TypeChecker {
         // `match` nested anywhere inside an arm gets its own context or none,
         // never this one by accident.
         let expected = self.local.match_expected.take();
+        let partial_enum_context = expected
+            .as_ref()
+            .is_some_and(crate::semantic::generic_inference::has_enum_hole);
         let errors_before_match = self.error_generation;
         let scrutinee_ty = self.check_expr(&m.scrutinee);
         if Self::contains_error_type(&scrutinee_ty) {
@@ -1320,10 +1323,13 @@ impl TypeChecker {
 
             // Each arm contributes constraints, including complementary
             // Result<T, void> and Result<void, E> constructors.
-            let arm_ty = if let Some(merged) = result_type
-                .as_ref()
-                .and_then(|existing| self.merge_inferred_enum_types(existing, &arm_ty))
-            {
+            let arm_ty = if let Some(merged) = result_type.as_ref().and_then(|existing| {
+                if partial_enum_context {
+                    crate::semantic::generic_inference::merge_enum_holes(existing, &arm_ty)
+                } else {
+                    self.merge_inferred_enum_types(existing, &arm_ty)
+                }
+            }) {
                 result_type = Some(merged.clone());
                 merged
             } else {
@@ -1340,16 +1346,19 @@ impl TypeChecker {
             match &result_type {
                 None => result_type = Some(arm_ty),
                 // Same type, or a subtype of the arms so far: no change.
-                Some(existing) if self.types_compatible(existing, &arm_ty) => {}
+                Some(existing)
+                    if existing == &arm_ty
+                        || (!partial_enum_context && self.types_compatible(existing, &arm_ty)) => {}
                 Some(existing) => {
-                    if let Some(unified) =
-                        self.unify_to_expected(expected.as_ref(), existing, &arm_ty)
+                    if !partial_enum_context
+                        && let Some(unified) =
+                            self.unify_to_expected(expected.as_ref(), existing, &arm_ty)
                     {
                         // Distinct arm types the destination accepts, e.g. two
                         // classes implementing the returned interface
                         // (willow-jz15.47).
                         result_type = Some(unified);
-                    } else if self.types_compatible(&arm_ty, existing) {
+                    } else if !partial_enum_context && self.types_compatible(&arm_ty, existing) {
                         // A later arm of a supertype widens the result, as a
                         // ternary's branches do.
                         result_type = Some(arm_ty);

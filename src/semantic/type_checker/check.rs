@@ -1547,6 +1547,13 @@ impl TypeChecker {
                     }
                     ann.clone()
                 } else {
+                    if let Expr::Call(call) = &s.init
+                        && matches!(call.callee.as_str(), "Ok" | "Err")
+                        && let Type::Generic(_, args) = &inferred
+                        && args.contains(&Type::Void)
+                    {
+                        self.report_contextless_variant(&call.callee, call.span);
+                    }
                     if let Some(diag) = self.unresolved_generic_enum_diagnostic(
                         &s.init,
                         &inferred,
@@ -2772,6 +2779,9 @@ impl TypeChecker {
                     );
                     return Self::error_type();
                 }
+                if self.report_contextless_variant(name, *span) {
+                    return Self::error_type();
+                }
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -2931,6 +2941,12 @@ impl TypeChecker {
                     return ty;
                 }
 
+                if self.report_contextless_variant(&c.callee, c.span) {
+                    for arg in &c.args {
+                        self.check_expr(&arg.expr);
+                    }
+                    return Self::error_type();
+                }
                 self.push(
                     Diagnostic::new(
                         Severity::Error,

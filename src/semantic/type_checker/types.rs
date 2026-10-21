@@ -81,6 +81,9 @@ pub(crate) fn type_name<N: std::fmt::Display>(ty: &Type<N>) -> String {
                 if &output[start..] == "\0diagnostic-error" {
                     output.truncate(start);
                     output.push_str("<error>");
+                } else if &output[start..] == crate::semantic::generic_inference::ENUM_HOLE {
+                    output.truncate(start);
+                    output.push('_');
                 }
             }
             Part::Type(ty) => match ty {

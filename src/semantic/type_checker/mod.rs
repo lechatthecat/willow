@@ -1289,8 +1289,9 @@ impl TypeChecker {
 
     fn validate_type(&mut self, ty: &Type, span: Span) {
         match ty {
-            // Recovery marker: its cause has already been reported.
-            ty if Self::is_error_type(ty) => {}
+            // Recovery and partial-inference markers are compiler-owned, not source names.
+            ty if Self::is_error_type(ty)
+                || crate::semantic::generic_inference::is_enum_hole(ty) => {}
             Type::Array(element) => {
                 self.check_collection_type_imported("Array", span);
                 self.validate_type(element, span);
@@ -8707,3 +8708,6 @@ mod ticket_69_tests;
 thread_local! {
     static RECOVERY_TYPE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+#[cfg(test)]
+mod generic_variant_tests;

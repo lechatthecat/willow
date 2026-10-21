@@ -244,6 +244,13 @@ impl TypeChecker {
     }
 
     fn check_expr_expecting_inner(&mut self, expr: &Expr, expected: &Type) -> Type {
+        if crate::semantic::generic_inference::has_enum_hole(expected) {
+            return self.check_generic_enum_argument(
+                expr,
+                expected,
+                &HashSet::from([crate::semantic::generic_inference::ENUM_HOLE]),
+            );
+        }
         // Every array element receives the contextual element type, including
         // nested literals and class values stored through an interface.
         if let (Expr::ArrayLiteral(elements, _, _), Type::Array(elem)) = (expr, expected) {
@@ -345,6 +352,30 @@ impl TypeChecker {
         actual
     }
 
+    pub(super) fn report_contextless_variant(&mut self, name: &str, span: Span) -> bool {
+        let enum_name = match name {
+            "Some" | "None" => "Option",
+            "Ok" | "Err" => "Result",
+            _ => return false,
+        };
+        if !self.prelude_variant_name_is_unshadowed(name) {
+            return false;
+        }
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0202,
+                format!("shorthand `{name}` needs an expected `{enum_name}` type"),
+            )
+            .with_label(Label::primary(span, "expected enum type required"))
+            .with_help(format!(
+                "add a type annotation or use `{enum_name}::{name}{}`",
+                if name == "None" { "" } else { "(..)" }
+            )),
+        );
+        true
+    }
+
     /// Bare enum variants are contextual prelude shorthands, not privileged
     /// identifiers. Ordinary declarations keep normal lexical precedence.
     pub(super) fn prelude_variant_name_is_unshadowed(&self, name: &str) -> bool {
@@ -360,7 +391,7 @@ impl TypeChecker {
     /// stays `bool`, and BOTH branches are checked expecting `expected`, so
     /// contextual forms (unqualified enum variants, contextually-typed lambdas,
     /// nested ternaries) resolve inside the branches (willow-ok7f).
-    fn check_ternary_expecting(&mut self, t: &TernaryExpr, expected: &Type) -> Type {
+    pub(super) fn check_ternary_expecting(&mut self, t: &TernaryExpr, expected: &Type) -> Type {
         let errors_before = self.error_generation;
         let cond_ty = self.check_expr(&t.condition);
         if cond_ty != Type::Bool
@@ -384,10 +415,17 @@ impl TypeChecker {
         }
         let then_ty = self.check_expr_expecting(&t.then_expr, expected);
         let else_ty = self.check_expr_expecting(&t.else_expr, expected);
-        if let Some(unified_ty) = self
-            .unify_ternary_types(&then_ty, &else_ty)
-            .or_else(|| self.unify_to_expected(Some(expected), &then_ty, &else_ty))
-        {
+        let unified = if crate::semantic::generic_inference::has_enum_hole(expected) {
+            match (&then_ty, &else_ty) {
+                (Type::Never, _) => Some(else_ty.clone()),
+                (_, Type::Never) => Some(then_ty.clone()),
+                _ => crate::semantic::generic_inference::merge_enum_holes(&then_ty, &else_ty),
+            }
+        } else {
+            self.unify_ternary_types(&then_ty, &else_ty)
+                .or_else(|| self.unify_to_expected(Some(expected), &then_ty, &else_ty))
+        };
+        if let Some(unified_ty) = unified {
             self.validate_type(&unified_ty, t.span);
             unified_ty
         } else {
@@ -439,7 +477,7 @@ impl TypeChecker {
         self.expected_qualified_variant(name, expected)
     }
 
-    fn expected_qualified_variant(
+    pub(super) fn expected_qualified_variant(
         &self,
         name: &str,
         expected: &Type,
@@ -462,13 +500,16 @@ impl TypeChecker {
                 if info.type_params.is_empty() {
                     return None;
                 }
-                let instantiated = info.instantiate(type_args);
-                let variant = instantiated.variants.iter().find(|v| v.name == name)?;
-                Some((
-                    enum_name.clone(),
-                    variant.payload_types.clone(),
-                    expected.clone(),
-                ))
+                let variant = info.variants.iter().find(|v| v.name == name)?;
+                let bindings: HashMap<_, _> = info.type_params.iter().zip(type_args).collect();
+                let payloads = variant
+                    .payload_types
+                    .iter()
+                    .map(|ty| {
+                        ty.substitute_names(|name| bindings.get(name).map(|ty| (*ty).clone()))
+                    })
+                    .collect();
+                Some((enum_name.clone(), payloads, expected.clone()))
             }
             _ => None,
         }
