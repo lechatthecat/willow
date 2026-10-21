@@ -14,9 +14,9 @@ The `willow` CLI exposes compiler-resolved program structure as commands:
 
 | Command | Answers |
 | --- | --- |
-| `willow refs SELECTOR` | every reference to a symbol, including same-named fields of other types |
+| `willow refs SELECTOR` | every compiler-resolved reference to a symbol, even when other types have fields with the same name |
 | `willow rename SELECTOR NEW_NAME` | a project-wide rename with collision checks (`--dry-run --diff` previews it) |
-| `willow impact SELECTOR` | the definitions, implementations, direct callers and indirect callers to edit after a signature change |
+| `willow impact SELECTOR` | definitions and implementations plus direct and indirect callers affected by a signature change |
 | `willow effects SELECTOR` | whether a function may suspend, take a lock or allocate, with evidence locations |
 | `willow type SELECTOR` / `willow symbol SELECTOR` | inferred types and declarations, including locals (`module::function::local`) |
 | `willow overview` | a bounded outline of the project |
