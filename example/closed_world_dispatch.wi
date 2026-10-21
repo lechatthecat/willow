@@ -1,0 +1,25 @@
+// A complete build proves each interface method has one implementation.
+interface Work {
+    fn update(self, n: &mut i64);
+    fn value(self, x: f64) -> f64;
+    fn label(self) -> String;
+    fn same(self) -> Self;
+    fn get(self) -> i64;
+}
+class Item implements Work {
+    pub name: String;
+    pub fn update(self, n: &mut i64) { n = n + 2; }
+    pub fn value(self, x: f64) -> f64 { return x + 0.5; }
+    pub fn label(self) -> String { gc_collect(); return self.name + "!"; }
+    pub fn same(self) -> Item { gc_collect(); return self; }
+    pub fn get(self) -> i64 { return 7; }
+}
+fn run(w: Work) {
+    let mut n = 10;
+    w.update(&n);
+    println(n);
+    println(w.value(1.5));
+    println(w.label());
+    println(w.same().get());
+}
+fn main() { run(new Item("item")); }

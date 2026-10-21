@@ -235,6 +235,132 @@ mod tests {
     }
 
     #[test]
+    fn closed_world_interface_ir_and_analysis_scale() {
+        use super::super::emit_interface::INTERFACE_WORK;
+        for targets in [1, 2, 4, 5, 32] {
+            for sites in [1, 8, 32] {
+                let classes: String = (0..targets).map(|i| format!(
+                    "class C{i} implements Value {{ pub fn get(self) -> i64 {{ return {i}; }} }}"
+                )).collect();
+                let source = format!(
+                    "interface Value {{ fn get(self) -> i64; }} {classes}
+                    fn probe(v: Value) -> i64 {{ let mut n = 0; {} return n; }} fn main() {{}}",
+                    "n = n + v.get();".repeat(sites)
+                );
+                INTERFACE_WORK.with(|w| w.set([0; 2]));
+                let functions = compiled_functions(&source);
+                assert_eq!(INTERFACE_WORK.with(|w| w.get()), [sites, targets]);
+                let indirect = functions
+                    .iter()
+                    .flat_map(|f| {
+                        f.layout.blocks().flat_map(move |b| {
+                            f.layout.block_insts(b).map(move |i| &f.dfg.insts[i])
+                        })
+                    })
+                    .filter(|i| i.opcode() == Opcode::CallIndirect)
+                    .count();
+                let addresses = functions
+                    .iter()
+                    .flat_map(|f| {
+                        f.layout.blocks().flat_map(move |b| {
+                            f.layout.block_insts(b).map(move |i| &f.dfg.insts[i])
+                        })
+                    })
+                    .filter(|i| i.opcode() == Opcode::FuncAddr)
+                    .count();
+                assert_eq!(indirect, if targets == 1 { 0 } else { sites });
+                // Only guarded dispatch materializes target addresses.
+                assert_eq!(
+                    addresses,
+                    if (2..=4).contains(&targets) {
+                        targets * sites
+                    } else {
+                        0
+                    }
+                );
+                eprintln!(
+                    "closed-world targets={targets} sites={sites} queries={sites} slot_visits={targets} indirect={indirect} guards={addresses}"
+                );
+                if targets == 1 && sites == 1 {
+                    for f in &functions {
+                        eprintln!("{}", f.display());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn closed_world_open_singleton_bypasses_redispatch_thunk() {
+        for extra in ["", "class Child extends C {}"] {
+            let functions = compiled_functions(&format!(
+                "interface Value {{ fn get(self) -> i64; }}
+                 open class C implements Value {{ pub open fn get(self) -> i64 {{ return 7; }} }}
+                 {extra} fn probe(v: Value) -> i64 {{ return v.get(); }} fn main() {{}}"
+            ));
+            // Thunks are defined separately, outside body layout capture.
+            assert!(
+                !functions
+                    .iter()
+                    .flat_map(|f| f
+                        .layout
+                        .blocks()
+                        .flat_map(move |b| f.layout.block_insts(b).map(move |i| &f.dfg.insts[i])))
+                    .any(|i| i.opcode() == Opcode::CallIndirect)
+            );
+        }
+    }
+
+    #[test]
+    fn closed_world_shared_thunk_analysis_chain_fanout_and_methods() {
+        use super::super::emit_interface::{DESCENDANT_WORK, INTERFACE_WORK};
+        for chain in [false, true] {
+            for types in [8, 32, 128] {
+                for methods in [1, 4] {
+                    let declarations: String = (0..methods)
+                        .map(|m| format!("fn m{m}(self) -> i64;"))
+                        .collect();
+                    let bodies: String = (0..methods)
+                        .map(|m| format!("pub open fn m{m}(self) -> i64 {{ return {m}; }}"))
+                        .collect();
+                    let mut source = format!(
+                        "interface Value {{ {declarations} }} open class C0 implements Value {{ {bodies} }}"
+                    );
+                    for i in 1..types {
+                        let parent = if chain { i - 1 } else { 0 };
+                        source.push_str(&format!("open class C{i} extends C{parent} {{}}"));
+                    }
+                    for f in 0..4 {
+                        let calls: String = (0..methods)
+                            .map(|m| format!("n = n + v.m{m}();").repeat(8))
+                            .collect();
+                        source.push_str(&format!(
+                            "fn probe{f}(v: Value) -> i64 {{ let mut n = 0; {calls} return n; }}"
+                        ));
+                    }
+                    source.push_str("fn main() {}");
+                    INTERFACE_WORK.with(|w| w.set([0; 2]));
+                    DESCENDANT_WORK.with(|w| w.set([0; 2]));
+                    compiled_functions(&source);
+                    assert_eq!(INTERFACE_WORK.with(|w| w.get()), [32 * methods, methods]);
+                    assert_eq!(
+                        DESCENDANT_WORK.with(|w| w.get()),
+                        [types - 1, (types - 1) * methods]
+                    );
+                    eprintln!(
+                        "closed-world shape={} types={types} methods={methods} calls={} slot_visits={} built_edges={} visited_edges={}",
+                        if chain { "chain" } else { "fanout" },
+                        32 * methods,
+                        INTERFACE_WORK.with(|w| w.get()[1]),
+                        types - 1,
+                        (types - 1) * methods
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn stack_helper_publications_do_not_scale_with_runtime_call_sites() {
         use cranelift_codegen::ir::{InstructionData, ValueDef};
         let mut baseline = None;

@@ -2633,14 +2633,15 @@ impl UnitCodegenContext<'_> {
                 .classes()
                 .slots(class_name)
                 .and_then(|slots| slots.slot_of(method_name));
-            // A thunk's runtime target is any override below this class, so
-            // the slot summary records it as unknown (willow-8hq4.14).
+            // Keep the static class for a thunk. Body-time closed-world
+            // analysis can resolve it only after every unit is declared.
             let target = match (&symbol, func_id, vslot) {
-                (Some(symbol), Some(_), None) => {
+                (Some(symbol), Some(_), _) => {
                     let id = self.func_ids.scope().lookup_id(symbol);
                     Some(super::SlotTarget {
                         id,
-                        roots_receiver: !self.async_methods.contains(&id),
+                        virtual_class: vslot.map(|_| TypeId::from_source_name(class_name)),
+                        roots_receiver: vslot.is_none() && !self.async_methods.contains(&id),
                     })
                 }
                 _ => None,

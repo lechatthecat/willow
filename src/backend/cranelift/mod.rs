@@ -43,10 +43,12 @@ thread_local! {
     static INSTANTIATION_ALIAS_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// One direct method body an interface vtable slot points at.
+/// One interface slot body, or the static class of its re-dispatching thunk.
 #[derive(Clone, Copy, Debug)]
 struct SlotTarget {
     id: FunctionId,
+    /// Static class of a re-dispatching slot; resolve only after all declarations.
+    virtual_class: Option<TypeId>,
     /// A synchronous method roots `self` on entry before its first safepoint,
     /// or never reaches one; an async constructor allocates its frame first.
     roots_receiver: bool,
@@ -164,8 +166,7 @@ struct EmissionState {
     string_literals: HashMap<String, StringLiteralData>,
     string_counter: usize,
     runtime_declared: bool,
-    interface_slot_summaries:
-        std::cell::RefCell<HashMap<(TypeId, String), emit_interface::InterfaceSlotSummary>>,
+    interface_slot_summaries: std::cell::RefCell<emit_interface::InterfaceAnalysis>,
     unit_static_inits: HashMap<InitUnitId, UnitStaticInit>,
     gc_bitmap_descriptors: HashMap<Vec<u64>, (DataId, u64)>,
     gc_layout_descriptors: HashMap<willow_abi::GcLayoutDescriptor, DataId>,
@@ -1518,8 +1519,7 @@ struct FuncGen<'a, 'b> {
     /// Static `(class, interface)` vtable data objects for class→interface boxing.
     vtable_ids: &'a VtableMap<'a, DataId>,
     interface_slot_targets: &'a InterfaceSlotTargets,
-    interface_slot_summaries:
-        &'a std::cell::RefCell<HashMap<(TypeId, String), emit_interface::InterfaceSlotSummary>>,
+    interface_slot_summaries: &'a std::cell::RefCell<emit_interface::InterfaceAnalysis>,
     /// When emitting a cooperative poll fn: the async frame pointer, so a
     /// `return` inside nested statement control flow (e.g. a statement-position
     /// match arm, willow-zvkv) stores the result and returns the Ready status

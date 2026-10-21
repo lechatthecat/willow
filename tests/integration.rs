@@ -357,3 +357,6 @@ mod imported_error_identity;
 
 #[path = "integration/memberwise_owner.rs"]
 mod memberwise_owner;
+
+#[path = "integration/closed_world_dispatch.rs"]
+mod closed_world_dispatch;

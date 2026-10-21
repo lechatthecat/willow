@@ -184,3 +184,12 @@ AGENTS.md
 !/docs/audits/willow-8hq4.39/audit.md
 !/docs/audits/willow-8hq4.39/measure.py
 !/docs/audits/willow-8hq4.39/results.json
+
+# Reviewed public evidence for closed-world dispatch (willow-8hq4.34).
+!/docs/audits/willow-8hq4.34/
+/docs/audits/willow-8hq4.34/*
+!/docs/audits/willow-8hq4.34/audit.md
+!/docs/audits/willow-8hq4.34/benchmark.md
+!/docs/audits/willow-8hq4.34/benchmark.jsonl
+!/docs/audits/willow-8hq4.34/analysis.txt
+!/docs/audits/willow-8hq4.34/reproduce.sh

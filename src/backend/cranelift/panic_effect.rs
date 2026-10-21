@@ -315,8 +315,13 @@ impl FuncGen<'_, '_> {
         interface: TypeId,
         method: &str,
     ) -> super::emit_interface::InterfaceSlotSummary {
+        #[cfg(test)]
+        super::emit_interface::INTERFACE_WORK.with(|w| {
+            let [q, v] = w.get();
+            w.set([q + 1, v]);
+        });
         let key = (interface, method.to_string());
-        if let Some(&cached) = self.interface_slot_summaries.borrow().get(&key) {
+        if let Some(&cached) = self.interface_slot_summaries.borrow().slots.get(&key) {
             return cached;
         }
         let mut summary = super::emit_interface::InterfaceSlotSummary {
@@ -324,7 +329,8 @@ impl FuncGen<'_, '_> {
             may_panic: !optimization_enabled(),
             needs_receiver_root: false,
         };
-        let mut target_count = 0;
+        let mut candidates = super::emit_interface::InterfaceCandidates::default();
+        let mut has_thunk = false;
         match self.interface_slot_targets.get(&key) {
             None => {
                 summary.may_panic = true;
@@ -332,10 +338,15 @@ impl FuncGen<'_, '_> {
             }
             Some(targets) => {
                 for target in targets {
+                    #[cfg(test)]
+                    super::emit_interface::INTERFACE_WORK.with(|w| {
+                        let [q, v] = w.get();
+                        w.set([q, v + 1]);
+                    });
                     let Some(target) = target else {
                         summary.may_panic = true;
                         summary.needs_receiver_root = true;
-                        summary.direct_targets = [None; 4];
+                        candidates.add(None);
                         break;
                     };
                     summary.may_panic |= self
@@ -344,23 +355,30 @@ impl FuncGen<'_, '_> {
                         .copied()
                         .unwrap_or(true);
                     summary.needs_receiver_root |= !target.roots_receiver;
-                    if target_count <= summary.direct_targets.len()
-                        && let Some(&fid) = self.func_ids.get_id(&target.id)
-                        && !summary.direct_targets.contains(&Some(fid))
-                    {
-                        if target_count < summary.direct_targets.len() {
-                            summary.direct_targets[target_count] = Some(fid);
-                        }
-                        target_count += 1;
-                    }
+                    let fid = if let Some(class) = target.virtual_class {
+                        // Slots contain a thunk, but a complete build may prove
+                        // that every object reaching it uses the same body.
+                        // Do not promote that body behind an address guard:
+                        // it differs from the actual thunk address.
+                        summary.may_panic = true;
+                        has_thunk = true;
+                        self.exact_interface_virtual_target(class, method)
+                    } else {
+                        self.func_ids.get_id(&target.id).copied()
+                    };
+                    candidates.add(fid);
                 }
             }
         }
-        if target_count > summary.direct_targets.len() {
+        summary.direct_targets = candidates.ordered();
+        if has_thunk && summary.direct_targets[1].is_some() {
+            // These are body addresses, not thunk slot addresses: only the
+            // unguarded singleton proof can use them.
             summary.direct_targets = [None; 4];
         }
         self.interface_slot_summaries
             .borrow_mut()
+            .slots
             .insert(key, summary);
         summary
     }

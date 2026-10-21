@@ -255,16 +255,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if !receiver_prepared {
             self.emit_interface_dispatch_nil_check(obj, span, method);
         }
-        let fnptr = self.builder.ins().load(
-            reference_type(self.module.target_config()),
-            MemFlagsData::new(),
-            vtable,
-            willow_abi::dispatch_layout::table_slot_offset(
-                slot as u32,
-                reference_type(self.module.target_config()).bytes(),
-            ) as i32,
-        );
-
         let slots = self.interface_slot_summary(info.name, method);
         // Pin the hidden receiver even when the interface pair is held only by
         // an async frame's interior slot. Nothing between this load and the
@@ -322,37 +312,72 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             [None; 4]
         };
-        for fid in direct_targets.into_iter().flatten() {
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            // Only promote calls with exactly the same lowered ABI.
-            let target_sig = self.builder.func.dfg.ext_funcs[fref].signature;
-            if self.builder.func.dfg.signatures[target_sig]
-                != self.builder.func.dfg.signatures[sig_ref]
-            {
-                continue;
-            }
-            let addr = self.builder.ins().func_addr(ptr_ty, fref);
-            let matches = self.builder.ins().icmp(
-                cranelift_codegen::ir::condcodes::IntCC::Equal,
-                fnptr,
-                addr,
-            );
-            let direct = self.builder.create_block();
-            let next = self.builder.create_block();
-            self.builder.ins().brif(matches, direct, &[], next, &[]);
-            self.builder.switch_to_block(direct);
-            self.builder.seal_block(direct);
+        // A complete singleton needs neither a slot load nor an address guard.
+        // ABI disagreement deliberately falls back to the original indirect path.
+        let exact = if direct_targets[1].is_none() {
+            direct_targets[0].and_then(|fid| {
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                let target_sig = self.builder.func.dfg.ext_funcs[fref].signature;
+                (self.builder.func.dfg.signatures[target_sig]
+                    == self.builder.func.dfg.signatures[sig_ref])
+                    .then_some(fref)
+            })
+        } else {
+            None
+        };
+        if let Some(fref) = exact {
             let call = self.builder.ins().call(fref, &call_args);
+            let values = self
+                .builder
+                .inst_results(call)
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect::<Vec<_>>();
+            self.builder.ins().jump(merge, &values);
+        } else {
+            let fnptr = self.builder.ins().load(
+                reference_type(self.module.target_config()),
+                MemFlagsData::new(),
+                vtable,
+                willow_abi::dispatch_layout::table_slot_offset(
+                    slot as u32,
+                    reference_type(self.module.target_config()).bytes(),
+                ) as i32,
+            );
+
+            for fid in direct_targets.into_iter().flatten() {
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                // Only promote calls with exactly the same lowered ABI.
+                let target_sig = self.builder.func.dfg.ext_funcs[fref].signature;
+                if self.builder.func.dfg.signatures[target_sig]
+                    != self.builder.func.dfg.signatures[sig_ref]
+                {
+                    continue;
+                }
+                let addr = self.builder.ins().func_addr(ptr_ty, fref);
+                let matches = self.builder.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    fnptr,
+                    addr,
+                );
+                let direct = self.builder.create_block();
+                let next = self.builder.create_block();
+                self.builder.ins().brif(matches, direct, &[], next, &[]);
+                self.builder.switch_to_block(direct);
+                self.builder.seal_block(direct);
+                let call = self.builder.ins().call(fref, &call_args);
+                let values = self.builder.inst_results(call).to_vec();
+                let values = values.iter().copied().map(Into::into).collect::<Vec<_>>();
+                self.builder.ins().jump(merge, &values);
+                self.builder.switch_to_block(next);
+                self.builder.seal_block(next);
+            }
+            let call = self.builder.ins().call_indirect(sig_ref, fnptr, &call_args);
             let values = self.builder.inst_results(call).to_vec();
             let values = values.iter().copied().map(Into::into).collect::<Vec<_>>();
             self.builder.ins().jump(merge, &values);
-            self.builder.switch_to_block(next);
-            self.builder.seal_block(next);
         }
-        let call = self.builder.ins().call_indirect(sig_ref, fnptr, &call_args);
-        let values = self.builder.inst_results(call).to_vec();
-        let values = values.iter().copied().map(Into::into).collect::<Vec<_>>();
-        self.builder.ins().jump(merge, &values);
         self.builder.switch_to_block(merge);
         self.builder.seal_block(merge);
         let mut result = if result_ty.is_some() {

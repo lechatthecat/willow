@@ -5,10 +5,11 @@ use super::*;
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static INTERFACE_WORK: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
     // Candidate queries and defining-class visits, isolated per compiler thread.
     static DISPATCH_WORK: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
     // Reverse edges built and visited, independent of class-name aliases.
-    static DESCENDANT_WORK: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+    pub(super) static DESCENDANT_WORK: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
 /// Snapshot-local memoization: scoped metadata is immutable for the cache lifetime. Keep source spellings as keys/results so scoped
@@ -76,11 +77,26 @@ pub(super) struct DispatchCache {
     fallback: HashMap<String, (DispatchSummary, Option<String>)>,
 }
 
+/// Build-wide interface proofs use canonical identities, never caller aliases.
+#[derive(Default)]
+pub(super) struct InterfaceAnalysis {
+    pub(super) slots: HashMap<(TypeId, String), InterfaceSlotSummary>,
+    defining: DefiningClassCache,
+    hierarchy: Option<std::rc::Rc<DispatchHierarchy>>,
+}
+
+impl InterfaceAnalysis {
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// What every function an interface method's vtable slots can hold has in
 /// common (willow-8hq4.14).
 #[derive(Clone, Copy)]
 pub(super) struct InterfaceSlotSummary {
-    /// At most four guarded direct calls per site bound both code growth and
+    /// A complete singleton is unguarded; at most four guarded calls otherwise
+    /// bound both code growth and
     /// runtime comparisons, independently of the number of implementers.
     /// Excess polymorphism keeps indirect dispatch rather than selecting an
     /// arbitrary subset without profile evidence.
@@ -89,6 +105,52 @@ pub(super) struct InterfaceSlotSummary {
     /// Whether the call site must root the receiver because some target does
     /// not root it before its first safepoint.
     pub(super) needs_receiver_root: bool,
+}
+
+/// Bounded union of proven targets. Unknown or excessive polymorphism
+/// poisons the proof permanently. Counts are static slot multiplicity, not a
+/// runtime profile; ties use declaration IDs for deterministic guard ordering.
+#[derive(Default)]
+pub(super) struct InterfaceCandidates {
+    entries: [Option<(FuncId, usize)>; 4],
+    incomplete: bool,
+}
+
+impl InterfaceCandidates {
+    pub(super) fn add(&mut self, target: Option<FuncId>) {
+        if self.incomplete {
+            return;
+        }
+        let Some(target) = target else {
+            self.incomplete = true;
+            return;
+        };
+        for entry in &mut self.entries {
+            match entry {
+                Some((id, count)) if *id == target => {
+                    *count += 1;
+                    return;
+                }
+                None => {
+                    *entry = Some((target, 1));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.incomplete = true;
+    }
+
+    pub(super) fn ordered(mut self) -> [Option<FuncId>; 4] {
+        if self.incomplete {
+            return [None; 4];
+        }
+        self.entries.sort_by_key(|entry| match entry {
+            Some((id, count)) => (std::cmp::Reverse(*count), id.as_u32()),
+            None => (std::cmp::Reverse(0), u32::MAX),
+        });
+        self.entries.map(|entry| entry.map(|(id, _)| id))
+    }
 }
 
 /// The questions code generation needs form a constant-size summary, not a
@@ -226,6 +288,71 @@ pub(super) struct VirtualCallPlan {
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Resolve a thunk's complete receiver subtree once in canonical id space.
+    /// This cache is shared across units; a local alias must never rebind an
+    /// entry-program class while proving an imported function's call target.
+    pub(super) fn exact_interface_virtual_target(
+        &self,
+        class: TypeId,
+        method: &str,
+    ) -> Option<FuncId> {
+        let receiver = self.classes.type_id_canonical(&class)?;
+        let hierarchy = {
+            let mut analysis = self.interface_slot_summaries.borrow_mut();
+            analysis
+                .hierarchy
+                .get_or_insert_with(|| {
+                    std::rc::Rc::new(DispatchHierarchy::new(
+                        self.classes.runtime_classes(),
+                        |name| {
+                            self.classes
+                                .base_canonical(name)
+                                .and_then(|base| self.classes.type_id_canonical(&base))
+                        },
+                    ))
+                })
+                .clone()
+        };
+        let summary = hierarchy.summary(receiver, method, |name| {
+            let defining =
+                self.interface_slot_summaries
+                    .borrow_mut()
+                    .defining
+                    .resolve(name, method, |name| {
+                        let class = TypeId::from_source_name(name);
+                        let defines = self
+                            .func_ids
+                            .get_id(&FunctionId::method(class, method))
+                            .is_some();
+                        (
+                            defines,
+                            if defines {
+                                None
+                            } else {
+                                self.classes
+                                    .base_canonical(&class)
+                                    .map(|base| base.to_string())
+                            },
+                        )
+                    });
+            let first = defining.and_then(|name| {
+                self.func_ids
+                    .get_id(&FunctionId::method(TypeId::from_source_name(&name), method))
+                    .copied()
+            });
+            DispatchSummary {
+                first,
+                multiple: first.is_none(),
+                may_panic: true,
+            }
+        });
+        if summary.multiple {
+            None
+        } else {
+            summary.first
+        }
+    }
+
     /// Defense-in-depth check for the two raw pointers used by interface
     /// dispatch: the vtable and concrete object. Safe Willow code cannot
     /// construct either invalid value, but checking this ABI boundary keeps
@@ -617,6 +744,39 @@ pub(super) mod tests {
     use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
     use super::*;
+
+    #[test]
+    fn interface_candidates_complete_bounded_and_frequency_ordered() {
+        let id = FuncId::from_u32;
+        let cases = [
+            (vec![], vec![]),
+            (vec![Some(1)], vec![1]),
+            (vec![Some(1), Some(1)], vec![1]),
+            (vec![Some(2), Some(1)], vec![1, 2]),
+            (vec![Some(1), Some(2), Some(2)], vec![2, 1]),
+            (vec![Some(3), Some(2), Some(1)], vec![1, 2, 3]),
+            (vec![Some(4), Some(3), Some(2), Some(1)], vec![1, 2, 3, 4]),
+            (vec![Some(1), Some(2), Some(3), Some(4), Some(5)], vec![]),
+            (vec![None], vec![]),
+            (vec![None, Some(1)], vec![]),
+            (vec![Some(1), None], vec![]),
+            (vec![Some(1), None, Some(1)], vec![]),
+        ];
+        for (input, expected) in cases {
+            let mut candidates = InterfaceCandidates::default();
+            for target in input {
+                candidates.add(target.map(id));
+            }
+            assert_eq!(
+                candidates
+                    .ordered()
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+                expected.into_iter().map(id).collect::<Vec<_>>()
+            );
+        }
+    }
 
     /// The ancestry perspectives below run in `type_id` space, because that is
     /// what the emitted dispatch chain compares and what collapses a class's
