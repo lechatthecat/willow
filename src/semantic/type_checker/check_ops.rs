@@ -127,7 +127,7 @@ impl TypeChecker {
     }
 
     fn finish_binary(&mut self, b: &BinaryExpr, lty: Type, rty: Type) -> Type {
-        if Self::is_error_type(&lty) || Self::is_error_type(&rty) {
+        if Self::contains_error_type(&lty) || Self::contains_error_type(&rty) {
             return Self::error_type();
         }
         match &b.op {
@@ -418,7 +418,7 @@ impl TypeChecker {
     }
 
     fn finish_unary(&mut self, u: &UnaryExpr, ty: Type) -> Type {
-        if Self::is_error_type(&ty) {
+        if Self::contains_error_type(&ty) {
             return Self::error_type();
         }
         match &u.op {

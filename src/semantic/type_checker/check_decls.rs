@@ -711,6 +711,15 @@ impl TypeChecker {
             .resolve_static_call_class_name(&n.class_name, n.span)
             .unwrap_or_else(|| n.class_name.clone());
 
+        // Generic expansion already reported the invalid constructor type.
+        // Keep independent argument errors, but do not look up the recovery marker.
+        if Self::is_error_name(&resolved) {
+            for arg in &n.args {
+                self.check_expr(&arg.expr);
+            }
+            return Self::error_type();
+        }
+
         let Some(class) = self.symbols.lookup_class(&resolved).cloned() else {
             // No signature exists to provide argument context, but still check
             // every argument so its independent diagnostics are preserved.

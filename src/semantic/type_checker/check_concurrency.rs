@@ -62,7 +62,10 @@ impl TypeChecker {
                             super::async_retention::Key::Value(value.id()),
                         );
                     }
-                    if elem != Type::Void && v_ty != elem {
+                    if elem != Type::Void
+                        && v_ty != elem
+                        && !self.recovery_types_compatible(&elem, &v_ty)
+                    {
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -79,7 +82,7 @@ impl TypeChecker {
                 }
                 SelectCaseKind::Timeout { millis } => {
                     let ms_ty = self.check_expr(millis);
-                    if ms_ty != Type::I64 {
+                    if ms_ty != Type::I64 && !Self::contains_error_type(&ms_ty) {
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -119,6 +122,7 @@ impl TypeChecker {
                     // therefore classified consistently (willow-qrj9).
                     let (output_ty, cancel_aware) = match awaitable_task_type(&task_ty) {
                         Some(shape) => shape,
+                        None if Self::contains_error_type(&task_ty) => (Self::error_type(), false),
                         None => {
                             self.push(
                                 Diagnostic::new(
@@ -204,6 +208,9 @@ impl TypeChecker {
                 match call.method.as_str() {
                     "is_some" | "is_none" => {
                         if !call.args.is_empty() {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -217,6 +224,9 @@ impl TypeChecker {
                     }
                     "unwrap" => {
                         if !call.args.is_empty() {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -230,6 +240,9 @@ impl TypeChecker {
                     }
                     "expect" => {
                         if call.args.len() != 1 {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -243,7 +256,7 @@ impl TypeChecker {
                             );
                         } else {
                             let msg_ty = self.check_expr(&call.args[0].expr);
-                            if msg_ty != Type::String {
+                            if msg_ty != Type::String && !Self::contains_error_type(&msg_ty) {
                                 self.push(
                                     Diagnostic::new(
                                         Severity::Error,
@@ -266,6 +279,9 @@ impl TypeChecker {
                     }
                     "unwrap_or" => {
                         if call.args.len() != 1 {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -303,6 +319,9 @@ impl TypeChecker {
                     }
                     "map" => {
                         if call.args.len() != 1 {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -331,6 +350,11 @@ impl TypeChecker {
                                     }
                                     Some(B::Option.apply(vec![*ret.clone()]))
                                 }
+                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
+                                    && Self::contains_error_type(&f_ty) =>
+                                {
+                                    Some(Self::error_type())
+                                }
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Option::map` expects a function `fn({}) -> U`, found `{}`",
@@ -343,6 +367,9 @@ impl TypeChecker {
                     }
                     "and_then" => {
                         if call.args.len() != 1 {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -371,6 +398,11 @@ impl TypeChecker {
                                     }
                                     Some(*ret.clone())
                                 }
+                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
+                                    && Self::contains_error_type(&f_ty) =>
+                                {
+                                    Some(Self::error_type())
+                                }
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Option::and_then` expects a function `fn({}) -> Option<U>`, found `{}`",
@@ -383,6 +415,9 @@ impl TypeChecker {
                     }
                     "or_else" => {
                         if call.args.len() != 1 {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -405,6 +440,11 @@ impl TypeChecker {
                                 Type::Fn(ref params, ref ret) if params.is_empty() => {
                                     Some(*ret.clone())
                                 }
+                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
+                                    && Self::contains_error_type(&f_ty) =>
+                                {
+                                    Some(Self::error_type())
+                                }
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Option::or_else` expects a function `fn() -> Option<{}>`, found `{}`",
@@ -425,6 +465,9 @@ impl TypeChecker {
                 match call.method.as_str() {
                     "is_ok" | "is_err" => {
                         if !call.args.is_empty() {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -438,6 +481,9 @@ impl TypeChecker {
                     }
                     "unwrap" => {
                         if !call.args.is_empty() {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -451,6 +497,9 @@ impl TypeChecker {
                     }
                     "expect" => {
                         if call.args.len() != 1 {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -464,7 +513,7 @@ impl TypeChecker {
                             );
                         } else {
                             let msg_ty = self.check_expr(&call.args[0].expr);
-                            if msg_ty != Type::String {
+                            if msg_ty != Type::String && !Self::contains_error_type(&msg_ty) {
                                 self.push(
                                     Diagnostic::new(
                                         Severity::Error,
@@ -487,6 +536,9 @@ impl TypeChecker {
                     }
                     "unwrap_or" => {
                         if call.args.len() != 1 {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -524,6 +576,9 @@ impl TypeChecker {
                     }
                     "unwrap_err" => {
                         if !call.args.is_empty() {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -537,6 +592,9 @@ impl TypeChecker {
                     }
                     "map" => {
                         if call.args.len() != 1 {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -568,6 +626,11 @@ impl TypeChecker {
                                         vec![*ret.clone(), err_ty],
                                     ))
                                 }
+                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
+                                    && Self::contains_error_type(&f_ty) =>
+                                {
+                                    Some(Self::error_type())
+                                }
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Result::map` expects a function `fn({}) -> U`, found `{}`",
@@ -580,6 +643,9 @@ impl TypeChecker {
                     }
                     "map_err" => {
                         if call.args.len() != 1 {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -611,6 +677,11 @@ impl TypeChecker {
                                         vec![ok_ty, *ret.clone()],
                                     ))
                                 }
+                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
+                                    && Self::contains_error_type(&f_ty) =>
+                                {
+                                    Some(Self::error_type())
+                                }
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Result::map_err` expects a function `fn({}) -> F`, found `{}`",
@@ -623,6 +694,9 @@ impl TypeChecker {
                     }
                     "and_then" => {
                         if call.args.len() != 1 {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -651,6 +725,11 @@ impl TypeChecker {
                                     }
                                     Some(*ret.clone())
                                 }
+                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
+                                    && Self::contains_error_type(&f_ty) =>
+                                {
+                                    Some(Self::error_type())
+                                }
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Result::and_then` expects a function `fn({}) -> Result<U, E>`, found `{}`",
@@ -663,6 +742,9 @@ impl TypeChecker {
                     }
                     "or_else" => {
                         if call.args.len() != 1 {
+                            for arg in &call.args {
+                                self.check_expr(&arg.expr);
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -690,6 +772,11 @@ impl TypeChecker {
                                             .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
                                     }
                                     Some(*ret.clone())
+                                }
+                                _ if !matches!(f_ty, Type::Fn(..) | Type::Closure(..))
+                                    && Self::contains_error_type(&f_ty) =>
+                                {
+                                    Some(Self::error_type())
                                 }
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
@@ -777,7 +864,10 @@ impl TypeChecker {
         }
         if let (Some(expected), Some(arg)) = (arg_ty, call.args.first()) {
             let got = self.check_expr(&arg.expr);
-            if got != expected && got != Type::Never {
+            if got != expected
+                && got != Type::Never
+                && !self.recovery_types_compatible(&expected, &got)
+            {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -848,7 +938,10 @@ impl TypeChecker {
                 continue;
             };
             let got = self.check_expr(&arg.expr);
-            if &got != expected && got != Type::Never {
+            if &got != expected
+                && got != Type::Never
+                && !self.recovery_types_compatible(expected, &got)
+            {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -972,7 +1065,9 @@ impl TypeChecker {
                         Type::Void
                     } else {
                         let task_ty = self.check_expr(&call.args[0].expr);
-                        if !is_task_handle_type(&task_ty) {
+                        if !is_task_handle_type(&task_ty) && Self::contains_error_type(&task_ty) {
+                            Self::error_type()
+                        } else if !is_task_handle_type(&task_ty) {
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,

@@ -363,13 +363,16 @@ impl TypeChecker {
     fn check_ternary_expecting(&mut self, t: &TernaryExpr, expected: &Type) -> Type {
         let errors_before = self.error_generation;
         let cond_ty = self.check_expr(&t.condition);
-        if cond_ty != Type::Bool && self.error_generation == errors_before {
+        if cond_ty != Type::Bool
+            && self.error_generation == errors_before
+            && !Self::contains_error_type(&cond_ty)
+        {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0901,
                     format!(
-                        "ternary condition must be `bool`, found `{}`",
+                        "if-expression condition must be `bool`, found `{}`",
                         type_name(&cond_ty)
                     ),
                 )
@@ -1075,7 +1078,7 @@ impl TypeChecker {
         }
         for (i, arg) in args.iter().enumerate() {
             let ty = self.check_expr(&arg.expr);
-            if Self::is_error_type(&ty) {
+            if Self::contains_error_type(&ty) {
                 continue;
             }
             match placeholders.get(i) {

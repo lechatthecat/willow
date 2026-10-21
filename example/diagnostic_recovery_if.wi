@@ -1,0 +1,28 @@
+// Valid counterparts of generic-constructor and if-expression recovery cases.
+class Gen<T> {
+    pub value: T;
+    pub static fn make(x: T) -> Gen<T> { return new Gen<T>(x); }
+}
+fn choose(s: String) -> String {
+    let i = s.find(".");
+    return if i > 0 { s } else { "none" };
+}
+fn propagate() -> Option<i64> {
+    let value = Option::Some(7)?;
+    return Some(value);
+}
+async fn main() {
+    let mutex = Mutex::new(0);
+    lock mutex as mut protected { protected = protected + 1; }
+    let value = Gen<i64>::make(7);
+    let selected: i64 = if value.value > 0 { value.value } else { 0 };
+    let xs = [0];
+    xs[0] = selected;
+    let mut total = 0;
+    for i in 0..1 { total = total + xs[i]; }
+    let _ = propagate();
+    select { sleep(0) => {} }
+    println(Option::Some(total).expect("present"));
+    println(choose("a.b"));
+    println(choose("abc"));
+}

@@ -891,6 +891,7 @@ impl TypeChecker {
     fn select_channel_elem(&mut self, ch_ty: &Type, span: Span) -> Type {
         match channel_element_type(ch_ty) {
             Some(t) => t,
+            None if Self::contains_error_type(ch_ty) => Self::error_type(),
             None => {
                 self.push(
                     Diagnostic::new(
@@ -1087,6 +1088,9 @@ impl TypeChecker {
     }
 
     fn unify_ternary_types(&self, then_ty: &Type, else_ty: &Type) -> Option<Type> {
+        if Self::contains_error_type(then_ty) || Self::contains_error_type(else_ty) {
+            return Some(Self::error_type());
+        }
         if then_ty == else_ty {
             return Some(then_ty.clone());
         }
@@ -1182,6 +1186,48 @@ impl TypeChecker {
     fn is_error_type(ty: &Type) -> bool {
         matches!(ty, Type::Named(name) if Self::is_error_name(name))
     }
+    /// Diagnostic consumers cannot use a partially recovered compound type either.
+    /// Keep this separate from structural compatibility: a valid sibling type
+    /// must still be checked when only one component is erroneous.
+    fn contains_error_type(ty: &Type) -> bool {
+        let mut current = ty;
+        let mut pending: Vec<&[Type]> = Vec::new();
+        loop {
+            let ty = current;
+            #[cfg(test)]
+            RECOVERY_TYPE_VISITS.with(|visits| visits.set(visits.get() + 1));
+            match ty {
+                Type::Named(name) if Self::is_error_name(name) => return true,
+                Type::Array(element) => {
+                    current = element;
+                    continue;
+                }
+                Type::Generic(name, args) => {
+                    if Self::is_error_name(name) {
+                        return true;
+                    }
+                    pending.push(args);
+                }
+                Type::Fn(params, result) | Type::Closure(params, result) => {
+                    pending.push(std::slice::from_ref(result.as_ref()));
+                    pending.push(params);
+                }
+                _ => {}
+            }
+            loop {
+                let Some(siblings) = pending.last_mut() else {
+                    return false;
+                };
+                if let Some((next, rest)) = siblings.split_first() {
+                    current = next;
+                    *siblings = rest;
+                    break;
+                }
+                pending.pop();
+            }
+        }
+    }
+
     fn is_error_name(name: &str) -> bool {
         name == "\0diagnostic-error"
     }
@@ -1532,6 +1578,13 @@ impl TypeChecker {
         )
     }
 
+    // Exact-type builtin contracts stay exact for valid values. On recovery,
+    // compare known components so unrelated sibling mismatches remain visible.
+    fn recovery_types_compatible(&self, expected: &Type, actual: &Type) -> bool {
+        (Self::contains_error_type(expected) || Self::contains_error_type(actual))
+            && self.same_type_identity(expected, actual)
+    }
+
     fn types_compatible(&self, expected: &Type, actual: &Type) -> bool {
         // A diverging expression produces no value and can flow into any
         // expected type. This is directional: concrete values cannot become Never.
@@ -1615,6 +1668,9 @@ impl TypeChecker {
                 | (Type::String, Type::String)
                 | (Type::Void, Type::Void)
                 | (Type::Never, Type::Never) => {}
+                // Unlike matching shapes, an unresolved subtree cannot support
+                // a mismatch diagnostic. Keep checking any known siblings.
+                _ if Self::contains_error_type(a) || Self::contains_error_type(b) => {}
                 _ => return false,
             }
             // Retain sibling slices instead of one work item per sibling:
@@ -8646,3 +8702,8 @@ mod import_diagnostic_tests;
 
 #[cfg(test)]
 mod ticket_69_tests;
+
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_TYPE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}

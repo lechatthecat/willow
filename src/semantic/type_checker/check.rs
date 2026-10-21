@@ -1352,7 +1352,7 @@ impl TypeChecker {
         let target_ty = self.check_expr(&s.target);
         let target_is_broken = self.error_count() > errors_before;
         let protected = if target_is_broken {
-            None
+            Some(Self::error_type())
         } else {
             self.lock_protected_type(s, &target_ty)
         };
@@ -1452,6 +1452,9 @@ impl TypeChecker {
             return Some(args[0].clone());
         }
         // A checker error upstream already reported itself; do not pile on.
+        if Self::contains_error_type(target_ty) {
+            return Some(Self::error_type());
+        }
         if *target_ty == Type::Never {
             return None;
         }
@@ -1672,7 +1675,7 @@ impl TypeChecker {
                 let arr_ty = self.check_expr(&s.array);
                 self.record_element_write(&s.array, reference_start, false);
                 let idx_ty = self.check_expr(&s.index);
-                if !matches!(idx_ty, Type::I64) {
+                if !matches!(idx_ty, Type::I64) && !Self::contains_error_type(&idx_ty) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -1703,7 +1706,10 @@ impl TypeChecker {
                             );
                         }
                     }
-                    Type::Void => {
+                    // A known array still provides element context even if a
+                    // component is erroneous. Other recovery receivers cannot
+                    // support a not-an-array diagnostic; always check the value.
+                    ty if *ty == Type::Void || Self::contains_error_type(ty) => {
                         self.check_expr(&s.value);
                     }
                     other => {
@@ -1855,8 +1861,8 @@ impl TypeChecker {
                 let errors_before = self.error_generation;
                 let cond_ty = self.check_expr(&s.cond);
                 if cond_ty != Type::Bool
-                    && !Self::is_error_type(&cond_ty)
                     && self.error_generation == errors_before
+                    && !Self::contains_error_type(&cond_ty)
                 {
                     self.push(
                         Diagnostic::new(
@@ -1880,8 +1886,8 @@ impl TypeChecker {
                 let errors_before = self.error_generation;
                 let cond_ty = self.check_expr(&s.cond);
                 if cond_ty != Type::Bool
-                    && !Self::is_error_type(&cond_ty)
                     && self.error_generation == errors_before
+                    && !Self::contains_error_type(&cond_ty)
                 {
                     self.push(
                         Diagnostic::new(
@@ -1903,7 +1909,7 @@ impl TypeChecker {
             Stmt::For(s) => {
                 let iterable_ty = self.check_expr(&s.iterable);
                 let elem_ty = match &iterable_ty {
-                    ty if Self::is_error_type(ty) => Self::error_type(),
+                    ty if Self::contains_error_type(ty) => Self::error_type(),
                     Type::Array(elem) => (**elem).clone(),
                     ty if builtin_types::unary_arg(ty, B::FrozenArray).is_some() => {
                         builtin_types::unary_arg(ty, B::FrozenArray)
@@ -2824,6 +2830,9 @@ impl TypeChecker {
                             for arg in &c.args {
                                 self.check_expr(&arg.expr);
                             }
+                            if Self::contains_error_type(ty) {
+                                return Self::error_type();
+                            }
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -3009,7 +3018,8 @@ impl TypeChecker {
                     );
                     return Type::Void;
                 }
-                if Self::is_error_type(&awaited_ty) || self.error_generation != errors_before {
+                if Self::contains_error_type(&awaited_ty) || self.error_generation != errors_before
+                {
                     return Self::error_type();
                 }
                 // `Task<T>`/`JoinHandle<T>` yield `T`; `Future<T>` yields `T`;
@@ -3071,7 +3081,7 @@ impl TypeChecker {
                 if !matches!(
                     &arg_ty,
                     Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never
-                ) && !Self::is_error_type(&arg_ty)
+                ) && !Self::contains_error_type(&arg_ty)
                 {
                     let fn_name = if *newline { "println" } else { "print" };
                     self.push(
@@ -3098,15 +3108,15 @@ impl TypeChecker {
                 let errors_before = self.error_generation;
                 let cond_ty = self.check_expr(&t.condition);
                 if cond_ty != Type::Bool
-                    && !Self::is_error_type(&cond_ty)
                     && self.error_generation == errors_before
+                    && !Self::contains_error_type(&cond_ty)
                 {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0901,
                             format!(
-                                "ternary condition must be `bool`, found `{}`",
+                                "if-expression condition must be `bool`, found `{}`",
                                 type_name(&cond_ty)
                             ),
                         )
@@ -3259,7 +3269,11 @@ impl TypeChecker {
         let start_ty = self.check_expr(&range.start);
         let end_ty = self.check_expr(&range.end);
 
-        if start_ty != Type::I64 || end_ty != Type::I64 {
+        // Judge each bound independently: an unresolved bound cannot justify
+        // a mismatch, but must not hide a real error on the opposite bound.
+        if (start_ty != Type::I64 && !Self::contains_error_type(&start_ty))
+            || (end_ty != Type::I64 && !Self::contains_error_type(&end_ty))
+        {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -3311,7 +3325,7 @@ impl TypeChecker {
             Some(expected) => self.check_expr_expecting(&m.object, expected),
             None => self.check_expr(&m.object),
         };
-        if Self::is_error_type(&obj_ty) {
+        if Self::contains_error_type(&obj_ty) {
             for arg in &m.args {
                 self.check_expr(&arg.expr);
             }

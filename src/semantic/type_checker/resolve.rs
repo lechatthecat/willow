@@ -1347,7 +1347,7 @@ impl TypeChecker {
         check_visibility: bool,
         role: &str,
     ) -> Type {
-        if Self::is_error_type(obj_ty) {
+        if Self::contains_error_type(obj_ty) {
             return Self::error_type();
         }
         // `Range<i64>` exposes its bounds as read-only `.start` / `.end` (i64).
@@ -1942,6 +1942,14 @@ impl TypeChecker {
             return Type::Void;
         };
         let class_name = resolved_class_name.as_str();
+        // Generic expansion already diagnosed this receiver. No signature can
+        // provide argument context, but independent argument errors still matter.
+        if Self::is_error_name(class_name) {
+            for arg in args {
+                self.check_expr(&arg.expr);
+            }
+            return Self::error_type();
+        }
         // Reject a static call on a private module type from another module.
         self.check_type_visibility(class_name, span);
         // Constructors are not directly callable as `Type::init(...)` — use `new`

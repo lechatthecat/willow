@@ -43,6 +43,11 @@ impl TypeChecker {
         let (ok_ty, err_ty) = match builtin_types::binary_args(&operand_ty, B::Result) {
             Some((ok, err)) => (ok.clone(), err.clone()),
             None => {
+                // Recognized Option/Result shapes still owe their context and
+                // error-type checks even when a payload is unresolved.
+                if Self::contains_error_type(&operand_ty) {
+                    return Self::error_type();
+                }
                 let other = &operand_ty;
                 self.push(
                     Diagnostic::new(
@@ -705,7 +710,7 @@ impl TypeChecker {
         let errors_before = self.error_generation;
         let guard_ty = self.check_expr(guard);
         if guard_ty != Type::Bool
-            && !Self::is_error_type(&guard_ty)
+            && !Self::contains_error_type(&guard_ty)
             && self.error_generation == errors_before
         {
             self.push(
@@ -759,7 +764,7 @@ impl TypeChecker {
         let expected = self.local.match_expected.take();
         let errors_before_match = self.error_generation;
         let scrutinee_ty = self.check_expr(&m.scrutinee);
-        if Self::is_error_type(&scrutinee_ty) {
+        if Self::contains_error_type(&scrutinee_ty) {
             // The failed scrutinee cannot constrain patterns. Keep checking arm
             // bodies for independent errors with poisoned payload bindings.
             for arm in &m.arms {

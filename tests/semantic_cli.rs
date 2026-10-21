@@ -4888,3 +4888,675 @@ fn every_effect_evidence_line_has_a_status() {
         assert!(fact["status"].is_string(), "{value}");
     }
 }
+
+#[test]
+fn sentinel_diagnostics_original_reproductions() {
+    for (source, primary) in [
+        (
+            "class Gen<T> { v: T; pub static fn make(x: T) -> Gen { return new Gen(x); } } fn main() {}",
+            "E0201",
+        ),
+        (
+            "fn f(s: String) -> String { let i = s.find(\".\"); return match i { Some(k) => if k > 0 { s } else { s }, None => s }; } fn main() {}",
+            "E1205",
+        ),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.0.join("src/main.wi"), source).unwrap();
+        for format in ["human", "ndjson", "json"] {
+            let output = if format == "json" {
+                f.run(&["symbol", "main", "--format", format])
+            } else {
+                f.run(&["check", ".", "--format", format])
+            };
+            assert!(!output.status.success());
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(text.contains(primary), "{text}");
+            for forbidden in ["diagnostic-error", "\0", "\\u0000", "E0844", "E0901"] {
+                assert!(!text.contains(forbidden), "{format}: {text:?}");
+            }
+        }
+    }
+}
+
+// Every diagnostic payload is scanned, including labels, notes and JSON strings.
+#[test]
+fn sentinel_diagnostics_recovery_perspectives() {
+    let uses = [
+        "let n: i64 = if bad { 1 } else { 2 };",
+        "let n = if bad { 1 } else { 2 };",
+        "let n: i64 = bad ? 1 : 2;",
+        "let n = bad ? 1 : 2;",
+        "take(if bad { 1 } else { 2 });",
+        "return if bad { 1 } else { 2 };",
+        "let n: i64 = if bad { if bad { 1 } else { 2 } } else { 3 };",
+        "let alias = bad; let n: i64 = if alias { 1 } else { 2 };",
+        "if bad {}",
+        "while bad {}",
+        "println(bad);",
+        "let n = bad.field;",
+        "let n = bad.nope();",
+        "let n = bad + 1;",
+        "let n = -bad;",
+        "let n = bad[0];",
+        "take(bad);",
+        "let n: i64 = bad;",
+        "let n = if true { bad } else { 1 };",
+        "let n: i64 = if true { 1 } else { bad };",
+    ];
+    let f = Fixture::new();
+    for use_site in uses {
+        fs::write(f.0.join("src/main.wi"), format!(
+            "fn take(n: i64) {{}} fn probe() -> i64 {{ let bad = absent; {use_site} return 0; }} fn main() {{}}"
+        )).unwrap();
+        for format in ["human", "ndjson", "json"] {
+            let output = if format == "json" {
+                f.run(&["symbol", "main", "--format", format])
+            } else {
+                f.run(&["check", ".", "--format", format])
+            };
+            assert!(!output.status.success(), "{use_site}");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(text.contains("absent"), "{use_site}: {text}");
+            if format == "human" {
+                assert_eq!(text.matches("error[E").count(), 1, "{use_site}: {text}");
+            }
+            for forbidden in ["diagnostic-error", "\0", "\\u0000", "E0901", "E0902"] {
+                assert!(!text.contains(forbidden), "{use_site}: {text:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn sentinel_diagnostics_preserve_independent_errors_and_if_wording() {
+    for (source, expected) in [
+        (
+            "fn main() { let arr = [1]; let x = if arr { 1 } else { 2 }; }",
+            "if-expression condition",
+        ),
+        (
+            "fn main() { let arr = (1, true); let x: i64 = if arr { 1 } else { 2 }; }",
+            "if-expression condition",
+        ),
+        (
+            "fn main() { let arr = |n: i64| n; let x: i64 = if arr { 1 } else { 2 }; }",
+            "if-expression condition",
+        ),
+        (
+            "fn main() { let bad = absent; let arr = [bad]; let x: i64 = if arr { missing } else { 2 }; }",
+            "missing",
+        ),
+        (
+            "class Gen<T> { v: T; } fn main() { let x = new Gen(absent); }",
+            "absent",
+        ),
+        ("fn main() { let x = new Missing(); }", "E0844"),
+        (
+            "fn main() { let x = if 1 { 2 } else { 3 }; }",
+            "if-expression condition",
+        ),
+        (
+            "fn main() { let x: i64 = if 1 { 2 } else { 3 }; }",
+            "if-expression condition",
+        ),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.0.join("src/main.wi"), source).unwrap();
+        for format in ["human", "ndjson", "json"] {
+            let output = if format == "json" {
+                f.run(&["symbol", "main", "--format", format])
+            } else {
+                f.run(&["check", ".", "--format", format])
+            };
+            assert!(!output.status.success());
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(text.contains(expected), "{text}");
+            assert!(
+                !text.contains("diagnostic-error")
+                    && !text.contains('\0')
+                    && !text.contains("\\u0000"),
+                "{text:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sentinel_diagnostics_compound_conditions() {
+    let f = Fixture::new();
+    for compound in ["[bad]", "[[bad]]", "(1, bad)", "|n: i64| bad"] {
+        for use_site in [
+            "let x: i64 = if arr { 1 } else { 2 };",
+            "let x = if arr { 1 } else { 2 };",
+            "let x: i64 = arr ? 1 : 2;",
+            "let x = arr ? 1 : 2;",
+            "if arr {}",
+            "while arr {}",
+        ] {
+            fs::write(
+                f.0.join("src/main.wi"),
+                format!("fn main() {{ let bad = absent; let arr = {compound}; {use_site} }}"),
+            )
+            .unwrap();
+            for format in ["human", "ndjson", "json"] {
+                let output = if format == "json" {
+                    f.run(&["symbol", "main", "--format", format])
+                } else {
+                    f.run(&["check", ".", "--format", format])
+                };
+                assert!(!output.status.success());
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(text.contains("absent"), "{compound}: {use_site}: {text}");
+                for forbidden in ["diagnostic-error", "\0", "\\u0000", "E0901", "E0203"] {
+                    assert!(
+                        !text.contains(forbidden),
+                        "{compound}: {use_site}: {text:?}"
+                    );
+                }
+                if format == "human" {
+                    assert_eq!(
+                        text.matches("error[E").count(),
+                        1,
+                        "{compound}: {use_site}: {text}"
+                    );
+                }
+            }
+        }
+    }
+}
+#[test]
+fn sentinel_diagnostics_compound_uses() {
+    let f = Fixture::new();
+    for compound in ["[bad]", "[[bad]]", "(1, bad)", "|n: i64| bad"] {
+        for use_site in [
+            "println(arr);",
+            "print(arr);",
+            "let x = [1][arr];",
+            "let x = arr[0];",
+            "let x = arr.nope();",
+            "let x = arr.toString();",
+            "let x = arr.field;",
+            "let x = arr + 1;",
+            "let x = -arr;",
+            "let x = !arr;",
+            "let x: i64 = arr;",
+            "let x = [arr, 1];",
+            "let x: i64 = if true { arr } else { 1 };",
+            "for x in arr { println(x); }",
+            "let x = match arr { _ => 1 };",
+            "take(arr);",
+            "let x = format(\"{}\", arr);",
+            "let x = format(\"{:.6f}\", arr);",
+            "let x = match 1 { n if arr => n, _ => 0 };",
+            "let x = arr == arr;",
+            "let x = arr && true;",
+            "let alias = arr; println(alias);",
+            "let x = await arr;",
+            "let x = arr(1);",
+        ] {
+            fs::write(
+                f.0.join("src/main.wi"),
+                format!("fn take(n: i64) {{}} async fn main() {{ let bad = absent; let arr = {compound}; {use_site} }}"),
+            )
+            .unwrap();
+            for format in ["human", "ndjson", "json"] {
+                let output = if format == "json" {
+                    f.run(&["symbol", "main", "--format", format])
+                } else {
+                    f.run(&["check", ".", "--format", format])
+                };
+                assert!(!output.status.success());
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(text.contains("absent"), "{compound}: {use_site}: {text}");
+                for forbidden in [
+                    "diagnostic-error",
+                    "\0",
+                    "\\u0000",
+                    "E0901",
+                    "E0203",
+                    "E1402",
+                ] {
+                    assert!(
+                        !text.contains(forbidden),
+                        "{compound}: {use_site}: {text:?}"
+                    );
+                }
+                if format == "human" {
+                    assert_eq!(
+                        text.matches("error[E").count(),
+                        1,
+                        "{compound}: {use_site}: {text}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sentinel_diagnostics_compound_independent_errors() {
+    let f = Fixture::new();
+    for use_site in [
+        "let x = arr[true];",
+        "let x = arr.nope(missing);",
+        "let x = arr(missing);",
+        "let x = arr + missing;",
+        "let x = match arr { _ => missing };",
+        "for x in arr { println(missing); }",
+        "let x: (i64, i64) = (arr, true);",
+    ] {
+        fs::write(
+            f.0.join("src/main.wi"),
+            format!("fn main() {{ let bad = absent; let arr = [bad]; {use_site} }}"),
+        )
+        .unwrap();
+        for format in ["human", "ndjson", "json"] {
+            let output = if format == "json" {
+                f.run(&["symbol", "main", "--format", format])
+            } else {
+                f.run(&["check", ".", "--format", format])
+            };
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!output.status.success());
+            assert!(text.contains("absent"), "{text}");
+            assert!(
+                text.contains(if use_site.contains("(arr, true)") {
+                    "bool"
+                } else if use_site.contains("true") {
+                    "array index must"
+                } else {
+                    "cannot find variable `missing`"
+                }),
+                "{text}"
+            );
+            for forbidden in ["diagnostic-error", "\0", "\\u0000"] {
+                assert!(!text.contains(forbidden), "{text:?}");
+            }
+            if format == "human" {
+                assert_eq!(text.matches("error[E").count(), 2, "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn sentinel_diagnostics_index_assignments() {
+    let f = Fixture::new();
+    for recovery in ["bad", "[bad]", "[[bad]]", "(1, bad)", "|n: i64| bad"] {
+        for (assignment, count, independent) in [
+            ("xs[poison] = 2;", 1, ""),
+            ("poison[0] = 2;", 1, ""),
+            ("xs[poison] = true;", 2, "cannot assign"),
+            ("poison[true] = 2;", 2, "array index must"),
+            ("poison[0] = missing;", 2, "missing"),
+            ("poison[true] = missing;", 3, "missing"),
+            ("xs[poison] = missing;", 2, "missing"),
+            ("poison[poison] = 2;", 1, ""),
+        ] {
+            fs::write(f.0.join("src/main.wi"), format!(
+                "fn main() {{ let bad = absent; let poison = {recovery}; let xs = [1]; {assignment} }}"
+            )).unwrap();
+            for format in ["human", "ndjson", "json"] {
+                let output = if format == "json" {
+                    f.run(&["symbol", "main", "--format", format])
+                } else {
+                    f.run(&["check", ".", "--format", format])
+                };
+                assert!(!output.status.success());
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let text = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+                for forbidden in ["diagnostic-error", "\0", "\\u0000"] {
+                    assert!(!text.contains(forbidden), "{text:?}");
+                }
+                assert!(
+                    text.contains("absent") && text.contains(independent),
+                    "{text}"
+                );
+                let actual = match format {
+                    "human" => text.matches("error[E").count(),
+                    "json" => {
+                        let value: Value = serde_json::from_str(&stdout).unwrap();
+                        assert_eq!(
+                            value["message"],
+                            format!("aborting due to {count} error(s)")
+                        );
+                        sentinel_error_count(&value)
+                            + String::from_utf8_lossy(&output.stderr)
+                                .matches("error[E")
+                                .count()
+                    }
+                    _ => stdout
+                        .lines()
+                        .map(|line| {
+                            sentinel_error_count(&serde_json::from_str::<Value>(line).unwrap())
+                        })
+                        .sum(),
+                };
+                assert_eq!(actual, count, "{recovery}: {assignment}: {format}: {text}");
+            }
+        }
+    }
+}
+
+fn sentinel_error_count(value: &Value) -> usize {
+    match value {
+        Value::Object(fields) => {
+            usize::from(
+                fields
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .is_some_and(|code| {
+                        code.starts_with('E') && code[1..].bytes().all(|b| b.is_ascii_digit())
+                    }),
+            ) + fields.values().map(sentinel_error_count).sum::<usize>()
+        }
+        Value::Array(values) => values.iter().map(sentinel_error_count).sum(),
+        _ => 0,
+    }
+}
+
+#[test]
+fn sentinel_diagnostics_range_and_try() {
+    let f = Fixture::new();
+    for recovery in ["bad", "[bad]", "[[bad]]", "(1, bad)", "|n: i64| bad"] {
+        for (expression, count, independent) in [
+            ("poison..3", 1, ""),
+            ("0..poison", 1, ""),
+            ("poison..poison", 1, ""),
+            ("poison..true", 2, "range bounds must"),
+            ("true..poison", 2, "range bounds must"),
+            ("poison..missing", 2, "missing"),
+            ("poison?", 1, ""),
+            ("(poison?)?", 1, ""),
+        ] {
+            let source = format!(
+                "fn main() {{ let bad = absent; let poison = {recovery}; let x = {expression}; }}"
+            );
+            sentinel_assert_diagnostics(&f, &source, count, independent);
+        }
+    }
+    for (source, count, independent) in [
+        (
+            "fn main() { let bad = absent; let x = Option::Some(bad)?; }",
+            2,
+            "E1807",
+        ),
+        (
+            "fn main() { let bad = absent; let x = Ok(bad)?; }",
+            2,
+            "E1807",
+        ),
+        (
+            "fn main() { let bad = absent; let x = Err(bad)?; }",
+            2,
+            "E1807",
+        ),
+        (
+            "fn f() -> Option<i64> { let bad = absent; let x = Option::Some(bad)?; return Option::Some(1); } fn main() {}",
+            1,
+            "",
+        ),
+        (
+            "fn f() -> Result<i64, String> { let bad = absent; let x = Err(bad)?; return Ok(1); } fn main() {}",
+            1,
+            "",
+        ),
+        (
+            "fn f() -> Result<i64, String> { let bad = absent; let x = Ok(bad); let y = x?; return Ok(1); } fn main() {}",
+            1,
+            "",
+        ),
+        (
+            "fn f() -> Result<i64, String> { let bad = absent; let x: Result<i64, i64> = Ok(bad); let y = x?; return Ok(1); } fn main() {}",
+            2,
+            "E1805",
+        ),
+        ("fn main() { let x = 1?; }", 1, "E1806"),
+        ("fn main() { let x = true..3; }", 1, "range bounds must"),
+    ] {
+        sentinel_assert_diagnostics(&f, source, count, independent);
+    }
+}
+
+fn sentinel_assert_diagnostics(f: &Fixture, source: &str, count: usize, independent: &str) {
+    fs::write(f.0.join("src/main.wi"), source).unwrap();
+    for format in ["human", "ndjson", "json"] {
+        let output = if format == "json" {
+            f.run(&["symbol", "main", "--format", format])
+        } else {
+            f.run(&["check", ".", "--format", format])
+        };
+        assert!(!output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let text = format!("{stdout}{stderr}");
+        for forbidden in ["diagnostic-error", "\0", "\\u0000"] {
+            assert!(!text.contains(forbidden), "{text:?}");
+        }
+        assert!(text.contains(independent), "{text}");
+        let actual = match format {
+            "human" => stderr.matches("error[E").count(),
+            "json" => {
+                let value: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(
+                    value["message"],
+                    format!("aborting due to {count} error(s)"),
+                    "{source}: {text}"
+                );
+                sentinel_error_count(&value) + stderr.matches("error[E").count()
+            }
+            _ => stdout
+                .lines()
+                .map(|line| sentinel_error_count(&serde_json::from_str::<Value>(line).unwrap()))
+                .sum(),
+        };
+        assert_eq!(actual, count, "{source}: {format}: {text}");
+    }
+}
+
+#[test]
+fn sentinel_diagnostics_generic_static_calls() {
+    let f = Fixture::new();
+    for receiver in ["Gen", "Gen<i64, i64>"] {
+        for method in ["make", "missing", "init"] {
+            for (args, count) in [("", 1), ("absent", 2), ("absent, other", 3)] {
+                let source = format!(
+                    "class Gen<T> {{ pub static fn make() -> i64 {{ return 1; }} }} fn main() {{ {receiver}::{method}({args}); }}"
+                );
+                sentinel_assert_diagnostics(&f, &source, count, "E0201");
+            }
+        }
+    }
+    sentinel_assert_diagnostics(
+        &f,
+        "class Gen<T> { pub static fn make() -> i64 { return 1; } } fn main() { Gen<i64>::missing(); }",
+        1,
+        "E0502",
+    );
+    sentinel_assert_diagnostics(&f, "fn main() { Missing::make(); }", 1, "E0350");
+    sentinel_assert_diagnostics(
+        &f,
+        "class Gen<T> { pub static fn make() -> i64 { return 1; } } fn main() { let x = Gen::make(); println(x); }",
+        1,
+        "E0201",
+    );
+}
+
+#[test]
+fn sentinel_diagnostics_concurrency_arguments() {
+    let f = Fixture::new();
+    for recovery in ["bad", "[bad]", "[[bad]]", "(1, bad)"] {
+        for statement in [
+            "o.expect(poison);",
+            "r.expect(poison);",
+            "o.map(poison);",
+            "o.and_then(poison);",
+            "o.or_else(poison);",
+            "r.map(poison);",
+            "r.map_err(poison);",
+            "r.and_then(poison);",
+            "r.or_else(poison);",
+            "select { sleep(poison) => {} }",
+            "select { ch.send(poison) => {} }",
+            "select { let x = await poison => { println(x); } }",
+            "select { let x = poison.recv() => { println(x); } }",
+            "select { poison.send(1) => {} }",
+            "atomic.store(poison);",
+            "cell.set(poison);",
+            "token.attach(poison);",
+        ] {
+            let source = format!(
+                "async fn main() {{ let bad = absent; let poison = {recovery}; let o = Option::Some(1); let r: Result<i64, String> = Ok(1); let ch = Channel<i64>::new(); let atomic = AtomicI64::new(0); let cell = BlockingCell<i64>::new(0); let token = CancellationToken::new(); {statement} }}"
+            );
+            sentinel_assert_diagnostics(&f, &source, 1, "absent");
+        }
+    }
+}
+
+#[test]
+fn sentinel_diagnostics_concurrency_independent_errors() {
+    let f = Fixture::new();
+    for (source, count, message) in [
+        (
+            "fn main() { let bad = absent; let o = Option::Some(1); o.expect(bad, missing); }",
+            3,
+            "wrong number of arguments",
+        ),
+        (
+            "fn main() { let bad = absent; let r: Result<i64, String> = Ok(1); r.map(bad, missing); }",
+            3,
+            "wrong number of arguments",
+        ),
+        (
+            "fn main() { let bad = absent; let o = Option::Some(1); o.expect(bad); }",
+            1,
+            "absent",
+        ),
+        (
+            "fn main() { let bad = absent; select { sleep(bad) => { println(missing); } } }",
+            2,
+            "missing",
+        ),
+        (
+            "fn main() { let bad = absent; select { let x = await bad => { println(x); } } }",
+            2,
+            "E0801",
+        ),
+        (
+            "fn main() { let bad = absent; select { let x = await bad => { println(missing); } } }",
+            3,
+            "missing",
+        ),
+        (
+            "fn main() { let bad = absent; let ch = Channel<i64>::new(); select { ch.send([bad]) => { println(missing); } } }",
+            2,
+            "missing",
+        ),
+        (
+            "fn main() { let bad = absent; select { bad.send(missing) => {} } }",
+            2,
+            "missing",
+        ),
+        (
+            "fn main() { let bad = absent; select { let x = bad.recv_opt() => { println(x); } } }",
+            1,
+            "absent",
+        ),
+        (
+            "fn main() { let bad = absent; let a = AtomicI64::new(0); a.compare_exchange(bad, true); }",
+            2,
+            "expects `i64`",
+        ),
+        (
+            "fn main() { let bad = absent; let ch = Channel<(i64, i64)>::new(); select { ch.send((bad, true)) => {} } }",
+            2,
+            "select send value",
+        ),
+        (
+            "fn main() { let o = Option::Some(1); o.expect(1); }",
+            1,
+            "expect message",
+        ),
+        (
+            "fn main() { let r: Result<i64, String> = Ok(1); r.expect(true); }",
+            1,
+            "expect message",
+        ),
+        (
+            "fn main() { let o = Option::Some(1); o.map(1); }",
+            1,
+            "expects a function",
+        ),
+        (
+            "fn main() { let bad = absent; let o = Option::Some(1); o.map(|x: i64, y: i64| bad); }",
+            2,
+            "expects a function",
+        ),
+        (
+            "fn main() { select { sleep(true) => {} } }",
+            1,
+            "timeout must",
+        ),
+        (
+            "async fn main() { select { let x = await 1 => {} } }",
+            1,
+            "cannot await",
+        ),
+    ] {
+        sentinel_assert_diagnostics(&f, source, count, message);
+    }
+}
+
+#[test]
+fn sentinel_diagnostics_lock_targets() {
+    let f = Fixture::new();
+    for recovery in ["bad", "[bad]", "[[bad]]", "(1, bad)"] {
+        for mode in ["lock", "lock read", "lock write"] {
+            for (context, body, count, message) in [
+                ("async ", "let x = value + 1;", 1, "absent"),
+                ("async ", "let x = missing;", 2, "missing"),
+                ("", "let x = value + 1;", 2, "E2603"),
+            ] {
+                let source = format!(
+                    "{context}fn main() {{ let bad = absent; let poison = {recovery}; {mode} poison as value {{ {body} }} }}"
+                );
+                sentinel_assert_diagnostics(&f, &source, count, message);
+            }
+        }
+    }
+    for mode in ["lock", "lock read", "lock write"] {
+        let source = format!("async fn main() {{ let target = 1; {mode} target as value {{}} }}");
+        sentinel_assert_diagnostics(&f, &source, 1, "E2602");
+    }
+    sentinel_assert_diagnostics(
+        &f,
+        "async fn main() { lock absent as value { let x = value + 1; } }",
+        1,
+        "absent",
+    );
+}

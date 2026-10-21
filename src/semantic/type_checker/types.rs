@@ -74,7 +74,14 @@ pub(crate) fn type_name<N: std::fmt::Display>(ty: &Type<N>) -> String {
             Part::Text(text) => output.push_str(text),
             Part::Name(name) => {
                 use std::fmt::Write;
+                let start = output.len();
                 write!(output, "{name}").expect("write into string");
+                // A real sibling mismatch may still mention a partially
+                // recovered type. Never expose the internal marker in prose.
+                if &output[start..] == "\0diagnostic-error" {
+                    output.truncate(start);
+                    output.push_str("<error>");
+                }
             }
             Part::Type(ty) => match ty {
                 Type::I64 => output.push_str("i64"),

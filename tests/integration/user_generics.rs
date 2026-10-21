@@ -1398,3 +1398,11 @@ fn generic_lambda_annotations_private_import_rejected() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("private"), "{stderr}");
 }
+
+#[test]
+fn sentinel_diagnostics_valid_example_runs() {
+    runs(
+        include_str!("../../example/diagnostic_recovery_if.wi"),
+        "7\na.b\nnone\n",
+    );
+}
