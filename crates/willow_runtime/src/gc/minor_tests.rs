@@ -1287,3 +1287,56 @@ fn fully_forwarded_chunks_release_without_a_second_header_walk() {
     }
     reset_internal();
 }
+
+#[test]
+fn minor_survivor_cost_and_page_index_scale() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    let _stress = GcStressTestScope::normal();
+    for chunks in [1usize, 4, 16, 64] {
+        reset_internal();
+        let mut tls = tlab_state_for_test();
+        let mut payloads = fill_chunks(&mut tls, chunks, 32, |_| 0, 0);
+        for (i, payload) in payloads.iter().enumerate() {
+            unsafe { *(*payload).cast::<usize>() = i };
+        }
+        let registry = minor_registry_snapshot();
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_unindexed(&mut state);
+        let mut stop = Default::default();
+        let mut collector = MinorCollector::new(&mut state, registry, &mut stop);
+        // A fixed-size, potentially unaligned chunk intersects at most two pages.
+        assert!(collector.chunk_pages.capacity() >= 2 * chunks);
+        let capacity = collector.chunk_pages.capacity();
+        let pages = collector.chunk_pages.len();
+        // Reconstruct the source index without permitting any hash-table growth.
+        collector.chunk_pages.clear();
+        for index in 0..chunks {
+            collector.index_chunk(index);
+            assert_eq!(collector.chunk_pages.capacity(), capacity);
+        }
+        assert_eq!(collector.chunk_pages.len(), pages);
+        let roots = MinorRoots {
+            slots: payloads.iter_mut().map(|p| p as *mut *mut u8).collect(),
+            values: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        collector.run(roots, Default::default());
+        let elapsed = started.elapsed().as_nanos();
+        let count = payloads.len();
+        assert_eq!(state.moved_objects, count as u64);
+        assert_eq!(state.survivor_stats.survivor_copies, count as u64);
+        assert_eq!(stop.root_values, count as u64);
+        assert_eq!(stop.swept_objects, count as u64);
+        for (i, payload) in payloads.iter().enumerate() {
+            assert_eq!(unsafe { *(*payload).cast::<usize>() }, i);
+        }
+        eprintln!(
+            "survivors={count} source_chunks={chunks} pages={pages} capacity={capacity} index_growths=0 moved={} elapsed_ns={elapsed} ns_per_move={:.2}",
+            state.moved_objects,
+            elapsed as f64 / count as f64
+        );
+        drop(state);
+        reset_internal();
+    }
+}

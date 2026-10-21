@@ -196,3 +196,30 @@ AGENTS.md
 
 # Public uppercase static property implementation audit.
 !/docs/audits/willow-jz15.103-uppercase-static-properties.md
+
+# Public minor-GC survivor audit and reproducible evidence (willow-8hq4.31).
+!/docs/audits/willow-8hq4.31/
+/docs/audits/willow-8hq4.31/*
+!/docs/audits/willow-8hq4.31/audit.md
+!/docs/audits/willow-8hq4.31/verify.sh
+!/docs/audits/willow-8hq4.31/stress.sh
+!/docs/audits/willow-8hq4.31/paired.py
+!/docs/audits/willow-8hq4.31/object_churn_stress.wi
+!/docs/audits/willow-8hq4.31/array_literal_churn_stress.wi
+!/docs/audits/willow-8hq4.31/before-churn.txt
+!/docs/audits/willow-8hq4.31/after-churn.txt
+!/docs/audits/willow-8hq4.31/after-idle-churn.txt
+!/docs/audits/willow-8hq4.31/paired.jsonl
+!/docs/audits/willow-8hq4.31/checks.txt
+!/docs/audits/willow-8hq4.31/descriptor.txt
+!/docs/audits/willow-8hq4.31/graph-counts.txt
+!/docs/audits/willow-8hq4.31/scaling-debug.txt
+!/docs/audits/willow-8hq4.31/scaling-release.txt
+!/docs/audits/willow-8hq4.31/stress-checks.txt
+!/docs/audits/willow-8hq4.31/example-normal.txt
+!/docs/audits/willow-8hq4.31/example-minor.txt
+!/docs/audits/willow-8hq4.31/example-relocate.txt
+!/docs/audits/willow-8hq4.31/object_churn-minor.txt
+!/docs/audits/willow-8hq4.31/object_churn-relocate.txt
+!/docs/audits/willow-8hq4.31/array_literal_churn-minor.txt
+!/docs/audits/willow-8hq4.31/array_literal_churn-relocate.txt

@@ -101,7 +101,13 @@ impl<'a> MinorCollector<'a> {
             promotion_entries: Vec::new(),
             buffer_promotion_entries: false,
             source_chunks,
-            chunk_pages: AddressMap::default(),
+            // Each fixed-size source chunk intersects at most two pages.
+            // Reserve once before indexing rather than rehashing at every
+            // growth threshold. Destination chunks can still grow this map.
+            chunk_pages: AddressMap::with_capacity_and_hasher(
+                source_chunks.saturating_mul(2),
+                Default::default(),
+            ),
             last_chunk: std::cell::Cell::new(None),
             forwarded_objects: 0,
             forwarded_per_chunk: vec![0; source_chunks],
