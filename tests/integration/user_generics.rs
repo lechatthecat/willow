@@ -1363,3 +1363,38 @@ fn literal_policy_failed_match_does_not_infer_from_surviving_arm() {
         }
     }
 }
+
+#[test]
+fn generic_lambda_annotations_example_runs() {
+    runs(
+        include_str!("../../example/generic_lambda_annotations.wi"),
+        "1\n2\n3\n14\n",
+    );
+}
+
+#[test]
+fn generic_lambda_annotations_imported_types_run() {
+    custom_module_runs(
+        "pub class Wrap<T> { pub v: T; }",
+        "import util; fn main() { let f = |x: util::Wrap<i64>| x.v; println(f(new util::Wrap<i64>(9))); }",
+        "9\n",
+    );
+}
+
+#[test]
+fn generic_lambda_annotations_private_import_rejected() {
+    let project = TestProject::new(
+        "private_lambda_annotation",
+        &[
+            ("util.wi", "class Wrap<T> { pub v: T; }"),
+            (
+                "main.wi",
+                "import util; fn main() { let f = |x: util::Wrap<i64>| x; }",
+            ),
+        ],
+    );
+    let output = project.check("main.wi");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("private"), "{stderr}");
+}

@@ -133,3 +133,6 @@ AGENTS.md
 # Public lambda Result context audit and focused reproduction commands.
 !/docs/audits/willow-jz15.116.md
 !/docs/audits/willow-jz15.116-check.sh
+
+# Reviewed lambda generic annotation audit (public source/test evidence only).
+!/docs/audits/willow-6d6o-lambda-generic-annotations.md

@@ -380,6 +380,34 @@ mod template_registry_tests {
     }
 
     #[test]
+    fn generic_lambda_annotations_reuse_class_specializations() {
+        for uses in [1, 8, 32] {
+            for depth in [1, 4, 8] {
+                let mut ty = "i64".to_string();
+                for _ in 0..depth {
+                    ty = format!("Wrap<{ty}>");
+                }
+                let mut body = String::new();
+                for index in 0..uses {
+                    body.push_str(&format!("let f{index} = |x: {ty}| x;"));
+                }
+                let source = format!("class Wrap<T> {{ pub v: T; }} fn main() {{ {body} }}");
+                let mut checker = TypeChecker::new();
+                checker.check_program(&parse(&source));
+                assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                let registry = checker.generics.registry.borrow();
+                assert_eq!(registry.class_requests, uses * depth);
+                assert_eq!(registry.class_specializations, depth);
+                assert_eq!(registry.class_copies, 1);
+                println!(
+                    "lambda annotations: uses={uses} depth={depth} requests={} specializations={} copies={}",
+                    registry.class_requests, registry.class_specializations, registry.class_copies
+                );
+            }
+        }
+    }
+
+    #[test]
     fn imported_member_access_scaling_reuses_specialization() {
         for width in [1, 16, 64] {
             let template = parse(&format!(

@@ -1,0 +1,19 @@
+// Generic class annotations work in standalone and contextual lambdas.
+class Wrap<T> { pub v: T; }
+class A { pub n: i64; }
+
+fn apply(f: fn(Wrap<A>) -> i64) -> i64 {
+    return f(new Wrap<A>(new A(3)));
+}
+fn apply_captured(f: closure(Wrap<Wrap<A>>) -> i64) -> i64 {
+    return f(new Wrap<Wrap<A>>(new Wrap<A>(new A(4))));
+}
+fn main() {
+    let expr = |x: Wrap<A>| x.v.n;
+    println(expr(new Wrap<A>(new A(1))));
+    let block = |x: Wrap<A>| { return x.v.n; };
+    println(block(new Wrap<A>(new A(2))));
+    println(apply(|x: Wrap<A>| x.v.n));
+    let offset = 10;
+    println(apply_captured(|x: Wrap<Wrap<A>>| { return x.v.v.n + offset; }));
+}

@@ -409,8 +409,9 @@ impl TypeChecker {
         for (idx, p) in l.params.iter().enumerate() {
             match &p.ty {
                 Some(ty) => {
-                    self.validate_type(ty, p.span);
+                    // Instantiate generic classes before validating their nominal identity.
                     let ty = self.normalize_type(ty, p.span);
+                    self.validate_type(&ty, p.span);
                     param_types.push(ty);
                 }
                 None => {

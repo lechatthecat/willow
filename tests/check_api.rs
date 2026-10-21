@@ -564,3 +564,91 @@ fn generic_diagnostics_constructor_human_output() {
     );
     assert!(!stderr.contains("$mono$"), "{stderr}");
 }
+
+#[test]
+fn generic_lambda_annotations_accept_twenty_contexts() {
+    // Five nominal/type-argument shapes crossed with four callable contexts.
+    for (ty, value, access) in [
+        ("Wrap<A>", "new Wrap<A>(new A(7))", "x.v.n"),
+        ("Wrap<i64>", "new Wrap<i64>(7)", "x.v"),
+        (
+            "Wrap<Wrap<A>>",
+            "new Wrap<Wrap<A>>(new Wrap<A>(new A(7)))",
+            "x.v.v.n",
+        ),
+        ("Wrap<String>", "new Wrap<String>(\"seven\")", "x.v"),
+        ("Wrap<bool>", "new Wrap<bool>(true)", "x.v"),
+    ] {
+        for context in 0..4 {
+            let ret = if ty == "Wrap<String>" {
+                "String"
+            } else if ty == "Wrap<bool>" {
+                "bool"
+            } else {
+                "i64"
+            };
+            let (decl, body) = match context {
+                0 => (
+                    String::new(),
+                    format!("let f = |x: {ty}| {access}; println(f({value}));"),
+                ),
+                1 => (
+                    String::new(),
+                    format!("let f = |x: {ty}| {{ return {access}; }}; println(f({value}));"),
+                ),
+                2 => (
+                    format!("fn apply(f: fn({ty}) -> {ret}) -> {ret} {{ return f({value}); }}"),
+                    format!("println(apply(|x: {ty}| {access}));"),
+                ),
+                _ => (
+                    format!(
+                        "fn apply(f: closure({ty}) -> {ret}) -> {ret} {{ return f({value}); }}"
+                    ),
+                    format!(
+                        "let captured = true; println(apply(|x: {ty}| {{ if captured {{ return {access}; }} return {access}; }}));"
+                    ),
+                ),
+            };
+            let source = format!(
+                "class Wrap<T> {{ pub v: T; }} class A {{ pub n: i64; }} {decl} fn main() {{ {body} }}"
+            );
+            let fixture = Fixture::new(&source);
+            let mut collected = Collected::default();
+            let result = fixture.check(&mut collected);
+            assert!(
+                result.is_ok(),
+                "{ty}, context {context}: {:?}",
+                collected.diagnostics
+            );
+            assert!(
+                collected.diagnostics.is_empty(),
+                "{:?}",
+                collected.diagnostics
+            );
+        }
+    }
+}
+
+#[test]
+fn generic_lambda_annotations_reject_invalid_types() {
+    for (ty, message) in [
+        ("Wrap", "requires explicit type arguments"),
+        ("Wrap<i64, bool>", "expects 1 type argument"),
+        ("Wrap<Missing>", "cannot find type"),
+        ("Missing", "cannot find type"),
+    ] {
+        let fixture = Fixture::new(&format!(
+            "class Wrap<T> {{ pub v: T; }} fn main() {{ let f = |x: {ty}| x; }}"
+        ));
+        let mut collected = Collected::default();
+        assert!(fixture.check(&mut collected).is_err(), "{ty}");
+        assert!(
+            collected
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains(message)),
+            "{ty}: {:?}",
+            collected.diagnostics
+        );
+    }
+}
