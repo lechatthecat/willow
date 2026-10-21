@@ -115,3 +115,11 @@ AGENTS.md
 /docs/audits/willow-6fv.5.6/*
 !/docs/audits/willow-6fv.5.6/audit.md
 !/docs/audits/willow-6fv.5.6/reproduce.sh
+
+# Public, self-contained async allocation RSS regression evidence.
+!/docs/audits/willow-jz15.118/
+/docs/audits/willow-jz15.118/*
+!/docs/audits/willow-jz15.118/audit.md
+!/docs/audits/willow-jz15.118/measure.py
+!/docs/audits/willow-jz15.118/before.jsonl
+!/docs/audits/willow-jz15.118/after.jsonl

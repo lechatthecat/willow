@@ -23,17 +23,18 @@ pub(super) fn scheduler_start(state: &mut super::GcState, workers: usize) {
     {
         return;
     }
-    let budget = initial_budget_for(workers);
-    state.nursery_threshold_bytes = state.nursery_policy.bound(
-        state.nursery_policy.fixed.unwrap_or(budget),
-        state.memory_limit_bytes,
-    );
+    let budget = major_startup_budget_for(workers);
+    // Worker capacity is not allocation pressure: an async main may be the
+    // only allocator. Keep the compact nursery (including its configured
+    // override/limit) until measured survival justifies growing it. Widen only
+    // the major-cycle runway; otherwise the first minor retains up to 32 MiB
+    // of dead young objects solely because a scheduler was entered.
     super::pacer::scheduler_start(state, budget as u64);
 }
 
-/// Bounded cold runway for actual concurrent allocators, without reserving
-/// storage. Survival feedback can subsequently shrink back to FLOOR.
-fn initial_budget_for(workers: usize) -> usize {
+/// Bounded cold major-cycle runway for scheduler capacity, without reserving
+/// storage. Minor survival feedback independently controls the nursery.
+fn major_startup_budget_for(workers: usize) -> usize {
     workers.clamp(1, 8) * (4 * 1024 * 1024)
 }
 
@@ -281,7 +282,7 @@ mod tests {
 #[test]
 fn startup_runway_is_worker_bounded_and_respects_limits() {
     for workers in [0, 1, 2, 4, 8, 64, usize::MAX] {
-        let bytes = initial_budget_for(workers);
+        let bytes = major_startup_budget_for(workers);
         assert_eq!(bytes, workers.clamp(1, 8) * 4 * 1024 * 1024);
         assert!(bytes <= CAP);
     }
@@ -304,7 +305,7 @@ fn scheduler_runway_only_initializes_a_cold_heap_once() {
         let mut state = runtime().heap.lock().unwrap();
         assert_eq!(state.nursery_threshold_bytes, FLOOR);
         self::scheduler_start(&mut state, 8);
-        assert_eq!(state.nursery_threshold_bytes, CAP);
+        assert_eq!(state.nursery_threshold_bytes, FLOOR);
         assert_eq!(state.threshold_bytes, CAP);
         state.nursery_threshold_bytes = FLOOR;
         self::scheduler_start(&mut state, 8);
@@ -338,8 +339,38 @@ fn scheduler_runway_only_initializes_a_cold_heap_once() {
         let mut state = runtime().heap.lock().unwrap();
         state.nursery_policy = Policy { fixed: Some(8192) };
         state.memory_limit_bytes = Some(4096);
+        state.nursery_threshold_bytes = state.nursery_policy.initial(state.memory_limit_bytes);
         self::scheduler_start(&mut state, 8);
         assert_eq!(state.nursery_threshold_bytes, 4096);
+    }
+    reset_internal();
+}
+
+#[cfg(test)]
+#[test]
+fn scheduler_capacity_preserves_compact_nursery_and_overrides() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    for workers in [0, 1, 2, 8, 64, usize::MAX] {
+        for fixed in [None, Some(8192), Some(4 * 1024 * 1024)] {
+            for limit in [None, Some(4096)] {
+                reset_internal();
+                let mut state = runtime().heap.lock().unwrap();
+                state.nursery_policy = Policy { fixed };
+                state.memory_limit_bytes = limit;
+                let initial = state.nursery_policy.initial(limit);
+                state.nursery_threshold_bytes = initial;
+                self::scheduler_start(&mut state, workers);
+                assert_eq!(state.nursery_threshold_bytes, initial);
+                // Startup must not disable the measured-survival feedback.
+                assert_eq!(
+                    state.nursery_policy.next(initial, 1024, 0, limit),
+                    state
+                        .nursery_policy
+                        .bound(fixed.unwrap_or((initial / 2).max(FLOOR)), limit)
+                );
+            }
+        }
     }
     reset_internal();
 }

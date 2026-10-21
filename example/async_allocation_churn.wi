@@ -1,0 +1,26 @@
+// Bounded live ring from a synchronous allocator called by async main.
+import std::collections::Array;
+class Node { pub v: i64; pub next: Option<Node>; }
+fn churn(n: i64, keep: Array<Node>) {
+ let mut i = 0;
+ while i < n {
+  let a = new Node(i, Option::None);
+  let b = new Node(i + 1, Option::Some(a));
+  keep[i % 64] = b;
+  i = i + 1;
+ }
+}
+async fn main() {
+ let keep: Array<Node> = [];
+ let mut i = 0;
+ while i < 64 { keep.push(new Node(0, Option::None)); i = i + 1; }
+ churn(100000, keep);
+ let mut sum = 0;
+ let mut j = 0;
+ while j < 64 {
+  sum = sum + keep[j].v + keep[j].next.unwrap().v;
+  j = j + 1;
+ }
+ println(sum); // 12795904
+ println(gc_minor_collections());
+}
