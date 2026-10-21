@@ -103,7 +103,8 @@ sha256sum --check --ignore-missing SHA256SUMS
 On macOS, for example:
 
 ```bash
-grep 'willow-v0.1.5-macos-arm64.tar.gz
+grep 'willow-v0.1.5-macos-arm64.tar.gz' SHA256SUMS | shasum -a 256 --check
+```
 
 ### Build from source
 
