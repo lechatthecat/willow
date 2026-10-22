@@ -7,10 +7,14 @@ struct WaitList {
     slots: Vec<WaitSlot>,
     free: Vec<usize>,
     head: Option<usize>,
+    /// Latest linked slot registered under each worker index, so a targeted
+    /// wake finds its owner in O(1) (willow-jz15.120).
+    by_worker: Vec<Option<usize>>,
 }
 
 struct WaitSlot {
     thread: std::thread::Thread,
+    worker: usize,
     previous: Option<usize>,
     next: Option<usize>,
     linked: bool,
@@ -18,8 +22,10 @@ struct WaitSlot {
 
 impl WaitList {
     fn insert(&mut self) -> usize {
+        let worker = current_worker();
         let slot = WaitSlot {
             thread: std::thread::current(),
+            worker,
             previous: None,
             next: self.head,
             linked: true,
@@ -35,6 +41,10 @@ impl WaitList {
             self.slots[head].previous = Some(index);
         }
         self.head = Some(index);
+        if self.by_worker.len() <= worker {
+            self.by_worker.resize(worker + 1, None);
+        }
+        self.by_worker[worker] = Some(index);
         index
     }
 
@@ -53,6 +63,10 @@ impl WaitList {
             self.slots[next].previous = previous;
         }
         self.slots[index].linked = false;
+        let worker = self.slots[index].worker;
+        if self.by_worker[worker] == Some(index) {
+            self.by_worker[worker] = None;
+        }
     }
 }
 
@@ -99,6 +113,23 @@ impl IdleWaiters {
             }
         }
         count
+    }
+
+    /// Publish work for `worker` alone: advance the generation, so a worker
+    /// that probed its queue before this publication does not park on it, and
+    /// unpark that worker if it already waits. Other waiters stay parked. A
+    /// non-pool thread sharing the index may be woken spuriously, or may hide
+    /// the worker's slot, which then sees the generation at its timeout.
+    fn notify_worker(&self, worker: usize) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if self.registered.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let list = self.list.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(index) = list.by_worker.get(worker).copied().flatten() {
+            // The waiter sees the new generation and unlinks itself.
+            list.slots[index].thread.unpark();
+        }
     }
 
     fn wait(&self, start: u64, timeout: Duration) -> bool {
@@ -164,6 +195,10 @@ pub(super) fn notify_local_work(backlog: usize) {
     // thief for that sole continuation creates cross-core ping-pong (and
     // native-stack affinity bounces) without adding useful parallelism.
     IDLE_WAITERS.publish(backlog > 1, false);
+}
+
+pub(super) fn notify_worker_waiter(worker: usize) {
+    IDLE_WAITERS.notify_worker(worker);
 }
 
 pub(super) fn notify_all_idle_waiters() {
@@ -258,6 +293,58 @@ mod tests {
             assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
             assert!(waiters.list.lock().unwrap().head.is_none());
         }
+    }
+
+    #[test]
+    fn worker_notification_wakes_only_that_worker() {
+        for workers in [2, 8, 32] {
+            let waiters = IdleWaiters::default();
+            let target = workers - 1;
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|worker| {
+                        let waiters = &waiters;
+                        scope.spawn(move || {
+                            CURRENT_WORKER.with(|slot| slot.set(worker));
+                            waiters.wait(waiters.generation(), Duration::from_secs(5))
+                        })
+                    })
+                    .collect();
+                registered(&waiters, workers);
+                let generation = waiters.generation();
+                waiters.notify_worker(target);
+                assert_eq!(waiters.generation(), generation + 1);
+                registered(&waiters, workers - 1);
+                {
+                    let list = waiters.list.lock().unwrap();
+                    assert!(list.by_worker[target].is_none());
+                    assert!((0..target).all(|worker| list.by_worker[worker].is_some()));
+                }
+                // Release the untargeted waiters.
+                waiters.notify(true);
+                for handle in handles {
+                    assert!(handle.join().unwrap());
+                }
+            });
+            assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
+            assert!(
+                waiters
+                    .list
+                    .lock()
+                    .unwrap()
+                    .by_worker
+                    .iter()
+                    .all(Option::is_none)
+            );
+        }
+    }
+
+    #[test]
+    fn worker_notification_without_waiters_only_advances_generation() {
+        let waiters = IdleWaiters::default();
+        waiters.notify_worker(3);
+        assert_eq!(waiters.generation(), 1);
+        assert!(waiters.list.lock().unwrap().slots.is_empty());
     }
 
     #[test]

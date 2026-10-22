@@ -438,6 +438,10 @@ fn managed_growth_consumes_lock_free_native_headroom_before_pacer_crossing() {
         let mut state = runtime().heap.lock().unwrap();
         assert!(state.pacer.enabled());
         state.threshold_bytes = usize::MAX / 2;
+        // Young bytes within the nursery budget belong to minor collections;
+        // pin the budget so the managed growth below counts toward the major
+        // policy (willow-jz15.120).
+        state.nursery_threshold_bytes = state.young_allocated_bytes;
         state.pacer_trigger = memory_inputs(&state).occupied + room;
     }
     invalidate_runtime_policy_budgets();

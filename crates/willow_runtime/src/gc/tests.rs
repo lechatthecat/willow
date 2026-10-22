@@ -1088,6 +1088,10 @@ fn test_gc_tlab_refill_slow_path_coordinates_threshold_collection() {
     let first = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
     assert!(!first.is_null());
     assert_eq!(willow_gc_tlab_refills(), 1);
+    // Young bytes within the nursery budget belong to minor collections
+    // (willow-jz15.120); a zero budget lets the first chunk's bytes reach the
+    // major threshold.
+    runtime().heap.lock().unwrap().nursery_threshold_bytes = 0;
     set_threshold(1);
     let second = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
     assert!(!second.is_null());
@@ -4299,4 +4303,135 @@ fn cumulative_allocation_bytes_clamp_without_wrapping() {
         );
     }
     reset_gc();
+}
+
+/// willow-jz15.120: young bytes up to the nursery budget belong to minor
+/// collections and never shorten the major runway; deferred young growth past
+/// the budget and promoted bytes do.
+#[test]
+fn major_policy_domain_counts_young_bytes_only_past_the_nursery_budget() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    let mut state = runtime().heap.lock().unwrap();
+    let old = 4096;
+    state.nursery_threshold_bytes = 1 << 20;
+    for young in [0, 1, 1 << 19, 1 << 20, (1 << 20) + 1, 1 << 22] {
+        state.allocated_bytes = old + young;
+        state.young_allocated_bytes = young;
+        let expected = old + young.saturating_sub(1 << 20);
+        assert_eq!(
+            major_policy_managed_bytes(&state),
+            expected,
+            "young={young}"
+        );
+        assert_eq!(
+            memory_inputs(&state).occupied,
+            (expected + external_bytes()) as u64
+        );
+        // Hard reservation pressure still sees every reserved byte.
+        assert_eq!(
+            memory_inputs(&state).pressure_bytes,
+            (state.old_reserved_bytes + state.tlab_reserved_bytes + external_bytes()) as u64
+        );
+    }
+    // Allocation history: young allocation enters only once promoted.
+    state.total_allocated_bytes = 10_000;
+    state.young_allocation_clock = 8_000;
+    state.promoted_bytes = 300;
+    let base = policy_allocated_total(&state);
+    assert_eq!(
+        base,
+        2_300 + EXTERNAL_ALLOCATED_BYTES.load(Ordering::Relaxed)
+    );
+    state.total_allocated_bytes += 5_000;
+    state.young_allocation_clock += 5_000;
+    assert_eq!(policy_allocated_total(&state), base);
+    state.promoted_bytes += 700;
+    assert_eq!(policy_allocated_total(&state), base + 700);
+    drop(state);
+    reset_gc();
+}
+
+/// willow-jz15.120: a soft limit budgets every managed byte. However large
+/// the nursery grows, young bytes count toward the soft decision, so the heap
+/// cannot exceed the limit by a nursery budget. Without a soft limit the same
+/// young bytes stay with minor collections.
+#[test]
+fn soft_memory_limit_counts_young_bytes_at_every_nursery_size() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    let mut state = runtime().heap.lock().unwrap();
+    let limit: usize = 8 << 20;
+    let old = 1 << 20;
+    state.threshold_bytes = usize::MAX / 2;
+    state.total_allocated_bytes = 1 << 30;
+    for nursery in [1 << 20, 16 << 20, 64 << 20] {
+        state.nursery_threshold_bytes = nursery;
+        // A full nursery: every young byte is within the nursery budget.
+        let young = nursery;
+        state.allocated_bytes = old + young;
+        state.young_allocated_bytes = young;
+        state.soft_memory = memory_control::Controller::default();
+        let unlimited = memory_inputs(&state);
+        assert_eq!(
+            unlimited.occupied,
+            (major_policy_managed_bytes(&state) + external_bytes()) as u64
+        );
+        assert!(
+            !state.soft_memory.decide(unlimited).collect,
+            "nursery={nursery}"
+        );
+        state.soft_memory.set_limit(limit as u64);
+        let input = memory_inputs(&state);
+        assert_eq!(
+            input.occupied,
+            (state.allocated_bytes + external_bytes()) as u64
+        );
+        let decision = state.soft_memory.decide(input);
+        assert!(decision.goal <= limit as u64);
+        // Old bytes alone sit far below the limit; a nursery past the soft
+        // trigger requests a collection.
+        assert!(((old + external_bytes()) as u64) < decision.trigger);
+        assert_eq!(
+            decision.collect,
+            input.occupied >= decision.trigger,
+            "nursery={nursery}"
+        );
+        assert_eq!(decision.collect, nursery > 1 << 20, "nursery={nursery}");
+    }
+    drop(state);
+    reset_gc();
+}
+
+/// willow-jz15.120: chunk storage is prepared outside the heap lock; a refill
+/// the reservation refuses keeps it for a retry, and installation takes it.
+#[test]
+fn tlab_chunk_storage_is_kept_when_refused_and_taken_when_installed() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    let mut tls = new_tlab_state();
+    let owner = &mut tls as *mut GcTlabState as usize;
+    let mut storage = tlab::ChunkStorage::allocate();
+    assert!(storage.is_some());
+    let mut state = runtime().heap.lock().unwrap();
+    tlab::register_tlab_state(&mut state, owner);
+    let chunks = state.tlab_chunks.len();
+    state.memory_limit_bytes = Some(1);
+    assert!(tlab::install_tlab_chunk(&mut state, owner, &mut storage).is_none());
+    assert!(storage.is_some(), "a refused refill keeps its storage");
+    assert_eq!(state.tlab_chunks.len(), chunks);
+    state.memory_limit_bytes = None;
+    let base = tlab::install_tlab_chunk(&mut state, owner, &mut storage);
+    assert!(base.is_some());
+    assert!(storage.is_none(), "installation takes the storage");
+    assert_eq!(state.tlab_chunks.len(), chunks + 1);
+    assert_eq!(state.tlab_chunks.last().unwrap().base, base.unwrap());
+    // Nothing left to install: no chunk without storage.
+    assert!(tlab::install_tlab_chunk(&mut state, owner, &mut storage).is_none());
+    assert_eq!(state.tlab_chunks.len(), chunks + 1);
+    retire_tlab_locked(&mut state, owner);
+    drop(state);
+    reset_gc();
+    // An uninstalled value releases its storage on drop.
+    drop(tlab::ChunkStorage::allocate());
 }

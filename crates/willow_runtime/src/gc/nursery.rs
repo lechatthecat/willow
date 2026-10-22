@@ -1,7 +1,7 @@
 //! Constant-work minor-trigger policy; consumes counters from the completed cycle.
 
 const FLOOR: usize = 256 * 1024;
-const CAP: usize = 32 * 1024 * 1024;
+const CAP: usize = 64 * 1024 * 1024;
 
 /// Preserve the compact synchronous startup nursery.
 pub(super) fn initial_budget() -> usize {
@@ -76,14 +76,22 @@ impl Policy {
         if self.fixed.is_some() {
             return self.initial(memory_limit);
         }
-        // Empty cycles carry no survival evidence. A dead band avoids
-        // oscillation around a single survival-ratio boundary. Division keeps
-        // the comparisons safe even for extreme accounting values.
+        // A minor's cost follows its survivor bytes, not the dead bytes it
+        // skips, and its stop is serial: keep survivors between 1/64 and 1/16
+        // of the nursery so the copy stays amortized over the allocation
+        // between minors. Above the band, jump straight to 32 times the
+        // survivors instead of doubling once per cycle: ramp-up cycles
+        // otherwise copy (and tenure) nearly every in-flight object, and
+        // concurrent allocators each keep a live working set in flight
+        // (willow-jz15.120). Empty cycles carry no survival evidence; the dead
+        // band avoids oscillation, and division keeps the comparisons safe
+        // even for extreme accounting values.
         let target = if young_before == 0 {
             current
-        } else if promoted >= (young_before - young_before / 2) as u64 {
-            current.saturating_mul(2)
-        } else if promoted <= (young_before / 4) as u64 {
+        } else if promoted >= (young_before / 16) as u64 {
+            let goal = usize::try_from(promoted.saturating_mul(32)).unwrap_or(usize::MAX);
+            current.saturating_mul(2).max(goal)
+        } else if promoted <= (young_before / 64) as u64 {
             current / 2
         } else {
             current
@@ -238,19 +246,37 @@ mod tests {
         assert_eq!(policy.initial(None), initial_budget());
         let mut threshold = FLOOR;
         for _ in 0..20 {
-            let next = policy.next(threshold, 1024, 512, None);
+            // Survival at the 1/16 boundary grows; 32x of it stays below 2x.
+            let next = policy.next(threshold, 1024, 64, None);
             assert_eq!(next, threshold.saturating_mul(2).min(CAP));
             threshold = next;
         }
         assert_eq!(threshold, CAP);
-        assert_eq!(policy.next(threshold, 1024, 400, None), threshold);
+        // Both band edges are exclusive: neither grows nor shrinks.
+        assert_eq!(policy.next(threshold, 1024, 63, None), threshold);
+        assert_eq!(policy.next(threshold, 1024, 17, None), threshold);
         assert_eq!(policy.next(threshold, 0, 0, None), threshold);
         for _ in 0..20 {
-            let next = policy.next(threshold, 1024, 256, None);
+            let next = policy.next(threshold, 1024, 16, None);
             assert_eq!(next, (threshold / 2).max(FLOOR));
             threshold = next;
         }
         assert_eq!(threshold, FLOOR);
+    }
+
+    #[test]
+    fn nursery_policy_jumps_to_32x_survivors_within_cap_and_limit() {
+        // willow-jz15.120: high survival jumps straight to 32x the survivors
+        // instead of doubling once per cycle, bounded by the cap and limit.
+        let policy = Policy::default();
+        let mib = 1024 * 1024;
+        assert_eq!(policy.next(FLOOR, mib, mib as u64, None), 32 * mib);
+        // Not rounded: 32 x 300 KiB is below the next power of two.
+        assert_eq!(policy.next(FLOOR, mib, 300 * 1024, None), 300 * 32 * 1024);
+        // Doubling still wins when it exceeds the survivor goal.
+        assert_eq!(policy.next(16 * mib, mib, 64 * 1024, None), 32 * mib);
+        assert_eq!(policy.next(FLOOR, mib, 4 * mib as u64, None), CAP);
+        assert_eq!(policy.next(FLOOR, mib, mib as u64, Some(3 * mib)), 3 * mib);
     }
 
     #[test]
@@ -306,7 +332,7 @@ fn scheduler_runway_only_initializes_a_cold_heap_once() {
         assert_eq!(state.nursery_threshold_bytes, FLOOR);
         self::scheduler_start(&mut state, 8);
         assert_eq!(state.nursery_threshold_bytes, FLOOR);
-        assert_eq!(state.threshold_bytes, CAP);
+        assert_eq!(state.threshold_bytes, major_startup_budget_for(8));
         state.nursery_threshold_bytes = FLOOR;
         self::scheduler_start(&mut state, 8);
         assert_eq!(state.nursery_threshold_bytes, FLOOR);

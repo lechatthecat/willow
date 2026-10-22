@@ -335,18 +335,76 @@ pub(super) fn retire_tlabs_for_thread(owner: ThreadId) {
     retire_owned_tlabs_locked(&mut runtime().heap.lock().unwrap(), owner, true);
 }
 
+/// Zeroed storage and start bitmaps for one TLAB chunk, prepared before the
+/// refill takes the heap lock. Zeroing 32 KiB and allocating both bitmaps
+/// inside the critical section serialized every concurrent refill
+/// (willow-jz15.120). Dropping an uninstalled value releases the storage.
+pub(super) struct ChunkStorage {
+    block: StorageBlock,
+    mark_bitmap: RegionMarkBitmap,
+    concurrent_marks: Arc<concurrent_bitmap::ConcurrentMarkBits>,
+}
+
+struct StorageBlock(*mut u8);
+
+impl StorageBlock {
+    fn layout() -> Layout {
+        Layout::from_size_align(GC_TLAB_CHUNK_SIZE, std::mem::align_of::<GcHeader>())
+            .expect("TLAB chunk layout is valid")
+    }
+
+    /// Hand the storage to a chunk, whose cleanup releases it.
+    fn into_raw(self) -> *mut u8 {
+        let base = self.0;
+        std::mem::forget(self);
+        base
+    }
+}
+
+impl Drop for StorageBlock {
+    fn drop(&mut self) {
+        // SAFETY: an uninstalled block still owns its storage exclusively.
+        unsafe { dealloc(self.0, Self::layout()) };
+    }
+}
+
+impl ChunkStorage {
+    /// `None` when the system allocator fails; no heap lock is needed.
+    pub(super) fn allocate() -> Option<Self> {
+        // SAFETY: the layout is nonzero and valid. Fresh zeroing makes every
+        // unallocated payload byte safe before generated code publishes a header.
+        let base = unsafe { allocate_region_storage(StorageBlock::layout()) };
+        (!base.is_null()).then(|| Self {
+            block: StorageBlock(base),
+            mark_bitmap: RegionMarkBitmap::new(GC_TLAB_CHUNK_SIZE),
+            concurrent_marks: Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(
+                GC_TLAB_CHUNK_SIZE / GC_REGION_MARK_GRANULE,
+            )),
+        })
+    }
+}
+
+#[cfg(test)]
 pub(super) fn allocate_tlab_chunk(state: &mut GcState, owner_state: usize) -> Option<*mut u8> {
-    if !can_reserve(state, GC_TLAB_CHUNK_SIZE) {
+    install_tlab_chunk(state, owner_state, &mut ChunkStorage::allocate())
+}
+
+/// Install `storage` as `owner_state`'s current chunk, taking it only when
+/// the reservation admits it. O(1) expected under the heap lock.
+pub(super) fn install_tlab_chunk(
+    state: &mut GcState,
+    owner_state: usize,
+    storage: &mut Option<ChunkStorage>,
+) -> Option<*mut u8> {
+    if storage.is_none() || !can_reserve(state, GC_TLAB_CHUNK_SIZE) {
         return None;
     }
-    let layout =
-        Layout::from_size_align(GC_TLAB_CHUNK_SIZE, std::mem::align_of::<GcHeader>()).ok()?;
-    // SAFETY: the layout is nonzero and valid. Fresh zeroing makes every
-    // unallocated payload byte safe before generated code publishes a header.
-    let base = unsafe { allocate_region_storage(layout) };
-    if base.is_null() {
-        return None;
-    }
+    let ChunkStorage {
+        block,
+        mark_bitmap,
+        concurrent_marks,
+    } = storage.take().unwrap();
+    let base = block.into_raw();
     runtime().tlab_ever_allocated.store(true, Ordering::Release);
     state
         .tlab_addresses
@@ -358,10 +416,8 @@ pub(super) fn allocate_tlab_chunk(state: &mut GcState, owner_state: usize) -> Op
         owner_state: Some(owner_state),
         kind: RegionKind::Nursery,
         live_bytes: 0,
-        mark_bitmap: RegionMarkBitmap::new(GC_TLAB_CHUNK_SIZE),
-        concurrent_marks: Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(
-            GC_TLAB_CHUNK_SIZE / GC_REGION_MARK_GRANULE,
-        )),
+        mark_bitmap,
+        concurrent_marks,
         header_offsets: Vec::new(),
     });
     let chunk = state.tlab_chunks.last().unwrap();

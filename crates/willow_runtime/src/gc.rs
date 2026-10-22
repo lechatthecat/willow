@@ -315,6 +315,9 @@ struct GcState {
     hard_pressure_triggered: bool,
     soft_memory: memory_control::Controller,
     last_major_live_bytes: u64,
+    /// `last_major_live_bytes` in the major-policy domain, which excludes the
+    /// nursery budget ([`major_policy_managed_bytes`]).
+    last_major_policy_live_bytes: u64,
     last_major_mark_work: u64,
     pacer: pacer::Sampler,
     pacer_trigger: u64,
@@ -574,7 +577,8 @@ pub(crate) fn charge_external(bytes: usize) {
         let trigger = (limit / 4).saturating_mul(3).max(1);
         previous_footprint < trigger && previous_footprint.saturating_add(bytes) >= trigger
     });
-    let previous_occupied = state.allocated_bytes.saturating_add(previous_external) as u64;
+    let previous_occupied =
+        major_policy_managed_bytes(&state).saturating_add(previous_external) as u64;
     let paced_crossing = state.pacer.enabled()
         && previous_occupied < state.pacer_trigger
         && previous_occupied.saturating_add(bytes as u64) >= state.pacer_trigger;
@@ -673,7 +677,7 @@ fn major_trigger(state: &GcState) -> usize {
 fn pacer_inputs(state: &GcState) -> pacer::Inputs {
     pacer::Inputs {
         live: state
-            .last_major_live_bytes
+            .last_major_policy_live_bytes
             .saturating_add(external_bytes() as u64),
         previous_goal: state.threshold_bytes as u64,
         expected_work: state.last_major_mark_work.max(state.last_major_live_bytes),
@@ -687,25 +691,59 @@ fn pacer_inputs(state: &GcState) -> pacer::Inputs {
 }
 
 // Policy samplers share one cumulative domain. Reclamation reduces occupancy,
-// but must not remove native allocation history from a rate sample.
+// but must not remove native allocation history from a rate sample. Young
+// allocation enters the domain only when promoted: minor collections reclaim
+// the rest, so a high young allocation rate alone must not shorten the major
+// runway (willow-jz15.120).
 fn policy_allocated_total(state: &GcState) -> u64 {
     state
         .total_allocated_bytes
+        .saturating_sub(state.young_allocation_clock)
+        .saturating_add(state.promoted_bytes)
         .saturating_add(EXTERNAL_ALLOCATED_BYTES.load(Ordering::Relaxed))
 }
 
+/// Managed bytes the major policy is responsible for. Minor collections own
+/// young bytes up to the nursery budget; counting them would start whole-heap
+/// cycles for garbage the next minor reclaims anyway, and once the nursery
+/// approaches the goal every allocation sample would request a major
+/// (willow-jz15.120). Young growth beyond the budget (deferred minors) still
+/// counts. Hard reservation pressure always sees every reserved byte.
+fn major_policy_managed_bytes(state: &GcState) -> usize {
+    let nursery_owned = state
+        .young_allocated_bytes
+        .min(state.nursery_threshold_bytes);
+    state.allocated_bytes.saturating_sub(nursery_owned)
+}
+
 fn memory_inputs(state: &GcState) -> memory_control::Inputs {
+    // A soft limit budgets every managed byte: excluding the nursery would let
+    // the heap exceed the limit by up to one nursery budget (willow-jz15.120).
+    // Its relief runway likewise measures all allocation.
+    let (live, occupied, allocated_total) = if state.soft_memory.enabled() {
+        (
+            state.last_major_live_bytes,
+            state.allocated_bytes,
+            state
+                .total_allocated_bytes
+                .saturating_add(EXTERNAL_ALLOCATED_BYTES.load(Ordering::Relaxed)),
+        )
+    } else {
+        (
+            state.last_major_policy_live_bytes,
+            major_policy_managed_bytes(state),
+            policy_allocated_total(state),
+        )
+    };
     memory_control::Inputs {
         unlimited_goal: state.threshold_bytes as u64,
-        live: state
-            .last_major_live_bytes
-            .saturating_add(external_bytes() as u64),
-        occupied: state.allocated_bytes.saturating_add(external_bytes()) as u64,
+        live: live.saturating_add(external_bytes() as u64),
+        occupied: occupied.saturating_add(external_bytes()) as u64,
         pressure_bytes: state
             .old_reserved_bytes
             .saturating_add(state.tlab_reserved_bytes)
             .saturating_add(external_bytes()) as u64,
-        allocated_total: policy_allocated_total(state),
+        allocated_total,
         // Our process provider reports RSS, not a compatible commit scope.
         non_heap_commit: None,
     }
@@ -736,6 +774,7 @@ impl Default for GcState {
             hard_pressure_triggered: false,
             soft_memory: memory_control::Controller::from_env(),
             last_major_live_bytes: 0,
+            last_major_policy_live_bytes: 0,
             last_major_mark_work: 0,
             pacer: pacer::Sampler::default(),
             pacer_trigger: 1024 * 1024,
@@ -979,8 +1018,11 @@ fn allocation_should_collect() -> bool {
     let hard_pressure = hard_reservation_pressure(&mut state);
     let memory_input = memory_inputs(&state);
     let memory = state.soft_memory.decide(memory_input);
+    // The pacer trigger lives in the major-policy domain even when a soft
+    // limit makes the memory inputs count every young byte.
     let paced = state.pacer.enabled()
-        && memory_input.occupied >= state.pacer_trigger
+        && major_policy_managed_bytes(&state).saturating_add(external_bytes()) as u64
+            >= state.pacer_trigger
         && memory.reason != memory_control::Reason::Relief;
     let collect = stress || hard_pressure || paced || memory.collect;
     if !collect {
@@ -989,8 +1031,12 @@ fn allocation_should_collect() -> bool {
     collect
 }
 
+fn minor_stress_enabled() -> bool {
+    gc_stress_enabled("minor") || gc_stress_enabled("relocate")
+}
+
 fn allocation_should_minor_collect() -> bool {
-    let stress = gc_stress_enabled("minor") || gc_stress_enabled("relocate");
+    let stress = minor_stress_enabled();
     let mut state = runtime().heap.lock().unwrap();
     sync_tlab_bytes(&mut state);
     stress || minor_allocation_due(&state)
@@ -1185,7 +1231,7 @@ fn tlab_alloc_slow(
     };
     let stress = gc_stress_enabled("alloc");
     let small = total_size <= GC_TLAB_MAX_OBJECT_SIZE;
-    let fast_bytes = {
+    let (fast_bytes, minor_due) = {
         let mut state = runtime().heap.lock().unwrap();
         register_tlab_state(&mut state, state_address);
         let record = state.tlab_states.get_mut(&state_address).unwrap();
@@ -1198,12 +1244,14 @@ fn tlab_alloc_slow(
             // space. Seal it before collection/refill.
             retire_tlab_locked(&mut state, state_address);
         }
-        fast_bytes
+        // Reuse this critical section's TLAB sync for the minor trigger:
+        // every sync scans all registered TLABs (willow-jz15.120).
+        (fast_bytes, minor_allocation_due(&state))
     };
     sweep::assist();
     assist_concurrent_mark(fast_bytes.saturating_add(total_size as u64));
 
-    if !stress && allocation_should_minor_collect() {
+    if !stress && (minor_due || minor_stress_enabled()) && allocation_should_minor_collect() {
         minor_collect_internal();
         // A busy owner may only have queued the request. Account for its debt
         // immediately; join only when no bounded refill runway remains.
@@ -1230,15 +1278,19 @@ fn tlab_alloc_slow(
         return allocate_old(layout_id, type_id as u32, payload_size, gc_ref_mask);
     }
 
+    let mut storage = tlab::ChunkStorage::allocate();
     let mut state = runtime().heap.lock().unwrap();
     register_tlab_state(&mut state, state_address);
-    let mut base = allocate_tlab_chunk(&mut state, state_address);
+    let mut base = tlab::install_tlab_chunk(&mut state, state_address, &mut storage);
     if base.is_none() && (state.memory_limit_bytes.is_some() || state.soft_memory.enabled()) {
         drop(state);
         collect_for_budget();
+        if storage.is_none() {
+            storage = tlab::ChunkStorage::allocate();
+        }
         state = runtime().heap.lock().unwrap();
         register_tlab_state(&mut state, state_address);
-        base = allocate_tlab_chunk(&mut state, state_address);
+        base = tlab::install_tlab_chunk(&mut state, state_address, &mut storage);
     }
     let Some(base) = base else {
         return allocation_failure(&state);
@@ -1963,6 +2015,7 @@ fn try_collect_internal() -> bool {
         let after = state.allocated_bytes as u64;
         let previous_goal = state.threshold_bytes as u64;
         state.last_major_live_bytes = after;
+        state.last_major_policy_live_bytes = major_policy_managed_bytes(&state) as u64;
         state.last_major_mark_work = work
             .marked_bytes
             .saturating_add(work.scanned_bytes)
@@ -2236,6 +2289,7 @@ fn reset_internal() {
     state.hard_pressure_triggered = false;
     state.soft_memory = memory_control::Controller::from_env();
     state.last_major_live_bytes = 0;
+    state.last_major_policy_live_bytes = 0;
     state.last_major_mark_work = 0;
     state.pacer = pacer::Sampler::default();
     assist::reset();

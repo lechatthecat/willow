@@ -861,9 +861,22 @@ impl<'a> MinorCollector<'a> {
             let base = self.state.tlab_chunks[chunk_index].base;
             let used = self.state.tlab_chunks[chunk_index].used;
             let identity = chunk_identities[chunk_index];
-            let source = identity < self.source_chunks;
-            if source
-                && !poison_moved
+            if identity >= self.source_chunks {
+                // A destination of this cycle holds only the young copies
+                // `allocate_survivor` indexed and marked: its offsets, start
+                // bits and live bytes are already exact. Re-walking it would
+                // revisit every survivor once more (willow-jz15.120).
+                let chunk = &self.state.tlab_chunks[chunk_index];
+                debug_assert_eq!(chunk.kind, RegionKind::Survivor);
+                debug_assert_eq!(chunk.live_bytes, chunk.used);
+                debug_assert_eq!(chunk.header_offsets.len(), chunk.mark_bitmap.bits.count());
+                let stats = &mut self.state.survivor_stats;
+                stats.survivor_space_reserved += chunk.capacity as u64;
+                stats.survivor_space_live += chunk.live_bytes as u64;
+                chunk_index += 1;
+                continue;
+            }
+            if !poison_moved
                 && self.forwarded_per_chunk[identity] != 0
                 && self.forwarded_per_chunk[identity]
                     == self.state.tlab_chunks[chunk_index].header_offsets.len()
@@ -886,7 +899,6 @@ impl<'a> MinorCollector<'a> {
                 // Marking never found a young object here, or `young_source`
                 // would have indexed the chunk: every object in it is dead
                 // and young (willow-8hq4.21).
-                debug_assert!(source, "survivor destinations are indexed");
                 if !self.may_drop(chunk_index) {
                     // Nothing to run per object: account the whole chunk from
                     // its bump prefix and start-bit popcount, O(chunk words).
@@ -908,7 +920,6 @@ impl<'a> MinorCollector<'a> {
                 self.stop_work.metadata_bytes += indexed * GC_HEADER_SIZE as u64;
             }
             let mut has_allocated = false;
-            let mut has_young = false;
             let mut live_bytes = 0usize;
             self.state.tlab_chunks[chunk_index].mark_bitmap.clear();
             // Retirement and survivor copying index every header, so visit the
@@ -934,7 +945,7 @@ impl<'a> MinorCollector<'a> {
                     .expect("TLAB header address is non-null");
                 // Young objects left in a source chunk were either copied
                 // (forwarded) or unreachable; reclaim both in this same walk.
-                if source && object.allocated() && object.generation() == GC_GENERATION_YOUNG {
+                if object.allocated() && object.generation() == GC_GENERATION_YOUNG {
                     self.stop_work.swept_objects += 1;
                     let size = object.size();
                     let type_id = object.type_id();
@@ -974,12 +985,9 @@ impl<'a> MinorCollector<'a> {
                     reclaimed_bytes = reclaimed_bytes.saturating_add(size);
                 }
                 if object.allocated() {
-                    has_young |= object.generation() == GC_GENERATION_YOUNG;
-                    debug_assert!(
-                        object.generation() == GC_GENERATION_OLD
-                            || self.state.tlab_chunks[chunk_index].kind == RegionKind::Survivor,
-                        "young survivors must be in collector-owned destination storage"
-                    );
+                    // Every young object of a source was reclaimed above;
+                    // young survivors live only in skipped destinations.
+                    debug_assert_eq!(object.generation(), GC_GENERATION_OLD);
                     has_allocated = true;
                     live_bytes = live_bytes.saturating_add(object.size());
                     self.state.tlab_chunks[chunk_index]
@@ -991,13 +999,7 @@ impl<'a> MinorCollector<'a> {
             if !has_allocated {
                 self.release_chunk(chunk_index, &mut chunk_identities);
             } else {
-                if !has_young {
-                    self.state.tlab_chunks[chunk_index].kind = RegionKind::Pinned;
-                } else {
-                    self.state.survivor_stats.survivor_space_reserved +=
-                        self.state.tlab_chunks[chunk_index].capacity as u64;
-                    self.state.survivor_stats.survivor_space_live += live_bytes as u64;
-                }
+                self.state.tlab_chunks[chunk_index].kind = RegionKind::Pinned;
                 self.state.tlab_chunks[chunk_index].live_bytes = live_bytes;
                 chunk_index += 1;
             }

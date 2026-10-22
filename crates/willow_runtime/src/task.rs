@@ -276,6 +276,9 @@ pub struct RuntimeTask {
     /// Running. The scheduler publishes that requeue only after the poll returns
     /// Pending, avoiding a second worker polling the same frame concurrently.
     pub yield_requested: bool,
+    /// How often the scheduler handed this unpinned task back to the shared
+    /// queue to start it on an idle worker (willow-jz15.120).
+    pub(crate) spread_hops: u16,
     /// Wait relationships, allocated on the first registration and released
     /// with the last (willow-ezs.3). Private so every mutation goes through the
     /// accessors that maintain that invariant.
@@ -321,6 +324,7 @@ impl RuntimeTask {
             frame_rooted: false,
             wake_deadline: None,
             yield_requested: false,
+            spread_hops: 0,
             wait: None,
             debug: None,
             panic_context: Arc::new(crate::panic_context::PanicContext::new(id)),

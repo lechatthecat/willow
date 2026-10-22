@@ -229,6 +229,8 @@ struct RunQueues {
     #[cfg(test)]
     idle_notifications: AtomicUsize,
     #[cfg(test)]
+    owner_notifications: AtomicUsize,
+    #[cfg(test)]
     pause_global_publish: AtomicBool,
     #[cfg(test)]
     global_publish_gate: Mutex<()>,
@@ -383,6 +385,8 @@ impl RunQueues {
             #[cfg(test)]
             idle_notifications: AtomicUsize::new(0),
             #[cfg(test)]
+            owner_notifications: AtomicUsize::new(0),
+            #[cfg(test)]
             pause_global_publish: AtomicBool::new(false),
             #[cfg(test)]
             global_publish_gate: Mutex::new(()),
@@ -499,6 +503,31 @@ impl RunQueues {
                     self.notify_idle();
                 }
                 self.worker_metrics[worker]
+                    .local_pushes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            None => self.push_global(id),
+        }
+    }
+
+    /// Make the worker's next pop local-first, so a task it just spread to the
+    /// shared queue goes to an idle peer before this worker can take it back.
+    fn defer_global_pop(&self, worker: usize) {
+        if let Some(queue) = self.locals.get(worker) {
+            queue.prefer_global.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Return a pinned task to its owner and wake only that owner: an idle
+    /// thief would just steal it and reroute it again (willow-jz15.120).
+    fn push_rerouted(&self, owner: usize, id: RuntimeTaskId) {
+        match self.locals.get(owner) {
+            Some(queue) => {
+                queue.publish(id);
+                #[cfg(test)]
+                self.owner_notifications.fetch_add(1, Ordering::Relaxed);
+                notify_worker_waiter(owner);
+                self.worker_metrics[owner]
                     .local_pushes
                     .fetch_add(1, Ordering::Relaxed);
             }
@@ -2954,7 +2983,7 @@ pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) 
 mod parking;
 use parking::{
     current_wake_generation, notify_all_idle_waiters, notify_idle_waiters, notify_local_work,
-    wait_for_wake_since,
+    notify_worker_waiter, wait_for_wake_since,
 };
 
 /// Wake every idle-parked scheduler thread so it reaches its safepoint now.
@@ -4009,6 +4038,7 @@ fn claim_global_ready_for_worker(
         Work(ClaimedTaskWork, Arc<crate::panic_context::PanicContext>),
         FinalizeCancelled,
         Reroute(usize),
+        Spread,
         Drop,
     }
 
@@ -4103,6 +4133,10 @@ fn claim_global_ready_for_worker(
                 {
                     return Claim::Reroute(owner);
                 }
+                if task_should_spread(task, worker, queues, shared) {
+                    task.spread_hops = task.spread_hops.saturating_add(1);
+                    return Claim::Spread;
+                }
                 match task.claim_for_poll() {
                     ClaimOutcome::Drop => Claim::Drop,
                     ClaimOutcome::Poll => {
@@ -4148,12 +4182,61 @@ fn claim_global_ready_for_worker(
                 set_current_task(None);
             }
             Claim::Reroute(owner) => {
-                queues.push_local(owner, id);
+                queues.push_rerouted(owner, id);
+                return None;
+            }
+            Claim::Spread => {
+                // The queue token is still set because no claim occurred.
+                queues.push_global(id);
+                queues.notify_idle();
+                queues.defer_global_pop(worker);
                 return None;
             }
             Claim::Drop => {}
         }
     }
+}
+
+/// A first poll pins a suspending task to its worker for the rest of its life
+/// (native stack or quantum affinity). A worker that still has queued local
+/// work would time-slice the new task with that work while another worker sits
+/// idle, so it hands an unpinned Ready task back to the shared queue and wakes
+/// an idle worker instead (willow-jz15.120). Idleness is "not running a poll",
+/// not "registered to park": a worker between parks, or one just woken for
+/// this very task, is not registered either, and treating it as busy pinned
+/// two tasks to one worker. Each hop is paired with a local pop by the busy
+/// worker (`defer_global_pop`), and a task hops at most once per pool worker.
+fn task_should_spread(
+    task: &RuntimeTask,
+    worker: usize,
+    queues: &RunQueues,
+    shared: Option<&ParallelRunState>,
+) -> bool {
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    if task.native_stack.is_some() {
+        return false;
+    }
+    usize::from(task.spread_hops) < queues.worker_count()
+        && task.worker_affinity.is_none()
+        && task.state.lifecycle() == TaskLifecycle::Ready
+        && queues
+            .locals
+            .get(worker)
+            .is_some_and(|queue| !queue.looks_empty())
+        // The claiming worker has not begun its poll, so any other active
+        // poll count below `workers - 1` leaves some peer idle.
+        && shared.is_some_and(|state| state.active_polls() + 1 < queues.worker_count())
 }
 
 fn duration_until(deadline: Instant) -> Duration {
@@ -5035,6 +5118,10 @@ pub(crate) mod scaling_measurements;
 #[cfg(test)]
 #[path = "scheduler_run_queue_metrics_tests.rs"]
 mod run_queue_metrics_tests;
+
+#[cfg(test)]
+#[path = "scheduler_spread_tests.rs"]
+mod spread_tests;
 
 #[cfg(test)]
 #[path = "scheduler_tests.rs"]

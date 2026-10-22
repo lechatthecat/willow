@@ -176,11 +176,12 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
                 work.root_scan_bytes,
                 (root_count * size_of::<usize>()) as u64
             );
-            // The n chunks holding a node are indexed once and swept once,
-            // plus n - 1 copies; the n dead chunks are released without a
-            // header walk (willow-8hq4.21), and the young set is not
+            // The n chunks holding a node are indexed once and swept once;
+            // survivor copies land in fresh destination chunks that the sweep
+            // skips (willow-jz15.120). The n dead chunks are released without
+            // a header walk (willow-8hq4.21), and the young set is not
             // pre-indexed (willow-8hq4.16).
-            assert_eq!(stop.metadata_objects, (3 * n - 1) as u64);
+            assert_eq!(stop.metadata_objects, (2 * n) as u64);
             assert_eq!(state.promoted_objects, 1);
             assert_eq!(state.survivor_stats.survivor_copies, (n - 1) as u64);
             assert_eq!(state.moved_objects, (n - 1) as u64);
@@ -431,9 +432,10 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
                     },
                     remembered,
                 );
-                // Child chunks are indexed and swept, survivor copies swept;
-                // dead chunks are released unwalked (willow-8hq4.21).
-                let expected = if cycle % 2 == 0 { 3 * young } else { young };
+                // Child chunks are indexed and swept; survivor copies sit in
+                // destination chunks the sweep skips (willow-jz15.120); dead
+                // chunks are released unwalked (willow-8hq4.21).
+                let expected = if cycle % 2 == 0 { 2 * young } else { young };
                 assert_eq!(stop.metadata_objects, expected as u64);
                 if young == 0 {
                     assert_eq!(work.marked_bytes, 0);
@@ -787,8 +789,9 @@ fn fully_dead_nursery_chunks_are_released_without_header_walks() {
             let stop = collect_with_stop(slots);
             let state = runtime().heap.lock().unwrap();
             if rooted {
-                // The rooted chunk: index + sweep walk; plus the one copy.
-                assert_eq!(stop.metadata_objects, 2 * per_chunk as u64 + 1);
+                // The rooted chunk: index + sweep walk. The copy's destination
+                // chunk is not swept (willow-jz15.120).
+                assert_eq!(stop.metadata_objects, 2 * per_chunk as u64);
                 assert_ne!(root, payloads[per_chunk / 2]);
                 assert_eq!(state.survivor_stats.survivor_copies, 1);
                 assert_eq!(state.young_allocated_bytes, size);

@@ -2491,9 +2491,12 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
             (count * (GC_HEADER_SIZE + 8)) as i64
         );
         // Initial stopped retirement, final accounting and the allocated-byte
-        // snapshot remain linear in the mutator/TLAB count.
-        let recovery = crate::gc_telemetry::stops::snapshot_stops().by_reason[3].requests as usize;
-        let expected_reads = (4 + recovery) * count;
+        // snapshot remain linear in the mutator/TLAB count. Each remark stop
+        // reads every record once; with many mutators a retry-capped remark
+        // completes as a recovery stop instead, so both kinds count.
+        let stops = crate::gc_telemetry::stops::snapshot_stops();
+        let remarks = (stops.by_reason[1].requests + stops.by_reason[3].requests) as usize;
+        let expected_reads = (2 + remarks) * count;
         assert_eq!(
             TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed),
             expected_reads

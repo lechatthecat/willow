@@ -264,7 +264,7 @@ mod tests {
         reset_internal();
         let mut state = runtime().heap.lock().unwrap();
         state.pacer.disable_for_test();
-        state.last_major_live_bytes = 3 * MIN_GOAL;
+        state.last_major_policy_live_bytes = 3 * MIN_GOAL;
         complete_threshold(&mut state, MIN_GOAL);
         assert_eq!(state.threshold_bytes as u64, 6 * MIN_GOAL);
         assert_eq!(state.pacer_trigger, 6 * MIN_GOAL);

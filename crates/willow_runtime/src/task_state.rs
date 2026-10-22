@@ -46,7 +46,21 @@
 //! the frame status Release/Acquire pair documented in
 //! `willow_happens_before.md` is unchanged and still carries the result itself.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+/// Advances after every cancel request that set a task's request bit
+/// (willow-jz15.120). A predicate `cancel_requested || Cancelling` can only
+/// become true through such a request, so a reader that already looked at a
+/// task's state after observing epoch `E` need not look again until the epoch
+/// moves. Starts at 1 so a zero cache always forces the first look.
+static CANCEL_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// The current cancel-request epoch. Acquire pairs with the Release advance
+/// that follows the request CAS, so a state read after this load observes
+/// every request counted in the returned value.
+pub fn cancel_epoch() -> u64 {
+    CANCEL_EPOCH.load(Ordering::Acquire)
+}
 
 /// Lifecycle state of a task, as stored in the low bits of the atomic word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,8 +471,14 @@ impl AtomicTaskState {
                 Ordering::AcqRel
             };
             match self.compare_exchange(word, next, ordering) {
-                Ok(_) if deferred || already_queued => return CancelOutcome::Deferred,
-                Ok(_) => return CancelOutcome::Enqueue,
+                Ok(_) => {
+                    CANCEL_EPOCH.fetch_add(1, Ordering::Release);
+                    return if deferred || already_queued {
+                        CancelOutcome::Deferred
+                    } else {
+                        CancelOutcome::Enqueue
+                    };
+                }
                 Err(seen) => word = seen,
             }
         }
@@ -568,6 +588,29 @@ mod tests {
         let state = running();
         assert!(state.finish_terminal());
         state
+    }
+
+    /// willow-jz15.120: every recorded request advances the cancel epoch
+    /// before its caller returns, so a reader caching "not cancelled" against
+    /// an older epoch looks again. Other tests may advance it concurrently, so
+    /// only strict growth is asserted.
+    #[test]
+    fn recorded_cancel_requests_advance_the_cancel_epoch() {
+        for (state, outcome) in [
+            (running(), CancelOutcome::Deferred),
+            (parked(), CancelOutcome::Enqueue),
+            (blocked(), CancelOutcome::Enqueue),
+        ] {
+            let before = cancel_epoch();
+            assert_eq!(state.request_cancel(), outcome);
+            let after = cancel_epoch();
+            assert!(after > before, "{outcome:?} did not advance the epoch");
+            // The predicate that readers cache is now true.
+            assert!(state.load().cancel_requested());
+            assert_eq!(state.request_cancel(), CancelOutcome::NoChange);
+        }
+        assert_eq!(terminal().request_cancel(), CancelOutcome::NoChange);
+        assert_ne!(cancel_epoch(), 0, "zero is reserved for 'never looked'");
     }
 
     #[test]

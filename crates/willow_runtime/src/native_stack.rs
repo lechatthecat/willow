@@ -43,6 +43,10 @@ pub(crate) struct NativeStack {
     result: i32,
     suspended: bool,
     cancelled: bool,
+    /// Cancel-request epoch at this stack's last task-state look; 0 forces a
+    /// look. `cancelled()` re-reads the shared task table only when the epoch
+    /// has moved, so per-call checks stay thread-local (willow-jz15.120).
+    cancel_epoch: u64,
     cleanup_depth: u32,
     /// Countdown that generated synchronous safepoints decrement inline; they
     /// enter `willow_sync_safepoint` only when it reaches zero. Generated code
@@ -86,6 +90,7 @@ impl NativeStack {
             stack.cancel_entry = None;
             stack.frame = frame;
             stack.cancelled = false;
+            stack.cancel_epoch = 0;
             stack.cleanup_depth = 0;
             stack.poll_countdown = 0;
             stack.poll_granted = 0;
@@ -153,6 +158,7 @@ impl NativeStack {
             result: 0,
             suspended: false,
             cancelled: false,
+            cancel_epoch: 0,
             cleanup_depth: 0,
             poll_countdown: 0,
             poll_granted: 0,
@@ -435,8 +441,14 @@ pub(crate) fn cancelled() -> i32 {
             return 0;
         }
         if !(*stack).cancelled {
-            let task = crate::scheduler::willow_sched_current_task();
-            (*stack).cancelled = crate::scheduler::willow_sched_is_cancelled(task) != 0;
+            // Load the epoch BEFORE the state: a request that lands after this
+            // load advances the epoch again, so the next call looks.
+            let epoch = crate::task_state::cancel_epoch();
+            if epoch != (*stack).cancel_epoch {
+                let task = crate::scheduler::willow_sched_current_task();
+                (*stack).cancelled = crate::scheduler::willow_sched_is_cancelled(task) != 0;
+                (*stack).cancel_epoch = epoch;
+            }
         }
         i32::from((*stack).cancelled)
     }
