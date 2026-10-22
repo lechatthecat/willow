@@ -251,10 +251,15 @@ impl RegionIndex {
 
     /// Snapshot only new extents under the heap mutex. Publish their page map
     /// after releasing that mutex and the initial global stop.
-    fn snapshot_late(&self, state: &GcState) -> LatePreparation {
+    ///
+    /// `stopped_chunks` is the TLAB chunk count at the initial stop. Chunks
+    /// appended after it hold only uncolored post-snapshot allocations; indexing
+    /// them would make sweep reclaim their live objects, so they stay outside
+    /// the epoch and implicitly black. Old regions color their allocations.
+    fn snapshot_late(&self, state: &GcState, stopped_chunks: usize) -> LatePreparation {
         let new_old_regions = state.old_regions.len() - self.old_regions;
-        let mut views =
-            Vec::with_capacity(new_old_regions + state.tlab_chunks.len() - self.tlab_ids.len());
+        let late_chunks = &state.tlab_chunks[self.tlab_ids.len()..stopped_chunks];
+        let mut views = Vec::with_capacity(new_old_regions + late_chunks.len());
         let mut old_objects = self.old_objects;
         for region in &state.old_regions[self.old_regions..] {
             views.push((
@@ -268,7 +273,7 @@ impl RegionIndex {
             ));
             old_objects += region.allocations.len();
         }
-        for chunk in &state.tlab_chunks[self.tlab_ids.len()..] {
+        for chunk in late_chunks {
             views.push((
                 RegionView {
                     base: chunk.base as usize,
@@ -302,7 +307,7 @@ impl RegionIndex {
 
     #[cfg(test)]
     fn complete_initial(&mut self, state: &GcState) {
-        self.publish_late(self.snapshot_late(state));
+        self.publish_late(self.snapshot_late(state, state.tlab_chunks.len()));
     }
 
     fn locate_region_id(&self, address: usize) -> Option<(usize, usize)> {
@@ -448,9 +453,9 @@ impl EpochIndex {
     pub(super) fn regions(index: RegionIndex) -> Self {
         Self(std::sync::RwLock::new(EpochData::Regions(index)))
     }
-    pub(super) fn snapshot_late(&self, state: &GcState) -> LatePreparation {
+    pub(super) fn snapshot_late(&self, state: &GcState, stopped_chunks: usize) -> LatePreparation {
         match &*self.0.read().unwrap() {
-            EpochData::Regions(index) => index.snapshot_late(state),
+            EpochData::Regions(index) => index.snapshot_late(state, stopped_chunks),
             #[cfg(test)]
             EpochData::Synthetic { .. } => unreachable!("initial capture uses regions"),
         }
@@ -653,7 +658,10 @@ mod tests {
             0,
         ));
         let late_object = willow_gc_alloc_layout(0, 0, GC_OLD_REGION_SIZE as i64, 0);
-        let late = cycle.objects.snapshot_late(&runtime().heap.lock().unwrap());
+        let late = {
+            let state = runtime().heap.lock().unwrap();
+            cycle.objects.snapshot_late(&state, state.tlab_chunks.len())
+        };
         assert!(!cycle.objects.contains(late_object as usize));
         if mode == "object" {
             for object in objects {
@@ -834,7 +842,7 @@ mod tests {
                 let mut state = runtime().heap.lock().unwrap();
                 marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
                 GC_MARK_PHASE.store(1, Ordering::Release);
-                cycle.objects.snapshot_late(&state)
+                cycle.objects.snapshot_late(&state, state.tlab_chunks.len())
             };
             cycle.objects.publish_late(late);
             cycle.enqueue(root);
@@ -881,7 +889,7 @@ mod tests {
             let mut state = runtime().heap.lock().unwrap();
             marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
             GC_MARK_PHASE.store(1, Ordering::Release);
-            cycle.objects.snapshot_late(&state)
+            cycle.objects.snapshot_late(&state, state.tlab_chunks.len())
         };
         // Root snapshot precedes late publication, as in the root handshake.
         cycle.enqueue(anchor);
@@ -902,6 +910,64 @@ mod tests {
             willow_gc_allocated_bytes(),
             (2 * GC_HEADER_SIZE + 8 + GC_OLD_REGION_SIZE) as i64
         );
+        willow_pop_roots(2);
+        drop(collector);
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn tlab_chunk_created_after_initial_stop_stays_black_through_sweep() {
+        let _test = runtime_test_guard();
+        reset_internal_for_test();
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        let collector = cycle_wait::CollectorGuard::try_acquire().unwrap();
+        let mut anchor = willow_alloc_typed(8, 0);
+        willow_push_root(&mut anchor);
+        let (prepared, _) = {
+            let state = runtime().heap.lock().unwrap();
+            RegionIndex::snapshot(&state)
+        }
+        .build(true);
+        let mut cycle = ConcurrentCycle::with_index(
+            EpochIndex::regions(prepared),
+            IdSet::default(),
+            IdMap::default(),
+            2,
+        );
+        cycle.late_published = std::sync::atomic::AtomicBool::new(false);
+        let cycle = Arc::new(cycle);
+        // The initial stop retires every cursor and fixes the late boundary.
+        let stopped_chunks = {
+            let mut state = runtime().heap.lock().unwrap();
+            retire_all_tlabs_unindexed_for_mark(&mut state);
+            marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+            GC_MARK_PHASE.store(1, Ordering::Release);
+            state.tlab_chunks.len()
+        };
+        cycle.enqueue(anchor);
+        // After resume, but before late publication, a fresh TLAB chunk takes
+        // an uncolored allocation named only by a post-snapshot root.
+        let mut tls = tlab_state_for_test();
+        let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
+        willow_push_root(&mut young);
+        let chunk_base = {
+            let mut state = runtime().heap.lock().unwrap();
+            assert_eq!(state.tlab_chunks.len(), stopped_chunks + 1);
+            let base = state.tlab_chunks[stopped_chunks].base as usize;
+            let late = cycle.objects.snapshot_late(&state, stopped_chunks);
+            // A refill retires the chunk, so the concurrent sweep visits it.
+            retire_tlab_locked(&mut state, &mut tls as *mut GcTlabState as usize);
+            drop(state);
+            cycle.publish_late(late);
+            base
+        };
+        assert!(!cycle.objects.contains_extent(chunk_base));
+        assert!(cycle.objects.retains_allocated(young as usize));
+        let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
+        sweep::concurrent(plan);
+        let object = HeapObject::from_payload(GcPayload::from_raw(young).unwrap());
+        assert!(object.allocated(), "post-stop TLAB allocation was swept");
+        assert_eq!(object.generation(), GC_GENERATION_YOUNG);
         willow_pop_roots(2);
         drop(collector);
         reset_internal_for_test();
@@ -938,7 +1004,7 @@ mod tests {
             let mut state = runtime().heap.lock().unwrap();
             marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
             GC_MARK_PHASE.store(1, Ordering::Release);
-            cycle.objects.snapshot_late(&state)
+            cycle.objects.snapshot_late(&state, state.tlab_chunks.len())
         };
         cycle.enqueue(anchor);
         // A mutator assist may trace the anchor before late publication.

@@ -29,7 +29,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
             }
             #[cfg(test)]
             INITIAL_PARTICIPANTS.fetch_add(coord.mutators.len(), Ordering::Relaxed);
-            let (before, cycle) = {
+            let (before, cycle, late_chunks) = {
                 let mut state = runtime().heap.lock().unwrap();
                 assert!(
                     state.satb.is_empty(),
@@ -37,6 +37,9 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                 );
                 retire_all_tlabs_unindexed_for_mark(&mut state);
                 sync_tlab_accounting_unindexed(&mut state);
+                // Chunks appended after this stop receive only post-snapshot,
+                // uncolored TLAB allocations: they stay implicitly black.
+                let late_chunks = state.tlab_chunks.len();
                 let before = state.allocated_bytes as u64;
                 // Generated allocations publish start bits after header initialization.
                 // A publication racing initialization is retried after the handshake.
@@ -63,7 +66,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                 let cycle = Arc::new(cycle);
                 marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
                 GC_MARK_PHASE.store(1, Ordering::Release);
-                (before, cycle)
+                (before, cycle, late_chunks)
             };
             let root_scan = crate::gc_telemetry::measurement::Span::new(
                 crate::gc_telemetry::measurement::Phase::Roots,
@@ -105,18 +108,18 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                 .lock()
                 .unwrap()
                 .transition(old_cycle::Phase::ConcurrentMark);
-            Some((before, cycle))
+            Some((before, cycle, late_chunks))
         },
     );
-    if let Some((_, cycle)) = &result {
+    if let Some((_, cycle, late_chunks)) = &result {
         sweep::release_quarantine(cycle.assist_epoch);
         // Late extents may be arbitrarily numerous after collector descheduling.
         // Publish them after resume, before starting workers; captured roots and
         // SATB claims retain unresolved values in owned unindexed work meanwhile.
         let state = runtime().heap.lock().unwrap();
-        let late = cycle.objects.snapshot_late(&state);
+        let late = cycle.objects.snapshot_late(&state, *late_chunks);
         drop(state);
         cycle.publish_late(late);
     }
-    result
+    result.map(|(before, cycle, _)| (before, cycle))
 }
