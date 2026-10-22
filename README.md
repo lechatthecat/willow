@@ -87,22 +87,22 @@ Willow used 8 workers. Comparison runtimes were Go 1.27.0 and OpenJDK 26.0.2 usi
 
 | Case | Willow (ms) | Go (ms) | Java (ms) |
 | --- | ---: | ---: | ---: |
-| idle_spawn | **59.865** | 117.138 | 94.362 |
-| wake_fanout | 68.737 | **13.534** | 190.546 |
-| yield_switch | 660.536 | 1,381.693 | **549.412** |
-| ping_pong | 745.233 | **165.653** | 784.982 |
-| gc_scheduler | 144.043 | **134.869** | 141.283 |
-| channel_select_fan_in | 1,029.407 | **230.543** | 525.474 |
-| spawn_join_tree | 167.243 | **16.343** | 99.208 |
-| general_pow | 578.237 | 601.031 | **199.976** |
-| fibonacci | 249.229 | 386.242 | **229.733** |
-| array_sum | 53.058 | **51.955** | 87.606 |
-| linked_list | 101.875 | **27.372** | 45.806 |
-| object_churn | 98.714 | **54.713** | 71.012 |
-| map_lookup_insert | 89.433 | **85.139** | 198.286 |
-| virtual_dispatch | 69.503 | **41.383** | 58.146 |
-| closure_call | 57.062 | 25.735 | **16.517** |
-| string_build | **63.953** | 79.973 | 85.099 |
+| idle_spawn | **76.847** | 114.706 | 86.052 |
+| wake_fanout | 72.090 | **13.334** | 203.489 |
+| yield_switch | 1,127.807 | 1,472.703 | **553.509** |
+| ping_pong | 729.448 | **168.098** | 803.912 |
+| gc_scheduler | 141.597 | **136.290** | 143.513 |
+| channel_select_fan_in | 1,025.584 | **233.291** | 540.071 |
+| spawn_join_tree | 211.162 | **16.508** | 96.946 |
+| general_pow | 576.120 | 596.288 | **198.036** |
+| fibonacci | 234.369 | 388.397 | **229.820** |
+| array_sum | 53.486 | **51.556** | 83.574 |
+| linked_list | 32.183 | **28.383** | 44.931 |
+| object_churn | 66.643 | **54.926** | 69.774 |
+| map_lookup_insert | 88.194 | **84.500** | 199.472 |
+| virtual_dispatch | 69.848 | **40.614** | 58.301 |
+| closure_call | 58.177 | 26.167 | **16.521** |
+| string_build | **64.596** | 79.601 | 83.775 |
 
 For `idle_spawn` with 100,000 parked tasks, RSS after parking was 73.69 MiB for Willow (734 B/task), 263.56 MiB for Go (2,737 B/task), and 172.77 MiB for Java (1,349 B/task).
 
