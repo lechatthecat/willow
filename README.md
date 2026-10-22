@@ -106,11 +106,6 @@ Willow used 8 workers. Comparison runtimes were Go 1.27.0 and OpenJDK 26.0.2 usi
 
 For `idle_spawn` with 100,000 parked tasks, RSS after parking was 73.69 MiB for Willow (734 B/task), 263.56 MiB for Go (2,737 B/task), and 172.77 MiB for Java (1,349 B/task).
 
-Scheduler cases time marked phases. The `object_churn`, `map_lookup_insert`, `virtual_dispatch`, `closure_call` and `string_build` cases also time marked phases. The remaining synchronous cases time the whole process, including JVM startup and JIT warm-up.
-The Java `channel_select_fan_in` case uses one shared queue. CPU affinity/frequency were not pinned and background services were active.
-The Willow `spawn_join_tree` result includes a confirmed regression (151.4 → 167.2 ms) tracked in `willow-9bvc`; it is shown here rather than excluded.
-These are machine-local microbenchmark results, not general language rankings; workload and runtime behavior vary substantially by case.
-
 ---
 
 ## Examples
