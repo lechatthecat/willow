@@ -1509,6 +1509,104 @@ mod tests {
         assert_eq!(queries.typed.stats().computations, typed_computations);
     }
 
+    // Measurement harness for willow-r52c.20; no production behavior changes.
+    #[test]
+    fn default_body_clone_measurements() {
+        use crate::ir::{lower, lowered};
+        use crate::semantic::ids::{FunctionId, TypeId};
+        for width in [1, 16, 64] {
+            for statements in [1, 16, 64] {
+                for dispatch in [false, true] {
+                    let body = (0..statements)
+                        .map(|i| format!("let v{i}: i64 = {i};"))
+                        .collect::<String>();
+                    let result = if dispatch { "self.seed()" } else { "42" };
+                    let classes = (0..width)
+                        .map(|i| format!("class C{i} implements I {{ pub fn seed(self) -> i64 {{ return {i}; }} }}"))
+                        .collect::<String>();
+                    let source = format!(
+                        "interface I {{ fn seed(self) -> i64; fn value(self) -> i64 {{ {body} return {result}; }} }} {classes} fn main() {{}}"
+                    );
+                    let (program, queries, checker) = prepare(&source, true);
+                    let Item::Interface(interface) = &program.items[0] else {
+                        panic!()
+                    };
+                    let canonical = interface
+                        .methods
+                        .iter()
+                        .find_map(|m| m.default_body.as_ref())
+                        .unwrap();
+                    let nodes = |b: &Block| AstWalk::new(AstEvent::Block(b)).count();
+                    let per_body = nodes(canonical);
+                    let record = queries.typed_record(canonical.id).unwrap();
+                    let mut retained_nodes = 0;
+                    let mut identities = std::collections::HashSet::new();
+                    for item in &program.items {
+                        if let Item::Class(class) = item {
+                            let m = class.methods.iter().find(|m| m.name == "value").unwrap();
+                            retained_nodes += nodes(&m.body);
+                            assert!(identities.insert(m.body.id));
+                            assert_ne!(m.body.id, canonical.id);
+                            assert_eq!(*queries.typed_record(m.body.id).unwrap(), *record);
+                        }
+                    }
+                    let before_repeat = queries.typed.stats().computations;
+                    for &id in &identities {
+                        assert_eq!(*queries.typed_record(id).unwrap(), *record);
+                    }
+                    assert_eq!(queries.typed.stats().computations, before_repeat);
+                    assert_eq!(retained_nodes, width * per_body);
+                    // One main, one default and one explicit seed per receiver.
+                    assert_eq!(queries.typechecks(), width + 2);
+                    let tables = lower::CheckerTables::from_checker(&checker);
+                    let (hir, gaps) = lower::lower_program_with(&program, &tables);
+                    assert!(gaps.is_empty(), "{gaps:?}");
+                    let lir = lowered::lower_program(&hir);
+                    let functions: HashMap<_, _> =
+                        lir.functions.iter().map(|f| (f.name, f)).collect();
+                    let mut shapes = std::collections::HashSet::new();
+                    let mut receiver_shapes = std::collections::HashSet::new();
+                    let mut bytes = 0;
+                    for i in 0..width {
+                        let name =
+                            FunctionId::method(TypeId::from_source_name(&format!("C{i}")), "value");
+                        let f = functions.get(&name).unwrap();
+                        let mut wire = serde_json::to_value(f).unwrap();
+                        bytes += serde_json::to_vec(&wire).unwrap().len();
+                        // Only erase the exported symbol. Receiver types, calls,
+                        // spans, locals and instructions remain part of equality.
+                        wire.as_object_mut().unwrap().remove("name");
+                        shapes.insert(serde_json::to_string(&wire).unwrap());
+                        fn rename_receiver(value: &mut serde_json::Value, receiver: &str) {
+                            match value {
+                                serde_json::Value::String(s) if s == receiver => *s = "C0".into(),
+                                serde_json::Value::Array(a) => {
+                                    for v in a {
+                                        rename_receiver(v, receiver);
+                                    }
+                                }
+                                serde_json::Value::Object(o) => {
+                                    for v in o.values_mut() {
+                                        rename_receiver(v, receiver);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        rename_receiver(&mut wire, &format!("C{i}"));
+                        receiver_shapes.insert(serde_json::to_string(&wire).unwrap());
+                    }
+                    println!(
+                        "NON15 width={width} statements={statements} dispatch={dispatch} ast_events_per_body={per_body} retained_copy_events={retained_nodes} typechecks={} default_typed_records=1 repeat_typed_computations=0 lir_bodies={width} symbol_erased_shapes={} receiver_renamed_shapes={} lir_json_bytes={bytes}",
+                        queries.typechecks(),
+                        shapes.len(),
+                        receiver_shapes.len()
+                    );
+                }
+            }
+        }
+    }
+
     /// willow-dnia: a default whose signature names `Self` is typed once for
     /// the interface: next to the same program without it, it adds one body
     /// check whatever the receiver count, and every copy reuses the canonical

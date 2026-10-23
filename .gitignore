@@ -242,3 +242,9 @@ AGENTS.md
 !/docs/audits/willow-8hq4.33/after.txt
 !/docs/audits/willow-8hq4.33/codegen.txt
 !/docs/audits/willow-8hq4.33/grow_after_ref_registration.wi
+
+# Public default-body sharing measurements (willow-r52c.20).
+!/docs/audits/willow-r52c.20.md
+!/docs/audits/willow-r52c.20-measurements.txt
+!/docs/audits/willow-r52c.20-generic-measurements.txt
+!/docs/audits/willow-r52c.20-reproduce.sh

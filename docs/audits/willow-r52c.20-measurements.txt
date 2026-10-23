@@ -1,0 +1,24 @@
+
+running 1 test
+NON15 width=1 statements=1 dispatch=false ast_events_per_body=12 retained_copy_events=12 typechecks=3 default_typed_records=1 repeat_typed_computations=0 lir_bodies=1 symbol_erased_shapes=1 receiver_renamed_shapes=1 lir_json_bytes=1010
+NON15 width=1 statements=1 dispatch=true ast_events_per_body=15 retained_copy_events=15 typechecks=3 default_typed_records=1 repeat_typed_computations=0 lir_bodies=1 symbol_erased_shapes=1 receiver_renamed_shapes=1 lir_json_bytes=2117
+NON15 width=1 statements=16 dispatch=false ast_events_per_body=87 retained_copy_events=87 typechecks=3 default_typed_records=1 repeat_typed_computations=0 lir_bodies=1 symbol_erased_shapes=1 receiver_renamed_shapes=1 lir_json_bytes=5580
+NON15 width=1 statements=16 dispatch=true ast_events_per_body=90 retained_copy_events=90 typechecks=3 default_typed_records=1 repeat_typed_computations=0 lir_bodies=1 symbol_erased_shapes=1 receiver_renamed_shapes=1 lir_json_bytes=6710
+NON15 width=1 statements=64 dispatch=false ast_events_per_body=327 retained_copy_events=327 typechecks=3 default_typed_records=1 repeat_typed_computations=0 lir_bodies=1 symbol_erased_shapes=1 receiver_renamed_shapes=1 lir_json_bytes=20428
+NON15 width=1 statements=64 dispatch=true ast_events_per_body=330 retained_copy_events=330 typechecks=3 default_typed_records=1 repeat_typed_computations=0 lir_bodies=1 symbol_erased_shapes=1 receiver_renamed_shapes=1 lir_json_bytes=21567
+NON15 width=16 statements=1 dispatch=false ast_events_per_body=12 retained_copy_events=192 typechecks=18 default_typed_records=1 repeat_typed_computations=0 lir_bodies=16 symbol_erased_shapes=16 receiver_renamed_shapes=1 lir_json_bytes=16178
+NON15 width=16 statements=1 dispatch=true ast_events_per_body=15 retained_copy_events=240 typechecks=18 default_typed_records=1 repeat_typed_computations=0 lir_bodies=16 symbol_erased_shapes=16 receiver_renamed_shapes=1 lir_json_bytes=33914
+NON15 width=16 statements=16 dispatch=false ast_events_per_body=87 retained_copy_events=1392 typechecks=18 default_typed_records=1 repeat_typed_computations=0 lir_bodies=16 symbol_erased_shapes=16 receiver_renamed_shapes=1 lir_json_bytes=89298
+NON15 width=16 statements=16 dispatch=true ast_events_per_body=90 retained_copy_events=1440 typechecks=18 default_typed_records=1 repeat_typed_computations=0 lir_bodies=16 symbol_erased_shapes=16 receiver_renamed_shapes=1 lir_json_bytes=107402
+NON15 width=16 statements=64 dispatch=false ast_events_per_body=327 retained_copy_events=5232 typechecks=18 default_typed_records=1 repeat_typed_computations=0 lir_bodies=16 symbol_erased_shapes=16 receiver_renamed_shapes=1 lir_json_bytes=326866
+NON15 width=16 statements=64 dispatch=true ast_events_per_body=330 retained_copy_events=5280 typechecks=18 default_typed_records=1 repeat_typed_computations=0 lir_bodies=16 symbol_erased_shapes=16 receiver_renamed_shapes=1 lir_json_bytes=345114
+NON15 width=64 statements=1 dispatch=false ast_events_per_body=12 retained_copy_events=768 typechecks=66 default_typed_records=1 repeat_typed_computations=0 lir_bodies=64 symbol_erased_shapes=64 receiver_renamed_shapes=1 lir_json_bytes=64802
+NON15 width=64 statements=1 dispatch=true ast_events_per_body=15 retained_copy_events=960 typechecks=66 default_typed_records=1 repeat_typed_computations=0 lir_bodies=64 symbol_erased_shapes=64 receiver_renamed_shapes=1 lir_json_bytes=135866
+NON15 width=64 statements=16 dispatch=false ast_events_per_body=87 retained_copy_events=5568 typechecks=66 default_typed_records=1 repeat_typed_computations=0 lir_bodies=64 symbol_erased_shapes=64 receiver_renamed_shapes=1 lir_json_bytes=357282
+NON15 width=64 statements=16 dispatch=true ast_events_per_body=90 retained_copy_events=5760 typechecks=66 default_typed_records=1 repeat_typed_computations=0 lir_bodies=64 symbol_erased_shapes=64 receiver_renamed_shapes=1 lir_json_bytes=429818
+NON15 width=64 statements=64 dispatch=false ast_events_per_body=327 retained_copy_events=20928 typechecks=66 default_typed_records=1 repeat_typed_computations=0 lir_bodies=64 symbol_erased_shapes=64 receiver_renamed_shapes=1 lir_json_bytes=1307554
+NON15 width=64 statements=64 dispatch=true ast_events_per_body=330 retained_copy_events=21120 typechecks=66 default_typed_records=1 repeat_typed_computations=0 lir_bodies=64 symbol_erased_shapes=64 receiver_renamed_shapes=1 lir_json_bytes=1380666
+test compiler_db::body::tests::default_body_clone_measurements ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3295 filtered out; finished in 1.49s
+

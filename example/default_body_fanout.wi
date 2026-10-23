@@ -1,0 +1,42 @@
+// willow-r52c.20: one default body, sixteen independent receivers.
+interface Answer {
+    fn seed(self) -> i64;
+    fn value(self) -> i64 { return self.seed() + 42; }
+}
+class Receiver0 implements Answer { pub fn seed(self) -> i64 { return 0; } }
+class Receiver1 implements Answer { pub fn seed(self) -> i64 { return 1; } }
+class Receiver2 implements Answer { pub fn seed(self) -> i64 { return 2; } }
+class Receiver3 implements Answer { pub fn seed(self) -> i64 { return 3; } }
+class Receiver4 implements Answer { pub fn seed(self) -> i64 { return 4; } }
+class Receiver5 implements Answer { pub fn seed(self) -> i64 { return 5; } }
+class Receiver6 implements Answer { pub fn seed(self) -> i64 { return 6; } }
+class Receiver7 implements Answer { pub fn seed(self) -> i64 { return 7; } }
+class Receiver8 implements Answer { pub fn seed(self) -> i64 { return 8; } }
+class Receiver9 implements Answer { pub fn seed(self) -> i64 { return 9; } }
+class Receiver10 implements Answer { pub fn seed(self) -> i64 { return 10; } }
+class Receiver11 implements Answer { pub fn seed(self) -> i64 { return 11; } }
+class Receiver12 implements Answer { pub fn seed(self) -> i64 { return 12; } }
+class Receiver13 implements Answer { pub fn seed(self) -> i64 { return 13; } }
+class Receiver14 implements Answer { pub fn seed(self) -> i64 { return 14; } }
+class Receiver15 implements Answer { pub fn seed(self) -> i64 { return 15; } }
+fn read(a: Answer) -> i64 { return a.value(); }
+fn main() {
+    let mut total = 0;
+    total = total + read(new Receiver0());
+    total = total + read(new Receiver1());
+    total = total + read(new Receiver2());
+    total = total + read(new Receiver3());
+    total = total + read(new Receiver4());
+    total = total + read(new Receiver5());
+    total = total + read(new Receiver6());
+    total = total + read(new Receiver7());
+    total = total + read(new Receiver8());
+    total = total + read(new Receiver9());
+    total = total + read(new Receiver10());
+    total = total + read(new Receiver11());
+    total = total + read(new Receiver12());
+    total = total + read(new Receiver13());
+    total = total + read(new Receiver14());
+    total = total + read(new Receiver15());
+    println(total); // 792
+}
