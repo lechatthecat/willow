@@ -1,0 +1,81 @@
+    Blocking waiting for file lock on build directory
+   Compiling willow v0.1.6 (/home/shu/Documents/gitproject/willow)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.67s
+     Running unittests src/lib.rs (target/debug/deps/willow_compiler-65054407f5676687)
+
+running 38 tests
+cleanup_chain depth=8 fanout=4 created=8 payload_clones=0 dropped=8
+cleanup_chain depth=8 fanout=32 created=8 payload_clones=0 dropped=8
+cleanup_chain depth=8 fanout=256 created=8 payload_clones=0 dropped=8
+cleanup_chain depth=64 fanout=4 created=64 payload_clones=0 dropped=64
+cleanup_chain depth=64 fanout=32 created=64 payload_clones=0 dropped=64
+cleanup_chain depth=64 fanout=256 created=64 payload_clones=0 dropped=64
+cleanup_chain depth=512 fanout=4 created=512 payload_clones=0 dropped=512
+cleanup_chain depth=512 fanout=32 created=512 payload_clones=0 dropped=512
+cleanup_chain depth=512 fanout=256 created=512 payload_clones=0 dropped=512
+test backend::cranelift::cleanup_stack::tests::cleanup_chain_snapshot_fanout_has_zero_payload_clones ... ok
+cleanup fanout input=4 blocks=8 scopes=1 enters=1 exits=4 regions=1
+cleanup persistent depth=8 fanout=8 states=16 registrations=8 edge_checks=15
+cleanup deep_chain input=8 blocks=1 scopes=8 enters=8 exits=8 regions=8
+test ir::lowered::cleanup::tests::cleanup_flush_accepts_complete_suffix_with_duplicate_requests ... ok
+test ir::lowered::cleanup::tests::cleanup_defer_requires_current_scope_ownership ... ok
+test ir::lowered::cleanup::tests::cleanup_leave_matches_site_sets_independent_of_order_and_duplicates ... ok
+test ir::lowered::cleanup::tests::cleanup_equivalent_block_permutation_preserves_scope_transfers ... ok
+test ir::lowered::cleanup::tests::cleanup_flush_rejects_non_suffix_unknown_and_incomplete_sites ... ok
+test ir::lowered::cleanup::tests::cleanup_nested_flush_preserves_outer_scope_and_panic_parent ... ok
+cleanup fanout input=32 blocks=64 scopes=1 enters=1 exits=32 regions=1
+cleanup panic sites=8 blocks=17 instructions=17
+test ir::lowered::cleanup::tests::cleanup_leave_rejects_wrong_or_incomplete_sites ... ok
+test ir::lowered::cleanup::tests::cleanup_panic_program_has_explicit_lifo_consumption_and_dispatch ... ok
+test ir::lowered::cleanup::tests::cleanup_recovery_and_normal_join_must_agree ... ok
+test ir::lowered::cleanup::tests::cleanup_registration_list_is_persistent_and_source_neutral ... ok
+test ir::lowered::cleanup::tests::cleanup_registration_prefix_survives_nested_scope_and_recovery ... ok
+test ir::lowered::cleanup::tests::cleanup_panic_program_empty_scope_restores_roots_and_propagates ... ok
+test ir::lowered::cleanup::tests::cleanup_rejects_declared_site_without_registration_body ... ok
+test ir::lowered::cleanup::tests::cleanup_rejects_duplicate_registration_instructions ... ok
+test ir::lowered::cleanup::tests::cleanup_rejects_invalid_normal_and_recovery_targets ... ok
+cleanup panic sites=64 blocks=129 instructions=129
+cleanup persistent depth=64 fanout=64 states=128 registrations=64 edge_checks=127
+cleanup deep_chain input=64 blocks=1 scopes=64 enters=64 exits=64 regions=64
+test ir::lowered::cleanup::tests::cleanup_rejects_registration_without_any_scope ... ok
+test ir::lowered::cleanup::tests::cleanup_rejects_site_owned_by_distinct_scopes ... ok
+test ir::lowered::cleanup::tests::cleanup_rejects_unowned_registration_in_unreachable_block ... ok
+test ir::lowered::cleanup::tests::cleanup_rejects_registration_prefix_divergence_at_join ... ok
+test compiler_db::lir_artifact::tests::float_suspend_and_cleanup_roundtrip_preserves_payloads ... ok
+test ir::lowered::cleanup::tests::cleanup_rejects_scope_underflow ... ok
+cleanup fanout input=256 blocks=512 scopes=1 enters=1 exits=256 regions=1
+cleanup_chain depth=20000 stack_bytes=131072 dropped=20000
+cleanup persistent depth=256 fanout=256 states=512 registrations=256 edge_checks=511
+cleanup panic sites=512 blocks=1025 instructions=1025
+test ir::lowered::async_liveness::stable_borrow_tests::stable_borrow_cleanup_capture_requires_storage ... ok
+test ir::lowered::cleanup::tests::cleanup_fanout_reuses_one_region_for_equivalent_exits ... ok
+test ir::lowered::tests::expression_cleanup_region_captures_registration_time_operand ... ok
+test ir::lowered::tests::defer_cleanup_region_owns_cfg_and_captures_only_outer_reads_or_writes ... ok
+test ir::lowered::cleanup::tests::cleanup_deep_scope_fanout_shares_states_and_registration_nodes ... ok
+test ir::lowered::cleanup::tests::cleanup_panic_program_deduplicates_sites_and_scales_linearly ... ok
+test backend::cranelift::cleanup_stack::tests::cleanup_chain_deep_drop_uses_bounded_stack ... ok
+cleanup deep_chain input=512 blocks=1 scopes=512 enters=512 exits=512 regions=512
+test ir::lowered::cleanup::tests::cleanup_deep_chain_has_one_node_and_transition_per_scope ... ok
+test backend::cranelift::lir_gen::tests::entry_poll_stays_before_faults_cleanup_and_cycles ... ok
+unwind n=16 blocks=139 facts=6 edges=8 summary=(84, 96)
+cleanup summaries n=16 nodes=64 visits=32
+ordered cleanup n=16 blocks=133 facts=0 edges=0
+test semantic::type_checker::async_retention::tests::async_retention_cleanup_continuations ... ok
+cleanup summaries n=32 nodes=128 visits=64
+ordered cleanup n=32 blocks=261 facts=0 edges=0
+unwind n=32 blocks=267 facts=6 edges=8 summary=(164, 192)
+test backend::cranelift::lir_gen::tests::cleanup_stack_classifier_handles_deep_defer_trees_on_a_small_stack ... ok
+test ir::lowered::tests::select_cleanup_graph_is_shared_across_all_winners ... ok
+cleanup summaries n=64 nodes=256 visits=128
+ordered cleanup n=64 blocks=517 facts=0 edges=0
+unwind n=64 blocks=523 facts=6 edges=8 summary=(324, 384)
+cleanup summaries n=128 nodes=512 visits=256
+ordered cleanup n=128 blocks=1029 facts=0 edges=0
+test semantic::type_checker::async_retention::tests::async_retention_shared_ordered_cleanup_scaling ... ok
+unwind n=128 blocks=1035 facts=6 edges=8 summary=(644, 768)
+test semantic::type_checker::async_retention::tests::async_retention_unwind_cleanup_scaling ... ok
+test ir::lowered::final_ir::tests::deeply_nested_cleanup_clone_dump_and_drop_use_bounded_stack ... ok
+test compiler_db::lir_artifact::tests::fifty_thousand_cleanup_regions_roundtrip_on_one_megabyte_stack ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 3298 filtered out; finished in 2.47s
+

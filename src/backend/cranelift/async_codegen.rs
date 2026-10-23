@@ -1401,7 +1401,7 @@ impl UnitCodegenContext<'_> {
                 lir_nonnegative: Default::default(),
                 array_fault_spill: None,
                 sync_defer_flags: HashMap::new(),
-                panic_scopes: Vec::new(),
+                panic_scopes: Default::default(),
                 unavailable_defer_ids: HashSet::new(),
                 sync_cancel_defer_context: 0,
                 panic_defer_codegen_depth: 0,
@@ -1419,7 +1419,7 @@ impl UnitCodegenContext<'_> {
                 lir_reference_scopes: Vec::new(),
                 fault_site_span: None,
                 collected_defer_sites: Vec::new(),
-                lock_scopes: Vec::new(),
+                lock_scopes: Default::default(),
                 collected_lock_sites: Vec::new(),
                 collected_cleanup_order: 0,
                 module: &mut self.output.module,
@@ -1642,7 +1642,7 @@ impl UnitCodegenContext<'_> {
                 lir_nonnegative: Default::default(),
                 array_fault_spill: None,
                 sync_defer_flags: HashMap::new(),
-                panic_scopes: Vec::new(),
+                panic_scopes: Default::default(),
                 unavailable_defer_ids: HashSet::new(),
                 sync_cancel_defer_context: 0,
                 panic_defer_codegen_depth: 0,
@@ -1660,7 +1660,7 @@ impl UnitCodegenContext<'_> {
                 lir_reference_scopes: Vec::new(),
                 fault_site_span: None,
                 collected_defer_sites: Vec::new(),
-                lock_scopes: Vec::new(),
+                lock_scopes: Default::default(),
                 collected_lock_sites: Vec::new(),
                 collected_cleanup_order: 0,
                 module: &mut self.output.module,
@@ -1761,7 +1761,7 @@ impl UnitCodegenContext<'_> {
                 }
 
                 let site = &sites[index];
-                for (name, storage) in &site.bindings {
+                for (name, storage) in site.bindings.iter() {
                     fg.vars.insert(name.clone(), storage.clone());
                 }
                 let flag =

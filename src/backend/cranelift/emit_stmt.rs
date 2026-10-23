@@ -39,7 +39,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// first, newest registration first (LIFO). Frames are left in place —
     /// scope bookkeeping pops them (willow-vynv.2).
     pub(super) fn emit_flush_defers_from(&mut self, depth: usize) {
-        let frames: Vec<Vec<super::DeferEntry>> = self.defer_stack[depth..].to_vec();
+        let frames = self.defer_stack.frames.clone();
+        let frame_count = self.defer_stack.len();
+        let locks = self.lock_scopes.clone();
+        let mut locks = locks.iter_rev().peekable();
         let unavailable_before = self.unavailable_defer_ids.clone();
         let cancel_context_before = self.sync_cancel_defer_context;
         // Each registration is emitted under the bindings it captured, so the
@@ -47,43 +50,52 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // value was bound AFTER the registration, the rest of an enclosing
         // scope — still expects its own bindings (willow-0g8j.2.15).
         let vars_before = self.vars.clone();
-        'frames: for (index, frame) in frames.iter().enumerate().rev() {
+        'frames: for (index, (frame, guarded)) in
+            frames.iter_rev().take(frame_count - depth).enumerate()
+        {
             // A `lock` critical section is released as its own defer frame
             // finishes unwinding, which is what orders the section's defers
             // (still holding the lock) before the enclosing scopes' defers
             // (after the release) on EVERY exit path — fallthrough, `return`,
             // `?`, `break` and `continue` all reach here (willow-38w.1.4).
-            let lock_depth = depth + index;
-            for entry in frame.iter().rev() {
+            let lock_depth = frame_count - index - 1;
+            for entry in frame.iter_rev() {
                 if self.unavailable_defer_ids.contains(&entry.id) {
                     continue;
                 }
-                let inactive = if let (Some(off), Some(frame_ptr)) =
+                let flag = if let (Some(off), Some(frame_ptr)) =
                     (entry.flag_offset, self.coop_frame)
                 {
-                    let flag =
+                    Some(
                         self.builder
                             .ins()
-                            .load(types::I64, MemFlagsData::new(), frame_ptr, off);
+                            .load(types::I64, MemFlagsData::new(), frame_ptr, off),
+                    )
+                } else if *guarded {
+                    entry
+                        .sync_flag_slot
+                        .map(|slot| self.stack_load(types::I64, slot))
+                } else {
+                    None
+                };
+                let inactive = flag.map(|flag| {
                     let active = self.builder.create_block();
                     let inactive = self.builder.create_block();
                     self.builder.ins().brif(flag, active, &[], inactive, &[]);
                     self.builder.switch_to_block(active);
                     self.builder.seal_block(active);
-                    Some(inactive)
-                } else {
-                    None
-                };
+                    inactive
+                });
                 // Consume before entering user code. If this action panics, its
                 // nested unwind sees the registration as unavailable and cannot
                 // execute it a second time.
                 self.unavailable_defer_ids.insert(entry.id);
                 self.sync_cancel_defer_context = self.defer_stack.fresh_identity();
-                self.vars = entry.vars_at_registration.clone();
+                self.vars = (*entry.vars_at_registration).clone();
                 // Rebind the hidden frame operands: coop loop bodies restore
                 // `vars`, wiping the names between registration and a
                 // function-exit flush (willow-vynv.3).
-                for (name, storage) in &entry.bindings {
+                for (name, storage) in entry.bindings.iter() {
                     self.vars.insert(name.clone(), storage.clone());
                 }
                 // Async: leave REGISTERED before entering user cleanup code.
@@ -125,7 +137,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // A terminated path left through panic unwinding, whose cleanup
             // releases the lock itself; releasing here too would be dead code
             // after a block terminator.
-            self.emit_lock_release_at_depth(lock_depth);
+            while let Some(lock) = locks.peek().filter(|lock| lock.defer_depth >= lock_depth) {
+                if lock.defer_depth == lock_depth && !self.terminated {
+                    self.emit_lock_scope_release(lock);
+                }
+                locks.next();
+            }
         }
         self.unavailable_defer_ids = unavailable_before;
         self.sync_cancel_defer_context = cancel_context_before;
@@ -146,11 +163,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let scopes: Vec<super::CoopLockScope> = self
             .lock_scopes
-            .iter()
+            .iter_rev()
+            .take_while(|scope| scope.defer_depth >= depth)
             .filter(|scope| scope.defer_depth == depth)
             .cloned()
             .collect();
-        for scope in scopes.iter().rev() {
+        for scope in &scopes {
             self.emit_lock_scope_release(scope);
         }
     }
@@ -687,141 +705,148 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .truncate(depth);
         }
         let cleanup_reservation = self.begin_cleanup_root_reservation();
-        let entries = self.defer_stack[scope.defer_depth].clone();
-        let scope_can_recover = entries.iter().any(|entry| entry.recovery_capable);
-
-        for entry in entries.iter().rev() {
-            let run = self.builder.create_block();
-            let next = self.builder.create_block();
-            let flag = if let Some(slot) = entry.sync_flag_slot {
-                self.stack_load(types::I64, slot)
-            } else {
-                let frame = self
-                    .coop_frame
-                    .expect("async panic cleanup requires a cooperative frame");
-                let offset = entry
-                    .flag_offset
-                    .expect("async panic cleanup requires a frame flag");
-                self.builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), frame, offset)
-            };
-            let registered = self.builder.ins().icmp_imm_u(IntCC::NotEqual, flag, 0);
-            self.builder.ins().brif(registered, run, &[], next, &[]);
-
-            self.builder.switch_to_block(run);
-            self.builder.seal_block(run);
-            let zero = self.builder.ins().iconst(types::I64, 0);
-            if let Some(slot) = entry.sync_flag_slot {
-                self.stack_store(zero, slot);
-            } else {
-                let frame = self
-                    .coop_frame
-                    .expect("async panic cleanup requires a cooperative frame");
-                let offset = entry
-                    .flag_offset
-                    .expect("async panic cleanup requires a frame flag");
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), zero, frame, offset);
+        use crate::ir::lowered::cleanup::{PanicInstruction as I, PanicTerminator as T};
+        let program = &scope.program;
+        let mut blocks = vec![scope.cleanup];
+        blocks.extend((1..program.blocks.len()).map(|_| self.builder.create_block()));
+        let scope_can_recover = program.blocks.iter().flat_map(|block| &block.instructions)
+            .any(|instruction| matches!(instruction, I::Invoke(id) if scope.entries[id].recovery_capable));
+        for (index, block) in program.blocks.iter().enumerate() {
+            if index > 0 {
+                self.builder.switch_to_block(blocks[index]);
             }
-            self.vars = entry.vars_at_registration.clone();
-            for (name, storage) in &entry.bindings {
-                self.vars.insert(name.clone(), storage.clone());
-            }
-
-            self.emit_void_runtime_call("willow_panic_enter_defer", &[]);
-            self.panic_defer_codegen_depth = 1;
-            self.recover_eligible_depth =
-                eligible_depth_before + if entry.recovery_capable { 1 } else { 0 };
-            self.emit_deferred_action(&entry.action, entry.flag_offset);
-            if !self.terminated {
-                self.emit_void_runtime_call("willow_panic_leave_defer", &[]);
-                self.builder.ins().jump(next, &[]);
-            }
-
-            // The flag-false predecessor always reaches `next`, even when the
-            // run predecessor raised a nested panic and terminated.
-            self.builder.switch_to_block(next);
-            self.builder.seal_block(next);
             self.terminated = false;
             self.panic_defer_codegen_depth = 0;
             self.recover_eligible_depth = eligible_depth_before;
-            self.vars = vars_before.clone();
-        }
-
-        // A panic leaves the critical section, so the lock must not survive the
-        // unwind: release it after the section's own defers have run (they are
-        // entitled to see the protected value) and before the panic reaches any
-        // enclosing scope. A recovered panic resumes in this same task, so
-        // waiting for task teardown would deadlock every other waiter.
-        self.emit_lock_release_at_depth(scope.defer_depth);
-
-        // The number of roots pushed in this scope depends on the panic path.
-        // Restore the exact entry depth dynamically instead of baking in the
-        // final source-order count.
-        let current_depth = self.emit_value_runtime_call("willow_root_depth", &[]);
-        let target_depth = if let Some(depth) = scope.coop_root_depth_at_entry {
-            let depth = self.builder.ins().iconst(types::I32, depth as i64);
-            self.builder.ins().iadd(scope.root_depth_at_entry, depth)
-        } else {
-            scope.root_depth_at_entry
-        };
-        let roots_to_pop = self.builder.ins().isub(current_depth, target_depth);
-        self.emit_void_runtime_call("willow_pop_roots", &[roots_to_pop]);
-        self.vars = scope.vars_before.clone();
-        if let Some(depth) = scope.coop_root_depth_at_entry {
-            self.gc_root_count = depth;
-            self.coop_shadow_roots
-                .as_mut()
-                .expect("cooperative panic scope requires a root tracker")
-                .active
-                .truncate(depth);
-        }
-
-        let propagate = if scope_can_recover {
-            let active = self.emit_value_runtime_call("willow_panic_active", &[]);
-            let propagate = self.builder.create_block();
-            let recovered = self.builder.create_block();
-            self.builder
-                .ins()
-                .brif(active, propagate, &[], recovered, &[]);
-            self.builder.switch_to_block(recovered);
-            self.builder.seal_block(recovered);
-            for (_, span) in &scope.call_frames_at_entry {
-                self.emit_callstack_reserve(*span);
+            for instruction in &block.instructions {
+                match instruction {
+                    I::Consume(id) => {
+                        let entry = &scope.entries[id];
+                        let zero = self.builder.ins().iconst(types::I64, 0);
+                        if let Some(slot) = entry.sync_flag_slot {
+                            self.stack_store(zero, slot);
+                        } else {
+                            let frame = self.coop_frame.expect("poll cleanup frame");
+                            self.builder.ins().store(
+                                MemFlagsData::new(),
+                                zero,
+                                frame,
+                                entry.flag_offset.expect("poll cleanup flag"),
+                            );
+                        }
+                    }
+                    I::Invoke(id) => {
+                        let entry = &scope.entries[id];
+                        self.vars = (*entry.vars_at_registration).clone();
+                        for (name, storage) in entry.bindings.iter() {
+                            self.vars.insert(name.clone(), storage.clone());
+                        }
+                        self.emit_void_runtime_call("willow_panic_enter_defer", &[]);
+                        self.panic_defer_codegen_depth = 1;
+                        self.recover_eligible_depth =
+                            eligible_depth_before + usize::from(entry.recovery_capable);
+                        self.emit_deferred_action(&entry.action, entry.flag_offset);
+                        if !self.terminated {
+                            self.emit_void_runtime_call("willow_panic_leave_defer", &[]);
+                        }
+                        self.panic_defer_codegen_depth = 0;
+                        self.recover_eligible_depth = eligible_depth_before;
+                        self.vars = vars_before.clone();
+                    }
+                    I::ReleaseLock(_) => self.emit_lock_release_at_depth(scope.defer_depth),
+                    I::RestoreRoots(_) => {
+                        let current = self.emit_value_runtime_call("willow_root_depth", &[]);
+                        let base = match scope.root_depth_at_entry {
+                            RootDepth::Value(value) => value,
+                            RootDepth::Variable(var) => self.builder.use_var(var),
+                        };
+                        let target = if let Some(depth) = scope.coop_root_depth_at_entry {
+                            let depth = self.builder.ins().iconst(types::I32, depth as i64);
+                            self.builder.ins().iadd(base, depth)
+                        } else {
+                            base
+                        };
+                        let count = self.builder.ins().isub(current, target);
+                        self.emit_void_runtime_call("willow_pop_roots", &[count]);
+                        self.vars = (*scope.vars_before).clone();
+                        if let Some(depth) = scope.coop_root_depth_at_entry {
+                            self.gc_root_count = depth;
+                            self.coop_shadow_roots
+                                .as_mut()
+                                .expect("poll root tracker")
+                                .active
+                                .truncate(depth);
+                        }
+                    }
+                }
+                if self.terminated {
+                    break;
+                }
             }
-            self.lir_reference_scopes = scope.reference_scopes_at_entry.clone();
-            self.emit_replay_reference_scopes();
-            for _ in 0..codegen_depth_before {
-                self.emit_void_runtime_call("willow_panic_enter_defer", &[]);
+            if self.terminated {
+                continue;
             }
-            self.builder.ins().jump(scope.resume, &[]);
-            // The propagation edge still has no prepared frames.
-            self.callstack_frame_depth = 0;
-            self.lir_reference_scopes.clear();
-            self.panic_recovery_targets.insert(scope.resume);
-            self.builder.switch_to_block(propagate);
-            self.builder.seal_block(propagate);
-            Some(propagate)
-        } else {
-            None
-        };
-
-        let parent_cleanup = self
-            .panic_scopes
-            .iter()
-            .rev()
-            .nth(1)
-            .map(|parent| parent.cleanup);
-        if let Some(parent) = parent_cleanup {
-            self.builder.ins().jump(parent, &[]);
-        } else if let Some(panic_return) = self.panic_return_block {
-            self.builder.ins().jump(panic_return, &[]);
-        } else {
-            self.emit_unhandled_panic_exit();
+            match block.terminator {
+                T::IfRegistered { site, run, next } => {
+                    let entry = &scope.entries[&site];
+                    let flag = if let Some(slot) = entry.sync_flag_slot {
+                        self.stack_load(types::I64, slot)
+                    } else {
+                        let frame = self.coop_frame.expect("poll cleanup frame");
+                        self.builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            frame,
+                            entry.flag_offset.expect("poll cleanup flag"),
+                        )
+                    };
+                    let registered = self.builder.ins().icmp_imm_u(IntCC::NotEqual, flag, 0);
+                    self.builder
+                        .ins()
+                        .brif(registered, blocks[run], &[], blocks[next], &[]);
+                }
+                T::Jump(next) => {
+                    self.builder.ins().jump(blocks[next], &[]);
+                }
+                T::Dispatch { recovery, .. } => {
+                    if recovery.is_some() && scope_can_recover {
+                        let active = self.emit_value_runtime_call("willow_panic_active", &[]);
+                        let propagate = self.builder.create_block();
+                        let recovered = self.builder.create_block();
+                        self.builder
+                            .ins()
+                            .brif(active, propagate, &[], recovered, &[]);
+                        self.builder.switch_to_block(recovered);
+                        self.builder.seal_block(recovered);
+                        for (_, span) in &scope.call_frames_at_entry {
+                            self.emit_callstack_reserve(*span);
+                        }
+                        self.lir_reference_scopes = scope.reference_scopes_at_entry.clone();
+                        self.emit_replay_reference_scopes();
+                        for _ in 0..codegen_depth_before {
+                            self.emit_void_runtime_call("willow_panic_enter_defer", &[]);
+                        }
+                        self.builder.ins().jump(scope.resume, &[]);
+                        self.callstack_frame_depth = 0;
+                        self.lir_reference_scopes.clear();
+                        self.panic_recovery_targets.insert(scope.resume);
+                        self.builder.switch_to_block(propagate);
+                        self.builder.seal_block(propagate);
+                    }
+                    if let Some(parent) = scope.parent_cleanup {
+                        self.builder.ins().jump(parent, &[]);
+                    } else if let Some(panic_return) = self.panic_return_block {
+                        self.builder.ins().jump(panic_return, &[]);
+                    } else {
+                        self.emit_unhandled_panic_exit();
+                    }
+                }
+            }
         }
-        let _ = propagate;
+        for block in blocks.into_iter().skip(1) {
+            self.builder.seal_block(block);
+        }
+
         self.finish_cleanup_root_reservation(cleanup_reservation);
         self.lir_call_frames = prepared_frames_before;
         self.lir_reference_scopes = reference_scopes_before;

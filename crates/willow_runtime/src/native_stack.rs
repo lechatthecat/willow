@@ -1851,6 +1851,13 @@ mod tests {
     }
 
     unsafe extern "C" fn lengthy_async_cleanup(_: *mut c_void) {
+        // Production fairness is time-based: 10,000 fast safepoints need not
+        // exhaust a quantum. Force the first yield without depending on CPU
+        // speed or mutating the process-wide environment.
+        crate::preempt::begin_quantum(
+            crate::preempt::PreemptConfig::from_env_values(Some("1"), Some("100000")),
+            std::ptr::null(),
+        );
         for _ in 0..10_000 {
             assert_eq!(willow_sync_safepoint(), 0);
         }

@@ -256,3 +256,11 @@ AGENTS.md
 
 # Public WSAPoll implementation audit and reproduction commands.
 !/docs/audits/willow-r52c.18-wsapoll.md
+
+# Public cleanup CFG audit and focused reproduction evidence.
+!/docs/audits/willow-r52c.15.md
+!/docs/audits/willow-r52c.15-counts.txt
+!/docs/audits/willow-r52c.15-reproduce.sh
+!/docs/audits/willow-r52c.15-measure.py
+!/docs/audits/willow-r52c.15-baseline.json
+!/docs/audits/willow-r52c.15-comparison.json

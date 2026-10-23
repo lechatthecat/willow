@@ -1,0 +1,26 @@
+// Explicit nested cleanup paths: continue, break, return and recovery.
+fn work(n: i64) -> i64 {
+    defer println(90);
+    for i in 0..3 {
+        defer println(i);
+        if i == 0 { continue; }
+        if n == 1 { break; }
+        return i;
+    }
+    return -1;
+}
+fn recovered() {
+    if true {
+        defer match recover() {
+            Some(info) => println(info.message),
+            None => {}
+        }
+        panic("recovered");
+    }
+    println("resumed");
+}
+fn main() {
+    println(work(1));
+    println(work(2));
+    recovered();
+}

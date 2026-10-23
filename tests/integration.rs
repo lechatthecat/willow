@@ -6,6 +6,9 @@
 #[path = "integration/support.rs"]
 mod support;
 
+#[path = "integration/cleanup_cfg.rs"]
+mod cleanup_cfg;
+
 #[path = "integration/preemption_completeness.rs"]
 mod preemption_completeness;
 

@@ -71,53 +71,15 @@ use super::{
     async_frame_slot_offset, channel_runtime_suffix,
 };
 
-/// Where a defer scope is opened: the LIR block and the position of its
-/// `EnterDeferScope` in it. A scope is opened by exactly one instruction, so
-/// this identifies it across the paths that reach it (willow-0g8j.2.15).
-type LirScopeId = (usize, BlockPos);
+mod cleanup_emission;
 
-/// Position of an instruction inside its block.
-type BlockPos = usize;
-
-/// One LIR-owned lexical defer scope, held open while the blocks it spans are
-/// emitted and finished when the whole body is.
-#[derive(Clone)]
-struct LirDeferScopeFrame {
-    /// Identity, so the same scope reached along two LIR edges compares equal.
-    id: LirScopeId,
-    scope: super::PanicScope,
-    /// Where normal emission continues after `LeaveDeferScope`. This is the
-    /// panic scope's resume block for ordinary synchronous scopes. A
-    /// recovery-capable synchronous scope instead points `scope.resume` at its
-    /// explicit LIR continuation, while this remains a private block in which
-    /// emission can finish the current LIR block.
-    normal_resume: cranelift_codegen::ir::Block,
-    /// The registrations this scope owns. A synchronous `FlushDefers` names the
-    /// sites an exit runs, and these are what say which OPEN scopes those sites
-    /// belong to — the depth the flush starts from (willow-0g8j.2.15).
-    sites: Vec<crate::ir::lowered::LirDeferId>,
-    /// The compile-time GC root count at scope entry, restored on the way out.
-    roots_before: usize,
-    /// Synchronous defer flags shadowed by this scope.
-    saved_flags: HashMap<Span, cranelift_codegen::ir::StackSlot>,
-    /// Whether this scope is a `lock` body and therefore pushed the critical
-    /// section its panic cleanup releases (willow-0g8j.2.13).
-    owns_lock: bool,
-}
-
-/// The synchronous emitter's defer state at one point in the block walk.
-///
-/// LIR blocks are emitted in index order, which is NOT the order control
-/// actually flows through them: a loop latch is emitted before the body that
-/// jumps to it, and a block after a `return` may open with a completely
-/// different set of scopes. So the state is snapshotted per LIR block and
-/// restored on entry instead of being carried linearly (willow-0g8j.2.15).
+/// Physical handles for one immutable LIR cleanup state. All three heads share
+/// their immutable ancestors; installing a block state is constant time.
 #[derive(Clone, Default)]
-struct LirDeferState {
-    scopes: Vec<LirDeferScopeFrame>,
+struct LirCleanupState {
     entries: super::DeferStack,
-    panic_scopes: Vec<super::PanicScope>,
-    flags: HashMap<Span, cranelift_codegen::ir::StackSlot>,
+    panic: super::Chain<super::PanicScope>,
+    locks: super::Chain<super::CoopLockScope>,
 }
 
 /// A normal flush can share code only with the same lexical registrations,
@@ -125,10 +87,11 @@ struct LirDeferState {
 /// already-bound LIR locals; a block parameter selects the continuation.
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct NormalCleanupKey {
-    entries: Vec<Vec<usize>>,
+    region: Option<crate::ir::lowered::cleanup::CleanupRegionId>,
+    entries: usize,
     depth: usize,
     roots: usize,
-    panic_targets: Vec<cranelift_codegen::ir::Block>,
+    panic_target: Option<cranelift_codegen::ir::Block>,
     panic_depth: usize,
     recover_depth: usize,
     call_depth: usize,
@@ -141,35 +104,18 @@ struct NormalCleanup {
     continuations: Vec<cranelift_codegen::ir::Block>,
 }
 
-/// Scopes a synchronous function opened, so the ones no `LeaveDeferScope` ever
-/// closes still get their panic cleanup emitted once at the end of the body.
-#[derive(Default)]
-struct LirDeferLedger {
-    /// Every scope in the order its `EnterDeferScope` was emitted.
-    opened: Vec<LirDeferScopeFrame>,
-    /// Scopes a `LeaveDeferScope` already finished.
-    closed: HashSet<LirScopeId>,
-    /// The emitter state a flush-only exit left a scope in. Its panic cleanup
-    /// re-runs the scope's registrations, so it needs the `defer_stack` shape
-    /// that was live at that point, not whatever the last block happened to
-    /// leave behind.
-    dropped: HashMap<LirScopeId, LirDeferState>,
-    /// Panic-cleanup blocks awaiting their seal. A scope's cleanup jumps to its
-    /// PARENT's cleanup, and block order can finish an inner scope after the
-    /// outer one, so sealing at the point a scope is finished would seal a
-    /// block a later child still has to name (willow-0g8j.2.15).
-    cleanups: Vec<cranelift_codegen::ir::Block>,
+struct LirCleanupBindings {
+    initial: LirCleanupState,
+    states: Vec<LirCleanupState>,
+    scopes: Vec<super::PanicScope>,
+    panic_states: Vec<LirCleanupState>,
     normal: HashMap<NormalCleanupKey, NormalCleanup>,
-    sites: HashMap<crate::ir::lowered::LirDeferId, (usize, usize, usize)>,
+    roots: usize,
 }
-
-/// Mutable synchronous-defer context shared while one LIR block is emitted.
-/// Keeping these coupled avoids passing three pieces of the same state through
-/// every block-emission call independently.
 struct LirBlockDeferCtx<'a> {
     block_index: usize,
-    scopes: &'a mut Vec<LirDeferScopeFrame>,
-    ledger: &'a mut LirDeferLedger,
+    cleanup: &'a crate::ir::lowered::cleanup::CleanupGraph,
+    bindings: &'a mut LirCleanupBindings,
 }
 
 fn scalar(ty: &Type) -> bool {
@@ -1712,114 +1658,9 @@ fn lir_reference_scope_entries(
     Some(entries.into_iter().map(Option::unwrap_or_default).collect())
 }
 
-/// How many of the innermost open scopes a `FlushDefers` naming `sites` covers.
-///
-/// An abrupt exit names every registration it has to run, so the scopes it
-/// unwinds are exactly the innermost run of open scopes whose own registrations
-/// are all in that list. A scope only partly named is not being left, which
-/// stops the count.
-/// The scope identities a synchronous defer state holds open, outermost first.
-///
-/// The frames themselves carry Cranelift blocks and stack slots, so two states
-/// are only ever compared by identity (willow-0g8j.2.15).
-fn lir_scope_ids(state: &LirDeferState) -> Vec<LirScopeId> {
-    state.scopes.iter().map(|frame| frame.id).collect()
-}
-
-fn lir_flushed_scope_count(
-    sites: &[crate::ir::lowered::LirDeferId],
-    open_sites: &[Vec<crate::ir::lowered::LirDeferId>],
-) -> usize {
-    let sites: HashSet<_> = sites.iter().copied().collect();
-    open_sites
-        .iter()
-        .rev()
-        .take_while(|scope| scope.iter().all(|id| sites.contains(id)))
-        .count()
-}
-
-/// Whether the defer scopes open at each LIR block agree along every edge that
-/// reaches it, which is what lets the synchronous emitter restore a block's
-/// scope state instead of carrying one stack through the whole body.
-///
-/// The scope stack is a property of the path, and LIR blocks are not emitted in
-/// the order control flows through them, so this is a fixpoint over the edges
-/// rather than a walk in block order. `FlushDefers` is an abrupt exit — the
-/// path it is on leaves the scopes it names, without a `LeaveDeferScope`
-/// (willow-0g8j.2.15).
-fn lir_sync_defer_stacks_agree(f: &LirFunction) -> bool {
-    let touches_defers = f.blocks.iter().any(|block| {
-        block.instrs.iter().any(|inst| {
-            matches!(
-                inst,
-                LirInst::EnterDeferScope { .. }
-                    | LirInst::LeaveDeferScope { .. }
-                    | LirInst::Defer { .. }
-                    | LirInst::FlushDefers { .. }
-            )
-        })
-    });
-    if !touches_defers {
-        return true;
-    }
-
-    // Each open scope carries its own registrations, so a flush reached from a
-    // block that did not open the scope can still tell whether it unwinds it.
-    type OpenScope = (LirScopeId, Vec<crate::ir::lowered::LirDeferId>);
-    let mut entry: Vec<Option<Vec<OpenScope>>> = vec![None; f.blocks.len()];
-    entry[0] = Some(Vec::new());
-    let mut worklist = vec![0usize];
-    while let Some(index) = worklist.pop() {
-        let Some(mut stack) = entry[index].clone() else {
-            continue;
-        };
-        for (position, inst) in f.blocks[index].instrs.iter().enumerate() {
-            match inst {
-                LirInst::EnterDeferScope { sites, resume, .. } => {
-                    // A recovered panic has finished this scope before it
-                    // reaches the explicit continuation. Record that edge at
-                    // the entry instruction, while `stack` still describes
-                    // the enclosing scopes only.
-                    if let Some(resume) = resume {
-                        match &entry[resume.0] {
-                            Some(existing) if *existing != stack => return false,
-                            Some(_) => {}
-                            None => {
-                                entry[resume.0] = Some(stack.clone());
-                                worklist.push(resume.0);
-                            }
-                        }
-                    }
-                    stack.push(((index, position), sites.iter().map(|(id, _)| *id).collect()));
-                }
-                LirInst::LeaveDeferScope { .. } => match stack.pop() {
-                    Some(_) => {}
-                    None => return false,
-                },
-                LirInst::FlushDefers { sites } => {
-                    let open_sites: Vec<Vec<_>> =
-                        stack.iter().map(|(_, scope)| scope.clone()).collect();
-                    let flushed = lir_flushed_scope_count(sites, &open_sites);
-                    stack.truncate(stack.len() - flushed);
-                }
-                LirInst::Defer { .. } if stack.is_empty() => return false,
-                _ => {}
-            }
-        }
-        for target in lir_block_successors(&f.blocks[index]) {
-            match &entry[target] {
-                Some(existing) if *existing != stack => return false,
-                Some(_) => {}
-                None => {
-                    entry[target] = Some(stack.clone());
-                    worklist.push(target);
-                }
-            }
-        }
-    }
-    // An unreachable block is still emitted, under a scope state no edge ever
-    // fixed.
-    entry.iter().all(|state| state.is_some())
+/// Backend eligibility uses the same cleanup graph that drives emission.
+fn lir_cleanup_graph_is_valid(f: &LirFunction) -> bool {
+    crate::ir::lowered::cleanup::CleanupGraph::lower(f).is_ok()
 }
 
 /// Why the walker will not compile `f`, phrased to read after "has invalid
@@ -1982,7 +1823,7 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     // stack, so the walker can only compile one whose open scopes are the same
     // whichever way control reached a block AND are what the emitter is holding
     // when it gets there (willow-0g8j.2.15).
-    if !f.is_async && !lir_sync_defer_stacks_agree(f) {
+    if !lir_cleanup_graph_is_valid(f) {
         return Some("its defer scope crosses LIR blocks".to_string());
     }
 
@@ -5211,91 +5052,31 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             blocks.push(self.builder.create_block());
         }
 
-        let mut lir_defer_scopes = Vec::new();
-        let mut ledger = LirDeferLedger::default();
-        if coop.is_some() {
-            for (block_index, block) in f.blocks.iter().enumerate() {
-                for (instruction_index, inst) in block.instrs.iter().enumerate() {
-                    if let LirInst::Defer { id, .. } = inst {
-                        let entry_id = self.defer_counter;
-                        self.defer_counter += 1;
-                        ledger
-                            .sites
-                            .insert(*id, (block_index, instruction_index, entry_id));
-                    }
-                }
-            }
-        }
-        // Synchronous defer state per LIR block, filled in along the edges as
-        // the predecessors are emitted. Async functions rebuild every scope
-        // from the LIR at each exit, so they do not need it.
-        let sync_defers = coop.is_none();
-        let mut block_state: Vec<Option<LirDeferState>> = vec![None; f.blocks.len()];
-        let initial_state = if self.lir_cleanup_exit.is_some() {
-            LirDeferState {
-                scopes: Vec::new(),
-                entries: self.defer_stack.clone(),
-                panic_scopes: self.panic_scopes.clone(),
-                flags: self.sync_defer_flags.clone(),
-            }
-        } else {
-            LirDeferState::default()
-        };
-        if sync_defers {
-            block_state[0] = Some(initial_state.clone());
-        }
-        // Emission ORDER. A LIR block index is not a position in any order
-        // control can flow in: `if/else` lowers the merge block before the
-        // `else` arm, so index order emits the merge before the only
-        // predecessor that reaches it. The synchronous emitter carries its
-        // defer scopes along the edges, so a block emitted before any
-        // predecessor starts with no open scope at all — and its `flush
-        // defers` then unwinds nothing, silently skipping every `defer` on
-        // that path. So a block is emitted only once an edge has handed it a
-        // state; any such order works. A block no edge ever reaches is emitted
-        // last, with none (willow-fvt4).
+        let cleanup_graph = crate::ir::lowered::cleanup::CleanupGraph::lower(f)
+            .expect("validated cleanup control-flow graph");
+        let mut cleanup_bindings =
+            self.prepare_lir_cleanup(f, &cleanup_graph, &blocks, coop.is_some());
         let reuse_preds = super::transient_roots::sole_predecessors(f);
         let mut reuse_exits: Vec<Option<super::transient_roots::LirReuse>> =
             (0..f.blocks.len()).map(|_| None).collect();
-        let mut ready = vec![0usize];
-        let mut emitted = vec![false; f.blocks.len()];
-        // Which entry states arrived along a normal CFG edge. A recovery
-        // continuation legitimately reaches its resume block with the scopes it
-        // unwound already gone, so only edge-provided states are held to the
-        // agreement `lir_sync_defer_stacks_agree` vetted.
-        let mut state_from_edge = vec![false; f.blocks.len()];
-        let mut unreached = 0usize;
-        loop {
-            // Without sync defers there is no state to thread, so the worklist
-            // is left unused and every block is taken in index order below.
-            let next_ready = if sync_defers { ready.pop() } else { None };
-            let i = match next_ready {
-                Some(i) if emitted[i] => continue,
-                Some(i) => i,
-                None => {
-                    while unreached < f.blocks.len() && emitted[unreached] {
-                        unreached += 1;
-                    }
-                    if unreached == f.blocks.len() {
-                        break;
-                    }
-                    unreached
-                }
-            };
-            emitted[i] = true;
+        let mut order = cleanup_graph.order.clone();
+        match std::env::var("WILLOW_TEST_LIR_BLOCK_ORDER").as_deref() {
+            Ok("reverse") => {
+                order = (1..f.blocks.len()).rev().collect();
+                order.insert(0, 0);
+            }
+            Ok("index") => {
+                order = (0..f.blocks.len()).collect();
+            }
+            _ => {}
+        }
+        for i in order {
             let block = &f.blocks[i];
             if i > 0 {
                 self.builder.switch_to_block(blocks[i]);
             }
-            if sync_defers {
-                let state = block_state[i]
-                    .clone()
-                    .unwrap_or_else(|| initial_state.clone());
-                lir_defer_scopes = state.scopes;
-                self.defer_stack = state.entries;
-                self.panic_scopes = state.panic_scopes;
-                self.sync_defer_flags = state.flags;
-            }
+            self.install_lir_cleanup(cleanup_bindings.state(cleanup_graph.incoming_states[i]));
+            self.gc_root_count = cleanup_bindings.roots;
             // Each LIR block starts a fresh Cranelift block, so whatever the
             // previous one ended with (a `return`, a diverging statement) says
             // nothing about this one.
@@ -5317,8 +5098,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .map(|(suspends, frame)| (&mut **suspends, *frame));
             let mut defer_ctx = LirBlockDeferCtx {
                 block_index: i,
-                scopes: &mut lir_defer_scopes,
-                ledger: &mut ledger,
+                cleanup: &cleanup_graph,
+                bindings: &mut cleanup_bindings,
             };
             let block_poll = if deferred_poll && poll_blocks[i] {
                 let spare = poll_spare.filter(|_| loop_depths.all[i] > 0);
@@ -5349,7 +5130,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 reuse.comparison = None;
             }
-            let recovery_states = self.emit_lir_block(
+            self.emit_lir_block(
                 f,
                 block,
                 &blocks,
@@ -5369,68 +5150,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             {
                 reuse_exits[i] = facts.filter(|facts| facts.carriable());
             }
-            if sync_defers {
-                let exit = LirDeferState {
-                    scopes: lir_defer_scopes.clone(),
-                    entries: self.defer_stack.clone(),
-                    panic_scopes: self.panic_scopes.clone(),
-                    flags: self.sync_defer_flags.clone(),
-                };
-                for (target, state) in recovery_states {
-                    if block_state[target].is_none() {
-                        block_state[target] = Some(state);
-                        ready.push(target);
-                    }
-                }
-                for target in lir_block_successors(block) {
-                    match &block_state[target] {
-                        Some(existing) if state_from_edge[target] => debug_assert!(
-                            lir_scope_ids(existing) == lir_scope_ids(&exit),
-                            "LIR block bb{target} of `{}` is reached with two different \
-                             defer scope stacks: {:?} and {:?}",
-                            f.name,
-                            lir_scope_ids(existing),
-                            lir_scope_ids(&exit),
-                        ),
-                        Some(_) => {}
-                        None => {
-                            block_state[target] = Some(exit.clone());
-                            state_from_edge[target] = true;
-                            ready.push(target);
-                        }
-                    }
-                }
-            }
         }
         self.lir_call_frames = outer_frames;
         self.lir_reference_scopes = outer_references;
         self.callstack_frame_depth = outer_frame_depth;
         self.terminated = true;
-        if sync_defers {
-            // Scopes only ever left by a `return`, `break`, `continue` or `?`
-            // have no `LeaveDeferScope` to close them. Their panic cleanup is
-            // still owed, once each, innermost last opened first.
-            while let Some(frame) = ledger.opened.pop() {
-                if ledger.closed.contains(&frame.id) {
-                    continue;
-                }
-                if let Some(state) = ledger.dropped.remove(&frame.id) {
-                    self.defer_stack = state.entries;
-                    self.panic_scopes = state.panic_scopes;
-                    self.sync_defer_flags = state.flags;
-                }
-                self.terminated = true;
-                self.finish_lir_defer_scope(frame, &mut ledger.cleanups);
-            }
-            for cleanup in ledger.cleanups.drain(..) {
-                self.builder.seal_block(cleanup);
-            }
-        } else {
-            while let Some(frame) = lir_defer_scopes.pop() {
-                self.finish_lir_async_panic_scope(frame);
-            }
+        // Panic CFG resources exist before any source block is emitted. Every
+        // lexical program is emitted once, independently of which exit ran last.
+        for index in (0..cleanup_bindings.scopes.len()).rev() {
+            self.install_lir_cleanup(&cleanup_bindings.panic_states[index]);
+            self.gc_root_count = cleanup_bindings.roots;
+            self.emit_shared_panic_cleanup(&cleanup_bindings.scopes[index]);
         }
-        for cleanup in ledger.normal.into_values() {
+        for scope in &cleanup_bindings.scopes {
+            self.builder.seal_block(scope.cleanup);
+        }
+        self.install_lir_cleanup(&cleanup_bindings.initial);
+        for cleanup in cleanup_bindings.normal.into_values() {
             if let Some(end) = cleanup.end {
                 self.builder.switch_to_block(end);
                 let mut switch = cranelift_frontend::Switch::new();
@@ -6344,8 +6080,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         sync_poll: Option<(super::emit_stmt::SyncPoll, bool)>,
         then_fallthrough: bool,
         defers: &mut LirBlockDeferCtx<'_>,
-    ) -> Vec<(usize, LirDeferState)> {
-        let mut recovery_states = Vec::new();
+    ) {
         if let Some((poll, in_loop)) = sync_poll
             && (self.lir_cleanup_exit.is_none() || block.id.0 != 0)
         {
@@ -6354,20 +6089,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_sync_safepoint(poll, in_loop);
         }
         for (inst_index, inst) in block.instrs.iter().enumerate() {
-            // A panic/return has terminated the source path, but a
-            // SYNCHRONOUS lexical scope still has to be closed here:
-            // `finish_lir_defer_scope` emits the scope's cleanup and resume
-            // blocks, and it switches blocks itself rather than appending to
-            // the filled one.
-            //
-            // Nothing else may run. In particular a cooperative defer flush
-            // emits instructions into the CURRENT block, which the diverging
-            // statement already filled; the defers on that path are run by the
-            // panic cleanup CFG instead, which is where a recovering scope
-            // rejoins the LIR graph.
-            if self.terminated
-                && !(coop.is_none() && matches!(inst, LirInst::LeaveDeferScope { .. }))
-            {
+            if self.terminated {
                 continue;
             }
             // Debug builds report runtime-raised faults (array bounds, a
@@ -6403,206 +6125,69 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.store_lir_local(function, *local, result);
                     }
                 }
-                LirInst::EnterDeferScope {
-                    sites,
-                    resume,
-                    lock,
-                } => {
-                    if coop.is_none()
-                        && let Some(resume) = resume
-                    {
-                        // Recovery leaves this scope, so its LIR continuation
-                        // inherits the state immediately before the push.
-                        recovery_states.push((
-                            resume.0,
-                            LirDeferState {
-                                scopes: defers.scopes.clone(),
-                                entries: self.defer_stack.clone(),
-                                panic_scopes: self.panic_scopes.clone(),
-                                flags: self.sync_defer_flags.clone(),
-                            },
-                        ));
-                    }
-                    let saved_flags = self.sync_defer_flags.clone();
-                    if coop.is_none() {
-                        for (_, span) in sites {
-                            let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                                StackSlotKind::ExplicitSlot,
-                                8,
-                                0,
-                            ));
+                LirInst::EnterDeferScope { sites, .. } => {
+                    let crate::ir::lowered::cleanup::CleanupTransition::Enter { scope: id, state } =
+                        defers.cleanup.transitions[&(defers.block_index, inst_index)]
+                    else {
+                        unreachable!()
+                    };
+                    let scope = &mut defers.bindings.scopes[id.0];
+                    scope.call_frames_at_entry = self.lir_call_frames.clone();
+                    scope.reference_scopes_at_entry = self.lir_reference_scopes.clone();
+                    if let super::RootDepth::Variable(var) = scope.root_depth_at_entry {
+                        let depth = self.emit_value_runtime_call("willow_root_depth", &[]);
+                        self.builder.def_var(var, depth);
+                        for (site, _) in sites {
                             let zero = self.builder.ins().iconst(types::I64, 0);
-                            self.stack_store(zero, slot);
-                            self.sync_defer_flags.insert(*span, slot);
+                            self.stack_store(zero, self.sync_defer_flags[site]);
                         }
                     }
-                    let roots_before = self.gc_root_count;
-                    let defer_depth = self.defer_stack.len();
-                    // A `lock` body's scope owns the critical section
-                    // (willow-0g8j.2.13). Registering it HERE rather than at the
-                    // acquisition is what makes the panic path work: the cleanup
-                    // finds the section by this scope's `defer_depth`, and that
-                    // depth counts scopes in block-INDEX order, which a
-                    // suspension split reorders relative to the source — the
-                    // acquisition can be emitted after the body it opens.
-                    //
-                    // Taking the cleanup order before the loop below is what
-                    // orders an unwind: the cancel entry walks registrations
-                    // backwards, so the section's own defers, registered after
-                    // this, run before the release rather than after it.
-                    let owns_lock = coop.is_some() && lock.is_some();
-                    if let (true, Some(slots)) = (coop.is_some(), lock) {
-                        let offsets = self.lir_lock_offsets(slots);
-                        let order = self.next_cleanup_order();
-                        self.collected_lock_sites.push(super::AsyncLockSite {
-                            mode: slots.mode,
-                            handle_offset: offsets[0],
-                            token_offset: offsets[1],
-                            phase_offset: offsets[2],
-                            value_offset: offsets[3],
-                            value_ty: slots.value_ty.clone(),
-                            order,
-                        });
-                        self.lock_scopes.push(super::CoopLockScope {
-                            mode: slots.mode,
-                            handle_offset: offsets[0],
-                            token_offset: offsets[1],
-                            phase_offset: offsets[2],
-                            value_offset: offsets[3],
-                            value_ty: slots.value_ty.clone(),
-                            defer_depth,
-                        });
+                    self.install_lir_cleanup(defers.bindings.state(state));
+                }
+                LirInst::Defer { .. } => {
+                    let crate::ir::lowered::cleanup::CleanupTransition::Register {
+                        site: id,
+                        state,
+                    } = defers.cleanup.transitions[&(defers.block_index, inst_index)]
+                    else {
+                        unreachable!()
+                    };
+                    if let Some(frame) = self.coop_frame.filter(|_| coop.is_some()) {
+                        let one = self.builder.ins().iconst(types::I64, 1);
+                        self.builder.ins().store(
+                            MemFlagsData::new(),
+                            one,
+                            frame,
+                            self.lir_defer_offsets[&id],
+                        );
+                    } else {
+                        let one = self.builder.ins().iconst(types::I64, 1);
+                        self.stack_store(one, self.sync_defer_flags[&id]);
                     }
-                    let mut entries = Vec::new();
-                    if coop.is_some() {
-                        for (site_id, _) in sites {
-                            let body = function
-                                .blocks
-                                .iter()
-                                .flat_map(|block| &block.instrs)
-                                .find_map(|inst| match inst {
-                                    LirInst::Defer { id, body, .. } if id == site_id => Some(body),
-                                    _ => None,
-                                })
-                                .expect("LIR defer site has no registration instruction");
-                            let action = body.clone();
-                            let bindings: Vec<_> = self
-                                .vars
-                                .iter()
-                                .filter_map(|(name, storage)| match storage {
-                                    VarStorage::Frame { .. }
-                                    | VarStorage::FrameReference { .. } => {
-                                        Some((name.clone(), storage.clone()))
-                                    }
-                                    _ => None,
-                                })
-                                .collect();
-                            let flag_offset = self.lir_defer_offsets[site_id];
-                            let recovery_capable = body.contains_recover();
-                            let order = self.next_cleanup_order();
-                            self.collected_defer_sites.push(super::AsyncDeferSite {
-                                action: action.clone(),
-                                flag_offset,
-                                bindings: bindings.clone(),
-                                recovery_capable,
-                                order,
-                            });
-                            let id = self.defer_counter;
-                            self.defer_counter += 1;
-                            entries.push(super::DeferEntry {
-                                id,
-                                action,
-                                flag_offset: Some(flag_offset),
-                                sync_flag_slot: None,
-                                bindings,
-                                vars_at_registration: self.vars.clone(),
-                                recovery_capable,
-                            });
+                    self.install_lir_cleanup(defers.bindings.state(state));
+                }
+                LirInst::LeaveDeferScope { .. } | LirInst::FlushDefers { .. } => {
+                    let crate::ir::lowered::cleanup::CleanupTransition::Exit { edge, state: after } =
+                        defers.cleanup.transitions[&(defers.block_index, inst_index)]
+                    else {
+                        unreachable!()
+                    };
+                    let depth = defers.bindings.state(after).entries.len();
+                    if edge.scopes > 0 {
+                        self.emit_lir_shared_normal_cleanup(
+                            depth,
+                            Some(edge.region),
+                            defers.bindings,
+                        );
+                    }
+                    if coop.is_none() && !self.terminated {
+                        let roots = self.gc_root_count - defers.bindings.roots;
+                        if roots > 0 {
+                            self.emit_pop_roots_n(roots);
                         }
+                        self.gc_root_count = defers.bindings.roots;
                     }
-                    self.defer_stack.push(entries);
-                    let normal_resume = self.builder.create_block();
-                    let scope = super::PanicScope {
-                        call_frames_at_entry: self.lir_call_frames.clone(),
-                        reference_scopes_at_entry: self.lir_reference_scopes.clone(),
-                        cleanup: self.builder.create_block(),
-                        resume: resume
-                            .map(|resume| blocks[resume.0])
-                            .unwrap_or(normal_resume),
-                        root_depth_at_entry: if coop.is_some() {
-                            self.panic_function_root_depth
-                                .expect("cooperative poll root depth snapshot")
-                        } else {
-                            self.emit_value_runtime_call("willow_root_depth", &[])
-                        },
-                        defer_depth,
-                        vars_before: self.vars.clone(),
-                        coop_root_depth_at_entry: coop.as_ref().map(|_| self.coop_root_depth()),
-                    };
-                    self.panic_scopes.push(scope.clone());
-                    let frame = LirDeferScopeFrame {
-                        id: (defers.block_index, inst_index),
-                        scope,
-                        normal_resume,
-                        sites: sites.iter().map(|(id, _)| *id).collect(),
-                        roots_before,
-                        saved_flags,
-                        owns_lock,
-                    };
-                    if coop.is_none() {
-                        defers.ledger.opened.push(frame.clone());
-                    }
-                    defers.scopes.push(frame);
-                }
-                LirInst::Defer { id, body, span } => {
-                    let action = body.clone();
-                    let slot = coop
-                        .is_none()
-                        .then(|| self.sync_defer_flags.get(span).copied())
-                        .flatten();
-                    let flag_offset = coop.as_ref().map(|_| self.lir_defer_offsets[id]);
-                    if let (Some(frame), Some(offset)) = (self.coop_frame, flag_offset) {
-                        let one = self.builder.ins().iconst(types::I64, 1);
-                        self.builder
-                            .ins()
-                            .store(MemFlagsData::new(), one, frame, offset);
-                    } else if let Some(slot) = slot {
-                        let one = self.builder.ins().iconst(types::I64, 1);
-                        self.stack_store(one, slot);
-                    }
-                    if coop.is_none() {
-                        let id = self.defer_counter;
-                        self.defer_counter += 1;
-                        self.defer_stack
-                            .last_mut()
-                            .expect("LIR defer outside scope")
-                            .push(super::DeferEntry {
-                                id,
-                                action,
-                                flag_offset,
-                                sync_flag_slot: slot,
-                                bindings: Vec::new(),
-                                vars_at_registration: self.vars.clone(),
-                                recovery_capable: body.contains_recover(),
-                            });
-                    }
-                }
-                LirInst::LeaveDeferScope { sites } => {
-                    if coop.is_some() {
-                        self.emit_lir_defer_sites(function, sites, defers.ledger);
-                    } else if let Some(frame) = defers.scopes.pop() {
-                        defers.ledger.closed.insert(frame.id);
-                        self.finish_lir_defer_scope(frame, &mut defers.ledger.cleanups);
-                    } else {
-                        panic!("LIR defer scope underflow");
-                    }
-                }
-                LirInst::FlushDefers { sites } => {
-                    if coop.is_some() {
-                        self.emit_lir_defer_sites(function, sites, defers.ledger);
-                    } else {
-                        self.emit_lir_sync_flush(sites, defers.scopes, defers.ledger);
-                    }
+                    self.install_lir_cleanup(defers.bindings.state(after));
                 }
                 LirInst::ClearScopeRoots { locals } => {
                     self.emit_lir_clear_scope_roots(function, locals);
@@ -6671,7 +6256,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
         }
         if self.terminated {
-            return recovery_states;
+            return;
         }
         match &block.terminator {
             Terminator::Jump(b) => {
@@ -6732,7 +6317,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_lir_suspend(function, operation, *resume, blocks, suspends, *frame);
             }
         }
-        recovery_states
     }
 
     /// The function-exit sequence: pop every root this function pushed, then
@@ -6752,129 +6336,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         slots.locals().map(|local| self.lir_frame_offsets[&local])
     }
 
-    fn finish_lir_defer_scope(
+    fn emit_lir_shared_normal_cleanup(
         &mut self,
-        frame: LirDeferScopeFrame,
-        pending_seals: &mut Vec<cranelift_codegen::ir::Block>,
+        depth: usize,
+        region: Option<crate::ir::lowered::cleanup::CleanupRegionId>,
+        ledger: &mut LirCleanupBindings,
     ) {
-        let LirDeferScopeFrame {
-            id: _,
-            scope,
-            normal_resume,
-            sites: _,
-            roots_before,
-            saved_flags,
-            owns_lock,
-        } = frame;
-        debug_assert!(!owns_lock, "a `lock` body scope is cooperative by E2603");
-        if !self.terminated {
-            self.emit_flush_defers_from(scope.defer_depth);
-        }
-        let mut normal_reaches_resume = false;
-        if !self.terminated {
-            let roots = self.gc_root_count - roots_before;
-            if roots > 0 {
-                self.emit_pop_roots_n(roots);
-            }
-            self.builder.ins().jump(normal_resume, &[]);
-            normal_reaches_resume = true;
-        }
-        self.emit_shared_panic_cleanup(&scope);
-        pending_seals.push(scope.cleanup);
-        self.panic_scopes.pop();
-        self.defer_stack.pop();
-        self.gc_root_count = roots_before;
-        self.sync_defer_flags = saved_flags;
-        let recovered = self.panic_recovery_targets.remove(&scope.resume);
-        if normal_reaches_resume {
-            self.builder.switch_to_block(normal_resume);
-            self.builder.seal_block(normal_resume);
-            self.terminated = false;
-        } else if recovered && normal_resume == scope.resume {
-            self.builder.switch_to_block(scope.resume);
-            self.builder.seal_block(scope.resume);
-            self.terminated = false;
-        } else {
-            self.terminated = true;
-        }
-    }
-
-    /// Emit only the abnormal edge for an async LIR scope. Its normal cleanup
-    /// is represented by `LeaveDeferScope`, while recovery branches directly
-    /// to the scope's explicit LIR resume block.
-    fn finish_lir_async_panic_scope(&mut self, frame: LirDeferScopeFrame) {
-        let LirDeferScopeFrame {
-            id: _,
-            scope,
-            normal_resume: _,
-            sites: _,
-            roots_before,
-            saved_flags,
-            owns_lock,
-        } = frame;
-        // Emitted BEFORE the critical section is dropped from `lock_scopes`:
-        // the cleanup is exactly where an unwind out of the section releases
-        // the lock, and it finds it by this scope's depth (willow-0g8j.2.13).
-        self.emit_shared_panic_cleanup(&scope);
-        if owns_lock {
-            self.lock_scopes.pop();
-        }
-        self.builder.seal_block(scope.cleanup);
-        self.panic_scopes.pop();
-        self.defer_stack.pop();
-        self.gc_root_count = roots_before;
-        self.sync_defer_flags = saved_flags;
-        self.panic_recovery_targets.remove(&scope.resume);
-        self.terminated = true;
-    }
-
-    /// Run the registrations a synchronous exit leaves behind (willow-0g8j.2.15).
-    ///
-    /// The cooperative twin above rebuilds each site from the LIR, because an
-    /// async frame's registrations are named by heap flags and no Rust-side
-    /// stack survives a poll return. A synchronous function keeps its scopes on
-    /// `self.defer_stack` for exactly as long as they are open, so the flush is
-    /// the ordinary [`FuncGen::emit_flush_defers_from`] — all this has to do is
-    /// find the DEPTH it starts from.
-    ///
-    /// `sites` names every registration this exit runs, which is always the
-    /// sites of a suffix of the open scopes: `return` leaves all of them,
-    /// `break` and `continue` leave the ones inside the loop. Walking the open
-    /// scopes from the innermost outwards while their sites are all named finds
-    /// that suffix without the emitter having to know which statement it is.
-    fn emit_lir_sync_flush(
-        &mut self,
-        sites: &[crate::ir::lowered::LirDeferId],
-        open: &mut Vec<LirDeferScopeFrame>,
-        ledger: &mut LirDeferLedger,
-    ) {
-        let open_sites: Vec<Vec<_>> = open.iter().map(|frame| frame.sites.clone()).collect();
-        let flushed = lir_flushed_scope_count(sites, &open_sites);
-        if flushed == 0 {
-            return;
-        }
-        let depth = open[open.len() - flushed].scope.defer_depth;
-        self.emit_lir_shared_normal_cleanup(depth, ledger);
-        // The path taken here has left those scopes; only the paths that reach
-        // their `LeaveDeferScope` still hold them. Record what the scope looked
-        // like from here so the end-of-body sweep can emit the panic cleanup of
-        // any scope no `LeaveDeferScope` ever closes.
-        for _ in 0..flushed {
-            let frame = open.pop().expect("flushed scope count is bounded by open");
-            let state = LirDeferState {
-                scopes: Vec::new(),
-                entries: self.defer_stack.clone(),
-                panic_scopes: self.panic_scopes.clone(),
-                flags: self.sync_defer_flags.clone(),
-            };
-            ledger.dropped.insert(frame.id, state);
-            self.defer_stack.truncate(frame.scope.defer_depth);
-            self.panic_scopes.pop();
-            self.sync_defer_flags = frame.saved_flags.clone();
-        }
-    }
-
-    fn emit_lir_shared_normal_cleanup(&mut self, depth: usize, ledger: &mut LirDeferLedger) {
         // Active reference/call preparations carry per-site diagnostic values.
         // Their cleanup remains local rather than merging distinct protocols.
         if !self.lir_call_frames.is_empty() || !self.lir_reference_scopes.is_empty() {
@@ -6893,18 +6360,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return;
         }
         let key = NormalCleanupKey {
-            entries: self
-                .defer_stack
-                .iter()
-                .map(|frame| frame.iter().map(|entry| entry.id).collect())
-                .collect(),
+            region,
+            entries: self.defer_stack.identity,
             depth,
             roots: self.gc_root_count,
-            panic_targets: self
-                .panic_scopes
-                .iter()
-                .map(|scope| scope.cleanup)
-                .collect(),
+            panic_target: self.panic_scopes.last().map(|scope| scope.cleanup),
             panic_depth: self.panic_defer_codegen_depth,
             recover_depth: self.recover_eligible_depth,
             call_depth: self.callstack_frame_depth,
@@ -6956,54 +6416,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.terminated = true;
         }
-    }
-
-    /// Emit exactly the LIR defer sites named by a CFG exit. Runtime flags
-    /// decide which registrations on that source path are active, so this is
-    /// independent of Rust code-generation order between basic blocks.
-    fn emit_lir_defer_sites(
-        &mut self,
-        function: &LirFunction,
-        sites: &[crate::ir::lowered::LirDeferId],
-        ledger: &mut LirDeferLedger,
-    ) {
-        if sites.is_empty() || self.coop_frame.is_none() {
-            return;
-        }
-        let mut entries = Vec::with_capacity(sites.len());
-        for site_id in sites {
-            let &(block, instruction, id) = ledger
-                .sites
-                .get(site_id)
-                .expect("LIR defer exit references an unknown site");
-            let LirInst::Defer { body, .. } = &function.blocks[block].instrs[instruction] else {
-                unreachable!()
-            };
-            let action = body.clone();
-            let bindings = self
-                .vars
-                .iter()
-                .filter_map(|(name, storage)| match storage {
-                    VarStorage::Frame { .. } | VarStorage::FrameReference { .. } => {
-                        Some((name.clone(), storage.clone()))
-                    }
-                    _ => None,
-                })
-                .collect();
-            entries.push(super::DeferEntry {
-                id,
-                action,
-                flag_offset: Some(self.lir_defer_offsets[site_id]),
-                sync_flag_slot: None,
-                bindings,
-                vars_at_registration: self.vars.clone(),
-                recovery_capable: body.contains_recover(),
-            });
-        }
-        let depth = self.defer_stack.len();
-        self.defer_stack.push(entries);
-        self.emit_lir_shared_normal_cleanup(depth, ledger);
-        self.defer_stack.pop();
     }
 
     fn emit_lir_operand_store(
@@ -15623,13 +15035,13 @@ fn f(n: i64) -> Result<i64, String> {
                 block(3, Vec::new(), Terminator::Return(None)),
             ],
         };
-        assert!(!lir_sync_defer_stacks_agree(&f));
+        assert!(!lir_cleanup_graph_is_valid(&f));
 
         // The same graph with the scope opened before the branch instead — the
         // edges agree, and it is accepted.
         let mut balanced = f;
         balanced.blocks[0].instrs = std::mem::take(&mut balanced.blocks[1].instrs);
-        assert!(lir_sync_defer_stacks_agree(&balanced));
+        assert!(lir_cleanup_graph_is_valid(&balanced));
     }
 
     // r11c. A synchronous recover-capable scope needs an explicit LIR resume

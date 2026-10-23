@@ -33,6 +33,7 @@ use super::typed_ast::{
 };
 
 pub mod async_liveness;
+pub mod cleanup;
 mod lifetime;
 mod liveness;
 pub mod value;

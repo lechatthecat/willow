@@ -7,6 +7,8 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::ObjectBuilder;
+mod cleanup_stack;
+use cleanup_stack::Chain;
 mod runtime_module;
 use runtime_module::RuntimeObjectModule as ObjectModule;
 pub use runtime_module::supports_direct_runtime_calls;
@@ -1213,78 +1215,59 @@ pub(super) type DeferredAction = crate::ir::lowered::LirDeferBody;
 #[derive(Clone)]
 pub(super) struct DeferEntry {
     id: usize,
-    action: DeferredAction,
+    action: std::rc::Rc<DeferredAction>,
     flag_offset: Option<i32>,
     sync_flag_slot: Option<cranelift_codegen::ir::StackSlot>,
-    bindings: Vec<(String, VarStorage)>,
-    vars_at_registration: HashMap<String, VarStorage>,
+    bindings: std::rc::Rc<Vec<(String, VarStorage)>>,
+    vars_at_registration: std::rc::Rc<HashMap<String, VarStorage>>,
     /// The deferred body contains a direct call to the compiler-known
     /// `recover()` builtin. Calls hidden behind another function/lambda do not
     /// grant recovery capability (willow-s9ej.3).
     recovery_capable: bool,
 }
 
-/// Snapshots retain their identity; new registrations and scopes get fresh
-/// identities from a function-local sequence shared by snapshots. Removing a
-/// scope restores its prefix identity. Cleanup lookups need not walk or hash
-/// all registrations at every runtime-call edge.
+/// Persistent bindings mirror LIR registration states. No block/edge copies
+/// ancestors, actions, or captured binding maps.
 #[derive(Clone, Default)]
 struct DeferStack {
-    frames: Vec<Vec<DeferEntry>>,
+    // The bool marks a panic frame: its static sites need runtime flag checks.
+    // Ordinary frames contain only the graph-proven registered prefix.
+    frames: Chain<(Chain<std::rc::Rc<DeferEntry>>, bool)>,
     identity: usize,
-    /// Each prefix keeps its identity when an inner scope is removed.
-    prefixes: Vec<usize>,
     sequence: std::rc::Rc<std::cell::Cell<usize>>,
 }
-
-impl std::ops::Deref for DeferStack {
-    type Target = [Vec<DeferEntry>];
-
-    fn deref(&self) -> &Self::Target {
-        &self.frames
-    }
-}
-
 impl DeferStack {
     fn fresh_identity(&self) -> usize {
-        let identity = self
+        let id = self
             .sequence
             .get()
             .checked_add(1)
             .expect("defer identity overflow");
-        self.sequence.set(identity);
-        identity
+        self.sequence.set(id);
+        id
     }
-
-    fn changed(&mut self) {
-        self.identity = self.fresh_identity();
+    fn len(&self) -> usize {
+        self.frames.len()
     }
-
-    fn push(&mut self, frame: Vec<DeferEntry>) {
-        self.changed();
-        self.prefixes.push(self.identity);
-        self.frames.push(frame);
+    fn push(&mut self, entries: Vec<std::rc::Rc<DeferEntry>>) {
+        self.push_guarded(entries, false);
     }
-
-    fn pop(&mut self) -> Option<Vec<DeferEntry>> {
-        self.prefixes.pop();
-        self.identity = self.prefixes.last().copied().unwrap_or(0);
-        self.frames.pop()
-    }
-
-    fn truncate(&mut self, depth: usize) {
-        self.prefixes.truncate(depth);
-        self.identity = self.prefixes.last().copied().unwrap_or(0);
-        self.frames.truncate(depth);
-    }
-
-    fn last_mut(&mut self) -> Option<&mut Vec<DeferEntry>> {
-        if self.frames.is_empty() {
-            return None;
+    fn push_guarded(&mut self, entries: Vec<std::rc::Rc<DeferEntry>>, guarded: bool) {
+        let mut frame = Chain::default();
+        for entry in entries {
+            frame.push(entry);
         }
-        self.changed();
-        *self.prefixes.last_mut().expect("defer prefix") = self.identity;
-        self.frames.last_mut()
+        self.identity = self.fresh_identity();
+        self.frames.push((frame, guarded));
+    }
+    fn register(&mut self, entry: std::rc::Rc<DeferEntry>) {
+        let (head, guarded) = self.frames.last().expect("defer scope");
+        let guarded = *guarded;
+        let mut frame = head.clone();
+        frame.push(entry);
+        self.frames.pop();
+        self.identity = self.fresh_identity();
+        self.frames.push((frame, guarded));
     }
 }
 
@@ -1301,6 +1284,12 @@ struct SyncCancelCleanupKey {
     native_active: bool,
 }
 
+#[derive(Clone, Copy)]
+enum RootDepth {
+    Value(cranelift_codegen::ir::Value),
+    Variable(cranelift_frontend::Variable),
+}
+
 #[derive(Clone)]
 pub(super) struct PanicScope {
     /// Preparations live before this lexical scope must be replayed on recovery.
@@ -1308,12 +1297,15 @@ pub(super) struct PanicScope {
     reference_scopes_at_entry: Vec<Vec<FlatReferenceDebug>>,
     cleanup: cranelift_codegen::ir::Block,
     resume: cranelift_codegen::ir::Block,
-    root_depth_at_entry: cranelift_codegen::ir::Value,
+    root_depth_at_entry: RootDepth,
     defer_depth: usize,
-    vars_before: HashMap<String, VarStorage>,
+    vars_before: std::rc::Rc<HashMap<String, VarStorage>>,
     /// Native-stack root depth at cooperative scope entry. `None` for an
     /// ordinary synchronous function.
     coop_root_depth_at_entry: Option<usize>,
+    program: std::rc::Rc<crate::ir::lowered::cleanup::PanicProgram>,
+    entries: std::rc::Rc<HashMap<crate::ir::lowered::LirDeferId, std::rc::Rc<DeferEntry>>>,
+    parent_cleanup: Option<cranelift_codegen::ir::Block>,
 }
 
 /// A `lock` critical section currently being emitted (willow-38w.1.4). The
@@ -1375,9 +1367,9 @@ pub(super) struct AsyncLockSite {
 /// operand bindings the action references.
 #[derive(Clone)]
 pub(super) struct AsyncDeferSite {
-    action: DeferredAction,
+    action: std::rc::Rc<DeferredAction>,
     flag_offset: i32,
-    bindings: Vec<(String, VarStorage)>,
+    bindings: std::rc::Rc<Vec<(String, VarStorage)>>,
     recovery_capable: bool,
     /// Position in the function's cleanup sequence, shared with
     /// [`AsyncLockSite::order`] so the cancel entry can interleave the two
@@ -1423,10 +1415,10 @@ struct FuncGen<'a, 'b> {
     array_fault_spill: Option<cranelift_codegen::ir::StackSlot>,
     /// Pre-zeroed registration flags for synchronous defer sites in the
     /// lexical block currently being emitted, keyed by source span.
-    sync_defer_flags: HashMap<crate::diagnostics::Span, cranelift_codegen::ir::StackSlot>,
+    sync_defer_flags: HashMap<crate::ir::lowered::LirDeferId, cranelift_codegen::ir::StackSlot>,
     /// Synchronous lexical scopes that are valid recovery continuations.
     /// Async panic unwinding is deliberately deferred to willow-s9ej.6.
-    panic_scopes: Vec<PanicScope>,
+    panic_scopes: Chain<PanicScope>,
     /// Defer registrations already consumed on the cleanup path currently
     /// being emitted. A nested panic must not execute them again.
     unavailable_defer_ids: HashSet<usize>,
@@ -1476,7 +1468,7 @@ struct FuncGen<'a, 'b> {
     collected_defer_sites: Vec<AsyncDeferSite>,
     /// `lock` critical sections enclosing the code currently being emitted,
     /// outermost first (willow-38w.1.4).
-    lock_scopes: Vec<CoopLockScope>,
+    lock_scopes: Chain<CoopLockScope>,
     /// Every `lock` site seen while emitting a poll fn — consumed by the
     /// generated cancel entry, which has no lexical context of its own.
     collected_lock_sites: Vec<AsyncLockSite>,
@@ -2638,15 +2630,15 @@ mod tests {
         let mut left = original.clone();
         let mut right = original.clone();
         assert_eq!(left.identity, right.identity);
-        left.last_mut().unwrap().clear();
+        left.push(Vec::new());
         right.push(Vec::new());
         assert_ne!(left.identity, right.identity);
         assert_ne!(left.identity, original.identity);
         assert_ne!(right.identity, original.identity);
         let snapshot = right.clone();
-        right.pop();
+        right = original.clone();
         assert_eq!(right.identity, original.identity);
-        left.truncate(0);
+        left = DeferStack::default();
         assert_ne!(right.identity, snapshot.identity);
         assert_ne!(left.identity, right.identity);
         assert_eq!(original.len(), 1);
