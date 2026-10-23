@@ -1,0 +1,13 @@
+// Expected output: 1, 2, 9, 9 (one value per line).
+fn read(value: &i64) -> i64 { return value; }
+fn write(value: &mut i64) { value = 9; }
+fn main() {
+    let mut local = 1;
+    let array = [2];
+    println(read(&local));
+    println(read(&array[0]));
+    write(&local);
+    write(&array[0]);
+    println(local);
+    println(array[0]);
+}

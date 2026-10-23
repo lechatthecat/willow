@@ -1938,7 +1938,7 @@ mod tests {
         let mut checker = crate::semantic::TypeChecker::new();
         crate::register_prelude(&mut checker).unwrap();
         checker.check_program(&ast);
-        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        let tables = crate::ir::lower::SemanticFacts::from_checker(&checker);
         let (hir, errors) = crate::ir::lower::lower_program_with(&ast, &tables);
         assert!(errors.is_empty(), "{errors:?}");
         super::super::super::lower_source_program(&hir)

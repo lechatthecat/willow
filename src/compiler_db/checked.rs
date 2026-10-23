@@ -1,7 +1,7 @@
 use crate::semantic::async_borrows::ReferenceArgMode;
 use crate::{
     diagnostics::Diagnostic,
-    ir::lower::CheckerTables,
+    ir::lower::SemanticFacts,
     parser::ast::*,
     semantic::{TypeChecker, symbols::SymbolTable, type_checker::LambdaCapture},
 };
@@ -23,7 +23,7 @@ pub struct CheckedUnit {
     pub arm_leaves: HashMap<BodyId, bool>,
     #[serde(with = "super::map_entries")]
     pub normalized_types: HashMap<Type, Type>,
-    pub static_call_classes: HashMap<ExprId, String>,
+    pub static_call_classes: HashMap<ExprId, crate::semantic::ids::TypeId>,
     pub lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
 }
 
@@ -47,18 +47,16 @@ impl From<TypeChecker> for CheckedUnit {
 }
 
 impl CheckedUnit {
-    pub fn tables(&self) -> CheckerTables<'_> {
-        CheckerTables {
-            mutable_capture_declarations: Default::default(),
-            symbols: Some(&self.symbols),
-            expr_types: Some(&self.expr_types),
-            enums: Some(&self.symbols.enums),
-            enum_variant_resolutions: Some(&self.enum_variant_resolutions),
-            pattern_resolutions: Some(&self.pattern_resolutions),
-            arm_leaves: Some(&self.arm_leaves),
-            normalized_types: Some(&self.normalized_types),
-            static_call_classes: Some(&self.static_call_classes),
-            lambda_captures: Some(&self.lambda_captures),
+    pub fn tables(&self) -> SemanticFacts<'_> {
+        SemanticFacts {
+            symbols: &self.symbols,
+            expr_types: &self.expr_types,
+            enum_variant_resolutions: &self.enum_variant_resolutions,
+            pattern_resolutions: &self.pattern_resolutions,
+            arm_leaves: &self.arm_leaves,
+            normalized_types: &self.normalized_types,
+            static_call_classes: &self.static_call_classes,
+            lambda_captures: &self.lambda_captures,
         }
     }
 }
@@ -76,13 +74,13 @@ pub(crate) struct CheckedDeclarations {
 impl CheckedDeclarations {
     /// The declaration-level subset of [`CheckedUnit::tables`]: enough to
     /// normalize a declared type, nothing body-level.
-    pub fn tables(&self) -> CheckerTables<'_> {
-        CheckerTables {
+    pub fn tables(&self) -> crate::ir::lower::PartialCheckerTables<'_> {
+        crate::ir::lower::PartialCheckerTables {
             mutable_capture_declarations: Default::default(),
             symbols: Some(&self.symbols),
             enums: Some(&self.symbols.enums),
             normalized_types: Some(&self.normalized_types),
-            ..CheckerTables::default()
+            ..crate::ir::lower::PartialCheckerTables::default()
         }
     }
 

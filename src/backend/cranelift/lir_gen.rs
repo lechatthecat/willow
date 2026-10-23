@@ -10200,7 +10200,7 @@ mod tests {
     /// Parse, desugar and TYPE CHECK, then lower with the checker's side
     /// tables — the pipeline `compile_program` runs, minus module resolution.
     ///
-    /// The plain [`eligible`] path lowers with empty `CheckerTables`, which is
+    /// The plain [`eligible`] path lowers with empty `PartialCheckerTables`, which is
     /// enough for anything the lowering can derive structurally. An interface
     /// method call is not: `lower_expr` finds no such method on the receiver's
     /// class and falls back to `tables.expr_type(span)`, so without the checker
@@ -10222,7 +10222,7 @@ mod tests {
             .filter(|d| d.severity == crate::diagnostics::Severity::Error)
             .collect();
         assert!(errors.is_empty(), "{errors:?}");
-        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        let tables = crate::ir::lower::SemanticFacts::from_checker(&checker);
         let (hir, diags) = crate::ir::lower::lower_program_with(&program, &tables);
         assert!(diags.is_empty(), "{diags:?}");
         let lir = crate::ir::lowered::lower_program(&hir);
@@ -13557,7 +13557,7 @@ mod tests {
             .filter(|d| d.severity == crate::diagnostics::Severity::Error)
             .collect();
         assert!(errors.is_empty(), "{errors:?}");
-        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        let tables = crate::ir::lower::SemanticFacts::from_checker(&checker);
         crate::ir::lower::lower_program_with(&program, &tables).1
     }
 

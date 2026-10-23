@@ -1,0 +1,33 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/willow_compiler-65054407f5676687)
+
+running 14 tests
+test compiler_db::lir::tests::semantic_facts_error_does_not_promote_ordinary_lowering_gaps ... ok
+test compiler_db::lir::tests::semantic_facts_missing_entry_reaches_compiler_error ... ok
+test compiler_db::revision::tests::revision_semantic_facts_enum_generic_static_edits_match_cold ... ok
+test ir::lower::facts_tests::semantic_facts_deep_operator_reads_are_linear ... operator_depth=16 expr_facts=33 required_type_reads=33
+operator_depth=64 expr_facts=129 required_type_reads=129
+operator_depth=256 expr_facts=513 required_type_reads=513
+ok
+test ir::lower::facts_tests::semantic_facts_missing_capture_and_static_target ... ok
+test ir::lower::facts_tests::semantic_facts_missing_match_exit ... ok
+test ir::lower::facts_tests::semantic_facts_missing_nested_operator ... ok
+test ir::lower::facts_tests::semantic_facts_reference_place_storage_is_linear ... reference_arguments=32 expr_facts=99 entry_capacity=112 entry_storage_bytes=6272
+reference_arguments=128 expr_facts=387 entry_capacity=448 entry_storage_bytes=25088
+reference_arguments=512 expr_facts=1539 entry_capacity=1792 entry_storage_bytes=100352
+ok
+test ir::lower::facts_tests::semantic_facts_reference_places_twenty_four_perspectives ... ok
+test ir::lower::facts_tests::semantic_facts_reparse_rejects_stale_facts ... ok
+test ir::lower::facts_tests::semantic_facts_repeated_static_targets_share_identity ... static_calls=16 distinct_targets=1 target_entry_capacity=28 target_entry_storage_bytes=448
+static_calls=64 distinct_targets=1 target_entry_capacity=112 target_entry_storage_bytes=1792
+static_calls=256 distinct_targets=1 target_entry_capacity=448 target_entry_storage_bytes=7168
+ok
+test ir::lower::facts_tests::semantic_facts_scope_and_memory ... functions=16 expr_facts=48 entry_capacity=56 entry_storage_bytes=3136 borrowed_facts_bytes=64 hir_functions=16 required_type_reads=48
+functions=64 expr_facts=192 entry_capacity=224 entry_storage_bytes=12544 borrowed_facts_bytes=64 hir_functions=64 required_type_reads=192
+functions=256 expr_facts=768 entry_capacity=896 entry_storage_bytes=50176 borrowed_facts_bytes=64 hir_functions=256 required_type_reads=768
+ok
+test ir::lower::facts_tests::semantic_facts_twenty_perspectives ... ok
+test semantic::type_checker::generics::semantic_fact_identity_tests::semantic_facts_specialization_never_reuses_template_node_ids ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 3296 filtered out; finished in 8.31s
+

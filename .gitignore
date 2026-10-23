@@ -248,3 +248,8 @@ AGENTS.md
 !/docs/audits/willow-r52c.20-measurements.txt
 !/docs/audits/willow-r52c.20-generic-measurements.txt
 !/docs/audits/willow-r52c.20-reproduce.sh
+
+# Public semantic-facts implementation audit and focused measurements.
+!/docs/audits/willow-r52c.19.md
+!/docs/audits/willow-r52c.19-measurements.txt
+!/docs/audits/willow-r52c.19-reproduce.sh

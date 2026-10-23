@@ -824,7 +824,8 @@ impl SyntaxQueries {
 }
 
 // A process-private derived wire; bump when its payload contract changes.
-const DERIVED_WIRE_VERSION: u8 = 1;
+// Semantic static targets are now total for checked static expressions.
+const DERIVED_WIRE_VERSION: u8 = 2;
 
 #[derive(Clone)]
 struct DerivedValue {

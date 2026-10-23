@@ -162,7 +162,7 @@ mod tests {
     }
     #[test]
     fn tuple_let_lookup_probes_scale_linearly() {
-        use crate::ir::lower::{CheckerTables, lower_program_with};
+        use crate::ir::lower::{SemanticFacts, lower_program_with};
         use crate::semantic::scopes::LOOKUP_PROBES;
         for lambda in [false, true] {
             let mut samples = Vec::new();
@@ -194,7 +194,7 @@ mod tests {
                 );
                 LOOKUP_PROBES.with(|n| n.set(0));
                 let (_, diagnostics) =
-                    lower_program_with(&program, &CheckerTables::from_checker(&checker));
+                    lower_program_with(&program, &SemanticFacts::from_checker(&checker));
                 assert!(diagnostics.is_empty(), "{diagnostics:?}");
                 let lowering = LOOKUP_PROBES.with(|n| n.get());
                 samples.push((count, checking, lowering));

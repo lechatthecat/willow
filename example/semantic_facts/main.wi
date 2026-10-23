@@ -1,0 +1,6 @@
+// Expected output: 42
+import values;
+fn main() {
+    let value = values::Value::Number(values::Counter::answer());
+    println(values::identity(values::read(value)));
+}

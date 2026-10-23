@@ -1,0 +1,8 @@
+pub enum Value { Empty, Number(i64) }
+pub class Counter {
+    pub static fn answer() -> i64 { return 42; }
+}
+pub fn identity<T>(value: T) -> T { return value; }
+pub fn read(value: Value) -> i64 {
+    return match value { Empty => 0, Number(n) => n };
+}

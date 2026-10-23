@@ -2078,7 +2078,7 @@ impl<'p> ForeignDefaults<'p> {
         index: &compiler_db::ids::BodyIndex,
         plan: Option<&mut Vec<backend::cranelift::UnitBody<'_>>>,
         program: &parser::ast::Program,
-        tables: &ir::lower::CheckerTables<'_>,
+        tables: &ir::lower::SemanticFacts<'_>,
         class_name: &dyn Fn(&parser::ast::ClassDecl) -> String,
         batches: &mut ForeignBatches,
     ) {
@@ -2379,7 +2379,7 @@ impl ForeignBatch {
         &self,
         db: &compiler_db::CompilerDb,
         scope: &parser::ast::Program,
-        scope_tables: &ir::lower::CheckerTables<'_>,
+        scope_tables: &ir::lower::SemanticFacts<'_>,
         defaults: &std::collections::HashMap<parser::ast::BodyId, parser::ast::MethodDecl>,
     ) -> Result<compiler_db::lir::ForeignLowering> {
         let receivers = self.classes(db.bodies(), defaults)?;
@@ -2613,7 +2613,7 @@ fn run_backend(
             // fresh temporary IDs. Preserve source resolutions/captures, but
             // lower the exact declared tree with its extended payload types.
             let mut tables = checker.tables();
-            tables.expr_types = Some(unit.normalized_expr_types());
+            tables.expr_types = unit.normalized_expr_types();
             log_hir_gaps(&db.lir.lower_unit(
                 module.id,
                 unit.normalized_program(),
@@ -2627,7 +2627,7 @@ fn run_backend(
         let mut plan = codegen.module_body_plan(&unit);
         {
             let mut tables = checker.tables();
-            tables.expr_types = Some(unit.normalized_expr_types());
+            tables.expr_types = unit.normalized_expr_types();
             let defaults =
                 ForeignDefaults::collect(db.bodies(), module.id, unit.normalized_program());
             let names = if defaults.providers.is_empty() {
@@ -2671,7 +2671,7 @@ fn run_backend(
     let checked = db.checked_unit(module::UnitId::ENTRY, &artifacts)?;
     {
         let mut tables = checked.tables();
-        tables.expr_types = Some(entry_unit.normalized_expr_types());
+        tables.expr_types = entry_unit.normalized_expr_types();
         log_hir_gaps(&db.lir.lower_unit(
             module::UnitId::ENTRY,
             entry_unit.normalized_program(),
@@ -2682,7 +2682,7 @@ fn run_backend(
     let mut plan = codegen.program_body_plan(&entry_unit);
     {
         let mut tables = checked.tables();
-        tables.expr_types = Some(entry_unit.normalized_expr_types());
+        tables.expr_types = entry_unit.normalized_expr_types();
         ForeignDefaults::collect(
             db.bodies(),
             module::UnitId::ENTRY,
@@ -2732,7 +2732,7 @@ fn run_backend(
         let defaults = batch.defaults(db.bodies(), scope.normalized_program());
         {
             let mut tables = checked.tables();
-            tables.expr_types = Some(scope.normalized_expr_types());
+            tables.expr_types = scope.normalized_expr_types();
             let (gaps, _) = batch.lower(&db, scope.normalized_program(), &tables, &defaults)?;
             log_hir_gaps(&gaps);
         }

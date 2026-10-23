@@ -40,11 +40,105 @@ use super::typed_ast::{
     HirParam, HirPattern, HirProgram, HirSelectCase, HirSelectCaseKind, HirStmt,
 };
 
-/// Type-checker side tables the lowering can consume to close gaps the
-/// immutable AST cannot express (willow-mb5 checker pivot, step 1). These are
-/// the same tables the checker already hands to the backend.
+/// Complete semantic input to production lowering. Sparse maps represent
+/// optional per-node facts, never an optional checking phase. The references
+/// borrow one checked unit; no fact maps are cloned at this boundary.
+pub struct SemanticFacts<'a> {
+    pub symbols: &'a symbols::SymbolTable,
+    pub expr_types: &'a HashMap<ExprId, Type>,
+    pub enum_variant_resolutions: &'a HashMap<ExprId, String>,
+    pub pattern_resolutions: &'a HashMap<PatternId, crate::parser::ast::Pattern>,
+    pub arm_leaves: &'a HashMap<crate::parser::ast::BodyId, bool>,
+    pub normalized_types: &'a HashMap<Type, Type>,
+    pub static_call_classes: &'a HashMap<ExprId, crate::semantic::ids::TypeId>,
+    pub lambda_captures: &'a HashMap<ExprId, Vec<LambdaCapture>>,
+}
+
+impl<'a> SemanticFacts<'a> {
+    pub fn from_checker(checker: &'a crate::semantic::TypeChecker) -> Self {
+        Self {
+            symbols: &checker.symbols,
+            expr_types: &checker.expr_types,
+            enum_variant_resolutions: &checker.enum_variant_resolutions,
+            pattern_resolutions: &checker.pattern_resolutions,
+            arm_leaves: &checker.arm_leaves,
+            normalized_types: &checker.normalized_types,
+            static_call_classes: &checker.static_call_classes,
+            lambda_captures: &checker.lambda_captures,
+        }
+    }
+
+    fn lowering(&self) -> PartialCheckerTables<'_> {
+        PartialCheckerTables {
+            checked: true,
+            mutable_capture_declarations: Default::default(),
+            symbols: Some(self.symbols),
+            expr_types: Some(self.expr_types),
+            enums: Some(&self.symbols.enums),
+            enum_variant_resolutions: Some(self.enum_variant_resolutions),
+            pattern_resolutions: Some(self.pattern_resolutions),
+            arm_leaves: Some(self.arm_leaves),
+            normalized_types: Some(self.normalized_types),
+            static_call_classes: Some(self.static_call_classes),
+            lambda_captures: Some(self.lambda_captures),
+        }
+    }
+
+    pub(crate) fn normalize(&self, ty: &Type) -> Type {
+        self.lowering().normalize(ty)
+    }
+
+    pub fn declared_enum_identities(&self, program: &Program) -> HashSet<String> {
+        self.lowering().declared_enum_identities(program)
+    }
+
+    pub fn codegen_enum_info(
+        &self,
+        info: &symbols::EnumInfo,
+        declared: &HashSet<String>,
+    ) -> symbols::EnumInfo<crate::semantic::ids::TypeId> {
+        self.lowering().codegen_enum_info(info, declared)
+    }
+}
+
+pub fn lower_program_with(
+    program: &Program,
+    facts: &SemanticFacts<'_>,
+) -> (HirProgram, Vec<Diagnostic>) {
+    lower_program_except(program, facts, &|_| false)
+}
+
+pub fn lower_program_except(
+    program: &Program,
+    facts: &SemanticFacts<'_>,
+    foreign: &dyn Fn(&MethodDecl) -> bool,
+) -> (HirProgram, Vec<Diagnostic>) {
+    lower_program_except_partial(program, &facts.lowering(), foreign)
+}
+
+pub fn lower_foreign_methods(
+    scope: &Program,
+    facts: &SemanticFacts<'_>,
+    receivers: &[ForeignClass<'_>],
+    classes: &HashMap<crate::semantic::ids::TypeId, super::typed_ast::HirClassInfo>,
+) -> (HirProgram, Vec<Diagnostic>) {
+    lower_foreign_methods_partial(scope, &facts.lowering(), receivers, classes)
+}
+
+pub(crate) fn lower_resolution(
+    program: &Program,
+    facts: &SemanticFacts<'_>,
+) -> super::typed_ast::HirResolution {
+    lower_resolution_partial(program, &facts.lowering())
+}
+
+/// Explicit partial input for standalone lowering tests and declaration-only
+/// queries. Production executable entry points accept [`SemanticFacts`].
+/// Internally a complete view shares these accessors, with missing required
+/// per-node facts diagnosed instead of using standalone inference.
 #[derive(Default)]
-pub struct CheckerTables<'a> {
+pub struct PartialCheckerTables<'a> {
+    pub(crate) checked: bool,
     /// One unit-wide index, shared by all lowered functions and nested lambdas.
     pub mutable_capture_declarations: std::sync::OnceLock<std::collections::HashSet<Span>>,
     /// Syntax-only block exit facts computed by checking.
@@ -59,9 +153,8 @@ pub struct CheckerTables<'a> {
     /// present, an absent entry preserves the parsed binding or downcast;
     /// knowing an enum's identity does not grant access to its bare variants.
     pub pattern_resolutions: Option<&'a HashMap<PatternId, crate::parser::ast::Pattern>>,
-    /// The checker's authoritative type for every checked expression, keyed by
-    /// node ID — the final fallback when the structural lowering cannot derive
-    /// a type (generic constructions, `Self::` calls, module-qualified items).
+    /// Authoritative checked types. Production lowering transcribes these onto
+    /// HIR expressions; standalone tests may omit the table.
     pub expr_types: Option<&'a HashMap<ExprId, Type>>,
     /// Every enum the checker registered, under every name it registered it
     /// by: a program's own `Color`, an imported module's `palette::Color`, and
@@ -79,9 +172,9 @@ pub struct CheckerTables<'a> {
     /// other phase sees the normalized type, so without this the LIR walker
     /// meets a named type nothing has heard of and turns the body down.
     pub normalized_types: Option<&'a HashMap<Type, Type>>,
-    /// What a static call's written class name resolved to, keyed by the call's
-    /// node ID, for the calls where the two differ (willow-0g8j.3).
-    pub static_call_classes: Option<&'a HashMap<ExprId, String>>,
+    /// Resolved class/module name for every checked static expression, including
+    /// unchanged spellings. Absence is an error on the production path.
+    pub static_call_classes: Option<&'a HashMap<ExprId, crate::semantic::ids::TypeId>>,
     /// What each lambda captures from its enclosing function, keyed by the
     /// lambda's node ID and ordered as the closure environment lays its slots out
     /// (willow-0g8j.2.12). Only the checker knows this: capture is decided by
@@ -90,23 +183,7 @@ pub struct CheckerTables<'a> {
 }
 
 #[willow_continuations::methods(normalize)]
-impl<'a> CheckerTables<'a> {
-    /// Borrow the relevant tables from a run type checker.
-    pub fn from_checker(checker: &'a crate::semantic::TypeChecker) -> Self {
-        Self {
-            mutable_capture_declarations: Default::default(),
-            symbols: Some(&checker.symbols),
-            arm_leaves: Some(&checker.arm_leaves),
-            enum_variant_resolutions: Some(&checker.enum_variant_resolutions),
-            pattern_resolutions: Some(&checker.pattern_resolutions),
-            expr_types: Some(&checker.expr_types),
-            enums: Some(&checker.symbols.enums),
-            normalized_types: Some(&checker.normalized_types),
-            static_call_classes: Some(&checker.static_call_classes),
-            lambda_captures: Some(&checker.lambda_captures),
-        }
-    }
-
+impl<'a> PartialCheckerTables<'a> {
     fn cell_declaration(&self, span: &Span) -> bool {
         self.mutable_capture_declarations
             .get_or_init(|| {
@@ -305,7 +382,7 @@ impl<'a> CheckerTables<'a> {
     fn static_call_class(&self, id: &ExprId, written: &str) -> String {
         self.static_call_classes
             .and_then(|m| m.get(id))
-            .cloned()
+            .map(ToString::to_string)
             .unwrap_or_else(|| written.to_string())
     }
 
@@ -338,24 +415,24 @@ impl<'a> CheckerTables<'a> {
 /// constructs outside slice 1 are reported as diagnostics; the functions that
 /// do lower cleanly are still returned, so callers can make progress.
 pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
-    lower_program_with(program, &CheckerTables::default())
+    lower_program_with_partial(program, &PartialCheckerTables::default())
 }
 
 /// Like [`lower_program`], additionally consulting the type checker's side
 /// tables for information the structural lowering cannot derive.
-pub fn lower_program_with(
+pub fn lower_program_with_partial(
     program: &Program,
-    tables: &CheckerTables,
+    tables: &PartialCheckerTables,
 ) -> (HirProgram, Vec<Diagnostic>) {
-    lower_program_except(program, tables, &|_| false)
+    lower_program_except_partial(program, tables, &|_| false)
 }
 
-/// [`lower_program_with`], leaving out the class methods `foreign` selects:
-/// interface defaults another unit declared, which [`lower_foreign_methods`]
+/// [`lower_program_with_partial`], leaving out the class methods `foreign` selects:
+/// interface defaults another unit declared, which [`lower_foreign_methods_partial`]
 /// lowers in that unit's scope instead (willow-rvpp).
-pub fn lower_program_except(
+fn lower_program_except_partial(
     program: &Program,
-    tables: &CheckerTables,
+    tables: &PartialCheckerTables,
     foreign: &dyn Fn(&MethodDecl) -> bool,
 ) -> (HirProgram, Vec<Diagnostic>) {
     let LowerEnv {
@@ -427,7 +504,7 @@ pub fn lower_program_except(
         HirProgram {
             functions,
             classes: hir_classes,
-            resolution: lower_resolution(program, tables),
+            resolution: lower_resolution_partial(program, tables),
         },
         diagnostics,
     )
@@ -439,9 +516,9 @@ pub fn lower_program_except(
 /// typed record of each default is what the copies reuse. The scope's
 /// signatures and resolution are built once for all `receivers`; `classes`
 /// holds their class chains, taken from the implementing units.
-pub fn lower_foreign_methods(
+fn lower_foreign_methods_partial(
     scope: &Program,
-    scope_tables: &CheckerTables,
+    scope_tables: &PartialCheckerTables,
     receivers: &[ForeignClass<'_>],
     classes: &HashMap<crate::semantic::ids::TypeId, super::typed_ast::HirClassInfo>,
 ) -> (HirProgram, Vec<Diagnostic>) {
@@ -502,7 +579,7 @@ pub fn lower_foreign_methods(
             span: receiver.span,
         });
     }
-    let mut resolution = lower_resolution(scope, scope_tables);
+    let mut resolution = lower_resolution_partial(scope, scope_tables);
     // The receivers' class chains are their implementing units' declarations;
     // module class identities are qualified, and a bare one the scope's own
     // names shadow arrives under `FOREIGN_RECEIVER_PREFIX` (willow-nvi6), so
@@ -541,7 +618,7 @@ struct LowerEnv {
     enums: Enums,
 }
 
-fn lower_env(program: &Program, tables: &CheckerTables) -> LowerEnv {
+fn lower_env(program: &Program, tables: &PartialCheckerTables) -> LowerEnv {
     // Builtin functions the checker registers (register_builtin_functions):
     // their call-site types, so calls to them lower like any other call.
     let mut fn_returns: HashMap<String, Type> = HashMap::from([
@@ -855,7 +932,7 @@ fn lower_function(
     fn_returns: &HashMap<String, Type>,
     classes: &Classes,
     enums: &Enums,
-    tables: &CheckerTables,
+    tables: &PartialCheckerTables,
 ) -> Result<HirFunction, Diagnostic> {
     let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
     let mut params = Vec::with_capacity(f.params.len());
@@ -891,7 +968,7 @@ fn lower_method(
     fn_returns: &HashMap<String, Type>,
     classes: &Classes,
     enums: &Enums,
-    tables: &CheckerTables,
+    tables: &PartialCheckerTables,
 ) -> Result<HirFunction, Diagnostic> {
     let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
     ctx.current_class = Some(class_name.to_owned());
@@ -944,7 +1021,7 @@ fn lower_constructor(
     fn_returns: &HashMap<String, Type>,
     classes: &Classes,
     enums: &Enums,
-    tables: &CheckerTables,
+    tables: &PartialCheckerTables,
 ) -> Result<HirFunction, Diagnostic> {
     let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
     ctx.current_class = Some(class_name.to_owned());
@@ -1042,7 +1119,7 @@ struct LowerCtx<'a> {
     fn_returns: &'a HashMap<String, Type>,
     classes: &'a Classes,
     enums: &'a Enums,
-    tables: &'a CheckerTables<'a>,
+    tables: &'a PartialCheckerTables<'a>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -1050,7 +1127,7 @@ impl<'a> LowerCtx<'a> {
         fn_returns: &'a HashMap<String, Type>,
         classes: &'a Classes,
         enums: &'a Enums,
-        tables: &'a CheckerTables<'a>,
+        tables: &'a PartialCheckerTables<'a>,
     ) -> Self {
         Self {
             arm_leaves: HashMap::new(),
@@ -1466,8 +1543,35 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
     lower_value_args
 )]
 fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    // Operator lowering checks/transcribes every operator, including the root.
+    // Do not read and clone the root's type twice.
+    let checked_type = if matches!(expr, Expr::Binary(_) | Expr::Unary(_)) {
+        None
+    } else {
+        required_expr_type(expr.id(), expr.span(), ctx)?
+    };
+    if ctx.tables.checked
+        && matches!(expr, Expr::Lambda(_))
+        && !ctx
+            .tables
+            .lambda_captures
+            .is_some_and(|facts| facts.contains_key(&expr.id()))
+    {
+        return Err(missing_fact(expr.span(), "lambda captures"));
+    }
+    if ctx.tables.checked
+        && matches!(expr, Expr::StaticCall(_) | Expr::StaticField(_))
+        && !ctx
+            .tables
+            .static_call_classes
+            .is_some_and(|facts| facts.contains_key(&expr.id()))
+    {
+        return Err(missing_fact(expr.span(), "static target"));
+    }
     let mut lowered = lower_expr_inner(expr, ctx)?;
-    lowered.ty = ctx.normalize(&lowered.ty.to_source()).into();
+    lowered.ty = ctx
+        .normalize(&checked_type.unwrap_or_else(|| lowered.ty.to_source()))
+        .into();
     match &mut lowered.kind {
         HirExprKind::StaticCall { class, .. } | HirExprKind::StaticField { class, .. } => {
             let source = if *class == crate::semantic::ids::TypeId::local("Self") {
@@ -1559,6 +1663,22 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
         Expr::Lambda(l) => lower_lambda_expr(l, ctx),
         Expr::Match(m) => lower_match(m, ctx),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REQUIRED_TYPE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A missing checked fact is an invariant error, not permission to infer it.
+fn required_expr_type(id: ExprId, span: Span, ctx: &LowerCtx) -> Result<Option<Type>, Diagnostic> {
+    #[cfg(test)]
+    REQUIRED_TYPE_READS.with(|reads| reads.set(reads.get() + 1));
+    let ty = ctx.expr_type(&id);
+    if ctx.tables.checked && ty.is_none() {
+        return Err(missing_fact(span, "expression type"));
+    }
+    Ok(ty)
 }
 
 /// The literal one use of a module-level `const` stands for (willow-jz15.10).
@@ -1706,7 +1826,8 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
             Step::Binary(binary) => {
                 let rhs = values.pop().expect("lowered right operand");
                 let lhs = values.pop().expect("lowered left operand");
-                let ty = binary_result_type(&binary.op, &lhs.ty.to_source());
+                let ty = required_expr_type(binary.id, binary.span, ctx)?
+                    .unwrap_or_else(|| binary_result_type(&binary.op, &lhs.ty.to_source()));
                 HirExpr {
                     kind: HirExprKind::Binary {
                         op: binary.op.clone(),
@@ -1719,12 +1840,14 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
             }
             Step::Unary(unary) => {
                 let operand = values.pop().expect("lowered unary operand");
-                let ty = match unary.op {
-                    UnaryOp::Neg => operand.ty.clone(),
-                    // `!` is bitwise on `i64` and logical on `bool`.
-                    UnaryOp::Not if operand.ty == Type::I64 => Type::I64,
-                    UnaryOp::Not => Type::Bool,
-                };
+                let ty = required_expr_type(unary.id, unary.span, ctx)?
+                    .map(Into::into)
+                    .unwrap_or_else(|| match unary.op {
+                        UnaryOp::Neg => operand.ty.clone(),
+                        // `!` is bitwise on `i64` and logical on `bool`.
+                        UnaryOp::Not if operand.ty == Type::I64 => Type::I64,
+                        UnaryOp::Not => Type::Bool,
+                    });
                 HirExpr {
                     kind: HirExprKind::Unary {
                         op: unary.op.clone(),
@@ -3015,17 +3138,20 @@ fn lower_match(
                 (vec![HirStmt::Expr(value)], ty)
             }
             MatchBody::Block(block) => {
-                let ty = if ctx
+                let checked_exit = ctx
                     .tables
                     .arm_leaves
                     .and_then(|facts| facts.get(&block.id))
-                    .copied()
-                    .unwrap_or_else(|| {
-                        crate::semantic::type_checker::analysis::cached_arm_leaves(
-                            block,
-                            &mut ctx.arm_leaves,
-                        )
-                    }) {
+                    .copied();
+                if ctx.tables.checked && checked_exit.is_none() {
+                    return Err(missing_fact(block.span, "match arm exit"));
+                }
+                let ty = if checked_exit.unwrap_or_else(|| {
+                    crate::semantic::type_checker::analysis::cached_arm_leaves(
+                        block,
+                        &mut ctx.arm_leaves,
+                    )
+                }) {
                     Type::Never
                 } else {
                     Type::Void
@@ -3247,6 +3373,18 @@ fn unsupported(span: Span, what: &str) -> Diagnostic {
     .with_label(crate::diagnostics::Label::primary(span, "here"))
 }
 
+fn missing_fact(span: Span, fact: &str) -> Diagnostic {
+    Diagnostic::new(
+        Severity::Error,
+        ErrorCode::E0890,
+        format!("internal compiler error: missing required semantic fact: {fact}"),
+    )
+    .with_label(crate::diagnostics::Label::primary(
+        span,
+        "missing checked fact",
+    ))
+}
+
 fn internal(span: Span, msg: String) -> Diagnostic {
     Diagnostic::new(
         Severity::Error,
@@ -3259,9 +3397,9 @@ fn internal(span: Span, msg: String) -> Diagnostic {
 /// Freeze declaration facts before control-flow lowering. Source declarations
 /// provide a complete fallback for checkerless tools/tests; checker entries
 /// then replace them with the canonical, globally resolved definitions.
-pub(crate) fn lower_resolution(
+fn lower_resolution_partial(
     program: &Program,
-    tables: &CheckerTables<'_>,
+    tables: &PartialCheckerTables<'_>,
 ) -> super::typed_ast::HirResolution {
     use super::typed_ast::{
         HirClassInfo, HirEnumInfo, HirEnumVariant, HirInterfaceInfo, HirResolution, HirSignature,
@@ -3700,11 +3838,11 @@ mod tests {
             Type::Named("Alias".into()),
             Type::Named("sales::Amount".into()),
         )]);
-        let tables = CheckerTables {
+        let tables = PartialCheckerTables {
             normalized_types: Some(&normalized),
             ..Default::default()
         };
-        let (hir, diagnostics) = lower_program_with(&program, &tables);
+        let (hir, diagnostics) = lower_program_with_partial(&program, &tables);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         for statement in &hir.functions[0].body {
             if let HirStmt::Let { value, .. } = statement {
@@ -4793,7 +4931,7 @@ mod tests {
             "checker errors: {:?}",
             checker.errors
         );
-        let tables = CheckerTables::from_checker(&checker);
+        let tables = SemanticFacts::from_checker(&checker);
         lower_program_with(&program, &tables)
     }
 
@@ -5036,3 +5174,7 @@ mod tests {
         assert_eq!(classes.field_type("B", "missing"), None);
     }
 }
+
+#[cfg(test)]
+#[path = "lower_facts_tests.rs"]
+mod facts_tests;

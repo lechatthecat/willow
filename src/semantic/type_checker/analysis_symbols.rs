@@ -476,8 +476,8 @@ impl TypeChecker {
                 let name = self
                     .static_call_classes
                     .get(&call.id)
-                    .unwrap_or(&call.class)
-                    .clone();
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| call.class.clone());
                 self.record_type_use(&call.class, &Type::Named(name), call.span);
             }
             Expr::Print(_, newline, span, _) => {
@@ -494,8 +494,8 @@ impl TypeChecker {
                 let name = self
                     .static_call_classes
                     .get(&field.id)
-                    .unwrap_or(&field.class)
-                    .clone();
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| field.class.clone());
                 self.record_type_use(&field.class, &Type::Named(name), field.span);
             }
             _ => {}

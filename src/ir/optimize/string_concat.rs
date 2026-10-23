@@ -338,7 +338,7 @@ mod tests {
         crate::register_prelude(&mut checker).unwrap();
         checker.check_program(&ast);
         assert!(checker.errors.is_empty(), "{:?}", checker.errors);
-        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        let tables = crate::ir::lower::SemanticFacts::from_checker(&checker);
         let (hir, errors) = crate::ir::lower::lower_program_with(&ast, &tables);
         assert!(errors.is_empty(), "{errors:?}");
         crate::ir::lowered::lower_source_program(&hir)

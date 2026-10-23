@@ -101,6 +101,7 @@ error_codes! {
     E0706, // two declarations would share one linker symbol
     // Internal compiler error E08xx
     E0800,
+    E0890, // required checked semantic fact missing at lowering
     // Concurrency / async E08xx
     E0801,
     E0802,

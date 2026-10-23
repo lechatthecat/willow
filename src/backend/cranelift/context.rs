@@ -480,7 +480,7 @@ mod tests {
             .iter()
             .map(|(id, ty)| (*id, ty.into()))
             .collect();
-        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        let tables = crate::ir::lower::SemanticFacts::from_checker(&checker);
         let (hir, gaps) = crate::ir::lower::lower_program_with(&program, &tables);
         assert!(gaps.is_empty(), "{gaps:?}");
         (

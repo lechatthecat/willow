@@ -2687,7 +2687,7 @@ mod task_boundary_callback_tests {
         crate::register_prelude(&mut checker).unwrap();
         checker.check_program(&program);
         assert!(checker.errors.is_empty(), "{:?}", checker.errors);
-        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        let tables = crate::ir::lower::SemanticFacts::from_checker(&checker);
         let (hir, errors) = crate::ir::lower::lower_program_with(&program, &tables);
         assert!(errors.is_empty(), "{errors:?}");
         let lir = crate::ir::lowered::lower_program(&hir).functions.remove(0);
@@ -2940,7 +2940,7 @@ mod task_boundary_callback_tests {
         crate::register_prelude(&mut checker).unwrap();
         checker.check_program(&program);
         assert!(checker.errors.is_empty(), "{:?}", checker.errors);
-        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        let tables = crate::ir::lower::SemanticFacts::from_checker(&checker);
         let (hir, diagnostics) = crate::ir::lower::lower_program_with(&program, &tables);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let mut codegen = Codegen::for_tests(&crate::CompilerOptions::debug()).unwrap();

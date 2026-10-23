@@ -1267,9 +1267,10 @@ impl TypeChecker {
         if let Expr::StaticCall(call) = expr {
             self.record_type_use(&call.class, &result, call.span);
             self.check_source_type_name(&call.class, call.span);
-            if call.class != *enum_name {
-                self.static_call_classes.insert(call.id, enum_name.clone());
-            }
+            self.static_call_classes.insert(
+                call.id,
+                crate::semantic::ids::TypeId::from_source_name(enum_name),
+            );
         }
         self.expr_types.insert(expr.id(), result.clone());
         result
@@ -2754,4 +2755,59 @@ fn fresh_expr(e: &mut Expr, ids: &mut FreshIds) {
         }
     };
     *slot = ids.expr(*slot);
+}
+
+#[cfg(test)]
+mod semantic_fact_identity_tests {
+    use super::*;
+    use crate::{
+        lexer::Lexer,
+        parser::{
+            Parser,
+            iter::{AstEvent, AstWalk},
+        },
+    };
+
+    #[test]
+    fn semantic_facts_specialization_never_reuses_template_node_ids() {
+        let source = "fn identity<T>(x: T) -> T { let f = |v: T| v; return match true { true => f(x), false => x }; }";
+        let (program, errors) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
+        assert!(errors.is_empty());
+        let collect = |item: &Item| {
+            let Item::Function(function) = item else {
+                panic!()
+            };
+            let mut exprs = HashSet::new();
+            let mut patterns = HashSet::new();
+            let mut bodies = HashSet::new();
+            for event in AstWalk::new(AstEvent::Block(&function.body)) {
+                match event {
+                    AstEvent::Expr(expr) => {
+                        assert!(exprs.insert(expr.id()));
+                    }
+                    AstEvent::Pattern(pattern) => {
+                        assert!(patterns.insert(pattern.id()));
+                    }
+                    AstEvent::Block(block) => {
+                        assert!(bodies.insert(block.id));
+                    }
+                    _ => {}
+                }
+            }
+            (exprs, patterns, bodies)
+        };
+        let template = &program.items[0];
+        let (mut exprs, mut patterns, mut bodies) = collect(template);
+        for ty in [Type::I64, Type::Bool, Type::String] {
+            let mut instance = template.clone();
+            substitute_item(&mut instance, &HashMap::from([("T".into(), ty)]));
+            let (new_exprs, new_patterns, new_bodies) = collect(&instance);
+            assert!(exprs.is_disjoint(&new_exprs));
+            assert!(patterns.is_disjoint(&new_patterns));
+            assert!(bodies.is_disjoint(&new_bodies));
+            exprs.extend(new_exprs);
+            patterns.extend(new_patterns);
+            bodies.extend(new_bodies);
+        }
+    }
 }

@@ -721,7 +721,7 @@ mod tests {
             )
             .unwrap();
         let mut tables = checked.tables();
-        tables.expr_types = Some(unit.normalized_expr_types());
+        tables.expr_types = unit.normalized_expr_types();
         db.lir
             .lower_unit(
                 UnitId::ENTRY,
@@ -2009,5 +2009,16 @@ mod tests {
             &lib("let v = self.v; return v;", "2").replace("= 3", "= 4"),
         );
         assert!(f.compare(&mut warm));
+    }
+    #[test]
+    fn revision_semantic_facts_enum_generic_static_edits_match_cold() {
+        let f = Fixture::new();
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        f.write("main.wi", "import values; fn main() { println(values::read(values::identity(values::Value::Number(values::Counter::answer())))); }");
+        for value in [41, 42, 42, 43] {
+            f.write("values.wi", &format!("pub enum Value {{ Empty, Number(i64) }} pub class Counter {{ pub static fn answer() -> i64 {{ return {value}; }} }} pub fn identity<T>(v: T) -> T {{ return v; }} pub fn read(v: Value) -> i64 {{ return match v {{ Empty => 0, Number(n) => n }}; }}"));
+            assert!(f.compare(&mut warm));
+        }
     }
 }

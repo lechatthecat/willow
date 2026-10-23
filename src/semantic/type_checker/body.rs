@@ -145,7 +145,7 @@ pub(super) struct BodyOutputs {
     pattern_resolutions: HashMap<PatternId, Pattern>,
     arm_leaves: HashMap<BodyId, bool>,
     normalized_types: HashMap<Type, Type>,
-    static_call_classes: HashMap<ExprId, String>,
+    static_call_classes: HashMap<ExprId, crate::semantic::ids::TypeId>,
     lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
     lock_edges: HashMap<FunctionId, HashSet<FunctionId>>,
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
@@ -175,7 +175,7 @@ pub(crate) struct TypedBody {
     arm_leaves: HashMap<BodyId, bool>,
     #[serde(with = "crate::compiler_db::map_entries")]
     normalized_types: HashMap<Type, Type>,
-    static_call_classes: HashMap<ExprId, String>,
+    static_call_classes: HashMap<ExprId, crate::semantic::ids::TypeId>,
     lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
     #[serde(with = "crate::compiler_db::map_entries")]
     lock_edges: HashMap<FunctionId, HashSet<FunctionId>>,
@@ -995,7 +995,7 @@ mod tests {
         super::analysis::ARM_BLOCK_VISITS.set(0);
         let (_, errors) = crate::ir::lower::lower_program_with(
             &program,
-            &crate::ir::lower::CheckerTables::from_checker(&checker),
+            &crate::ir::lower::SemanticFacts::from_checker(&checker),
         );
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(super::analysis::ARM_BLOCK_VISITS.get(), 0);

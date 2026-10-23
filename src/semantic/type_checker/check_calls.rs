@@ -239,6 +239,7 @@ impl TypeChecker {
 
     pub(super) fn check_expr_expecting(&mut self, expr: &Expr, expected: &Type) -> Type {
         let ty = self.check_expr_expecting_inner(expr, expected);
+        self.record_static_target(expr);
         self.expr_types.insert(expr.id(), ty.clone());
         ty
     }
@@ -678,7 +679,10 @@ impl TypeChecker {
         if let Some(key) = self.static_call_enum_key(&call.class)
             && key != call.class
         {
-            self.static_call_classes.insert(call.id, key);
+            self.static_call_classes.insert(
+                call.id,
+                crate::semantic::ids::TypeId::from_source_name(&key),
+            );
         }
         let omitted_void_payload = call.args.is_empty() && matches!(payload_types, [Type::Void]);
         if call.args.len() != payload_types.len() && !omitted_void_payload {

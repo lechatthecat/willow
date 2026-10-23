@@ -4,7 +4,7 @@ use super::{ids::BodyIndex, lir_artifact::FlatLir, query::QueryTable};
 use crate::{
     diagnostics::{Diagnostic, Span},
     ir::{
-        lower::{self, CheckerTables},
+        lower::{self, SemanticFacts},
         lowered::{self, LirFunction},
     },
     module::{UnitId, artifacts::ArtifactStore},
@@ -57,6 +57,18 @@ pub(crate) struct LirQueries {
     bodies: QueryTable<BodyId, usize>,
     /// Debug builds check integer overflow (willow-jz15.14).
     overflow_checks: bool,
+}
+
+/// Preserve invariant diagnostics at the compiler boundary, including unused
+/// functions. A missing fact must not degrade into a later "no lowered body".
+fn require_complete_facts(diagnostics: &[Diagnostic]) -> Result<()> {
+    if let Some(error) = diagnostics
+        .iter()
+        .find(|d| d.code == crate::diagnostics::ErrorCode::E0890)
+    {
+        anyhow::bail!("{}", error.message);
+    }
+    Ok(())
 }
 
 impl LirQueries {
@@ -126,7 +138,7 @@ impl LirQueries {
         unit: UnitId,
         program: &Program,
         index: &BodyIndex,
-        tables: &CheckerTables,
+        tables: &SemanticFacts,
     ) -> Result<Arc<[Diagnostic]>> {
         Ok(Arc::clone(
             &self.evaluate(unit, program, index, tables)?.diagnostics,
@@ -138,7 +150,7 @@ impl LirQueries {
         unit: UnitId,
         program: &Program,
         index: &BodyIndex,
-        tables: &CheckerTables,
+        tables: &SemanticFacts,
     ) -> Result<Arc<LirUnit>> {
         self.units.query(unit, || {
             let deps = self
@@ -227,6 +239,7 @@ impl LirQueries {
                 let (hir, diagnostics) = lower::lower_program_except(program, tables, &|m| {
                     index.foreign_default(unit, m).is_some()
                 });
+                require_complete_facts(&diagnostics)?;
                 let source = lowered::lower_source_program_with(&hir, self.overflow_checks);
                 let mut result = LirInventory {
                     diagnostics,
@@ -288,13 +301,14 @@ impl LirQueries {
     pub(crate) fn lower_foreign(
         &self,
         scope: &Program,
-        scope_tables: &CheckerTables,
+        scope_tables: &SemanticFacts,
         receivers: &[lower::ForeignClass<'_>],
         classes: &HashMap<TypeId, crate::ir::typed_ast::HirClassInfo>,
         index: &BodyIndex,
     ) -> Result<ForeignLowering> {
         let (hir, diagnostics) =
             lower::lower_foreign_methods(scope, scope_tables, receivers, classes);
+        require_complete_facts(&diagnostics)?;
         let mut names = HashMap::new();
         let mut lambdas: HashMap<ExprId, VecDeque<BodyId>> = HashMap::new();
         for receiver in receivers {
@@ -412,9 +426,42 @@ mod tests {
         (program, index, checker)
     }
 
+    #[test]
+    fn semantic_facts_error_does_not_promote_ordinary_lowering_gaps() {
+        let gap = Diagnostic::new(
+            crate::diagnostics::Severity::Error,
+            crate::diagnostics::ErrorCode::E0800,
+            "unsupported standalone construct",
+        );
+        assert!(require_complete_facts(&[gap]).is_ok());
+    }
+
+    #[test]
+    fn semantic_facts_missing_entry_reaches_compiler_error() {
+        let (program, index, mut checker) = check("fn unused() -> i64 { return 1; } fn main() {}");
+        checker.expr_types.clear();
+        let artifacts = UnitArtifacts::new().unwrap();
+        let queries = LirQueries::new(Rc::clone(&artifacts.store), true);
+        let error = queries
+            .lower_unit(
+                UnitId::ENTRY,
+                &program,
+                &index,
+                &SemanticFacts::from_checker(&checker),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing required semantic fact: expression type"),
+            "{error:#}"
+        );
+        assert_eq!(queries.bodies.stats().computations, 0);
+    }
+
     fn compare(source: &str) -> (usize, usize) {
         let (program, index, checker) = check(source);
-        let tables = CheckerTables::from_checker(&checker);
+        let tables = SemanticFacts::from_checker(&checker);
         let (hir, gaps) = lower::lower_program_with(&program, &tables);
         assert!(gaps.is_empty(), "{gaps:?}");
         let expected = lowered::lower_program(&hir);

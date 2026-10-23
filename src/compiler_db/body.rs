@@ -1558,7 +1558,7 @@ mod tests {
                     assert_eq!(retained_nodes, width * per_body);
                     // One main, one default and one explicit seed per receiver.
                     assert_eq!(queries.typechecks(), width + 2);
-                    let tables = lower::CheckerTables::from_checker(&checker);
+                    let tables = lower::SemanticFacts::from_checker(&checker);
                     let (hir, gaps) = lower::lower_program_with(&program, &tables);
                     assert!(gaps.is_empty(), "{gaps:?}");
                     let lir = lowered::lower_program(&hir);

@@ -180,14 +180,13 @@ pub struct TypeChecker {
     /// which is the one place a written spelling could still reach the back end
     /// and be turned down as an unknown type.
     pub normalized_types: HashMap<Type, Type>,
-    /// What each static call's written class name resolved to, keyed by the
-    /// call expression's ID, when the two differ: `Dict::new()` under
-    /// `import std::collections::Map as Dict` records `Map` (willow-0g8j.3).
-    pub static_call_classes: HashMap<ExprId, String>,
+    /// Resolved class/module identity for every static call and field, including
+    /// unchanged spellings. Interned identities avoid per-site name allocation.
+    pub static_call_classes: HashMap<ExprId, crate::semantic::ids::TypeId>,
     /// What each lambda captures from its enclosing function, keyed by the
     /// lambda expression's ID and ordered as the closure environment lays the
-    /// slots out (willow-0g8j.2.12). An absent entry and an empty vector mean
-    /// the same thing — a non-capturing lambda, which stays a plain `fn` value.
+    /// slots out (willow-0g8j.2.12). An empty vector denotes a non-capturing
+    /// lambda; an absent entry is a missing required fact at lowering.
     pub lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
     /// Canonical names of every class already labelled by an E0426 class
     /// `extends` cycle diagnostic. Each member of a cycle discovers the same
@@ -917,6 +916,9 @@ impl TypeChecker {
                     self.check_expr(expr);
                     return None;
                 };
+                // Place checking bypasses check_expr, but the argument still
+                // needs its authoritative type when lowered as a reference.
+                self.expr_types.insert(expr.id(), var_info.ty.clone());
                 Some(ReferencePlaceInfo {
                     name: name.clone(),
                     ty: var_info.ty,
@@ -955,6 +957,7 @@ impl TypeChecker {
                 if matches!(elem_ty, Type::Void) {
                     return None;
                 }
+                self.expr_types.insert(expr.id(), elem_ty.clone());
                 Some(ReferencePlaceInfo {
                     name: reference_place_key(expr).unwrap_or_else(|| "array element".to_string()),
                     ty: elem_ty,

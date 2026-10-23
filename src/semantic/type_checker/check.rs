@@ -2270,6 +2270,10 @@ impl TypeChecker {
                         // static call it cannot resolve itself (willow-0g8j.2.14).
                         self.expr_types
                             .insert(sc.id, self.local.current_return_type.clone());
+                        self.static_call_classes.insert(
+                            sc.id,
+                            crate::semantic::ids::TypeId::from_source_name(&sc.class),
+                        );
                         return;
                     }
                 }
@@ -2376,12 +2380,7 @@ impl TypeChecker {
         self.record_checked_expr(expr, ty, generation)
     }
 
-    pub(super) fn record_checked_expr(&mut self, expr: &Expr, ty: Type, generation: usize) -> Type {
-        let ty = if ty == Type::Void && self.error_generation != generation {
-            Self::error_type()
-        } else {
-            ty
-        };
+    pub(super) fn record_static_target(&mut self, expr: &Expr) {
         // What the written class turned out to name, per call site: HIR lowering
         // rewrites `Level::High` to the build-wide identity `signal::Level::High`
         // with this, because the node's type already carries that identity and
@@ -2391,12 +2390,27 @@ impl TypeChecker {
             Expr::StaticField(s) => Some(s.class.as_str()),
             _ => None,
         };
-        if let Some(written) = written_class
-            && let Some(resolved) = self.resolve_static_call_class_quiet(written)
-            && resolved != written
-        {
-            self.static_call_classes.insert(expr.id(), resolved);
+        if let Some(written) = written_class {
+            if self.static_call_classes.contains_key(&expr.id()) {
+                return;
+            }
+            let resolved = self
+                .resolve_static_call_class_quiet(written)
+                .unwrap_or_else(|| written.to_owned());
+            self.static_call_classes.insert(
+                expr.id(),
+                crate::semantic::ids::TypeId::from_source_name(&resolved),
+            );
         }
+    }
+
+    pub(super) fn record_checked_expr(&mut self, expr: &Expr, ty: Type, generation: usize) -> Type {
+        let ty = if ty == Type::Void && self.error_generation != generation {
+            Self::error_type()
+        } else {
+            ty
+        };
+        self.record_static_target(expr);
         // Record the authoritative expression type for downstream consumers
         // (HIR lowering, willow-mb5): keyed by node ID, so a pass that rebuilds
         // or duplicates syntax cannot inherit another node's entry the way two
@@ -2476,12 +2490,10 @@ impl TypeChecker {
                 self.static_method_effect_id(&call.class, &call.method)
                     .unwrap_or_else(|| {
                         FunctionId::method(
-                            TypeId::from_source_name(
-                                self.static_call_classes
-                                    .get(&call.id)
-                                    .map(String::as_str)
-                                    .unwrap_or(&call.class),
-                            ),
+                            self.static_call_classes
+                                .get(&call.id)
+                                .copied()
+                                .unwrap_or_else(|| TypeId::from_source_name(&call.class)),
                             &call.method,
                         )
                     }),
@@ -2546,10 +2558,10 @@ impl TypeChecker {
             let class = self
                 .static_call_classes
                 .get(&call.id)
-                .map(String::as_str)
-                .unwrap_or(&call.class);
+                .map(ToString::to_string)
+                .unwrap_or_else(|| call.class.clone());
             self.imported_std_modules
-                .get(class)
+                .get(&class)
                 .filter(|module| {
                     // Inspect the borrowed schema, without rebuilding builtin
                     // parameter types at every call site.

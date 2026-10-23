@@ -6800,7 +6800,7 @@ mod prune_and_corpus_tests {
             let mut checker = crate::semantic::TypeChecker::new();
             crate::register_prelude(&mut checker).expect("prelude registers");
             checker.check_program(&program);
-            let tables = super::super::lower::CheckerTables::from_checker(&checker);
+            let tables = super::super::lower::SemanticFacts::from_checker(&checker);
             let (hir, diags) = super::super::lower::lower_program_with(&program, &tables);
             let _ = lower_source_program(&hir); // must not panic
             if diags.is_empty() {
