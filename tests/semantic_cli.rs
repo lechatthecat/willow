@@ -622,6 +622,37 @@ fn effects_human_decodes_masks_and_retains_source_evidence() {
 }
 
 #[test]
+fn power_effects_follow_lowered_guards_and_cite_the_integer_power() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "fn big() -> f64 { return 2.0 ** 1100.0; }\n\
+         fn neg(x: f64) -> f64 { return x ** 0.5; }\n\
+         fn gen<T>(t: T, x: f64) -> f64 { return x ** 2.0; }\n\
+         fn ivar(x: i64, e: i64) -> i64 { return x ** e; }\n\
+         fn ilit(x: i64) -> i64 { return x ** 3; }\n\
+         fn main() { println(big()); println(gen(1, 3.0)); }\n",
+    )
+    .unwrap();
+    for name in ["big", "neg", "gen"] {
+        let value = f.json(&["effects", &format!("main::{name}")], 0);
+        assert_eq!(value["result"]["runtime_effects"], 0, "{name}: {value}");
+        let text = String::from_utf8(f.run(&["effects", &format!("main::{name}")]).stdout).unwrap();
+        assert!(text.contains("Runtime effects: none"), "{name}: {text}");
+        assert!(!text.contains("panic-guard"), "{name}: {text}");
+    }
+    // Debug analysis: the dynamic exponent's sign guard and the literal
+    // exponent's checked multiplications both cite the `**` expression.
+    for (name, at) in [("ivar", "src/main.wi:4:43"), ("ilit", "src/main.wi:5:35")] {
+        let value = f.json(&["effects", &format!("main::{name}")], 0);
+        assert_eq!(value["result"]["runtime_effects"], 32, "{name}: {value}");
+        let text = String::from_utf8(f.run(&["effects", &format!("main::{name}")]).stdout).unwrap();
+        assert!(text.contains("operation=panic-guard"), "{name}: {text}");
+        assert!(text.contains(&format!("at {at}")), "{name}: {text}");
+    }
+}
+
+#[test]
 fn imported_interface_effects_use_completed_implementation_summaries() {
     use willow_compiler::semantic::effects::RuntimeEffects;
     for (body, waiting) in [

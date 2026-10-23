@@ -1374,3 +1374,69 @@ fn array_literal_allocation_example_preserves_roots_and_active_panic() {
         assert_eq!(out, expected, "{stress}");
     }
 }
+
+/// willow-25da.29.66: `f64 **` lowers to a guard-free float power, while
+/// `i64 **` keeps the runtime negative-exponent guard and, for a literal
+/// exponent, only the debug multiplication overflow checks.
+#[test]
+fn pe_power_classification_follows_operand_type_and_exponent_shape() {
+    let source = r#"
+fn fbig() -> f64 { return 2.0 ** 1100.0; }
+fn fvar(x: f64, y: f64) -> f64 { return x ** y; }
+fn ivar(x: i64, e: i64) -> i64 { return x ** e; }
+fn ilit(x: i64) -> i64 { return x ** 3; }
+fn ione(x: i64) -> i64 { return x ** 1; }
+fn izero(x: i64) -> i64 { return x ** 0; }
+fn gf<T>(t: T, x: f64) -> f64 { return x ** 2.0; }
+fn gi<T>(t: T, x: i64, e: i64) -> i64 { return x ** e; }
+fn cf(x: f64) -> closure(f64) -> f64 { return |y: f64| -> f64 { return y ** x; }; }
+fn ci(x: i64) -> closure(i64) -> i64 { return |y: i64| -> i64 { return y ** x; }; }
+fn main() {
+    println(fbig()); println(fvar(-4.0, 0.5)); println(ivar(2, 3)); println(ilit(2));
+    println(ione(2)); println(izero(2)); println(gf(1, 3.0)); println(gi("a", 2, 3));
+    let f = cf(0.5); let g = ci(3); println(f(-4.0)); println(g(2));
+}
+"#;
+    let env = [("WILLOW_PANIC_EFFECTS_LOG", "1")];
+    for release in [false, true] {
+        let (ok, stderr) = if release {
+            compile_release_with_compiler_env(source, &env)
+        } else {
+            compile_with_compiler_env(source, &env)
+        };
+        assert!(ok, "{stderr}");
+        let fact = |name: &str| {
+            stderr
+                .lines()
+                .find_map(|line| {
+                    let rest = line.strip_prefix("[panic-effects] ")?;
+                    let (function, fact) = rest.split_once(": ")?;
+                    (function == name
+                        || function
+                            .strip_prefix(name)
+                            .is_some_and(|tail| tail.starts_with("$mono$")))
+                    .then(|| fact.to_string())
+                })
+                .unwrap_or_else(|| panic!("no fact for {name}: {stderr}"))
+        };
+        for (function, panics) in [
+            ("fbig", false),
+            ("fvar", false),
+            ("gf", false),
+            ("$lambda.0", false),
+            ("ivar", true),
+            ("gi", true),
+            ("$lambda.1", true),
+            // Literal exponents only multiply, which release wraps.
+            ("ilit", !release),
+            ("ione", false),
+            ("izero", false),
+        ] {
+            let expected = if panics { "may-panic" } else { "no-panic" };
+            assert_eq!(fact(function), expected, "{function} release={release}");
+        }
+    }
+    let (stdout, ok) = compile_and_run_release(source);
+    assert!(ok, "{stdout}");
+    assert_eq!(stdout, "Infinity\nNaN\n8\n8\n2\n1\n9\n8\nNaN\n8\n");
+}

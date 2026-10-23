@@ -1435,13 +1435,26 @@ impl<N> HazardVisitor<'_, N> {
                 let guarded_division = matches!(expr.op, BinOp::Div | BinOp::Rem)
                     && !matches!(ty, Some(Type::F64))
                     && !matches!(expr.rhs, Expr::Integer(divisor, ..) if divisor != 0 && divisor != -1);
+                // `f64 **` lowers to a plain float power with no guard. Integer
+                // `**` guards a runtime exponent's sign; a literal exponent
+                // unrolls into a multiplication chain, which only debug builds
+                // check, and `0`/`1` multiply nothing (see `emit_pow`).
+                let float_pow = matches!(ty, Some(Type::F64));
+                let pow_literal = match expr.rhs {
+                    Expr::Integer(exponent, ..) if exponent >= 0 => Some(exponent),
+                    _ => None,
+                };
+                let guarded_pow = expr.op == BinOp::Pow && !float_pow && pow_literal.is_none();
                 // Debug builds check integer `+ - *` for overflow and a shift
                 // amount outside `0..64` unless it is an in-range literal.
                 let checked = matches!(expr.op, BinOp::Add | BinOp::Sub | BinOp::Mul)
                     && !matches!(ty, Some(Type::F64))
                     || matches!(expr.op, BinOp::Shl | BinOp::Shr)
-                        && !matches!(expr.rhs, Expr::Integer(amount, ..) if (0..64).contains(&amount));
-                if concat || guarded_division || expr.op == BinOp::Pow {
+                        && !matches!(expr.rhs, Expr::Integer(amount, ..) if (0..64).contains(&amount))
+                    || expr.op == BinOp::Pow
+                        && !float_pow
+                        && pow_literal.is_some_and(|exponent| exponent >= 2);
+                if concat || guarded_division || guarded_pow {
                     self.mark_direct(expression.span());
                 } else if checked {
                     self.mark_checked(expression.span());
@@ -1782,6 +1795,11 @@ mod tests {
             ("return a >> 0;", false),
             ("return a & 3 | a ^ 5;", false),
             ("return !a;", false),
+            // A literal exponent unrolls into checked multiplications; `0` and
+            // `1` multiply nothing.
+            ("return a ** 3;", true),
+            ("return a ** 1;", false),
+            ("return a ** 0;", false),
         ] {
             let program = program(&format!("fn f(a: i64) -> i64 {{ {body} }}"));
             let Item::Function(function) = &program.items[0] else {
@@ -1809,6 +1827,57 @@ mod tests {
                     "{body} overflow_checks={overflow_checks}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn runtime_integer_exponent_keeps_its_sign_guard_in_every_mode() {
+        for body in ["return a ** a;", "return a ** (1 + 2);", "return 2 ** a;"] {
+            let program = program(&format!("fn f(a: i64) -> i64 {{ {body} }}"));
+            let Item::Function(function) = &program.items[0] else {
+                unreachable!()
+            };
+            for overflow_checks in [true, false] {
+                let mut hazards = HazardVisitor {
+                    panics: false,
+                    checked_panics: false,
+                    checked_span: None,
+                    panic_span: None,
+                    expr_types: &HashMap::<ExprId, Type<TypeId>>::new(),
+                    overflow_checks,
+                };
+                hazards.visit_block(&function.body);
+                assert!(hazards.panics, "{body} overflow_checks={overflow_checks}");
+            }
+        }
+    }
+
+    #[test]
+    fn float_exponent_has_no_guard_but_untyped_power_stays_conservative() {
+        let program = program("fn f(a: f64) -> f64 { return a ** 0.5; }");
+        let Item::Function(function) = &program.items[0] else {
+            unreachable!()
+        };
+        let Stmt::Return(ret) = &function.body.stmts[0] else {
+            unreachable!()
+        };
+        let power = ret.value.as_ref().unwrap().id();
+        for (types, panics) in [
+            (HashMap::new(), true),
+            (HashMap::from([(power, Type::<TypeId>::F64)]), false),
+            (HashMap::from([(power, Type::<TypeId>::I64)]), true),
+        ] {
+            let mut hazards = HazardVisitor {
+                panics: false,
+                checked_panics: false,
+                checked_span: None,
+                panic_span: None,
+                expr_types: &types,
+                overflow_checks: true,
+            };
+            hazards.visit_block(&function.body);
+            assert_eq!(hazards.panics, panics, "{types:?}");
+            assert!(!hazards.checked_panics);
         }
     }
 
