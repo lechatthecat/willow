@@ -33,7 +33,8 @@ error_codes! {
     E0051,
     E0052, // integer literal out of range for i64
     E0053, // unterminated block comment
-    E0054, // malformed numeric literal (bad digit, prefix or `_`)
+    E0054, // malformed numeric literal (bad digit, prefix, `_` or exponent)
+    E0055, // float literal out of range for f64
     // Parser E010x
     E0101,
     E0102,

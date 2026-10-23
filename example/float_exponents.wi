@@ -1,0 +1,26 @@
+// Float literals in scientific notation (willow-jz15.121).
+// A decimal literal with an exponent is an `f64`, even without a point.
+
+const AVOGADRO: f64 = 6.022_140_76e23;
+const TOLERANCE: f64 = 1.0e-9;
+
+fn close_enough(a: f64, b: f64) -> bool {
+    let diff = a - b;
+    return diff < TOLERANCE && -diff < TOLERANCE;
+}
+
+fn main() {
+    let kilo = 1e3;
+    let milli = 1E-3;
+    println(kilo * milli);
+    println(AVOGADRO / 1e23);
+    println(close_enough(0.1 + 0.2, 3e-1));
+    println(2.5e+2);
+    // The literal and `f64::parse` agree bit for bit, even for subnormals.
+    let tiny = 5e-324;
+    let parsed = match f64::parse("5e-324") {
+        Ok(v) => v,
+        Err(_) => 0.0,
+    };
+    println(tiny == parsed && tiny > 0.0);
+}

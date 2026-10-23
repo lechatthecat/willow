@@ -128,3 +128,77 @@ fn lexer_diag_hex_sign_bit_e0052() {
         ],
     );
 }
+
+// ── Float exponents (willow-jz15.121) ────────────────────────────────────────
+
+// End-to-end: exponent literals reach `let`, `const`, call arguments and
+// arithmetic, are `f64`, and equal the runtime `f64::parse` of their text.
+#[test]
+fn lexer_float_exponent_literals_compile_and_run() {
+    let (out, ok) = compile_and_run(
+        r#"
+const EPS: f64 = 1.0e-3;
+
+fn half(x: f64) -> f64 {
+    return x / 2.0;
+}
+
+fn same(text: String, lit: f64) -> bool {
+    return match f64::parse(text) {
+        Ok(v) => v == lit,
+        Err(_) => false,
+    };
+}
+
+fn main() {
+    let a = 1e3;
+    let b: f64 = 2.5E-4;
+    println(a);
+    println(b * 1e4);
+    println(half(1.0e-3) == 5e-4);
+    println(EPS + 2.0e+0);
+    println(1_000e-3);
+    println(same("1.5e-3", 1.5e-3));
+    println(same("5e-324", 5e-324));
+    println(same("1.7976931348623157e308", 1.7976931348623157e308));
+    println(1e3 - 1.0);
+}
+"#,
+    );
+    assert!(ok, "exponent literals should compile: {out}");
+    assert_eq!(out, "1000\n2.5\ntrue\n2.001\n1\ntrue\ntrue\ntrue\n999\n");
+}
+
+// End-to-end: a missing exponent is a dedicated E0054, not E0101.
+#[test]
+fn lexer_diag_float_missing_exponent_e0054() {
+    assert_compile_error_contains(
+        "fn main() { let a = 1e; println(a); }\n",
+        &["error[E0054]", "float literal `1e` has no exponent digits"],
+    );
+}
+
+// End-to-end: inside a call, `1.e3` is a dedicated E0054, not E0104.
+#[test]
+fn lexer_diag_float_missing_fraction_e0054() {
+    assert_compile_error_contains(
+        "fn f(x: f64) -> f64 { return x; }\nfn main() { println(f(1.e3)); }\n",
+        &[
+            "error[E0054]",
+            "float literal `1.e3` has no digits after `.`",
+            "write `1.0e3`",
+        ],
+    );
+}
+
+// End-to-end: a literal that rounds to infinity is E0055.
+#[test]
+fn lexer_diag_float_overflow_e0055() {
+    assert_compile_error_contains(
+        "fn main() { println(1e309); }\n",
+        &[
+            "error[E0055]",
+            "float literal `1e309` out of range for `f64`",
+        ],
+    );
+}

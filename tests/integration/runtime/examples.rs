@@ -325,6 +325,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "0\n0\n0\n0\ntrue\n-0\n-0\n-0\n-0\ntrue\n2\n2\n2\n2\ntrue\n-2\n-2\n-2\n-2\ntrue\n1\n1\n1\n1\ntrue\n1.25\n1.25\n1.25\n1.25\ntrue\n-Infinity\n",
         ),
         ("example/floats.wi", "4\ntrue\n-4\n"),
+        (
+            "example/float_exponents.wi",
+            "1\n6.02214076\ntrue\n250\ntrue\n",
+        ),
         ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
         ("example/lambda_shadowing.wi", "101\n201\n102\n"),
         ("example/for_loops.wi", "6\n1\n2\n3\n5050\n9\n"),
@@ -1367,6 +1371,18 @@ fn test_runnable_example_catalog_is_complete() {
 #[test]
 fn test_string_concat_fusion_example() {
     let path = "example/string_concat_fusion.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
+}
+
+#[test]
+fn test_float_exponents_example() {
+    let path = "example/float_exponents.wi";
     let (_, expected) = runnable_example_cases()
         .iter()
         .find(|(entry, _)| *entry == path)

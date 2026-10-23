@@ -61,6 +61,12 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
   ``integer overflow: `<<` shift amount outside 0..64``; `--release` masks it
   to the low six bits. Using `&` or `|` on `bool` is still error E0202, now
   with a hint to use `&&`/`||`. See `example/bitwise_operators.wi`.
+- **Float literals in scientific notation.** `1e3`, `1E3`, `1.5e-3` and
+  `2.0e+10` are `f64` literals, with `_` separators allowed in the mantissa
+  and exponent. A literal equals `f64::parse` of the same text bit for bit.
+  A literal that rounds to infinity (`1e309`) is the new error E0055;
+  `1e`, `1e+` and `1.e3` are E0054 instead of parser errors. See
+  `example/float_exponents.wi`.
 
 ### Fixed
 

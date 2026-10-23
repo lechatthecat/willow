@@ -348,6 +348,9 @@ impl<'a> Lexer<'a> {
     ///   accept separators too.
     /// - An integer literal must fit `i64` whatever its radix, so
     ///   `0xFFFF_FFFF_FFFF_FFFF` is out of range rather than `-1` (as in Rust).
+    /// - A decimal literal with a fraction or an exponent (`1e3`, `2.5E-4`) is
+    ///   an `f64` (willow-jz15.121). Its value is the runtime `f64::parse` of
+    ///   the text without separators; a value that rounds to infinity is E0055.
     fn lex_number(&mut self) -> Result<TokenKind, Diagnostic> {
         let start = self.pos;
         let line = self.line;
@@ -364,16 +367,43 @@ impl<'a> Lexer<'a> {
             }
         }
         self.skip_decimal_digits();
-        // check for decimal point
+        let mut is_float = false;
         if self.pos + 1 < self.bytes.len()
             && self.bytes[self.pos] == b'.'
             && self.bytes[self.pos + 1].is_ascii_digit()
         {
             self.advance(); // consume '.'
             self.skip_decimal_digits();
+            is_float = true;
+        } else if self.bytes.get(self.pos) == Some(&b'.') && self.starts_exponent(self.pos + 1) {
+            // `1.e3`: a point needs fractional digits. Rejecting it here keeps
+            // the literal from lexing as a field access `1 . e3`.
+            self.advance(); // consume '.'
+            self.skip_exponent();
             let s = &self.src[start..self.pos];
-            // Only the separator rules apply; a float half may exceed `i64`.
-            for part in s.split('.') {
+            return Err(self.err_float_literal(FloatError::MissingFraction, s, start, line, col));
+        }
+        let exponent_at = self.pos;
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            if !self.skip_exponent() {
+                let s = &self.src[start..self.pos];
+                return Err(self.err_float_literal(
+                    FloatError::NoExponentDigits,
+                    s,
+                    start,
+                    line,
+                    col,
+                ));
+            }
+            is_float = true;
+        }
+        if is_float {
+            let s = &self.src[start..self.pos];
+            // Only the separator rules apply; a mantissa or exponent may exceed
+            // `i64`. The sign and `e` sit outside every checked digit run.
+            let (mantissa, exponent) = s.split_at(exponent_at - start);
+            let exponent = exponent.get(1..).map(|e| e.trim_start_matches(['+', '-']));
+            for part in mantissa.split('.').chain(exponent) {
                 match scan_digits(part.as_bytes(), 10) {
                     Ok(_) | Err(NumberError::OutOfRange) => {}
                     Err(err) => {
@@ -381,12 +411,19 @@ impl<'a> Lexer<'a> {
                     }
                 }
             }
+            // The text is now valid Rust float syntax once separators are
+            // removed, so this is the exact parse `f64::parse` performs at
+            // runtime: correctly rounded, subnormals and underflow to zero
+            // included. Only overflow to infinity is rejected.
             let f: f64 = if s.contains('_') {
                 s.replace('_', "").parse()
             } else {
                 s.parse()
             }
-            .unwrap_or(0.0);
+            .expect("validated float literal is valid `f64` syntax");
+            if f.is_infinite() {
+                return Err(self.err_float_literal(FloatError::OutOfRange, s, start, line, col));
+            }
             return Ok(TokenKind::Float(f));
         }
         let s = &self.src[start..self.pos];
@@ -404,6 +441,33 @@ impl<'a> Lexer<'a> {
         {
             self.advance();
         }
+    }
+
+    /// Whether an exponent (`e`/`E`, an optional sign, then a digit) starts
+    /// at `at`.
+    fn starts_exponent(&self, at: usize) -> bool {
+        if !matches!(self.bytes.get(at), Some(b'e' | b'E')) {
+            return false;
+        }
+        let digit_at = match self.bytes.get(at + 1) {
+            Some(b'+' | b'-') => at + 2,
+            _ => at + 1,
+        };
+        self.bytes.get(digit_at).is_some_and(u8::is_ascii_digit)
+    }
+
+    /// Consumes `e`/`E`, an optional sign and the exponent digits (with
+    /// separators). Returns whether the exponent has at least one digit.
+    fn skip_exponent(&mut self) -> bool {
+        self.advance(); // 'e' / 'E'
+        if matches!(self.peek(), Some(b'+' | b'-')) {
+            self.advance();
+        }
+        let digits_at = self.pos;
+        self.skip_decimal_digits();
+        self.bytes[digits_at..self.pos]
+            .iter()
+            .any(u8::is_ascii_digit)
     }
 
     /// Lexes `0x…`/`0o…`/`0b…`. The body takes every following identifier
@@ -533,6 +597,45 @@ impl<'a> Lexer<'a> {
             )
             .with_label(Label::primary(span, "radix prefix must be lowercase"))
             .with_help(format!("write `{prefix}`")),
+        }
+    }
+
+    fn err_float_literal(
+        &self,
+        err: FloatError,
+        lit: &str,
+        start: usize,
+        line: usize,
+        col: usize,
+    ) -> Diagnostic {
+        let span = self.span_at(start, self.pos, line, col);
+        match err {
+            FloatError::NoExponentDigits => Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0054,
+                format!("float literal `{lit}` has no exponent digits"),
+            )
+            .with_label(Label::primary(span, "expected digits after the exponent"))
+            .with_help(
+                "an exponent is `e` or `E`, an optional `+` or `-`, then digits: `1e3`, `2.5e-4`",
+            ),
+            FloatError::MissingFraction => {
+                let fixed = lit.replacen('.', ".0", 1);
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0054,
+                    format!("float literal `{lit}` has no digits after `.`"),
+                )
+                .with_label(Label::primary(span, "expected digits after the point"))
+                .with_help(format!("write `{fixed}`"))
+            }
+            FloatError::OutOfRange => Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0055,
+                format!("float literal `{lit}` out of range for `f64`"),
+            )
+            .with_label(Label::primary(span, "value rounds to infinity"))
+            .with_help(format!("the largest finite `f64` is {:e}", f64::MAX)),
         }
     }
 
@@ -701,6 +804,17 @@ impl<'a> Lexer<'a> {
     fn span_at(&self, start: usize, end: usize, line: usize, col: usize) -> Span {
         Span::in_file(self.file_id, start, end, line, col)
     }
+}
+
+/// Why a float literal is malformed beyond its digit runs (willow-jz15.121).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloatError {
+    /// `1e`, `1e+`, `1e_`: an exponent marker without digits.
+    NoExponentDigits,
+    /// `1.e3`: a point followed directly by an exponent.
+    MissingFraction,
+    /// The value rounds to infinity (`1e309`).
+    OutOfRange,
 }
 
 /// Why a digit sequence is not a valid `i64` literal.
@@ -1483,5 +1597,226 @@ mod tests {
     fn radix_22_zero_forms_unchanged() {
         assert_eq!(ints("0 01 0"), vec![0, 1, 0]);
         assert_eq!(kinds("0.5").unwrap(), vec![TokenKind::Float(0.5)]);
+    }
+
+    // ── Float exponents (willow-jz15.121) ───────────────────────────────────
+
+    fn floats(src: &str) -> Vec<f64> {
+        kinds(src)
+            .unwrap()
+            .into_iter()
+            .map(|k| match k {
+                TokenKind::Float(f) => f,
+                other => panic!("expected a float, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The literal's bits must equal the runtime `f64::parse` of its text.
+    fn assert_parse_identical(src: &str) {
+        let expected: f64 = src.replace('_', "").parse().unwrap();
+        let got = floats(src);
+        assert_eq!(got.len(), 1, "{src}");
+        assert_eq!(got[0].to_bits(), expected.to_bits(), "{src}");
+    }
+
+    // Exponent 1: an integer mantissa with an exponent is an `f64`.
+    #[test]
+    fn exponent_01_integer_mantissa_is_float() {
+        assert_eq!(kinds("1e3").unwrap(), vec![TokenKind::Float(1000.0)]);
+    }
+
+    // Exponent 2: `E` is accepted like `e`.
+    #[test]
+    fn exponent_02_uppercase_marker() {
+        assert_eq!(floats("1E3 2.5E2"), vec![1000.0, 250.0]);
+    }
+
+    // Exponent 3: a negative exponent after a fraction.
+    #[test]
+    fn exponent_03_negative_exponent() {
+        assert_eq!(floats("1.5e-3"), vec![0.0015]);
+    }
+
+    // Exponent 4: an explicit `+` sign.
+    #[test]
+    fn exponent_04_plus_sign() {
+        assert_eq!(floats("2.0e+10"), vec![2.0e10]);
+    }
+
+    // Exponent 5: separators in mantissa and exponent follow the digit rules.
+    #[test]
+    fn exponent_05_separators() {
+        assert_eq!(floats("1_000e1_0 1.000_5e-0_1"), vec![1e13, 0.10005]);
+    }
+
+    // Exponent 6: values are bit-identical to `f64::parse`, including
+    // correctly rounded, many-digit and leading-zero forms.
+    #[test]
+    fn exponent_06_bit_identical_to_parse() {
+        for src in [
+            "1e3",
+            "0.1e1",
+            "1.7976931348623157e308",
+            "2.2250738585072014e-308",
+            "123456789012345678901234567890e-10",
+            "1e0",
+            "1e-0",
+            "0e999",
+            "00012.5e002",
+            "9007199254740993e0",
+            "1.000_000_000_000_000_1e0",
+        ] {
+            assert_parse_identical(src);
+        }
+    }
+
+    // Exponent 7: subnormals keep their exact bits.
+    #[test]
+    fn exponent_07_subnormal() {
+        assert_parse_identical("5e-324");
+        assert_parse_identical("2.225e-308");
+        assert_eq!(floats("5e-324")[0].to_bits(), 1);
+    }
+
+    // Exponent 8: a value below the smallest subnormal rounds to zero, as
+    // `f64::parse` does.
+    #[test]
+    fn exponent_08_underflow_is_zero() {
+        assert_eq!(floats("1e-400")[0].to_bits(), 0.0f64.to_bits());
+        assert_parse_identical("1e-99999999999999999999");
+    }
+
+    // Exponent 9: overflow to infinity is E0055, not a silent `inf`.
+    #[test]
+    fn exponent_09_overflow_is_e0055() {
+        for src in ["1e309", "1.8e308", "1e99999999999999999999"] {
+            let d = first_error(src);
+            assert_eq!(d.code, ErrorCode::E0055, "{src}");
+            assert!(d.message.contains("out of range for `f64`"), "{src}");
+            assert!(d.helps.iter().any(|h| h.contains("1.7976931348623157e308")));
+        }
+    }
+
+    // Exponent 10: the largest finite value is accepted.
+    #[test]
+    fn exponent_10_max_finite_accepted() {
+        assert_eq!(floats("1.7976931348623157e308"), vec![f64::MAX]);
+    }
+
+    // Exponent 11: a long decimal float that rounds to infinity is E0055 too.
+    #[test]
+    fn exponent_11_long_decimal_overflow() {
+        let src = format!("1{}.0", "0".repeat(400));
+        assert_eq!(first_error(&src).code, ErrorCode::E0055);
+    }
+
+    // Exponent 12: a marker without digits is a dedicated E0054.
+    #[test]
+    fn exponent_12_missing_digits() {
+        for src in ["1e", "1e+", "1E-", "1.5e", "1e_", "1ex"] {
+            let d = first_error(src);
+            assert_eq!(d.code, ErrorCode::E0054, "{src}");
+            assert!(d.message.contains("has no exponent digits"), "{src}");
+        }
+    }
+
+    // Exponent 13: `1.e3` is rejected with a `1.0e3` suggestion.
+    #[test]
+    fn exponent_13_missing_fraction() {
+        for (src, fixed) in [("1.e3", "1.0e3"), ("2.E-4", "2.0E-4"), ("7.e+1", "7.0e+1")] {
+            let d = first_error(src);
+            assert_eq!(d.code, ErrorCode::E0054, "{src}");
+            assert!(d.message.contains("no digits after `.`"), "{src}");
+            assert!(d.helps.iter().any(|h| h.contains(fixed)), "{src}");
+        }
+    }
+
+    // Exponent 14: misplaced separators around the exponent are E0054.
+    #[test]
+    fn exponent_14_misplaced_separators() {
+        for src in ["1_e3", "1e_3", "1e3_", "1.5_e3", "1e+_3", "1e3__0"] {
+            let d = first_error(src);
+            assert_eq!(d.code, ErrorCode::E0054, "{src}");
+            assert!(d.message.contains("misplaced `_`"), "{src}");
+        }
+    }
+
+    // Exponent 15: the diagnostic span covers the whole literal.
+    #[test]
+    fn exponent_15_error_span() {
+        let d = first_error("  1e+ ");
+        assert_eq!((d.labels[0].span.start, d.labels[0].span.end), (2, 5));
+        let toks = Lexer::new(" 2.5e-3;").tokenize().unwrap();
+        assert_eq!((toks[0].span.start, toks[0].span.end), (1, 7));
+    }
+
+    // Exponent 16: the literal stops at operators, so `1e3-1` is a subtraction.
+    #[test]
+    fn exponent_16_boundaries() {
+        assert_eq!(
+            kinds("1e3-1 2e2..3").unwrap(),
+            vec![
+                TokenKind::Float(1000.0),
+                TokenKind::Minus,
+                TokenKind::Integer(1),
+                TokenKind::Float(200.0),
+                TokenKind::DotDot,
+                TokenKind::Integer(3),
+            ]
+        );
+    }
+
+    // Exponent 17: hex digits `e`/`E` are not exponents.
+    #[test]
+    fn exponent_17_hex_unchanged() {
+        assert_eq!(ints("0x1e3 0xE"), vec![0x1e3, 14]);
+    }
+
+    // Exponent 18: a method call or range on an integer is not an exponent.
+    #[test]
+    fn exponent_18_dot_identifier_unchanged() {
+        assert_eq!(
+            kinds("1.exp 1.e").unwrap(),
+            vec![
+                TokenKind::Integer(1),
+                TokenKind::Dot,
+                TokenKind::Ident("exp".to_string()),
+                TokenKind::Integer(1),
+                TokenKind::Dot,
+                TokenKind::Ident("e".to_string()),
+            ]
+        );
+    }
+
+    // Exponent 19: a following identifier separated by space is unaffected.
+    #[test]
+    fn exponent_19_spaced_identifier() {
+        assert_eq!(
+            kinds("1 e3").unwrap(),
+            vec![TokenKind::Integer(1), TokenKind::Ident("e3".to_string())]
+        );
+    }
+
+    // Exponent 20: lexing recovers after malformed exponents.
+    #[test]
+    fn exponent_20_recovers_after_error() {
+        let errs = Lexer::new("1e + 1e400 + 1.e2 + 2e2")
+            .tokenize()
+            .unwrap_err();
+        let codes: Vec<_> = errs.iter().map(|d| d.code).collect();
+        assert_eq!(
+            codes,
+            vec![ErrorCode::E0054, ErrorCode::E0055, ErrorCode::E0054]
+        );
+    }
+
+    // Exponent 21: a zero mantissa stays zero whatever its exponent.
+    #[test]
+    fn exponent_21_zero_mantissa() {
+        assert_eq!(
+            floats("0e0 0.0e-5 0e99999999999999999999"),
+            vec![0.0, 0.0, 0.0]
+        );
     }
 }
