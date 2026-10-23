@@ -5509,7 +5509,7 @@ fn vjaf_08_release_pops_only_the_prefix_below_the_bound() {
     let frames = vjaf_retire(&mut s, 3);
     let tags: Vec<u64> = s.pending_frame_unroots.iter().map(|r| r.tag).collect();
     assert!(tags.windows(2).all(|pair| pair[0] < pair[1]));
-    assert_eq!(s.frame_roots, 3);
+    assert_eq!(s.metadata_snapshot().frame_roots, 3);
     assert!(s.take_quiescent_frame_unroots(tags[0]).is_empty());
     assert_eq!(
         s.take_quiescent_frame_unroots(tags[1])
@@ -5518,7 +5518,7 @@ fn vjaf_08_release_pops_only_the_prefix_below_the_bound() {
             .collect::<Vec<_>>(),
         frames[..1]
     );
-    assert_eq!(s.frame_roots, 2);
+    assert_eq!(s.metadata_snapshot().frame_roots, 2);
     assert_eq!(
         s.take_quiescent_frame_unroots(u64::MAX)
             .iter()
@@ -5526,7 +5526,7 @@ fn vjaf_08_release_pops_only_the_prefix_below_the_bound() {
             .collect::<Vec<_>>(),
         frames[1..]
     );
-    assert_eq!(s.frame_roots, 0);
+    assert_eq!(s.metadata_snapshot().frame_roots, 0);
     drop(s);
     reset_stress_fixture();
 }

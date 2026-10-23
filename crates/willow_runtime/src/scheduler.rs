@@ -1217,7 +1217,9 @@ fn set_wake_after_millis_in(tasks: &ShardedTaskTable, timers: &TimerQueue, milli
 
 #[derive(Debug)]
 pub struct RuntimeScheduler {
-    next_task_id: RuntimeTaskId,
+    /// Next never-reused task id, shared with [`SchedulerComponents`] so global
+    /// spawns reserve ids without `GLOBAL_SCHEDULER` (willow-9bvc).
+    next_task_id: Arc<AtomicU64>,
     tasks: Arc<ShardedTaskTable>,
     /// Per-worker local run queues + a shared global queue, with work stealing
     /// (willow-gyaa.4). New/woken tasks go to the global queue; an idle worker
@@ -1245,8 +1247,10 @@ pub struct RuntimeScheduler {
     /// unit)`.
     frame_release_scan_at: usize,
     /// Total frame roots currently owned by the scheduler: active task frames
-    /// plus terminal frames still inside their grace period.
-    frame_roots: usize,
+    /// plus terminal frames still inside their grace period. Atomic and shared
+    /// with [`SchedulerComponents`] because global spawns publish without
+    /// `GLOBAL_SCHEDULER` (willow-9bvc); retirement still decrements under it.
+    frame_roots: Arc<AtomicUsize>,
     /// Wake-deadlines, behind their own lock rather than this scheduler's
     /// metadata mutex (willow-9ha4). The run loop promotes expired timers once
     /// per iteration, so keeping them here cost one global-mutex acquisition
@@ -1269,40 +1273,30 @@ impl RuntimeScheduler {
     }
 
     fn with_run_queues(run_queues: Arc<RunQueues>) -> Self {
-        Self::with_components(
-            run_queues,
-            Arc::new(ShardedTaskTable::new()),
-            Arc::new(TimerQueue::new()),
-            Arc::new(AtomicBool::new(false)),
-        )
-    }
-
-    fn with_components(
-        run_queues: Arc<RunQueues>,
-        tasks: Arc<ShardedTaskTable>,
-        timers: Arc<TimerQueue>,
-        terminal_cleanups_pending: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            next_task_id: 1,
-            tasks,
-            run_queues,
-            timers,
-            pending_terminal_cleanups: Vec::new(),
-            terminal_cleanups_pending,
-            pending_frame_unroots: VecDeque::new(),
-            frame_release_scan_at: FRAME_RELEASE_MIN_BATCH,
-            frame_roots: 0,
-        }
+        Self::from_components(&SchedulerComponents::with_run_queues(run_queues))
     }
 
     fn from_components(components: &SchedulerComponents) -> Self {
-        Self::with_components(
-            Arc::clone(&components.run_queues),
-            Arc::clone(&components.tasks),
-            Arc::clone(&components.timers),
-            Arc::clone(&components.terminal_cleanups_pending),
-        )
+        Self {
+            next_task_id: Arc::clone(&components.next_task_id),
+            tasks: Arc::clone(&components.tasks),
+            run_queues: Arc::clone(&components.run_queues),
+            timers: Arc::clone(&components.timers),
+            pending_terminal_cleanups: Vec::new(),
+            terminal_cleanups_pending: Arc::clone(&components.terminal_cleanups_pending),
+            pending_frame_unroots: VecDeque::new(),
+            frame_release_scan_at: FRAME_RELEASE_MIN_BATCH,
+            frame_roots: Arc::clone(&components.frame_roots),
+        }
+    }
+
+    fn spawn_target(&self) -> SpawnTarget<'_> {
+        SpawnTarget {
+            next_task_id: &self.next_task_id,
+            tasks: &self.tasks,
+            run_queues: &self.run_queues,
+            frame_roots: &self.frame_roots,
+        }
     }
 
     /// Reconcile scheduler counters around one atomic task-state transition.
@@ -1645,10 +1639,13 @@ impl RuntimeScheduler {
             frames.push(*retired);
             self.pending_frame_unroots.pop_front();
         }
-        self.frame_roots = self
-            .frame_roots
-            .checked_sub(frames.len())
-            .expect("scheduler frame-root counter underflow");
+        if !frames.is_empty() {
+            self.frame_roots
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |roots| {
+                    roots.checked_sub(frames.len())
+                })
+                .expect("scheduler frame-root counter underflow");
+        }
         self.frame_release_scan_at =
             FRAME_RELEASE_MIN_BATCH.max(self.pending_frame_unroots.len() * 2);
         frames
@@ -1659,7 +1656,7 @@ impl RuntimeScheduler {
             heavy_tasks: self.tasks.len(),
             queue_entries: self.ready_total(),
             pending_cleanups: self.pending_terminal_cleanups.len(),
-            frame_roots: self.frame_roots,
+            frame_roots: self.frame_roots.load(Ordering::Relaxed),
             blocked_syscalls: self.blocked_syscall_count(),
         }
     }
@@ -1697,58 +1694,8 @@ impl RuntimeScheduler {
     }
 
     /// Reserve a never-reused task id without publishing a task record.
-    ///
-    /// Global native-task spawning deliberately releases `GLOBAL_SCHEDULER`
-    /// after this step, initializes frame/native state, then re-acquires the
-    /// lock only for [`Self::publish_reserved_task`]. An id gap after an
-    /// initializer panic is intentional: reusing it would create an ABA risk
-    /// for native registrations that observed the reserved id.
-    fn reserve_task_id(&mut self) -> RuntimeTaskId {
-        let id = self.next_task_id;
-        self.next_task_id = self
-            .next_task_id
-            .checked_add(1)
-            .expect("runtime task id exhausted");
-        id
-    }
-
-    /// Publish one fully initialized task. Queue insertion is the final step,
-    /// so no worker can claim the record before poll/cancel/frame fields exist.
-    fn publish_reserved_task(
-        &mut self,
-        id: RuntimeTaskId,
-        poll: RuntimePollFn,
-        frame: *mut c_void,
-        cancel: Option<RuntimeCancelFn>,
-        cooperative_poll: bool,
-    ) {
-        debug_assert!(
-            self.tasks.with(id, |_| ()).is_none(),
-            "reserved task id was already published"
-        );
-        let mut task = RuntimeTask::new(id);
-        task.poll = Some(poll);
-        task.cooperative_poll = cooperative_poll;
-        // Generated constructors run inside the caller's debug call frame.
-        // The later explicit setter can race the first poll on another worker,
-        // so install the location before the task table or queue can expose it.
-        if cooperative_poll && let Some((file, line)) = crate::stack_trace::current_call_site() {
-            task.set_spawn_site(file, line);
-        }
-        task.cancel = cancel;
-        task.frame = frame;
-        task.frame_rooted = !frame.is_null();
-        if task.frame_rooted {
-            self.frame_roots += 1;
-            crate::frame_lifetime::record(
-                crate::frame_lifetime::FrameEventKind::SchedulerRootAdded,
-                frame as usize,
-                crate::frame_reclaim::current_epoch(),
-                0,
-            );
-        }
-        self.tasks.insert(id, task);
-        self.enqueue_ready(id);
+    fn reserve_task_id(&self) -> RuntimeTaskId {
+        self.spawn_target().reserve_task_id()
     }
 
     pub fn spawn_placeholder(&mut self) -> RuntimeTaskId {
@@ -1797,9 +1744,10 @@ impl RuntimeScheduler {
         cancel: Option<RuntimeCancelFn>,
         initialize: impl FnOnce(RuntimeTaskId),
     ) -> RuntimeTaskId {
-        let id = self.reserve_task_id();
+        let target = self.spawn_target();
+        let id = target.reserve_task_id();
         initialize(id);
-        self.publish_reserved_task(id, poll, frame, cancel, false);
+        target.publish(id, poll, frame, cancel, false);
         id
     }
 
@@ -2082,20 +2030,110 @@ struct SchedulerComponents {
     tasks: Arc<ShardedTaskTable>,
     timers: Arc<TimerQueue>,
     terminal_cleanups_pending: Arc<AtomicBool>,
+    next_task_id: Arc<AtomicU64>,
+    frame_roots: Arc<AtomicUsize>,
 }
 
 impl SchedulerComponents {
     fn new(worker_count: usize) -> Self {
+        Self::with_run_queues(Arc::new(RunQueues::new(worker_count)))
+    }
+
+    /// Task ids start at 1 (id 0 is the `willow_sched_current_task()` "no
+    /// running task" sentinel).
+    fn with_run_queues(run_queues: Arc<RunQueues>) -> Self {
         Self {
-            run_queues: Arc::new(RunQueues::new(worker_count)),
+            run_queues,
             tasks: Arc::new(ShardedTaskTable::new()),
             timers: Arc::new(TimerQueue::new()),
             terminal_cleanups_pending: Arc::new(AtomicBool::new(false)),
+            next_task_id: Arc::new(AtomicU64::new(1)),
+            frame_roots: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn spawn_target(&self) -> SpawnTarget<'_> {
+        SpawnTarget {
+            next_task_id: &self.next_task_id,
+            tasks: &self.tasks,
+            run_queues: &self.run_queues,
+            frame_roots: &self.frame_roots,
         }
     }
 
     fn publish(self) -> *mut Self {
         Box::into_raw(Box::new(self))
+    }
+}
+
+/// The scheduler state a spawn touches. Every field is internally
+/// synchronized, so global spawns reserve and publish without
+/// `GLOBAL_SCHEDULER`; that lock serialized every spawning worker twice per
+/// spawn (willow-9bvc).
+struct SpawnTarget<'a> {
+    next_task_id: &'a AtomicU64,
+    tasks: &'a ShardedTaskTable,
+    run_queues: &'a RunQueues,
+    frame_roots: &'a AtomicUsize,
+}
+
+impl SpawnTarget<'_> {
+    /// Reserve a never-reused task id without publishing a task record.
+    ///
+    /// Global native-task spawning initializes frame/native state between this
+    /// step and [`Self::publish`]. An id gap after an initializer panic is
+    /// intentional: reusing it would create an ABA risk for native
+    /// registrations that observed the reserved id.
+    fn reserve_task_id(&self) -> RuntimeTaskId {
+        // `with_global` used to provide this guard (see `NoPreemptGuard`).
+        let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+        self.next_task_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("runtime task id exhausted")
+    }
+
+    /// Publish one fully initialized task. The record enters the table already
+    /// holding its queue slot and queue insertion is the final step, so no
+    /// worker can claim it before poll/cancel/frame fields exist and no waker
+    /// can enqueue it a second time.
+    fn publish(
+        &self,
+        id: RuntimeTaskId,
+        poll: RuntimePollFn,
+        frame: *mut c_void,
+        cancel: Option<RuntimeCancelFn>,
+        cooperative_poll: bool,
+    ) {
+        let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+        debug_assert!(
+            self.tasks.with(id, |_| ()).is_none(),
+            "reserved task id was already published"
+        );
+        let mut task = RuntimeTask::new(id);
+        task.poll = Some(poll);
+        task.cooperative_poll = cooperative_poll;
+        // Generated constructors run inside the caller's debug call frame.
+        // The later explicit setter can race the first poll on another worker,
+        // so install the location before the task table or queue can expose it.
+        if cooperative_poll && let Some((file, line)) = crate::stack_trace::current_call_site() {
+            task.set_spawn_site(file, line);
+        }
+        task.cancel = cancel;
+        task.frame = frame;
+        task.frame_rooted = !frame.is_null();
+        if task.frame_rooted {
+            self.frame_roots.fetch_add(1, Ordering::Relaxed);
+            crate::frame_lifetime::record(
+                crate::frame_lifetime::FrameEventKind::SchedulerRootAdded,
+                frame as usize,
+                crate::frame_reclaim::current_epoch(),
+                0,
+            );
+        }
+        let claimed = task.state.claim_queue_slot();
+        debug_assert!(claimed, "a fresh task must own its queue slot");
+        self.tasks.insert(id, task);
+        self.run_queues.push_spawned(id);
     }
 }
 
@@ -2535,14 +2573,16 @@ fn spawn_global_task_initialized_inner(
     // The caller holds `frame` unrooted once the task is published and may
     // finish on another worker (willow-vjaf).
     let _unit = crate::frame_reclaim::ExecutionUnit::enter();
-    // Reserve under the metadata lock, then initialize entirely outside it.
-    // The frame is rooted before the callback because native initialization may
-    // allocate or explicitly collect. A panic leaves an id gap but the guard
-    // rolls the unpublished runtime root back.
-    let id = with_global(RuntimeScheduler::reserve_task_id);
+    // Reserve and publish through the internally synchronized components;
+    // `GLOBAL_SCHEDULER` is not taken (willow-9bvc). The frame is rooted before
+    // the callback because native initialization may allocate or explicitly
+    // collect. A panic leaves an id gap but the guard rolls the unpublished
+    // runtime root back.
+    let target = global_components().spawn_target();
+    let id = target.reserve_task_id();
     let mut root = PendingSpawnRoot::new(frame as *mut u8);
     initialize(id);
-    with_global(|sched| sched.publish_reserved_task(id, poll, frame, cancel, cooperative_poll));
+    target.publish(id, poll, frame, cancel, cooperative_poll);
     root.publish();
     crate::observability::record(
         crate::observability::RuntimeEventKind::TaskSpawn,
