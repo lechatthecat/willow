@@ -1139,6 +1139,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/generic_lambda_inference.wi",
             "6\n102\nneg\n210\ntrue\n",
         ),
+        ("example/generic_lambda_generic_callers.wi", "3\n2\n2\n6\n"),
         ("example/user_generics.wi", "42\nhello\n7\nwillow\n20\n"),
         (
             "example/module_tuple_calls/main.wi",

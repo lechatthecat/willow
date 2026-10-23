@@ -1,0 +1,45 @@
+// A generic function may call another generic function with an unannotated
+// lambda. The lambda's parameter types come from the caller's own type
+// parameters, even where those reuse the callee's names (`T` below).
+import std::collections::Array;
+
+pub fn fold<T, A>(xs: Array<T>, init: A, f: closure(A, T) -> A) -> A {
+    let mut acc = init;
+    for x in xs {
+        acc = f(acc, x);
+    }
+    return acc;
+}
+
+pub fn map<T, U>(xs: Array<T>, f: closure(T) -> U) -> Array<U> {
+    let out: Array<U> = [];
+    for x in xs {
+        out.push(f(x));
+    }
+    return out;
+}
+
+pub fn count_where<T>(xs: Array<T>, pred: closure(T) -> bool) -> i64 {
+    return fold(xs, 0, |n, x| if pred(x) { n + 1 } else { n });
+}
+
+// Crossed names: the callee's `T` is this function's `U` and vice versa.
+pub fn remap<U, T>(xs: Array<U>, f: closure(U) -> T) -> Array<T> {
+    return map(xs, |x| f(x));
+}
+
+class Bag<T> {
+    pub items: Array<T>;
+    pub fn total(self, weight: closure(T) -> i64) -> i64 {
+        return fold(self.items, 0, |sum, x| sum + weight(x));
+    }
+}
+
+fn main() {
+    println(count_where([1, 2, 3, 4, 5], |v| v > 2));
+    println(count_where(["a", "bb", "a"], |s| s == "a"));
+    let flags = remap([1, -1, 2], |v| v > 0);
+    println(count_where(flags, |b| b));
+    let bag = new Bag<String>(["x", "yy", "zzz"]);
+    println(bag.total(|s| s.len()));
+}

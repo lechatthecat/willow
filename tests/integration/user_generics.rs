@@ -1176,6 +1176,14 @@ fn generic_lambda_inference_example_runs() {
 }
 
 #[test]
+fn generic_lambda_generic_callers_example_runs() {
+    runs(
+        include_str!("../../example/generic_lambda_generic_callers.wi"),
+        "3\n2\n2\n6\n",
+    );
+}
+
+#[test]
 fn imported_generic_function_types_lambda_arguments() {
     custom_module_runs(
         "import std::collections::Array; pub class Cell<T> { pub value: T; } pub fn map<T, U>(xs: Array<T>, f: fn(T) -> U) -> Array<U> { let out: Array<U> = []; for x in xs { out.push(f(x)); } return out; } pub fn apply<T, U>(c: Cell<T>, f: closure(T) -> U) -> U { return f(c.value); }",

@@ -338,6 +338,40 @@ mod template_registry_tests {
         }
     }
     #[test]
+    fn generic_caller_chains_check_each_generic_call_once() {
+        // Every link is a generic function that calls `fold` and the previous
+        // link with unannotated lambdas typed from its own `T` (willow-jz15.97).
+        for depth in [1, 4, 16, 64] {
+            let mut source = "import std::collections::Array; fn fold<T, A>(xs: Array<T>, init: A, f: closure(A, T) -> A) -> A { let mut acc = init; for x in xs { acc = f(acc, x); } return acc; }".to_string();
+            for link in 0..depth {
+                let previous = if link == 0 {
+                    "0".to_string()
+                } else {
+                    format!("c{}(xs, |y| p(y))", link - 1)
+                };
+                source.push_str(&format!(
+                    " fn c{link}<T>(xs: Array<T>, p: closure(T) -> bool) -> i64 {{ return fold(xs, 0, |n, x| if p(x) {{ n + 1 }} else {{ n }}) + {previous}; }}"
+                ));
+            }
+            source.push_str(&format!(
+                " fn main() {{ println(c{}([1, 2], |v| v > 1)); }}",
+                depth - 1
+            ));
+            let mut checker = TypeChecker::new();
+            GENERIC_CALL_CHECKS.with(|count| count.set(0));
+            checker.check_program(&parse(&source));
+            assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+            let visits = GENERIC_CALL_CHECKS.with(|count| count.get());
+            // `fold` in every link, the previous link in all but the first,
+            // and the call in `main`.
+            assert_eq!(visits, 2 * depth);
+            println!(
+                "WILLOW_GENERIC_AUDIT {}",
+                serde_json::json!({"case":"generic_caller_chain", "depth":depth, "generic_call_checks":visits})
+            );
+        }
+    }
+    #[test]
     fn nested_reference_inference_checks_each_generic_call_once() {
         for depth in [1, 4, 8, 16] {
             let mut expression = "0".to_string();
@@ -1337,8 +1371,11 @@ impl TypeChecker {
             .map(|ty| {
                 let substituted = fully_explicit
                     .then(|| ty.substitute_names(|name| explicit_bindings.get(name).cloned()));
+                // The test runs on the formal: an explicit argument may spell
+                // the caller's own parameter under a callee parameter's name
+                // (willow-jz15.97).
                 let expected = substituted.as_ref().unwrap_or(ty);
-                (!uses_parameters(expected, &parameter_names))
+                (fully_explicit || !uses_parameters(ty, &parameter_names))
                     .then(|| self.normalize_type(expected, span))
             })
             .collect();
@@ -1482,8 +1519,21 @@ impl TypeChecker {
             // argument means it never will be bound: it is then the recovery
             // marker, so the body is checked without a derived E1001.
             let unbound = poisoned.then(Self::error_type);
+            // Knownness is decided on the FORMAL: a binding may itself spell
+            // the caller's own type parameter, whose name can coincide with
+            // one of the callee's (`fold` called from `count_where<T>` binds
+            // the callee's `T` to the caller's `T`), so the substituted type
+            // says nothing about which callee parameters are still unbound
+            // (willow-jz15.97).
             let known = |ty: &Type| {
-                let ty = ty.substitute_names(|name| {
+                if mentions(ty, |name| {
+                    parameter_names.contains(name)
+                        && unbound.is_none()
+                        && inference.binding(name).is_none()
+                }) {
+                    return None;
+                }
+                Some(ty.substitute_names(|name| {
                     if !parameter_names.contains(name.as_str()) {
                         return None;
                     }
@@ -1498,8 +1548,7 @@ impl TypeChecker {
                             })
                         })
                         .or_else(|| unbound.clone())
-                });
-                (!uses_parameters(&ty, &parameter_names)).then_some(ty)
+                }))
             };
             let lambda_ty = if formal_params.len() == lambda.params.len() {
                 let expected_params: Option<Vec<_>> = formal_params.iter().map(known).collect();
