@@ -1922,6 +1922,7 @@ impl TypeChecker {
         m.return_type.clone()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_static_call(
         &mut self,
         class_name: &str,
@@ -1930,6 +1931,7 @@ impl TypeChecker {
         args: &[CallArg],
         span: Span,
         method_span: Span,
+        expected: Option<&Type>,
     ) -> Type {
         if let Some(ty) =
             self.resolve_fully_qualified_std_module_call(class_name, method_name, args, span)
@@ -2228,7 +2230,20 @@ impl TypeChecker {
                 );
                 return Type::Generic(class_name.to_string(), vec![Type::Void]);
             }
-            let arg_ty = self.check_expr(&args[0].expr);
+            // The written type argument, else the expected lock's element, is
+            // the argument's context: `Mutex::new([])` expected as
+            // `Mutex<Array<i64>>` types `[]` as `Array<i64>` (willow-jz15.96).
+            let context = match (type_args, expected) {
+                ([t], _) => Some(t),
+                ([], Some(Type::Generic(name, elem))) if name == class_name && elem.len() == 1 => {
+                    Some(&elem[0])
+                }
+                _ => None,
+            };
+            let arg_ty = match context {
+                Some(context) => self.check_expr_expecting(&args[0].expr, context),
+                None => self.check_expr(&args[0].expr),
+            };
             let elem = match type_args {
                 [] => arg_ty.clone(),
                 [t] => {

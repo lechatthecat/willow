@@ -70,6 +70,16 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
 
 ### Fixed
 
+- **An annotated lock or generic result now types its empty arguments.**
+  `let seen: Mutex<Map<i64, i64>> = Mutex::new(Map::new());` used to fail
+  with E0201 (`found Mutex<Map<void, void>>`), and so did `Mutex::new([])`,
+  `RwLock::new(...)` and a generic call such as
+  `let h: Holder<Array<i64>> = wrap([]);`. The expected type of a
+  `Mutex`/`RwLock`/`BlockingCell`/`BlockingRwCell` constructor, or of a
+  generic function's result, is now the context of its arguments, at any
+  nesting depth. It is only a context: a non-empty argument keeps its own
+  type, and inference still binds from the arguments. See
+  `example/contextual_ctor_args.wi`.
 - **Class `extends` cycles are now rejected with E0426.** A ring such as
   `open class A extends B {}` / `open class B extends A {}` used to compile
   silently when the classes had no fields, and to abort with an internal

@@ -153,7 +153,8 @@ enum InstantiationTypeRef<'a> {
 #[cfg(test)]
 thread_local! {
     pub(super) static GENERIC_ENUM_ARGUMENT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static GENERIC_CALL_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static GENERIC_CALL_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static EXPECTED_RESULT_HINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INSTANTIATION_METADATA_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1316,8 +1317,77 @@ impl TypeChecker {
         }
     }
 
-    pub(super) fn check_generic_call(&mut self, c: &CallExpr) -> Option<Type> {
-        self.check_generic_call_parts(&c.callee, &c.type_args, &c.args, c.span, c.id)
+    /// Per value parameter, the formal with its type parameters taken from the
+    /// expected result (`expected` matched against `declared`, the return type),
+    /// or `None` when the formal does not mention a type parameter or the match
+    /// leaves one of them unbound. Explicit type arguments win over the hint.
+    /// One walk over `declared` and `expected`, then one substitution per
+    /// formal: O(|declared| + |expected| + sum |formal|).
+    fn expected_result_param_hints(
+        &mut self,
+        type_params: &[String],
+        declared: &Type,
+        params: &[Type],
+        explicit: &HashMap<String, Type>,
+        expected: &Type,
+        span: Span,
+    ) -> Vec<Option<Type>> {
+        #[cfg(test)]
+        EXPECTED_RESULT_HINTS.with(|count| count.set(count.get() + 1));
+        if Self::contains_error_type(expected) {
+            return Vec::new();
+        }
+        let Ok(mut inference) =
+            crate::semantic::generic_inference::Inference::new(type_params, &[])
+        else {
+            return Vec::new();
+        };
+        // An expected generic class arrives as its instance; match its logical
+        // application, as argument types are.
+        let expected =
+            expected.substitute_names(|name| self.generics.logical_types.get(name).cloned());
+        let mut spellings = HashMap::new();
+        let formal = self.canonical_generic_type(declared, &mut HashMap::new());
+        let expected = self.canonical_generic_type(&expected, &mut spellings);
+        if inference.constrain(&formal, &expected).is_err() {
+            return Vec::new();
+        }
+        let parameter_names: HashSet<_> = type_params.iter().map(String::as_str).collect();
+        let mut hints = Vec::with_capacity(params.len());
+        for formal in params {
+            hints.push(if !uses_parameters(formal, &parameter_names) {
+                None
+            } else {
+                let mut unbound = false;
+                let hint = formal.substitute_names(|name| {
+                    if !parameter_names.contains(name.as_str()) {
+                        return None;
+                    }
+                    let bound = explicit.get(name).cloned().or_else(|| {
+                        inference.binding(name).map(|bound| {
+                            bound.map_names(|identity| {
+                                spellings
+                                    .get(identity)
+                                    .cloned()
+                                    .unwrap_or_else(|| identity.clone())
+                            })
+                        })
+                    });
+                    unbound |= bound.is_none();
+                    bound
+                });
+                (!unbound).then(|| self.normalize_type(&hint, span))
+            });
+        }
+        hints
+    }
+
+    pub(super) fn check_generic_call(
+        &mut self,
+        c: &CallExpr,
+        expected: Option<&Type>,
+    ) -> Option<Type> {
+        self.check_generic_call_parts(&c.callee, &c.type_args, &c.args, c.span, c.id, expected)
     }
 
     pub(super) fn check_generic_call_parts(
@@ -1327,6 +1397,7 @@ impl TypeChecker {
         call_args: &[CallArg],
         span: Span,
         id: ExprId,
+        expected: Option<&Type>,
     ) -> Option<Type> {
         let template = self.generics.functions.get(callee)?.clone();
         #[cfg(test)]
@@ -1379,6 +1450,28 @@ impl TypeChecker {
                     .then(|| self.normalize_type(expected, span))
             })
             .collect();
+        // The expected result type, matched against the declared return type,
+        // gives a parameter-mentioning formal a context for contextual forms
+        // (`let h: Box<Array<i64>> = wrap([])`, willow-jz15.96). It is only a
+        // checking context: inference still binds from the checked arguments,
+        // so an ordinary value keeps its own type.
+        let hinted_params = match expected {
+            // An async call yields `Task<R>` and has no generic form to match.
+            Some(expected) if !fully_explicit && !template.is_async => {
+                let declared = imported
+                    .as_ref()
+                    .map_or(&template.return_type, |info| &info.return_type);
+                self.expected_result_param_hints(
+                    &template.type_params,
+                    declared,
+                    &params,
+                    &explicit_bindings,
+                    expected,
+                    span,
+                )
+            }
+            _ => Vec::new(),
+        };
         // A lambda whose formal still mentions a type parameter is typed after
         // the other arguments: its parameter types come from what they bind
         // (`map(xs, |x| x * 2)`), and its result then binds the rest.
@@ -1420,6 +1513,8 @@ impl TypeChecker {
                         .map_or_else(Self::error_type, |place| place.ty.clone())
                 } else if let Some(Some(expected)) = contextual_params.get(i) {
                     self.check_expr_expecting(&a.expr, expected)
+                } else if let Some(Some(hint)) = hinted_params.get(i) {
+                    self.check_expr_expecting(&a.expr, hint)
                 } else if let Some(expected) = params.get(i) {
                     self.check_generic_enum_argument(&a.expr, expected, &parameter_names)
                 } else {

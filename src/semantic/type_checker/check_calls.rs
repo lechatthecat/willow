@@ -326,7 +326,37 @@ impl TypeChecker {
                 return result;
             }
         }
-        let actual = self.check_expr(expr);
+        // Generic calls and lock constructors pass the expected result into
+        // their arguments' context (willow-jz15.96). A local callable binding
+        // shadows a generic function of the same name, as in `check_expr`, and
+        // a static call on a generic class template keeps `check_expr`, which
+        // instantiates the class and checks the call against the instance.
+        let contextual_call = match expr {
+            Expr::StaticCall(call) => {
+                !self.is_static_field_call(call)
+                    && !self
+                        .generic_class_site(expr)
+                        .is_some_and(|(name, _)| self.generics.classes.contains_key(name))
+            }
+            Expr::Call(call) => {
+                self.symbols.lookup_var(&call.callee).is_none()
+                    && self.generics.functions.contains_key(&call.callee)
+            }
+            _ => false,
+        };
+        let actual = if contextual_call {
+            let generation = self.error_generation;
+            let ty = match expr {
+                Expr::StaticCall(call) => self.check_static_call(call, Some(expected)),
+                Expr::Call(call) => self
+                    .check_generic_call(call, Some(expected))
+                    .expect("a registered generic function is checked"),
+                _ => unreachable!("contextual calls are calls"),
+            };
+            self.finish_checked_expr(expr, ty, generation)
+        } else {
+            self.check_expr(expr)
+        };
         if let Expr::StaticCall(call) = expr
             && call.type_args.is_empty()
             && call.method == "new"

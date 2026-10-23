@@ -1,0 +1,44 @@
+// An annotated type reaches the arguments of lock constructors and generic
+// calls (willow-jz15.96). An empty collection argument takes the annotated
+// element types; it no longer becomes `Map<void, void>` or `Array<void>`.
+import std::collections::Array;
+import std::collections::Map;
+
+class Holder<T> {
+    pub value: T;
+}
+
+fn wrap<T>(value: T) -> Holder<T> { return new Holder<T>(value); }
+fn guarded<T>(value: T) -> Mutex<T> { return Mutex::new(value); }
+
+// The return type is the context too.
+fn empty_index() -> RwLock<Map<String, Array<i64>>> {
+    return RwLock::new(Map::new());
+}
+
+async fn main() {
+    let seen: Mutex<Map<i64, i64>> = Mutex::new(Map::new());
+    lock seen as mut m { m.insert(3, 9); }
+    lock seen as m { println(m.get(3).unwrap_or(0)); }
+
+    let queue: Mutex<Array<i64>> = Mutex::new([]);
+    lock queue as mut q { q.push(4); q.push(5); }
+    lock queue as q { println(q.len()); }
+
+    let index = empty_index();
+    let names: RwLock<FrozenMap<String, i64>> = RwLock::new(Map::new().freeze());
+    lock read names as n { println(n.len()); }
+
+    // Through a generic function, alone and nested in a lock.
+    let boxed: Holder<Array<i64>> = wrap([]);
+    boxed.value.push(1);
+    println(boxed.value.len());
+    let counts: Mutex<Map<String, i64>> = guarded(Map::new());
+    lock counts as mut c { c.insert("a", 1); c.insert("b", 2); }
+    lock counts as c { println(c.len()); }
+
+    // As array elements: every lock gets the element type.
+    let shards: Array<Mutex<Array<i64>>> = [Mutex::new([]), Mutex::new([7])];
+    lock shards[0] as mut s { s.push(8); }
+    lock shards[0] as s { println(s.len()); }
+}

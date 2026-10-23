@@ -2315,9 +2315,54 @@ impl TypeChecker {
         }
     }
 
+    /// A static call (not a static field read). `expected` is the contextual
+    /// result type: it reaches the arguments of a generic function and of a
+    /// lock constructor, so `Mutex::new(Map::new())` expected as
+    /// `Mutex<Map<i64, i64>>` types its argument as `Map<i64, i64>`.
+    pub(super) fn check_static_call(
+        &mut self,
+        s: &StaticCallExpr,
+        expected: Option<&Type>,
+    ) -> Type {
+        let generic_name = format!("{}::{}", s.class, s.method);
+        if self.generics.functions.contains_key(&generic_name)
+            && let Some(ty) = self.check_generic_call_parts(
+                &generic_name,
+                &s.type_args,
+                &s.args,
+                s.span,
+                s.id,
+                expected,
+            )
+        {
+            return ty;
+        }
+        self.record_static_builtin_lock_effect(s);
+        let callee = self.static_method_effect_id(&s.class, &s.method);
+        let result = self.resolve_static_call(
+            &s.class,
+            &s.type_args,
+            &s.method,
+            &s.args,
+            s.span,
+            s.method_span,
+            expected,
+        );
+        if let Some(callee) = callee {
+            self.record_lock_effect_call(callee, s.span);
+        }
+        result
+    }
+
     pub(super) fn check_expr(&mut self, expr: &Expr) -> Type {
         let generation = self.error_generation;
         let ty = self.check_expr_inner(expr);
+        self.finish_checked_expr(expr, ty, generation)
+    }
+
+    /// The common tail of [`Self::check_expr`], shared with contextual checks
+    /// that type the node themselves.
+    pub(super) fn finish_checked_expr(&mut self, expr: &Expr, ty: Type, generation: usize) -> Type {
         // Imported signatures retain generic class applications until a value
         // reaches this checker. Materialize the class before recording its type
         // or letting a parent expression resolve fields/methods on the value.
@@ -2365,7 +2410,7 @@ impl TypeChecker {
     /// The parser cannot distinguish uppercase class properties from enum variants.
     /// A known class makes a bare member a field; parentheses still mean a call.
     /// Classify by receiver only, so the field resolver walks inheritance once.
-    fn is_static_field_call(&self, call: &StaticCallExpr) -> bool {
+    pub(super) fn is_static_field_call(&self, call: &StaticCallExpr) -> bool {
         call.is_bare_member()
             && (self
                 .symbols
@@ -2592,6 +2637,26 @@ impl TypeChecker {
         Self::error_type()
     }
 
+    /// The class and type arguments a `new` or static call names, unless a
+    /// bare static call resolves to the enclosing class's own receiver. When
+    /// that class is a generic template, `check_expr_inner` instantiates it
+    /// and checks the call against the instance.
+    pub(super) fn generic_class_site<'e>(
+        &self,
+        expr: &'e Expr,
+    ) -> Option<(&'e String, &'e Vec<Type>)> {
+        match expr {
+            Expr::New(n) => Some((&n.class_name, &n.type_args)),
+            Expr::StaticCall(c)
+                if c.type_args.is_empty() && self.enclosing_static_receiver(&c.class).is_some() =>
+            {
+                None
+            }
+            Expr::StaticCall(c) => Some((&c.class, &c.type_args)),
+            _ => None,
+        }
+    }
+
     fn check_expr_inner(&mut self, expr: &Expr) -> Type {
         if let Expr::Var(name, span, _) = expr
             && self.symbols.lookup_var(name).is_none()
@@ -2613,16 +2678,7 @@ impl TypeChecker {
             return self.check_object_literal(literal);
         }
 
-        let generic_class = match expr {
-            Expr::New(n) => Some((&n.class_name, &n.type_args)),
-            Expr::StaticCall(c)
-                if c.type_args.is_empty() && self.enclosing_static_receiver(&c.class).is_some() =>
-            {
-                None
-            }
-            Expr::StaticCall(c) => Some((&c.class, &c.type_args)),
-            _ => None,
-        };
+        let generic_class = self.generic_class_site(expr);
         if let Some((name, args)) = generic_class
             && let Some(ty) = self.instantiate_class(name, args, expr.span())
         {
@@ -2880,7 +2936,7 @@ impl TypeChecker {
                     }
                 }
 
-                if let Some(ty) = self.check_generic_call(c) {
+                if let Some(ty) = self.check_generic_call(c, None) {
                     return ty;
                 }
                 if !c.type_args.is_empty() {
@@ -2952,8 +3008,15 @@ impl TypeChecker {
                         .lookup_enum(name)
                         .is_some_and(|info| info.name == name)
                 {
-                    let ty =
-                        self.resolve_static_call(name, &[], &c.callee, &c.args, c.span, c.span);
+                    let ty = self.resolve_static_call(
+                        name,
+                        &[],
+                        &c.callee,
+                        &c.args,
+                        c.span,
+                        c.span,
+                        None,
+                    );
                     self.enum_variant_resolutions.insert(c.id, name.to_string());
                     return ty;
                 }
@@ -2982,34 +3045,7 @@ impl TypeChecker {
             Expr::StaticCall(s) if self.is_static_field_call(s) => {
                 self.resolve_static_field_read(&s.class, &s.method, s.span)
             }
-            Expr::StaticCall(s) => {
-                let generic_name = format!("{}::{}", s.class, s.method);
-                if self.generics.functions.contains_key(&generic_name)
-                    && let Some(ty) = self.check_generic_call_parts(
-                        &generic_name,
-                        &s.type_args,
-                        &s.args,
-                        s.span,
-                        s.id,
-                    )
-                {
-                    return ty;
-                }
-                self.record_static_builtin_lock_effect(s);
-                let callee = self.static_method_effect_id(&s.class, &s.method);
-                let result = self.resolve_static_call(
-                    &s.class,
-                    &s.type_args,
-                    &s.method,
-                    &s.args,
-                    s.span,
-                    s.method_span,
-                );
-                if let Some(callee) = callee {
-                    self.record_lock_effect_call(callee, s.span);
-                }
-                result
-            }
+            Expr::StaticCall(s) => self.check_static_call(s, None),
             Expr::StaticField(s) => self.resolve_static_field_read(&s.class, &s.field, s.span),
             Expr::New(n) => {
                 let result = self.check_new(n);

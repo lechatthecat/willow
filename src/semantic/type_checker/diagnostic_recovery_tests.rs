@@ -515,8 +515,15 @@ fn sentinel_diagnostics_static_call_argument_work() {
             .map(|i| CallArg::value(Expr::Integer(i, Span::dummy(), ExprId::fresh())))
             .collect();
         let mut checker = TypeChecker::new();
-        let result =
-            checker.resolve_static_call(name, &[], "make", &args, Span::dummy(), Span::dummy());
+        let result = checker.resolve_static_call(
+            name,
+            &[],
+            "make",
+            &args,
+            Span::dummy(),
+            Span::dummy(),
+            None,
+        );
         assert!(TypeChecker::is_error_type(&result));
         assert!(checker.errors.is_empty());
         assert_eq!(checker.expr_types.len(), count as usize);

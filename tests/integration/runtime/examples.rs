@@ -329,6 +329,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/float_exponents.wi",
             "1\n6.02214076\ntrue\n250\ntrue\n",
         ),
+        ("example/contextual_ctor_args.wi", "9\n2\n0\n1\n2\n1\n"),
         ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
         ("example/lambda_shadowing.wi", "101\n201\n102\n"),
         ("example/for_loops.wi", "6\n1\n2\n3\n5050\n9\n"),
@@ -1372,6 +1373,18 @@ fn test_runnable_example_catalog_is_complete() {
 #[test]
 fn test_string_concat_fusion_example() {
     let path = "example/string_concat_fusion.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
+}
+
+#[test]
+fn test_contextual_ctor_args_example() {
+    let path = "example/contextual_ctor_args.wi";
     let (_, expected) = runnable_example_cases()
         .iter()
         .find(|(entry, _)| *entry == path)

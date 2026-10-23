@@ -8690,6 +8690,9 @@ thread_local! {
 mod contextual_values_tests;
 
 #[cfg(test)]
+mod contextual_ctor_args_tests;
+
+#[cfg(test)]
 mod diagnostic_recovery_tests;
 
 #[cfg(test)]
