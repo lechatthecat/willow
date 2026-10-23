@@ -264,3 +264,8 @@ AGENTS.md
 !/docs/audits/willow-r52c.15-measure.py
 !/docs/audits/willow-r52c.15-baseline.json
 !/docs/audits/willow-r52c.15-comparison.json
+
+# Public retry measurement evidence (source/observations only).
+!/docs/audits/willow-r52c.14.md
+!/docs/audits/willow-r52c.14-measurements.txt
+!/docs/audits/willow-r52c.14-reproduce.sh

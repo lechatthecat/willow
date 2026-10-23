@@ -1,0 +1,370 @@
+   Compiling willow_runtime v0.1.6 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
+    Finished `release` profile [optimized] target(s) in 1m 06s
+     Running unittests src/lib.rs (target/release/deps/willow_runtime-b005ffccd85ba643)
+
+running 1 test
+test scheduler::retry_measurements::retry_measurement_counts_terminal_success_and_empty ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1871 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/willow_runtime-b005ffccd85ba643)
+
+running 1 test
+test scheduler::retry_measurements::retry_contention_measurement ... sample repeat=0 mode=wake workers=1 tokens=4096 wall_ns=564093 worker_cpu_ns=503232 tokens_per_cpu_s=8139387 per_worker=[4096]
+retry kind=single calls=4124 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=fan_in workers=1 tokens=4096 wall_ns=287427 worker_cpu_ns=237133 tokens_per_cpu_s=17273007 per_worker=[4096]
+retry kind=single calls=4096 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=owner workers=1 tokens=4096 wall_ns=411659 worker_cpu_ns=369351 tokens_per_cpu_s=11089722 per_worker=[4096]
+retry kind=single calls=4096 retries=1 p99=0 max=1 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=inbox workers=1 tokens=4096 wall_ns=272699 worker_cpu_ns=242784 tokens_per_cpu_s=16870963 per_worker=[4096]
+retry kind=single calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=131 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=wake workers=1 tokens=32768 wall_ns=3484365 worker_cpu_ns=3452821 tokens_per_cpu_s=9490211 per_worker=[32768]
+retry kind=single calls=32835 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=fan_in workers=1 tokens=32768 wall_ns=1653167 worker_cpu_ns=1390580 tokens_per_cpu_s=23564268 per_worker=[32768]
+retry kind=single calls=32768 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=owner workers=1 tokens=32768 wall_ns=2749113 worker_cpu_ns=2720040 tokens_per_cpu_s=12046882 per_worker=[32768]
+retry kind=single calls=32768 retries=2 p99=0 max=1 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=inbox workers=1 tokens=32768 wall_ns=2167777 worker_cpu_ns=2137470 tokens_per_cpu_s=15330274 per_worker=[32768]
+retry kind=single calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=1044 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=wake workers=1 tokens=262144 wall_ns=26772938 worker_cpu_ns=26706303 tokens_per_cpu_s=9815810 per_worker=[262144]
+retry kind=single calls=262498 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=fan_in workers=1 tokens=262144 wall_ns=13551432 worker_cpu_ns=11289075 tokens_per_cpu_s=23221034 per_worker=[262144]
+retry kind=single calls=262144 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=owner workers=1 tokens=262144 wall_ns=19610625 worker_cpu_ns=19556725 tokens_per_cpu_s=13404289 per_worker=[262144]
+retry kind=single calls=262144 retries=2 p99=0 max=1 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=inbox workers=1 tokens=262144 wall_ns=15859361 worker_cpu_ns=15804694 tokens_per_cpu_s=16586465 per_worker=[262144]
+retry kind=single calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=8323 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=wake workers=4 tokens=4096 wall_ns=789224 worker_cpu_ns=2684133 tokens_per_cpu_s=1526005 per_worker=[794, 1684, 826, 792]
+retry kind=single calls=5948 retries=2008 p99=4 max=8 overflow_ge255=0
+retry kind=batch calls=87 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=fan_in workers=4 tokens=16384 wall_ns=2316996 worker_cpu_ns=7564383 tokens_per_cpu_s=2165940 per_worker=[3920, 4074, 4468, 3922]
+retry kind=single calls=18942 retries=11372 p99=5 max=18 overflow_ge255=0
+retry kind=batch calls=37 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=owner workers=4 tokens=4096 wall_ns=562130 worker_cpu_ns=2024818 tokens_per_cpu_s=2022898 per_worker=[858, 1186, 916, 1136]
+retry kind=single calls=5394 retries=2975 p99=5 max=10 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=inbox workers=4 tokens=4096 wall_ns=477792 worker_cpu_ns=1716411 tokens_per_cpu_s=2386375 per_worker=[1386, 1014, 773, 923]
+retry kind=single calls=5989 retries=1221 p99=2 max=5 overflow_ge255=0
+retry kind=batch calls=1091 retries=301 p99=3 max=4 overflow_ge255=0
+sample repeat=0 mode=wake workers=4 tokens=32768 wall_ns=4983054 worker_cpu_ns=19740350 tokens_per_cpu_s=1659950 per_worker=[7606, 8640, 8545, 7977]
+retry kind=single calls=51263 retries=20963 p99=4 max=11 overflow_ge255=0
+retry kind=batch calls=888 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=fan_in workers=4 tokens=131072 wall_ns=13332563 worker_cpu_ns=53094412 tokens_per_cpu_s=2468659 per_worker=[31998, 33449, 33245, 32380]
+retry kind=single calls=147955 retries=90290 p99=6 max=21 overflow_ge255=0
+retry kind=batch calls=284 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=owner workers=4 tokens=32768 wall_ns=4137745 worker_cpu_ns=16334304 tokens_per_cpu_s=2006085 per_worker=[7960, 8457, 7008, 9343]
+retry kind=single calls=41556 retries=28215 p99=6 max=14 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=inbox workers=4 tokens=32768 wall_ns=3283591 worker_cpu_ns=12923953 tokens_per_cpu_s=2535447 per_worker=[10781, 7633, 6728, 7626]
+retry kind=single calls=47650 retries=9682 p99=2 max=7 overflow_ge255=0
+retry kind=batch calls=8727 retries=2608 p99=3 max=8 overflow_ge255=0
+sample repeat=0 mode=wake workers=4 tokens=262144 wall_ns=36425421 worker_cpu_ns=145369885 tokens_per_cpu_s=1803290 per_worker=[65340, 63849, 66131, 66824]
+retry kind=single calls=391548 retries=190653 p99=5 max=13 overflow_ge255=0
+retry kind=batch calls=6401 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=fan_in workers=4 tokens=1048576 wall_ns=94064309 worker_cpu_ns=376011910 tokens_per_cpu_s=2788678 per_worker=[261214, 262018, 264530, 260814]
+retry kind=single calls=1162392 retries=545517 p99=5 max=19 overflow_ge255=0
+retry kind=batch calls=1983 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=owner workers=4 tokens=262144 wall_ns=29750418 worker_cpu_ns=118643694 tokens_per_cpu_s=2209506 per_worker=[64668, 67162, 65362, 64952]
+retry kind=single calls=340638 retries=197978 p99=5 max=15 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=inbox workers=4 tokens=262144 wall_ns=24975753 worker_cpu_ns=99569354 tokens_per_cpu_s=2632778 per_worker=[86259, 59407, 57039, 59439]
+retry kind=single calls=376432 retries=75499 p99=2 max=8 overflow_ge255=0
+retry kind=batch calls=67901 retries=19195 p99=3 max=10 overflow_ge255=0
+sample repeat=0 mode=wake workers=16 tokens=4096 wall_ns=948621 worker_cpu_ns=11762458 tokens_per_cpu_s=348227 per_worker=[199, 235, 252, 122, 113, 265, 214, 302, 234, 315, 260, 400, 298, 354, 302, 231]
+retry kind=single calls=10285 retries=12291 p99=12 max=25 overflow_ge255=0
+retry kind=batch calls=90 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=fan_in workers=16 tokens=65536 wall_ns=8775354 worker_cpu_ns=96724264 tokens_per_cpu_s=677555 per_worker=[3968, 4255, 2078, 5505, 6614, 5464, 4327, 5060, 3528, 6803, 1944, 3843, 3524, 1494, 3221, 3908]
+retry kind=single calls=66850 retries=217001 p99=19 max=54 overflow_ge255=0
+retry kind=batch calls=12 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=owner workers=16 tokens=4096 wall_ns=788502 worker_cpu_ns=9654356 tokens_per_cpu_s=424264 per_worker=[228, 239, 219, 291, 226, 225, 199, 117, 96, 264, 626, 241, 281, 241, 296, 307]
+retry kind=single calls=12200 retries=11350 p99=10 max=22 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=inbox workers=16 tokens=4096 wall_ns=653710 worker_cpu_ns=7760931 tokens_per_cpu_s=527772 per_worker=[821, 214, 219, 239, 222, 207, 129, 210, 266, 88, 196, 283, 291, 231, 214, 266]
+retry kind=single calls=6619 retries=14060 p99=22 max=61 overflow_ge255=0
+retry kind=batch calls=195 retries=780 p99=20 max=24 overflow_ge255=0
+sample repeat=0 mode=wake workers=16 tokens=32768 wall_ns=6062179 worker_cpu_ns=89175898 tokens_per_cpu_s=367454 per_worker=[2182, 2068, 1995, 2006, 2197, 1918, 2078, 1630, 1587, 2301, 2256, 2020, 2026, 1962, 2035, 2507]
+retry kind=single calls=86295 retries=94895 p99=10 max=26 overflow_ge255=0
+retry kind=batch calls=604 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=fan_in workers=16 tokens=524288 wall_ns=69119705 worker_cpu_ns=794749889 tokens_per_cpu_s=659689 per_worker=[22590, 33022, 35011, 37301, 30308, 20216, 45971, 47752, 28141, 50361, 42055, 22441, 35252, 21060, 30042, 22765]
+retry kind=single calls=540296 retries=1773556 p99=19 max=56 overflow_ge255=0
+retry kind=batch calls=85 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=owner workers=16 tokens=32768 wall_ns=5536527 worker_cpu_ns=81014781 tokens_per_cpu_s=404469 per_worker=[2081, 2018, 2069, 2111, 2010, 2030, 799, 4140, 742, 1971, 2033, 2237, 2264, 1993, 2142, 2128]
+retry kind=single calls=100392 retries=96828 p99=11 max=29 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=inbox workers=16 tokens=32768 wall_ns=4429630 worker_cpu_ns=64030460 tokens_per_cpu_s=511756 per_worker=[5252, 1849, 1824, 1783, 1900, 2009, 1730, 1802, 383, 2630, 1973, 1830, 1839, 2013, 2064, 1887]
+retry kind=single calls=54626 retries=119749 p99=21 max=59 overflow_ge255=0
+retry kind=batch calls=984 retries=5200 p99=24 max=32 overflow_ge255=0
+sample repeat=0 mode=wake workers=16 tokens=262144 wall_ns=46490834 worker_cpu_ns=694684162 tokens_per_cpu_s=377357 per_worker=[17036, 16419, 13424, 16116, 16749, 15730, 14771, 18563, 17040, 16518, 20540, 17179, 17161, 13376, 16492, 15030]
+retry kind=single calls=686811 retries=732927 p99=9 max=27 overflow_ge255=0
+retry kind=batch calls=4882 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=fan_in workers=16 tokens=4194304 wall_ns=513076312 worker_cpu_ns=6640253246 tokens_per_cpu_s=631648 per_worker=[271742, 171071, 279692, 321683, 272146, 316636, 297853, 301156, 289907, 193042, 335443, 294755, 185901, 271072, 231560, 160645]
+retry kind=single calls=4220951 retries=13817182 p99=18 max=54 overflow_ge255=0
+retry kind=batch calls=88 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=owner workers=16 tokens=262144 wall_ns=43406585 worker_cpu_ns=648529339 tokens_per_cpu_s=404213 per_worker=[16680, 16110, 16118, 15406, 6978, 16863, 14240, 15806, 18096, 6642, 17633, 17796, 31256, 18240, 17750, 16530]
+retry kind=single calls=798538 retries=804238 p99=11 max=34 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=0 mode=inbox workers=16 tokens=262144 wall_ns=33730278 worker_cpu_ns=503507843 tokens_per_cpu_s=520635 per_worker=[58578, 6577, 13674, 13922, 14240, 7339, 14283, 13505, 16594, 14083, 16557, 15031, 14430, 13884, 15107, 14340]
+retry kind=single calls=374473 retries=949244 p99=25 max=100 overflow_ge255=0
+retry kind=batch calls=9787 retries=49971 p99=20 max=38 overflow_ge255=0
+sample repeat=1 mode=wake workers=1 tokens=4096 wall_ns=432577 worker_cpu_ns=400300 tokens_per_cpu_s=10232326 per_worker=[4096]
+retry kind=single calls=4098 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=fan_in workers=1 tokens=4096 wall_ns=217717 worker_cpu_ns=185036 tokens_per_cpu_s=22136233 per_worker=[4096]
+retry kind=single calls=4096 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=owner workers=1 tokens=4096 wall_ns=332912 worker_cpu_ns=303568 tokens_per_cpu_s=13492858 per_worker=[4096]
+retry kind=single calls=4096 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=inbox workers=1 tokens=4096 wall_ns=287387 worker_cpu_ns=260247 tokens_per_cpu_s=15738894 per_worker=[4096]
+retry kind=single calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=131 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=wake workers=1 tokens=32768 wall_ns=3538297 worker_cpu_ns=3501341 tokens_per_cpu_s=9358700 per_worker=[32768]
+retry kind=single calls=32827 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=fan_in workers=1 tokens=32768 wall_ns=1988182 worker_cpu_ns=1956350 tokens_per_cpu_s=16749559 per_worker=[32768]
+retry kind=single calls=32768 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=owner workers=1 tokens=32768 wall_ns=2448121 worker_cpu_ns=2415390 tokens_per_cpu_s=13566339 per_worker=[32768]
+retry kind=single calls=32768 retries=2 p99=0 max=1 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=inbox workers=1 tokens=32768 wall_ns=1821020 worker_cpu_ns=1795880 tokens_per_cpu_s=18246208 per_worker=[32768]
+retry kind=single calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=1044 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=wake workers=1 tokens=262144 wall_ns=26299956 worker_cpu_ns=26259156 tokens_per_cpu_s=9982956 per_worker=[262144]
+retry kind=single calls=262364 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=fan_in workers=1 tokens=262144 wall_ns=12329311 worker_cpu_ns=12215595 tokens_per_cpu_s=21459782 per_worker=[262144]
+retry kind=single calls=262144 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=owner workers=1 tokens=262144 wall_ns=18897353 worker_cpu_ns=18845453 tokens_per_cpu_s=13910199 per_worker=[262144]
+retry kind=single calls=262144 retries=1 p99=0 max=1 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=inbox workers=1 tokens=262144 wall_ns=14530560 worker_cpu_ns=14475546 tokens_per_cpu_s=18109438 per_worker=[262144]
+retry kind=single calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=8323 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=wake workers=4 tokens=4096 wall_ns=638021 worker_cpu_ns=2257867 tokens_per_cpu_s=1814102 per_worker=[928, 870, 874, 1424]
+retry kind=single calls=5873 retries=2493 p99=5 max=10 overflow_ge255=0
+retry kind=batch calls=103 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=fan_in workers=4 tokens=16384 wall_ns=1223434 worker_cpu_ns=4718579 tokens_per_cpu_s=3472232 per_worker=[4285, 4208, 3835, 4056]
+retry kind=single calls=16392 retries=4498 p99=3 max=10 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=owner workers=4 tokens=4096 wall_ns=506225 worker_cpu_ns=1850201 tokens_per_cpu_s=2213814 per_worker=[1032, 984, 1059, 1021]
+retry kind=single calls=5308 retries=3034 p99=5 max=10 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=inbox workers=4 tokens=4096 wall_ns=445271 worker_cpu_ns=1628045 tokens_per_cpu_s=2515901 per_worker=[1368, 862, 949, 917]
+retry kind=single calls=6101 retries=1222 p99=2 max=9 overflow_ge255=0
+retry kind=batch calls=1097 retries=319 p99=3 max=6 overflow_ge255=0
+sample repeat=1 mode=wake workers=4 tokens=32768 wall_ns=4629955 worker_cpu_ns=18351098 tokens_per_cpu_s=1785615 per_worker=[7509, 8294, 8474, 8491]
+retry kind=single calls=48768 retries=23653 p99=5 max=13 overflow_ge255=0
+retry kind=batch calls=803 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=fan_in workers=4 tokens=131072 wall_ns=12506521 worker_cpu_ns=49826815 tokens_per_cpu_s=2630551 per_worker=[33351, 31482, 32921, 33318]
+retry kind=single calls=149169 retries=70745 p99=5 max=20 overflow_ge255=0
+retry kind=batch calls=347 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=owner workers=4 tokens=32768 wall_ns=3738430 worker_cpu_ns=14771601 tokens_per_cpu_s=2218311 per_worker=[8599, 8103, 8580, 7486]
+retry kind=single calls=41356 retries=25073 p99=6 max=17 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=inbox workers=4 tokens=32768 wall_ns=3409737 worker_cpu_ns=13435451 tokens_per_cpu_s=2438921 per_worker=[10171, 6517, 7998, 8082]
+retry kind=single calls=48758 retries=9416 p99=2 max=6 overflow_ge255=0
+retry kind=batch calls=8102 retries=2638 p99=3 max=7 overflow_ge255=0
+sample repeat=1 mode=wake workers=4 tokens=262144 wall_ns=36229204 worker_cpu_ns=144656731 tokens_per_cpu_s=1812180 per_worker=[65569, 65342, 66379, 64854]
+retry kind=single calls=390031 retries=195029 p99=5 max=17 overflow_ge255=0
+retry kind=batch calls=6220 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=fan_in workers=4 tokens=1048576 wall_ns=110665134 worker_cpu_ns=442385996 tokens_per_cpu_s=2370274 per_worker=[263500, 260078, 258631, 266367]
+retry kind=single calls=1247652 retries=825278 p99=6 max=21 overflow_ge255=0
+retry kind=batch calls=3111 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=owner workers=4 tokens=262144 wall_ns=29128426 worker_cpu_ns=116241360 tokens_per_cpu_s=2255170 per_worker=[65397, 65232, 65398, 66117]
+retry kind=single calls=337640 retries=194649 p99=5 max=15 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=inbox workers=4 tokens=262144 wall_ns=25333350 worker_cpu_ns=101015308 tokens_per_cpu_s=2595092 per_worker=[85107, 59944, 58659, 58434]
+retry kind=single calls=386335 retries=74993 p99=2 max=8 overflow_ge255=0
+retry kind=batch calls=67464 retries=20350 p99=3 max=14 overflow_ge255=0
+sample repeat=1 mode=wake workers=16 tokens=4096 wall_ns=1027719 worker_cpu_ns=11065353 tokens_per_cpu_s=370164 per_worker=[327, 120, 178, 224, 180, 217, 178, 172, 154, 381, 202, 335, 385, 404, 316, 323]
+retry kind=single calls=9868 retries=11919 p99=11 max=31 overflow_ge255=0
+retry kind=batch calls=70 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=fan_in workers=16 tokens=65536 wall_ns=8850656 worker_cpu_ns=101852016 tokens_per_cpu_s=643443 per_worker=[2472, 5218, 3511, 2124, 5785, 5270, 5969, 6908, 3514, 4750, 5655, 2763, 1696, 2847, 3989, 3065]
+retry kind=single calls=67241 retries=222205 p99=19 max=45 overflow_ge255=0
+retry kind=batch calls=16 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=owner workers=16 tokens=4096 wall_ns=800274 worker_cpu_ns=9982951 tokens_per_cpu_s=410300 per_worker=[275, 258, 255, 263, 234, 214, 267, 260, 235, 104, 91, 239, 330, 515, 261, 295]
+retry kind=single calls=12886 retries=10978 p99=10 max=25 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=inbox workers=16 tokens=4096 wall_ns=631569 worker_cpu_ns=7797358 tokens_per_cpu_s=525306 per_worker=[891, 234, 233, 192, 204, 181, 259, 214, 158, 222, 57, 232, 266, 214, 288, 251]
+retry kind=single calls=6295 retries=13610 p99=23 max=57 overflow_ge255=0
+retry kind=batch calls=164 retries=722 p99=24 max=26 overflow_ge255=0
+sample repeat=1 mode=wake workers=16 tokens=32768 wall_ns=6103436 worker_cpu_ns=89370125 tokens_per_cpu_s=366655 per_worker=[1805, 2354, 1645, 2239, 1927, 2061, 2117, 1883, 1876, 2068, 2086, 1908, 2149, 2486, 2191, 1973]
+retry kind=single calls=88069 retries=92781 p99=9 max=23 overflow_ge255=0
+retry kind=batch calls=638 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=fan_in workers=16 tokens=524288 wall_ns=61791973 worker_cpu_ns=760056755 tokens_per_cpu_s=689801 per_worker=[30871, 34310, 38300, 31059, 33643, 36323, 26071, 38523, 36383, 33862, 26253, 18714, 33809, 37328, 33045, 35794]
+retry kind=single calls=529098 retries=1634424 p99=18 max=57 overflow_ge255=0
+retry kind=batch calls=29 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=owner workers=16 tokens=32768 wall_ns=5414419 worker_cpu_ns=73834089 tokens_per_cpu_s=443806 per_worker=[845, 2208, 1973, 1967, 1850, 1945, 2102, 2148, 820, 788, 803, 4665, 2127, 4284, 1999, 2244]
+retry kind=single calls=98252 retries=77335 p99=10 max=30 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=inbox workers=16 tokens=32768 wall_ns=4311650 worker_cpu_ns=61373843 tokens_per_cpu_s=533908 per_worker=[7064, 1921, 1663, 1665, 1619, 1319, 1626, 1965, 1928, 2294, 1825, 1927, 1729, 1993, 458, 1772]
+retry kind=single calls=46148 retries=116100 p99=24 max=61 overflow_ge255=0
+retry kind=batch calls=1192 retries=6143 p99=19 max=27 overflow_ge255=0
+sample repeat=1 mode=wake workers=16 tokens=262144 wall_ns=46758855 worker_cpu_ns=699391084 tokens_per_cpu_s=374817 per_worker=[16864, 15753, 16848, 14985, 17640, 17071, 22602, 17217, 15092, 13470, 12460, 16877, 16169, 15349, 16598, 17149]
+retry kind=single calls=699353 retries=716062 p99=9 max=26 overflow_ge255=0
+retry kind=batch calls=4974 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=fan_in workers=16 tokens=4194304 wall_ns=552269712 worker_cpu_ns=6022198696 tokens_per_cpu_s=696474 per_worker=[276096, 307983, 212444, 213259, 201767, 309968, 284135, 253057, 354288, 226154, 295146, 221386, 335303, 207822, 240545, 254951]
+retry kind=single calls=4385780 retries=13689273 p99=19 max=76 overflow_ge255=0
+retry kind=batch calls=986 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=owner workers=16 tokens=262144 wall_ns=42126485 worker_cpu_ns=620206366 tokens_per_cpu_s=422672 per_worker=[18917, 15549, 17452, 17188, 16557, 29083, 16088, 7355, 11861, 16981, 7074, 17149, 16840, 19264, 18708, 16078]
+retry kind=single calls=769680 retries=766678 p99=11 max=38 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=1 mode=inbox workers=16 tokens=262144 wall_ns=33286089 worker_cpu_ns=496602627 tokens_per_cpu_s=527875 per_worker=[53369, 13704, 13224, 13103, 16864, 13975, 7181, 14469, 15995, 15271, 7675, 14348, 15575, 16389, 15698, 15304]
+retry kind=single calls=379606 retries=944866 p99=24 max=89 overflow_ge255=0
+retry kind=batch calls=8449 retries=50186 p99=21 max=37 overflow_ge255=0
+sample repeat=2 mode=wake workers=1 tokens=4096 wall_ns=434221 worker_cpu_ns=343502 tokens_per_cpu_s=11924239 per_worker=[4096]
+retry kind=single calls=4096 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=fan_in workers=1 tokens=4096 wall_ns=213749 worker_cpu_ns=185727 tokens_per_cpu_s=22053875 per_worker=[4096]
+retry kind=single calls=4096 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=owner workers=1 tokens=4096 wall_ns=302805 worker_cpu_ns=272380 tokens_per_cpu_s=15037815 per_worker=[4096]
+retry kind=single calls=4096 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=inbox workers=1 tokens=4096 wall_ns=242243 worker_cpu_ns=213730 tokens_per_cpu_s=19164366 per_worker=[4096]
+retry kind=single calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=131 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=wake workers=1 tokens=32768 wall_ns=3302636 worker_cpu_ns=3273595 tokens_per_cpu_s=10009790 per_worker=[32768]
+retry kind=single calls=32789 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=fan_in workers=1 tokens=32768 wall_ns=1664237 worker_cpu_ns=1631051 tokens_per_cpu_s=20090114 per_worker=[32768]
+retry kind=single calls=32768 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=owner workers=1 tokens=32768 wall_ns=2629660 worker_cpu_ns=2601799 tokens_per_cpu_s=12594363 per_worker=[32768]
+retry kind=single calls=32768 retries=1 p99=0 max=1 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=inbox workers=1 tokens=32768 wall_ns=1818775 worker_cpu_ns=1791001 tokens_per_cpu_s=18295914 per_worker=[32768]
+retry kind=single calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=1044 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=wake workers=1 tokens=262144 wall_ns=26101144 worker_cpu_ns=26053250 tokens_per_cpu_s=10061854 per_worker=[262144]
+retry kind=single calls=262411 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=fan_in workers=1 tokens=262144 wall_ns=12422294 worker_cpu_ns=12370437 tokens_per_cpu_s=21191167 per_worker=[262144]
+retry kind=single calls=262144 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=owner workers=1 tokens=262144 wall_ns=19108116 worker_cpu_ns=19037011 tokens_per_cpu_s=13770229 per_worker=[262144]
+retry kind=single calls=262144 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=inbox workers=1 tokens=262144 wall_ns=14747516 worker_cpu_ns=14682134 tokens_per_cpu_s=17854625 per_worker=[262144]
+retry kind=single calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+retry kind=batch calls=8323 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=wake workers=4 tokens=4096 wall_ns=825471 worker_cpu_ns=2958267 tokens_per_cpu_s=1384594 per_worker=[935, 816, 775, 1570]
+retry kind=single calls=6386 retries=2025 p99=3 max=9 overflow_ge255=0
+retry kind=batch calls=114 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=fan_in workers=4 tokens=16384 wall_ns=1443235 worker_cpu_ns=5497146 tokens_per_cpu_s=2980456 per_worker=[4278, 4198, 3822, 4086]
+retry kind=single calls=16392 retries=4836 p99=3 max=10 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=owner workers=4 tokens=4096 wall_ns=524669 worker_cpu_ns=1847887 tokens_per_cpu_s=2216586 per_worker=[1083, 942, 1025, 1046]
+retry kind=single calls=4922 retries=2920 p99=5 max=12 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=inbox workers=4 tokens=4096 wall_ns=409154 worker_cpu_ns=1483075 tokens_per_cpu_s=2761829 per_worker=[1333, 891, 924, 948]
+retry kind=single calls=5623 retries=1254 p99=3 max=5 overflow_ge255=0
+retry kind=batch calls=949 retries=283 p99=3 max=5 overflow_ge255=0
+sample repeat=2 mode=wake workers=4 tokens=32768 wall_ns=4580823 worker_cpu_ns=18145363 tokens_per_cpu_s=1805861 per_worker=[8149, 7995, 8231, 8393]
+retry kind=single calls=49504 retries=23267 p99=5 max=11 overflow_ge255=0
+retry kind=batch calls=846 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=fan_in workers=4 tokens=131072 wall_ns=13489216 worker_cpu_ns=53755256 tokens_per_cpu_s=2438310 per_worker=[31804, 33379, 32610, 33279]
+retry kind=single calls=153501 retries=89402 p99=5 max=19 overflow_ge255=0
+retry kind=batch calls=366 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=owner workers=4 tokens=32768 wall_ns=3701320 worker_cpu_ns=14617823 tokens_per_cpu_s=2241647 per_worker=[7817, 8321, 8488, 8142]
+retry kind=single calls=42108 retries=24208 p99=5 max=15 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=inbox workers=4 tokens=32768 wall_ns=3328004 worker_cpu_ns=13110611 tokens_per_cpu_s=2499350 per_worker=[10548, 6670, 7753, 7797]
+retry kind=single calls=47516 retries=9496 p99=2 max=11 overflow_ge255=0
+retry kind=batch calls=8226 retries=2364 p99=3 max=8 overflow_ge255=0
+sample repeat=2 mode=wake workers=4 tokens=262144 wall_ns=36735870 worker_cpu_ns=146664579 tokens_per_cpu_s=1787371 per_worker=[66854, 66725, 63853, 64712]
+retry kind=single calls=394716 retries=189852 p99=5 max=14 overflow_ge255=0
+retry kind=batch calls=6477 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=fan_in workers=4 tokens=1048576 wall_ns=107712863 worker_cpu_ns=430590795 tokens_per_cpu_s=2435203 per_worker=[254160, 263560, 262281, 268575]
+retry kind=single calls=1239117 retries=780845 p99=6 max=23 overflow_ge255=0
+retry kind=batch calls=3051 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=owner workers=4 tokens=262144 wall_ns=30327825 worker_cpu_ns=120969999 tokens_per_cpu_s=2167017 per_worker=[65532, 66591, 65241, 64780]
+retry kind=single calls=339174 retries=197685 p99=5 max=14 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=inbox workers=4 tokens=262144 wall_ns=24945896 worker_cpu_ns=99451809 tokens_per_cpu_s=2635890 per_worker=[84347, 58475, 59661, 59661]
+retry kind=single calls=376494 retries=75609 p99=2 max=8 overflow_ge255=0
+retry kind=batch calls=65820 retries=19696 p99=3 max=8 overflow_ge255=0
+sample repeat=2 mode=wake workers=16 tokens=4096 wall_ns=915860 worker_cpu_ns=11485053 tokens_per_cpu_s=356637 per_worker=[141, 271, 301, 89, 286, 271, 302, 275, 243, 191, 322, 375, 161, 361, 168, 339]
+retry kind=single calls=9563 retries=12727 p99=13 max=30 overflow_ge255=0
+retry kind=batch calls=85 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=fan_in workers=16 tokens=65536 wall_ns=8468552 worker_cpu_ns=96893149 tokens_per_cpu_s=676374 per_worker=[4271, 5139, 4351, 2776, 5365, 5316, 5595, 4895, 4255, 4591, 3706, 4769, 3592, 1519, 1252, 4144]
+retry kind=single calls=67264 retries=214389 p99=18 max=42 overflow_ge255=0
+retry kind=batch calls=12 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=owner workers=16 tokens=4096 wall_ns=802017 worker_cpu_ns=9769050 tokens_per_cpu_s=419283 per_worker=[340, 259, 239, 133, 210, 269, 274, 226, 206, 241, 249, 527, 85, 283, 295, 260]
+retry kind=single calls=11366 retries=12215 p99=12 max=30 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=inbox workers=16 tokens=4096 wall_ns=624957 worker_cpu_ns=7634195 tokens_per_cpu_s=536533 per_worker=[746, 236, 230, 165, 250, 208, 227, 221, 2, 339, 222, 251, 244, 247, 283, 225]
+retry kind=single calls=6080 retries=14183 p99=23 max=54 overflow_ge255=0
+retry kind=batch calls=135 retries=685 p99=17 max=22 overflow_ge255=0
+sample repeat=2 mode=wake workers=16 tokens=32768 wall_ns=6027004 worker_cpu_ns=88431691 tokens_per_cpu_s=370546 per_worker=[2134, 1999, 2289, 1938, 1579, 1547, 1970, 2326, 2236, 1918, 2136, 2143, 2367, 1961, 2177, 2048]
+retry kind=single calls=85573 retries=93681 p99=9 max=25 overflow_ge255=0
+retry kind=batch calls=594 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=fan_in workers=16 tokens=524288 wall_ns=54131069 worker_cpu_ns=487629568 tokens_per_cpu_s=1075177 per_worker=[107268, 16410, 12246, 33564, 113651, 26874, 25639, 21953, 29563, 20168, 21690, 19750, 17460, 22203, 22509, 13340]
+retry kind=single calls=542181 retries=1029522 p99=17 max=54 overflow_ge255=0
+retry kind=batch calls=108 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=owner workers=16 tokens=32768 wall_ns=5469182 worker_cpu_ns=79942264 tokens_per_cpu_s=409896 per_worker=[2116, 2194, 2041, 1924, 1950, 924, 1963, 863, 3490, 2189, 2078, 2062, 2292, 2383, 2022, 2277]
+retry kind=single calls=97766 retries=99778 p99=11 max=33 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=inbox workers=16 tokens=32768 wall_ns=4299487 worker_cpu_ns=62396847 tokens_per_cpu_s=525155 per_worker=[3374, 1850, 1806, 1035, 2033, 1881, 2186, 2067, 1918, 1996, 1952, 2120, 2129, 2192, 2223, 2006]
+retry kind=single calls=56268 retries=118434 p99=20 max=65 overflow_ge255=0
+retry kind=batch calls=594 retries=3155 p99=18 max=30 overflow_ge255=0
+sample repeat=2 mode=wake workers=16 tokens=262144 wall_ns=47534623 worker_cpu_ns=709138502 tokens_per_cpu_s=369665 per_worker=[14927, 14334, 16292, 15383, 15488, 18248, 16090, 15673, 22763, 17381, 16994, 13291, 14945, 16964, 15689, 17682]
+retry kind=single calls=691979 retries=713803 p99=9 max=30 overflow_ge255=0
+retry kind=batch calls=4875 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=fan_in workers=16 tokens=4194304 wall_ns=517418540 worker_cpu_ns=6544624146 tokens_per_cpu_s=640878 per_worker=[320932, 191164, 294550, 292978, 180308, 255681, 244274, 347843, 292946, 320362, 172970, 272975, 266069, 267290, 209138, 264824]
+retry kind=single calls=4241720 retries=13608163 p99=18 max=67 overflow_ge255=0
+retry kind=batch calls=210 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=owner workers=16 tokens=262144 wall_ns=46131172 worker_cpu_ns=639306437 tokens_per_cpu_s=410044 per_worker=[18491, 32424, 15225, 7629, 16299, 17055, 6851, 7060, 7272, 17186, 17797, 17563, 27409, 17567, 19078, 17238]
+retry kind=single calls=876704 retries=621451 p99=8 max=33 overflow_ge255=0
+retry kind=batch calls=0 retries=0 p99=0 max=0 overflow_ge255=0
+sample repeat=2 mode=inbox workers=16 tokens=262144 wall_ns=34389810 worker_cpu_ns=479024408 tokens_per_cpu_s=547246 per_worker=[29941, 18364, 16481, 17348, 15447, 17501, 8062, 18244, 11956, 16531, 8412, 16330, 17946, 16341, 16756, 16484]
+retry kind=single calls=446198 retries=941415 p99=20 max=94 overflow_ge255=0
+retry kind=batch calls=5686 retries=29963 p99=21 max=40 overflow_ge255=0
+single_task_queue_latency_ns p50=40 p99=110 max=180
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1871 filtered out; finished in 3.19s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/willow_runtime-b005ffccd85ba643)
+
+running 1 test
+test scheduler::idle_backoff_tests::publication_during_failed_probes_reaches_real_task_polls ... latency workers=2 count=128 burst=8 forced=true path=all samples=128 p50_ns=1056242 p99_ns=1061933 stale_retries=4 failed_probes=19
+latency workers=2 count=128 burst=8 forced=true path=stale samples=2 p50_ns=6202 p99_ns=6202 stale_retries=4 failed_probes=19
+latency workers=8 count=128 burst=8 forced=true path=all samples=128 p50_ns=23905 p99_ns=906342 stale_retries=8 failed_probes=38
+latency workers=8 count=128 burst=8 forced=true path=stale samples=2 p50_ns=8947 p99_ns=8947 stale_retries=8 failed_probes=38
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1871 filtered out; finished in 0.02s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/willow_runtime-b005ffccd85ba643)
+
+running 1 test
+test scheduler::run_queue_metrics_tests::concurrent_publishers_and_stealers_do_not_lose_events ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1871 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/willow_runtime-b005ffccd85ba643)
+
+running 1 test
+test scheduler::run_queue_metrics_tests::global_batch_tokens_are_popped_exactly_once_by_concurrent_workers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1871 filtered out; finished in 0.01s
+

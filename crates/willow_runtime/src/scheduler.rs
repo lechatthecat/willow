@@ -321,21 +321,33 @@ impl LocalRunQueue {
 }
 
 fn steal_retry_batch<T>(inbox: &Injector<T>, owner: &Worker<T>) -> Option<T> {
+    #[cfg(test)]
+    let mut probe = retry_measurements::RetryProbe::new(1);
     loop {
         match inbox.steal_batch_and_pop(owner) {
             Steal::Success(id) => return Some(id),
             Steal::Empty => return None,
-            Steal::Retry => std::hint::spin_loop(),
+            Steal::Retry => {
+                #[cfg(test)]
+                probe.retry();
+                std::hint::spin_loop();
+            }
         }
     }
 }
 
 fn steal_retry<T>(stealer: &impl FnSteal<T>) -> Option<T> {
+    #[cfg(test)]
+    let mut probe = retry_measurements::RetryProbe::new(0);
     loop {
         match stealer.steal_one() {
             Steal::Success(id) => return Some(id),
             Steal::Empty => return None,
-            Steal::Retry => std::hint::spin_loop(),
+            Steal::Retry => {
+                #[cfg(test)]
+                probe.retry();
+                std::hint::spin_loop();
+            }
         }
     }
 }
@@ -5263,3 +5275,7 @@ mod yield_accounting_tests;
 #[cfg(test)]
 #[path = "scheduler_cooperative_affinity_tests.rs"]
 mod cooperative_affinity_tests;
+
+#[cfg(test)]
+#[path = "scheduler_retry_measurements.rs"]
+mod retry_measurements;
