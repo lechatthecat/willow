@@ -66,6 +66,7 @@ mod old_cycle;
 mod old_lab;
 mod pacer;
 mod pending_registry;
+mod region_cache;
 mod region_candidates;
 mod root_handshake;
 mod runtime_roots;
@@ -299,6 +300,8 @@ struct GcState {
     /// (largest available span, region index); excludes dedicated/full regions.
     old_region_candidates: region_candidates::RegionCandidates,
     old_reserved_bytes: usize,
+    /// Released region storage kept for reuse; counted by `can_reserve`.
+    region_cache: region_cache::RegionStorageCache,
     /// Per-thread old allocation buffers used by runtime-side allocation.
     old_labs: Vec<old_lab::OldLabRecord>,
     old_lab_pending: pending_registry::Pending<usize>,
@@ -462,9 +465,10 @@ fn consume_policy_headroom(bytes: u64) -> bool {
 /// pacer trigger, or (under a hard cap) the hard-pressure watermark at 3/4 of
 /// the cap, below which `can_reserve` cannot fail either. Goal and trigger only
 /// move under the heap lock and every write that can lower them invalidates
-/// the headroom; reservation growth quiesces it in `can_reserve`. Zero at or
-/// past the watermark and under a soft limit, whose controller decides on
-/// every charge.
+/// the headroom; reservation growth quiesces it in `can_reserve`. Retained
+/// region storage occupies the cap too: it shares the room below the
+/// watermark, and sweep only moves reserved bytes into it. Zero at or past the
+/// watermark and under a soft limit, whose controller decides on every charge.
 fn external_headroom(state: &GcState) -> usize {
     if state.soft_memory.enabled() {
         return 0;
@@ -472,11 +476,11 @@ fn external_headroom(state: &GcState) -> usize {
     let input = memory_inputs(state);
     let below = |trigger: u64| trigger.saturating_sub(input.occupied).saturating_sub(1);
     let mut room = below(input.unlimited_goal.max(input.live));
-    if let Some(limit) = state.memory_limit_bytes {
-        let watermark = (limit / 4).saturating_mul(3).max(1) as u64;
+    if let Some(watermark) = hard_pressure_watermark(state) {
         room = room.min(
             watermark
                 .saturating_sub(input.pressure_bytes)
+                .saturating_sub(state.region_cache.retained_bytes() as u64)
                 .saturating_sub(1),
         );
     }
@@ -484,6 +488,28 @@ fn external_headroom(state: &GcState) -> usize {
         room = room.min(below(state.pacer_trigger));
     }
     room.min(POLICY_HEADROOM_CAP) as usize
+}
+
+/// 3/4 of the hard cap, where native charges stop being lock-free.
+fn hard_pressure_watermark(state: &GcState) -> Option<u64> {
+    state
+        .memory_limit_bytes
+        .map(|limit| (limit / 4).saturating_mul(3).max(1) as u64)
+}
+
+/// Evict retained region storage that would close the lock-free native
+/// headroom below the hard-pressure watermark. Locked charges call this before
+/// republishing, so the cache never forces every later charge onto the heap
+/// lock. O(1) unless storage is evicted.
+fn trim_region_cache_to_watermark(state: &mut GcState) {
+    if let Some(watermark) = hard_pressure_watermark(state) {
+        let keep = watermark
+            .saturating_sub(memory_inputs(state).pressure_bytes)
+            .saturating_sub(1);
+        state
+            .region_cache
+            .shrink_to(usize::try_from(keep).unwrap_or(usize::MAX));
+    }
 }
 
 /// Lock-free native charges between their headroom check and completion.
@@ -549,10 +575,10 @@ pub(crate) fn charge_external(bytes: usize) {
     }
     // Serialize increases with region reservations. Releases need no heap lock,
     // so finalizers also work during reset and stop-the-world collection.
-    let state = runtime().heap.lock().unwrap();
+    let mut state = runtime().heap.lock().unwrap();
     // Exact inputs for the crossing checks below.
     quiesce_external_charges();
-    if !can_reserve(&state, bytes) {
+    if !can_reserve(&mut state, bytes) {
         allocation_failure(&state);
     }
     let previous_external = EXTERNAL_BYTES
@@ -587,6 +613,7 @@ pub(crate) fn charge_external(bytes: usize) {
         && (hard_crossing
             || paced_crossing
             || state.soft_memory.decide(memory_inputs(&state)).collect);
+    trim_region_cache_to_watermark(&mut state);
     EXTERNAL_HEADROOM.store(external_headroom(&state), Ordering::Release);
     drop(state);
     if pressure {
@@ -604,19 +631,70 @@ pub(crate) fn release_external(bytes: usize) {
         .expect("native byte accounting underflow");
 }
 
-fn can_reserve(state: &GcState, additional: usize) -> bool {
-    state.memory_limit_bytes.is_none_or(|limit| {
-        // Every reservation passes here first: stop lock-free native charges
-        // (their headroom predates this reservation) and drop their transient
-        // bytes before the exact cap check.
-        quiesce_external_charges();
-        state
-            .old_reserved_bytes
-            .checked_add(state.tlab_reserved_bytes)
-            .and_then(|total| total.checked_add(external_bytes()))
-            .and_then(|total| total.checked_add(additional))
-            .is_some_and(|total| total <= limit)
-    })
+/// Retained region storage counts toward the hard cap and the soft limit but
+/// never refuses a reservation: it is freed first, so admission ignores it.
+fn can_reserve(state: &mut GcState, additional: usize) -> bool {
+    let Some(limit) = state.memory_limit_bytes else {
+        if state.soft_memory.enabled() {
+            evict_region_cache_for(state, additional);
+        }
+        return true;
+    };
+    // Every reservation passes here first: stop lock-free native charges
+    // (their headroom predates this reservation) and drop their transient
+    // bytes before the exact cap check.
+    quiesce_external_charges();
+    if state
+        .old_reserved_bytes
+        .checked_add(state.tlab_reserved_bytes)
+        .and_then(|total| total.checked_add(external_bytes()))
+        .and_then(|total| total.checked_add(additional))
+        .is_none_or(|total| total > limit)
+    {
+        return false;
+    }
+    evict_region_cache_for(state, additional);
+    true
+}
+
+/// Free retained storage that would leave less than `additional` bytes below
+/// either limit. O(1) unless storage is freed.
+fn evict_region_cache_for(state: &mut GcState, additional: usize) {
+    let keep = region_cache_budget(state).saturating_sub(additional);
+    state.region_cache.shrink_to(keep);
+}
+
+/// Bytes released storage may occupy without crossing the hard cap or the
+/// soft limit. Under a soft limit retained storage is evicted rather than
+/// counted as collection pressure: no collection could reclaim it.
+fn region_cache_budget(state: &GcState) -> usize {
+    let footprint = state
+        .old_reserved_bytes
+        .saturating_add(state.tlab_reserved_bytes)
+        .saturating_add(external_bytes());
+    let room = |limit: usize| limit.saturating_sub(footprint);
+    let soft = state.soft_memory.limit().map_or(usize::MAX, |limit| {
+        room(usize::try_from(limit).unwrap_or(usize::MAX))
+    });
+    state.memory_limit_bytes.map_or(usize::MAX, room).min(soft)
+}
+
+/// Admit a new old region, reusing retained storage of the same capacity.
+/// The caller accounts the returned region as reserved.
+fn reserve_old_region(state: &mut GcState, kind: RegionKind, capacity: usize) -> Option<OldRegion> {
+    let retained = state.region_cache.take(capacity);
+    if !can_reserve(state, capacity) {
+        if let Some(base) = retained {
+            // SAFETY: the block left the cache and is owned here.
+            unsafe { region_cache::free_region_storage(base, capacity) };
+        }
+        return None;
+    }
+    match retained {
+        // SAFETY: the cache held this released block of exactly `capacity`.
+        Some(base) => Some(unsafe { OldRegion::reuse(kind, capacity, base) }),
+        None => OldRegion::new(kind, capacity),
+    }
 }
 
 #[cfg(test)]
@@ -764,6 +842,7 @@ impl Default for GcState {
             old_addresses: address_index::AddressIndex::default(),
             old_region_candidates: region_candidates::RegionCandidates::default(),
             old_reserved_bytes: 0,
+            region_cache: Default::default(),
             old_labs: Vec::new(),
             old_lab_pending: Default::default(),
             tlab_states: HashMap::new(),
@@ -1097,7 +1176,10 @@ fn minor_refill_should_wait(state: &mut GcState) -> bool {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_set_memory_limit(bytes: u64) -> u64 {
-    let previous = runtime().heap.lock().unwrap().soft_memory.set_limit(bytes);
+    let mut state = runtime().heap.lock().unwrap();
+    let previous = state.soft_memory.set_limit(bytes);
+    evict_region_cache_for(&mut state, 0);
+    drop(state);
     invalidate_runtime_policy_budgets();
     previous
 }
@@ -1579,15 +1661,12 @@ fn allocate_old_region_object_for_move(
         allocated
     } else {
         let capacity = if large { span_size } else { GC_OLD_REGION_SIZE };
-        if !can_reserve(state, capacity) {
-            return None;
-        }
         let kind = if large {
             RegionKind::LargeObject
         } else {
             RegionKind::Old
         };
-        let mut region = OldRegion::new(kind, capacity)?;
+        let mut region = reserve_old_region(state, kind, capacity)?;
         let allocated = region.allocate_object_for_move(
             type_id,
             layout_id,
@@ -2262,6 +2341,7 @@ fn reset_internal() {
     state.tlab_addresses.clear();
     state.old_region_candidates.clear();
     state.old_reserved_bytes = 0;
+    state.region_cache.shrink_to(0);
     for chunk in state.tlab_chunks.drain(..) {
         let mut offset = 0;
         while offset < chunk.used {

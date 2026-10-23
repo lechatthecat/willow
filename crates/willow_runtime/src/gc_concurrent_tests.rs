@@ -738,7 +738,7 @@ fn memory_limit_bounds_region_reservations_and_recovers_after_sweep() {
         .is_none()
     );
     assert_eq!(willow_gc_allocated_bytes(), before);
-    assert!(can_reserve(&runtime().heap.lock().unwrap(), 0));
+    assert!(can_reserve(&mut runtime().heap.lock().unwrap(), 0));
     willow_pop_roots(1);
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
@@ -1040,7 +1040,7 @@ fn reservation_pressure_collects_garbage_before_rejecting_an_allocation() {
     let large = willow_alloc((GC_OLD_REGION_SIZE + GC_OLD_REGION_SIZE / 2) as i64);
     assert!(!large.is_null());
     assert_eq!(runtime().heap.lock().unwrap().total_frees, 1);
-    assert!(can_reserve(&runtime().heap.lock().unwrap(), 0));
+    assert!(can_reserve(&mut runtime().heap.lock().unwrap(), 0));
     reset_internal_for_test();
 }
 

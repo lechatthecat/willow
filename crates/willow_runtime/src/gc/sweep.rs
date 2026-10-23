@@ -19,6 +19,9 @@ pub(super) struct SweepPlan {
     chunks: usize,
     epoch: u64,
     marking: Option<Arc<ConcurrentCycle>>,
+    /// Released storage left idle too long; freed by `execute`
+    /// outside the heap lock.
+    stale_storage: region_cache::StaleStorage,
 }
 
 pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>) -> SweepPlan {
@@ -48,6 +51,7 @@ pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>
         chunks: state.tlab_chunks.len(),
         epoch: state.major_collections,
         marking,
+        stale_storage: state.region_cache.begin_sweep(),
     }
 }
 
@@ -75,6 +79,7 @@ pub(super) fn prepare_bounded(
         chunks: state.tlab_chunks.len(),
         epoch: state.major_collections,
         marking: Some(marking),
+        stale_storage: state.region_cache.begin_sweep(),
     })
 }
 
@@ -163,10 +168,11 @@ fn run_drops(drops: &mut Vec<PendingDrop>, epoch: u64) {
 }
 
 fn execute(
-    plan: SweepPlan,
+    mut plan: SweepPlan,
     work: &mut crate::gc_telemetry::stops::StopWorkV2,
     concurrent: bool,
 ) -> usize {
+    drop(std::mem::take(&mut plan.stale_storage));
     let mut freed = 0;
     let mut drops = Vec::new();
     for index in 0..plan.old {
@@ -457,10 +463,12 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
     let mut released = 0usize;
     let mut positions = Vec::with_capacity(regions_before);
     let mut next_index = 0;
+    let mut released_storage = Vec::new();
     state.old_regions.retain_mut(|region| {
         if region.allocations.is_empty() {
             positions.push(None);
             released += region.capacity;
+            released_storage.push((region.take_storage(), region.capacity));
             false
         } else {
             region.sweep_pending = false;
@@ -472,6 +480,14 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
     });
     state.old_addresses.remap(&positions);
     state.old_reserved_bytes -= released;
+    // Keep released storage for the next cycle's regions. O(released).
+    let budget = region_cache_budget(state);
+    for (base, capacity) in released_storage {
+        // SAFETY: the released region handed over its unindexed storage.
+        if let Some(base) = unsafe { state.region_cache.retain(base, capacity, budget) } {
+            unsafe { region_cache::free_region_storage(base, capacity) };
+        }
+    }
     state.released_bytes = state.released_bytes.saturating_add(released as u64);
     state.old_regions_released = state
         .old_regions_released

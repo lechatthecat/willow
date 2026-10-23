@@ -619,7 +619,7 @@ mod tests {
                         let ready = ready.clone();
                         std::thread::spawn(move || {
                             let _mutator = MutatorRegistration::new();
-                            assert!(!can_reserve(&runtime().heap.lock().unwrap(), 1));
+                            assert!(!can_reserve(&mut runtime().heap.lock().unwrap(), 1));
                             ready.wait();
                             let before = crate::gc_telemetry::workers::thread_cpu_ns();
                             let checks = if legacy {

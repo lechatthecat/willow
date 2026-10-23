@@ -1856,3 +1856,146 @@ fn active_tlab_validation_requires_publication_not_just_an_advanced_cursor() {
     assert_eq!(willow_gc_allocated_bytes(), 0);
     reset_internal_for_test();
 }
+
+fn dirty_released_storage(kind: RegionKind, capacity: usize) -> *mut u8 {
+    let mut region = OldRegion::new(kind, capacity).unwrap();
+    let base = region.take_storage();
+    // SAFETY: the released storage is owned here.
+    unsafe { std::ptr::write_bytes(base, 0xAB, capacity) };
+    base
+}
+
+#[test]
+fn region_cache_02_limit_evicts_retained_storage_instead_of_refusing() {
+    let _guard = global_gc_guard();
+    reset_gc();
+    let mut state = GcState {
+        memory_limit_bytes: Some(4 * GC_OLD_REGION_SIZE),
+        ..GcState::default()
+    };
+    for _ in 0..2 {
+        let base = dirty_released_storage(RegionKind::Old, GC_OLD_REGION_SIZE);
+        // SAFETY: released storage owned here.
+        assert!(
+            unsafe {
+                state
+                    .region_cache
+                    .retain(base, GC_OLD_REGION_SIZE, usize::MAX)
+            }
+            .is_none()
+        );
+    }
+    state.old_reserved_bytes = GC_OLD_REGION_SIZE;
+    // A refusal is decided by live reservations alone and evicts nothing.
+    assert!(!can_reserve(&mut state, 3 * GC_OLD_REGION_SIZE + 1));
+    assert_eq!(state.region_cache.retained_bytes(), 2 * GC_OLD_REGION_SIZE);
+    assert!(can_reserve(&mut state, GC_OLD_REGION_SIZE));
+    assert_eq!(state.region_cache.retained_bytes(), 2 * GC_OLD_REGION_SIZE);
+    // Admission evicts retained storage down to the remaining headroom.
+    assert!(can_reserve(&mut state, 2 * GC_OLD_REGION_SIZE + 1));
+    assert_eq!(state.region_cache.retained_bytes(), 0);
+    assert_eq!(region_cache_budget(&state), 3 * GC_OLD_REGION_SIZE);
+    reset_gc();
+}
+
+#[test]
+fn region_cache_03_reservation_reuses_or_frees_the_retained_block() {
+    let _guard = global_gc_guard();
+    reset_gc();
+    let mut state = GcState::default();
+    let base = dirty_released_storage(RegionKind::Old, GC_OLD_REGION_SIZE);
+    // SAFETY: released storage owned here.
+    unsafe {
+        state
+            .region_cache
+            .retain(base, GC_OLD_REGION_SIZE, usize::MAX);
+    }
+    let other = reserve_old_region(&mut state, RegionKind::Old, 4096).unwrap();
+    assert_ne!(other.start(), base as usize, "capacity must match exactly");
+    let region = reserve_old_region(&mut state, RegionKind::Old, GC_OLD_REGION_SIZE).unwrap();
+    assert_eq!(region.start(), base as usize);
+    assert_eq!(state.region_cache.retained_bytes(), 0);
+    drop((region, other));
+
+    let base = dirty_released_storage(RegionKind::Old, GC_OLD_REGION_SIZE);
+    // SAFETY: released storage owned here.
+    unsafe {
+        state
+            .region_cache
+            .retain(base, GC_OLD_REGION_SIZE, usize::MAX);
+    }
+    state.memory_limit_bytes = Some(GC_OLD_REGION_SIZE - 1);
+    assert!(reserve_old_region(&mut state, RegionKind::Old, GC_OLD_REGION_SIZE).is_none());
+    assert_eq!(state.region_cache.retained_bytes(), 0);
+    reset_gc();
+}
+
+/// Fill several old regions with unreachable objects. Returns the reserved
+/// and retained bytes before collection.
+fn allocate_dead_regions() -> (usize, usize) {
+    while willow_gc_old_region_count() < 3 {
+        willow_alloc_object(1, 8);
+    }
+    let state = runtime().heap.lock().unwrap();
+    (
+        state.old_reserved_bytes,
+        state.region_cache.retained_bytes(),
+    )
+}
+
+fn assert_released_storage_retained_and_reused((reserved, retained_before): (usize, usize)) {
+    let (retained, regions) = {
+        let state = runtime().heap.lock().unwrap();
+        assert_eq!(
+            state.region_cache.retained_bytes() - retained_before,
+            reserved - state.old_reserved_bytes,
+            "every released region parks its storage"
+        );
+        (state.region_cache.retained_bytes(), state.old_regions.len())
+    };
+    assert!(retained >= 2 * GC_OLD_REGION_SIZE);
+    while willow_gc_old_region_count() as usize == regions {
+        willow_alloc_object(1, 8);
+    }
+    assert_eq!(
+        runtime().heap.lock().unwrap().region_cache.retained_bytes(),
+        retained - GC_OLD_REGION_SIZE,
+        "a new region reuses retained storage"
+    );
+    reset_gc();
+    assert_eq!(
+        runtime().heap.lock().unwrap().region_cache.retained_bytes(),
+        0
+    );
+}
+
+#[test]
+fn region_cache_04_stopped_sweep_retains_released_storage() {
+    let _guard = global_gc_guard();
+    reset_gc();
+    let before = allocate_dead_regions();
+    // Nothing is marked: the stopped sweep's `finish` releases every region.
+    sweep();
+    assert_released_storage_retained_and_reused(before);
+}
+
+#[test]
+fn region_cache_05_concurrent_sweep_retains_released_storage() {
+    let _guard = global_gc_guard();
+    reset_internal_for_test();
+    let before = allocate_dead_regions();
+    let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
+    let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now())
+        .expect("an unrooted heap closes concurrently");
+    sweep::concurrent(plan);
+    assert_released_storage_retained_and_reused(before);
+}
+
+#[test]
+fn region_cache_06_explicit_collection_retains_released_storage() {
+    let _guard = global_gc_guard();
+    reset_gc();
+    let before = allocate_dead_regions();
+    willow_gc_collect();
+    assert_released_storage_retained_and_reused(before);
+}

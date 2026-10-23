@@ -154,23 +154,45 @@ impl RegionMarkBitmap {
 
 impl OldRegion {
     pub(super) fn new(kind: RegionKind, capacity: usize) -> Option<Self> {
-        debug_assert!(matches!(kind, RegionKind::Old | RegionKind::LargeObject));
         let layout = Layout::from_size_align(capacity, std::mem::align_of::<GcHeader>()).ok()?;
         // SAFETY: `layout` is nonzero, aligned, and owned by the returned region.
         let base = unsafe { allocate_region_storage(layout) };
         if base.is_null() {
             return None;
         }
+        // SAFETY: fresh zeroed storage of `capacity` bytes.
+        Some(unsafe { Self::with_storage(kind, capacity, base, true) })
+    }
+
+    /// Region over released storage of exactly `capacity` bytes. Its stale
+    /// contents make it non-pristine: every allocation clears its span.
+    ///
+    /// # Safety
+    /// As for [`Self::with_storage`] with `pristine == false`.
+    pub(super) unsafe fn reuse(kind: RegionKind, capacity: usize, base: *mut u8) -> Self {
+        unsafe { Self::with_storage(kind, capacity, base, false) }
+    }
+
+    /// # Safety
+    /// `base` came from [`allocate_region_storage`] with `capacity` bytes, is
+    /// owned by no other region or cache, and is zeroed when `pristine`.
+    unsafe fn with_storage(
+        kind: RegionKind,
+        capacity: usize,
+        base: *mut u8,
+        pristine: bool,
+    ) -> Self {
+        debug_assert!(matches!(kind, RegionKind::Old | RegionKind::LargeObject));
         let bitmap_capacity = if kind == RegionKind::LargeObject {
             GC_REGION_MARK_GRANULE
         } else {
             capacity
         };
-        Some(Self {
+        Self {
             base,
             capacity,
             used: 0,
-            pristine: true,
+            pristine,
             kind,
             live_bytes: 0,
             allocations: BTreeMap::new(),
@@ -189,7 +211,17 @@ impl OldRegion {
             concurrent_marks: Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(
                 bitmap_capacity.div_ceil(GC_REGION_MARK_GRANULE),
             )),
-        })
+        }
+    }
+
+    /// Hand an empty region's storage to the caller; dropping the region
+    /// afterwards frees only its metadata.
+    pub(super) fn take_storage(&mut self) -> *mut u8 {
+        assert!(
+            self.allocations.is_empty(),
+            "released region owns no objects"
+        );
+        std::mem::replace(&mut self.base, std::ptr::null_mut())
     }
 
     pub(super) fn start(&self) -> usize {
@@ -524,10 +556,10 @@ impl Drop for OldRegion {
                 .unwrap()
                 .reclaim_in_place();
         }
-        let layout = Layout::from_size_align(self.capacity, std::mem::align_of::<GcHeader>())
-            .expect("old-region allocation layout remains valid");
-        // SAFETY: each region owns one block and `Drop` runs exactly once.
-        unsafe { dealloc(self.base, layout) };
+        if !self.base.is_null() {
+            // SAFETY: each region owns one block and `Drop` runs exactly once.
+            unsafe { region_cache::free_region_storage(self.base, self.capacity) };
+        }
     }
 }
 
@@ -569,6 +601,24 @@ mod zero_initialization_tests {
                     region.cleared_bytes
                 );
             }
+        }
+    }
+
+    #[test]
+    fn released_storage_reuse_clears_every_allocation() {
+        for kind in [RegionKind::Old, RegionKind::LargeObject] {
+            let mut released = OldRegion::new(kind, 4096).unwrap();
+            let base = released.take_storage();
+            drop(released);
+            unsafe { std::ptr::write_bytes(base, 0xa5, 4096) };
+            // SAFETY: released storage of exactly 4096 bytes, owned here.
+            let mut region = unsafe { OldRegion::reuse(kind, 4096, base) };
+            assert_eq!(region.start(), base as usize);
+            assert!(!region.pristine);
+            let bytes = 4096 - GC_HEADER_SIZE;
+            let (object, _) = region.allocate_object(0, 0, 0, bytes).unwrap();
+            assert_zero(object, bytes);
+            assert_eq!(region.cleared_bytes, 4096);
         }
     }
 

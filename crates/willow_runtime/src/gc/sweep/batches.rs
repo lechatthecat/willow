@@ -125,8 +125,9 @@ pub(super) fn assist() {
     }
 }
 
-pub(super) fn execute(plan: SweepPlan) -> usize {
+pub(super) fn execute(mut plan: SweepPlan) -> usize {
     let began = Instant::now();
+    drop(std::mem::take(&mut plan.stale_storage));
     let job = Arc::new(Mutex::new(Cursor::new(plan)));
     job.lock().unwrap().report.setup_ns = began.elapsed().as_nanos() as u64;
     assert!(ACTIVE.lock().unwrap().is_none());
@@ -448,9 +449,13 @@ impl Cursor {
                 self.headers = Some(Vec::with_capacity(capacity));
                 true
             }
-            Action::ReleaseOld(region) => {
+            Action::ReleaseOld(region, excess) => {
                 let began = Instant::now();
                 release_pause();
+                if let Some(base) = excess {
+                    // SAFETY: storage the cache declined is owned here.
+                    unsafe { region_cache::free_region_storage(base, region.capacity) };
+                }
                 drop(region);
                 self.report.release_ns += began.elapsed().as_nanos() as u64;
                 true
@@ -747,7 +752,7 @@ impl Cursor {
             assert_eq!(region.sweep_state.phase, region::SweepPhase::Swept);
             if region.allocations.is_empty() {
                 region.sweep_state.phase = region::SweepPhase::Released;
-                let region = state.old_regions.swap_remove(index);
+                let mut region = state.old_regions.swap_remove(index);
                 state.old_addresses.remove(region.start());
                 if index < state.old_regions.len() {
                     let moved = &state.old_regions[index];
@@ -761,7 +766,13 @@ impl Cursor {
                 state.old_reserved_bytes -= region.capacity;
                 state.released_bytes += region.capacity as u64;
                 state.old_regions_released += 1;
-                return Action::ReleaseOld(region);
+                // Retaining is O(1); only storage over budget is freed after
+                // the heap lock is dropped.
+                let base = region.take_storage();
+                let budget = region_cache_budget(state);
+                // SAFETY: the released region handed over its unindexed storage.
+                let excess = unsafe { state.region_cache.retain(base, region.capacity, budget) };
+                return Action::ReleaseOld(region, excess);
             }
             // Existing safe holes need not acquire another epoch of quarantine
             // when this sweep reclaimed no new object in the extent.
@@ -842,7 +853,8 @@ enum Action {
     Drop(DropFn, *mut u8),
     Build(usize, FreeSpans),
     ReserveHeaders(usize),
-    ReleaseOld(OldRegion),
+    /// A released region's metadata and any storage the cache declined.
+    ReleaseOld(OldRegion, Option<*mut u8>),
     ReleaseChunk(BumpChunk),
 }
 

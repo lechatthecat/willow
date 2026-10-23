@@ -135,8 +135,8 @@ fn native_bytes_participate_in_reservation_and_trigger_inputs() {
         let mut state = runtime().heap.lock().unwrap();
         let managed = state.old_reserved_bytes + state.tlab_reserved_bytes;
         state.memory_limit_bytes = Some(managed + external);
-        assert!(can_reserve(&state, 0));
-        assert!(!can_reserve(&state, 1));
+        assert!(can_reserve(&mut state, 0));
+        assert!(!can_reserve(&mut state, 1));
         let inputs = memory_inputs(&state);
         assert_eq!(inputs.pressure_bytes, (managed + external) as u64);
         assert_eq!(inputs.occupied, (state.allocated_bytes + external) as u64);
@@ -331,7 +331,7 @@ fn unchanged_high_reservations_do_not_collect_per_managed_allocation() {
             *root = willow_alloc(8);
             willow_push_root(root);
         }
-        let state = runtime().heap.lock().unwrap();
+        let mut state = runtime().heap.lock().unwrap();
         assert_eq!(state.old_reserved_bytes, 256 * 1024);
         assert_eq!(state.tlab_reserved_bytes, 0);
         let sample = telemetry::accounting_from_state(&state);
@@ -345,8 +345,8 @@ fn unchanged_high_reservations_do_not_collect_per_managed_allocation() {
             state.major_collections, 1,
             "unchanged reservations caused repeated full collections"
         );
-        assert!(can_reserve(&state, 44 * 1024));
-        assert!(!can_reserve(&state, 44 * 1024 + 1));
+        assert!(can_reserve(&mut state, 44 * 1024));
+        assert!(!can_reserve(&mut state, 44 * 1024 + 1));
         println!(
             "reservation pressure objects={count} reserved={} occupied={} major_collections={}",
             state.old_reserved_bytes, state.allocated_bytes, state.major_collections
@@ -530,7 +530,7 @@ fn native_charges_far_below_a_hard_cap_skip_the_heap_lock() {
             watermark.saturating_sub(committed).saturating_sub(1)
         );
         // A reservation check stops lock-free charging until republished.
-        assert!(can_reserve(&state, 0));
+        assert!(can_reserve(&mut state, 0));
         assert_eq!(EXTERNAL_HEADROOM.load(Ordering::Acquire), 0);
         state.memory_limit_bytes = None;
     }
@@ -634,4 +634,155 @@ fn m0_threshold_locked_sample_reports_actual_limit_and_categories() {
     assert!(record.contains("\"young_reserved_bytes\":0"), "{record}");
     assert!(record.contains("\"kind\":\"managed_memory_threshold\""));
     println!("{record}");
+}
+
+/// willow-8hq4.47: storage parked by a sweep shares the cap with native bytes,
+/// so lock-free charges after the release cannot push reserved + native +
+/// retained past the hard-pressure watermark.
+#[test]
+fn lock_free_native_headroom_counts_retained_region_storage() {
+    let _guard = runtime_test_guard();
+    willow_gc_init();
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        state.memory_limit_bytes = Some(1 << 30);
+        state.threshold_bytes = usize::MAX / 2;
+        state.pacer_trigger = u64::MAX / 2;
+    }
+    invalidate_runtime_policy_budgets();
+    while willow_gc_old_region_count() < 4 {
+        willow_alloc_object(1, 8);
+    }
+    willow_gc_collect();
+    let retained = runtime().heap.lock().unwrap().region_cache.retained_bytes();
+    assert!(
+        retained >= 3 * GC_OLD_REGION_SIZE,
+        "release filled the cache"
+    );
+
+    // Watermark headroom fits the retained storage plus a small native room.
+    let set_watermark = |headroom: usize| {
+        let mut state = runtime().heap.lock().unwrap();
+        let pressure = memory_inputs(&state).pressure_bytes as usize;
+        state.memory_limit_bytes = Some((pressure + headroom).div_ceil(3) * 4);
+        invalidate_external_headroom();
+        (hard_pressure_watermark(&state).unwrap() as usize, pressure)
+    };
+    let (watermark, pressure) = set_watermark(retained + 4096);
+    assert!(watermark - pressure >= retained + 4096);
+    charge_external(1);
+    let room = EXTERNAL_HEADROOM.load(Ordering::Acquire);
+    {
+        let state = runtime().heap.lock().unwrap();
+        assert_eq!(
+            state.region_cache.retained_bytes(),
+            retained,
+            "nothing to evict"
+        );
+        assert_eq!(room, watermark - (pressure + 1) - retained - 1);
+    }
+    assert!(!charge_external_lock_free(room + 1));
+    assert!(charge_external_lock_free(room));
+    let footprint = {
+        let state = runtime().heap.lock().unwrap();
+        memory_inputs(&state).pressure_bytes as usize + state.region_cache.retained_bytes()
+    };
+    assert!(footprint < watermark, "{footprint} >= {watermark}");
+    release_external(1 + room);
+
+    // A cache larger than the room left is evicted by the next locked
+    // charge instead of closing the lock-free path or overshooting the cap.
+    let (watermark, _) = set_watermark(retained / 2);
+    charge_external(1);
+    let room = EXTERNAL_HEADROOM.load(Ordering::Acquire);
+    assert!(charge_external_lock_free(room));
+    {
+        let state = runtime().heap.lock().unwrap();
+        let retained_now = state.region_cache.retained_bytes();
+        assert!(retained_now <= retained / 2, "evicted to the watermark");
+        let footprint = memory_inputs(&state).pressure_bytes as usize + retained_now;
+        assert!(footprint < watermark, "{footprint} >= {watermark}");
+    }
+    release_external(1 + room);
+    runtime().heap.lock().unwrap().memory_limit_bytes = None;
+    willow_gc_collect();
+    reset_internal();
+}
+
+/// willow-8hq4.47: a soft limit bounds retained region storage. A collection
+/// cannot reclaim it, so it is evicted instead of counted as soft pressure.
+#[test]
+fn soft_limit_bounds_retained_region_storage() {
+    let _guard = runtime_test_guard();
+    willow_gc_init();
+    runtime().heap.lock().unwrap().threshold_bytes = usize::MAX / 2;
+    invalidate_runtime_policy_budgets();
+    let fill_cache = || {
+        while willow_gc_old_region_count() < 4 {
+            willow_alloc_object(1, 8);
+        }
+        willow_gc_collect();
+    };
+    let footprint = || {
+        let state = runtime().heap.lock().unwrap();
+        (
+            memory_inputs(&state).pressure_bytes as usize,
+            state.region_cache.retained_bytes(),
+        )
+    };
+    fill_cache();
+    let (pressure, retained) = footprint();
+    assert!(
+        retained >= 3 * GC_OLD_REGION_SIZE,
+        "release filled the cache"
+    );
+
+    // Lowering the soft limit evicts down to its headroom, oldest first.
+    let limit = pressure + retained / 2;
+    willow_gc_set_memory_limit(limit as u64);
+    let (pressure, kept) = footprint();
+    assert!(
+        kept > 0 && kept <= retained / 2,
+        "kept {kept} of {retained}"
+    );
+    assert!(pressure + kept <= limit);
+    {
+        let state = runtime().heap.lock().unwrap();
+        let input = memory_inputs(&state);
+        assert_eq!(input.pressure_bytes as usize, pressure);
+        assert_eq!(
+            state.soft_memory.decide(input).overshoot,
+            0,
+            "retained storage is not soft pressure"
+        );
+    }
+
+    // Native growth into the headroom evicts instead of overshooting.
+    charge_external(kept);
+    let (pressure, now) = footprint();
+    assert!(
+        now < kept && pressure + now <= limit,
+        "{pressure} + {now} > {limit}"
+    );
+    release_external(kept);
+
+    // Release under a soft limit retains only up to its headroom.
+    willow_gc_set_memory_limit(0);
+    fill_cache();
+    let (pressure, _) = footprint();
+    let limit = pressure + GC_OLD_REGION_SIZE + GC_OLD_REGION_SIZE / 2;
+    willow_gc_set_memory_limit(limit as u64);
+    // Soft pressure may collect during this loop; each release is bounded.
+    for _ in 0..4 * GC_OLD_REGION_SIZE / (GC_HEADER_SIZE + 8) {
+        willow_alloc_object(1, 8);
+    }
+    willow_gc_collect();
+    let (pressure, retained) = footprint();
+    assert!(retained > 0, "the soft headroom still admits one region");
+    assert!(
+        pressure + retained <= limit,
+        "{pressure} + {retained} > {limit}"
+    );
+    willow_gc_set_memory_limit(0);
+    reset_internal();
 }

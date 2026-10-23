@@ -261,10 +261,7 @@ fn carve(state: &mut GcState, span: usize) -> Option<(usize, usize, usize, bool)
         }
         return Some((index, offset, len, reused));
     }
-    if !can_reserve(state, GC_OLD_REGION_SIZE) {
-        return None;
-    }
-    let mut region = OldRegion::new(RegionKind::Old, GC_OLD_REGION_SIZE)?;
+    let mut region = reserve_old_region(state, RegionKind::Old, GC_OLD_REGION_SIZE)?;
     let (offset, len, reused) = region.carve(span, OLD_LAB_BYTES)?;
     let index = state.old_regions.len();
     state.old_addresses.insert(region.base as usize, index);

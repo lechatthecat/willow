@@ -51,6 +51,9 @@ impl Controller {
     pub(super) fn enabled(&self) -> bool {
         self.limit != 0
     }
+    pub(super) fn limit(&self) -> Option<u64> {
+        self.enabled().then_some(self.limit)
+    }
     pub(super) fn from_env() -> Self {
         let limit = std::env::var("WILLOW_GC_MEMORY_LIMIT_BYTES")
             .ok()
