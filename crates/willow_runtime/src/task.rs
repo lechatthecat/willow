@@ -279,6 +279,10 @@ pub struct RuntimeTask {
     /// How often the scheduler handed this unpinned task back to the shared
     /// queue to start it on an idle worker (willow-jz15.120).
     pub(crate) spread_hops: u16,
+    /// Set by the first claim for a poll. Only a task that never ran may
+    /// spread: a later Ready claim resumes an unpinned task that thieves can
+    /// already take (willow-xere).
+    pub(crate) started: bool,
     /// Wait relationships, allocated on the first registration and released
     /// with the last (willow-ezs.3). Private so every mutation goes through the
     /// accessors that maintain that invariant.
@@ -325,6 +329,7 @@ impl RuntimeTask {
             wake_deadline: None,
             yield_requested: false,
             spread_hops: 0,
+            started: false,
             wait: None,
             debug: None,
             panic_context: Arc::new(crate::panic_context::PanicContext::new(id)),

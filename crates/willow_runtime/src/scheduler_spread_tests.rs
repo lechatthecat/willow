@@ -110,3 +110,123 @@ fn rerouted_task_reaches_its_owner_without_waking_idle_thieves() {
     queues.push_rerouted(9, 66);
     assert_eq!(queues.pop_for_worker(0), Some(66));
 }
+
+/// willow-xere: a resumed task is not a first claim. Spreading every yield
+/// resume tripled yield_switch's shared-queue traffic and wall time.
+#[test]
+fn a_started_task_never_spreads() {
+    for workers in [2, 4, 8, 16] {
+        let queues = RunQueues::new(workers);
+        let state = ParallelRunState::default();
+        queues.locals[0].publish(2);
+        let mut task = ready_task(1);
+        assert!(task_should_spread(&task, 0, &queues, Some(&state)));
+        task.started = true;
+        // Still Ready, unpinned and without hops, as after a yield requeue.
+        assert_eq!(task.state.lifecycle(), TaskLifecycle::Ready);
+        assert!(!task_should_spread(&task, 0, &queues, Some(&state)));
+    }
+}
+
+#[test]
+fn every_scheduler_claim_marks_the_task_started() {
+    let mut scheduler = RuntimeScheduler::with_worker_count(1);
+    let popped = scheduler.spawn_placeholder();
+    assert_eq!(
+        scheduler.with_task(popped, |task| task.started),
+        Some(false)
+    );
+    assert_eq!(scheduler.pop_ready(), Some(popped));
+    assert_eq!(scheduler.with_task(popped, |task| task.started), Some(true));
+    // A yield requeue keeps the mark: the next claim is a resume.
+    scheduler.requeue_runnable(popped);
+    assert_eq!(scheduler.with_task(popped, |task| task.started), Some(true));
+
+    let direct = scheduler.spawn_placeholder();
+    scheduler.set_running(direct);
+    assert_eq!(scheduler.with_task(direct, |task| task.started), Some(true));
+}
+
+/// willow-xere: a peer with queued local work is busy even between polls, so
+/// a spawn burst that batch pops filled every local queue does not spread.
+#[test]
+fn peers_with_local_backlog_are_not_idle() {
+    for workers in [2, 4, 8, 16] {
+        let queues = RunQueues::new(workers);
+        let state = ParallelRunState::default();
+        let task = ready_task(1);
+        for (worker, queue) in queues.locals.iter().enumerate() {
+            queue.publish(100 + worker as RuntimeTaskId);
+        }
+        assert!(!task_should_spread(&task, 0, &queues, Some(&state)));
+        // Draining one peer makes exactly that peer idle.
+        let peer = workers - 1;
+        assert_eq!(
+            queues.pop_for_worker(peer),
+            Some(100 + peer as RuntimeTaskId)
+        );
+        assert!(task_should_spread(&task, 0, &queues, Some(&state)));
+        // The claimer's own queue never counts as an idle peer.
+        assert!(!task_should_spread(&task, peer, &queues, Some(&state)));
+    }
+}
+
+/// willow-xere: a shared queue that already holds a task per idle peer gains
+/// nothing from one more.
+#[test]
+fn spread_requires_fewer_shared_tasks_than_idle_peers() {
+    for workers in [2, 4, 8, 16] {
+        let queues = RunQueues::new(workers);
+        let state = ParallelRunState::default();
+        let task = ready_task(1);
+        queues.locals[0].publish(2);
+        // All `workers - 1` peers are idle.
+        for waiting in 0..workers - 1 {
+            assert!(
+                task_should_spread(&task, 0, &queues, Some(&state)),
+                "{waiting} shared tasks for {} idle peers",
+                workers - 1
+            );
+            queues.push_global(1000 + waiting as RuntimeTaskId);
+        }
+        assert!(!task_should_spread(&task, 0, &queues, Some(&state)));
+        // Active polls shrink the idle count below the shared backlog too.
+        while queues.pop_global(0, &queues.metrics, false).is_some() {}
+        queues.push_global(2000);
+        for _ in 0..workers.saturating_sub(2) {
+            state.begin_poll();
+        }
+        // One idle peer and one shared task: no spread.
+        assert!(!task_should_spread(&task, 0, &queues, Some(&state)));
+        for _ in 0..workers.saturating_sub(2) {
+            state.end_poll();
+        }
+    }
+}
+
+#[test]
+fn idle_peer_count_excludes_the_claimer_and_busy_peers() {
+    for workers in [1, 2, 4, 8, 16] {
+        let queues = RunQueues::new(workers);
+        for worker in 0..workers {
+            // Every other worker is idle.
+            if workers >= 2 {
+                assert!(queues.idle_peers_exceed(worker, workers - 2));
+            }
+            assert!(!queues.idle_peers_exceed(worker, workers - 1));
+        }
+        for queue in queues.locals.iter().skip(1).step_by(2) {
+            queue.publish(1);
+        }
+        // Workers 0, 2, 4, ... stay empty.
+        let empty = workers.div_ceil(2);
+        assert!(!queues.idle_peers_exceed(0, empty - 1));
+        if empty >= 2 {
+            assert!(queues.idle_peers_exceed(0, empty - 2));
+        }
+        if workers >= 2 {
+            assert!(queues.idle_peers_exceed(1, empty - 1));
+            assert!(!queues.idle_peers_exceed(1, empty));
+        }
+    }
+}

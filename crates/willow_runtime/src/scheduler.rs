@@ -510,6 +510,17 @@ impl RunQueues {
         }
     }
 
+    /// Whether more than `waiting` workers other than `worker` have an empty
+    /// local queue. Stops at the first `waiting + 1` such peers: O(workers).
+    fn idle_peers_exceed(&self, worker: usize, waiting: usize) -> bool {
+        self.locals
+            .iter()
+            .enumerate()
+            .filter(|&(index, queue)| index != worker && queue.looks_empty())
+            .nth(waiting)
+            .is_some()
+    }
+
     /// Make the worker's next pop local-first, so a task it just spread to the
     /// shared queue goes to an idle peer before this worker can take it back.
     fn defer_global_pop(&self, worker: usize) {
@@ -1395,6 +1406,7 @@ impl RuntimeScheduler {
             let outcome = task.claim_for_poll();
             if outcome == ClaimOutcome::Poll {
                 task.yield_requested = false;
+                task.started = true;
             }
             let has_cleanup =
                 outcome == ClaimOutcome::Cancel && task.cancel.is_some() && !task.frame.is_null();
@@ -1834,6 +1846,7 @@ impl RuntimeScheduler {
                     TaskLifecycle::Terminal => return false,
                 }
                 task.yield_requested = false;
+                task.started = true;
                 matches!(
                     task.state.claim_for_poll(),
                     ClaimOutcome::Poll | ClaimOutcome::Cancel
@@ -4151,6 +4164,7 @@ fn claim_global_ready_for_worker(
                             );
                         }
                         task.yield_requested = false;
+                        task.started = true;
                         Claim::Work(claimed_task_work(task), task.panic_context())
                     }
                     ClaimOutcome::Cancel if task_requires_cancel_poll(task) => {
@@ -4206,6 +4220,11 @@ fn claim_global_ready_for_worker(
 /// this very task, is not registered either, and treating it as busy pinned
 /// two tasks to one worker. Each hop is paired with a local pop by the busy
 /// worker (`defer_global_pop`), and a task hops at most once per pool worker.
+/// A peer with queued local work is not idle either, and a shared queue that
+/// already holds a task for every idle peer gains nothing from one more:
+/// requeueing then only churns the shared queue and wakes peers that find
+/// other work anyway, as when batch pops spread a spawn burst over every
+/// local queue (willow-xere).
 fn task_should_spread(
     task: &RuntimeTask,
     worker: usize,
@@ -4227,16 +4246,23 @@ fn task_should_spread(
     if task.native_stack.is_some() {
         return false;
     }
-    usize::from(task.spread_hops) < queues.worker_count()
+    !task.started
+        && usize::from(task.spread_hops) < queues.worker_count()
         && task.worker_affinity.is_none()
         && task.state.lifecycle() == TaskLifecycle::Ready
         && queues
             .locals
             .get(worker)
             .is_some_and(|queue| !queue.looks_empty())
-        // The claiming worker has not begun its poll, so any other active
-        // poll count below `workers - 1` leaves some peer idle.
-        && shared.is_some_and(|state| state.active_polls() + 1 < queues.worker_count())
+        && shared.is_some_and(|state| {
+            // The claiming worker has not begun its poll, so at most `workers
+            // - 1 - active polls` peers are idle.
+            let free = queues
+                .worker_count()
+                .saturating_sub(state.active_polls().saturating_add(1));
+            let waiting = queues.global_len.load(Ordering::Relaxed);
+            waiting < free && queues.idle_peers_exceed(worker, waiting)
+        })
 }
 
 fn duration_until(deadline: Instant) -> Duration {
