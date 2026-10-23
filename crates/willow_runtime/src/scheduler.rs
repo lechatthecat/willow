@@ -3035,8 +3035,9 @@ pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) 
 #[path = "scheduler_parking.rs"]
 mod parking;
 use parking::{
-    current_wake_generation, notify_all_idle_waiters, notify_idle_waiters, notify_local_work,
-    notify_worker_waiter, wait_for_wake_since,
+    completion_wake_generation, current_wake_generation, notify_all_idle_waiters,
+    notify_idle_waiters, notify_local_work, notify_worker_waiter, wait_for_completion_event,
+    wait_for_event_since, wait_for_wake_since,
 };
 
 /// Wake every idle-parked scheduler thread so it reaches its safepoint now.
@@ -3900,12 +3901,12 @@ impl ParallelCompletion {
         loop {
             // The driver remains a registered mutator. Wait on the idle-waiter
             // list so both completion and a GC request cut the park short.
+            let generation = completion_wake_generation();
             crate::gc::relocatable_safepoint();
-            let generation = current_wake_generation();
             if self.remaining.load(Ordering::SeqCst) == 0 {
                 return;
             }
-            wait_for_wake_since(generation, Duration::from_millis(1));
+            wait_for_completion_event(generation);
         }
     }
 }
@@ -4324,13 +4325,30 @@ fn deadline_bounded(wait: Duration, deadline: Option<Instant>) -> Duration {
     }
 }
 
-// Park is interruptible by work publication. Keep the existing 1ms upper
-// bound because parked threads remain GC mutators and must reach safepoints.
+// Timed/event-source and transient-claim fallback. GC separately wakes all
+// registered waiters; pure compute does not need this periodic fallback.
 fn idle_wait_bound(deadline: Option<Instant>) -> Duration {
     let wait = global_next_timer_deadline()
         .map(|(_, timer)| bounded_parallel_wait(duration_until(timer)))
         .unwrap_or(Duration::from_millis(1));
     deadline_bounded(wait, deadline)
+}
+
+// Pure compute has no timed event to service. GC, work publication and poll
+// completion explicitly wake this wait. Retain bounded polling for netpoll,
+// whose readiness is supplied by the OS rather than the scheduler wait list.
+// Nested drives also retain bounded waits: a peer completion targets worker 0,
+// whereas their awaited target can belong to any worker.
+fn wait_for_scheduler_event(generation: u64, deadline: Option<Instant>) {
+    if SCHED_RUN_DEPTH.with(Cell::get) > 1
+        || deadline.is_some()
+        || global_next_timer_deadline().is_some()
+        || crate::netpoll::has_waiters()
+    {
+        wait_for_wake_since(generation, idle_wait_bound(deadline));
+    } else {
+        wait_for_event_since(generation);
+    }
 }
 
 fn scheduler_idle_step(
@@ -4349,9 +4367,24 @@ fn scheduler_idle_step(
     // A claim that has popped its task but not yet reached `active_polls` is
     // equally in-flight work, and is invisible in every other check
     // (willow-atth).
-    if claims_in_flight() || shared.is_some_and(|state| state.has_active_peer(0)) {
+    if claims_in_flight() {
+        // Empty claims publish no event when they finish. Reprobe this short
+        // transition instead of waiting indefinitely for a nonexistent poll.
         wait_for_wake_since(generation, idle_wait_bound(deadline));
         return true;
+    }
+    if let Some(state) = shared {
+        let before = CLAIM_WORD.snapshot();
+        // Scan once, distinguishing an observed poll from a racing empty
+        // claim. Only a poll promises a future boundary notification.
+        if state.active_polls() > 0 {
+            wait_for_scheduler_event(generation, deadline);
+            return true;
+        }
+        if claims_changed_or_in_flight(&before) {
+            wait_for_wake_since(generation, idle_wait_bound(deadline));
+            return true;
+        }
     }
 
     let earliest = global_next_timer_deadline();
@@ -4542,6 +4575,9 @@ fn scheduler_run_loop(
             .map(|state| &state.target),
     );
     loop {
+        // Snapshot before stop/target/GC observations: their notifications
+        // must remain visible even if they race the later registration.
+        let wake_generation = current_wake_generation();
         if SPAWN_NOTIFICATION_PENDING.with(|pending| pending.replace(false)) {
             notify_idle_waiters();
         }
@@ -4604,7 +4640,6 @@ fn scheduler_run_loop(
         // every worker on every iteration, so it must stay cheap when no timer
         // exists: `wake_global_due_timers` answers that case with one atomic
         // load and takes no lock at all (willow-9ha4).
-        let wake_generation = current_wake_generation();
         let woken_timers = wake_global_due_timers(Instant::now());
         let next = if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             None
@@ -4634,7 +4669,7 @@ fn scheduler_run_loop(
             // Letting any worker stop the pool races with another worker that
             // is publishing a timer/netpoll waiter as its poll returns Pending.
             if stop_pool_on_exit && shared.is_some() && worker != 0 {
-                wait_for_wake_since(wake_generation, idle_wait_bound(deadline));
+                wait_for_scheduler_event(wake_generation, deadline);
                 continue;
             }
             // A nested run_until may wait on a target whose poll is itself
@@ -4734,6 +4769,9 @@ fn scheduler_run_loop(
                         crate::observability::record(event, Some(worker), id, i64::from(result));
                         set_current_task(None);
                         finish_active_poll(shared);
+                        if matches!(result, RUNTIME_POLL_PENDING | RUNTIME_POLL_BLOCKED_SYSCALL) {
+                            notify_worker_waiter(0);
+                        }
                         continue;
                     }
                     crate::native_stack::NativeStack::recycle(stack);
@@ -4781,6 +4819,7 @@ fn scheduler_run_loop(
             drain_terminal_cleanups();
             crate::gc::stress_collect("scheduler");
             finish_active_poll(shared);
+            notify_worker_waiter(0);
             if cleanup_panicked {
                 crate::panic_context::finish_unhandled_with_async_chain(
                     panic_chain.as_deref().unwrap_or_default(),
@@ -4805,6 +4844,7 @@ fn scheduler_run_loop(
             crate::gc::stress_collect("await");
             crate::gc::stress_collect("scheduler");
             finish_active_poll(shared);
+            notify_worker_waiter(0);
             record_completed_task(&mut completed, shared);
             continue;
         };
@@ -4952,6 +4992,11 @@ fn scheduler_run_loop(
         // join this worker while its collection is waiting for worker 0 to
         // reach a safepoint.
         finish_active_poll(shared);
+        if !matches!(outcome, PollOutcome::Yield | PollOutcome::Preempted) {
+            // Only the coordinator must recheck timers/netpoll/idleness.
+            // Waking the whole pool here would cost tasks * workers.
+            notify_worker_waiter(0);
+        }
         if outcome == PollOutcome::Ready {
             record_completed_task(&mut completed, shared);
         }

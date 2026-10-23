@@ -59,10 +59,10 @@ unsafe fn coordinator_frame(frame: *mut c_void) -> NativeTaskFrame<CoordinatorFr
 // checks in generated loops. The mapper's own safepoints still consume the
 // shared quantum. Do not make one cheap scalar operation a scheduler quantum:
 // requeue/claim contention would otherwise dominate eight-worker mapping.
-const ELEMENTS_PER_SAFEPOINT: i64 = crate::preempt::SYNC_POLL_STRIDE as i64;
+const ELEMENTS_PER_SAFEPOINT: i64 = 64;
 /// Hard upper bound for one native poll, even without an active quantum.
-const MAX_ELEMENTS_PER_POLL: i64 =
-    ELEMENTS_PER_SAFEPOINT * crate::preempt::DEFAULT_TASK_BUDGET as i64;
+// Keep the native batch bound independent of production time-based scheduling.
+const MAX_ELEMENTS_PER_POLL: i64 = 65_536;
 
 pub type I64Mapper = unsafe extern "C" fn(i64) -> i64;
 

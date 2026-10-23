@@ -1,0 +1,13 @@
+// CPU-only async work still yields by time; its result matches synchronous execution.
+fn heavy() -> i64 {
+    let mut x = 7;
+    let mut i = 0;
+    while i < 1000000 {
+        x = (x * 17 + i) % 1000000007;
+        i = i + 1;
+    }
+    return x;
+}
+async fn main() {
+    println(heavy());
+}

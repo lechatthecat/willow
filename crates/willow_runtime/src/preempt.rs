@@ -25,8 +25,10 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Default safepoint budget per quantum (spec §8 example).
-pub const DEFAULT_TASK_BUDGET: u64 = 1024;
+/// Production fairness is time-based. Explicit WILLOW_TASK_BUDGET values
+/// retain exact deterministic safepoint budgets for tests and tuning.
+/// A small default turns fast arithmetic into repeated scheduler round trips.
+pub const DEFAULT_TASK_BUDGET: u64 = u64::MAX;
 /// Default wall-clock time quantum in milliseconds (spec §8 example, upper end
 /// of the 1ms–10ms range for production fairness).
 pub const DEFAULT_TIME_QUANTUM_MS: u64 = 10;
@@ -447,7 +449,7 @@ pub(crate) fn charge_safepoints(count: u64) -> i32 {
 /// checks. It bounds how stale the time quantum, preemption flag, and
 /// cancellation state can be while the per-safepoint cost stays one counter
 /// decrement (willow-jz15.40).
-pub const SYNC_POLL_STRIDE: u64 = 64;
+pub const SYNC_POLL_STRIDE: u64 = 256;
 
 /// The next inline safepoint grant: never past the remaining budget, so the
 /// budget still trips at the exact safepoint it would without batching.
@@ -657,8 +659,31 @@ mod tests {
     }
 
     #[test]
+    fn production_budget_uses_deadline_and_bounds_runtime_checks() {
+        for safepoints in [1024usize, 4096, 16384] {
+            begin_quantum(
+                PreemptConfig::from_env_values(None, Some("100000")),
+                std::ptr::null(),
+            );
+            let mut calls = 0;
+            for _ in 0..safepoints {
+                calls += usize::from(unsafe { *willow_async_poll_counter() } <= 1);
+                assert_eq!(direct_check(), 0);
+            }
+            assert_eq!(calls, 1 + (safepoints - 1) / SYNC_POLL_STRIDE as usize);
+            QUANTUM.with(|q| q.deadline.set(Some(Instant::now())));
+            let mut until_preempt = 0;
+            while direct_check() == 0 {
+                until_preempt += 1;
+                assert!(until_preempt < SYNC_POLL_STRIDE);
+            }
+            willow_preempt_end();
+        }
+    }
+
+    #[test]
     fn direct_async_batches_preserve_exact_budgets_and_bound_checks() {
-        for budget in [1, 2, 3, 63, 64, 65, 127, 1000, 4096] {
+        for budget in [1, 2, 3, 63, 64, 65, 127, 255, 256, 257, 1000, 4096] {
             begin_quantum(cfg(budget, 100000), std::ptr::null());
             let mut calls = 0;
             for n in 1..=budget {

@@ -141,7 +141,11 @@ impl IdleWaiters {
     }
 
     fn wait_with_backoff(&self, start: u64, timeout: Duration, backoff: impl FnOnce()) -> bool {
-        // Two CPU pauses per failed probe, including publication races.
+        self.wait_inner(start, Some(timeout), backoff)
+    }
+
+    fn wait_inner(&self, start: u64, timeout: Option<Duration>, backoff: impl FnOnce()) -> bool {
+        // Bounded CPU backoff per failed probe, including publication races.
         // The backoff never waits for a condition or yields to the OS, and
         // it holds no lock. Then retry known work or register to park.
         backoff();
@@ -164,11 +168,17 @@ impl IdleWaiters {
             }
             list.insert()
         };
-        let deadline = Instant::now() + timeout;
+        let deadline = timeout.map(|duration| Instant::now() + duration);
         loop {
-            std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+            if let Some(deadline) = deadline {
+                std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+            } else {
+                std::thread::park();
+            }
             let list = self.list.lock().unwrap_or_else(|p| p.into_inner());
-            if !list.slots[index].linked || self.generation() != start || Instant::now() >= deadline
+            if !list.slots[index].linked
+                || self.generation() != start
+                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
             {
                 break;
             }
@@ -185,6 +195,17 @@ impl IdleWaiters {
 }
 
 static IDLE_WAITERS: LazyLock<IdleWaiters> = LazyLock::new(IdleWaiters::default);
+// Drivers cannot consume a worker's work notification or hide worker 0's
+// targeted registration. Only completion, shutdown and GC wake this list.
+static COMPLETION_WAITERS: LazyLock<IdleWaiters> = LazyLock::new(IdleWaiters::default);
+
+pub(super) fn completion_wake_generation() -> u64 {
+    COMPLETION_WAITERS.generation()
+}
+
+pub(super) fn wait_for_completion_event(start: u64) {
+    COMPLETION_WAITERS.wait_inner(start, None, std::hint::spin_loop);
+}
 
 pub(super) fn notify_idle_waiters() {
     IDLE_WAITERS.notify(false);
@@ -203,6 +224,7 @@ pub(super) fn notify_worker_waiter(worker: usize) {
 
 pub(super) fn notify_all_idle_waiters() {
     IDLE_WAITERS.notify(true);
+    COMPLETION_WAITERS.notify(true);
 }
 
 pub(super) fn current_wake_generation() -> u64 {
@@ -211,6 +233,10 @@ pub(super) fn current_wake_generation() -> u64 {
 
 pub(super) fn wait_for_wake_since(start: u64, timeout: Duration) -> bool {
     IDLE_WAITERS.wait(start, timeout)
+}
+
+pub(super) fn wait_for_event_since(start: u64) -> bool {
+    IDLE_WAITERS.wait_inner(start, None, std::hint::spin_loop)
 }
 
 #[cfg(test)]
@@ -222,6 +248,41 @@ mod tests {
         while waiters.registered.load(Ordering::SeqCst) != count {
             assert!(Instant::now() < deadline, "waiter registration timed out");
             std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn event_wait_retains_publication_before_registration() {
+        let waiters = IdleWaiters::default();
+        let generation = waiters.generation();
+        waiters.notify(true);
+        assert!(waiters.wait_inner(generation, None, || {}));
+        assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn event_wait_has_no_periodic_backoff_and_wakes_at_pool_sizes() {
+        for workers in [1, 2, 8, 32] {
+            let waiters = IdleWaiters::default();
+            let probes = AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    let waiters = &waiters;
+                    let probes = &probes;
+                    scope.spawn(move || {
+                        assert!(waiters.wait_inner(waiters.generation(), None, || {
+                            probes.fetch_add(1, Ordering::SeqCst);
+                        }));
+                    });
+                }
+                registered(&waiters, workers);
+                // The event wait has no timeout; one registration/probe per
+                // worker regardless of how long the producer computes.
+                assert_eq!(probes.load(Ordering::SeqCst), workers);
+                waiters.notify(true);
+            });
+            assert_eq!(probes.load(Ordering::SeqCst), workers);
+            assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
         }
     }
 
