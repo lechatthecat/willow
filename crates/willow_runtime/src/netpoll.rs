@@ -134,9 +134,11 @@ pub struct RuntimeNetPoll {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     kqueue_fd: Option<i32>,
     #[cfg(target_os = "windows")]
-    wake_receiver: Option<std::net::UdpSocket>,
+    wake_receiver: Option<std::sync::Arc<std::net::UdpSocket>>,
     #[cfg(target_os = "windows")]
     wake_sender: Option<std::net::UdpSocket>,
+    #[cfg(target_os = "windows")]
+    poll_sockets: Vec<WsaPollFd>,
 }
 
 fn remove_index_key<K: std::hash::Hash + Eq>(
@@ -184,6 +186,8 @@ impl RuntimeNetPoll {
             wake_receiver: None,
             #[cfg(target_os = "windows")]
             wake_sender: None,
+            #[cfg(target_os = "windows")]
+            poll_sockets: Vec::new(),
         }
     }
 
@@ -378,6 +382,15 @@ impl RuntimeNetPoll {
         token: usize,
         ready_interest: Option<IoInterest>,
     ) -> Vec<RuntimeTaskId> {
+        self.ready_tasks_before(token, ready_interest, u64::MAX)
+    }
+
+    fn ready_tasks_before(
+        &self,
+        token: usize,
+        ready_interest: Option<IoInterest>,
+        sequence_limit: u64,
+    ) -> Vec<RuntimeTaskId> {
         let mut seen = HashSet::new();
         let mut tasks = Vec::new();
         // Registration order is the wake order: a task that waited longer on
@@ -386,7 +399,7 @@ impl RuntimeNetPoll {
             .by_token
             .get(&token)
             .into_iter()
-            .flat_map(BTreeMap::values)
+            .flat_map(|waiters| waiters.range(..sequence_limit).map(|(_, key)| key))
         {
             #[cfg(test)]
             self.ready_visits.set(self.ready_visits.get() + 1);
@@ -702,7 +715,8 @@ fn apple_kevent(ident: usize, filter: i16, flags: u16, fflags: u32) -> libc::kev
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug)]
 #[repr(C)]
 struct WsaPollFd {
     fd: usize,
@@ -710,9 +724,9 @@ struct WsaPollFd {
     revents: i16,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 const WSA_POLL_READ: i16 = 0x0100 | 0x0200;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 const WSA_POLL_WRITE: i16 = 0x0010;
 #[cfg(target_os = "windows")]
 const WSA_POLL_ERROR: i16 = 0x0001 | 0x0002 | 0x0004;
@@ -749,7 +763,7 @@ impl RuntimeNetPoll {
         {
             return -1;
         }
-        self.wake_receiver = Some(receiver);
+        self.wake_receiver = Some(std::sync::Arc::new(receiver));
         self.wake_sender = Some(sender);
         0
     }
@@ -937,30 +951,37 @@ fn wait_ready_tasks(timeout: Option<Duration>) -> Vec<RuntimeTaskId> {
             if !poll.has_waiters() || poll.init() != 0 {
                 None
             } else {
-                Some((
-                    poll.interest_counts
-                        .keys()
-                        .map(|&fd| (fd, poll.merged_interest(fd).unwrap()))
-                        .collect::<Vec<_>>(),
-                    poll.wake_receiver.as_ref()?.as_raw_socket() as usize,
-                ))
+                // Each in-flight wait owns its buffer; concurrent waiters never alias it.
+                let wake = std::sync::Arc::clone(poll.wake_receiver.as_ref()?);
+                let mut sockets = std::mem::take(&mut poll.poll_sockets);
+                fill_windows_sockets(&mut sockets, poll, wake.as_raw_socket() as usize);
+                Some((sockets, wake, poll.next_sequence))
             }
         });
-        let Some((registrations, wake_socket)) = snapshot else {
+        let Some((mut sockets, _wake, sequence_limit)) = snapshot else {
             return Vec::new();
         };
-        let events = wait_windows_events(&registrations, wake_socket, timeout);
+        let events = wait_windows_events(&mut sockets, timeout);
         with_global(|poll| {
-            let mut ready = Vec::new();
+            let mut tasks = Vec::new();
+            let mut seen = HashSet::new();
             for event in events {
-                if event.token == WAKE_TOKEN {
+                let ready = if event.token == WAKE_TOKEN {
                     poll.drain_platform_waker();
-                    ready.extend(poll.drain_ready_tokens());
+                    let queued = poll.drain_ready_tokens();
+                    poll.tasks_for_ready_events(queued)
                 } else {
-                    ready.push(event);
-                }
+                    // A descriptor can be cancelled, closed and reused while WSAPoll
+                    // runs. Only registrations present in this snapshot may wake.
+                    poll.ready_tasks_before(event.token, event.interest, sequence_limit)
+                };
+                tasks.extend(ready.into_iter().filter(|task| seen.insert(*task)));
             }
-            poll.tasks_for_ready_events(ready)
+            sockets.clear();
+            if sockets.capacity() > poll.poll_sockets.capacity() {
+                poll.poll_sockets = sockets;
+            }
+            tasks
         })
     }
 
@@ -1024,27 +1045,28 @@ fn wait_apple_events(kqueue_fd: i32, timeout: Option<Duration>) -> Vec<ReadyEven
         .collect()
 }
 
-#[cfg(target_os = "windows")]
-fn wait_windows_events(
-    unique: &[(RawFd, IoInterest)],
-    wake_socket: usize,
-    timeout: Option<Duration>,
-) -> Vec<ReadyEvent> {
-    let mut sockets = Vec::with_capacity(unique.len() + 1);
+#[cfg(any(target_os = "windows", test))]
+fn fill_windows_sockets(sockets: &mut Vec<WsaPollFd>, poll: &RuntimeNetPoll, wake_socket: usize) {
+    sockets.clear();
+    sockets.reserve(poll.interest_counts.len() + 1);
     sockets.push(WsaPollFd {
         fd: wake_socket,
         events: WSA_POLL_READ,
         revents: 0,
     });
-    sockets.extend(unique.iter().map(|(fd, interest)| WsaPollFd {
-        fd: *fd as usize,
-        events: match interest {
+    sockets.extend(poll.interest_counts.keys().map(|&fd| WsaPollFd {
+        fd: fd as usize,
+        events: match poll.merged_interest(fd).unwrap() {
             IoInterest::Readable => WSA_POLL_READ,
             IoInterest::Writable => WSA_POLL_WRITE,
             IoInterest::ReadWrite => WSA_POLL_READ | WSA_POLL_WRITE,
         },
         revents: 0,
     }));
+}
+
+#[cfg(target_os = "windows")]
+fn wait_windows_events(sockets: &mut [WsaPollFd], timeout: Option<Duration>) -> Vec<ReadyEvent> {
     let timeout_ms = match timeout {
         None => -1,
         Some(duration) => duration.as_millis().min(i32::MAX as u128) as i32,
@@ -1054,15 +1076,11 @@ fn wait_windows_events(
         return Vec::new();
     }
     sockets
-        .into_iter()
+        .iter()
         .enumerate()
         .filter(|(_, socket)| socket.revents != 0)
         .map(|(index, socket)| {
-            let token = if index == 0 {
-                WAKE_TOKEN
-            } else {
-                unique[index - 1].0 as usize
-            };
+            let token = if index == 0 { WAKE_TOKEN } else { socket.fd };
             let interest = if socket.revents & WSA_POLL_ERROR != 0 {
                 Some(IoInterest::ReadWrite)
             } else {
@@ -1210,6 +1228,315 @@ pub fn reset_global_netpoll_for_test() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_snapshot_reuses_storage_and_tracks_live_interests() {
+        let mut poll = RuntimeNetPoll::new();
+        let mut sockets = Vec::new();
+        for count in [1, 1_000, 10_000, 20_000] {
+            for fd in 1..=count {
+                poll.register(IoRegistration::new(fd, fd as u64, IoInterest::Readable));
+            }
+            fill_windows_sockets(&mut sockets, &poll, 0);
+            assert_eq!(sockets.len(), count as usize + 1);
+            let pointer = sockets.as_ptr();
+            let capacity = sockets.capacity();
+            for _ in 0..4 {
+                for socket in &mut sockets {
+                    socket.revents = 123;
+                }
+                fill_windows_sockets(&mut sockets, &poll, 0);
+                assert_eq!(sockets.as_ptr(), pointer);
+                assert_eq!(sockets.capacity(), capacity);
+                assert!(sockets.iter().all(|socket| socket.revents == 0));
+            }
+        }
+        // Fragment the registration table, change interests, then shrink it.
+        for fd in 1..=20_000 {
+            if fd != 7 {
+                poll.remove_task_fd(fd, fd as u64);
+            }
+        }
+        poll.reregister(IoRegistration::new(7, 7, IoInterest::Writable));
+        fill_windows_sockets(&mut sockets, &poll, 42);
+        assert_eq!(sockets.len(), 2);
+        assert_eq!(sockets[0].fd, 42);
+        assert_eq!(sockets[1].events, WSA_POLL_WRITE);
+        poll.register(IoRegistration::new(7, 8, IoInterest::Readable));
+        fill_windows_sockets(&mut sockets, &poll, 42);
+        assert_eq!(sockets[1].events, WSA_POLL_READ | WSA_POLL_WRITE);
+    }
+
+    #[test]
+    fn windows_snapshot_rejects_replacement_and_cancelled_waiters() {
+        for interest in [
+            IoInterest::Readable,
+            IoInterest::Writable,
+            IoInterest::ReadWrite,
+        ] {
+            let mut poll = RuntimeNetPoll::new();
+            poll.register(IoRegistration::new(7, 1, interest));
+            poll.register(IoRegistration::new(7, 2, interest));
+            let limit = poll.next_sequence;
+            assert_eq!(
+                poll.ready_tasks_before(7, Some(interest), limit),
+                vec![1, 2]
+            );
+            poll.remove_task_fd(7, 1);
+            poll.register(IoRegistration::new(7, 1, interest));
+            poll.register(IoRegistration::new(7, 3, interest));
+            assert_eq!(poll.ready_tasks_before(7, Some(interest), limit), vec![2]);
+            poll.remove_task_fd(7, 2);
+            // Includes disconnect/error (ReadWrite), cancel and same-task fd reuse.
+            assert!(
+                poll.ready_tasks_before(7, Some(IoInterest::ReadWrite), limit)
+                    .is_empty()
+            );
+            assert_eq!(
+                poll.ready_tasks_before(7, None, poll.next_sequence),
+                vec![1, 3]
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_snapshot_native_read_write_disconnect() {
+        use std::io::{Read, Write};
+        use std::os::windows::io::AsRawSocket;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let wake = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let fd = server.as_raw_socket() as i64;
+        let mut poll = RuntimeNetPoll::new();
+        let mut sockets = Vec::new();
+        poll.register(IoRegistration::new(fd, 1, IoInterest::Readable));
+        poll.register(IoRegistration::new(fd, 2, IoInterest::Writable));
+        fill_windows_sockets(&mut sockets, &poll, wake.as_raw_socket() as usize);
+        let events = wait_windows_events(&mut sockets, Some(Duration::from_secs(1)));
+        assert_eq!(poll.tasks_for_ready_events(events), vec![2]);
+        poll.remove_task_fd(fd, 2);
+        client.write_all(&[1]).unwrap();
+        fill_windows_sockets(&mut sockets, &poll, wake.as_raw_socket() as usize);
+        let limit = poll.next_sequence;
+        let events = wait_windows_events(&mut sockets, Some(Duration::from_secs(1)));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            poll.ready_tasks_before(events[0].token, events[0].interest, limit),
+            vec![1]
+        );
+        poll.purge_task(1);
+        poll.register(IoRegistration::new(fd, 3, IoInterest::Readable));
+        assert!(
+            poll.ready_tasks_before(events[0].token, events[0].interest, limit)
+                .is_empty()
+        );
+        server.read_exact(&mut [0]).unwrap();
+        drop(client);
+        fill_windows_sockets(&mut sockets, &poll, wake.as_raw_socket() as usize);
+        let events = wait_windows_events(&mut sockets, Some(Duration::from_secs(1)));
+        assert_eq!(poll.tasks_for_ready_events(events), vec![3]);
+    }
+
+    // One outstanding datagram at a time. The clock and poll/receive operation
+    // are injected so delayed delivery and deadlines are tested deterministically.
+    fn measurement_receive_pending(
+        deadline: Duration,
+        mut elapsed: impl FnMut() -> Duration,
+        mut poll_receive: impl FnMut() -> std::io::Result<bool>,
+    ) -> std::io::Result<(usize, Duration)> {
+        let mut polls = 0;
+        loop {
+            if elapsed() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "WSAPoll measurement datagram delivery deadline exceeded",
+                ));
+            }
+            polls += 1;
+            match poll_receive() {
+                Ok(true) => return Ok((polls, elapsed())),
+                Ok(false) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[test]
+    fn windows_measurement_delayed_receipt_counts_every_poll() {
+        let mut steps = [
+            Ok(false),
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            Ok(false),
+            Ok(true),
+        ]
+        .into_iter();
+        let mut time = 0;
+        let (polls, latency) = measurement_receive_pending(
+            Duration::from_millis(10),
+            || {
+                time += 1;
+                Duration::from_millis(time)
+            },
+            || steps.next().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(polls, 4);
+        assert_eq!(latency, Duration::from_millis(5));
+        assert!(steps.next().is_none());
+    }
+
+    #[test]
+    fn windows_measurement_missing_receipt_has_bounded_deadline() {
+        let mut time = 0;
+        let mut polls = 0;
+        let error = measurement_receive_pending(
+            Duration::from_millis(4),
+            || {
+                time += 1;
+                Duration::from_millis(time)
+            },
+            || {
+                polls += 1;
+                Ok(false)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(polls, 3);
+        let error = measurement_receive_pending(
+            Duration::from_secs(1),
+            || Duration::ZERO,
+            || Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// Run on Windows with --ignored --nocapture. No network peers or external services.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "manual Windows WSAPoll scale measurement"]
+    fn windows_wsapoll_scale_measurement() {
+        use std::os::windows::io::AsRawSocket;
+        use std::time::Instant;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn GetProcessTimes(
+                process: *mut std::ffi::c_void,
+                creation: *mut u64,
+                exit: *mut u64,
+                kernel: *mut u64,
+                user: *mut u64,
+            ) -> i32;
+        }
+        fn cpu_ns() -> u64 {
+            let (mut creation, mut exit, mut kernel, mut user) = (0, 0, 0, 0);
+            assert_ne!(
+                unsafe {
+                    GetProcessTimes(
+                        GetCurrentProcess(),
+                        &mut creation,
+                        &mut exit,
+                        &mut kernel,
+                        &mut user,
+                    )
+                },
+                0
+            );
+            (kernel + user) * 100
+        }
+        for count in [1, 1_000, 10_000, 10_001] {
+            let receivers: Vec<_> = (0..count)
+                .map(|_| {
+                    let socket = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+                    socket.set_nonblocking(true).unwrap();
+                    socket
+                })
+                .collect();
+            let sender = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            let wake = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            let mut poll = RuntimeNetPoll::new();
+            for (index, socket) in receivers.iter().enumerate() {
+                poll.register(IoRegistration::new(
+                    socket.as_raw_socket() as i64,
+                    index as u64 + 1,
+                    IoInterest::Readable,
+                ));
+            }
+            for every in [1, 10, 100] {
+                for reuse in [false, true] {
+                    let mut sockets = Vec::new();
+                    fill_windows_sockets(&mut sockets, &poll, wake.as_raw_socket() as usize);
+                    let mut latencies = Vec::new();
+                    let mut wakes = 0;
+                    let cpu = cpu_ns();
+                    let start = Instant::now();
+                    let mut polls = 0;
+                    for iteration in 0..1_000 {
+                        let pending = if iteration % every == 0 {
+                            let sent = Instant::now();
+                            sender
+                                .send_to(&[1], receivers[0].local_addr().unwrap())
+                                .unwrap();
+                            Some(sent)
+                        } else {
+                            None
+                        };
+                        let mut poll_receive = || -> std::io::Result<bool> {
+                            if !reuse {
+                                sockets = Vec::new();
+                            }
+                            fill_windows_sockets(
+                                &mut sockets,
+                                &poll,
+                                wake.as_raw_socket() as usize,
+                            );
+                            let events = wait_windows_events(&mut sockets, Some(Duration::ZERO));
+                            wakes += events.len();
+                            if pending.is_some()
+                                && events.iter().any(|event| {
+                                    event.token == receivers[0].as_raw_socket() as usize
+                                })
+                            {
+                                let mut byte = [0];
+                                let received = receivers[0].recv(&mut byte)?;
+                                assert_eq!(received, 1);
+                                Ok(true)
+                            } else {
+                                Ok(false)
+                            }
+                        };
+                        if let Some(sent) = pending {
+                            let (attempts, latency) = measurement_receive_pending(
+                                Duration::from_secs(5),
+                                || sent.elapsed(),
+                                &mut poll_receive,
+                            )
+                            .expect("pending measurement datagram must arrive within five seconds");
+                            polls += attempts;
+                            latencies.push(latency.as_nanos());
+                        } else {
+                            poll_receive().unwrap();
+                            polls += 1;
+                        }
+                    }
+                    let elapsed = start.elapsed();
+                    let cpu = cpu_ns() - cpu;
+                    latencies.sort_unstable();
+                    println!(
+                        "sockets={count} wake_every={every} reuse={reuse} polls={polls} polls_per_s={} wakes={wakes} latency_p50_ns={} latency_p99_ns={} cpu_ns={cpu}",
+                        polls as f64 / elapsed.as_secs_f64(),
+                        latencies[latencies.len() / 2],
+                        latencies[(latencies.len() * 99 / 100).min(latencies.len() - 1)]
+                    );
+                }
+            }
+        }
+    }
+
     use super::*;
     #[cfg(any(unix, windows))]
     use crate::async_frame::{async_frame_slot_offset, willow_async_frame_alloc};

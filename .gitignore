@@ -253,3 +253,6 @@ AGENTS.md
 !/docs/audits/willow-r52c.19.md
 !/docs/audits/willow-r52c.19-measurements.txt
 !/docs/audits/willow-r52c.19-reproduce.sh
+
+# Public WSAPoll implementation audit and reproduction commands.
+!/docs/audits/willow-r52c.18-wsapoll.md
