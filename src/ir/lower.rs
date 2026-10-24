@@ -279,21 +279,28 @@ impl<'a> PartialCheckerTables<'a> {
     /// that declares its own (willow-nvi6). `None` leaves `name` to the
     /// ordinary normalization.
     fn receiver_spelling(&self, name: &str) -> Option<String> {
+        // The kind too: a receiver class and the scope's own interface can
+        // share one bare identity.
         let identity = |name: &str| {
             let symbols = self.symbols?;
-            (self.enum_identity(name))
-                .or_else(|| symbols.lookup_class(name).map(|info| info.name.as_str()))
+            (self.enum_identity(name).map(|id| (id, 0)))
+                .or_else(|| {
+                    symbols
+                        .lookup_class(name)
+                        .map(|info| (info.name.as_str(), 1))
+                })
                 .or_else(|| {
                     symbols
                         .lookup_interface(name)
-                        .map(|info| info.name.as_str())
+                        .map(|info| (info.name.as_str(), 2))
                 })
         };
-        let target = identity(name)?;
+        let resolved = identity(name)?;
+        let target = resolved.0;
         if target == name || target.contains("::") || target.starts_with('$') {
             return None;
         }
-        (identity(target)? != target).then(|| crate::semantic::ids::foreign_receiver_name(target))
+        (identity(target)? != resolved).then(|| crate::semantic::ids::foreign_receiver_name(target))
     }
 
     /// The identity this checker gave the enum written `name` here.

@@ -1112,6 +1112,8 @@ impl TypeChecker {
             );
             return;
         };
+        // Lowering requires a checked type for every argument, the literal too.
+        self.check_expr(&first.expr);
 
         let segments = match crate::interpolate::parse_spec(spec) {
             Ok(segments) => segments,

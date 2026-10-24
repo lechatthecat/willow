@@ -118,6 +118,7 @@ fn cleanup_nested_flush_preserves_outer_scope_and_panic_parent() {
             register(2),
             LirInst::FlushDefers {
                 sites: vec![LirDeferId(2), LirDeferId(1)],
+                scopes: 2,
             },
             leave(0),
         ],
@@ -150,6 +151,7 @@ fn cleanup_flush_rejects_non_suffix_unknown_and_incomplete_sites() {
                 inner,
                 LirInst::FlushDefers {
                     sites: sites.into_iter().map(LirDeferId).collect(),
+                    scopes: 1,
                 },
             ],
             Terminator::Return(None),
@@ -163,10 +165,73 @@ fn cleanup_flush_rejects_non_suffix_unknown_and_incomplete_sites() {
         0,
         vec![LirInst::FlushDefers {
             sites: vec![LirDeferId(0)],
+            scopes: 1,
         }],
         Terminator::Return(None),
     )]);
     assert!(CleanupGraph::lower(&no_owner).is_err());
+}
+
+#[test]
+fn cleanup_flush_rejects_sites_of_scopes_it_does_not_leave() {
+    // Leaving only the inner scope must not claim the outer scope's site.
+    let graph = function(vec![block(
+        0,
+        vec![
+            enter(0, None),
+            enter(1, None),
+            LirInst::FlushDefers {
+                sites: vec![LirDeferId(1), LirDeferId(0)],
+                scopes: 1,
+            },
+        ],
+        Terminator::Return(None),
+    )]);
+    assert_eq!(
+        CleanupGraph::lower(&graph).unwrap_err(),
+        "cleanup flush sites are not a complete active scope suffix"
+    );
+}
+
+#[test]
+fn cleanup_flush_leaves_only_the_counted_siteless_scopes() {
+    // `lock` scopes have no sites. A `break` out of the inner one must leave
+    // exactly that scope, so the loop exit agrees with its fallthrough edge
+    // and the enclosing siteless scope stays open.
+    let siteless = || LirInst::EnterDeferScope {
+        sites: vec![],
+        resume: None,
+        lock: None,
+    };
+    let graph = CleanupGraph::lower(&function(vec![
+        block(0, vec![siteless(), siteless()], branch(1, 2)),
+        block(
+            1,
+            vec![LirInst::FlushDefers {
+                sites: vec![],
+                scopes: 1,
+            }],
+            Terminator::Jump(BlockId(3)),
+        ),
+        block(
+            2,
+            vec![LirInst::LeaveDeferScope { sites: vec![] }],
+            Terminator::Jump(BlockId(3)),
+        ),
+        block(
+            3,
+            vec![LirInst::LeaveDeferScope { sites: vec![] }],
+            Terminator::Return(None),
+        ),
+    ]))
+    .unwrap();
+    assert_eq!(graph.entries[3], Some(RootScopeId(0)));
+    let flush = graph.exits[&(1, 0)];
+    assert_eq!(
+        (flush.from, flush.to, flush.scopes),
+        (Some(RootScopeId(1)), Some(RootScopeId(0)), 1)
+    );
+    assert_eq!(graph.exits[&(3, 0)].to, None);
 }
 
 #[test]
@@ -326,6 +391,7 @@ fn cleanup_flush_accepts_complete_suffix_with_duplicate_requests() {
             register(1),
             LirInst::FlushDefers {
                 sites: vec![LirDeferId(1), LirDeferId(1)],
+                scopes: 1,
             },
             leave(0),
         ],

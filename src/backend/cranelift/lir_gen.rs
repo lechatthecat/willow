@@ -15007,8 +15007,10 @@ fn f(n: i64) -> Result<i64, String> {
             terminator,
             recovery: Vec::new(),
         };
+        // Siteless, so the balanced graph needs no registration body: only the
+        // scope's openness differs between the two edges.
         let enter = LirInst::EnterDeferScope {
-            sites: vec![(crate::ir::lowered::LirDeferId(0), Span::dummy())],
+            sites: Vec::new(),
             resume: None,
             lock: None,
         };

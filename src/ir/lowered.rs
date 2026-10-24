@@ -512,6 +512,9 @@ pub(crate) enum SourceInst {
     /// `return`, `break` or `continue` that leaves their scopes.
     FlushDefers {
         sites: Vec<LirDeferId>,
+        /// Innermost open scopes this exit leaves. Explicit because a `lock`
+        /// scope has no sites, so the sites alone cannot say where it stops.
+        scopes: usize,
     },
     /// The end of the lexical scope that declared `locals` (willow-0g8j.3.3).
     ///
@@ -4193,15 +4196,19 @@ impl Builder {
 
     /// Register one `FlushDefers` for the scopes in `from..to`, newest last.
     fn flush_defer_scopes(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
         let mut sites = Vec::new();
         for scope in &self.defer_scopes[from..to] {
             let mut scope_sites: Vec<_> = scope.values().copied().collect();
             scope_sites.sort_unstable();
             sites.extend(scope_sites);
         }
-        if !sites.is_empty() {
-            self.push(SourceInst::FlushDefers { sites });
-        }
+        self.push(SourceInst::FlushDefers {
+            sites,
+            scopes: to - from,
+        });
     }
 
     fn lower_stmt(&mut self, stmt: &HirStmt) {
@@ -5019,7 +5026,9 @@ fn format_inst(inst: &SourceInst) -> String {
         SourceInst::LeaveDeferScope { sites } => {
             format!("leave defer scope ({} sites);", sites.len())
         }
-        SourceInst::FlushDefers { sites } => format!("flush defers ({} sites);", sites.len()),
+        SourceInst::FlushDefers { sites, scopes } => {
+            format!("flush defers ({} sites, {scopes} scopes);", sites.len())
+        }
         SourceInst::ClearScopeRoots { locals } => {
             let names = locals
                 .iter()

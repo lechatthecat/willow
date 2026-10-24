@@ -208,6 +208,7 @@ pub enum LirInst {
     },
     FlushDefers {
         sites: Vec<LirDeferId>,
+        scopes: usize,
     },
     ClearScopeRoots {
         locals: Vec<LirLocalId>,
@@ -471,7 +472,9 @@ pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
                                 lock,
                             },
                             I::LeaveDeferScope { sites } => LirInst::LeaveDeferScope { sites },
-                            I::FlushDefers { sites } => LirInst::FlushDefers { sites },
+                            I::FlushDefers { sites, scopes } => {
+                                LirInst::FlushDefers { sites, scopes }
+                            }
                             I::ClearScopeRoots { locals } => LirInst::ClearScopeRoots { locals },
                             I::Defer { id, body, span } => {
                                 let child = next_id;

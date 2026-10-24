@@ -1187,6 +1187,14 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/sync_field_identity/src/main.wi",
             "7\n8000\n16000\n24000\n",
         ),
+        ("example/async_compute_quantum.wi", "213177131\n"),
+        ("example/default_body_fanout.wi", "792\n"),
+        (
+            "example/cleanup_cfg.wi",
+            "0\n1\n90\n-1\n0\n1\n90\n1\nrecovered\nresumed\n",
+        ),
+        ("example/semantic_facts/main.wi", "42\n"),
+        ("example/semantic_facts/references.wi", "1\n2\n9\n9\n"),
     ]
 }
 

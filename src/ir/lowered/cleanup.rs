@@ -132,14 +132,11 @@ pub struct Scope {
     pub location: (usize, usize),
     pub entry_state: Option<CleanupStateId>,
     pub parent_state: Option<CleanupStateId>,
-    nonempty_state: Option<CleanupStateId>,
     pub parent: Option<RootScopeId>,
     pub sites: Vec<LirDeferId>,
     pub recovery: Option<BlockId>,
     pub panic: PanicTarget,
     site_set: HashSet<LirDeferId>,
-    depth: usize,
-    nonempty_ancestor: Option<RootScopeId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -208,14 +205,11 @@ impl CleanupGraph {
                         location: (block_index, position),
                         entry_state: None,
                         parent_state: None,
-                        nonempty_state: None,
                         parent: None,
                         sites: unique_sites,
                         recovery: *resume,
                         panic: PanicTarget::Propagate,
                         site_set,
-                        depth: 0,
-                        nonempty_ancestor: None,
                     });
                 }
                 if let LirInst::Defer { id, .. } = instruction
@@ -250,28 +244,7 @@ impl CleanupGraph {
                 match instruction {
                     LirInst::EnterDeferScope { resume, lock, .. } => {
                         let id = graph.enters[&(index, position)];
-                        let (depth, nonempty_ancestor) = scope.map_or((1, None), |parent| {
-                            let ancestor = &graph.scopes[parent.0];
-                            (
-                                ancestor.depth + 1,
-                                if ancestor.sites.is_empty() {
-                                    ancestor.nonempty_ancestor
-                                } else {
-                                    Some(parent)
-                                },
-                            )
-                        });
                         graph.scopes[id.0].parent_state = state;
-                        graph.scopes[id.0].nonempty_state = state.and_then(|parent| {
-                            let ancestor = &graph.scopes[graph.states[parent.0].scope.0];
-                            if ancestor.sites.is_empty() {
-                                ancestor.nonempty_state
-                            } else {
-                                Some(parent)
-                            }
-                        });
-                        graph.scopes[id.0].depth = depth;
-                        graph.scopes[id.0].nonempty_ancestor = nonempty_ancestor;
                         graph.scopes[id.0].parent = scope;
                         graph.scopes[id.0].panic =
                             scope.map_or(PanicTarget::Propagate, PanicTarget::Scope);
@@ -328,33 +301,22 @@ impl CleanupGraph {
                             },
                         );
                     }
-                    LirInst::FlushDefers { sites } => {
-                        let mut sites: HashSet<_> = sites.iter().copied().collect();
+                    LirInst::FlushDefers { sites, scopes } => {
+                        let requested: HashSet<_> = sites.iter().copied().collect();
+                        let mut covered = HashSet::new();
                         let from = scope;
                         let from_state = state;
-                        while let Some(id) = scope {
-                            let current = &graph.scopes[id.0];
-                            if current.sites.is_empty() {
-                                state = current.nonempty_state;
-                                scope = state.map(|id| graph.states[id.0].scope);
-                                continue;
-                            }
-                            if !current.site_set.iter().all(|site| sites.contains(site)) {
-                                break;
-                            }
-                            for site in &current.site_set {
-                                sites.remove(site);
-                            }
+                        for _ in 0..*scopes {
+                            let id = scope.ok_or("cleanup scope underflow")?;
+                            covered.extend(graph.scopes[id.0].site_set.iter().copied());
                             state = graph.states[state.expect("active scope has state").0].parent;
                             scope = state.map(|id| graph.states[id.0].scope);
                         }
-                        if !sites.is_empty() {
+                        if requested != covered {
                             return Err(
                                 "cleanup flush sites are not a complete active scope suffix",
                             );
                         }
-                        let scopes = from.map_or(0, |id| graph.scopes[id.0].depth)
-                            - scope.map_or(0, |id| graph.scopes[id.0].depth);
                         let next = regions.len();
                         let region = *regions
                             .entry((from_state, state))
@@ -365,7 +327,7 @@ impl CleanupGraph {
                                 region,
                                 from,
                                 to: scope,
-                                scopes,
+                                scopes: *scopes,
                             },
                         );
                     }
