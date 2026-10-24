@@ -41,7 +41,7 @@ JRE-only images such as Ubuntu's `openjdk-26-jre-headless`.
 
 ## Scheduler benchmarks
 
-This suite compares equivalent scheduler operations with Willow and Go 1.27.0.
+This suite compares equivalent scheduler operations in Willow, Go and Java (virtual threads).
 It uses 8 workers (`WILLOW_WORKERS=8`, `GOMAXPROCS=8`) to match the machine's
 physical core count. RSS is read externally from `/proc/<pid>/status`; benchmark
 timings use the harness's monotonic clock and markers printed by each process.
@@ -95,8 +95,8 @@ runs made under different worker counts, power profiles, or background load.
 
 `run_sync.py` follows the whole-program method in the
 [referenced Qiita article](https://qiita.com/hanaata/items/c91788bcac2a40f1bb05)
-and compares five equivalent, single-main-thread workloads using release-built
-Willow and Go binaries:
+and compares seventeen equivalent, single-main-thread workloads using
+release-built Willow and Go binaries and the Java classes (`--languages`):
 
 - `leibniz_pow`: the Qiita article's Leibniz-series expression, including terms
   0 through 100,000,000 and computing the alternating sign with exponentiation.
@@ -134,7 +134,7 @@ operation each, and four more target the allocator, the map and dispatch:
 
 The harness validates every result, alternates language launch order, and uses
 five fresh-process trials by default. Python's monotonic clock measures wall
-time; GNU `time` supplies process user/system time and peak RSS. Both runtimes
+time; GNU `time` supplies process user/system time and peak RSS. All runtimes
 receive a worker limit of eight for consistency with the scheduler suite,
 although the benchmark body itself is synchronous.
 

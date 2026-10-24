@@ -116,6 +116,13 @@ def json_lines(text: str) -> list[Row]:
     return [json.loads(line) for line in text.splitlines() if line.startswith("{")]
 
 
+def split_environment(records: list[Row]) -> tuple[dict[str, str] | None, list[Row]]:
+    """Separate the measurement-time environment record that `run` writes first."""
+    env = next((r for r in records if r.get("record") == "environment"), None)
+    rows = [r for r in records if r.get("record") != "environment"]
+    return (None if env is None else {k: str(v) for k, v in env.items() if k != "record"}), rows
+
+
 def run_suites(args: argparse.Namespace) -> list[Row]:
     rows: list[Row] = []
     if not args.no_build and "willow" in args.languages:
@@ -212,7 +219,14 @@ def languages_in(rows: list[Row]) -> list[str]:
     return [language for language in LANGUAGES if language in seen]
 
 
-def render(rows: list[Row], label: str, baseline: list[Row] | None, workers: int, jsonl_name: str) -> str:
+def render(
+    rows: list[Row],
+    label: str,
+    baseline: list[Row] | None,
+    workers: int,
+    jsonl_name: str,
+    env: dict[str, str] | None,
+) -> str:
     g = group(rows)
     b = group(baseline) if baseline else {}
     langs = languages_in(rows)
@@ -220,7 +234,11 @@ def render(rows: list[Row], label: str, baseline: list[Row] | None, workers: int
     others = [l for l in langs if l != "willow"]
     present = [c for c in ORDER if any((c, l) in g for l in langs)]
     trials = sorted({len(v) for v in g.values()})
-    env = environment()
+    # JSONL files written before the environment record existed fall back to
+    # the current checkout, labelled as such.
+    when = "at measurement time"
+    if env is None:
+        env, when = environment(), "at report time; the JSONL has no environment record"
     out: list[str] = []
 
     def med(case: str, lang: str, key: str) -> float | None:
@@ -233,7 +251,7 @@ def render(rows: list[Row], label: str, baseline: list[Row] | None, workers: int
         return fmt(None if value is None else value / 1e6, digits)
 
     out.append(f"# {' vs '.join(names)} measurement — {label}\n")
-    out.append(f"- Commit: `{env['commit']}` (working tree {env['dirty']} at report time).")
+    out.append(f"- Commit: `{env['commit']}` (working tree {env['dirty']} {when}).")
     out.append(f"- {env['cpu']}, {env['cores']} logical CPUs; {env['os']}.")
     toolchains = ["release Willow compiler and benchmark binaries" if "willow" in langs else None,
                   env["go"] if "go" in langs else None,
@@ -433,19 +451,21 @@ def main() -> None:
         args.languages = [l for l in dict.fromkeys(p.strip() for p in args.languages.split(",")) if l]
         if not args.languages or any(l not in LANGUAGES for l in args.languages):
             parser.error(f"--languages must name one or more of {','.join(LANGUAGES)}")
+        env = environment()
         rows = run_suites(args)
         args.out_dir.mkdir(parents=True, exist_ok=True)
         jsonl = args.out_dir / f"MEASUREMENT_{args.label}.jsonl"
-        jsonl.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+        records = [{"record": "environment", **env}, *rows]
+        jsonl.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in records))
         md = args.out_dir / f"MEASUREMENT_{args.label}.md"
         label = args.label
     else:
         jsonl = args.jsonl
-        rows = json_lines(jsonl.read_text())
+        env, rows = split_environment(json_lines(jsonl.read_text()))
         label = args.label or jsonl.stem.removeprefix("MEASUREMENT_")
         md = args.out or jsonl.with_suffix(".md")
-    baseline = json_lines(args.baseline.read_text()) if args.baseline else None
-    md.write_text(render(rows, label, baseline, args.workers, jsonl.name))
+    baseline = split_environment(json_lines(args.baseline.read_text()))[1] if args.baseline else None
+    md.write_text(render(rows, label, baseline, args.workers, jsonl.name, env))
     print(md)
     print(md.read_text())
 

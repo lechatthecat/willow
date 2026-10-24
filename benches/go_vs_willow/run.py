@@ -11,6 +11,7 @@ import queue
 import shutil
 import statistics
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -32,8 +33,7 @@ RESULT_METRICS = frozenset({"KEPT_OBJECTS", "RECEIVED", "CANCELLED", "LEAVES"})
 def build(languages: tuple[str, ...] = DEFAULT_LANGUAGES) -> None:
     BUILD.mkdir(exist_ok=True)
     if "willow" in languages:
-        if not WILLOWC.exists():
-            subprocess.run(["cargo", "build", "--release", "--bin", "willow"], cwd=ROOT, check=True)
+        subprocess.run(["cargo", "build", "--release", "--bin", "willow"], cwd=ROOT, check=True)
         for source in (SUITE / "willow").glob("*.wi"):
             subprocess.run(
                 [str(WILLOWC), "build", str(source), "-o", str(BUILD / source.stem), "--release"],
@@ -84,14 +84,28 @@ def one_run(language: str, benchmark: str, values: list[int], workers: int) -> d
     env = os.environ.copy()
     env["GOMAXPROCS"] = str(workers)
     env["WILLOW_WORKERS"] = str(workers)
-    process = subprocess.Popen(
-        command(language, benchmark, values, workers),
-        cwd=ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,
-    )
+    # stderr goes to a file so a full stderr pipe cannot block the child.
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(
+            command(language, benchmark, values, workers),
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=errors,
+            bufsize=0,
+        )
+        output, markers, cpu, rss = collect(process, language, benchmark, values)
+        return_code = process.wait()
+        errors.seek(0)
+        stderr = errors.read().decode(errors="replace")
+    if return_code != 0:
+        raise RuntimeError(f"{language} exited {return_code}: {stderr}\nstdout: {output}")
+    return summarize(language, benchmark, values, output, markers, cpu, rss)
+
+
+def collect(
+    process: subprocess.Popen[bytes], language: str, benchmark: str, values: list[int]
+) -> tuple[list[str], dict[str, int], dict[str, int], dict[str, int]]:
     assert process.stdout is not None
     lines: queue.Queue[tuple[int, bytes] | None] = queue.Queue()
 
@@ -129,11 +143,18 @@ def one_run(language: str, benchmark: str, values: list[int], workers: int) -> d
                 cpu[value] = cpu_runtime_ns(process.pid)
             if value in {"BASELINE", "READY"}:
                 rss[value] = rss_bytes(process.pid)
-    stderr = process.stderr.read().decode() if process.stderr is not None else ""
-    return_code = process.wait()
-    if return_code != 0:
-        raise RuntimeError(f"{language} exited {return_code}: {stderr}\nstdout: {output}")
+    return output, markers, cpu, rss
 
+
+def summarize(
+    language: str,
+    benchmark: str,
+    values: list[int],
+    output: list[str],
+    markers: dict[str, int],
+    cpu: dict[str, int],
+    rss: dict[str, int],
+) -> dict[str, float | int | str]:
     result: dict[str, float | int | str] = {
         "language": language,
         "benchmark": benchmark,
