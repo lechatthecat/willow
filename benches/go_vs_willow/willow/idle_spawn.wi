@@ -1,0 +1,34 @@
+async fn idle_worker(gate: Channel<i64>) {
+    gate.recv();
+}
+
+fn benchmark_count() -> i64 {
+    let value = env::arg(0).unwrap();
+    if value == "100" { return 100; }
+    if value == "1000" { return 1000; }
+    if value == "10000" { return 10000; }
+    if value == "100000" { return 100000; }
+    if value == "1000000" { return 1000000; }
+    return 1000;
+}
+
+async fn main() {
+    let count = benchmark_count();
+    let gate = Channel<i64>::new();
+
+    await sleep(500);
+    println("BASELINE");
+    println("SPAWN_START");
+    let mut i = 0;
+    while i < count {
+        idle_worker(gate);
+        i = i + 1;
+    }
+    println("SPAWN_DONE");
+
+    // Give every eager task enough time to run once and park on the channel.
+    await sleep(1000);
+    println(gc_allocated_bytes());
+    println("READY");
+    await sleep(1000);
+}

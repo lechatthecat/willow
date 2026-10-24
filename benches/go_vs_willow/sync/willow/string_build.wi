@@ -1,0 +1,14 @@
+// 2,000,000 short strings: two integer-to-decimal conversions and three
+// concatenations each; the summed byte length keeps every string live.
+fn main() {
+    let mut total: i64 = 0;
+    println("START");
+    let mut i: i64 = 0;
+    while i < 2000000 {
+        let s = "k" + i.toString() + ":" + (i * 7).toString();
+        total = total + s.len();
+        i = i + 1;
+    }
+    println("END");
+    println(total);
+}

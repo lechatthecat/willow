@@ -1,0 +1,16 @@
+// 20,000 cycles of 1,024 exactly representable bases. Nonintegral exponent
+// exercises the general kernel, not binary exponentiation or sqrt.
+fn main() {
+    let mut i: i64 = 0;
+    let mut x: f64 = 1.125;
+    let mut sum: f64 = 0.0;
+    while i < 20480000 {
+        sum = sum + x ** 0.375;
+        x = x + 0.0009765625;
+        if x >= 2.125 {
+            x = 1.125;
+        }
+        i = i + 1;
+    }
+    println(sum);
+}

@@ -1,0 +1,23 @@
+import std::collections::Map;
+
+fn main() {
+    let mut table: Map<i64, i64> = Map::new();
+    println("START");
+    let mut i: i64 = 0;
+    while i < 1000000 {
+        table.insert(i * 2654435761, i);
+        i = i + 1;
+    }
+    let mut sum: i64 = 0;
+    i = 0;
+    while i < 2000000 {
+        let found = match table.get(i * 2654435761) {
+            Option::Some(value) => value,
+            Option::None => 1,
+        };
+        sum = sum + found;
+        i = i + 1;
+    }
+    println("END");
+    println(sum);
+}

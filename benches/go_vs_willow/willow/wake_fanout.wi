@@ -1,0 +1,78 @@
+import std::collections::Array;
+
+async fn parked_worker(wake: Channel<i64>, done: Channel<i64>) {
+    wake.recv();
+    done.send(1);
+}
+
+fn benchmark_count() -> i64 {
+    let value = env::arg(0).unwrap();
+    if value == "100" { return 100; }
+    if value == "1000" { return 1000; }
+    if value == "10000" { return 10000; }
+    if value == "100000" { return 100000; }
+    return 1000;
+}
+
+async fn main() {
+    let count = benchmark_count();
+    let wakes: Array<Channel<i64>> = [];
+    let done = Channel<i64>::new();
+    let mut i = 0;
+    while i < count {
+        let wake = Channel<i64>::with_capacity(1);
+        wakes.push(wake);
+        parked_worker(wake, done);
+        i = i + 1;
+    }
+
+    await sleep(1000);
+    let before_local_pop_hits = sched_local_pop_hits();
+    let before_global_pop_hits = sched_global_pop_hits();
+    let before_global_pop_attempts = sched_global_pop_attempts();
+    let before_steal_attempts = sched_steal_attempts();
+    let before_steal_successes = sched_steal_successes();
+    let before_steal_failures = sched_steal_failures();
+    let before_victim_locks = sched_victim_locks();
+    let before_global_pushes = sched_global_pushes();
+    let before_local_pushes = sched_local_pushes();
+    println("START");
+    i = 0;
+    while i < count {
+        wakes[i].send(1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < count {
+        done.recv();
+        i = i + 1;
+    }
+    println("END");
+    let measured_local_pop_hits = sched_local_pop_hits() - before_local_pop_hits;
+    let measured_global_pop_hits = sched_global_pop_hits() - before_global_pop_hits;
+    let measured_global_pop_attempts = sched_global_pop_attempts() - before_global_pop_attempts;
+    let measured_steal_attempts = sched_steal_attempts() - before_steal_attempts;
+    let measured_steal_successes = sched_steal_successes() - before_steal_successes;
+    let measured_steal_failures = sched_steal_failures() - before_steal_failures;
+    let measured_victim_locks = sched_victim_locks() - before_victim_locks;
+    let measured_global_pushes = sched_global_pushes() - before_global_pushes;
+    let measured_local_pushes = sched_local_pushes() - before_local_pushes;
+    println("WILLOW_SCHED_LOCAL_POP_HITS");
+    println(measured_local_pop_hits);
+    println("WILLOW_SCHED_GLOBAL_POP_HITS");
+    println(measured_global_pop_hits);
+    println("WILLOW_SCHED_GLOBAL_POP_ATTEMPTS");
+    println(measured_global_pop_attempts);
+    println("WILLOW_SCHED_STEAL_ATTEMPTS");
+    println(measured_steal_attempts);
+    println("WILLOW_SCHED_STEAL_SUCCESSES");
+    println(measured_steal_successes);
+    println("WILLOW_SCHED_STEAL_FAILURES");
+    println(measured_steal_failures);
+    println("WILLOW_SCHED_VICTIM_LOCKS");
+    println(measured_victim_locks);
+    println("WILLOW_SCHED_GLOBAL_PUSHES");
+    println(measured_global_pushes);
+    println("WILLOW_SCHED_LOCAL_PUSHES");
+    println(measured_local_pushes);
+}

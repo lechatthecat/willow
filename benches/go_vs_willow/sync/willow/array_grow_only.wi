@@ -1,0 +1,19 @@
+import std::collections::Array;
+
+fn main() {
+    let mut total: i64 = 0;
+    let mut round: i64 = 0;
+    println("START");
+    while round < 1000 {
+        let values: Array<i64> = [];
+        let mut i: i64 = 0;
+        while i < 5000 {
+            values.push(i % 1000);
+            i = i + 1;
+        }
+        total = total + values.len();
+        round = round + 1;
+    }
+    println("END");
+    println(total);
+}

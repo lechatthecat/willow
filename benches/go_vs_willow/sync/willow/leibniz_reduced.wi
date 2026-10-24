@@ -1,0 +1,15 @@
+// The same Leibniz workload with the alternating power strength-reduced to a
+// sign flip. This separates loop/arithmetic throughput from pow implementation.
+fn main() {
+    let mut i: i64 = 0;
+    let mut sum: f64 = 0.0;
+    let mut sign: f64 = 1.0;
+    let mut denominator: f64 = 1.0;
+    while i <= 100000000 {
+        sum = sum + sign / denominator;
+        sign = -sign;
+        denominator = denominator + 2.0;
+        i = i + 1;
+    }
+    println(4.0 * sum);
+}

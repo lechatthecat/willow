@@ -1,0 +1,30 @@
+// 1,024 capturing closures in an array, called round-robin through the array
+// so the target is only known at run time. 20,000 rounds (20,480,000 calls).
+import std::collections::Array;
+
+fn adder(n: i64) -> closure(i64) -> i64 {
+    return |x| x + n;
+}
+
+fn main() {
+    let fs: Array<closure(i64) -> i64> = [];
+    let mut i: i64 = 0;
+    while i < 1024 {
+        fs.push(adder(i % 7 + 1));
+        i = i + 1;
+    }
+    let mut sum: i64 = 0;
+    println("START");
+    let mut round: i64 = 0;
+    while round < 20000 {
+        i = 0;
+        while i < 1024 {
+            let f = fs[i];
+            sum = sum + f(i);
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+    println("END");
+    println(sum);
+}

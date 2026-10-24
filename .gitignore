@@ -66,6 +66,21 @@ AGENTS.md
 /benches/runtime_compare/probes/*
 !/benches/runtime_compare/probes/async_frame_safepoint.wi
 !/benches/runtime_compare/probes/run_probe.js
+!/benches/go_vs_willow/
+/benches/go_vs_willow/*
+!/benches/go_vs_willow/.gitignore
+!/benches/go_vs_willow/README.md
+!/benches/go_vs_willow/compare.py
+!/benches/go_vs_willow/run.py
+!/benches/go_vs_willow/run_sync.py
+!/benches/go_vs_willow/javatool.py
+!/benches/go_vs_willow/go/
+!/benches/go_vs_willow/java/
+!/benches/go_vs_willow/willow/
+!/benches/go_vs_willow/sync/
+!/benches/go_vs_willow/MEASUREMENT_2026-10-25.md
+!/benches/go_vs_willow/MEASUREMENT_2026-10-25.jsonl
+!/benches/go_vs_willow/GC_CHURN_RERUN_2026-10-25.jsonl
 
 # Local structured-edit candidates and recovery journals
 .willow-edits/

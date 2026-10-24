@@ -1,0 +1,46 @@
+import std::collections::Array;
+
+async fn node(depth: i64, fanout: i64) -> i64 {
+    if depth == 0 {
+        return 1;
+    }
+    let scope = TaskScope::new();
+    let children: Array<Task<i64>> = [];
+    let mut i = 0;
+    while i < fanout {
+        children.push(scope.add(node(depth - 1, fanout)));
+        i = i + 1;
+    }
+    let mut sum = 0;
+    match await scope.finish() {
+        Ok(done) => { sum = 0; }
+        Err(e) => { sum = -1; }
+    }
+    i = 0;
+    while i < fanout {
+        sum = sum + await children[i];
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn benchmark_value(index: i64) -> i64 {
+    let value = env::arg(index).unwrap();
+    if value == "2" { return 2; }
+    if value == "3" { return 3; }
+    if value == "4" { return 4; }
+    if value == "5" { return 5; }
+    if value == "6" { return 6; }
+    if value == "10" { return 10; }
+    return 2;
+}
+
+async fn main() {
+    let fanout = benchmark_value(0);
+    let depth = benchmark_value(1);
+    println("START");
+    let leaves = await node(depth, fanout);
+    println("END");
+    println("LEAVES");
+    println(leaves);
+}

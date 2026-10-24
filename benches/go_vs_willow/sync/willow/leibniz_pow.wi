@@ -1,0 +1,11 @@
+// Qiita-compatible Leibniz series: use exponentiation exactly as the article's
+// implementations do and include both endpoints, 0 through 100,000,000.
+fn main() {
+    let mut n: f64 = 0.0;
+    let mut sum: f64 = 0.0;
+    while n <= 100000000.0 {
+        sum = sum + ((-1.0) ** n) / (2.0 * n + 1.0);
+        n = n + 1.0;
+    }
+    println(4.0 * sum);
+}

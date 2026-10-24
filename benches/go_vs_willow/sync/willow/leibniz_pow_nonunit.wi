@@ -1,0 +1,12 @@
+// leibniz_pow with a non-unit base. `(-1.0) ** n` lets pow return +/-1
+// without multiplying, so this variant keeps the same loop shape but makes
+// every call do real integral-exponent work. Terms 0 through 100,000,000.
+fn main() {
+    let mut n: f64 = 0.0;
+    let mut sum: f64 = 0.0;
+    while n <= 100000000.0 {
+        sum = sum + ((-1.0000001) ** n) / (2.0 * n + 1.0);
+        n = n + 1.0;
+    }
+    println(4.0 * sum);
+}

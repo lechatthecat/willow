@@ -1,0 +1,63 @@
+import std::collections::Array;
+
+interface Shape {
+    fn area(self) -> i64;
+}
+
+class Square implements Shape {
+    pub side: i64;
+    pub fn area(self) -> i64 { return self.side * self.side; }
+}
+
+class Rect implements Shape {
+    pub width: i64;
+    pub height: i64;
+    pub fn area(self) -> i64 { return self.width * self.height; }
+}
+
+class Triangle implements Shape {
+    pub base: i64;
+    pub height: i64;
+    pub fn area(self) -> i64 { return self.base * self.height / 2; }
+}
+
+class Circle implements Shape {
+    pub radius: i64;
+    pub fn area(self) -> i64 { return 3 * self.radius * self.radius; }
+}
+
+fn main() {
+    let shapes: Array<Shape> = [];
+    let mut i: i64 = 0;
+    while i < 1000 {
+        let kind = i % 4;
+        let n = i % 10 + 1;
+        if kind == 0 {
+            shapes.push(new Square(n));
+        } else {
+            if kind == 1 {
+                shapes.push(new Rect(n, n + 1));
+            } else {
+                if kind == 2 {
+                    shapes.push(new Triangle(n, n + 2));
+                } else {
+                    shapes.push(new Circle(n));
+                }
+            }
+        }
+        i = i + 1;
+    }
+    let mut sum: i64 = 0;
+    println("START");
+    let mut round: i64 = 0;
+    while round < 20000 {
+        i = 0;
+        while i < 1000 {
+            sum = sum + shapes[i].area();
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+    println("END");
+    println(sum);
+}

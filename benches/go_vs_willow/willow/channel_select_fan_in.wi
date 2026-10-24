@@ -1,0 +1,66 @@
+async fn producer(out: Channel<i64>) -> i64 {
+    let mut sent = 0;
+    while true {
+        out.send(1);
+        sent = sent + 1;
+    }
+    return sent;
+}
+
+fn benchmark_count() -> i64 {
+    let value = env::arg(0).unwrap();
+    if value == "1000" { return 1000; }
+    if value == "10000" { return 10000; }
+    if value == "100000" { return 100000; }
+    if value == "1000000" { return 1000000; }
+    return 1000;
+}
+
+async fn main() {
+    let count = benchmark_count();
+    let c0 = Channel<i64>::with_capacity(1);
+    let c1 = Channel<i64>::with_capacity(1);
+    let c2 = Channel<i64>::with_capacity(1);
+    let c3 = Channel<i64>::with_capacity(1);
+    let p0 = producer(c0);
+    let p1 = producer(c1);
+    let p2 = producer(c2);
+    let p3 = producer(c3);
+
+    println("START");
+    let mut received = 0;
+    while received < count {
+        select {
+            let v = c0.recv() => { received = received + v; }
+            let v = c1.recv() => { received = received + v; }
+            let v = c2.recv() => { received = received + v; }
+            let v = c3.recv() => { received = received + v; }
+        }
+    }
+    p0.cancel();
+    p1.cancel();
+    p2.cancel();
+    p3.cancel();
+    let mut stopped = 0;
+    match await p0.result() {
+        Ok(number) => { stopped = stopped + 0; }
+        Err(e) => { stopped = stopped + 1; }
+    }
+    match await p1.result() {
+        Ok(number) => { stopped = stopped + 0; }
+        Err(e) => { stopped = stopped + 1; }
+    }
+    match await p2.result() {
+        Ok(number) => { stopped = stopped + 0; }
+        Err(e) => { stopped = stopped + 1; }
+    }
+    match await p3.result() {
+        Ok(number) => { stopped = stopped + 0; }
+        Err(e) => { stopped = stopped + 1; }
+    }
+    println("END");
+    println("RECEIVED");
+    println(received);
+    println("CANCELLED");
+    println(stopped);
+}

@@ -1,0 +1,13 @@
+import std::collections::Array;
+
+fn main() {
+    println("START");
+    let values: Array<i64> = [];
+    let mut i: i64 = 0;
+    while i < 5000000 {
+        values.push(i % 1000);
+        i = i + 1;
+    }
+    println("END");
+    println(values.len());
+}
