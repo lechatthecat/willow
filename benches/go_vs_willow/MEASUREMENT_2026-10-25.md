@@ -1,6 +1,6 @@
 # Willow vs Go vs Java measurement — 2026-10-25
 
-- Commit: `453fc6cca583cfba36e9df3bbe2d3e2a1dd20c74` (working tree dirty at report time).
+- Commit: `453fc6cca583cfba36e9df3bbe2d3e2a1dd20c74` (working tree clean during the measurement run; this file was later re-rendered from the JSONL after unrelated README/.gitignore edits).
 - AMD Ryzen 7 7800X3D 8-Core Processor, 16 logical CPUs; Linux 7.0.0-38-generic, x86_64.
 - release Willow compiler and benchmark binaries; go version go1.27.0 linux/amd64; openjdk version "26.0.2" 2026-07-21 (default JVM flags plus `-XX:ActiveProcessorCount` and virtual-thread parallelism = workers).
 - Trials per language and case: 5; medians below. `WILLOW_WORKERS=8`, `GOMAXPROCS=8`, JVM processor count 8.
@@ -145,3 +145,4 @@ python3 benches/go_vs_willow/compare.py run --label 2026-10-25 --trials 5 --work
 - **Willow regressions (confirmed by rerun) — willow-bwqq.** `array_grow_only` 31.9 → 59.5 ms (rerun 75.1, +86–135%; sys 0.01 → 0.03–0.04 s, RSS 5.3 → 8.8 MiB), `array_literal_churn` 116.6 → 131.7 ms (rerun 132.9, +13%), `object_churn` 66.6 → 72.7 ms (rerun 72.4, +9%). Go is unchanged on all three. Willow GC counters (minor cycles, moved/promoted objects, TLAB fast allocations/refills, allocated bytes) are identical to the baseline, so the extra time is per-GC/per-refill or page commit cost, not more collections. Cause not yet bisected; candidates are the GC/region commits between `49f1900` and `453fc6c`.
 - **Other languages.** Java `idle_spawn` +10.3% and `spawn_join_tree` +12.7%, Go `array_build_only` +17.8%: not Willow, not rerun; treat as noise.
 - Everything else moved less than ~6%. Sync whole-process cases (`array_sum`, `linked_list`) include startup; their +1–6% is noise.
+- **gc_scheduler Willow GC counters.** In this run `willow/gc_scheduler.wi` printed TLAB, collection, promoted and moved counters as process-lifetime totals (allocated bytes was already a phase delta). The program now prints phase deltas like the churn cases; a 5-trial rerun with the fixed program gave 2 minor / 0 major collections, 1,075,893–1,075,920 TLAB fast allocations, 1,601–1,604 refills and 4,115–4,550 promoted objects, i.e. the same as the table above, because almost nothing is allocated before `START`.

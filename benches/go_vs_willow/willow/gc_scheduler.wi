@@ -28,6 +28,12 @@ async fn main() {
     let count = benchmark_value(0);
     let rounds = benchmark_value(1);
     let done = Channel<i64>::new();
+    let minor_before = gc_minor_collections();
+    let major_before = gc_major_collections();
+    let promoted_before = gc_promoted_objects();
+    let moved_before = gc_moved_objects();
+    let fast_before = gc_tlab_fast_allocations();
+    let refills_before = gc_tlab_refills();
 
     println("START");
     let allocated_before = gc_total_allocated_bytes();
@@ -51,15 +57,15 @@ async fn main() {
     println("WILLOW_LIVE_BYTES");
     println(gc_allocated_bytes());
     println("WILLOW_TLAB_FAST_ALLOCATIONS");
-    println(gc_tlab_fast_allocations());
+    println(gc_tlab_fast_allocations() - fast_before);
     println("WILLOW_TLAB_REFILLS");
-    println(gc_tlab_refills());
+    println(gc_tlab_refills() - refills_before);
     println("WILLOW_MINOR_COLLECTIONS");
-    println(gc_minor_collections());
+    println(gc_minor_collections() - minor_before);
     println("WILLOW_MAJOR_COLLECTIONS");
-    println(gc_major_collections());
+    println(gc_major_collections() - major_before);
     println("WILLOW_PROMOTED_OBJECTS");
-    println(gc_promoted_objects());
+    println(gc_promoted_objects() - promoted_before);
     println("WILLOW_MOVED_OBJECTS");
-    println(gc_moved_objects());
+    println(gc_moved_objects() - moved_before);
 }
