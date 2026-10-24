@@ -235,8 +235,10 @@ pub(super) fn retire_all_tlabs_unindexed(state: &mut GcState) {
 /// Initial mark captures start maps and must not index old-LAB objects while
 /// retiring nursery cursors. Minor and baseline index consumers keep their flush.
 pub(super) fn retire_all_tlabs_unindexed_for_mark(state: &mut GcState) {
-    sync_tlab_accounting_unindexed(state);
+    // Retirement keeps the derived totals continuous, so one sync afterwards
+    // also publishes the fast allocations folded in from retired chunks.
     retire_all_tlab_cursors(state);
+    sync_tlab_accounting_unindexed(state);
 }
 
 fn retire_all_tlab_cursors(state: &mut GcState) {

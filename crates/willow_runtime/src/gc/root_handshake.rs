@@ -36,7 +36,6 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                     "root handshake found undrained SATB work"
                 );
                 retire_all_tlabs_unindexed_for_mark(&mut state);
-                sync_tlab_accounting_unindexed(&mut state);
                 // Chunks appended after this stop receive only post-snapshot,
                 // uncolored TLAB allocations: they stay implicitly black.
                 let late_chunks = state.tlab_chunks.len();
