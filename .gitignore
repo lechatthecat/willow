@@ -306,3 +306,12 @@ AGENTS.md
 !/docs/audits/willow-6fv.5.8.3/audit.md
 !/docs/audits/willow-6fv.5.8.3/measure.py
 !/docs/audits/willow-6fv.5.8.3/measurements.json
+
+# Reviewed public mutator-assist audit and focused reproduction evidence.
+!/docs/audits/willow-6fv.5.8.4/
+/docs/audits/willow-6fv.5.8.4/*
+!/docs/audits/willow-6fv.5.8.4/audit.md
+!/docs/audits/willow-6fv.5.8.4/verify.py
+!/docs/audits/willow-6fv.5.8.4/measure.py
+!/docs/audits/willow-6fv.5.8.4/focused-tests.txt
+!/docs/audits/willow-6fv.5.8.4/measurement.txt

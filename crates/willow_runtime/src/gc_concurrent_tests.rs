@@ -4812,3 +4812,248 @@ fn native_retry_exhaustion_resolves_recovery_without_reclamation() {
     });
     eprintln!("RECOVERY_RETURNED");
 }
+
+#[test]
+fn allocation_assist_progress_latency_and_thread_fairness() {
+    let _guard = runtime_test_guard();
+    for threads in [1usize, 5, 16] {
+        if std::env::var("WILLOW_ASSIST_THREADS")
+            .ok()
+            .is_some_and(|value| value != threads.to_string())
+        {
+            continue;
+        }
+        reset_internal_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.pacer_trigger = u64::MAX;
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let objects = 8192;
+        let mut cycle = ConcurrentCycle::new(
+            (1..=objects).map(|address| {
+                (
+                    address,
+                    raw_heap::TraceMetadata {
+                        type_id: 0,
+                        layout_id: 0,
+                        gc_ref_mask: 0,
+                        payload_size: 0,
+                    },
+                )
+            }),
+            IdSet::default(),
+            IdMap::default(),
+            0,
+        );
+        let runway = 512 * 1024;
+        cycle.assist_pacing = Some(assist::Pacing::new(
+            (objects * GC_HEADER_SIZE) as u64,
+            runway,
+        ));
+        let cycle = Arc::new(cycle);
+        let allocated = AtomicU64::new(0);
+        let completion_bytes = AtomicU64::new(0);
+        cycle.enqueue_satb_batch(&(1..=objects).collect::<Vec<_>>());
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), Some(cycle.clone()));
+        GC_MARK_PHASE.store(1, Ordering::Release);
+        let start = Instant::now();
+        let barrier = std::sync::Barrier::new(threads);
+        let reports = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..threads {
+                let barrier = &barrier;
+                let allocated = &allocated;
+                let completion_bytes = &completion_bytes;
+                let cycle = &cycle;
+                handles.push(scope.spawn(move || {
+                    willow_gc_register_mutator();
+                    assist::CREDITED.set(0);
+                    barrier.wait();
+                    let cpu = crate::gc_telemetry::workers::thread_cpu_ns();
+                    let mut samples = Vec::new();
+                    let mut peak_debt = 0;
+                    for _ in 0..1024 {
+                        let started = Instant::now();
+                        // Exercise the real runtime allocation/assist path.
+                        allocated.fetch_add((1024 + GC_HEADER_SIZE) as u64, Ordering::Relaxed);
+                        assert!(!allocate_object(0, 0, 1024, 0).is_null());
+                        if cycle.queue.snapshot().is_drained() {
+                            let _ = completion_bytes.compare_exchange(
+                                0,
+                                allocated.load(Ordering::Relaxed),
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        samples.push(started.elapsed().as_nanos() as u64);
+                        peak_debt = peak_debt.max(assist::debt_units());
+                    }
+                    let cpu = cpu
+                        .zip(crate::gc_telemetry::workers::thread_cpu_ns())
+                        .map(|(a, b)| b - a);
+                    let work = assist::CREDITED.get();
+                    let debt = assist::debt_units();
+                    willow_gc_unregister_mutator();
+                    assert_eq!(assist::debt_units(), 0);
+                    samples.sort_unstable();
+                    (
+                        work,
+                        debt,
+                        peak_debt,
+                        cpu,
+                        samples[512],
+                        samples[1013],
+                        samples[1023],
+                    )
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            cycle.queue.snapshot().is_drained(),
+            "assist-only marking must finish"
+        );
+        assert_eq!(
+            reports.iter().map(|r| r.0).sum::<u64>(),
+            (objects * GC_HEADER_SIZE) as u64
+        );
+        for (thread, report) in reports.iter().enumerate() {
+            println!(
+                "allocation_assist threads={threads} thread={thread} work_bytes={} debt_q16={} peak_debt_q16={} allocation_cpu_ns={:?} allocation_p50_ns={} allocation_p99_ns={} allocation_max_ns={}",
+                report.0, report.1, report.2, report.3, report.4, report.5, report.6
+            );
+        }
+        let hist = crate::gc_telemetry::observations::snapshot().intervals
+            [crate::gc_telemetry::observations::Kind::Assist as usize];
+        let quantile = |percent: u64| {
+            let rank = (hist.count * percent).div_ceil(100);
+            let mut count = 0;
+            hist.buckets
+                .iter()
+                .position(|n| {
+                    count += n;
+                    count >= rank
+                })
+                .map_or(0, |bucket| {
+                    1u64.checked_shl(bucket as u32).unwrap_or(u64::MAX)
+                })
+        };
+        println!(
+            "assist_latency threads={threads} samples={} p50_upper_ns={} p99_upper_ns={} max_ns={} total_ns={}",
+            hist.count,
+            quantile(50),
+            quantile(99),
+            hist.max_ns,
+            hist.total_ns
+        );
+        let completion = completion_bytes.load(Ordering::Relaxed);
+        let overshoot = completion.saturating_sub(runway);
+        // Advisory pacing cannot bound an owner descheduled while holding the
+        // last work item. Report the isolated controller's overshoot; the real
+        // reservation safety bound is exercised by allocation_assist_pressure.
+        assert!(completion > 0);
+        println!(
+            "assist_runway threads={threads} runway={runway} completion_bytes={completion} overshoot_bytes={overshoot}"
+        );
+        let measurement = crate::gc_telemetry::measurement::snapshot();
+        println!(
+            "allocation_assist threads={threads} allocations={} elapsed_ns={} assist_samples={} assist_cpu_ns={}",
+            threads * 1024,
+            start.elapsed().as_nanos(),
+            measurement.assist_samples,
+            measurement.assist_cpu_ns
+        );
+        assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
+        assert_eq!(cycle.queue.end_epoch(), 0);
+        GC_MARK_PHASE.store(0, Ordering::Release);
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+        drop(cycle);
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn assist_remark_boundary_republishes_satb_tail() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    for stop in [false, true] {
+        let cycle = Arc::new(ConcurrentCycle::new(
+            (1..=32).map(|address| {
+                (
+                    address,
+                    raw_heap::TraceMetadata {
+                        type_id: 0,
+                        layout_id: 0,
+                        gc_ref_mask: 0,
+                        payload_size: 0,
+                    },
+                )
+            }),
+            IdSet::default(),
+            IdMap::default(),
+            0,
+        ));
+        cycle.enqueue_satb_batch(&(1..=32).collect::<Vec<_>>());
+        cycle.closing.store(!stop, Ordering::Release);
+        runtime().poll_requested.store(stop, Ordering::Release);
+        let other = cycle.clone();
+        let work = std::thread::spawn(move || other.drain_checked(8))
+            .join()
+            .unwrap();
+        assert_eq!(work, GC_HEADER_SIZE as u64);
+        assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
+        assert!(!cycle.queue.snapshot().is_drained());
+        runtime().poll_requested.store(false, Ordering::Release);
+        // Collector may finish the published tail across a stopped boundary.
+        assert_eq!(cycle.drain_checked(64), (31 * GC_HEADER_SIZE) as u64);
+        assert!(cycle.queue.snapshot().is_drained());
+        assert_eq!(cycle.queue.end_epoch(), 0);
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn allocation_assist_pressure_preserves_hard_reservation_bound() {
+    let _guard = runtime_test_guard();
+    for threads in [1usize, 5, 16] {
+        reset_internal_for_test();
+        let limit = 16 * 1024 * 1024;
+        runtime().heap.lock().unwrap().memory_limit_bytes = Some(limit);
+        let peak = AtomicUsize::new(0);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let peak = &peak;
+                scope.spawn(move || {
+                    let _registration = safepoint::MutatorRegistration::new();
+                    for i in 0..1024 {
+                        assert!(!willow_alloc(4096).is_null());
+                        if i % 16 == 0 {
+                            let state = runtime().heap.lock().unwrap();
+                            let reserved = state.old_reserved_bytes + state.tlab_reserved_bytes;
+                            peak.fetch_max(reserved, Ordering::Relaxed);
+                            assert!(reserved <= limit);
+                        }
+                    }
+                });
+            }
+        });
+        marking::shutdown_mark_workers();
+        assert_eq!(registered_mutator_count(), 0);
+        willow_gc_collect();
+        willow_gc_unregister_mutator();
+        println!(
+            "assist_pressure threads={threads} allocations={} elapsed_ns={} peak_reserved={} limit={limit} assist_enabled={}",
+            threads * 1024,
+            started.elapsed().as_nanos(),
+            peak.load(Ordering::Relaxed),
+            std::env::var("WILLOW_GC_ASSIST").unwrap_or_else(|_| "1".into())
+        );
+    }
+    reset_internal_for_test();
+}

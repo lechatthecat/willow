@@ -5,6 +5,96 @@ use std::cell::Cell;
 
 pub(super) const SCALE: u64 = 1 << 16;
 
+/// Cycle-local pacing estimate. Allocation consumption is published only at
+/// slow allocations/refills; completed work includes every queue consumer.
+/// Estimates never transfer background credit into a mutator's private debt.
+pub(super) struct Pacing {
+    pub(super) work: u64,
+    pub(super) runway: u64,
+    background_rate: u64,
+    allocated: std::sync::atomic::AtomicU64,
+}
+
+impl Pacing {
+    pub(super) fn new(work: u64, runway: u64) -> Self {
+        Self {
+            work,
+            runway,
+            background_rate: 0,
+            allocated: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(super) fn with_background(mut self, demand_ppm: u64) -> Self {
+        let demand = (u128::from(demand_ppm) * u128::from(SCALE))
+            .div_ceil(u128::from(super::pacer::SCALE))
+            .min(u64::MAX as u128) as u64;
+        self.background_rate = rate(self.work, self.runway).saturating_sub(demand);
+        self
+    }
+
+    pub(super) fn charge(&self, bytes: u64, completed: u64, pending: bool) -> u64 {
+        use std::sync::atomic::Ordering;
+        let previous = self
+            .allocated
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(bytes))
+            })
+            .unwrap();
+        let remaining = self.work.saturating_sub(completed);
+        // A historical prediction may underestimate the current graph. Retain
+        // a one-to-one rate until outstanding work disappears in that case.
+        rate(
+            remaining,
+            self.runway.saturating_sub(previous.saturating_add(bytes)),
+        )
+        .saturating_sub(self.background_rate)
+        .max(if pending && remaining == 0 { SCALE } else { 0 })
+    }
+}
+
+// Track only this thread's nested mark CPU, so wrapper-inclusive assist CPU
+// can enter the cycle budget without double-counting concurrent consumers.
+thread_local! {
+    static MARK_CPU: Cell<Option<Option<u64>>> = const { Cell::new(None) };
+}
+
+pub(super) fn record_mark_cpu(cpu: Option<u64>) {
+    if let Some(total) = MARK_CPU.get() {
+        MARK_CPU.set(Some(total.zip(cpu).and_then(|(a, b)| a.checked_add(b))));
+    }
+}
+
+pub(super) struct CpuScope {
+    start: Option<u64>,
+    previous: Option<Option<u64>>,
+}
+
+impl CpuScope {
+    pub(super) fn new() -> Self {
+        Self {
+            start: crate::gc_telemetry::workers::thread_cpu_ns(),
+            previous: MARK_CPU.replace(Some(Some(0))),
+        }
+    }
+
+    pub(super) fn overhead(&self) -> Option<u64> {
+        let elapsed = self
+            .start
+            .zip(crate::gc_telemetry::workers::thread_cpu_ns())
+            .and_then(|(start, end)| end.checked_sub(start));
+        elapsed
+            .zip(MARK_CPU.get().flatten())
+            .and_then(|(all, mark)| all.checked_sub(mark))
+    }
+}
+
+impl Drop for CpuScope {
+    fn drop(&mut self) {
+        MARK_CPU.set(self.previous);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Debt {
     epoch: u64,
@@ -49,7 +139,19 @@ pub(super) fn charge(epoch: u64, bytes: u64, rate: u64) -> bool {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static CREDITED: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn debt_units() -> i64 {
+    DEBT.get().units
+}
+
 pub(super) fn credit(epoch: u64, work: u64) {
+    #[cfg(test)]
+    CREDITED.set(CREDITED.get().saturating_add(work));
     DEBT.with(|local| {
         let mut debt = local.get();
         debt.credit(epoch, work);
@@ -64,6 +166,76 @@ pub(super) fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assist_cpu_scope_is_local_checked_and_unwind_safe() {
+        assert_eq!(MARK_CPU.get(), None);
+        {
+            let _scope = CpuScope::new();
+            record_mark_cpu(Some(3));
+            record_mark_cpu(Some(5));
+            assert_eq!(MARK_CPU.get(), Some(Some(8)));
+            record_mark_cpu(None);
+            assert_eq!(MARK_CPU.get(), Some(None));
+        }
+        assert_eq!(MARK_CPU.get(), None);
+        let result = std::panic::catch_unwind(|| {
+            let _scope = CpuScope::new();
+            record_mark_cpu(Some(u64::MAX));
+            record_mark_cpu(Some(1));
+            assert_eq!(MARK_CPU.get(), Some(None));
+            panic!("exercise assist CPU unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(MARK_CPU.get(), None);
+    }
+
+    #[test]
+    fn predicted_background_reduces_demand_but_exhausted_runway_recovers() {
+        let pacing = Pacing::new(100, 1000).with_background(0);
+        assert_eq!(pacing.charge(0, 0, true), 0);
+        assert!(pacing.charge(500, 0, true) > 0);
+        assert!(pacing.charge(500, 0, true) > SCALE);
+        assert_eq!(pacing.charge(0, 100, true), SCALE);
+        assert_eq!(pacing.charge(0, 100, false), 0);
+        let pacing = Pacing::new(100, 1000).with_background(50_000);
+        assert_eq!(pacing.charge(0, 0, true), rate(1, 20));
+    }
+
+    #[test]
+    fn remaining_work_and_runway_follow_batched_consumption() {
+        let pacing = Pacing::new(100, 1000);
+        assert_eq!(pacing.charge(100, 0, true), rate(100, 900));
+        assert_eq!(pacing.charge(100, 75, true), rate(25, 800));
+        assert_eq!(pacing.charge(800, 75, true), rate(25, 0));
+        assert_eq!(pacing.charge(u64::MAX, 100, true), SCALE);
+        assert_eq!(pacing.charge(u64::MAX, 100, false), 0);
+        assert_eq!(
+            pacing.allocated.load(std::sync::atomic::Ordering::Relaxed),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn pacing_races_only_consume_allocation_once() {
+        for threads in [1, 5, 16] {
+            let pacing = Pacing::new(1000, 1000);
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    let pacing = &pacing;
+                    scope.spawn(move || {
+                        for _ in 0..100 {
+                            pacing.charge(64, 0, true);
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                pacing.allocated.load(std::sync::atomic::Ordering::Relaxed),
+                threads * 6400
+            );
+        }
+    }
 
     #[test]
     fn fractional_batches_credit_and_epochs() {

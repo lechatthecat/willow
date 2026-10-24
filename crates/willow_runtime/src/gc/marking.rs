@@ -39,7 +39,7 @@ pub(super) struct ConcurrentCycle {
     duplicate_discoveries: AtomicU64,
     unindexed_discoveries: AtomicU64,
     pub(super) assist_epoch: u64,
-    pub(super) assist_rate: u64,
+    pub(super) assist_pacing: Option<assist::Pacing>,
     pub(super) objects: epoch_index::EpochIndex,
     pub(super) legacy_traces: IdSet<u32>,
     pub(super) traces: IdMap<u32, ConcurrentTraceFn>,
@@ -157,6 +157,7 @@ impl Drop for MarkBatch<'_> {
             let cpu = self.cpu_start.and_then(|start| {
                 crate::gc_telemetry::workers::thread_cpu_ns()?.checked_sub(start)
             });
+            assist::record_mark_cpu(cpu);
             let mut total = self.cycle.work.lock().unwrap();
             total.objects = total.objects.saturating_add(self.work.objects);
             total.frame_scans = total.frame_scans.saturating_add(self.work.frame_scans);
@@ -278,7 +279,7 @@ impl ConcurrentCycle {
             duplicate_discoveries: AtomicU64::new(0),
             unindexed_discoveries: AtomicU64::new(0),
             assist_epoch,
-            assist_rate: assist::SCALE,
+            assist_pacing: Some(assist::Pacing::new(1, 1)),
             objects,
             worker_failed: std::sync::atomic::AtomicBool::new(false),
             stopped_completion_required: std::sync::atomic::AtomicBool::new(false),
@@ -784,6 +785,12 @@ impl ConcurrentCycle {
         self.drain_worker_until(limit, children, worker, None)
     }
 
+    fn assist_stop_requested(&self) -> bool {
+        std::thread::current().id() != self.collector
+            && (self.closing.load(Ordering::Acquire)
+                || runtime().poll_requested.load(Ordering::Acquire))
+    }
+
     pub(super) fn drain_worker_until(
         &self,
         limit: usize,
@@ -856,7 +863,7 @@ impl ConcurrentCycle {
                 break;
             }
             // Always permit one work item, even after descheduling at entry.
-            if scanned != 0 && (expired() || minor::requested()) {
+            if scanned != 0 && (expired() || minor::requested() || self.assist_stop_requested()) {
                 break;
             }
             let (work, metadata) = if let Some((child, metadata)) = batch.local_child.take() {
@@ -933,7 +940,9 @@ impl ConcurrentCycle {
                             self.trace(object.addr(), Some(metadata), children, &mut batch);
                         }
                         scanned += 1;
-                        if expired() && objects.len() != 0 {
+                        if (expired() || minor::requested() || self.assist_stop_requested())
+                            && objects.len() != 0
+                        {
                             // Publish the unfinished tail before completing the
                             // original item; closure must never observe a gap.
                             self.queue
@@ -1100,22 +1109,54 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
         assist::reset();
         return;
     }
+    if !safepoint::current_thread_is_registered() {
+        assist::reset();
+        return;
+    }
     if let Some((_, cycle)) = cached_cycle()
         && !cycle.closing.load(Ordering::Acquire)
-        && cycle.assist_rate != 0
-        && assist::charge(cycle.assist_epoch, allocated, cycle.assist_rate)
+        && let Some(pacing) = &cycle.assist_pacing
     {
-        // One bounded object batch per slow allocation. An empty queue cannot
-        // block allocation or manufacture credit; background marking proceeds.
-        // A scheduling budget, not a hard callback-duration guarantee: legacy
-        // native hooks can overrun it. Bitmap/array/map slices have bounded work.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_micros(250);
-        let _assist = crate::gc_telemetry::measurement::Span::new(
-            crate::gc_telemetry::measurement::Phase::Assist,
-        );
-        let work = cycle.drain_checked_until(8, Some(deadline));
-        assist::credit(cycle.assist_epoch, work);
+        let completed = {
+            let work = cycle.work.lock().unwrap();
+            work.marked_bytes
+                .saturating_add(work.scanned_bytes)
+                .saturating_add(work.descriptor_bytes)
+        };
+        let pending = !cycle.queue.snapshot().is_drained();
+        let rate = pacing.charge(allocated, completed, pending);
+        if assist::charge(cycle.assist_epoch, allocated, rate) && pending {
+            // One bounded batch; empty queues never block or manufacture credit.
+            // Legacy callbacks are indivisible and measured by native telemetry.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_micros(250);
+            let cpu = assist::CpuScope::new();
+            {
+                let _assist = crate::gc_telemetry::measurement::Span::new(
+                    crate::gc_telemetry::measurement::Phase::Assist,
+                );
+                let work = cycle.drain_checked_until(8, Some(deadline));
+                assist::credit(cycle.assist_epoch, work);
+            }
+            let overhead = cpu.overhead();
+            let mut total = cycle.work.lock().unwrap();
+            if let Some(overhead) = overhead {
+                if let Some(cpu) = total.cpu_ns.checked_add(overhead) {
+                    total.cpu_ns = cpu;
+                } else {
+                    total.cpu_incomplete = true;
+                }
+                if std::thread::current().id() == cycle.collector {
+                    total.collector_mark_cpu_ns =
+                        total.collector_mark_cpu_ns.saturating_add(overhead);
+                }
+            } else {
+                total.cpu_incomplete = true;
+            }
+        }
     }
+    // All queue claims/readers and the assist CPU span are released before
+    // entering a handshake. A stop must not wait for an owner parked here.
+    willow_gc_safepoint();
 }
 
 pub(super) fn mark_worklist(

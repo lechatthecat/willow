@@ -50,14 +50,21 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                 cycle.late_published = std::sync::atomic::AtomicBool::new(false);
                 let goal = state.soft_memory.decide(memory_inputs(&state)).goal;
                 cycle.slices = slices;
-                cycle.assist_rate = if !old_cycle::concurrent_enabled()
+                cycle.assist_pacing = if !old_cycle::concurrent_enabled()
                     || std::env::var("WILLOW_GC_ASSIST").as_deref() == Ok("0")
                 {
-                    0
+                    None
                 } else {
-                    assist::rate(
-                        state.last_major_mark_work.max(before),
-                        goal.saturating_sub(before),
+                    let decision = state.pacer.decision(pacer_inputs(&state));
+                    Some(
+                        assist::Pacing::new(
+                            decision
+                                .expected_work
+                                .max(state.last_major_mark_work)
+                                .max(before),
+                            goal.saturating_sub(before),
+                        )
+                        .with_background(decision.assist_work_per_byte_ppm),
                     )
                 };
                 cycle
