@@ -269,3 +269,27 @@ AGENTS.md
 !/docs/audits/willow-r52c.14.md
 !/docs/audits/willow-r52c.14-measurements.txt
 !/docs/audits/willow-r52c.14-reproduce.sh
+
+# Public M4 source-derived audit, reproducer and focused measurements only.
+!/docs/audits/willow-6fv.7.5/
+/docs/audits/willow-6fv.7.5/*
+!/docs/audits/willow-6fv.7.5/audit.md
+!/docs/audits/willow-6fv.7.5/measure.py
+!/docs/audits/willow-6fv.7.5/measurements.json
+!/docs/audits/willow-6fv.7.5/samples.jsonl
+!/docs/audits/willow-6fv.7.5/validation.txt
+!/docs/audits/willow-6fv.7.5/fmt.txt
+!/docs/audits/willow-6fv.7.5/clippy-x86_64-unknown-linux-gnu.txt
+!/docs/audits/willow-6fv.7.5/clippy-x86_64-pc-windows-msvc.txt
+!/docs/audits/willow-6fv.7.5/clippy-aarch64-apple-darwin.txt
+!/docs/audits/willow-6fv.7.5/clippy-x86_64-apple-darwin.txt
+!/docs/audits/willow-6fv.7.5/example.txt
+!/docs/audits/willow-6fv.7.5/replicates.json
+!/docs/audits/willow-6fv.7.5/replicates-samples.jsonl
+!/docs/audits/willow-6fv.7.5/contract.md
+!/docs/audits/willow-6fv.7.5/confirmation-lock.json
+!/docs/audits/willow-6fv.7.5/confirmation-01/
+!/docs/audits/willow-6fv.7.5/confirmation-01/**
+!/docs/audits/willow-6fv.7.5/review-scope.md
+!/docs/audits/willow-6fv.7.5/summarize_confirmation.py
+!/docs/audits/willow-6fv.7.5/confirmation-validation.txt

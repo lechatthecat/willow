@@ -100,9 +100,18 @@ pub(crate) struct Span {
     start: Instant,
     cpu: Option<u64>,
     _interval: super::observations::Span,
+    _exclusive: Option<super::pause::Span>,
 }
 impl Span {
     pub(crate) fn new(phase: Phase) -> Self {
+        Self::start(phase, true)
+    }
+    /// Preserve V3's fused root-rewrite timing without attributing copying to
+    /// root enumeration in the exclusive component histograms.
+    pub(crate) fn fused_roots() -> Self {
+        Self::start(Phase::Roots, false)
+    }
+    fn start(phase: Phase, exclusive: bool) -> Self {
         let cpu = matches!(phase, Phase::Assist)
             .then(super::workers::thread_cpu_ns)
             .flatten();
@@ -114,6 +123,15 @@ impl Span {
         };
         Self {
             _interval: super::observations::Span::new(kind),
+            _exclusive: match phase {
+                Phase::Roots if exclusive => {
+                    Some(super::pause::Span::new(super::pause::Component::Roots))
+                }
+                Phase::Evacuation => {
+                    Some(super::pause::Span::new(super::pause::Component::Evacuation))
+                }
+                _ => None,
+            },
             phase,
             start: Instant::now(),
             cpu,

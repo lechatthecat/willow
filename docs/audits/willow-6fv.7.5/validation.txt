@@ -1,0 +1,184 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 5 tests
+test gc::minor::m4_probe::m4_pause_scaling_probe ... ignored, explicit M4 release measurement, independent dimensions
+test gc::minor::tests::m4_actual_stop_components_sum_to_complete_request_and_release ... ok
+test gc::minor::tests::m4_empty_admission_fallback_preserves_graph_and_releases_reserve ... ok
+{"version":3,"event":"gc_failure","kind":"test_panic","reason":"admission unwind fixture","timestamp_ns":882216,"epoch":1,"seed":0,"case":0,"heap_available":false,"heap_consistency":"metadata_without_lab_merge","actual_bytes":null,"limit_bytes":null,"managed_bytes":null,"external_bytes":null,"old_reserved_bytes":null,"young_reserved_bytes":null,"phase":0,"last_major_live_bytes":null,"allocated_bytes":null,"root_scan_bytes":0,"last_stop_reason":0,"last_stop_outcome":0,"minor_deferrals":null,"minor_deferral_age_bytes":null,"pin_fallback_count":null,"pinned_bytes":null,"registered_mutators":null,"parked_mutators":null,"pending_mutators":null,"os":"linux","arch":"x86_64","allocated_frame_bytes":0,"reclaimed_frame_bytes":0,"quarantined_frame_bytes":0,"task_frames_running":0,"task_frames_rooted":0,"task_frames_terminal":0,"task_frames_retired":0}
+
+thread 'gc::minor::tests::m4_admission_guard_releases_unused_capacity_on_unwind' (210301) panicked at crates/willow_runtime/src/gc/minor_tests.rs:1461:9:
+admission unwind fixture
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test gc::minor::tests::m4_admission_guard_releases_unused_capacity_on_unwind ... ok
+test gc::minor::tests::m4_survivor_admission_accounts_before_stop_and_transfers_without_storage_allocation ... ok
+
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 1879 filtered out; finished in 0.01s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 1 test
+test gc::minor::tests::survivor_direct_root_and_budget_fallback_promote_in_place ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1883 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 1 test
+test gc::minor::tests::tenure_budget_failure_retains_survivor_chunk_as_pinned ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1883 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 1 test
+minor shape=chain n=32 roots=1 metadata=64 marked_bytes=1024 scanned_bytes=512 promoted=1 moved=31 freed=32
+tenure shape=chain n=32 marked_bytes=1024 scanned_bytes=512 copies=31 tenured=31 moved=62
+minor shape=chain n=128 roots=1 metadata=256 marked_bytes=4096 scanned_bytes=2048 promoted=1 moved=127 freed=128
+tenure shape=chain n=128 marked_bytes=4096 scanned_bytes=2048 copies=127 tenured=127 moved=254
+minor shape=chain n=512 roots=1 metadata=1024 marked_bytes=16384 scanned_bytes=8192 promoted=1 moved=511 freed=512
+tenure shape=chain n=512 marked_bytes=16384 scanned_bytes=8192 copies=511 tenured=511 moved=1022
+minor shape=chain n=1024 roots=1 metadata=2048 marked_bytes=32768 scanned_bytes=16384 promoted=1 moved=1023 freed=1024
+tenure shape=chain n=1024 marked_bytes=32768 scanned_bytes=16384 copies=1023 tenured=1023 moved=2046
+minor shape=fanout n=32 roots=1 metadata=64 marked_bytes=1024 scanned_bytes=512 promoted=1 moved=31 freed=32
+tenure shape=fanout n=32 marked_bytes=1024 scanned_bytes=512 copies=31 tenured=31 moved=62
+minor shape=fanout n=128 roots=1 metadata=256 marked_bytes=4096 scanned_bytes=2048 promoted=1 moved=127 freed=128
+tenure shape=fanout n=128 marked_bytes=4096 scanned_bytes=2048 copies=127 tenured=127 moved=254
+minor shape=fanout n=512 roots=1 metadata=1024 marked_bytes=16384 scanned_bytes=8192 promoted=1 moved=511 freed=512
+tenure shape=fanout n=512 marked_bytes=16384 scanned_bytes=8192 copies=511 tenured=511 moved=1022
+minor shape=fanout n=1024 roots=1 metadata=2048 marked_bytes=32768 scanned_bytes=16384 promoted=1 moved=1023 freed=1024
+tenure shape=fanout n=1024 marked_bytes=32768 scanned_bytes=16384 copies=1023 tenured=1023 moved=2046
+minor shape=shared n=32 roots=1 metadata=64 marked_bytes=1024 scanned_bytes=512 promoted=1 moved=31 freed=32
+tenure shape=shared n=32 marked_bytes=1024 scanned_bytes=512 copies=31 tenured=31 moved=62
+minor shape=shared n=128 roots=1 metadata=256 marked_bytes=4096 scanned_bytes=2048 promoted=1 moved=127 freed=128
+tenure shape=shared n=128 marked_bytes=4096 scanned_bytes=2048 copies=127 tenured=127 moved=254
+minor shape=shared n=512 roots=1 metadata=1024 marked_bytes=16384 scanned_bytes=8192 promoted=1 moved=511 freed=512
+tenure shape=shared n=512 marked_bytes=16384 scanned_bytes=8192 copies=511 tenured=511 moved=1022
+minor shape=shared n=1024 roots=1 metadata=2048 marked_bytes=32768 scanned_bytes=16384 promoted=1 moved=1023 freed=1024
+tenure shape=shared n=1024 marked_bytes=32768 scanned_bytes=16384 copies=1023 tenured=1023 moved=2046
+minor shape=duplicate_roots n=32 roots=32 metadata=64 marked_bytes=1024 scanned_bytes=512 promoted=1 moved=31 freed=32
+tenure shape=duplicate_roots n=32 marked_bytes=1024 scanned_bytes=512 copies=31 tenured=31 moved=62
+minor shape=duplicate_roots n=128 roots=128 metadata=256 marked_bytes=4096 scanned_bytes=2048 promoted=1 moved=127 freed=128
+tenure shape=duplicate_roots n=128 marked_bytes=4096 scanned_bytes=2048 copies=127 tenured=127 moved=254
+minor shape=duplicate_roots n=512 roots=512 metadata=1024 marked_bytes=16384 scanned_bytes=8192 promoted=1 moved=511 freed=512
+tenure shape=duplicate_roots n=512 marked_bytes=16384 scanned_bytes=8192 copies=511 tenured=511 moved=1022
+minor shape=duplicate_roots n=1024 roots=1024 metadata=2048 marked_bytes=32768 scanned_bytes=16384 promoted=1 moved=1023 freed=1024
+tenure shape=duplicate_roots n=1024 marked_bytes=32768 scanned_bytes=16384 copies=1023 tenured=1023 moved=2046
+test gc::minor::tests::minor_tracing_work_scales_with_graph_and_roots ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1883 filtered out; finished in 0.27s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 1 test
+survivors=32 source_chunks=1 pages=2 capacity=3 index_growths=0 moved=32 elapsed_ns=31459 ns_per_move=983.09
+survivors=128 source_chunks=4 pages=5 capacity=14 index_growths=0 moved=128 elapsed_ns=75501 ns_per_move=589.85
+survivors=512 source_chunks=16 pages=18 capacity=56 index_growths=0 moved=512 elapsed_ns=256629 ns_per_move=501.23
+survivors=2048 source_chunks=64 pages=67 capacity=224 index_growths=0 moved=2048 elapsed_ns=829338 ns_per_move=404.95
+test gc::minor::tests::minor_survivor_cost_and_page_index_scale ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1883 filtered out; finished in 0.01s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 2 tests
+test gc_telemetry::pause::tests::exclusive_components_partition_time_without_double_counting ... ok
+test gc_telemetry::pause::tests::cause_generation_histograms_and_aborts_are_preserved ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1882 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 8 tests
+requests=64 retained=64 dropped=0
+test gc_telemetry::stops::tests::active_overlapping_and_malformed_intervals_cannot_look_complete ... requests=256 retained=64 dropped=192
+ok
+test gc_telemetry::stops::tests::saturated_counters_are_explicitly_invalid_for_acceptance ... ok
+test gc_telemetry::stops::tests::stop_reasons_separate_rendezvous_work_and_aborts ... ok
+requests=1024 retained=64 dropped=960
+test gc_telemetry::stops::tests::actual_baseline_stops_are_visible_even_for_empty_heaps ... ok
+requests=4096 retained=64 dropped=4032
+test gc_telemetry::stops::tests::event_storage_is_bounded_and_reports_every_lost_interval ... ok
+heap_objects=16 roots=0 initial_headers=0 remark_headers=0 stopped_sweep=0
+heap_objects=64 roots=0 initial_headers=0 remark_headers=0 stopped_sweep=0
+heap_objects=256 roots=0 initial_headers=0 remark_headers=0 stopped_sweep=0
+heap_objects=1024 roots=0 initial_headers=0 remark_headers=0 stopped_sweep=0
+test gc_telemetry::stops::tests::normal_old_cycles_do_not_scan_headers_or_sweep_under_stops ... ok
+{"version":3,"event":"gc_failure","kind":"test_panic","reason":"injected measurement unwind","timestamp_ns":6224268,"epoch":6,"seed":0,"case":0,"heap_available":true,"heap_consistency":"metadata_without_lab_merge","actual_bytes":0,"limit_bytes":null,"managed_bytes":0,"external_bytes":0,"old_reserved_bytes":0,"young_reserved_bytes":0,"phase":0,"last_major_live_bytes":0,"allocated_bytes":0,"root_scan_bytes":0,"last_stop_reason":0,"last_stop_outcome":0,"minor_deferrals":0,"minor_deferral_age_bytes":0,"pin_fallback_count":0,"pinned_bytes":0,"registered_mutators":0,"parked_mutators":0,"pending_mutators":0,"os":"linux","arch":"x86_64","allocated_frame_bytes":0,"reclaimed_frame_bytes":0,"quarantined_frame_bytes":0,"task_frames_running":0,"task_frames_rooted":0,"task_frames_terminal":0,"task_frames_retired":0}
+
+thread 'gc_telemetry::stops::tests::unfinished_measurement_records_failure_instead_of_zero_stops' (210383) panicked at crates/willow_runtime/src/gc_telemetry/stops_tests.rs:168:9:
+injected measurement unwind
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test gc_telemetry::stops::tests::unfinished_measurement_records_failure_instead_of_zero_stops ... ok
+test gc_telemetry::stops::tests::v2_negotiation_preserves_v1_and_guards_unaligned_output ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 1876 filtered out; finished in 0.01s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 11 tests
+concurrent-minor nodes=1000 pass=0 page_queries=1 copies=1000 live_marks=1000 publications=0
+concurrent-minor nodes=1000 pass=1 page_queries=1 copies=1000 live_marks=1000 publications=0
+concurrent-minor nodes=10000 pass=0 page_queries=23 copies=10000 live_marks=10000 publications=0
+concurrent-minor nodes=10000 pass=1 page_queries=31 copies=10000 live_marks=10000 publications=0
+concurrent-minor nodes=100000 pass=0 page_queries=221 copies=100000 live_marks=100000 publications=0
+concurrent-minor nodes=100000 pass=1 page_queries=295 copies=100000 live_marks=100000 publications=0
+test gc::minor::overlap_tests::concurrent_minor_snapshot_and_relocation_scale_linearly ... ok
+overlap shape=chain nodes=1 pass=0 copies=1 live_marks=1
+overlap shape=chain nodes=1 pass=1 copies=1 live_marks=1
+overlap shape=chain nodes=16 pass=0 copies=16 live_marks=16
+overlap shape=chain nodes=16 pass=1 copies=16 live_marks=16
+overlap shape=chain nodes=64 pass=0 copies=64 live_marks=64
+overlap shape=chain nodes=64 pass=1 copies=64 live_marks=64
+overlap shape=chain nodes=256 pass=0 copies=256 live_marks=256
+overlap shape=chain nodes=256 pass=1 copies=256 live_marks=256
+overlap shape=cycle nodes=1 pass=0 copies=1 live_marks=1
+overlap shape=cycle nodes=1 pass=1 copies=1 live_marks=1
+overlap shape=cycle nodes=16 pass=0 copies=16 live_marks=16
+overlap shape=cycle nodes=16 pass=1 copies=16 live_marks=16
+overlap shape=cycle nodes=64 pass=0 copies=64 live_marks=64
+overlap shape=cycle nodes=64 pass=1 copies=64 live_marks=64
+overlap shape=cycle nodes=256 pass=0 copies=256 live_marks=256
+overlap shape=cycle nodes=256 pass=1 copies=256 live_marks=256
+overlap shape=fanout nodes=1 pass=0 copies=1 live_marks=1
+overlap shape=fanout nodes=1 pass=1 copies=1 live_marks=1
+overlap shape=fanout nodes=16 pass=0 copies=16 live_marks=16
+overlap shape=fanout nodes=16 pass=1 copies=16 live_marks=16
+overlap shape=fanout nodes=64 pass=0 copies=64 live_marks=64
+overlap shape=fanout nodes=64 pass=1 copies=64 live_marks=64
+overlap shape=fanout nodes=256 pass=0 copies=256 live_marks=256
+overlap shape=fanout nodes=256 pass=1 copies=256 live_marks=256
+overlap shape=shared nodes=1 pass=0 copies=1 live_marks=1
+overlap shape=shared nodes=1 pass=1 copies=1 live_marks=1
+overlap shape=shared nodes=16 pass=0 copies=16 live_marks=16
+overlap shape=shared nodes=16 pass=1 copies=16 live_marks=16
+overlap shape=shared nodes=64 pass=0 copies=64 live_marks=64
+overlap shape=shared nodes=64 pass=1 copies=64 live_marks=64
+overlap shape=shared nodes=256 pass=0 copies=256 live_marks=256
+overlap shape=shared nodes=256 pass=1 copies=256 live_marks=256
+test gc::minor::overlap_tests::overlap_graph_copy_promotion_and_snapshot_only_reachability ... ok
+test gc::minor::overlap_tests::overlap_containers_and_async_frame_preserve_rewritten_edges ... ok
+test gc::minor::overlap_tests::overlap_minor_inline_credit_publishes_old_descendants ... ok
+test gc::minor::overlap_tests::overlap_minor_requests_coalesce_under_major_owner_and_registration_changes ... ok
+test gc::minor::overlap_tests::overlap_native_async_frame_and_marker_pool_pause_resume ... ok
+test gc::minor::overlap_tests::overlap_native_recovery_retry_history_follows_minor_relocation ... ok
+test gc::minor::overlap_tests::overlap_phase_requests_and_remark_election_keep_epoch_ownership_distinct ... ok
+test gc::minor::overlap_tests::overlap_post_snapshot_tlab_black_allocation_survives_minor_and_old_sweep ... ok
+overlap SATB parked_mutators=1 closing=false old_descendants=1 sweep=retained
+overlap SATB parked_mutators=1 closing=true old_descendants=1 sweep=retained
+overlap SATB parked_mutators=4 closing=false old_descendants=4 sweep=retained
+overlap SATB parked_mutators=4 closing=true old_descendants=4 sweep=retained
+overlap SATB parked_mutators=16 closing=false old_descendants=16 sweep=retained
+overlap SATB parked_mutators=16 closing=true old_descendants=16 sweep=retained
+test gc::minor::overlap_tests::overlap_satb_deletions_parked_mutators_and_old_descendants_survive_sweep ... ok
+test gc::minor::overlap_tests::post_snapshot_extent_publications_do_not_build_per_object_pending_sets ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 1873 filtered out; finished in 0.94s
+

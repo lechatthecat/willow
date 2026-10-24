@@ -217,3 +217,49 @@ thread state or claim that uninstrumented scheduler/native waits are GC pauses.
 Use the separate V2 stop checker for global stop requests and per-stop maxima.
 Transport validation and measured costs do not certify the collector's final
 zero-STW or latency acceptance gates.
+
+
+## Exclusive stop-component measurements
+
+The Rust API `gc_telemetry::pause::snapshot()` exposes fixed histograms indexed
+by stop reason (initial mark, remark, minor, recovery) and six exclusive
+components: rendezvous, root enumeration, remembered-set/card handling,
+evacuation, metadata/finalization, and wakeup. `last` retains the most recent
+sample; `longest[reason - 1]` retains component attribution for the longest
+request-to-release interval of that cause. Samples carry the V2 stop sequence
+and an aborted flag. Generation denotes the stop purpose: young for minor,
+old-cycle coordination for initial/remark, and mixed for recovery. An old
+object visited by a minor does not change the sample's purpose.
+
+Components partition request publication through gate/coordination release;
+they are additive within one sample. Root enumeration includes published stack,
+runtime/native/lease slots and old-marker transport roots. Root-slot rewriting,
+copying, promotion, forwarding and transitive reference scanning are fused in
+evacuation. Remembered handling covers transfer/card clear and owner traversal;
+scanning those owners' edges is evacuation work. Metadata is the remaining
+stopped work, including TLAB retirement, collector indexes, cleanup, finalizers
+and old-epoch publication. Wakeup ends at gate/coordination release, not when
+all workers have actually been scheduled. V3's existing overlapping root and
+evacuation measurements retain their meaning and must not be added together.
+
+The component counters allocate no per-stop history and take no per-object
+clock readings or telemetry locks. Histograms include zero-duration components
+and aborted stops; `saturated` invalidates aggregate acceptance evidence.
+The groups are separately coherent; compare sequence identities when correlating
+with V2 snapshots. Existing C V1–V4 layouts and symbols are unchanged. These new groups are Rust
+snapshot APIs, not additional fields in the C ABI or JSON trace schema.
+
+`gc::survivor_reserve_snapshot()` reports the last admission's requested,
+admitted, consumed and still-available storage bytes, and fallback objects.
+Both production minor entry points admit survivor chunks before the stop.
+Storage, start-bitmaps, concurrent-mark bitmaps and header-offset capacities
+are prepared together. Empty reserve storage counts in existing young/total
+reservation gauges until consumed or released. As with other region counters,
+these are region-storage bytes, not allocator metadata or process RSS.
+The legacy hard region/native cap is checked before each chunk admission.
+A hard cap, allocation refusal, packing loss or concurrent refill may exhaust
+the finite reserve. The collector then promotes the affected young object in
+place and traces/rewrites its children; no survivor storage growth occurs under
+the stop. This shares pin reason 3 with hard-budget fallback. Explicit leases
+retain their separate reason and precedence. Old-region promotion allocation
+and general collector scratch metadata retain their existing paths.

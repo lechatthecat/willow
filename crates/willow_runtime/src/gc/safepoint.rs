@@ -491,6 +491,7 @@ pub(super) fn with_stw<R>(
         collect(&coord, measurement.work())
     }));
     let collector_end = crate::gc_telemetry::timestamp_ns();
+    crate::gc_telemetry::pause::switch(crate::gc_telemetry::pause::Component::Wakeup);
     let resume = crate::gc_telemetry::measurement::Span::new(
         crate::gc_telemetry::measurement::Phase::Resume,
     );

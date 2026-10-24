@@ -214,6 +214,7 @@ impl StopMeasurement {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .request(reason, timestamp_ns());
+        super::pause::begin(event.sequence, event.reason, event.requested_ns);
         Self {
             event,
             finished: false,
@@ -221,6 +222,7 @@ impl StopMeasurement {
     }
     pub(crate) fn stopped(&mut self) {
         self.event.stopped_ns = timestamp_ns();
+        super::pause::switch(super::pause::Component::Metadata);
     }
     pub(crate) fn work(&mut self) -> &mut StopWorkV2 {
         &mut self.event.work
@@ -241,6 +243,7 @@ impl StopMeasurement {
         );
         self.event.outcome = u32::from(aborted);
         self.event.released_ns = timestamp_ns();
+        super::pause::finish(self.event.released_ns, aborted);
         STOPS
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -254,6 +257,7 @@ impl Drop for StopMeasurement {
         if !self.finished {
             self.event.outcome = 2;
             self.event.released_ns = timestamp_ns();
+            super::pause::finish(self.event.released_ns, true);
             STOPS
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())

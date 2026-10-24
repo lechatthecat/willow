@@ -16,9 +16,21 @@ pub mod measurement;
 pub mod milestones;
 pub mod native_trace;
 pub mod observations;
+pub mod pause;
 pub mod stops;
 pub mod workers;
 pub use milestones::{GcStage, GcTicket, WaitError, wait_gc_for_test};
+
+/// Last minor admission, separately heap-locked; does not change V1–V4 ABI.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SurvivorReserveStats {
+    pub requested_bytes: u64,
+    pub admitted_bytes: u64,
+    pub consumed_bytes: u64,
+    pub fallback_objects: u64,
+    /// Empty reserved storage still owned by the admission.
+    pub available_bytes: u64,
+}
 
 /// V3 extends the existing snapshot protocol without growing V1 or V2.
 #[repr(C)]
@@ -958,6 +970,7 @@ pub(crate) fn reset_for_test() {
     telemetry.stats.epoch = epoch;
     telemetry.stats.reset_generation = generation;
     stops::reset_for_test();
+    pause::reset();
     milestones::reset();
     native_trace::reset();
     measurement::reset();

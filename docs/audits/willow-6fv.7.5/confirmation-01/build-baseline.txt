@@ -1,0 +1,20 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling crossbeam-utils v0.8.23
+   Compiling libc v0.2.190
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling autocfg v1.5.1
+   Compiling crossbeam-epoch v0.9.21
+   Compiling corosensei v0.3.4
+   Compiling crossbeam-deque v0.8.8
+   Compiling syn v3.0.7
+   Compiling cfg-if v1.0.5
+   Compiling foldhash v0.2.0
+   Compiling scopeguard v1.2.0
+   Compiling hashbrown v0.17.1
+   Compiling socket2 v0.6.5
+   Compiling ryu v1.0.23
+   Compiling willow_abi v0.1.6 (/tmp/willow-m4-baseline-02m02206/crates/willow_abi)
+   Compiling willow_runtime_macros v0.1.6 (/tmp/willow-m4-baseline-02m02206/crates/willow_runtime_macros)
+   Compiling willow_runtime v0.1.6 (/tmp/willow-m4-baseline-02m02206/crates/willow_runtime)
+    Finished `release` profile [optimized] target(s) in 1m 07s

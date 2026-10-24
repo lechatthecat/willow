@@ -478,3 +478,13 @@ pub(crate) fn diagnostic_survivors() -> Option<crate::gc_telemetry::GcSurvivorSt
 pub(crate) fn diagnostic_invalid_pointer_for_test() {
     checked_payload_to_header(8usize as *mut u8, "diagnostic regression");
 }
+
+/// Separately coherent survivor admission counters; region reservation bytes
+/// include the reserve from admission until transfer or release.
+pub fn survivor_reserve_snapshot() -> crate::gc_telemetry::SurvivorReserveStats {
+    runtime()
+        .heap
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .survivor_reserve_stats
+}

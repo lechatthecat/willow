@@ -291,6 +291,10 @@ struct GcState {
     /// collection retires them before walking their object headers. Collector-only
     /// survivor chunks share this index but never belong to a TLS state.
     tlab_chunks: Vec<BumpChunk>,
+    /// Empty evacuation chunks admitted before a minor stop; included in TLAB reservations.
+    survivor_reserve: Vec<BumpChunk>,
+    survivor_reserve_active: bool,
+    survivor_reserve_stats: crate::gc_telemetry::SurvivorReserveStats,
     tlab_addresses: address_index::AddressIndex,
     /// Non-moving old-generation storage. Regular regions serve old/runtime
     /// allocations from a bump tail or region-local free spans. Large objects
@@ -837,6 +841,9 @@ impl Default for GcState {
             pending_sweep_chunks: 0..0,
             satb: satb::SatbBuffers::default(),
             tlab_chunks: Vec::new(),
+            survivor_reserve: Vec::new(),
+            survivor_reserve_active: false,
+            survivor_reserve_stats: Default::default(),
             tlab_addresses: address_index::AddressIndex::default(),
             old_regions: Vec::new(),
             old_addresses: address_index::AddressIndex::default(),
@@ -2342,6 +2349,7 @@ fn reset_internal() {
     state.old_region_candidates.clear();
     state.old_reserved_bytes = 0;
     state.region_cache.shrink_to(0);
+    minor::release_survivor_reserve(&mut state);
     for chunk in state.tlab_chunks.drain(..) {
         let mut offset = 0;
         while offset < chunk.used {
@@ -2407,6 +2415,7 @@ fn reset_internal() {
     state.promoted_bytes = 0;
     state.moved_objects = 0;
     state.survivor_stats = Default::default();
+    state.survivor_reserve_stats = Default::default();
     state.old_region_allocations = 0;
     state.old_region_reuses = 0;
     state.old_regions_released = 0;

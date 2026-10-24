@@ -29,6 +29,10 @@ mod tests;
 mod deferral_tests;
 
 #[cfg(test)]
+#[path = "minor_m4_probe.rs"]
+mod m4_probe;
+
+#[cfg(test)]
 #[path = "minor_overlap_tests.rs"]
 mod overlap_tests;
 
@@ -39,6 +43,8 @@ thread_local! {
 }
 
 struct MinorCollector<'a> {
+    #[cfg(test)]
+    release_reserve_on_drop: bool,
     work: crate::gc_telemetry::MarkWork,
     stop_work: &'a mut crate::gc_telemetry::stops::StopWorkV2,
     state: &'a mut GcState,
@@ -70,6 +76,10 @@ struct MinorCollector<'a> {
 impl Drop for MinorCollector<'_> {
     fn drop(&mut self) {
         self.release_promotion_destination();
+        #[cfg(test)]
+        if self.release_reserve_on_drop {
+            release_survivor_reserve(self.state);
+        }
     }
 }
 
@@ -91,8 +101,16 @@ impl<'a> MinorCollector<'a> {
         // the sweep; the collector wrote every survivor header. Young
         // membership is answered by the chunk index plus start bitmap, so no
         // per-object index is built for the (mostly dead) nursery.
+        #[cfg(test)]
+        let release_reserve_on_drop = !state.survivor_reserve_active;
+        #[cfg(test)]
+        if release_reserve_on_drop {
+            prepare_survivor_reserve(state);
+        }
         let source_chunks = state.tlab_chunks.len();
         let mut collector = Self {
+            #[cfg(test)]
+            release_reserve_on_drop,
             work: crate::gc_telemetry::MarkWork::default(),
             stop_work,
             state,
@@ -275,7 +293,7 @@ impl<'a> MinorCollector<'a> {
         size: usize,
         age: u8,
     ) -> Option<HeapObject> {
-        use super::{BumpChunk, GC_TLAB_CHUNK_SIZE, RegionMarkBitmap};
+        use super::GC_TLAB_CHUNK_SIZE;
         if size > GC_TLAB_CHUNK_SIZE {
             return None;
         }
@@ -283,37 +301,15 @@ impl<'a> MinorCollector<'a> {
             let chunk = &self.state.tlab_chunks[index];
             chunk.capacity - chunk.used < size
         }) {
-            if !super::can_reserve(self.state, GC_TLAB_CHUNK_SIZE) {
-                return None;
-            }
-            let layout =
-                Layout::from_size_align(GC_TLAB_CHUNK_SIZE, std::mem::align_of::<GcHeader>())
-                    .ok()?;
-            // SAFETY: valid aligned layout, owned until the common chunk cleanup.
-            let base = unsafe { super::allocate_region_storage(layout) };
-            if base.is_null() {
-                return None;
-            }
+            // Storage, start bits, concurrent marks and header-offset capacity
+            // were admitted before publishing the stop request.
+            let chunk = self.state.survivor_reserve.pop()?;
+            self.state.survivor_reserve_stats.available_bytes -= chunk.capacity as u64;
+            self.state.survivor_reserve_stats.consumed_bytes += chunk.capacity as u64;
             let index = self.state.tlab_chunks.len();
-            self.state.tlab_addresses.insert(base as usize, index);
-            self.state.tlab_chunks.push(BumpChunk {
-                base,
-                capacity: GC_TLAB_CHUNK_SIZE,
-                used: 0,
-                owner_state: None,
-                kind: RegionKind::Survivor,
-                live_bytes: 0,
-                mark_bitmap: RegionMarkBitmap::new(GC_TLAB_CHUNK_SIZE),
-                concurrent_marks: std::sync::Arc::new(
-                    super::concurrent_bitmap::ConcurrentMarkBits::new(
-                        GC_TLAB_CHUNK_SIZE / GC_REGION_MARK_GRANULE,
-                    ),
-                ),
-                header_offsets: Vec::new(),
-            });
+            self.state.tlab_addresses.insert(chunk.base as usize, index);
+            self.state.tlab_chunks.push(chunk);
             self.index_chunk(index);
-            self.state.tlab_reserved_bytes += GC_TLAB_CHUNK_SIZE;
-            super::note_reservation_growth(self.state);
             self.state.survivor_stats.survivor_space_reserved += GC_TLAB_CHUNK_SIZE as u64;
             self.survivor_destination = Some(index);
         }
@@ -469,10 +465,17 @@ impl<'a> MinorCollector<'a> {
             self.allocate_promotion(source, metadata)
         };
         let Some(target) = target else {
-            if self.state.memory_limit_bytes.is_some() {
-                // A hard region budget must not require extra evacuation
-                // storage. Retain this nursery object in place, using the same
+            if self.state.memory_limit_bytes.is_some()
+                || (age < self.state.tenuring.age() && self.state.survivor_reserve.is_empty())
+            {
+                // A hard cap or exhausted pre-admitted reserve must not grow
+                // survivor storage under STW. Retain in place, using the same
                 // promotion path as value roots, and keep tracing it.
+                self.state.survivor_reserve_stats.fallback_objects = self
+                    .state
+                    .survivor_reserve_stats
+                    .fallback_objects
+                    .saturating_add(1);
                 self.pin_root(payload, PinSource::MemoryBudget);
                 return payload;
             }
@@ -760,9 +763,7 @@ impl<'a> MinorCollector<'a> {
         let evacuation = crate::gc_telemetry::measurement::Span::new(
             crate::gc_telemetry::measurement::Phase::Evacuation,
         );
-        let root_scan = crate::gc_telemetry::measurement::Span::new(
-            crate::gc_telemetry::measurement::Phase::Roots,
-        );
+        let root_scan = crate::gc_telemetry::measurement::Span::fused_roots();
         let count = roots.slots.len() + roots.values.len();
         self.work.root_scan_bytes = crate::gc_telemetry::MarkWork::roots(count).root_scan_bytes;
         self.stop_work.root_values += count as u64;
@@ -780,6 +781,9 @@ impl<'a> MinorCollector<'a> {
                 self.pin_root(root, source);
             }
         }
+        let remembered_scan = crate::gc_telemetry::pause::Span::new(
+            crate::gc_telemetry::pause::Component::Remembered,
+        );
         for owner in remembered {
             // The set was taken; `scan_object` re-remembers owners that keep
             // a young child after this collection.
@@ -787,6 +791,7 @@ impl<'a> MinorCollector<'a> {
                 .set_remembered(false);
             self.pin_root(owner as *mut u8, PinSource::RememberedOwner);
         }
+        drop(remembered_scan);
         for slot in roots.slots {
             self.scan_root_slot(slot);
         }
@@ -1190,7 +1195,7 @@ impl PinSource {
             Self::RuntimeCodeStack => "root slot published from runtime code",
             Self::RememberedOwner => "remembered-set owner",
             Self::OldOrForeign => "root slot outside the young source chunks",
-            Self::MemoryBudget => "memory budget left no evacuation space",
+            Self::MemoryBudget => "memory budget or admitted reserve left no evacuation space",
             Self::ScopedLoan => "scoped fixed-address loan",
         }
     }
@@ -1271,8 +1276,11 @@ fn minor_collect_with_roots(
         crate::gc_telemetry::failure_record::emit("invariant", &message);
         panic!("willow gc: write barrier verification failed: {message}");
     }
+    let remembered_reset =
+        crate::gc_telemetry::pause::Span::new(crate::gc_telemetry::pause::Component::Remembered);
     let remembered = std::mem::take(&mut state.remembered_set);
     state.dirty_cards.clear();
+    drop(remembered_reset);
     state.minor_collections = state.minor_collections.saturating_add(1);
     let before = state.allocated_bytes as u64;
     let young_before = state.young_allocated_bytes;
@@ -1280,10 +1288,13 @@ fn minor_collect_with_roots(
     let copied_before = state.survivor_stats.survivor_bytes;
     let pinned_before = state.survivor_stats.pinned_promotions;
     let collector = MinorCollector::new(&mut state, registry, stop_work);
+    let root_enumeration =
+        crate::gc_telemetry::pause::Span::new(crate::gc_telemetry::pause::Component::Roots);
     let mut mark_roots = collector.snapshot_roots();
     roots
         .slots
         .extend(mark_roots.iter_mut().map(|p| p as *mut *mut u8));
+    drop(root_enumeration);
     let (_, work) = collector.run(roots, remembered);
     if state.survivor_stats.pinned_promotions != pinned_before {
         state.survivor_stats.pin_fallback_count += 1;
@@ -1449,6 +1460,7 @@ fn collect_stopped(
 
 pub(super) fn collect_owned() {
     let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Minor);
+    let _reserve = SurvivorAdmission::new();
     let collected = with_stw(
         crate::gc_telemetry::stops::StopReason::Minor,
         |coord, stop_work| {
@@ -1459,6 +1471,7 @@ pub(super) fn collect_owned() {
             collect_stopped(coord, stop_work)
         },
     );
+    drop(_reserve);
     if let Some((before, after, work)) = collected {
         crate::gc_telemetry::emit_cycle(cycle.finish(before, after, work));
     }
@@ -1486,6 +1499,7 @@ pub(crate) fn minor_collect_internal() {
     // This elected minor satisfies any request left at a previous owner boundary.
     PENDING.swap(false, std::sync::atomic::Ordering::AcqRel);
     let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Minor);
+    let _reserve = SurvivorAdmission::new();
     // Stop the world and scan every registered mutator, for the reason spelled
     // out over the major cycle's mark phase: a registration that races a
     // single-mutator scan leaves the newcomer's objects unmarked (willow-v6k0).
@@ -1507,7 +1521,86 @@ pub(crate) fn minor_collect_internal() {
     let Some((before, after, work)) = collected else {
         return;
     };
+    drop(_reserve);
     let event = cycle.finish(before, after, work);
     drop(_serialize);
     crate::gc_telemetry::emit_cycle(event);
+}
+
+/// Reserve one destination chunk per source chunk before the stop. Packing,
+/// concurrent refills, and a hard cap can exhaust this finite reserve; that
+/// case uses the existing traced in-place promotion fallback, never a stopped
+/// survivor allocation. Empty reserve chunks are not addressable heap objects.
+fn prepare_survivor_reserve(state: &mut GcState) {
+    use super::{BumpChunk, GC_TLAB_CHUNK_SIZE, RegionMarkBitmap};
+    assert!(!state.survivor_reserve_active);
+    state.survivor_reserve_active = true;
+    let count = state
+        .tlab_chunks
+        .iter()
+        .filter(|c| c.kind != RegionKind::Pinned)
+        .count();
+    state.survivor_reserve_stats = crate::gc_telemetry::SurvivorReserveStats {
+        requested_bytes: (count as u64).saturating_mul(GC_TLAB_CHUNK_SIZE as u64),
+        ..Default::default()
+    };
+    state.survivor_reserve.reserve(count);
+    state.tlab_chunks.reserve(count);
+    for _ in 0..count {
+        if !super::can_reserve(state, GC_TLAB_CHUNK_SIZE) {
+            break;
+        }
+        let layout =
+            Layout::from_size_align(GC_TLAB_CHUNK_SIZE, std::mem::align_of::<GcHeader>()).unwrap();
+        // SAFETY: valid aligned region; cleanup below or normal chunk sweep owns it.
+        let base = unsafe { super::allocate_region_storage(layout) };
+        if base.is_null() {
+            break;
+        }
+        state.survivor_reserve.push(BumpChunk {
+            base,
+            capacity: GC_TLAB_CHUNK_SIZE,
+            used: 0,
+            owner_state: None,
+            kind: RegionKind::Survivor,
+            live_bytes: 0,
+            mark_bitmap: RegionMarkBitmap::new(GC_TLAB_CHUNK_SIZE),
+            concurrent_marks: std::sync::Arc::new(
+                super::concurrent_bitmap::ConcurrentMarkBits::new(
+                    GC_TLAB_CHUNK_SIZE / GC_REGION_MARK_GRANULE,
+                ),
+            ),
+            header_offsets: Vec::with_capacity(GC_TLAB_CHUNK_SIZE / GC_HEADER_SIZE),
+        });
+        state.tlab_reserved_bytes += GC_TLAB_CHUNK_SIZE;
+        state.survivor_reserve_stats.admitted_bytes += GC_TLAB_CHUNK_SIZE as u64;
+        state.survivor_reserve_stats.available_bytes += GC_TLAB_CHUNK_SIZE as u64;
+        super::note_reservation_growth(state);
+    }
+}
+
+pub(super) fn release_survivor_reserve(state: &mut GcState) {
+    for chunk in state.survivor_reserve.drain(..) {
+        let layout =
+            Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();
+        // SAFETY: reserve chunks never contain objects and have a single owner.
+        unsafe { dealloc(chunk.base, layout) };
+        state.tlab_reserved_bytes -= chunk.capacity;
+        state.released_bytes = state.released_bytes.saturating_add(chunk.capacity as u64);
+    }
+    state.survivor_reserve_active = false;
+    state.survivor_reserve_stats.available_bytes = 0;
+}
+
+struct SurvivorAdmission;
+impl SurvivorAdmission {
+    fn new() -> Self {
+        prepare_survivor_reserve(&mut runtime().heap.lock().unwrap());
+        Self
+    }
+}
+impl Drop for SurvivorAdmission {
+    fn drop(&mut self) {
+        release_survivor_reserve(&mut runtime().heap.lock().unwrap_or_else(|p| p.into_inner()));
+    }
 }

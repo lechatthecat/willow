@@ -1343,3 +1343,150 @@ fn minor_survivor_cost_and_page_index_scale() {
         reset_internal();
     }
 }
+
+#[test]
+fn m4_survivor_admission_accounts_before_stop_and_transfers_without_storage_allocation() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    let _stress = GcStressTestScope::normal();
+    for count in [1, 16, 128] {
+        reset_internal();
+        let mut tls = tlab_state_for_test();
+        let mut payloads = fill_chunks(&mut tls, count, 8, |_| 0, 0);
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_unindexed(&mut state);
+        let before = state.tlab_reserved_bytes;
+        super::prepare_survivor_reserve(&mut state);
+        assert_eq!(state.survivor_reserve.len(), count);
+        assert_eq!(
+            state.survivor_reserve_stats.admitted_bytes,
+            (count * GC_TLAB_CHUNK_SIZE) as u64
+        );
+        assert_eq!(
+            state.survivor_reserve_stats.available_bytes,
+            state.survivor_reserve_stats.admitted_bytes
+        );
+        assert_eq!(
+            state.tlab_reserved_bytes,
+            before + count * GC_TLAB_CHUNK_SIZE
+        );
+        assert!(
+            state.survivor_reserve.iter().all(|c| c.used == 0
+                && c.header_offsets.capacity() >= GC_TLAB_CHUNK_SIZE / GC_HEADER_SIZE)
+        );
+        STORAGE_ATTEMPTS.set(0);
+        let mut stop = Default::default();
+        MinorCollector::new(&mut state, minor_registry_snapshot(), &mut stop).run(
+            MinorRoots {
+                slots: payloads.iter_mut().map(|p| p as *mut *mut u8).collect(),
+                values: Vec::new(),
+            },
+            Default::default(),
+        );
+        assert_eq!(STORAGE_ATTEMPTS.get(), 0);
+        assert_eq!(state.survivor_stats.survivor_copies, (count * 8) as u64);
+        // Production admission releases unused storage only after with_stw.
+        assert!(state.survivor_reserve_active);
+        super::release_survivor_reserve(&mut state);
+        assert!(state.survivor_reserve.is_empty());
+        assert_eq!(state.survivor_reserve_stats.available_bytes, 0);
+        assert_eq!(
+            state.survivor_reserve_stats.consumed_bytes,
+            state.survivor_stats.survivor_space_reserved
+        );
+        assert!(!state.survivor_reserve_active);
+        assert_eq!(
+            state.tlab_reserved_bytes,
+            state.tlab_chunks.iter().map(|c| c.capacity).sum::<usize>()
+        );
+        drop(state);
+        reset_internal();
+    }
+}
+
+#[test]
+fn m4_empty_admission_fallback_preserves_graph_and_releases_reserve() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    for hard_cap in [false, true] {
+        reset_internal();
+        let mut tls = tlab_state_for_test();
+        let child = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+        let mut root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 1);
+        unsafe {
+            *root.cast::<*mut u8>() = child;
+            *child.cast::<u64>() = 43;
+        }
+        let original = root;
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_unindexed(&mut state);
+        if hard_cap {
+            state.memory_limit_bytes = Some(state.tlab_reserved_bytes);
+        }
+        // Empty admission also models refills racing a finite pre-stop reserve.
+        state.survivor_reserve_active = true;
+        let mut stop = Default::default();
+        MinorCollector::new(&mut state, minor_registry_snapshot(), &mut stop).run(
+            MinorRoots {
+                slots: vec![&raw mut root],
+                values: Vec::new(),
+            },
+            Default::default(),
+        );
+        assert_eq!(root, original);
+        assert_eq!(unsafe { **root.cast::<*mut u64>() }, 43);
+        assert_eq!(
+            state.survivor_stats.pin_reasons[PinSource::MemoryBudget as usize],
+            2
+        );
+        assert_eq!(state.young_allocated_bytes, 0);
+        super::release_survivor_reserve(&mut state);
+        assert!(!state.survivor_reserve_active);
+        drop(state);
+        reset_internal();
+    }
+}
+
+#[test]
+fn m4_admission_guard_releases_unused_capacity_on_unwind() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    reset_internal();
+    let mut tls = tlab_state_for_test();
+    willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+    let before = runtime().heap.lock().unwrap().tlab_reserved_bytes;
+    let result = std::panic::catch_unwind(|| {
+        let _admission = super::SurvivorAdmission::new();
+        assert!(runtime().heap.lock().unwrap().tlab_reserved_bytes > before);
+        panic!("admission unwind fixture");
+    });
+    assert!(result.is_err());
+    let state = runtime().heap.lock().unwrap();
+    assert_eq!(state.tlab_reserved_bytes, before);
+    assert!(!state.survivor_reserve_active);
+    drop(state);
+    reset_internal();
+}
+
+#[test]
+fn m4_actual_stop_components_sum_to_complete_request_and_release() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    reset_internal();
+    let mut tls = tlab_state_for_test();
+    let mut root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+    willow_gc_add_runtime_root_slot(&raw mut root);
+    minor_collect_internal();
+    let event = crate::gc_telemetry::stops::snapshot_stops().last_event;
+    let stats = crate::gc_telemetry::pause::snapshot();
+    assert_eq!(stats.last.sequence, event.sequence);
+    assert_eq!(
+        stats.last.ns.iter().sum::<u64>(),
+        event.released_ns - event.requested_ns
+    );
+    assert_eq!(stats.last.generation, 1);
+    assert!(stats.by_reason[2].iter().all(|h| h.count == 1));
+    assert!(!stats.last.aborted);
+    willow_gc_remove_runtime_root_slot(&raw mut root);
+    reset_internal();
+}
