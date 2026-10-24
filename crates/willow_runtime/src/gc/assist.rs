@@ -33,23 +33,35 @@ impl Pacing {
         self
     }
 
-    pub(super) fn charge(&self, bytes: u64, completed: u64, pending: bool) -> u64 {
+    /// Whether allocation has consumed the whole planned runway.
+    pub(super) fn exhausted(&self) -> bool {
+        self.allocated.load(std::sync::atomic::Ordering::Relaxed) >= self.runway
+    }
+
+    /// Consume runway without charging debt; returns the previous total.
+    pub(super) fn record(&self, bytes: u64) -> u64 {
         use std::sync::atomic::Ordering;
-        let previous = self
-            .allocated
+        self.allocated
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_add(bytes))
             })
-            .unwrap();
+            .unwrap()
+    }
+
+    pub(super) fn charge(&self, bytes: u64, completed: u64, pending: bool) -> u64 {
+        let previous = self.record(bytes);
         let remaining = self.work.saturating_sub(completed);
+        let runway = self.runway.saturating_sub(previous.saturating_add(bytes));
+        // Past the runway any further allocation overshoots the goal: owe
+        // every pending unit, whatever the (possibly stale) work estimate says.
+        if pending && runway == 0 {
+            return u64::MAX;
+        }
         // A historical prediction may underestimate the current graph. Retain
         // a one-to-one rate until outstanding work disappears in that case.
-        rate(
-            remaining,
-            self.runway.saturating_sub(previous.saturating_add(bytes)),
-        )
-        .saturating_sub(self.background_rate)
-        .max(if pending && remaining == 0 { SCALE } else { 0 })
+        rate(remaining, runway)
+            .saturating_sub(self.background_rate)
+            .max(if pending && remaining == 0 { SCALE } else { 0 })
     }
 }
 
@@ -159,6 +171,12 @@ pub(super) fn credit(epoch: u64, work: u64) {
     });
 }
 
+/// Whether this thread still owes at least one work unit in `epoch`.
+pub(super) fn due(epoch: u64) -> bool {
+    let debt = DEBT.get();
+    debt.epoch == epoch && debt.units >= SCALE as i64
+}
+
 pub(super) fn reset() {
     DEBT.set(Debt::default());
 }
@@ -196,8 +214,11 @@ mod tests {
         assert_eq!(pacing.charge(0, 0, true), 0);
         assert!(pacing.charge(500, 0, true) > 0);
         assert!(pacing.charge(500, 0, true) > SCALE);
-        assert_eq!(pacing.charge(0, 100, true), SCALE);
+        // Past the runway every pending unit is owed, even beyond the estimate.
+        assert_eq!(pacing.charge(0, 100, true), u64::MAX);
         assert_eq!(pacing.charge(0, 100, false), 0);
+        let pacing = Pacing::new(100, 1000);
+        assert_eq!(pacing.charge(900, 100, true), SCALE);
         let pacing = Pacing::new(100, 1000).with_background(50_000);
         assert_eq!(pacing.charge(0, 0, true), rate(1, 20));
     }
@@ -207,13 +228,39 @@ mod tests {
         let pacing = Pacing::new(100, 1000);
         assert_eq!(pacing.charge(100, 0, true), rate(100, 900));
         assert_eq!(pacing.charge(100, 75, true), rate(25, 800));
-        assert_eq!(pacing.charge(800, 75, true), rate(25, 0));
-        assert_eq!(pacing.charge(u64::MAX, 100, true), SCALE);
+        assert_eq!(pacing.charge(799, 75, true), rate(25, 1));
+        assert!(!pacing.exhausted());
+        assert_eq!(pacing.charge(1, 75, true), u64::MAX);
+        assert!(pacing.exhausted());
+        assert_eq!(pacing.charge(u64::MAX, 100, true), u64::MAX);
         assert_eq!(pacing.charge(u64::MAX, 100, false), 0);
         assert_eq!(
             pacing.allocated.load(std::sync::atomic::Ordering::Relaxed),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn recorded_closing_allocation_exhausts_runway_and_debt_stays_due() {
+        let pacing = Pacing::new(100, 1000);
+        assert_eq!(pacing.record(999), 0);
+        assert!(!pacing.exhausted());
+        assert_eq!(pacing.record(1), 999);
+        assert!(pacing.exhausted());
+        assert_eq!(pacing.record(u64::MAX), 1000);
+        reset();
+        assert!(!due(1));
+        assert!(charge(1, 1, u64::MAX));
+        assert!(due(1));
+        assert!(!due(2));
+        credit(1, u64::MAX);
+        assert!(!due(1));
+        assert!(charge(1, 2, SCALE));
+        credit(1, 1);
+        assert!(due(1));
+        credit(1, 1);
+        assert!(!due(1));
+        reset();
     }
 
     #[test]

@@ -48,7 +48,13 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                 let mut cycle =
                     ConcurrentCycle::with_epoch_index(objects, legacy, traces, 0, identity);
                 cycle.late_published = std::sync::atomic::AtomicBool::new(false);
-                let goal = state.soft_memory.decide(memory_inputs(&state)).goal;
+                let inputs = memory_inputs(&state);
+                let goal = state.soft_memory.decide(inputs).goal;
+                // Reservations, not allocated bytes, reach the limit: partly
+                // filled regions and TLAB tails count before they hold objects.
+                // TLAB chunks reserved after this point enter the pacing only
+                // when refilled, so it lags by at most one chunk per allocator.
+                let runway = goal.saturating_sub(inputs.pressure_bytes.max(before));
                 cycle.slices = slices;
                 cycle.assist_pacing = if !old_cycle::concurrent_enabled()
                     || std::env::var("WILLOW_GC_ASSIST").as_deref() == Ok("0")
@@ -62,7 +68,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
                                 .expected_work
                                 .max(state.last_major_mark_work)
                                 .max(before),
-                            goal.saturating_sub(before),
+                            runway,
                         )
                         .with_background(decision.assist_work_per_byte_ppm),
                     )

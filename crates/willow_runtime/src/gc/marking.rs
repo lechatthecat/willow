@@ -1113,50 +1113,97 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
         assist::reset();
         return;
     }
-    if let Some((_, cycle)) = cached_cycle()
-        && !cycle.closing.load(Ordering::Acquire)
+    if let Some((generation, cycle)) = cached_cycle()
         && let Some(pacing) = &cycle.assist_pacing
     {
-        let completed = {
-            let work = cycle.work.lock().unwrap();
-            work.marked_bytes
-                .saturating_add(work.scanned_bytes)
-                .saturating_add(work.descriptor_bytes)
-        };
-        let pending = !cycle.queue.snapshot().is_drained();
-        let rate = pacing.charge(allocated, completed, pending);
-        if assist::charge(cycle.assist_epoch, allocated, rate) && pending {
-            // One bounded batch; empty queues never block or manufacture credit.
-            // Legacy callbacks are indivisible and measured by native telemetry.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_micros(250);
-            let cpu = assist::CpuScope::new();
-            {
-                let _assist = crate::gc_telemetry::measurement::Span::new(
-                    crate::gc_telemetry::measurement::Phase::Assist,
-                );
-                let work = cycle.drain_checked_until(8, Some(deadline));
-                assist::credit(cycle.assist_epoch, work);
+        if !cycle.closing.load(Ordering::Acquire) {
+            let completed = {
+                let work = cycle.work.lock().unwrap();
+                work.marked_bytes
+                    .saturating_add(work.scanned_bytes)
+                    .saturating_add(work.descriptor_bytes)
+            };
+            let mut pending = !cycle.queue.snapshot().is_drained();
+            let rate = pacing.charge(allocated, completed, pending);
+            let mut due = assist::charge(cycle.assist_epoch, allocated, rate);
+            // Repay the whole debt, not one batch per allocation: past the
+            // runway the rate makes debt exceed any single batch, and
+            // allocating on regardless would overshoot the planned goal.
+            while due && pending {
+                assist_batch(&cycle);
+                due = assist::due(cycle.assist_epoch);
+                pending = assist_open(&cycle) && !cycle.queue.snapshot().is_drained();
+                if due && pending {
+                    willow_gc_safepoint();
+                }
             }
-            let overhead = cpu.overhead();
-            let mut total = cycle.work.lock().unwrap();
-            if let Some(overhead) = overhead {
-                if let Some(cpu) = total.cpu_ns.checked_add(overhead) {
-                    total.cpu_ns = cpu;
-                } else {
-                    total.cpu_incomplete = true;
+        } else {
+            // Closing allocations still consume the runway.
+            pacing.record(allocated);
+        }
+        // Past the runway, closing termination (assists closed) or queued work
+        // means the mark is unfinished; allocating on would overshoot. Wait
+        // like an allocation-budget waiter, helping while assists are open.
+        // The collector never waits on its own cycle.
+        if pacing.exhausted() && std::thread::current().id() != cycle.collector {
+            let _stall = crate::gc_telemetry::observations::Span::new(
+                crate::gc_telemetry::observations::Kind::AllocationStall,
+            );
+            // Phase 0 or a reinstalled cycle ends the wait: a later cycle's
+            // phase 1 must not keep this thread parked on a finished one.
+            while GC_MARK_PHASE.load(Ordering::Acquire) != 0
+                && ASSIST_CYCLE_GENERATION.load(Ordering::Acquire) == generation
+            {
+                let drained = cycle.queue.snapshot().is_drained();
+                // A drained queue before `closing` means the collector is about
+                // to terminate the mark: its current worker-pool run returns and
+                // `finish` sets `closing`, which bounds this overshoot window.
+                if !cycle.closing.load(Ordering::Acquire) && drained {
+                    break;
                 }
-                if std::thread::current().id() == cycle.collector {
-                    total.collector_mark_cpu_ns =
-                        total.collector_mark_cpu_ns.saturating_add(overhead);
+                if !drained && assist_open(&cycle) && !cycle.recovering.load(Ordering::Acquire) {
+                    assist_batch(&cycle);
                 }
-            } else {
-                total.cpu_incomplete = true;
+                willow_gc_safepoint();
+                std::thread::yield_now();
             }
         }
     }
     // All queue claims/readers and the assist CPU span are released before
     // entering a handshake. A stop must not wait for an owner parked here.
     willow_gc_safepoint();
+}
+
+fn assist_open(cycle: &ConcurrentCycle) -> bool {
+    GC_MARK_PHASE.load(Ordering::Acquire) == 1 && !cycle.closing.load(Ordering::Acquire)
+}
+
+/// One bounded assist batch; empty queues never block or manufacture credit.
+/// Legacy callbacks are indivisible and measured by native telemetry.
+fn assist_batch(cycle: &ConcurrentCycle) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(250);
+    let cpu = assist::CpuScope::new();
+    {
+        let _assist = crate::gc_telemetry::measurement::Span::new(
+            crate::gc_telemetry::measurement::Phase::Assist,
+        );
+        let work = cycle.drain_checked_until(8, Some(deadline));
+        assist::credit(cycle.assist_epoch, work);
+    }
+    let overhead = cpu.overhead();
+    let mut total = cycle.work.lock().unwrap();
+    if let Some(overhead) = overhead {
+        if let Some(cpu) = total.cpu_ns.checked_add(overhead) {
+            total.cpu_ns = cpu;
+        } else {
+            total.cpu_incomplete = true;
+        }
+        if std::thread::current().id() == cycle.collector {
+            total.collector_mark_cpu_ns = total.collector_mark_cpu_ns.saturating_add(overhead);
+        }
+    } else {
+        total.cpu_incomplete = true;
+    }
 }
 
 pub(super) fn mark_worklist(
