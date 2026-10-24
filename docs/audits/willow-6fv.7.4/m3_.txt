@@ -1,0 +1,29 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 11 tests
+test gc::concurrent_tests::m3_real_closure_last_work_latency_and_cpu ... m3_termination notification=false samples=100 p50_ns=619186 p99_ns=1088291 closure_cpu_ns=5012101 cpu_valid=true
+m3_termination notification=true samples=100 p50_ns=19677 p99_ns=76543 closure_cpu_ns=5160300 cpu_valid=true
+ok
+test gc::coordinator::tests::m3_foreign_root_deferred_receipt_shutdown_stays_incomplete ... ok
+test gc::coordinator::tests::m3_receipts_defer_foreign_roots_before_and_at_handshake ... receipt asynchronous=false handshake_skip=false skipped_not_completed=true recovered=true
+receipt asynchronous=false handshake_skip=true skipped_not_completed=true recovered=true
+receipt asynchronous=true handshake_skip=false skipped_not_completed=true recovered=true
+receipt asynchronous=true handshake_skip=true skipped_not_completed=true recovered=true
+ok
+test gc::mark_termination::notification_tests::m3_termination_notification_before_wait_during_wait_and_spurious ... ok
+test gc::mark_termination::notification_tests::m3_termination_notification_timeout_preserves_owner_and_election ... ok
+test gc::opportunity::saturation_test::m3_saturated_mutators_preserve_mandatory_progress_and_hard_budget ... m3_saturation mutators=4 mandatory_requests=8 completed_cycles=8 optional_rejections=16 hard_limit=2097152 mutator_progress=667
+ok
+test gc::opportunity::tests::m3_mandatory_collection_ignores_missing_utilization ... ok
+test gc::opportunity::tests::m3_opportunity_quota_has_one_winner_and_no_overflow ... ok
+test gc::opportunity::tests::m3_opportunity_rejects_stale_missing_busy_and_queued_samples ... ok
+test gc::satb::m3_measurements::m3_satb_contention_and_seal_capture_all_publications ... m3_satb threads=1 stores=4096 elapsed_ns=2992114 seal_ns=6582 registry_wait_ns=168636 registry_collisions=0 buffer_wait_ns=168721
+m3_satb threads=8 stores=32768 elapsed_ns=11243471 seal_ns=11221 registry_wait_ns=1390293 registry_collisions=0 buffer_wait_ns=1371399
+m3_satb threads=64 stores=262144 elapsed_ns=105692551 seal_ns=65332 registry_wait_ns=13735300 registry_collisions=0 buffer_wait_ns=13724357
+m3_satb threads=128 stores=524288 elapsed_ns=210562637 seal_ns=141173 registry_wait_ns=7972403501 registry_collisions=39479 buffer_wait_ns=27884921
+ok
+test gc_telemetry::m3::tests::m3_histogram_bounds_zero_powers_extremes_and_percentiles ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 1884 filtered out; finished in 0.71s
+

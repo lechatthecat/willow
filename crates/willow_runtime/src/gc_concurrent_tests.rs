@@ -2818,6 +2818,129 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
 }
 
 #[test]
+fn m3_real_closure_last_work_latency_and_cpu() {
+    let _guard = runtime_test_guard();
+    for notification in [false, true] {
+        let mut latencies = Vec::new();
+        let mut cpu_ns = 0u64;
+        let mut cpu_valid = true;
+        for sample in 0..100 {
+            let (last_tx, last_rx) = std::sync::mpsc::channel();
+            reset_internal_for_test();
+            mark_closure::READER_WAIT_OBSERVED.store(false, Ordering::Relaxed);
+            let object = willow_alloc(8) as usize;
+            let cycle = {
+                let mut state = runtime().heap.lock().unwrap();
+                let cycle = Arc::new(ConcurrentCycle::with_index(
+                    epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
+                    IdSet::default(),
+                    IdMap::default(),
+                    0,
+                ));
+                assert!(cycle.objects.claim(object));
+                marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+                GC_MARK_PHASE.store(1, Ordering::Release);
+                cycle
+            };
+            let ready = Arc::new(AtomicBool::new(false));
+            let assist = {
+                let (cycle, ready) = (cycle.clone(), ready.clone());
+                std::thread::spawn(move || {
+                    {
+                        // Model a drain that has completed its queue item but still
+                        // owns unpublished accounting or an exception batch.
+                        let owner = cycle.termination.enter();
+                        cycle.active_drains.fetch_add(1, Ordering::AcqRel);
+                        let mut batch = MarkBatch {
+                            cpu_start: None,
+                            inline_children: false,
+                            branch_children: Vec::new(),
+                            discovery_counts: [0; 3],
+                            region_hint: None,
+                            inline_types: [None; 4],
+                            local_child: None,
+                            cycle: &cycle,
+                            work: Default::default(),
+                            deferred: Vec::new(),
+                            native_counts: Default::default(),
+                            unindexed: HashSet::new(),
+                        };
+                        batch.work.object(GC_HEADER_SIZE + 8, 0);
+                        ready.store(true, Ordering::Release);
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while !mark_closure::READER_WAIT_OBSERVED.load(Ordering::Acquire) {
+                            assert!(
+                                Instant::now() < deadline,
+                                "closure ignored an unpublished engine batch"
+                            );
+                            std::thread::yield_now();
+                        }
+                        assert!(!runtime().stop_requested.load(Ordering::Acquire));
+                        assert!(runtime().heap.lock().unwrap().concurrent_cycle.is_some());
+                        // Complete real accounting after closure has observed an
+                        // unfinished drain. Vary completion relative to its wait.
+                        std::thread::sleep(Duration::from_micros([0, 100, 500, 1500][sample % 4]));
+                        drop(batch);
+                        let last_work = Instant::now();
+                        drop(owner);
+                        last_tx.send(last_work).unwrap();
+                    }
+                })
+            };
+            while !ready.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            assert!(cycle.queue.snapshot().is_drained());
+            let cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
+            let finished = mark_closure::finish_with_policy(
+                &cycle,
+                Instant::now(),
+                std::thread::sleep,
+                || {},
+                notification,
+            );
+            let terminated = Instant::now();
+            if let Some(elapsed) = cpu_start
+                .zip(crate::gc_telemetry::workers::thread_cpu_ns())
+                .and_then(|(a, b)| b.checked_sub(a))
+            {
+                cpu_ns += elapsed;
+            } else {
+                cpu_valid = false;
+            }
+            latencies.push(
+                terminated
+                    .duration_since(last_rx.recv().unwrap())
+                    .as_nanos(),
+            );
+            assist.join().unwrap();
+            assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
+            let (work, plan) = finished.expect("closure must finish after the last owner");
+            assert_eq!(work.marked_bytes, (GC_HEADER_SIZE + 8) as u64);
+            assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+            assert!(cycle.queue.snapshot().is_drained());
+            sweep::concurrent(plan);
+            assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
+            assert!(
+                crate::gc_telemetry::stops::snapshot_stops()
+                    .by_reason
+                    .iter()
+                    .take(2)
+                    .any(|r| r.requests > 0)
+            );
+            willow_gc_collect();
+            assert_eq!(willow_gc_allocated_bytes(), 0);
+        }
+        latencies.sort_unstable();
+        println!(
+            "m3_termination notification={notification} samples=100 p50_ns={} p99_ns={} closure_cpu_ns={cpu_ns} cpu_valid={cpu_valid}",
+            latencies[49], latencies[98]
+        );
+    }
+    reset_internal_for_test();
+}
+
+#[test]
 fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_after_stopped_ownership_transfer() {
     let _guard = runtime_test_guard();
     reset_internal_for_test();

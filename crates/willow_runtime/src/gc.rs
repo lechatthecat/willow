@@ -64,6 +64,7 @@ mod minor;
 mod nursery;
 mod old_cycle;
 mod old_lab;
+pub mod opportunity;
 mod pacer;
 mod pending_registry;
 mod region_cache;
@@ -2001,9 +2002,21 @@ fn collect_internal() {
     let _ = try_collect_internal();
 }
 
-/// False means collector election was lost, not that the requested cycle ran.
-/// Automatic requests must wait cooperatively and retry rather than consume it.
-fn try_collect_internal() -> bool {
+// Route a real legacy owner to the definitive handshake check in regressions.
+#[cfg(test)]
+static RECEIPT_TEST_HANDSHAKE_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionAttempt {
+    Completed,
+    ElectionLost,
+    ForeignOwner,
+}
+
+/// Only Completed proves collection; both contention and unsafe foreign roots
+/// defer the attempt without satisfying a request.
+fn try_collect_internal() -> CollectionAttempt {
     // Collector election (willow-6fv.5.6): only one thread collects at a time.
     // A thread that cannot become the collector must NOT block on runtime().collect_lock —
     // if a stop-the-world collection is in progress, the holder is waiting for
@@ -2015,17 +2028,21 @@ fn try_collect_internal() -> bool {
         .load(std::sync::atomic::Ordering::Acquire)
     {
         willow_gc_safepoint();
-        return false;
+        return CollectionAttempt::ElectionLost;
     }
     let Some(_serialize) = cycle_wait::CollectorGuard::try_acquire() else {
         willow_gc_safepoint();
-        return false;
+        return CollectionAttempt::ElectionLost;
     };
     // A legacy root owner outside the registry cannot publish a snapshot.
     // Other registered workers do not make that foreign stack safe to scan.
-    if foreign_root_stack_owner_active() {
+    #[cfg(test)]
+    let check_early = !RECEIPT_TEST_HANDSHAKE_ONLY.load(Ordering::Relaxed);
+    #[cfg(not(test))]
+    let check_early = true;
+    if check_early && foreign_root_stack_owner_active() {
         progress::record_skip(GcSkipReason::ForeignOwner);
-        return true;
+        return CollectionAttempt::ForeignOwner;
     }
     let gc_log = std::env::var("WILLOW_GC_LOG").is_ok();
 
@@ -2046,7 +2063,7 @@ fn try_collect_internal() -> bool {
     let external_before = external_bytes() as u64;
     let Some((heap_before, marking)) = root_handshake::begin() else {
         progress::record_skip(GcSkipReason::ForeignOwnerAtHandshake);
-        return true;
+        return CollectionAttempt::ForeignOwner;
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(debug_assertions)]
@@ -2182,7 +2199,7 @@ fn try_collect_internal() -> bool {
     }
     drop(_serialize);
     crate::gc_telemetry::emit_cycle(event);
-    true
+    CollectionAttempt::Completed
 }
 
 #[cfg(test)]

@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/willow_compiler-65054407f5676687)
+
+running 1 test
+interface_pair_stores=1 old_loads=1 barrier_calls=1 atomic_stores=1 vtable_stores=1
+interface_pair_stores=16 old_loads=16 barrier_calls=16 atomic_stores=16 vtable_stores=16
+interface_pair_stores=256 old_loads=256 barrier_calls=256 atomic_stores=256 vtable_stores=256
+test backend::cranelift::gc_codegen::tests::interface_pair_stores_trace_only_object_word_in_linear_code ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3335 filtered out; finished in 0.04s
+

@@ -293,3 +293,9 @@ AGENTS.md
 !/docs/audits/willow-6fv.7.5/review-scope.md
 !/docs/audits/willow-6fv.7.5/summarize_confirmation.py
 !/docs/audits/willow-6fv.7.5/confirmation-validation.txt
+
+# Reviewed M3 measurement sources and evidence.
+!/docs/audits/willow-6fv.7.4/
+
+# Generated Python cache is not audit evidence.
+/docs/audits/willow-6fv.7.4/**/__pycache__/

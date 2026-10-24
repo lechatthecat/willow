@@ -1,0 +1,228 @@
+{
+  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+  "cpu_count": 16,
+  "profile": true,
+  "processes_per_cell": 5,
+  "results": [
+    {
+      "objects": 4096,
+      "fanout": 1,
+      "workers": 1,
+      "median_ns": 2556840,
+      "median_95_bootstrap_ci_ns": [
+        2312695,
+        2642731
+      ],
+      "peak_rss_kib": 3688
+    },
+    {
+      "objects": 4096,
+      "fanout": 1,
+      "workers": 2,
+      "median_ns": 2395509,
+      "median_95_bootstrap_ci_ns": [
+        2279783,
+        2902555
+      ],
+      "peak_rss_kib": 3744
+    },
+    {
+      "objects": 4096,
+      "fanout": 1,
+      "workers": 4,
+      "median_ns": 2459268,
+      "median_95_bootstrap_ci_ns": [
+        2312885,
+        2547954
+      ],
+      "peak_rss_kib": 3692
+    },
+    {
+      "objects": 4096,
+      "fanout": 1,
+      "workers": 8,
+      "median_ns": 2612294,
+      "median_95_bootstrap_ci_ns": [
+        2428580,
+        2933633
+      ],
+      "peak_rss_kib": 3816
+    },
+    {
+      "objects": 4096,
+      "fanout": 1,
+      "workers": 16,
+      "median_ns": 3535817,
+      "median_95_bootstrap_ci_ns": [
+        3327468,
+        10777427
+      ],
+      "peak_rss_kib": 3624
+    },
+    {
+      "objects": 4096,
+      "fanout": 4,
+      "workers": 1,
+      "median_ns": 3923800,
+      "median_95_bootstrap_ci_ns": [
+        3724448,
+        4807450
+      ],
+      "peak_rss_kib": 4000
+    },
+    {
+      "objects": 4096,
+      "fanout": 4,
+      "workers": 2,
+      "median_ns": 4431458,
+      "median_95_bootstrap_ci_ns": [
+        4080012,
+        4646038
+      ],
+      "peak_rss_kib": 3812
+    },
+    {
+      "objects": 4096,
+      "fanout": 4,
+      "workers": 4,
+      "median_ns": 16186189,
+      "median_95_bootstrap_ci_ns": [
+        12923631,
+        22308952
+      ],
+      "peak_rss_kib": 3860
+    },
+    {
+      "objects": 4096,
+      "fanout": 4,
+      "workers": 8,
+      "median_ns": 60432970,
+      "median_95_bootstrap_ci_ns": [
+        46312075,
+        73053426
+      ],
+      "peak_rss_kib": 3872
+    },
+    {
+      "objects": 4096,
+      "fanout": 4,
+      "workers": 16,
+      "median_ns": 71415891,
+      "median_95_bootstrap_ci_ns": [
+        35224709,
+        83970243
+      ],
+      "peak_rss_kib": 3740
+    },
+    {
+      "objects": 32768,
+      "fanout": 4,
+      "workers": 1,
+      "median_ns": 29036353,
+      "median_95_bootstrap_ci_ns": [
+        28464266,
+        34154062
+      ],
+      "peak_rss_kib": 7904
+    },
+    {
+      "objects": 32768,
+      "fanout": 4,
+      "workers": 2,
+      "median_ns": 32022905,
+      "median_95_bootstrap_ci_ns": [
+        28797778,
+        35071754
+      ],
+      "peak_rss_kib": 8008
+    },
+    {
+      "objects": 32768,
+      "fanout": 4,
+      "workers": 4,
+      "median_ns": 34371787,
+      "median_95_bootstrap_ci_ns": [
+        33045703,
+        35398483
+      ],
+      "peak_rss_kib": 7536
+    },
+    {
+      "objects": 32768,
+      "fanout": 4,
+      "workers": 8,
+      "median_ns": 35553552,
+      "median_95_bootstrap_ci_ns": [
+        31136902,
+        36908300
+      ],
+      "peak_rss_kib": 7760
+    },
+    {
+      "objects": 32768,
+      "fanout": 4,
+      "workers": 16,
+      "median_ns": 38821049,
+      "median_95_bootstrap_ci_ns": [
+        30776780,
+        40053588
+      ],
+      "peak_rss_kib": 7632
+    },
+    {
+      "objects": 32768,
+      "fanout": 16,
+      "workers": 1,
+      "median_ns": 32580395,
+      "median_95_bootstrap_ci_ns": [
+        32393537,
+        32780769
+      ],
+      "peak_rss_kib": 10128
+    },
+    {
+      "objects": 32768,
+      "fanout": 16,
+      "workers": 2,
+      "median_ns": 30915950,
+      "median_95_bootstrap_ci_ns": [
+        30843345,
+        31381449
+      ],
+      "peak_rss_kib": 10112
+    },
+    {
+      "objects": 32768,
+      "fanout": 16,
+      "workers": 4,
+      "median_ns": 33589749,
+      "median_95_bootstrap_ci_ns": [
+        32998655,
+        34920040
+      ],
+      "peak_rss_kib": 10328
+    },
+    {
+      "objects": 32768,
+      "fanout": 16,
+      "workers": 8,
+      "median_ns": 34423293,
+      "median_95_bootstrap_ci_ns": [
+        33409242,
+        37697081
+      ],
+      "peak_rss_kib": 10312
+    },
+    {
+      "objects": 32768,
+      "fanout": 16,
+      "workers": 16,
+      "median_ns": 36511480,
+      "median_95_bootstrap_ci_ns": [
+        36278905,
+        40976690
+      ],
+      "peak_rss_kib": 10416
+    }
+  ]
+}

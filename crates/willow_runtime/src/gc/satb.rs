@@ -377,10 +377,10 @@ impl SatbShards {
         publish: impl FnOnce(&mut ShardBuffer<'_>) -> R,
     ) -> Option<R> {
         let buffer = {
-            let mut buffers = self.shards[SHARD.with(|shard| *shard)]
-                .0
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut buffers = crate::gc_telemetry::m3::lock(
+                &self.shards[SHARD.with(|shard| *shard)].0,
+                crate::gc_telemetry::m3::Kind::SatbRegistry,
+            );
             if self.sealed.load(Ordering::Acquire) {
                 return None;
             }
@@ -399,7 +399,8 @@ impl SatbShards {
             }
             Arc::clone(buffers.get(&owner).unwrap())
         };
-        let mut entries = buffer.0.lock().unwrap_or_else(|error| error.into_inner());
+        let mut entries =
+            crate::gc_telemetry::m3::lock(&buffer.0, crate::gc_telemetry::m3::Kind::SatbBuffer);
         if self.sealed.load(Ordering::Acquire) || !valid() {
             return None;
         }
@@ -416,7 +417,8 @@ impl SatbShards {
             .unwrap_or_else(|error| error.into_inner());
         let owner = std::thread::current().id();
         if let Some(buffer) = buffers.get(&owner).cloned() {
-            let mut entries = buffer.0.lock().unwrap_or_else(|error| error.into_inner());
+            let mut entries =
+                crate::gc_telemetry::m3::lock(&buffer.0, crate::gc_telemetry::m3::Kind::SatbBuffer);
             if !entries.is_empty() {
                 // Closure may have revoked private publication before this
                 // owner reaches unregister. Transfer before removing storage.
@@ -452,6 +454,7 @@ impl SatbShards {
         budget: &mut super::old_cycle::RemarkBudget,
         mut publish: impl FnMut(&[usize]),
     ) -> bool {
+        let _profile = crate::gc_telemetry::m3::Span::new(crate::gc_telemetry::m3::Kind::SatbSeal);
         self.seal_stopped_bounded_with_clock(
             coord,
             budget,
@@ -1397,5 +1400,62 @@ mod tests {
             buffers.flush_thread(id, true, |_| panic!("duplicate publication"));
         }
         assert!(buffers.entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod m3_measurements {
+    use super::*;
+    #[test]
+    fn m3_satb_contention_and_seal_capture_all_publications() {
+        let _guard = super::super::runtime_test_guard();
+        for threads in [1, 8, 64, 128] {
+            let shards = Arc::new(SatbShards::new(256));
+            let start = Arc::new(std::sync::Barrier::new(threads));
+            let count = Arc::new(AtomicUsize::new(0));
+            let before = crate::gc_telemetry::m3::snapshot();
+            let began = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    let (shards, start, count) = (shards.clone(), start.clone(), count.clone());
+                    scope.spawn(move || {
+                        start.wait();
+                        for i in 0..4096 {
+                            shards
+                                .with_current(
+                                    || true,
+                                    |buffer| {
+                                        buffer.record(i + 1, |entries| {
+                                            count.fetch_add(entries.len(), Ordering::Relaxed);
+                                        })
+                                    },
+                                )
+                                .unwrap();
+                        }
+                    });
+                }
+            });
+            let coord = super::super::GcCoord {
+                stop_requested: true,
+                ..Default::default()
+            };
+            let seal = std::time::Instant::now();
+            shards.seal_stopped(&coord, |entries| {
+                count.fetch_add(entries.len(), Ordering::Relaxed);
+            });
+            let seal_ns = seal.elapsed().as_nanos();
+            assert!(shards.is_drained());
+            assert_eq!(count.load(Ordering::Relaxed), threads * 4096);
+            assert!(shards.with_current(|| true, |_| ()).is_none());
+            let after = crate::gc_telemetry::m3::snapshot();
+            println!(
+                "m3_satb threads={threads} stores={} elapsed_ns={} seal_ns={seal_ns} registry_wait_ns={} registry_collisions={} buffer_wait_ns={}",
+                threads * 4096,
+                began.elapsed().as_nanos(),
+                after.intervals[0].total_ns - before.intervals[0].total_ns,
+                after.collisions[0] - before.collisions[0],
+                after.intervals[1].total_ns - before.intervals[1].total_ns
+            );
+        }
     }
 }

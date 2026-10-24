@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 1 test
+test gc::sweep::batches::tests::bounded_sweep_competing_allocators_keep_forward_progress ... sweep_competing allocators=8 allocations=1024 p50_ns=41288 p99_ns=516343 p999_ns=688274 max_ns=913625 Report { objects: 4100, bytes: 98344, batches: 1021, assists: 1019, yields: 1020, overshoots: 0, work_ns: 5247514, setup_ns: 0, sweep_wall_ns: 0, partial_batches: 1019, heap_holds: 783, index_reads: 781, heap_hold_ns: 4644236, heap_wait_ns: 41042, heap_max_hold_ns: 28974, heap_max_wait_ns: 251, max_batch_ns: 56786, assist_max_ns: 56786, hook_ns: 0, release_ns: 1353, assist_objects: 4096, assist_bytes: 98304, reclaimed_bytes: 98304, metadata_items: 1, swept_objects: 4096, assist_cpu_ns: 0, assist_cpu_incomplete: false }
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1894 filtered out; finished in 0.02s
+

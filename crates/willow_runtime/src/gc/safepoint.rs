@@ -320,9 +320,9 @@ const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 120;
 /// An acknowledgement that never arrives means a registered thread stopped
 /// without unregistering. The wait then cannot end, and the process produces
 /// no further output at all — willow-utqy is a Windows CI job that spent its
-/// whole 90-minute budget inside one such wait. Debug builds, which is every
-/// test binary, give up after the bound and name the threads instead. Release
-/// builds keep the unbounded wait unless the environment asks otherwise.
+/// whole 90-minute budget inside one such wait. All builds give up after the
+/// bound and name the threads instead; release builds must not silently wait
+/// forever for a vanished mutator.
 /// `WILLOW_GC_HANDSHAKE_TIMEOUT_SECS=0` disables the bound everywhere.
 ///
 /// Read once: `std::env::var` allocates for the key on Windows (willow-ssl7.12).
@@ -333,8 +333,7 @@ fn handshake_timeout() -> Option<std::time::Duration> {
             .and_then(|value| value.trim().parse::<u64>().ok())
         {
             Some(seconds) => seconds,
-            None if cfg!(debug_assertions) => DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            None => 0,
+            None => DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         };
         (seconds != 0).then(|| std::time::Duration::from_secs(seconds))
     });

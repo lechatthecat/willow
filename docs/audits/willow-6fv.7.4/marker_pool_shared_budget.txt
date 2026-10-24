@@ -1,0 +1,17 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 1 test
+test gc::concurrent_tests::marker_pool_shared_budget_bounds_retries_and_preserves_pending_work ... workers=1 objects=256 budget=1024 retries=481 completion_calls=256
+workers=1 objects=1024 budget=4096 retries=2148 completion_calls=1024
+workers=1 objects=4096 budget=16384 retries=9344 completion_calls=4096
+workers=5 objects=256 budget=1024 retries=481 completion_calls=256
+workers=5 objects=1024 budget=4096 retries=1732 completion_calls=1024
+workers=5 objects=4096 budget=16384 retries=7568 completion_calls=4096
+workers=16 objects=256 budget=1024 retries=561 completion_calls=256
+workers=16 objects=1024 budget=4096 retries=1892 completion_calls=1024
+workers=16 objects=4096 budget=16384 retries=1301 completion_calls=4096
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1894 filtered out; finished in 0.06s
+

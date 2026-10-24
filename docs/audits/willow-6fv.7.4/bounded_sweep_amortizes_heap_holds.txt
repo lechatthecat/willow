@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 1 test
+test gc::sweep::batches::tests::bounded_sweep_amortizes_heap_holds_and_index_reads_over_strides ... sweep_holds objects=513 regions=1 holds=34 index_reads=34
+sweep_holds objects=8193 regions=1 holds=514 index_reads=514
+sweep_holds objects=40000 regions=4 holds=2506 index_reads=2506
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1894 filtered out; finished in 0.17s
+

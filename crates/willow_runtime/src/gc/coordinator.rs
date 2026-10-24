@@ -5,6 +5,8 @@ use super::*;
 #[derive(Default)]
 struct State {
     pending: bool,
+    requested: u64,
+    finished: Arc<AtomicU64>,
     running: bool,
     shutdown: bool,
 }
@@ -37,9 +39,37 @@ impl Coordinator {
 /// Returns false for the synchronous compatibility path: native callers outside
 /// the registry cannot publish roots to a background collector.
 pub(super) fn request() -> bool {
+    request_tracked().is_some()
+}
+
+/// A receipt is completed only by a successful coordinator collection which
+/// selected this request. An unrelated synchronous collection cannot satisfy it.
+#[derive(Clone)]
+pub struct Request {
+    sequence: u64,
+    finished: Arc<AtomicU64>,
+}
+impl Request {
+    /// False only when an unregistered/spawn-failure compatibility collection
+    /// completed synchronously before the receipt was returned.
+    pub fn is_asynchronous(&self) -> bool {
+        self.sequence != 0
+    }
+    pub fn is_complete(&self) -> bool {
+        self.finished.load(Ordering::Acquire) >= self.sequence
+    }
+    pub(super) fn synchronous() -> Self {
+        Self {
+            sequence: 0,
+            finished: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+pub(super) fn request_tracked() -> Option<Request> {
     let id = std::thread::current().id();
     if !runtime().coord.0.lock().unwrap().mutators.contains_key(&id) {
-        return false;
+        return None;
     }
     let mut coordinator = COORDINATOR.lock().unwrap();
     if coordinator.is_none() {
@@ -49,7 +79,7 @@ pub(super) fn request() -> bool {
                 crate::gc_telemetry::workers::record_failure(
                     crate::gc_telemetry::workers::Failure::Spawn,
                 );
-                return false;
+                return None;
             }
         }
     }
@@ -57,13 +87,21 @@ pub(super) fn request() -> bool {
     let (lock, cv) = &*coordinator.shared;
     let mut state = lock.lock().unwrap();
     if state.shutdown {
-        return false;
+        return None;
     }
     // Retain requests arriving before the current sweep publishes free spans.
     // The single coordinator starts the pending cycle only after collect returns.
+    state.requested = state
+        .requested
+        .checked_add(1)
+        .expect("GC request sequence exhausted");
+    let receipt = Request {
+        sequence: state.requested,
+        finished: state.finished.clone(),
+    };
     state.pending = true;
     cv.notify_one();
-    true
+    Some(receipt)
 }
 
 fn run(shared: Arc<(Mutex<State>, Condvar)>, completion: Arc<std::sync::atomic::AtomicBool>) {
@@ -89,35 +127,48 @@ fn run_loop(shared: Arc<(Mutex<State>, Condvar)>) {
         }
         state.pending = false;
         state.running = true;
+        let mut selected = state.requested;
         drop(state);
-        willow_gc_register_mutator();
-        #[cfg(test)]
-        if PANIC_BEFORE_COLLECTION.load(Ordering::Relaxed) {
-            panic!("injected coordinator collection panic");
-        }
-        loop {
-            if try_collect_internal() {
-                break;
+        let succeeded = loop {
+            willow_gc_register_mutator();
+            #[cfg(test)]
+            if PANIC_BEFORE_COLLECTION.load(Ordering::Relaxed) {
+                panic!("injected coordinator collection panic");
             }
-            // Keep this request owned while a different collector finishes.
-            // New requests during our eventual cycle remain a separate pending
-            // request; clear only the request about to attempt election.
-            {
-                let mut state = lock.lock().unwrap();
-                state.pending = true;
-                if state.shutdown {
-                    break;
-                }
+            let attempt = try_collect_internal();
+            willow_gc_unregister_mutator();
+            if attempt == CollectionAttempt::Completed {
+                break true;
             }
-            cycle_wait::wait_for_current_cycle();
+            // Keep the selected requests owned until an actual collection.
             let mut state = lock.lock().unwrap();
+            state.pending = true;
+            if attempt == CollectionAttempt::ForeignOwner {
+                // Legacy root owners need not safepoint and have no common
+                // notification edge. Retry at most once per 10ms while fully
+                // unregistered; shutdown interrupts this wait. New requests and
+                // spurious wakes cannot shorten the backoff into a busy loop.
+                state = cv
+                    .wait_timeout_while(state, std::time::Duration::from_millis(10), |state| {
+                        !state.shutdown
+                    })
+                    .unwrap()
+                    .0;
+            } else {
+                drop(state);
+                cycle_wait::wait_for_current_cycle();
+                state = lock.lock().unwrap();
+            }
             if state.shutdown {
-                break;
+                break false;
             }
             state.pending = false;
-        }
-        willow_gc_unregister_mutator();
+            selected = state.requested;
+        };
         let mut state = lock.lock().unwrap();
+        if succeeded {
+            state.finished.store(selected, Ordering::Release);
+        }
         state.running = false;
         cv.notify_all();
     }
@@ -353,7 +404,8 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        assert!(request()); // The only automatic request; no later allocations.
+        let receipt = request_tracked().unwrap(); // Only automatic request; no later allocations.
+        assert!(!receipt.is_complete());
         while cycle_wait::SLEEPS.load(Ordering::Acquire) == 0 {
             willow_gc_safepoint();
             assert!(
@@ -381,7 +433,13 @@ mod tests {
             std::thread::yield_now();
         }
         explicit.join().unwrap();
+        while !receipt.is_complete() {
+            willow_gc_safepoint();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         shutdown();
+        assert!(receipt.is_complete());
         assert_eq!(runtime().heap.lock().unwrap().major_collections, 2);
         assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
         println!(
@@ -390,6 +448,139 @@ mod tests {
         );
         willow_pop_roots(1);
         drop(_mutator);
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn m3_receipts_defer_foreign_roots_before_and_at_handshake() {
+        let _guard = runtime_test_guard();
+        for asynchronous in [false, true] {
+            for handshake in [false, true] {
+                reset_internal_for_test();
+                RECEIPT_TEST_HANDSHAKE_ONLY.store(handshake, Ordering::Relaxed);
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let owner = std::thread::spawn(move || {
+                    let mut root = willow_alloc(32);
+                    willow_push_root(&mut root);
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    willow_pop_root();
+                });
+                ready_rx.recv().unwrap();
+                let registration = asynchronous.then(MutatorRegistration::new);
+                let before = gc_progress();
+                let receipt = opportunity::request_tracked(opportunity::Priority::Required, None);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                if asynchronous {
+                    let receipt = receipt.as_ref().unwrap();
+                    assert!(receipt.is_asynchronous());
+                    while gc_progress().skipped_collections == before.skipped_collections {
+                        willow_gc_safepoint();
+                        assert!(std::time::Instant::now() < deadline);
+                        std::thread::yield_now();
+                    }
+                    let began = std::time::Instant::now();
+                    let skips = gc_progress().skipped_collections;
+                    while began.elapsed() < std::time::Duration::from_millis(35) {
+                        assert!(!receipt.is_complete());
+                        willow_gc_safepoint();
+                        // Exercise spurious wakeups during the timed backoff.
+                        if let Some(coordinator) = COORDINATOR.lock().unwrap().as_ref() {
+                            coordinator.shared.1.notify_all();
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    // Count attempts, not CPU timing: even spurious wakes cannot
+                    // turn the foreign-owner retry path into an unbounded loop.
+                    assert!(
+                        gc_progress().skipped_collections - skips
+                            <= began.elapsed().as_millis() as u64 / 10 + 2
+                    );
+                } else {
+                    assert!(
+                        receipt.is_none(),
+                        "skipped synchronous attempt invented completion"
+                    );
+                }
+                let skipped = gc_progress();
+                assert_eq!(
+                    skipped.successful_collections,
+                    before.successful_collections
+                );
+                assert_eq!(
+                    skipped.last_skip_reason,
+                    if handshake {
+                        GcSkipReason::ForeignOwnerAtHandshake as u64
+                    } else {
+                        GcSkipReason::ForeignOwner as u64
+                    }
+                );
+                release_tx.send(()).unwrap();
+                while !owner.is_finished() {
+                    willow_gc_safepoint();
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                owner.join().unwrap();
+                let receipt = receipt.unwrap_or_else(|| {
+                    opportunity::request_tracked(opportunity::Priority::Required, None).unwrap()
+                });
+                while !receipt.is_complete() {
+                    willow_gc_safepoint();
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "retained request did not resume"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(gc_progress().successful_collections > before.successful_collections);
+                assert_eq!(willow_gc_allocated_bytes(), 0);
+                shutdown();
+                drop(registration);
+                RECEIPT_TEST_HANDSHAKE_ONLY.store(false, Ordering::Relaxed);
+                println!(
+                    "receipt asynchronous={asynchronous} handshake_skip={handshake} skipped_not_completed=true recovered=true"
+                );
+            }
+        }
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn m3_foreign_root_deferred_receipt_shutdown_stays_incomplete() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let mut root = willow_alloc(32);
+            willow_push_root(&mut root);
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            willow_pop_root();
+        });
+        ready_rx.recv().unwrap();
+        let registration = MutatorRegistration::new();
+        let receipt = request_tracked().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while gc_progress().skipped_collections == 0 {
+            willow_gc_safepoint();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        shutdown(); // Must interrupt the backoff while the foreign owner remains.
+        assert!(!receipt.is_complete());
+        assert_eq!(gc_progress().successful_collections, 0);
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        willow_gc_collect();
+        assert!(
+            !receipt.is_complete(),
+            "an unrelated collection satisfied a canceled request"
+        );
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        drop(registration);
         reset_internal_for_test();
     }
 

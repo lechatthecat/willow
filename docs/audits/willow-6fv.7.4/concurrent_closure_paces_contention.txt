@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 1 test
+test gc::concurrent_tests::concurrent_closure_paces_contention_and_retains_work_until_release ... closure waits=1 retries=256 upper_bound=256 requested_sleep_ns=1000000 completion_calls=1 global_stops=required_stw
+closure waits=4 retries=1024 upper_bound=1024 requested_sleep_ns=4000000 completion_calls=1 global_stops=required_stw
+closure waits=16 retries=4096 upper_bound=4096 requested_sleep_ns=16000000 completion_calls=1 global_stops=required_stw
+closure waits=64 retries=16384 upper_bound=16384 requested_sleep_ns=64000000 completion_calls=1 global_stops=required_stw
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1894 filtered out; finished in 0.05s
+

@@ -81,7 +81,7 @@ impl Pool {
             shared.0.lock().unwrap().remaining_workers += 1;
             match std::thread::Builder::new()
                 .name(format!("willow-gc-mark-{index}"))
-                .spawn(move || worker_main(shared))
+                .spawn(move || worker_main_indexed(shared, index))
             {
                 Ok(thread) => pool.threads.push(thread),
                 Err(error) => {
@@ -173,9 +173,14 @@ impl Drop for Pool {
     }
 }
 
+#[cfg(test)]
 fn worker_main(shared: Arc<(Mutex<State>, Condvar)>) {
+    worker_main_indexed(shared, 0);
+}
+
+fn worker_main_indexed(shared: Arc<(Mutex<State>, Condvar)>, index: usize) {
     crate::failure::ffi_boundary("GC marker worker", || {
-        worker_loop(shared.clone());
+        worker_loop(shared.clone(), index);
         // worker_loop has dropped its scratch storage and all epoch owners.
         let mut state = shared.0.lock().unwrap();
         state.remaining_workers -= 1;
@@ -193,13 +198,14 @@ fn worker_main(shared: Arc<(Mutex<State>, Condvar)>) {
     });
 }
 
-fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
+fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>, index: usize) {
     let _role = crate::gc_telemetry::observations::MarkerRole::new();
     let _lifetime = crate::gc_telemetry::measurement::WorkerLifetime::new();
     let (lock, cv) = &*shared;
     let mut generation = 0;
     let mut children = Vec::new();
     loop {
+        let idle_start = crate::gc_telemetry::m3::enabled().then(std::time::Instant::now);
         let mut state = lock.lock().unwrap();
         while !state.shutdown && state.generation == generation {
             state = cv.wait(state).unwrap();
@@ -211,6 +217,10 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
         let job = state.job.as_ref().unwrap().clone();
         let cycle = &job.cycle;
         drop(state);
+        let profile = crate::gc_telemetry::m3::WorkerJob::begin(
+            index,
+            idle_start.map_or(0, |s| s.elapsed().as_nanos().min(u64::MAX as u128) as u64),
+        );
         let owner = cycle.termination.enter();
         let measurement = JobMeasurement::begin();
         willow_gc_register_mutator();
@@ -249,6 +259,7 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
         // Drop the epoch reference before publishing that this reader is gone.
         drop(job);
         drop(measurement);
+        drop(profile);
         let mut state = lock.lock().unwrap();
         state.remaining -= 1;
         cv.notify_all();

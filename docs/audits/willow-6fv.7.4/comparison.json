@@ -1,0 +1,610 @@
+{
+  "baseline": "4ca55d19fdd8f8c67f429710c22e96e437e4f453",
+  "profile": false,
+  "binary_sha256": {
+    "baseline": "26c7f92bd48fb801a8806d325c88c775caf753301392291fd05b9ee47eb9660a",
+    "current": "b0fbda8abf70539b61ec5c986a6655c9e0900d3c2a694194feb601e7720a3cad"
+  },
+  "rows": [
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 1,
+      "run": 0,
+      "rss_kib": 4756,
+      "allocations": 65536,
+      "elapsed_ns": 10442285,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 1,
+      "run": 0,
+      "rss_kib": 4704,
+      "allocations": 65536,
+      "elapsed_ns": 9900625,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 1,
+      "run": 1,
+      "rss_kib": 4672,
+      "allocations": 65536,
+      "elapsed_ns": 9838248,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 1,
+      "run": 1,
+      "rss_kib": 4720,
+      "allocations": 65536,
+      "elapsed_ns": 9980804,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 1,
+      "run": 2,
+      "rss_kib": 4404,
+      "allocations": 65536,
+      "elapsed_ns": 10047418,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 1,
+      "run": 2,
+      "rss_kib": 4544,
+      "allocations": 65536,
+      "elapsed_ns": 10115074,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 1,
+      "run": 3,
+      "rss_kib": 4704,
+      "allocations": 65536,
+      "elapsed_ns": 10124802,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 1,
+      "run": 3,
+      "rss_kib": 4568,
+      "allocations": 65536,
+      "elapsed_ns": 10267028,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 1,
+      "run": 4,
+      "rss_kib": 4564,
+      "allocations": 65536,
+      "elapsed_ns": 9995721,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 1,
+      "run": 4,
+      "rss_kib": 4640,
+      "allocations": 65536,
+      "elapsed_ns": 9874996,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 4,
+      "run": 0,
+      "rss_kib": 4448,
+      "allocations": 65536,
+      "elapsed_ns": 9955016,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 4,
+      "run": 0,
+      "rss_kib": 4704,
+      "allocations": 65536,
+      "elapsed_ns": 10069991,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 4,
+      "run": 1,
+      "rss_kib": 4644,
+      "allocations": 65536,
+      "elapsed_ns": 9912156,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 4,
+      "run": 1,
+      "rss_kib": 4756,
+      "allocations": 65536,
+      "elapsed_ns": 9930440,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 4,
+      "run": 2,
+      "rss_kib": 4592,
+      "allocations": 65536,
+      "elapsed_ns": 9970655,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 4,
+      "run": 2,
+      "rss_kib": 4704,
+      "allocations": 65536,
+      "elapsed_ns": 9955917,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 4,
+      "run": 3,
+      "rss_kib": 4660,
+      "allocations": 65536,
+      "elapsed_ns": 10004228,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 4,
+      "run": 3,
+      "rss_kib": 4756,
+      "allocations": 65536,
+      "elapsed_ns": 10065452,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 4,
+      "run": 4,
+      "rss_kib": 4440,
+      "allocations": 65536,
+      "elapsed_ns": 10042189,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 4,
+      "run": 4,
+      "rss_kib": 4640,
+      "allocations": 65536,
+      "elapsed_ns": 9906344,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 16,
+      "run": 0,
+      "rss_kib": 4568,
+      "allocations": 65536,
+      "elapsed_ns": 10621099,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 16,
+      "run": 0,
+      "rss_kib": 4524,
+      "allocations": 65536,
+      "elapsed_ns": 10662766,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 16,
+      "run": 1,
+      "rss_kib": 4704,
+      "allocations": 65536,
+      "elapsed_ns": 10778873,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 16,
+      "run": 1,
+      "rss_kib": 4444,
+      "allocations": 65536,
+      "elapsed_ns": 10646987,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 16,
+      "run": 2,
+      "rss_kib": 4568,
+      "allocations": 65536,
+      "elapsed_ns": 10430854,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 16,
+      "run": 2,
+      "rss_kib": 4488,
+      "allocations": 65536,
+      "elapsed_ns": 10472551,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 16,
+      "run": 3,
+      "rss_kib": 4584,
+      "allocations": 65536,
+      "elapsed_ns": 10426545,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 16,
+      "run": 3,
+      "rss_kib": 4568,
+      "allocations": 65536,
+      "elapsed_ns": 10539186,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "alloc",
+      "workers": 16,
+      "run": 4,
+      "rss_kib": 4552,
+      "allocations": 65536,
+      "elapsed_ns": 10844445,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "alloc",
+      "workers": 16,
+      "run": 4,
+      "rss_kib": 4576,
+      "allocations": 65536,
+      "elapsed_ns": 10462603,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 1,
+      "run": 0,
+      "rss_kib": 3476,
+      "allocations": 65536,
+      "elapsed_ns": 16930653,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 1,
+      "run": 0,
+      "rss_kib": 3352,
+      "allocations": 65536,
+      "elapsed_ns": 15929624,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 1,
+      "run": 1,
+      "rss_kib": 3420,
+      "allocations": 65536,
+      "elapsed_ns": 16441149,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 1,
+      "run": 1,
+      "rss_kib": 3284,
+      "allocations": 65536,
+      "elapsed_ns": 15845848,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 1,
+      "run": 2,
+      "rss_kib": 3288,
+      "allocations": 65536,
+      "elapsed_ns": 16083492,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 1,
+      "run": 2,
+      "rss_kib": 3352,
+      "allocations": 65536,
+      "elapsed_ns": 16032186,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 1,
+      "run": 3,
+      "rss_kib": 3416,
+      "allocations": 65536,
+      "elapsed_ns": 16149625,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 1,
+      "run": 3,
+      "rss_kib": 3156,
+      "allocations": 65536,
+      "elapsed_ns": 16756637,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 1,
+      "run": 4,
+      "rss_kib": 3288,
+      "allocations": 65536,
+      "elapsed_ns": 16613470,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 1,
+      "run": 4,
+      "rss_kib": 3424,
+      "allocations": 65536,
+      "elapsed_ns": 16414419,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 4,
+      "run": 0,
+      "rss_kib": 3160,
+      "allocations": 65536,
+      "elapsed_ns": 17217818,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 4,
+      "run": 0,
+      "rss_kib": 3424,
+      "allocations": 65536,
+      "elapsed_ns": 16758861,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 4,
+      "run": 1,
+      "rss_kib": 3420,
+      "allocations": 65536,
+      "elapsed_ns": 17235671,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 4,
+      "run": 1,
+      "rss_kib": 3288,
+      "allocations": 65536,
+      "elapsed_ns": 17211647,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 4,
+      "run": 2,
+      "rss_kib": 3288,
+      "allocations": 65536,
+      "elapsed_ns": 17373038,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 4,
+      "run": 2,
+      "rss_kib": 3388,
+      "allocations": 65536,
+      "elapsed_ns": 16818312,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 4,
+      "run": 3,
+      "rss_kib": 3420,
+      "allocations": 65536,
+      "elapsed_ns": 17043764,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 4,
+      "run": 3,
+      "rss_kib": 3288,
+      "allocations": 65536,
+      "elapsed_ns": 17338914,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 4,
+      "run": 4,
+      "rss_kib": 3288,
+      "allocations": 65536,
+      "elapsed_ns": 18369387,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 4,
+      "run": 4,
+      "rss_kib": 3296,
+      "allocations": 65536,
+      "elapsed_ns": 17256430,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 16,
+      "run": 0,
+      "rss_kib": 3288,
+      "allocations": 65536,
+      "elapsed_ns": 27818057,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 16,
+      "run": 0,
+      "rss_kib": 3424,
+      "allocations": 65536,
+      "elapsed_ns": 27254005,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 16,
+      "run": 1,
+      "rss_kib": 3552,
+      "allocations": 65536,
+      "elapsed_ns": 27071666,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 16,
+      "run": 1,
+      "rss_kib": 3296,
+      "allocations": 65536,
+      "elapsed_ns": 27350866,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 16,
+      "run": 2,
+      "rss_kib": 3416,
+      "allocations": 65536,
+      "elapsed_ns": 27476401,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 16,
+      "run": 2,
+      "rss_kib": 3240,
+      "allocations": 65536,
+      "elapsed_ns": 27250659,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 16,
+      "run": 3,
+      "rss_kib": 3248,
+      "allocations": 65536,
+      "elapsed_ns": 26950539,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 16,
+      "run": 3,
+      "rss_kib": 3416,
+      "allocations": 65536,
+      "elapsed_ns": 27271157,
+      "heap_after": 0
+    },
+    {
+      "version": "baseline",
+      "mode": "chain",
+      "workers": 16,
+      "run": 4,
+      "rss_kib": 3416,
+      "allocations": 65536,
+      "elapsed_ns": 27293850,
+      "heap_after": 0
+    },
+    {
+      "version": "current",
+      "mode": "chain",
+      "workers": 16,
+      "run": 4,
+      "rss_kib": 3480,
+      "allocations": 65536,
+      "elapsed_ns": 27173716,
+      "heap_after": 0
+    }
+  ]
+}

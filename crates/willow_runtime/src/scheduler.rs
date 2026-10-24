@@ -5279,3 +5279,20 @@ mod cooperative_affinity_tests;
 #[cfg(test)]
 #[path = "scheduler_retry_measurements.rs"]
 mod retry_measurements;
+
+/// Advisory versioned scheduling metrics. Atomic queue counters only; the caller
+/// receives an owned value and never holds a scheduler lock while acquiring GC
+/// locks. Queue emptiness is not a measurement of system or process CPU idle.
+#[derive(Clone, Copy, Debug)]
+pub struct GcMetricsV1 {
+    pub version: u32,
+    pub sampled_ns: u64,
+    pub runnable: usize,
+}
+pub fn gc_metrics_v1() -> GcMetricsV1 {
+    GcMetricsV1 {
+        version: 1,
+        sampled_ns: crate::gc_telemetry::timestamp_ns(),
+        runnable: global_run_queues().len(),
+    }
+}

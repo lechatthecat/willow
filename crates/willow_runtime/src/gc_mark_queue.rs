@@ -1350,6 +1350,7 @@ impl MarkWorker {
                 .counters
                 .steal_attempts
                 .fetch_add(1, Ordering::SeqCst);
+            crate::gc_telemetry::m3::steal(false);
             let available = QueueGuard::new(&self.queue.slots[victim].shared).len();
             if available == 0 {
                 continue;
@@ -1359,6 +1360,7 @@ impl MarkWorker {
                 drain_into_private(&self.queue, own, &self.queue.slots[victim].shared, limit);
             if taken > 0 {
                 self.queue.counters.steals.fetch_add(1, Ordering::SeqCst);
+                crate::gc_telemetry::m3::steal(true);
                 self.next_victim = (victim + 1) % slot_count;
                 return taken;
             }

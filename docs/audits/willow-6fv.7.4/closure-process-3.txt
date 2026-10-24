@@ -1,0 +1,10 @@
+
+running 1 test
+test gc::concurrent_tests::m3_real_closure_last_work_latency_and_cpu ... m3_termination notification=false samples=100 p50_ns=608135 p99_ns=1061631 closure_cpu_ns=1561723 cpu_valid=true
+m3_termination notification=true samples=100 p50_ns=7183 p99_ns=57628 closure_cpu_ns=1611342 cpu_valid=true
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1887 filtered out; finished in 0.23s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/willow_runtime-b005ffccd85ba643)

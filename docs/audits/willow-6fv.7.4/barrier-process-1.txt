@@ -1,0 +1,37 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (target/release/deps/willow_runtime-b005ffccd85ba643)
+
+running 1 test
+reference_store target=x86_64-linux entries=1024 stores=16777216 phase=0 satb=false run=0 elapsed_ns=11190772
+reference_store target=x86_64-linux entries=1024 stores=16777216 phase=0 satb=true run=0 elapsed_ns=8830658
+reference_store target=x86_64-linux entries=1024 stores=16777216 phase=0 satb=true run=1 elapsed_ns=8684004
+reference_store target=x86_64-linux entries=1024 stores=16777216 phase=0 satb=false run=1 elapsed_ns=10506355
+reference_store target=x86_64-linux entries=1024 stores=16777216 phase=0 satb=false run=2 elapsed_ns=10493600
+reference_store target=x86_64-linux entries=1024 stores=16777216 phase=0 satb=true run=2 elapsed_ns=8598244
+reference_store_median entries=1024 stores=16777216 baseline_ns=10506355 current_ns=8684004 regression_percent=-17.345 throughput_loss_percent=-20.985 g8_pass=true
+reference_store target=x86_64-linux entries=65536 stores=16777216 phase=0 satb=false run=0 elapsed_ns=10499382
+reference_store target=x86_64-linux entries=65536 stores=16777216 phase=0 satb=true run=0 elapsed_ns=8745258
+reference_store target=x86_64-linux entries=65536 stores=16777216 phase=0 satb=true run=1 elapsed_ns=8632488
+reference_store target=x86_64-linux entries=65536 stores=16777216 phase=0 satb=false run=1 elapsed_ns=10476930
+reference_store target=x86_64-linux entries=65536 stores=16777216 phase=0 satb=false run=2 elapsed_ns=10483833
+reference_store target=x86_64-linux entries=65536 stores=16777216 phase=0 satb=true run=2 elapsed_ns=8643008
+reference_store_median entries=65536 stores=16777216 baseline_ns=10483833 current_ns=8643008 regression_percent=-17.559 throughput_loss_percent=-21.298 g8_pass=true
+reference_store target=x86_64-linux entries=4194304 stores=16777216 phase=0 satb=false run=0 elapsed_ns=10676743
+reference_store target=x86_64-linux entries=4194304 stores=16777216 phase=0 satb=true run=0 elapsed_ns=8733647
+reference_store target=x86_64-linux entries=4194304 stores=16777216 phase=0 satb=true run=1 elapsed_ns=8679756
+reference_store target=x86_64-linux entries=4194304 stores=16777216 phase=0 satb=false run=1 elapsed_ns=10517396
+reference_store target=x86_64-linux entries=4194304 stores=16777216 phase=0 satb=false run=2 elapsed_ns=10504471
+reference_store target=x86_64-linux entries=4194304 stores=16777216 phase=0 satb=true run=2 elapsed_ns=9026062
+reference_store_median entries=4194304 stores=16777216 baseline_ns=10517396 current_ns=8733647 regression_percent=-16.960 throughput_loss_percent=-20.424 g8_pass=true
+reference_store_active capacity=1 run=0 stores=102400 elapsed_ns=8667474
+reference_store_active capacity=1 run=1 stores=102400 elapsed_ns=8668466
+reference_store_active capacity=1 run=2 stores=102400 elapsed_ns=8640954
+reference_store_active_median capacity=1 stores=102400 elapsed_ns=8667474
+reference_store_active capacity=256 run=0 stores=102400 elapsed_ns=8044651
+reference_store_active capacity=256 run=1 stores=102400 elapsed_ns=8058136
+reference_store_active capacity=256 run=2 stores=102400 elapsed_ns=8044561
+reference_store_active_median capacity=256 stores=102400 elapsed_ns=8044651
+test gc::concurrent_tests::satb_reference_store_throughput_baseline_and_current ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1887 filtered out; finished in 0.24s
+

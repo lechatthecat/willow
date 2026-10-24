@@ -1,0 +1,47 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 15 tests
+test gc::mark_closure::termination_tests::termination_epoch_rollover_rejects_stale_cycle_and_worker ... ok
+test gc::mark_closure::termination_tests::termination_hidden_published_and_last_in_hand_work_defeat_election ... ok
+test gc::mark_closure::termination_tests::termination_repeated_restarts_and_empty_assists_preserve_progress ... ok
+test gc::mark_closure::termination_tests::termination_requires_satb_seal_and_root_job_completion ... ok
+test gc::mark_termination::notification_tests::m3_termination_notification_before_wait_during_wait_and_spurious ... ok
+test gc::mark_termination::notification_tests::m3_termination_notification_timeout_preserves_owner_and_election ... ok
+test gc::mark_termination::scaling_tests::termination_generation_counts_scale_with_publications_and_nested_owners ... publications=1 generation_updates=4 candidate_cas=1
+publications=16 generation_updates=34 candidate_cas=1
+publications=257 generation_updates=516 candidate_cas=1
+publications=4096 generation_updates=8194 candidate_cas=1
+ok
+test gc::mark_termination::tests::termination_candidate_publication_race_is_deterministic ... ok
+test gc::mark_termination::tests::termination_checked_limits_do_not_wrap_or_underflow ... 
+thread 'gc::mark_termination::tests::termination_checked_limits_do_not_wrap_or_underflow' (300490) panicked at crates/willow_runtime/src/gc/mark_termination.rs:28:17:
+mark owner count exhausted
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'gc::mark_termination::tests::termination_checked_limits_do_not_wrap_or_underflow' (300490) panicked at crates/willow_runtime/src/gc/mark_termination.rs:62:14:
+mark publication generation exhausted
+
+thread 'gc::mark_termination::tests::termination_checked_limits_do_not_wrap_or_underflow' (300490) panicked at crates/willow_runtime/src/gc/mark_termination.rs:111:17:
+mark owner count underflow
+ok
+test gc::mark_termination::tests::termination_generation_rejects_last_owner_and_completed_publication_races ... ok
+test gc::mark_termination::tests::termination_transition_model_exhausts_owner_election_and_restart_histories ... termination model histories=142962 depth=7 owners=2
+ok
+test gc::mark_workers::termination_tests::shutdown_notification_drains_idle_and_used_pools ... shutdown workers=0 used=false completions=0 elapsed_us=0
+shutdown workers=0 used=true completions=0 elapsed_us=0
+shutdown workers=1 used=false completions=1 elapsed_us=19
+shutdown workers=1 used=true completions=1 elapsed_us=23
+shutdown workers=4 used=false completions=4 elapsed_us=36
+shutdown workers=4 used=true completions=4 elapsed_us=38
+shutdown workers=16 used=false completions=16 elapsed_us=107
+shutdown workers=16 used=true completions=16 elapsed_us=120
+shutdown workers=64 used=false completions=64 elapsed_us=558
+shutdown workers=64 used=true completions=64 elapsed_us=550
+ok
+test gc::mark_workers::termination_tests::shutdown_notification_timeout_detaches_only_idle_workers ... ok
+test gc::mark_workers::termination_tests::shutdown_notification_worker_infrastructure_panic_remains_fatal ... ok
+test gc::mark_workers::termination_tests::termination_spurious_pool_wakes_do_not_duplicate_jobs_or_completion ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 1880 filtered out; finished in 0.13s
+

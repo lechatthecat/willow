@@ -2,13 +2,20 @@
 //! only a stopped recheck may end the queue epoch. The packed CAS prevents an
 //! owner from becoming invisible between generation validation and election.
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(test, feature = "gc-notification-prototype"))]
+use std::sync::{Condvar, Mutex, atomic::AtomicUsize};
 
 const OWNERS: u64 = (1 << 20) - 1;
 const REQUESTED: u64 = 1 << 20;
 const GENERATION: u64 = 1 << 21;
 
 #[derive(Default)]
-pub(super) struct Termination(AtomicU64);
+pub(super) struct Termination(
+    AtomicU64,
+    #[cfg(any(test, feature = "gc-notification-prototype"))] Mutex<()>,
+    #[cfg(any(test, feature = "gc-notification-prototype"))] Condvar,
+    #[cfg(any(test, feature = "gc-notification-prototype"))] AtomicUsize,
+);
 
 pub(super) struct Owner<'a>(&'a Termination);
 
@@ -22,7 +29,31 @@ impl Termination {
                 Some(Self::advance(state) + 1)
             })
             .expect("ownership update is infallible");
+        #[cfg(any(test, feature = "gc-notification-prototype"))]
+        self.notify();
         Owner(self)
+    }
+
+    // SeqCst publication/waiter handshake: either the waiter sees the new
+    // generation or the publisher sees the waiter and takes its predicate lock.
+    // The hot path never takes this mutex when no closure waiter exists.
+    #[cfg(any(test, feature = "gc-notification-prototype"))]
+    fn notify(&self) {
+        if self.3.load(Ordering::SeqCst) != 0 {
+            let _guard = self.1.lock().unwrap();
+            self.2.notify_all();
+        }
+    }
+
+    #[cfg(any(test, feature = "gc-notification-prototype"))]
+    pub(super) fn wait_for_change(&self, sample: u64, timeout: std::time::Duration) {
+        let guard = self.1.lock().unwrap();
+        self.3.fetch_add(1, Ordering::SeqCst);
+        let (_guard, _) = self
+            .2
+            .wait_timeout_while(guard, timeout, |_| self.sample() == sample)
+            .unwrap();
+        self.3.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn advance(state: u64) -> u64 {
@@ -67,6 +98,8 @@ impl Termination {
                 Some(Self::advance(state))
             })
             .expect("restart update is infallible");
+        #[cfg(any(test, feature = "gc-notification-prototype"))]
+        self.notify();
     }
 }
 
@@ -79,6 +112,8 @@ impl Drop for Owner<'_> {
                 Some(Termination::advance(state) - 1)
             })
             .expect("owner completion is infallible");
+        #[cfg(any(test, feature = "gc-notification-prototype"))]
+        self.0.notify();
     }
 }
 
@@ -165,7 +200,12 @@ mod tests {
                 let packed = model.generation * GENERATION
                     + model.owners as u64
                     + if model.requested { REQUESTED } else { 0 };
-                let protocol = Termination(AtomicU64::new(packed));
+                let protocol = Termination(
+                    AtomicU64::new(packed),
+                    Mutex::new(()),
+                    Condvar::new(),
+                    AtomicUsize::new(0),
+                );
                 let mut next = model;
                 match action {
                     0 => {
@@ -212,7 +252,12 @@ mod tests {
     #[test]
     fn termination_checked_limits_do_not_wrap_or_underflow() {
         for packed in [OWNERS, !OWNERS & !REQUESTED] {
-            let protocol = Termination(AtomicU64::new(packed));
+            let protocol = Termination(
+                AtomicU64::new(packed),
+                Mutex::new(()),
+                Condvar::new(),
+                AtomicUsize::new(0),
+            );
             assert!(std::panic::catch_unwind(|| protocol.enter()).is_err());
             assert_eq!(protocol.sample(), packed);
         }
@@ -246,5 +291,45 @@ mod scaling_tests {
                 2 * (count + 1)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn m3_termination_notification_before_wait_during_wait_and_spurious() {
+        let t = std::sync::Arc::new(Termination::default());
+        let old = t.sample();
+        drop(t.enter());
+        t.wait_for_change(old, Duration::from_secs(10)); // Must not lose prior publication.
+        let sample = t.sample();
+        let other = t.clone();
+        let waiter =
+            std::thread::spawn(move || other.wait_for_change(sample, Duration::from_secs(10)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while t.3.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        {
+            let _guard = t.1.lock().unwrap();
+            t.2.notify_all();
+        }
+        assert_eq!(t.sample(), sample); // Spurious wake cannot manufacture work completion.
+        drop(t.enter());
+        waiter.join().unwrap();
+        assert_eq!(t.3.load(Ordering::SeqCst), 0);
+        assert!(t.request(t.sample(), true));
+    }
+    #[test]
+    fn m3_termination_notification_timeout_preserves_owner_and_election() {
+        let t = Termination::default();
+        let owner = t.enter();
+        t.wait_for_change(t.sample(), Duration::from_millis(1));
+        assert!(!t.request(t.sample(), true));
+        drop(owner);
+        assert!(t.request(t.sample(), true));
     }
 }

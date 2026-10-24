@@ -131,6 +131,13 @@ impl Drop for MarkBatch<'_> {
             self.cycle.worker_failed.store(true, Ordering::Release);
         }
         self.publish_branches();
+        if crate::gc_telemetry::m3::enabled() {
+            crate::gc_telemetry::m3::graph(
+                self.work,
+                self.discovery_counts[1],
+                self.cycle.queue.snapshot().outstanding,
+            );
+        }
         self.cycle
             .pointer_checks
             .fetch_add(self.discovery_counts[0], Ordering::Relaxed);

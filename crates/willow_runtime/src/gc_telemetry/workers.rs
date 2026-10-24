@@ -161,7 +161,7 @@ impl Drop for JobMeasurement {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn thread_cpu_ns() -> Option<u64> {
+pub fn thread_cpu_ns() -> Option<u64> {
     let mut time = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -177,7 +177,7 @@ pub(crate) fn thread_cpu_ns() -> Option<u64> {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn thread_cpu_ns() -> Option<u64> {
+pub fn thread_cpu_ns() -> Option<u64> {
     #[repr(C)]
     #[derive(Default)]
     struct FileTime {
@@ -224,7 +224,7 @@ pub(crate) fn thread_cpu_ns() -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(crate) fn thread_cpu_ns() -> Option<u64> {
+pub fn thread_cpu_ns() -> Option<u64> {
     None
 }
 

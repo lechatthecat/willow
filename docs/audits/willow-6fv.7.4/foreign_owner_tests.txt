@@ -1,0 +1,27 @@
+   Compiling willow_runtime v0.1.6 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.06s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 6 tests
+test gc::tests::foreign_owner_tests::existing_legacy_owner_can_extend_roots_during_election ... ok
+test gc::tests::foreign_owner_tests::legacy_admission_during_foreign_election_fails_safely ... ok
+test gc::tests::foreign_owner_tests::native_registration_and_gc_start_race_has_no_skips_or_stranded_roots ... ok
+test gc::tests::foreign_owner_tests::native_scope_nested_return_cancel_and_panic_release_roots ... {"version":3,"event":"gc_failure","kind":"test_panic","reason":"native cancellation unwind","timestamp_ns":82650724,"epoch":67,"seed":0,"case":0,"heap_available":false,"heap_consistency":"metadata_without_lab_merge","actual_bytes":null,"limit_bytes":null,"managed_bytes":null,"external_bytes":null,"old_reserved_bytes":null,"young_reserved_bytes":null,"phase":0,"last_major_live_bytes":null,"allocated_bytes":null,"root_scan_bytes":0,"last_stop_reason":0,"last_stop_outcome":0,"minor_deferrals":null,"minor_deferral_age_bytes":null,"pin_fallback_count":null,"pinned_bytes":null,"registered_mutators":null,"parked_mutators":null,"pending_mutators":null,"os":"linux","arch":"x86_64","allocated_frame_bytes":0,"reclaimed_frame_bytes":0,"quarantined_frame_bytes":0,"task_frames_running":0,"task_frames_rooted":0,"task_frames_terminal":0,"task_frames_retired":0}
+
+thread 'gc::tests::foreign_owner_tests::native_scope_nested_return_cancel_and_panic_release_roots' (299339) panicked at crates/willow_runtime/src/gc/foreign_owner_tests.rs:67:21:
+native cancellation unwind
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+{"version":3,"event":"gc_failure","kind":"test_panic","reason":"native cancellation unwind","timestamp_ns":83528531,"epoch":69,"seed":0,"case":0,"heap_available":false,"heap_consistency":"metadata_without_lab_merge","actual_bytes":null,"limit_bytes":null,"managed_bytes":null,"external_bytes":null,"old_reserved_bytes":null,"young_reserved_bytes":null,"phase":0,"last_major_live_bytes":null,"allocated_bytes":null,"root_scan_bytes":0,"last_stop_reason":0,"last_stop_outcome":0,"minor_deferrals":null,"minor_deferral_age_bytes":null,"pin_fallback_count":null,"pinned_bytes":null,"registered_mutators":null,"parked_mutators":null,"pending_mutators":null,"os":"linux","arch":"x86_64","allocated_frame_bytes":0,"reclaimed_frame_bytes":0,"quarantined_frame_bytes":0,"task_frames_running":0,"task_frames_rooted":0,"task_frames_terminal":0,"task_frames_retired":0}
+
+thread 'gc::tests::foreign_owner_tests::native_scope_nested_return_cancel_and_panic_release_roots' (299339) panicked at crates/willow_runtime/src/gc/foreign_owner_tests.rs:67:21:
+native cancellation unwind
+{"version":3,"event":"gc_failure","kind":"test_panic","reason":"native cancellation unwind","timestamp_ns":84470900,"epoch":71,"seed":0,"case":0,"heap_available":false,"heap_consistency":"metadata_without_lab_merge","actual_bytes":null,"limit_bytes":null,"managed_bytes":null,"external_bytes":null,"old_reserved_bytes":null,"young_reserved_bytes":null,"phase":0,"last_major_live_bytes":null,"allocated_bytes":null,"root_scan_bytes":0,"last_stop_reason":0,"last_stop_outcome":0,"minor_deferrals":null,"minor_deferral_age_bytes":null,"pin_fallback_count":null,"pinned_bytes":null,"registered_mutators":null,"parked_mutators":null,"pending_mutators":null,"os":"linux","arch":"x86_64","allocated_frame_bytes":0,"reclaimed_frame_bytes":0,"quarantined_frame_bytes":0,"task_frames_running":0,"task_frames_rooted":0,"task_frames_terminal":0,"task_frames_retired":0}
+
+thread 'gc::tests::foreign_owner_tests::native_scope_nested_return_cancel_and_panic_release_roots' (299339) panicked at crates/willow_runtime/src/gc/foreign_owner_tests.rs:67:21:
+native cancellation unwind
+ok
+test gc::tests::foreign_owner_tests::registered_then_unregistered_roots_defer_and_report_progress ... ok
+test gc::tests::foreign_owner_tests::registered_unregister_with_roots_waits_for_foreign_epoch ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 1889 filtered out; finished in 0.09s
+

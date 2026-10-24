@@ -211,6 +211,7 @@ impl Cursor {
             headers: None,
             done: false,
             timed_holds: cfg!(test)
+                || crate::gc_telemetry::m3::enabled()
                 || crate::gc_telemetry::profiling()
                 || std::env::var_os("WILLOW_GC_LOG").is_some(),
             deadline_due: false,
@@ -367,6 +368,8 @@ impl Cursor {
             self.report.heap_hold_ns += held_ns;
             self.report.heap_max_hold_ns = self.report.heap_max_hold_ns.max(held_ns);
             drop(state);
+            crate::gc_telemetry::m3::record(crate::gc_telemetry::m3::Kind::SweepWait, waited);
+            crate::gc_telemetry::m3::record(crate::gc_telemetry::m3::Kind::SweepHold, held_ns);
             let mut source = source;
             source.clear();
             self.gaps = source;
@@ -419,6 +422,8 @@ impl Cursor {
         self.report.heap_hold_ns = self.report.heap_hold_ns.saturating_add(held_ns);
         self.report.heap_max_hold_ns = self.report.heap_max_hold_ns.max(held_ns);
         drop(state);
+        crate::gc_telemetry::m3::record(crate::gc_telemetry::m3::Kind::SweepWait, waited_ns);
+        crate::gc_telemetry::m3::record(crate::gc_telemetry::m3::Kind::SweepHold, held_ns);
         self.deadline_due = !matches!(action, Action::Yield | Action::Progress);
         let progress = match action {
             Action::Yield => false,

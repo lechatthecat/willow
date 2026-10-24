@@ -11,6 +11,8 @@ crate-type = ["staticlib", "rlib"]
 [features]
 # Acceptance-test runtime only; never enabled by the compiler's normal build.
 borrow-migration-probe = []
+# M3 comparison only; normal compiler/runtime builds retain the existing waiter.
+gc-notification-prototype = []
 
 [dependencies]
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }

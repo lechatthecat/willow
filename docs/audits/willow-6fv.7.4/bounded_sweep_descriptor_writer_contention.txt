@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
+
+running 1 test
+test gc::sweep::batches::tests::bounded_sweep_descriptor_writer_contention_preserves_work_and_references ... descriptor_contention tlab=false rejected_batches=128 object_work=0 retained_references=1 eventual_releases=1
+descriptor_contention tlab=true rejected_batches=128 object_work=0 retained_references=1 eventual_releases=1
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1894 filtered out; finished in 0.00s
+

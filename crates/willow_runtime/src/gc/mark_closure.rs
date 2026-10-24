@@ -10,6 +10,10 @@ pub(super) fn finish(
     cycle: &Arc<ConcurrentCycle>,
     started: std::time::Instant,
 ) -> Option<(crate::gc_telemetry::MarkWork, sweep::SweepPlan)> {
+    #[cfg(feature = "gc-notification-prototype")]
+    if std::env::var_os("WILLOW_GC_NOTIFY").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        return finish_with_policy(cycle, started, std::thread::sleep, || {}, true);
+    }
     finish_with_wait(cycle, started, std::thread::sleep)
 }
 
@@ -59,9 +63,21 @@ fn require_stopped_completion(
 pub(super) fn finish_with_hooks(
     cycle: &Arc<ConcurrentCycle>,
     started: std::time::Instant,
+    wait: impl FnMut(std::time::Duration),
+    before_recheck: impl FnMut(),
+) -> Option<(crate::gc_telemetry::MarkWork, sweep::SweepPlan)> {
+    finish_with_policy(cycle, started, wait, before_recheck, false)
+}
+
+pub(super) fn finish_with_policy(
+    cycle: &Arc<ConcurrentCycle>,
+    started: std::time::Instant,
     mut wait: impl FnMut(std::time::Duration),
     mut before_recheck: impl FnMut(),
+    notification: bool,
 ) -> Option<(crate::gc_telemetry::MarkWork, sweep::SweepPlan)> {
+    #[cfg(not(any(test, feature = "gc-notification-prototype")))]
+    let _ = notification;
     // Owners continue publishing their own buffers at safepoints/unregister.
     // Closing redirects later heap-locked deletion publications to the queue;
     // foreign buffers are inspected only at the stopped COORD boundary below.
@@ -127,12 +143,16 @@ pub(super) fn finish_with_hooks(
         // Repay this collector's measured CPU before another unfinished wave.
         // Missing/regressing CPU samples use elapsed wall time conservatively.
         // The 1ms floor also bounds empty-reader polling and fast Retry work.
-        let delay = cpu_start
+        let repayment = cpu_start
             .zip(crate::gc_telemetry::workers::thread_cpu_ns())
             .and_then(|(start, end)| end.checked_sub(start))
             .map(std::time::Duration::from_nanos)
-            .unwrap_or_else(|| wave_start.elapsed())
-            .max(std::time::Duration::from_millis(1));
+            .unwrap_or_else(|| wave_start.elapsed());
+        let delay = repayment.max(std::time::Duration::from_millis(1));
+        // Sample after our own drain publishes, before checking idle sources.
+        // Owners bracket queue publication and the final reader/accounting merge.
+        #[cfg(any(test, feature = "gc-notification-prototype"))]
+        let generation = cycle.termination.sample();
         if !cycle.queue.snapshot().is_drained() || cycle.active_drains.load(Ordering::Acquire) != 0
         {
             #[cfg(test)]
@@ -141,6 +161,17 @@ pub(super) fn finish_with_hooks(
             }
             if wave + 1 == MAX_DRAIN_WAVES {
                 return require_stopped_completion(cycle);
+            }
+            #[cfg(any(test, feature = "gc-notification-prototype"))]
+            if notification && cycle.queue.snapshot().is_drained() {
+                // Notifications cannot forgive CPU already consumed. Only the
+                // idle remainder is interruptible; runnable Retry work retains
+                // its original 1ms pacing and recovery bounds.
+                wait(repayment);
+                cycle
+                    .termination
+                    .wait_for_change(generation, delay.saturating_sub(repayment));
+                continue;
             }
             wait(delay);
             continue;

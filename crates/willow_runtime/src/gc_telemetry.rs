@@ -12,6 +12,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
 pub mod failure_record;
+pub mod m3;
 pub mod measurement;
 pub mod milestones;
 pub mod native_trace;
