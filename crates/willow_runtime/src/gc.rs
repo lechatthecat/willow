@@ -613,6 +613,7 @@ pub(crate) fn charge_external(bytes: usize) {
     let paced_crossing = state.pacer.enabled()
         && previous_occupied < state.pacer_trigger
         && previous_occupied.saturating_add(bytes as u64) >= state.pacer_trigger;
+    state.soft_memory.sample_process();
     let pressure = state.concurrent_cycle.is_none()
         && state.sweeping.is_none()
         && (hard_crossing
@@ -763,9 +764,7 @@ fn pacer_inputs(state: &GcState) -> pacer::Inputs {
     let cpu = crate::gc_telemetry::pacing::snapshot();
     let memory = memory_inputs(state);
     pacer::Inputs {
-        live: state
-            .last_major_policy_live_bytes
-            .saturating_add(external_bytes() as u64),
+        live: memory.live,
         previous_goal: state.threshold_bytes as u64,
         expected_work: state
             .last_major_mark_work
@@ -777,8 +776,7 @@ fn pacer_inputs(state: &GcState) -> pacer::Inputs {
         max_workers: mark_workers::configured_count(),
         feedback: pacer::Feedback {
             occupied: memory.occupied,
-            pressure: state.soft_memory.enabled()
-                && state.soft_memory.decide(memory).trigger <= memory.occupied,
+            pressure: state.soft_memory.enabled() && state.soft_memory.decide(memory).collect,
             window_ns: crate::gc_telemetry::timestamp_ns().saturating_sub(cpu.window_start_ns),
             gc_cpu_ns: (cpu.window_end_ns != 0 && cpu.window_cpu_missing == 0)
                 .then_some(cpu.window_cpu_ns),
@@ -790,6 +788,8 @@ fn pacer_inputs(state: &GcState) -> pacer::Inputs {
                 .saturating_mul(8),
             pause_ns: history.major_pauses.max_ns,
             previous_peak: history.last_major_cycle.heap_before_bytes,
+            resident_bytes: memory.process_resident,
+            soft_limit: state.soft_memory.limit(),
             ..pacer::Feedback::default()
         },
         active: state.concurrent_cycle.is_some() || state.sweeping.is_some(),
@@ -853,6 +853,7 @@ fn memory_inputs(state: &GcState) -> memory_control::Inputs {
         allocated_total,
         // Our process provider reports RSS, not a compatible commit scope.
         non_heap_commit: None,
+        process_resident: state.soft_memory.resident(),
     }
 }
 
@@ -1127,6 +1128,7 @@ fn allocation_should_collect() -> bool {
         pacer::sample_threshold(&mut state);
     }
     let hard_pressure = hard_reservation_pressure(&mut state);
+    state.soft_memory.sample_process();
     let memory_input = memory_inputs(&state);
     let memory = state.soft_memory.decide(memory_input);
     // The pacer trigger lives in the major-policy domain even when a soft
@@ -1202,14 +1204,15 @@ fn minor_refill_should_wait(state: &mut GcState) -> bool {
 // Public runtime API
 // ---------------------------------------------------------------------------
 
-/// Set the soft managed-memory limit in bytes; zero disables it. Returns the
-/// previous limit. Collection is considered at the next allocation slow path;
+/// Set the soft memory target in bytes (managed pressure and best-effort
+/// process RSS); zero disables it. Returns the previous limit. Collection is considered at the next allocation slow path;
 /// this setter never parks mutators or changes the legacy hard reservation cap.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_set_memory_limit(bytes: u64) -> u64 {
     let mut state = runtime().heap.lock().unwrap();
     let previous = state.soft_memory.set_limit(bytes);
+    state.soft_memory.sample_process();
     evict_region_cache_for(&mut state, 0);
     drop(state);
     invalidate_runtime_policy_budgets();
@@ -2204,6 +2207,7 @@ fn try_collect_internal() -> CollectionAttempt {
         // reclamation crossed the low watermark, rearm before new allocations
         // can reserve a region again (even within the same allocation call).
         hard_reservation_pressure(&mut state);
+        state.soft_memory.sample_process();
         let memory_input = memory_inputs(&state);
         state
             .soft_memory
@@ -2211,12 +2215,14 @@ fn try_collect_internal() -> CollectionAttempt {
         if gc_log {
             let decision = state.soft_memory.decide(memory_input);
             eprintln!(
-                "[gc] soft_memory goal={} trigger={} overshoot={} reason={:?} native_requested_bytes={} native_requested_exact=false native_committed_valid=false process_limit_coverage_complete=false",
+                "[gc] soft_memory goal={} trigger={} overshoot={} reason={:?} native_requested_bytes={} native_requested_exact=false native_committed_valid=false process_resident_bytes={} resident_valid={} process_commit_valid=false process_limit_coverage_complete=false",
                 decision.goal,
                 decision.trigger,
                 decision.overshoot,
                 decision.reason,
-                external_bytes()
+                external_bytes(),
+                memory_input.process_resident.unwrap_or(0),
+                memory_input.process_resident.is_some()
             );
         }
         progress::record_success(state.total_allocated_bytes);

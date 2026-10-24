@@ -918,7 +918,7 @@ pub(crate) fn emit_cycle(cycle: GcCycleV1) {
 }
 
 #[cfg(target_os = "linux")]
-fn resident_bytes() -> Option<u64> {
+pub(crate) fn resident_bytes() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
     // SAFETY: sysconf takes a constant selector and no pointers.
@@ -930,7 +930,7 @@ fn resident_bytes() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 #[allow(deprecated)] // libc exposes this stable Darwin ABI; avoid a dependency for one call.
-fn resident_bytes() -> Option<u64> {
+pub(crate) fn resident_bytes() -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info>::zeroed();
     let mut count = (std::mem::size_of::<libc::mach_task_basic_info>()
         / std::mem::size_of::<libc::natural_t>())
@@ -951,7 +951,7 @@ fn resident_bytes() -> Option<u64> {
 }
 
 #[cfg(target_os = "windows")]
-fn resident_bytes() -> Option<u64> {
+pub(crate) fn resident_bytes() -> Option<u64> {
     #[repr(C)]
     struct ProcessMemoryCounters {
         cb: u32,
@@ -992,7 +992,7 @@ fn resident_bytes() -> Option<u64> {
     (ok != 0).then_some(counters.working_set as u64)
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn resident_bytes() -> Option<u64> {
+pub(crate) fn resident_bytes() -> Option<u64> {
     None
 }
 

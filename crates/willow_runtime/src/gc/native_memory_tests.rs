@@ -752,8 +752,11 @@ fn soft_limit_bounds_retained_region_storage() {
         assert_eq!(input.pressure_bytes as usize, pressure);
         assert_eq!(
             state.soft_memory.decide(input).overshoot,
-            0,
-            "retained storage is not soft pressure"
+            input
+                .process_resident
+                .unwrap_or(0)
+                .saturating_sub(limit as u64),
+            "heap pressure stays below the limit; independent RSS may exceed it"
         );
     }
 

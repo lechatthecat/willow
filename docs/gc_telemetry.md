@@ -263,3 +263,46 @@ place and traces/rewrites its children; no survivor storage growth occurs under
 the stop. This shares pin reason 3 with hard-budget fallback. Explicit leases
 retain their separate reason and precedence. Old-region promotion allocation
 and general collector scratch metadata retain their existing paths.
+
+## Soft memory target
+
+`WILLOW_GC_MEMORY_LIMIT_BYTES` initializes the soft byte target. Unset or zero
+means unlimited; `gc::willow_gc_set_memory_limit(bytes)` updates it and returns
+the previous value. Subsequent allocation decisions see the update. The setter
+does not itself stop mutators or run collection.
+
+The controller compares managed reservations plus native requested-capacity
+estimates with the target. It independently compares best-effort process RSS
+(working set on Windows) with that same target. These scopes overlap, so they
+are neither added together nor subtracted to invent non-heap commitment. The
+existing process provider is sampled at most once per 10 ms while enabled, on
+policy slow paths including cycle completion. There is no timer or new
+per-object accounting. A quiet process need not notice pressure until allocation
+resumes. Provider failure makes RSS unavailable; heap accounting remains usable.
+Process commit and exact native commit remain unavailable.
+
+Pacer goals, triggers and Assist demand use the soft goal, with a saturating
+live-byte floor. Concurrent sweep and normal allocation retain their existing
+paths. After two ineffective cycles under pressure, relief grants at least
+256 KiB or one eighth of retained live bytes of allocation progress before
+another automatic pressure cycle. Two effective observations leave relief.
+Managed reclamation alone is not progress when process RSS remains stalled or
+retained live bytes already exceed the target. Reusing a cached RSS sample gives
+no evidence of improvement, so relief may conservatively start before the next
+refresh; missing samples break RSS comparison history. Changing or temporarily
+disabling the target does not erase relief history.
+Explicit collections and the separate legacy reservation setting retain their
+own behavior; this is not a global GC CPU cap.
+
+With `WILLOW_GC_LOG=1`, completed cycles report `soft_memory` goal, trigger,
+overshoot, reason, process resident bytes and validity. Overshoot is the larger
+of the independently observed heap/native proxy and process RSS, minus the
+target (saturating at zero). The cached RSS observation is not an exact
+instantaneous peak. Existing versioned snapshot layouts remain unchanged.
+
+This is a soft target, not an RSS ceiling, a strict reservation guarantee, or a
+promise of convergence when live objects or unrelated process memory exceed it.
+Allocation failure may terminate with an OOM/resource-exhaustion diagnostic;
+arbitrary allocator failure during GC need not be recoverable. Existing bounded
+storage retries remain bounded. No emergency arena or prepaid metadata credits
+are provided by this control.

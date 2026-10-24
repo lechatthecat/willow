@@ -125,6 +125,8 @@ pub(super) struct Feedback {
     pub allocator_failed: bool,
     pub committed_bytes: Option<u64>,
     pub resident_bytes: Option<u64>,
+    /// Soft managed goal ceiling; the live floor always wins.
+    pub soft_limit: Option<u64>,
 }
 
 pub(super) const COLD: u64 = 1;
@@ -238,6 +240,11 @@ pub(super) fn decide(input: Inputs) -> Decision {
             .clamp(lower, previous.saturating_mul(2))
             .max(input.live)
     };
+    // Apply before deriving trigger, background work and Assist demand so
+    // all published decisions describe the same soft-bounded goal.
+    let goal = feedback
+        .soft_limit
+        .map_or(goal, |limit| goal.min(limit).max(input.live));
     let trigger = goal
         .saturating_sub(runway)
         .max(minimum_trigger(input.live).min(goal));
@@ -622,6 +629,32 @@ mod tests {
             assert_eq!(sampler.mark_rate, None);
             sampler.mark(100, Some(1_000_000_000));
             assert_eq!(sampler.mark_rate, Some(100));
+        }
+    }
+
+    #[test]
+    fn soft_goal_bounds_derived_assist_and_preserves_live_floor() {
+        for limit in [0, 1, 1024, u64::MAX] {
+            for live in [0, 512, 2048, u64::MAX] {
+                let mut input = input();
+                input.live = live;
+                input.feedback.soft_limit = Some(limit);
+                input.allocation_per_second = 1_000_000;
+                input.mark_per_cpu_second = Some(1);
+                let bounded = decide(input);
+                assert!(bounded.goal >= live);
+                assert!(bounded.goal <= limit.max(live));
+                assert!(bounded.trigger <= bounded.goal);
+                assert_eq!(bounded.overshoot_budget, bounded.goal / 8);
+                input.fixed_goal = true;
+                input.previous_goal = bounded.goal;
+                input.feedback.soft_limit = None;
+                let equivalent = decide(input);
+                assert_eq!(
+                    bounded.assist_work_per_byte_ppm,
+                    equivalent.assist_work_per_byte_ppm
+                );
+            }
         }
     }
 
