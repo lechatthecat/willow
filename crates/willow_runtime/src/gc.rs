@@ -713,6 +713,7 @@ static ELECTION_BUDGET_WAITING: std::sync::atomic::AtomicBool =
 /// exhaustion. Waiting mutators cooperate with remark and wait through sweep.
 /// Allocation-failure path only; explicit `gc()` uses `cycle_wait` directly.
 fn collect_for_budget() {
+    pacer::allocation_failure(&runtime().heap.lock().unwrap());
     let _interval = crate::gc_telemetry::observations::Span::new(
         crate::gc_telemetry::observations::Kind::AllocationStall,
     );
@@ -758,18 +759,41 @@ fn major_trigger(state: &GcState) -> usize {
 }
 
 fn pacer_inputs(state: &GcState) -> pacer::Inputs {
+    let history = crate::gc_telemetry::pacing_cycle_snapshot();
+    let cpu = crate::gc_telemetry::pacing::snapshot();
+    let memory = memory_inputs(state);
     pacer::Inputs {
         live: state
             .last_major_policy_live_bytes
             .saturating_add(external_bytes() as u64),
         previous_goal: state.threshold_bytes as u64,
-        expected_work: state.last_major_mark_work.max(state.last_major_live_bytes),
+        expected_work: state
+            .last_major_mark_work
+            .max(state.last_major_live_bytes)
+            .saturating_sub(history.last_major_cycle.root_scan_bytes),
         allocation_per_second: 0,
         mark_per_cpu_second: None,
-        // Until fractional worker duty is actuated, assume only one CPU of
-        // progress. More workers may finish early, never justify a later start.
-        cpu_capacity: 1,
+        cpu_capacity: pacer::cpu_capacity(),
+        max_workers: mark_workers::configured_count(),
+        feedback: pacer::Feedback {
+            occupied: memory.occupied,
+            pressure: state.soft_memory.enabled()
+                && state.soft_memory.decide(memory).trigger <= memory.occupied,
+            window_ns: crate::gc_telemetry::timestamp_ns().saturating_sub(cpu.window_start_ns),
+            gc_cpu_ns: (cpu.window_end_ns != 0 && cpu.window_cpu_missing == 0)
+                .then_some(cpu.window_cpu_ns),
+            root_work: history.last_major_cycle.root_scan_bytes,
+            barrier_work: runtime()
+                .write_barrier_calls
+                .load(Ordering::Relaxed)
+                .saturating_sub(state.pacer.barrier_baseline)
+                .saturating_mul(8),
+            pause_ns: history.major_pauses.max_ns,
+            previous_peak: history.last_major_cycle.heap_before_bytes,
+            ..pacer::Feedback::default()
+        },
         active: state.concurrent_cycle.is_some() || state.sweeping.is_some(),
+        fixed_goal: false,
     }
 }
 
@@ -2116,7 +2140,6 @@ fn try_collect_internal() -> CollectionAttempt {
         let mut state = runtime().heap.lock().unwrap();
         sync_tlab_bytes(&mut state);
         let after = state.allocated_bytes as u64;
-        let previous_goal = state.threshold_bytes as u64;
         state.last_major_live_bytes = after;
         state.last_major_policy_live_bytes = major_policy_managed_bytes(&state) as u64;
         state.last_major_mark_work = work
@@ -2131,31 +2154,6 @@ fn try_collect_internal() -> CollectionAttempt {
                 .saturating_add(work.descriptor_bytes),
             cpu,
         );
-        let bytes = policy_allocated_total(&state);
-        state
-            .pacer
-            .resume_allocation(crate::gc_telemetry::timestamp_ns(), bytes);
-        pacer::complete_threshold(&mut state, previous_goal);
-        // A completed full cycle services any high reservation pressure. If
-        // reclamation crossed the low watermark, rearm before new allocations
-        // can reserve a region again (even within the same allocation call).
-        hard_reservation_pressure(&mut state);
-        let memory_input = memory_inputs(&state);
-        state
-            .soft_memory
-            .completed(heap_before.saturating_add(external_before), memory_input);
-        if gc_log {
-            let decision = state.soft_memory.decide(memory_input);
-            eprintln!(
-                "[gc] soft_memory goal={} trigger={} overshoot={} reason={:?} native_requested_bytes={} native_requested_exact=false native_committed_valid=false process_limit_coverage_complete=false",
-                decision.goal,
-                decision.trigger,
-                decision.overshoot,
-                decision.reason,
-                external_bytes()
-            );
-        }
-        progress::record_success(state.total_allocated_bytes);
         drop(state);
         // Include the required initial/remark stops in V1 as well as V2.
         let pause_ns = coordination_ns().saturating_sub(pause_before);
@@ -2189,6 +2187,40 @@ fn try_collect_internal() -> CollectionAttempt {
         }
     };
     let event = cycle.finish_concurrent(heap_before, heap_after, work, pause_ns, freed as u64);
+
+    // Completion publishes the entire CPU interval before the next-goal decision.
+    // finish_concurrent may emit telemetry: never call it with the heap locked.
+    // Collector serialization remains held until all next-cycle policy is ready.
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        sync_tlab_bytes(&mut state);
+        let previous_goal = state.threshold_bytes as u64;
+        let bytes = policy_allocated_total(&state);
+        state
+            .pacer
+            .resume_allocation(crate::gc_telemetry::timestamp_ns(), bytes);
+        pacer::complete_threshold(&mut state, previous_goal);
+        // A completed full cycle services any high reservation pressure. If
+        // reclamation crossed the low watermark, rearm before new allocations
+        // can reserve a region again (even within the same allocation call).
+        hard_reservation_pressure(&mut state);
+        let memory_input = memory_inputs(&state);
+        state
+            .soft_memory
+            .completed(heap_before.saturating_add(external_before), memory_input);
+        if gc_log {
+            let decision = state.soft_memory.decide(memory_input);
+            eprintln!(
+                "[gc] soft_memory goal={} trigger={} overshoot={} reason={:?} native_requested_bytes={} native_requested_exact=false native_committed_valid=false process_limit_coverage_complete=false",
+                decision.goal,
+                decision.trigger,
+                decision.overshoot,
+                decision.reason,
+                external_bytes()
+            );
+        }
+        progress::record_success(state.total_allocated_bytes);
+    }
 
     if gc_log {
         let state = runtime().heap.lock().unwrap();

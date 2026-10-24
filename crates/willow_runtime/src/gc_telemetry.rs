@@ -17,6 +17,7 @@ pub mod measurement;
 pub mod milestones;
 pub mod native_trace;
 pub mod observations;
+pub mod pacing;
 pub mod pause;
 pub mod stops;
 pub mod workers;
@@ -377,9 +378,29 @@ impl Drop for Cycle {
             // epoch consumed while allowing the next elected collector to start.
             let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
             telemetry.stats.phase = self.previous_phase;
+            pacing::abort(self.start_ns, timestamp_ns(), self.previous_phase != 0);
             milestones::abort(self.epoch);
         }
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMPLETED_CPU_FOR_TEST: std::cell::Cell<Option<Option<u64>>> = const { std::cell::Cell::new(None) };
+}
+
+/// Replace only the measured CPU value, preserving the real collection,
+/// completion publication and policy-decision call path. Thread-local and scoped.
+#[cfg(test)]
+pub(crate) fn with_completed_cpu_for_test<T>(cpu: Option<u64>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<u64>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COMPLETED_CPU_FOR_TEST.set(self.0);
+        }
+    }
+    let _restore = Restore(COMPLETED_CPU_FOR_TEST.replace(Some(cpu)));
+    run()
 }
 
 impl Cycle {
@@ -388,6 +409,9 @@ impl Cycle {
         let start_ns = timestamp_ns();
         let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
         let minor_cpu_before = telemetry.minor_cpu_ns;
+        if kind == CycleKind::Major {
+            pacing::begin_major(start_ns);
+        }
         let stats = &mut telemetry.stats;
         let previous_phase = stats.phase;
         debug_assert!(
@@ -407,7 +431,7 @@ impl Cycle {
             start_ns,
             completed: false,
             previous_phase,
-            cpu_start: profiling().then(workers::thread_cpu_ns).flatten(),
+            cpu_start: workers::thread_cpu_ns(),
             minor_cpu_before,
             previous_epoch,
             _interval: observations::Span::new(observations::Kind::Cycle),
@@ -489,6 +513,9 @@ impl Cycle {
             telemetry.stats.phase = self.previous_phase;
             cpu
         };
+        #[cfg(test)]
+        let cpu = COMPLETED_CPU_FOR_TEST.get().unwrap_or(cpu);
+        pacing::cycle(self.start_ns, end_ns, cpu, self.previous_phase != 0);
         if profiling()
             && let Some(trace) = TRACE.as_ref()
         {
@@ -538,6 +565,12 @@ impl GcTelemetry {
         s.mark_ns = s.mark_ns.saturating_add(cycle.mark_ns);
         s.last_cycle = cycle;
     }
+}
+
+/// Cycle group only: safe while the caller already owns the heap mutex.
+/// Reuses V1's measurement units without recursively sampling the heap.
+pub(crate) fn pacing_cycle_snapshot() -> WillowGcStatsV1 {
+    TELEMETRY.lock().unwrap_or_else(|p| p.into_inner()).stats
 }
 
 /// Snapshot without RSS sampling, suitable for control loops and frequent polls.
@@ -975,6 +1008,7 @@ pub(crate) fn reset_for_test() {
     milestones::reset();
     native_trace::reset();
     measurement::reset();
+    pacing::reset();
 }
 
 #[cfg(test)]

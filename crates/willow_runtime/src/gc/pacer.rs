@@ -1,12 +1,36 @@
 //! Integer-only feedback for the heap runway. Sampling and policy are separate;
 //! unavailable CPU measurements never masquerade as zero-cost marking.
+pub(super) const SCALE: u64 = 1_000_000;
+const NORMAL_CPU: u64 = 250_000;
+const HARD_CPU: u64 = 500_000;
 const MIN_GOAL: u64 = 1024 * 1024;
 // Coalesce sub-millisecond allocation bursts instead of feeding refill-scale
 // clock/scheduling noise into the immediate-rise runway estimator.
 const ALLOCATION_SAMPLE_NS: u64 = 1_000_000;
 
-/// The sole mutable writer of the heap goal and pacing trigger. Allocation
-/// accounting never grants runway; reservation budgets are enforced separately.
+/// Available CPU capacity, sampled once outside the allocation hot path.
+pub(super) fn cpu_capacity() -> usize {
+    static CPUS: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| std::thread::available_parallelism().map_or(1, usize::from));
+    *CPUS
+}
+
+fn publish_decision(decision: Decision) {
+    crate::gc_telemetry::pacing::publish(crate::gc_telemetry::pacing::Decision {
+        goal_bytes: decision.goal,
+        trigger_bytes: decision.trigger,
+        runway_bytes: decision.runway,
+        expected_work_bytes: decision.expected_work,
+        dedicated_workers: decision.workers,
+        fractional_duty_ppm: decision.fractional_duty_ppm,
+        assist_work_per_byte_ppm: decision.assist_work_per_byte_ppm,
+        overshoot_budget_bytes: decision.overshoot_budget,
+        reasons: decision.reasons | UNCONTROLLED_PHASES,
+        start_now: decision.start_now,
+    });
+}
+
+/// Sole writer of goals and triggers; reservation budgets remain separate.
 fn publish(state: &mut super::GcState, goal: u64, trigger: u64, reason: &str) {
     let goal = goal.min(usize::MAX as u64) as usize;
     let trigger = trigger.min(goal as u64);
@@ -34,14 +58,22 @@ pub(super) fn scheduler_start(state: &mut super::GcState, budget: u64) {
 }
 
 pub(super) fn sample_threshold(state: &mut super::GcState) {
-    let input = super::pacer_inputs(state);
+    let input = Inputs {
+        fixed_goal: true,
+        ..super::pacer_inputs(state)
+    };
     let decision = state.pacer.decision(input);
-    let goal = state.threshold_bytes as u64;
-    let trigger = goal
-        .saturating_sub(decision.runway)
-        .max(minimum_trigger(input.live))
-        .min(goal);
-    publish(state, goal, trigger, "allocation_sample");
+    publish_decision(decision);
+    publish(state, decision.goal, decision.trigger, "allocation_sample");
+}
+
+pub(super) fn allocation_failure(state: &super::GcState) {
+    let mut input = super::pacer_inputs(state);
+    input.feedback.allocator_failed = true;
+    let mut decision = state.pacer.decision(input);
+    decision.reasons |= ALLOCATOR_FAILED;
+    decision.start_now = true;
+    publish_decision(decision);
 }
 
 pub(super) fn complete_threshold(state: &mut super::GcState, previous_goal: u64) {
@@ -51,11 +83,16 @@ pub(super) fn complete_threshold(state: &mut super::GcState, previous_goal: u64)
     };
     let (goal, trigger, reason) = if state.pacer.enabled() {
         let decision = state.pacer.decision(input);
+        publish_decision(decision);
         (decision.goal, decision.trigger, "cycle_paced")
     } else {
-        let goal = input.live.saturating_mul(2).max(MIN_GOAL);
-        (goal, goal, "cycle_fixed")
+        let decision = state.pacer.decision(input);
+        publish_decision(decision);
+        (decision.goal, decision.trigger, "cycle_fixed")
     };
+    state.pacer.barrier_baseline = super::runtime()
+        .write_barrier_calls
+        .load(std::sync::atomic::Ordering::Relaxed);
     publish(state, goal, trigger, reason);
 }
 
@@ -67,14 +104,54 @@ pub(super) struct Inputs {
     pub allocation_per_second: u64,
     pub mark_per_cpu_second: Option<u64>,
     pub cpu_capacity: usize,
+    pub max_workers: usize,
     pub active: bool,
+    pub fixed_goal: bool,
+    pub feedback: Feedback,
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Optional observations retain validity instead of interpreting missing CPU/RSS
+/// as zero. Work and allocation are bytes; CPU and wall windows are nanoseconds.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Feedback {
+    pub occupied: u64,
+    pub root_work: u64,
+    pub barrier_work: u64,
+    pub pause_ns: u64,
+    pub window_ns: u64,
+    pub gc_cpu_ns: Option<u64>,
+    pub previous_peak: u64,
+    pub pressure: bool,
+    pub allocator_failed: bool,
+    pub committed_bytes: Option<u64>,
+    pub resident_bytes: Option<u64>,
+}
+
+pub(super) const COLD: u64 = 1;
+pub(super) const CPU_MISSING: u64 = 2;
+pub(super) const CPU_NORMAL: u64 = 4;
+pub(super) const CPU_HARD: u64 = 8;
+pub(super) const PREDICTED_LATE: u64 = 16;
+pub(super) const PRESSURE: u64 = 32;
+pub(super) const ALLOCATOR_FAILED: u64 = 64;
+pub(super) const FIXED: u64 = 128;
+// Root coordination, sweep and mutator assistance currently cannot be throttled
+// by the background worker controller. Never label its duty as a global cap.
+pub(super) const UNCONTROLLED_PHASES: u64 = 256;
+pub(super) const MEMORY_UNAVAILABLE: u64 = 512;
+
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Decision {
     pub goal: u64,
     pub trigger: u64,
     pub runway: u64,
+    pub expected_work: u64,
+    pub workers: u64,
+    pub fractional_duty_ppm: u64,
+    pub assist_work_per_byte_ppm: u64,
+    pub overshoot_budget: u64,
+    pub reasons: u64,
+    pub start_now: bool,
 }
 
 // A completed full-heap scan must buy allocation progress proportional to
@@ -93,33 +170,131 @@ fn mul_div_ceil(a: u64, b: u64, divisor: u128) -> u64 {
 
 pub(super) fn decide(input: Inputs) -> Decision {
     let floor = input.live.saturating_mul(2).max(MIN_GOAL);
+    let feedback = input.feedback;
+    let cpus = input.cpu_capacity.clamp(1, 65536) as u64;
+    let worker_capacity_ppm =
+        (cpus * NORMAL_CPU).min((input.max_workers.min(65536) as u64) * SCALE);
+    let expected_work = input
+        .expected_work
+        .saturating_add(feedback.root_work)
+        .saturating_add(feedback.barrier_work);
+    let mut reasons = 0;
+    // Unlimited goals never clamp to RSS or commitment: the separate memory
+    // controller owns that policy. Preserve missing observations diagnostically.
+    if feedback.committed_bytes.is_none() || feedback.resident_bytes.is_none() {
+        reasons |= MEMORY_UNAVAILABLE;
+    }
+    if input.mark_per_cpu_second.is_none_or(|rate| rate == 0) {
+        reasons |= COLD;
+    }
+    match feedback.gc_cpu_ns.filter(|_| feedback.window_ns != 0) {
+        Some(cpu) => {
+            let ratio = mul_div_ceil(
+                cpu,
+                SCALE,
+                u128::from(feedback.window_ns) * u128::from(cpus),
+            );
+            if ratio > NORMAL_CPU {
+                reasons |= CPU_NORMAL;
+            }
+            if ratio > HARD_CPU {
+                reasons |= CPU_HARD;
+            }
+        }
+        None => reasons |= CPU_MISSING,
+    }
     // Conservative cold/invalid-rate runway: half the fixed fallback goal.
     let runway = match input.mark_per_cpu_second.filter(|&rate| rate != 0) {
         Some(rate) => {
             // Preserve the full denominator: saturating it at u64::MAX
             // overestimates required runway on multi-CPU inputs.
-            let capacity = u128::from(rate) * input.cpu_capacity.max(1) as u128;
-            mul_div_ceil(input.expected_work, input.allocation_per_second, capacity)
-                .saturating_mul(2)
+            let capacity =
+                (u128::from(rate) * u128::from(worker_capacity_ppm) / u128::from(SCALE)).max(1);
+            mul_div_ceil(expected_work, input.allocation_per_second, capacity).saturating_mul(2)
         }
         None => floor / 2,
     };
-    let desired = floor.max(input.live.saturating_add(runway.saturating_mul(2)));
+    let runway = runway.saturating_add(mul_div_ceil(
+        input.allocation_per_second,
+        feedback.pause_ns,
+        1_000_000_000,
+    ));
+    let floor = if reasons & CPU_NORMAL != 0 {
+        floor.saturating_mul(2)
+    } else {
+        floor
+    };
+    let desired = floor
+        .max(input.live.saturating_add(runway.saturating_mul(2)))
+        .max(feedback.previous_peak);
     // Limit each inter-cycle adjustment to a factor of two. Live is always a
     // lower bound. Never shrink a goal while that cycle is active.
     let previous = input.previous_goal.max(MIN_GOAL);
     let lower = if input.active { previous } else { previous / 2 };
-    let goal = desired
-        .clamp(lower, previous.saturating_mul(2))
-        .max(input.live);
+    let goal = if input.fixed_goal {
+        input.previous_goal.max(input.live)
+    } else {
+        desired
+            .clamp(lower, previous.saturating_mul(2))
+            .max(input.live)
+    };
     let trigger = goal
         .saturating_sub(runway)
         .max(minimum_trigger(input.live).min(goal));
+    if feedback.pressure {
+        reasons |= PRESSURE;
+    }
+    if feedback.allocator_failed {
+        reasons |= ALLOCATOR_FAILED;
+    }
+    let predicted_late = feedback.occupied >= minimum_trigger(input.live)
+        && feedback.occupied >= goal.saturating_sub(runway);
+    if predicted_late {
+        reasons |= PREDICTED_LATE;
+    }
+    let start_now = feedback.occupied >= goal
+        || predicted_late
+        || feedback.pressure
+        || feedback.allocator_failed;
+    let headroom = goal.saturating_sub(input.live).max(1);
+    let background_rate = input.mark_per_cpu_second.map_or(0, |rate| {
+        ((u128::from(rate) * u128::from(worker_capacity_ppm)) / u128::from(SCALE))
+            .min(u128::from(u64::MAX)) as u64
+    });
+    let background_work = if input.allocation_per_second == 0 {
+        0
+    } else {
+        ((u128::from(background_rate) * u128::from(headroom))
+            / u128::from(input.allocation_per_second))
+        .min(u128::from(u64::MAX)) as u64
+    };
+    let assist_work = expected_work.saturating_sub(background_work);
     Decision {
         goal,
         trigger,
         runway,
+        expected_work,
+        workers: worker_capacity_ppm / SCALE,
+        fractional_duty_ppm: worker_capacity_ppm % SCALE,
+        assist_work_per_byte_ppm: mul_div_ceil(assist_work, SCALE, u128::from(headroom)),
+        overshoot_budget: goal / 8,
+        reasons,
+        start_now,
     }
+}
+
+/// Full workers plus at most one fractional worker. No idle CPU is borrowed.
+pub(super) fn worker_duty(cpus: usize, index: usize) -> u64 {
+    let total = (cpus.clamp(1, 65536) as u64) * NORMAL_CPU;
+    total
+        .saturating_sub((index as u64).saturating_mul(SCALE))
+        .min(SCALE)
+}
+
+/// Repay CPU after a bounded drain, crediting wall time already elapsed.
+/// Missing CPU conservatively charges the whole interval.
+pub(super) fn duty_delay(cpu: Option<u64>, elapsed: u64, duty: u64) -> u64 {
+    mul_div_ceil(cpu.unwrap_or(elapsed), SCALE, u128::from(duty.max(1))).saturating_sub(elapsed)
 }
 
 #[derive(Debug)]
@@ -128,6 +303,7 @@ pub(super) struct Sampler {
     last: Option<(u64, u64)>,
     allocation_rate: u64,
     mark_rate: Option<u64>,
+    pub(super) barrier_baseline: u64,
 }
 
 impl Default for Sampler {
@@ -137,6 +313,7 @@ impl Default for Sampler {
             last: None,
             allocation_rate: 0,
             mark_rate: None,
+            barrier_baseline: 0,
         }
     }
 }
@@ -223,6 +400,21 @@ impl Sampler {
     pub(super) fn decision(&self, mut input: Inputs) -> Decision {
         input.allocation_per_second = self.allocation_rate;
         input.mark_per_cpu_second = self.mark_rate;
+        if !self.enabled {
+            let goal = if input.fixed_goal {
+                input.previous_goal.max(input.live)
+            } else {
+                input.live.saturating_mul(2).max(MIN_GOAL)
+            };
+            return Decision {
+                goal,
+                trigger: goal,
+                reasons: FIXED,
+                assist_work_per_byte_ppm: SCALE,
+                start_now: input.feedback.occupied >= goal,
+                ..Decision::default()
+            };
+        }
         decide(input)
     }
 }
@@ -253,7 +445,10 @@ mod tests {
             allocation_per_second: MIN_GOAL,
             mark_per_cpu_second: Some(4 * MIN_GOAL),
             cpu_capacity: 1,
+            max_workers: 64,
             active: false,
+            fixed_goal: false,
+            feedback: Feedback::default(),
         }
     }
 
@@ -288,7 +483,10 @@ mod tests {
                     allocation_per_second: u64::MAX,
                     mark_per_cpu_second: Some(rate),
                     cpu_capacity: 1,
+                    max_workers: 64,
                     active: false,
+                    fixed_goal: false,
+                    feedback: Feedback::default(),
                 });
                 assert!(decision.trigger >= live + live / 4);
                 assert!(decision.trigger <= decision.goal);
@@ -310,11 +508,7 @@ mod tests {
             });
             assert_eq!(
                 decision.runway,
-                mul_div_ceil(
-                    4 * MIN_GOAL,
-                    MIN_GOAL,
-                    u128::from(4 * MIN_GOAL) * cpus as u128
-                ) * 2
+                mul_div_ceil(4 * MIN_GOAL, MIN_GOAL, u128::from(MIN_GOAL) * cpus as u128) * 2
             );
             assert!(decision.trigger >= MIN_GOAL);
             assert!(decision.trigger <= decision.goal);
@@ -401,7 +595,7 @@ mod tests {
                 cpu_capacity: cpus,
                 ..input()
             });
-            assert_eq!(decision.runway, 2);
+            assert_eq!(decision.runway, if cpus == 2 { 6 } else { 2 });
             let decision = decide(Inputs {
                 expected_work: u64::MAX,
                 allocation_per_second: cpus as u64,
@@ -409,7 +603,7 @@ mod tests {
                 cpu_capacity: cpus,
                 ..input()
             });
-            assert_eq!(decision.runway, 2);
+            assert_eq!(decision.runway, if cpus < 64 { 10 } else { 8 });
         }
     }
 
@@ -451,5 +645,366 @@ mod tests {
         assert!(!allocation_should_collect());
         willow_pop_root();
         reset_internal();
+    }
+    #[test]
+    fn runtime_completed_cpu_excess_adjusts_next_goal() {
+        use super::super::*;
+        use crate::gc_telemetry::{pacing, with_completed_cpu_for_test};
+        let _guard = runtime_test_guard();
+        for (cpu, expected_flags, expected_goal) in [
+            (Some(0), 0, MIN_GOAL),
+            (Some(u64::MAX / 64), CPU_NORMAL | CPU_HARD, 2 * MIN_GOAL),
+            (None, CPU_MISSING, MIN_GOAL),
+        ] {
+            reset_internal();
+            runtime()
+                .heap
+                .lock()
+                .unwrap()
+                .pacer
+                .set_enabled_for_test(true);
+            with_completed_cpu_for_test(cpu, || {
+                // More than a full history window: verify sustained feedback,
+                // not just a synthetic call to the deterministic controller.
+                for cycle in 1..=10 {
+                    collect_internal();
+                    let snapshot = pacing::snapshot();
+                    assert_eq!(crate::gc_telemetry::snapshot().major_cycles, cycle);
+                    assert_eq!(
+                        snapshot.decision.reasons & (CPU_NORMAL | CPU_HARD | CPU_MISSING),
+                        expected_flags
+                    );
+                    assert_eq!(snapshot.decision.goal_bytes, expected_goal);
+                    let state = runtime().heap.lock().unwrap();
+                    assert_eq!(state.threshold_bytes as u64, expected_goal);
+                }
+            });
+        }
+        reset_internal();
+    }
+
+    #[test]
+    fn cpu_budget_thresholds_and_missing_windows() {
+        for (cpu, flags) in [
+            (0, 0),
+            (250, 0),
+            (251, CPU_NORMAL),
+            (500, CPU_NORMAL),
+            (501, CPU_NORMAL | CPU_HARD),
+        ] {
+            let d = decide(Inputs {
+                feedback: Feedback {
+                    window_ns: 1000,
+                    gc_cpu_ns: Some(cpu),
+                    ..Feedback::default()
+                },
+                ..input()
+            });
+            assert_eq!(d.reasons & (CPU_NORMAL | CPU_HARD | CPU_MISSING), flags);
+        }
+        for cpu in [None, Some(0), Some(u64::MAX)] {
+            let d = decide(Inputs {
+                feedback: Feedback {
+                    gc_cpu_ns: cpu,
+                    ..Feedback::default()
+                },
+                ..input()
+            });
+            assert_ne!(d.reasons & CPU_MISSING, 0);
+        }
+    }
+
+    #[test]
+    fn fractional_workers_and_duty_repayment() {
+        for cpus in [1, 2, 5, 64] {
+            let sum: u64 = (0..65).map(|i| worker_duty(cpus, i)).sum();
+            assert_eq!(sum, cpus as u64 * NORMAL_CPU);
+            let d = decide(Inputs {
+                cpu_capacity: cpus,
+                ..input()
+            });
+            assert_eq!(d.workers * SCALE + d.fractional_duty_ppm, sum);
+        }
+        assert_eq!(duty_delay(Some(100), 100, 250_000), 300);
+        assert_eq!(duty_delay(Some(100), 500, 250_000), 0);
+        assert_eq!(duty_delay(None, 100, 500_000), 100);
+        assert_eq!(duty_delay(Some(u64::MAX), 1, 1), u64::MAX - 1);
+        assert_eq!(
+            decide(Inputs {
+                cpu_capacity: 64,
+                max_workers: 2,
+                ..input()
+            })
+            .workers,
+            2
+        );
+        assert_eq!(
+            decide(Inputs {
+                max_workers: 0,
+                ..input()
+            })
+            .workers,
+            0
+        );
+    }
+
+    #[test]
+    fn work_pause_pressure_and_exhaustion_inputs() {
+        let base = decide(input());
+        for feedback in [
+            Feedback {
+                root_work: MIN_GOAL,
+                ..Feedback::default()
+            },
+            Feedback {
+                barrier_work: MIN_GOAL,
+                ..Feedback::default()
+            },
+            Feedback {
+                pause_ns: 1_000_000_000,
+                ..Feedback::default()
+            },
+        ] {
+            assert!(
+                decide(Inputs {
+                    feedback,
+                    ..input()
+                })
+                .runway
+                    > base.runway
+            );
+        }
+        for feedback in [
+            Feedback {
+                occupied: u64::MAX,
+                ..Feedback::default()
+            },
+            Feedback {
+                pressure: true,
+                ..Feedback::default()
+            },
+            Feedback {
+                allocator_failed: true,
+                ..Feedback::default()
+            },
+        ] {
+            assert!(
+                decide(Inputs {
+                    feedback,
+                    ..input()
+                })
+                .start_now
+            );
+        }
+        let d = decide(Inputs {
+            feedback: Feedback {
+                previous_peak: 8 * MIN_GOAL,
+                ..Feedback::default()
+            },
+            ..input()
+        });
+        assert_eq!(d.goal, 8 * MIN_GOAL);
+    }
+
+    #[test]
+    fn smoothed_improvements_converge_and_spikes_are_immediate() {
+        let mut s = Sampler::default();
+        s.mark(1000, Some(1_000_000_000));
+        for _ in 0..20 {
+            s.mark(2000, Some(1_000_000_000));
+        }
+        assert!(s.mark_rate.unwrap() >= 1990);
+        s.mark(100, Some(1_000_000_000));
+        assert_eq!(s.mark_rate, Some(100));
+        s.allocation(0, 0);
+        s.allocation(1_000_000_000, 1000);
+        for i in 2..=21 {
+            s.allocation(i * 1_000_000_000, 1000);
+        }
+        assert!(s.allocation_rate <= 4);
+        s.allocation(22_000_000_000, 1_001_000);
+        assert_eq!(s.allocation_rate, 1_000_000);
+    }
+
+    #[test]
+    fn decision_publication_is_a_coherent_group() {
+        use super::super::*;
+        let _guard = runtime_test_guard();
+        reset_internal();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for n in 1..=10_000 {
+                    publish_decision(Decision {
+                        goal: n * 2,
+                        trigger: n,
+                        ..Decision::default()
+                    });
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..10_000 {
+                    let s = crate::gc_telemetry::pacing::snapshot();
+                    assert_eq!(s.decision.goal_bytes, s.decision.trigger_bytes * 2);
+                }
+            });
+        });
+        reset_internal();
+    }
+
+    #[test]
+    fn nested_cpu_window_preserves_hard_budget_and_missing_reasons() {
+        use super::super::*;
+        use crate::gc_telemetry::pacing;
+        let _guard = runtime_test_guard();
+        for missing in [None, Some(0), Some(8)] {
+            reset_internal();
+            pacing::begin_major(100);
+            for i in 0..9 {
+                pacing::cycle(
+                    100 + i * 10,
+                    106 + i * 10,
+                    (missing != Some(i)).then_some(6),
+                    true,
+                );
+            }
+            pacing::cycle(100, 200, Some(1), false);
+            let snapshot = pacing::snapshot();
+            let d = decide(Inputs {
+                feedback: Feedback {
+                    window_ns: snapshot.window_end_ns - snapshot.window_start_ns,
+                    gc_cpu_ns: (snapshot.window_cpu_missing == 0).then_some(snapshot.window_cpu_ns),
+                    ..Feedback::default()
+                },
+                ..input()
+            });
+            if missing.is_none() {
+                assert_eq!(snapshot.window_cpu_ns, 55);
+                assert_eq!(
+                    d.reasons & (CPU_NORMAL | CPU_HARD | CPU_MISSING),
+                    CPU_NORMAL | CPU_HARD
+                );
+            } else {
+                assert_eq!(
+                    d.reasons & (CPU_NORMAL | CPU_HARD | CPU_MISSING),
+                    CPU_MISSING
+                );
+            }
+        }
+        reset_internal();
+    }
+
+    #[test]
+    fn fixed_goal_keeps_derived_outputs_consistent() {
+        let i = Inputs {
+            fixed_goal: true,
+            ..input()
+        };
+        let d = decide(i);
+        assert_eq!(d.goal, i.previous_goal);
+        assert_eq!(d.overshoot_budget, d.goal / 8);
+        assert!(d.trigger <= d.goal);
+        let cold = decide(Inputs {
+            mark_per_cpu_second: None,
+            ..i
+        });
+        assert_eq!(
+            cold.assist_work_per_byte_ppm,
+            mul_div_ceil(i.expected_work, SCALE, u128::from(i.previous_goal - i.live))
+        );
+        assert!(d.assist_work_per_byte_ppm < cold.assist_work_per_byte_ppm);
+        let d = decide(Inputs {
+            live: i.previous_goal * 2,
+            ..i
+        });
+        assert_eq!(d.goal, i.previous_goal * 2);
+    }
+
+    #[test]
+    fn output_ranges_cover_independent_extremes() {
+        for live in [0, 1, MIN_GOAL, u64::MAX] {
+            for work in [0, 1, MIN_GOAL, u64::MAX] {
+                for allocation in [0, 1, MIN_GOAL, u64::MAX] {
+                    for cpus in [0, 1, 2, 5, usize::MAX] {
+                        let d = decide(Inputs {
+                            live,
+                            expected_work: work,
+                            allocation_per_second: allocation,
+                            cpu_capacity: cpus,
+                            ..input()
+                        });
+                        assert!(d.goal >= live);
+                        assert!(d.trigger >= live && d.trigger <= d.goal);
+                        assert!(d.fractional_duty_ppm < SCALE);
+                        assert!(d.workers <= 64);
+                        assert!(d.overshoot_budget <= d.goal);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "reference-host measurement; run explicitly with --ignored --nocapture"]
+    fn pacer_reference_measurement() {
+        use super::super::*;
+        let _guard = runtime_test_guard();
+        for n in [10_000, 100_000, 1_000_000] {
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(decide(std::hint::black_box(input())));
+            }
+            println!(
+                "PACER_MODEL iterations={n} elapsed_ns={}",
+                start.elapsed().as_nanos()
+            );
+        }
+        for paced in [false, true] {
+            for payload in [64, 512, 4096] {
+                reset_internal();
+                runtime()
+                    .heap
+                    .lock()
+                    .unwrap()
+                    .pacer
+                    .set_enabled_for_test(paced);
+                let mut roots = [std::ptr::null_mut(); 128];
+                for root in &mut roots {
+                    willow_push_root(root);
+                    *root = willow_alloc(payload);
+                }
+                let start = std::time::Instant::now();
+                let mut overshoot = 0u64;
+                let mut peak = 0u64;
+                for _ in 0..128 {
+                    for _ in 0..64 {
+                        std::hint::black_box(willow_alloc(payload));
+                    }
+                    let state = runtime().heap.lock().unwrap();
+                    let occupied = memory_inputs(&state).occupied;
+                    peak = peak.max(occupied);
+                    overshoot =
+                        overshoot.max(occupied.saturating_sub(state.threshold_bytes as u64));
+                }
+                willow_gc_collect();
+                let elapsed = crate::gc_telemetry::elapsed_ns(start);
+                let stats = crate::gc_telemetry::snapshot();
+                let p = crate::gc_telemetry::pacing::snapshot();
+                let m = crate::gc_telemetry::measurement::snapshot();
+                println!(
+                    "PACER_RUNTIME enabled={paced} payload={payload} allocations=8192 wall_ns={elapsed} peak_bytes={peak} overshoot_bytes={overshoot} gc_cpu_ns={} missing_cpu_cycles={} pause_max_ns={} assist_samples={} assist_cpu_ns={} assist_demand_ppm={} reasons={}",
+                    p.gc_cpu_ns,
+                    p.cpu_missing_cycles,
+                    stats.major_pauses.max_ns,
+                    m.assist_samples,
+                    m.assist_cpu_ns,
+                    p.decision.assist_work_per_byte_ppm,
+                    p.decision.reasons
+                );
+                for _ in &roots {
+                    willow_pop_root();
+                }
+                reset_internal();
+            }
+        }
     }
 }

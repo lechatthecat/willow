@@ -16,6 +16,7 @@ const BACKGROUND_BATCH: usize = 1024;
 struct Job {
     cycle: Arc<ConcurrentCycle>,
     remaining_work: AtomicUsize,
+    pacing: bool,
 }
 
 impl Job {
@@ -103,6 +104,7 @@ impl Pool {
     pub(super) fn run(&self, cycle: &Arc<ConcurrentCycle>, budget: usize) {
         // Own the scheduled job before publishing it, including workers not
         // yet awake. Completion is published only after all readers unregister.
+        let pacing = runtime().heap.lock().unwrap().pacer.enabled();
         let _job_owner = cycle.termination.enter();
         let (lock, cv) = &*self.shared;
         {
@@ -117,6 +119,7 @@ impl Pool {
             // and Retry count as work even when no new object is marked.
             state.job = Some(Arc::new(Job {
                 cycle: cycle.clone(),
+                pacing,
                 remaining_work: AtomicUsize::new(cycle.objects.len().saturating_mul(4).max(1024)),
             }));
             state.remaining = self.threads.len();
@@ -223,6 +226,11 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>, index: usize) {
         );
         let owner = cycle.termination.enter();
         let measurement = JobMeasurement::begin();
+        let duty = if job.pacing {
+            pacer::worker_duty(pacer::cpu_capacity(), index)
+        } else {
+            pacer::SCALE
+        };
         willow_gc_register_mutator();
         {
             // Retry and sliced objects can republish work indefinitely. Spend
@@ -230,7 +238,7 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>, index: usize) {
             // closure. Neither an empty sample nor budget exhaustion ends the
             // epoch. Unused claims are not refunded, avoiding empty-queue spin.
             loop {
-                if cycle.worker_failed.load(Ordering::Acquire) || minor::requested() {
+                if duty == 0 || cycle.worker_failed.load(Ordering::Acquire) || minor::requested() {
                     break;
                 }
                 let budget = job.claim();
@@ -241,12 +249,28 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>, index: usize) {
                 // publication and CPU clock reads amortize over the claim. A
                 // trace panic unwinds the drain, retiring its consumer and
                 // publishing the batch; the loop head then observes failure.
+                let started = std::time::Instant::now();
+                let cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
                 let scanned =
                     cycle.drain_recovering(|| cycle.drain_background(budget, &mut children));
                 #[cfg(test)]
                 BACKGROUND_DRAINS.fetch_add(1, Ordering::Relaxed);
                 // Retire the consumer and publish private work before
                 // polling; no queue or heap lock crosses this call.
+                let cpu = cpu_start
+                    .zip(crate::gc_telemetry::workers::thread_cpu_ns())
+                    .and_then(|(a, b)| b.checked_sub(a));
+                let elapsed = crate::gc_telemetry::elapsed_ns(started);
+                let delay = pacer::duty_delay(cpu, elapsed, duty);
+                let waiting = std::time::Instant::now();
+                // Publish work before every poll. No queue/heap mutex crosses
+                // the wait, and short slices keep minor rendezvous responsive.
+                while crate::gc_telemetry::elapsed_ns(waiting) < delay {
+                    willow_gc_safepoint();
+                    let remaining = delay.saturating_sub(crate::gc_telemetry::elapsed_ns(waiting));
+                    std::thread::sleep(std::time::Duration::from_nanos(remaining.min(100_000)));
+                }
+                crate::gc_telemetry::pacing::duty(cpu, crate::gc_telemetry::elapsed_ns(waiting));
                 willow_gc_safepoint();
                 if scanned == 0 {
                     break;

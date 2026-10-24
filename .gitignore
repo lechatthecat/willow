@@ -299,3 +299,10 @@ AGENTS.md
 
 # Generated Python cache is not audit evidence.
 /docs/audits/willow-6fv.7.4/**/__pycache__/
+
+# Public source-derived Pacer audit and reference-host measurements.
+!/docs/audits/willow-6fv.5.8.3/
+/docs/audits/willow-6fv.5.8.3/*
+!/docs/audits/willow-6fv.5.8.3/audit.md
+!/docs/audits/willow-6fv.5.8.3/measure.py
+!/docs/audits/willow-6fv.5.8.3/measurements.json
