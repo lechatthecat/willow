@@ -12,6 +12,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
 pub mod failure_record;
+pub mod footprint;
 pub mod m3;
 pub mod measurement;
 pub mod milestones;
@@ -20,6 +21,7 @@ pub mod observations;
 pub mod pacing;
 pub mod pause;
 pub mod stops;
+pub mod sweep;
 pub mod workers;
 pub use milestones::{GcStage, GcTicket, WaitError, wait_gc_for_test};
 
@@ -873,14 +875,46 @@ static TRACE_MILESTONES: LazyLock<bool> = LazyLock::new(|| {
 /// see them even when `WILLOW_GC_MEASURE=1` enables the aggregate snapshot.
 static TRACE_OBSERVATIONS: LazyLock<bool> =
     LazyLock::new(|| std::env::var("WILLOW_GC_TRACE_VERSION").as_deref() == Ok("4"));
+/// Opt-in bounded history size: absent selects `default`; unparsable or
+/// outside `1..=max` yields None, which callers report instead of hiding.
+fn bounded_capacity(value: Option<&str>, default: usize, max: usize) -> Option<usize> {
+    match value {
+        None => Some(default),
+        Some(text) => text.parse::<usize>().ok().filter(|n| (1..=max).contains(n)),
+    }
+}
+
+/// Reads `var` for [`bounded_capacity`]; a non-Unicode value is invalid.
+fn env_capacity(var: &str, default: usize, max: usize) -> Option<usize> {
+    match std::env::var(var) {
+        Ok(value) => bounded_capacity(Some(&value), default, max),
+        Err(std::env::VarError::NotPresent) => bounded_capacity(None, default, max),
+        Err(std::env::VarError::NotUnicode(_)) => None,
+    }
+}
+
 /// Whether a V4 sink exists to drain per-event observation history.
 fn observation_history() -> bool {
     *TRACE_OBSERVATIONS && TRACE.is_some()
+}
+#[cfg(feature = "gc-acceptance-faults")]
+static ACCEPTANCE_EXTERNAL_CONSUMER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// The acceptance observer takes responsibility for all V4 drains while enabled.
+/// Enable before starting its thread; disable only after joining and flushing it.
+/// Endpoints still reconcile the full sequence and reject any missing records.
+#[cfg(feature = "gc-acceptance-faults")]
+pub fn acceptance_external_observation_consumer(enabled: bool) {
+    ACCEPTANCE_EXTERNAL_CONSUMER.store(enabled, Ordering::Release);
 }
 /// Flush V4 observations after releasing GC locks. Collections flush per cycle;
 /// runtime exit flushes the final checkpoint, including for workloads that
 /// perform no collection. Broken sinks remain nonfatal.
 pub fn flush_observations() {
+    #[cfg(feature = "gc-acceptance-faults")]
+    if ACCEPTANCE_EXTERNAL_CONSUMER.load(Ordering::Acquire) {
+        return;
+    }
     if !observations::enabled() || !*TRACE_OBSERVATIONS {
         return;
     }
@@ -929,8 +963,12 @@ pub(crate) fn resident_bytes() -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(deprecated)] // libc exposes this stable Darwin ABI; avoid a dependency for one call.
 pub(crate) fn resident_bytes() -> Option<u64> {
+    macos_resident(false)
+}
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc exposes this stable Darwin ABI; avoid a dependency for one call.
+fn macos_resident(peak: bool) -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info>::zeroed();
     let mut count = (std::mem::size_of::<libc::mach_task_basic_info>()
         / std::mem::size_of::<libc::natural_t>())
@@ -947,11 +985,20 @@ pub(crate) fn resident_bytes() -> Option<u64> {
     if result != libc::KERN_SUCCESS {
         return None;
     }
-    Some(unsafe { info.assume_init() }.resident_size as u64)
+    let info = unsafe { info.assume_init() };
+    Some(if peak {
+        info.resident_size_max
+    } else {
+        info.resident_size
+    } as u64)
 }
 
 #[cfg(target_os = "windows")]
 pub(crate) fn resident_bytes() -> Option<u64> {
+    windows_resident(false)
+}
+#[cfg(target_os = "windows")]
+fn windows_resident(peak: bool) -> Option<u64> {
     #[repr(C)]
     struct ProcessMemoryCounters {
         cb: u32,
@@ -989,10 +1036,48 @@ pub(crate) fn resident_bytes() -> Option<u64> {
     // SAFETY: -1 is GetCurrentProcess's documented pseudo-handle; counters has
     // the exact PROCESS_MEMORY_COUNTERS layout and initialized size.
     let ok = unsafe { GetProcessMemoryInfo(-1isize as *mut _, &mut counters, size) };
-    (ok != 0).then_some(counters.working_set as u64)
+    (ok != 0).then_some(if peak {
+        counters.peak_working_set
+    } else {
+        counters.working_set
+    } as u64)
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) fn resident_bytes() -> Option<u64> {
+    None
+}
+
+/// OS-maintained process-lifetime RSS/working-set high-water mark, not a sample.
+#[cfg(target_os = "linux")]
+pub fn peak_resident_bytes() -> Option<u64> {
+    // getrusage carries the fork parent's pre-exec high water on Linux. VmHWM
+    // belongs to this executable's memory map and excludes launcher history.
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    static OBSERVED: AtomicU64 = AtomicU64::new(0);
+    // Linux's asynchronously updated RSS counters can make consecutive VmHWM
+    // reads fall slightly. Never forget a larger OS high water already observed.
+    let value = resident_high_water(&status)?;
+    Some(OBSERVED.fetch_max(value, Ordering::Relaxed).max(value))
+}
+#[cfg(any(target_os = "linux", test))]
+fn resident_high_water(status: &str) -> Option<u64> {
+    let line = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?;
+    let mut fields = line.split_whitespace();
+    let bytes = fields.next()?.parse::<u64>().ok()?.checked_mul(1024)?;
+    (fields.next()? == "kB" && fields.next().is_none()).then_some(bytes)
+}
+#[cfg(target_os = "macos")]
+pub fn peak_resident_bytes() -> Option<u64> {
+    macos_resident(true)
+}
+#[cfg(target_os = "windows")]
+pub fn peak_resident_bytes() -> Option<u64> {
+    windows_resident(true)
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn peak_resident_bytes() -> Option<u64> {
     None
 }
 
@@ -1009,6 +1094,8 @@ pub(crate) fn reset_for_test() {
     native_trace::reset();
     measurement::reset();
     pacing::reset();
+    sweep::reset();
+    footprint::reset();
 }
 
 #[cfg(test)]
@@ -1051,4 +1138,24 @@ pub fn native_memory_snapshot() -> NativeMemorySnapshot {
 /// Bounded panic-path sample; never block while a collector owns telemetry.
 pub(crate) fn diagnostic_cycle() -> Option<WillowGcStatsV1> {
     Some(TELEMETRY.try_lock().ok()?.stats)
+}
+
+#[cfg(test)]
+mod high_water_tests {
+    #[test]
+    fn high_water_status_uses_hwm_not_current_rss_or_parent_history() {
+        assert_eq!(
+            super::resident_high_water("Name: probe\nVmRSS: 5 kB\nVmHWM: 8192 kB\n"),
+            Some(8 * 1024 * 1024)
+        );
+        for text in [
+            "VmRSS: 5 kB",
+            "VmHWM: -1 kB",
+            "VmHWM: 5 MB",
+            "VmHWM: 5 kB extra",
+            "VmHWM: 18446744073709551615 kB",
+        ] {
+            assert_eq!(super::resident_high_water(text), None);
+        }
+    }
 }

@@ -106,6 +106,11 @@ pub(super) fn wait_for_minor_budget() -> bool {
 /// recovery, wait for its sweep publication, then request a full collection.
 /// Reentrant native hooks on the elected collector never wait on themselves.
 pub(super) fn collect_explicit() {
+    collect_explicit_after(|| {});
+}
+
+/// `arm` runs once any active epoch has finished, just before the request.
+pub(super) fn collect_explicit_after(arm: impl FnOnce()) {
     if IS_COLLECTOR.get() {
         return;
     }
@@ -117,6 +122,7 @@ pub(super) fn collect_explicit() {
     } else {
         drop(coord);
     }
+    arm();
     collect_for_budget();
 }
 

@@ -1595,6 +1595,9 @@ fn invalidate_runtime_policy_budgets() {
 /// at the same allocation as without the per-thread budget. Reservations grow
 /// once per region or chunk, so this costs one check per thread per growth.
 fn note_reservation_growth(state: &GcState) {
+    crate::gc_telemetry::footprint::reservation(
+        (state.old_reserved_bytes as u64).saturating_add(state.tlab_reserved_bytes as u64),
+    );
     if state.memory_limit_bytes.is_some() {
         invalidate_runtime_policy_budgets();
     }
@@ -2626,3 +2629,106 @@ mod native_memory_tests;
 
 #[cfg(test)]
 mod native_trace_tests;
+
+/// Explicit collection returning reservation high water from after any epoch
+/// already in flight finishes through the next major MarkComplete (the cycle
+/// this request runs or joins). Arming shares the growth lock; sweep
+/// preparation atomically cuts off further updates.
+#[cfg(feature = "gc-acceptance-faults")]
+pub fn acceptance_collect_scoped() -> u64 {
+    crate::scheduler::release_quiescent_frame_roots(true);
+    let _relocation = RelocationSafeScope::enter();
+    let mut armed = false;
+    cycle_wait::collect_explicit_after(|| {
+        let clean = {
+            let heap = runtime().heap.lock().unwrap();
+            crate::gc_telemetry::footprint::window_begin(
+                (heap.old_reserved_bytes as u64).saturating_add(heap.tlab_reserved_bytes as u64),
+            )
+        };
+        // Checked after unlock so a failure cannot poison the heap mutex.
+        assert!(clean, "footprint window already armed");
+        armed = true;
+    });
+    assert!(
+        armed,
+        "scoped collection requested by the elected collector"
+    );
+    // Another election between arming and the request may have been joined
+    // instead; request again until a major sweep preparation closes the window.
+    while crate::gc_telemetry::footprint::window_open() {
+        cycle_wait::collect_for_budget();
+    }
+    crate::gc_telemetry::footprint::window_end()
+}
+
+/// Controlled protocol faults for the opt-in acceptance executable. These enter
+/// real stop/heap-lock paths; no trace line or snapshot is forged by the probe.
+#[cfg(feature = "gc-acceptance-faults")]
+pub fn acceptance_inject(kind: &str) {
+    use crate::gc_telemetry::stops::StopReason;
+    // Stop initiators must own collector election, like real cycles, so an
+    // injected stop never races a background sweep or another stop request.
+    fn elected() -> cycle_wait::CollectorGuard {
+        loop {
+            if let Some(guard) = cycle_wait::CollectorGuard::try_acquire() {
+                break guard;
+            }
+            willow_gc_safepoint();
+            std::thread::yield_now();
+        }
+    }
+    match kind {
+        "short_stw" => {
+            let _election = elected();
+            with_stw(StopReason::InitialMark, |_, _| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            })
+        }
+        "fallback" => {
+            let _election = elected();
+            with_stw(StopReason::Recovery, |_, _| {})
+        }
+        "mark_wait" => {
+            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal = ready.clone();
+            let owner = std::thread::spawn(move || {
+                let _role = crate::gc_telemetry::observations::MarkerRole::new();
+                let _registration = MutatorRegistration::new();
+                let _election = elected();
+                signal.store(true, Ordering::Release);
+                // Hold the election, but stay stoppable by any other initiator.
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(50);
+                while std::time::Instant::now() < until {
+                    willow_gc_safepoint();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            while !ready.load(Ordering::Acquire) && !owner.is_finished() {
+                willow_gc_safepoint();
+                std::thread::yield_now();
+            }
+            assert!(ready.load(Ordering::Acquire), "collector injection failed");
+            // Exercise the actual explicit-request election join (CycleWait),
+            // without inventing a stop-the-world interval around the delay.
+            willow_gc_collect();
+            owner.join().unwrap();
+        }
+        "lock_stall" => {
+            let heap = runtime().heap.lock().unwrap();
+            let worker = std::thread::spawn(|| {
+                let _registration = MutatorRegistration::new();
+                std::hint::black_box(willow_alloc(64));
+                willow_gc_safepoint();
+            });
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            drop(heap);
+            while !worker.is_finished() {
+                willow_gc_safepoint();
+                std::thread::yield_now();
+            }
+            worker.join().unwrap();
+        }
+        _ => panic!("unknown acceptance fault"),
+    }
+}

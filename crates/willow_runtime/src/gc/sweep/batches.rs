@@ -57,6 +57,7 @@ struct Report {
     reclaimed_bytes: u64,
     metadata_items: u64,
     swept_objects: u64,
+    swept_bytes: u64,
     assist_cpu_ns: u64,
     assist_cpu_incomplete: bool,
 }
@@ -164,6 +165,12 @@ pub(super) fn execute(mut plan: SweepPlan) -> usize {
             .unwrap()
             .transition(old_cycle::Phase::Idle);
     }
+    crate::gc_telemetry::sweep::completed(
+        cursor.report.swept_objects,
+        cursor.report.swept_bytes,
+        cursor.report.sweep_wall_ns,
+        cursor.report.reclaimed_bytes,
+    );
     let freed = cursor.report.reclaimed_bytes as usize;
     crate::frame_lifetime::record_sweep(
         crate::frame_lifetime::FrameEventKind::SweepCompleted,
@@ -566,6 +573,7 @@ impl Cursor {
         self.report.objects += 1;
         self.report.bytes += work_bytes;
         self.report.swept_objects += 1;
+        self.report.swept_bytes += size as u64;
         self.ahead.pop();
         self.offset = offset + span;
         if live {
@@ -724,7 +732,10 @@ impl Cursor {
         self.offset += size;
         self.report.objects += 1;
         self.report.bytes += work_bytes;
-        self.report.swept_objects += u64::from(object.allocated());
+        if object.allocated() {
+            self.report.swept_objects += 1;
+            self.report.swept_bytes += size as u64;
+        }
         if live {
             object.clear_mark();
             self.chunk_live = true;
@@ -1663,11 +1674,16 @@ mod tests {
             let mut first = make_cursor();
             finish(&mut first);
             assert_eq!(first.report.swept_objects, objects as u64);
+            assert_eq!(
+                first.report.swept_bytes,
+                (objects * (GC_HEADER_SIZE + 8)) as u64
+            );
             survivor.begin_trace();
             let mut second = make_cursor();
             finish(&mut second);
             let words = (objects * (GC_HEADER_SIZE + 8)).div_ceil(64 * GC_REGION_MARK_GRANULE);
             assert_eq!(second.report.swept_objects, 1);
+            assert_eq!(second.report.swept_bytes, (GC_HEADER_SIZE + 8) as u64);
             assert!(second.report.objects <= words as u64 + 5);
             println!(
                 "sweep_fragmented physical_headers={objects} first_objects={} second_objects={} second_work_items={} bitmap_reads={} word_bound={words}",

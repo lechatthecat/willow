@@ -9,10 +9,17 @@ name = "willow_runtime"
 crate-type = ["staticlib", "rlib"]
 
 [features]
+# Explicit acceptance executable only; production compiler builds never enable this.
+gc-acceptance-faults = []
 # Acceptance-test runtime only; never enabled by the compiler's normal build.
 borrow-migration-probe = []
 # M3 comparison only; normal compiler/runtime builds retain the existing waiter.
 gc-notification-prototype = []
+
+[[example]]
+name = "gc_acceptance"
+# Spool consumer gating and fault injection exist only with this feature.
+required-features = ["gc-acceptance-faults"]
 
 [dependencies]
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }

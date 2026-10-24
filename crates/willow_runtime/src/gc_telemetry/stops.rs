@@ -8,10 +8,24 @@ use std::sync::{LazyLock, Mutex};
 
 pub const STOP_KINDS: usize = 4;
 const EVENT_CAPACITY: usize = 64;
+const MAX_EVENT_CAPACITY: usize = 16384;
+#[cfg(test)]
+fn configured_capacity(value: Option<&str>) -> Option<usize> {
+    super::bounded_capacity(value, EVENT_CAPACITY, MAX_EVENT_CAPACITY)
+}
+static CONFIGURED_CAPACITY: LazyLock<Option<usize>> = LazyLock::new(|| {
+    super::env_capacity(
+        "WILLOW_GC_STOP_TRACE_CAPACITY",
+        EVENT_CAPACITY,
+        MAX_EVENT_CAPACITY,
+    )
+});
 pub const STOP_COUNTERS_VALID: u64 = 1;
 pub const STOP_EVENTS_LOST: u64 = 2;
 pub const STOP_COUNTERS_SATURATED: u64 = 4;
 pub const STOP_PROTOCOL_ERROR: u64 = 8;
+/// `WILLOW_GC_STOP_TRACE_CAPACITY` was unusable; the default history is kept.
+pub const STOP_CONFIG_INVALID: u64 = 16;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug)]
@@ -94,16 +108,29 @@ pub struct WillowGcStatsV2 {
 struct StopTelemetry {
     stats: StopStatsV2,
     pending: VecDeque<StopEventV2>,
+    capacity: usize,
 }
 
 impl Default for StopTelemetry {
     fn default() -> Self {
+        Self::with_capacity(Some(EVENT_CAPACITY))
+    }
+}
+impl StopTelemetry {
+    fn with_capacity(configured: Option<usize>) -> Self {
+        let capacity = configured.unwrap_or(EVENT_CAPACITY);
         Self {
             stats: StopStatsV2 {
-                flags: STOP_COUNTERS_VALID,
+                flags: STOP_COUNTERS_VALID
+                    | if configured.is_none() {
+                        STOP_CONFIG_INVALID
+                    } else {
+                        0
+                    },
                 ..Default::default()
             },
-            pending: VecDeque::with_capacity(EVENT_CAPACITY),
+            pending: VecDeque::with_capacity(capacity),
+            capacity,
         }
     }
 }
@@ -190,7 +217,7 @@ impl StopTelemetry {
             &mut s.flags,
         );
         s.last_event = event;
-        if self.pending.len() == EVENT_CAPACITY {
+        if self.pending.len() == self.capacity {
             self.pending.pop_front();
             add(&mut s.events_dropped, 1, &mut s.flags);
             s.flags |= STOP_EVENTS_LOST;
@@ -201,7 +228,7 @@ impl StopTelemetry {
 }
 
 static STOPS: LazyLock<Mutex<StopTelemetry>> =
-    LazyLock::new(|| Mutex::new(StopTelemetry::default()));
+    LazyLock::new(|| Mutex::new(StopTelemetry::with_capacity(*CONFIGURED_CAPACITY)));
 
 pub(crate) struct StopMeasurement {
     event: StopEventV2,
@@ -266,6 +293,11 @@ impl Drop for StopMeasurement {
     }
 }
 
+/// Finite predeclared stop history; overflow still invalidates the measurement.
+pub fn transport_capacity() -> usize {
+    STOPS.lock().unwrap_or_else(|p| p.into_inner()).capacity
+}
+
 pub fn snapshot_stops() -> StopStatsV2 {
     STOPS.lock().unwrap_or_else(|p| p.into_inner()).stats
 }
@@ -289,7 +321,7 @@ pub(super) fn reset_for_test() {
     let mut telemetry = STOPS.lock().unwrap_or_else(|p| p.into_inner());
     let sequence = telemetry.stats.last_sequence;
     let generation = telemetry.stats.reset_generation.saturating_add(1);
-    *telemetry = StopTelemetry::default();
+    *telemetry = StopTelemetry::with_capacity(*CONFIGURED_CAPACITY);
     telemetry.stats.last_sequence = sequence;
     telemetry.stats.reset_generation = generation;
 }

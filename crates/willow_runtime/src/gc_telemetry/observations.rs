@@ -10,10 +10,23 @@ use std::sync::{
 
 pub const KINDS: usize = 9;
 pub const CAPACITY: usize = 4096;
+/// Opt-in upper bound, including acceptance runs. Producers never block on I/O.
+pub const MAX_CAPACITY: usize = 524_288;
+#[cfg(test)]
+fn configured_capacity(value: Option<&str>) -> Option<usize> {
+    super::bounded_capacity(value, CAPACITY, MAX_CAPACITY)
+}
+/// Preallocated event storage, excluding the bounded drained batch held by a sink.
+pub fn transport_capacity() -> usize {
+    let s = STATE.lock().unwrap_or_else(|p| p.into_inner());
+    if s.discard { 0 } else { s.capacity }
+}
 pub const ENABLED: u64 = 1;
 pub const LOST: u64 = 2;
 pub const SATURATED: u64 = 4;
 pub const INVALID: u64 = 8;
+/// `WILLOW_GC_TRACE_CAPACITY` was unusable; the default capacity is kept.
+pub const CONFIG_INVALID: u64 = 16;
 /// These are overlapping intervals, never additive components of wall time.
 #[repr(u64)]
 #[derive(Clone, Copy, Debug)]
@@ -81,11 +94,21 @@ pub struct Event {
 }
 /// `discard` keeps aggregate stats but retains no per-event history when no V4
 /// trace sink will ever drain it, so measurement-only runs never report loss.
-#[derive(Default)]
 struct State {
     stats: Stats,
     events: VecDeque<Event>,
     discard: bool,
+    capacity: usize,
+}
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            stats: Stats::default(),
+            events: VecDeque::new(),
+            discard: false,
+            capacity: CAPACITY,
+        }
+    }
 }
 fn add(value: &mut u64, n: u64, flags: &mut u64) {
     if let Some(v) = value.checked_add(n) {
@@ -116,7 +139,7 @@ impl State {
         if self.discard {
             return e.sequence;
         }
-        if self.events.len() == CAPACITY {
+        if self.events.len() == self.capacity {
             self.events.pop_front();
             add(&mut self.stats.dropped, 1, &mut self.stats.flags);
             self.stats.flags |= LOST;
@@ -162,17 +185,29 @@ impl State {
 // under the observation lock.
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
     let history = super::observation_history();
+    let configured = super::env_capacity("WILLOW_GC_TRACE_CAPACITY", CAPACITY, MAX_CAPACITY);
+    let capacity = configured.unwrap_or(CAPACITY);
     Mutex::new(State {
         stats: Stats {
-            flags: if enabled() { ENABLED } else { 0 },
+            flags: if enabled() {
+                ENABLED
+                    | if configured.is_none() {
+                        CONFIG_INVALID
+                    } else {
+                        0
+                    }
+            } else {
+                0
+            },
             ..Default::default()
         },
         events: if history {
-            VecDeque::with_capacity(CAPACITY)
+            VecDeque::with_capacity(capacity)
         } else {
             VecDeque::new()
         },
         discard: !history,
+        capacity,
     })
 });
 /// Safepoint polls are counted without the observation mutex.

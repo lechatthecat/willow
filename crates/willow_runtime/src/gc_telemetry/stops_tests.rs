@@ -174,3 +174,34 @@ fn unfinished_measurement_records_failure_instead_of_zero_stops() {
     assert_eq!(stats.by_reason[3].aborted, 1);
     crate::gc::reset_internal_for_test();
 }
+
+#[test]
+fn configured_stop_history_is_bounded_and_invalid_is_not_silent() {
+    assert_eq!(configured_capacity(None), Some(EVENT_CAPACITY));
+    for value in [
+        "0",
+        "-1",
+        "garbage",
+        "",
+        &(MAX_EVENT_CAPACITY + 1).to_string(),
+    ] {
+        assert_eq!(configured_capacity(Some(value)), None);
+        let t = StopTelemetry::with_capacity(configured_capacity(Some(value)));
+        assert_eq!(t.capacity, EVENT_CAPACITY);
+        assert_eq!(t.stats.flags, STOP_COUNTERS_VALID | STOP_CONFIG_INVALID);
+    }
+    for capacity in [1, EVENT_CAPACITY, 1024, MAX_EVENT_CAPACITY] {
+        assert_eq!(
+            configured_capacity(Some(&capacity.to_string())),
+            Some(capacity)
+        );
+        let mut t = StopTelemetry::with_capacity(Some(capacity));
+        assert_eq!(t.stats.flags, STOP_COUNTERS_VALID);
+        for i in 0..capacity + 3 {
+            complete(&mut t, StopReason::Minor, i as u64 * 40, false);
+        }
+        assert_eq!(t.pending.len(), capacity);
+        assert_eq!(t.stats.events_dropped, 3);
+        assert_ne!(t.stats.flags & STOP_EVENTS_LOST, 0);
+    }
+}

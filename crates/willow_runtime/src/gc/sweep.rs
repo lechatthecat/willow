@@ -24,13 +24,20 @@ pub(super) struct SweepPlan {
     stale_storage: region_cache::StaleStorage,
 }
 
-pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>) -> SweepPlan {
+/// Shared by both major sweep preparations once liveness is final.
+fn begin_sweep(state: &mut GcState) {
     assert!(state.sweeping.is_none());
-    crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::MarkComplete);
+    #[cfg(feature = "gc-acceptance-faults")]
+    crate::gc_telemetry::footprint::mark_window_complete();
     state.sweeping = Some(std::thread::current().id());
     state.pending_sweep_chunks = 0..state.tlab_chunks.len();
     publish_collection_busy(state);
     state.major_collections = state.major_collections.saturating_add(1);
+}
+
+pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>) -> SweepPlan {
+    crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::MarkComplete);
+    begin_sweep(state);
     // Active buffers copied a clear sweep_pending flag.
     old_lab::retire_all(state);
     for (index, region) in state.old_regions.iter_mut().enumerate() {
@@ -69,11 +76,7 @@ pub(super) fn prepare_bounded(
     if !publish_regions_bounded(state, &marking, budget, crate::gc_telemetry::timestamp_ns) {
         return None;
     }
-    assert!(state.sweeping.is_none());
-    state.sweeping = Some(std::thread::current().id());
-    state.pending_sweep_chunks = 0..state.tlab_chunks.len();
-    publish_collection_busy(state);
-    state.major_collections = state.major_collections.saturating_add(1);
+    begin_sweep(state);
     Some(SweepPlan {
         old: state.old_regions.len(),
         chunks: state.tlab_chunks.len(),
@@ -172,6 +175,11 @@ fn execute(
     work: &mut crate::gc_telemetry::stops::StopWorkV2,
     concurrent: bool,
 ) -> usize {
+    // Timed after planning, as the batched path is; heap lock waits remain.
+    let started = std::time::Instant::now();
+    let before = work.swept_objects;
+    let mut visited = 0;
+    let visited = &mut visited;
     drop(std::mem::take(&mut plan.stale_storage));
     let mut freed = 0;
     let mut drops = Vec::new();
@@ -180,6 +188,7 @@ fn execute(
             &mut runtime().heap.lock().unwrap(),
             index,
             work,
+            visited,
             &mut drops,
             plan.marking.as_deref(),
         );
@@ -194,6 +203,7 @@ fn execute(
             &mut runtime().heap.lock().unwrap(),
             index,
             work,
+            visited,
             &mut drops,
             plan.marking.as_deref(),
         );
@@ -213,6 +223,13 @@ fn execute(
             .unwrap()
             .transition(old_cycle::Phase::Idle);
     }
+    // Publish stats before the milestone that wakes sweep waiters.
+    crate::gc_telemetry::sweep::completed(
+        work.swept_objects.saturating_sub(before),
+        *visited,
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        freed as u64,
+    );
     crate::gc_telemetry::milestones::reached(crate::gc_telemetry::GcStage::SweepComplete);
     // Account reusable storage before another sweep can start.
     crate::frame_lifetime::record_sweep(
@@ -255,6 +272,7 @@ fn sweep_region(
     state: &mut GcState,
     index: usize,
     stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
+    visited: &mut u64,
     drops: &mut Vec<PendingDrop>,
     marking: Option<&ConcurrentCycle>,
 ) -> usize {
@@ -290,6 +308,7 @@ fn sweep_region(
                 let object = HeapObject::from_raw(unsafe { base.add(offset) }.cast())
                     .expect("region allocation has a non-null header");
                 let size = object.size();
+                *visited += size as u64;
                 if object.marked()
                     || marking.is_some_and(|cycle| {
                         cycle
@@ -348,6 +367,7 @@ fn sweep_chunk(
     state: &mut GcState,
     chunk_index: usize,
     stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
+    visited: &mut u64,
     drops: &mut Vec<PendingDrop>,
     marking: Option<&ConcurrentCycle>,
 ) -> (usize, bool) {
@@ -399,6 +419,7 @@ fn sweep_chunk(
             continue;
         }
         stop_work.swept_objects += 1;
+        *visited += size as u64;
         if object.marked()
             || marking.is_some_and(|cycle| {
                 cycle

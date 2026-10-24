@@ -167,6 +167,7 @@ pub(super) fn retire_tlab_locked(state: &mut GcState, address: usize) {
         let start = chunk.base as usize;
         let end = start.saturating_add(chunk.capacity);
         chunk.used = cursor.clamp(start, end).saturating_sub(start);
+        crate::gc_telemetry::footprint::retired_tail((chunk.capacity - chunk.used) as u64);
         chunk.owner_state = None;
         assert!(
             chunk.header_offsets.is_empty(),

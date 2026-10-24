@@ -402,3 +402,37 @@ fn marker_role_restores_after_unwind_and_does_not_reclassify_application_assist(
     });
     assert_eq!(event(1, Kind::Assist as u64).role, 0);
 }
+
+#[test]
+fn transport_capacity_configuration_is_bounded_and_invalid_is_not_silent() {
+    assert_eq!(configured_capacity(None), Some(CAPACITY));
+    for n in [1, 64, CAPACITY, MAX_CAPACITY] {
+        assert_eq!(configured_capacity(Some(&n.to_string())), Some(n));
+    }
+    assert_eq!(
+        configured_capacity(Some(&(MAX_CAPACITY + 1).to_string())),
+        None
+    );
+    for value in ["0", "-1", "18446744073709551616", "garbage", ""] {
+        assert_eq!(configured_capacity(Some(value)), None);
+    }
+}
+#[test]
+fn configured_transport_bound_and_drain_preserve_sequence() {
+    for capacity in [1, 16, 4096, 16384] {
+        let mut s = State {
+            capacity,
+            ..Default::default()
+        };
+        for i in 0..capacity * 2 {
+            s.event(e(5, 0, i as u64));
+        }
+        assert_eq!(s.events.len(), capacity);
+        assert_eq!(s.stats.dropped, capacity as u64);
+        assert_eq!(s.events.front().unwrap().sequence, capacity as u64 + 1);
+        s.events.clear();
+        s.event(e(5, 0, 0));
+        assert_eq!(s.events.front().unwrap().sequence, 2 * capacity as u64 + 1);
+        assert_ne!(s.stats.flags & LOST, 0);
+    }
+}
