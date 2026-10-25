@@ -805,7 +805,14 @@ fn fully_dead_nursery_chunks_are_released_without_header_walks() {
             }
             assert_eq!(stop.swept_objects, objects);
             assert_eq!(state.total_frees, objects - u64::from(rooted));
-            assert_eq!(state.released_bytes, (chunks * GC_TLAB_CHUNK_SIZE) as u64);
+            // Unused pre-admitted survivor destinations are released too; the
+            // rooted copy keeps one.
+            let unused_reserve = state.survivor_reserve_stats.admitted_bytes
+                - u64::from(rooted) * GC_TLAB_CHUNK_SIZE as u64;
+            assert_eq!(
+                state.released_bytes,
+                (chunks * GC_TLAB_CHUNK_SIZE) as u64 + unused_reserve
+            );
             eprintln!(
                 "dead-chunk per_chunk={per_chunk} rooted={rooted} metadata={} swept={}",
                 stop.metadata_objects, stop.swept_objects
@@ -1445,6 +1452,65 @@ fn m4_empty_admission_fallback_preserves_graph_and_releases_reserve() {
         drop(state);
         reset_internal();
     }
+}
+
+#[test]
+fn m4_refills_after_admission_admit_their_own_destinations() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    reset_internal();
+    let mut tls = tlab_state_for_test();
+    let mut head = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 1);
+    let mut state = runtime().heap.lock().unwrap();
+    super::prepare_survivor_reserve(&mut state);
+    let admitted = state.survivor_reserve.len();
+    drop(state);
+    // Refills racing the stop: each slow allocation installs a new chunk.
+    const REFILLS: usize = 8;
+    for _ in 0..REFILLS {
+        let node = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 1);
+        unsafe { *node.cast::<*mut u8>() = head };
+        head = node;
+    }
+    let mut state = runtime().heap.lock().unwrap();
+    let sources = state
+        .tlab_chunks
+        .iter()
+        .filter(|c| c.kind != RegionKind::Pinned)
+        .count();
+    assert!(sources >= admitted + REFILLS);
+    assert_eq!(state.survivor_reserve.len(), sources);
+    assert_eq!(
+        state.survivor_reserve_stats.requested_bytes,
+        (sources * GC_TLAB_CHUNK_SIZE) as u64
+    );
+    retire_all_tlabs_unindexed(&mut state);
+    let mut stop = Default::default();
+    MinorCollector::new(&mut state, minor_registry_snapshot(), &mut stop).run(
+        MinorRoots {
+            slots: vec![&raw mut head],
+            values: Vec::new(),
+        },
+        Default::default(),
+    );
+    assert_eq!(
+        state.survivor_stats.pin_reasons[PinSource::MemoryBudget as usize],
+        0
+    );
+    let mut length = 0;
+    let mut node = head;
+    while !node.is_null() {
+        length += 1;
+        node = unsafe { *node.cast::<*mut u8>() };
+    }
+    assert_eq!(length, REFILLS + 1);
+    super::release_survivor_reserve(&mut state);
+    assert_eq!(
+        state.tlab_reserved_bytes,
+        state.tlab_chunks.iter().map(|c| c.capacity).sum::<usize>()
+    );
+    drop(state);
+    reset_internal();
 }
 
 #[test]

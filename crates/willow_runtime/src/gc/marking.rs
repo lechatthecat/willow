@@ -1117,20 +1117,20 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
         && let Some(pacing) = &cycle.assist_pacing
     {
         if !cycle.closing.load(Ordering::Acquire) {
-            let completed = {
-                let work = cycle.work.lock().unwrap();
-                work.marked_bytes
-                    .saturating_add(work.scanned_bytes)
-                    .saturating_add(work.descriptor_bytes)
-            };
+            let completed = completed_work(&cycle);
             let mut pending = !cycle.queue.snapshot().is_drained();
             let rate = pacing.charge(allocated, completed, pending);
             let mut due = assist::charge(cycle.assist_epoch, allocated, rate);
             // Repay the whole debt, not one batch per allocation: past the
             // runway the rate makes debt exceed any single batch, and
             // allocating on regardless would overshoot the planned goal.
+            // A batch without progress (only retrying slices or work claimed
+            // elsewhere) keeps its debt for the next allocation: a retrying
+            // slice may wait on this very mutator.
             while due && pending {
-                assist_batch(&cycle);
+                if assist_batch(&cycle) == 0 {
+                    break;
+                }
                 due = assist::due(cycle.assist_epoch);
                 pending = assist_open(&cycle) && !cycle.queue.snapshot().is_drained();
                 if due && pending {
@@ -1151,6 +1151,11 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
             );
             // Phase 0 or a reinstalled cycle ends the wait: a later cycle's
             // phase 1 must not keep this thread parked on a finished one.
+            // Only retrying work left (e.g. a lock or channel slice this thread
+            // holds) cannot finish while it waits: without mark progress for
+            // STALL_NO_PROGRESS the allocation proceeds instead of livelocking
+            // or exhausting the collector's bounded recovery retries.
+            let mut progress = (completed_work(&cycle), std::time::Instant::now());
             while GC_MARK_PHASE.load(Ordering::Acquire) != 0
                 && ASSIST_CYCLE_GENERATION.load(Ordering::Acquire) == generation
             {
@@ -1166,6 +1171,13 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
                 }
                 willow_gc_safepoint();
                 std::thread::yield_now();
+                let completed = completed_work(&cycle);
+                let now = std::time::Instant::now();
+                if completed != progress.0 {
+                    progress = (completed, now);
+                } else if now.duration_since(progress.1) >= STALL_NO_PROGRESS {
+                    break;
+                }
             }
         }
     }
@@ -1174,22 +1186,35 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
     willow_gc_safepoint();
 }
 
+/// Longer than the collector's 1 ms resumed recovery wait between native
+/// retries, far below its bounded retry allowance.
+const STALL_NO_PROGRESS: std::time::Duration = std::time::Duration::from_millis(2);
+
+fn completed_work(cycle: &ConcurrentCycle) -> u64 {
+    let work = cycle.work.lock().unwrap();
+    work.marked_bytes
+        .saturating_add(work.scanned_bytes)
+        .saturating_add(work.descriptor_bytes)
+}
+
 fn assist_open(cycle: &ConcurrentCycle) -> bool {
     GC_MARK_PHASE.load(Ordering::Acquire) == 1 && !cycle.closing.load(Ordering::Acquire)
 }
 
 /// One bounded assist batch; empty queues never block or manufacture credit.
 /// Legacy callbacks are indivisible and measured by native telemetry.
-fn assist_batch(cycle: &ConcurrentCycle) {
+/// Returns the credited work.
+fn assist_batch(cycle: &ConcurrentCycle) -> u64 {
     let deadline = std::time::Instant::now() + std::time::Duration::from_micros(250);
     let cpu = assist::CpuScope::new();
-    {
+    let work = {
         let _assist = crate::gc_telemetry::measurement::Span::new(
             crate::gc_telemetry::measurement::Phase::Assist,
         );
         let work = cycle.drain_checked_until(8, Some(deadline));
         assist::credit(cycle.assist_epoch, work);
-    }
+        work
+    };
     let overhead = cpu.overhead();
     let mut total = cycle.work.lock().unwrap();
     if let Some(overhead) = overhead {
@@ -1204,6 +1229,7 @@ fn assist_batch(cycle: &ConcurrentCycle) {
     } else {
         total.cpu_incomplete = true;
     }
+    work
 }
 
 pub(super) fn mark_worklist(

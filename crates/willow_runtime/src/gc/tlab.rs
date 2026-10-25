@@ -432,6 +432,7 @@ pub(super) fn install_tlab_chunk(
     state.tlab_reserved_bytes = state.tlab_reserved_bytes.saturating_add(GC_TLAB_CHUNK_SIZE);
     note_reservation_growth(state);
     state.tlab_refills = state.tlab_refills.saturating_add(1);
+    super::minor::admit_refill_survivor(state);
     state
         .tlab_states
         .get_mut(&owner_state)

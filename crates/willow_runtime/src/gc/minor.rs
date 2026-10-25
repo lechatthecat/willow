@@ -1527,12 +1527,13 @@ pub(crate) fn minor_collect_internal() {
     crate::gc_telemetry::emit_cycle(event);
 }
 
-/// Reserve one destination chunk per source chunk before the stop. Packing,
-/// concurrent refills, and a hard cap can exhaust this finite reserve; that
-/// case uses the existing traced in-place promotion fallback, never a stopped
-/// survivor allocation. Empty reserve chunks are not addressable heap objects.
+/// Reserve one destination chunk per source chunk before the stop. Packing
+/// and a hard cap can exhaust this finite reserve; that case uses the
+/// existing traced in-place promotion fallback, never a stopped survivor
+/// allocation. Refills before the stop admit their own destination
+/// (`admit_refill_survivor`). Empty reserve chunks are not addressable heap
+/// objects.
 fn prepare_survivor_reserve(state: &mut GcState) {
-    use super::{BumpChunk, GC_TLAB_CHUNK_SIZE, RegionMarkBitmap};
     assert!(!state.survivor_reserve_active);
     state.survivor_reserve_active = true;
     let count = state
@@ -1540,43 +1541,62 @@ fn prepare_survivor_reserve(state: &mut GcState) {
         .iter()
         .filter(|c| c.kind != RegionKind::Pinned)
         .count();
-    state.survivor_reserve_stats = crate::gc_telemetry::SurvivorReserveStats {
-        requested_bytes: (count as u64).saturating_mul(GC_TLAB_CHUNK_SIZE as u64),
-        ..Default::default()
-    };
+    state.survivor_reserve_stats = crate::gc_telemetry::SurvivorReserveStats::default();
     state.survivor_reserve.reserve(count);
     state.tlab_chunks.reserve(count);
     for _ in 0..count {
-        if !super::can_reserve(state, GC_TLAB_CHUNK_SIZE) {
+        if !admit_survivor_chunk(state) {
             break;
         }
-        let layout =
-            Layout::from_size_align(GC_TLAB_CHUNK_SIZE, std::mem::align_of::<GcHeader>()).unwrap();
-        // SAFETY: valid aligned region; cleanup below or normal chunk sweep owns it.
-        let base = unsafe { super::allocate_region_storage(layout) };
-        if base.is_null() {
-            break;
-        }
-        state.survivor_reserve.push(BumpChunk {
-            base,
-            capacity: GC_TLAB_CHUNK_SIZE,
-            used: 0,
-            owner_state: None,
-            kind: RegionKind::Survivor,
-            live_bytes: 0,
-            mark_bitmap: RegionMarkBitmap::new(GC_TLAB_CHUNK_SIZE),
-            concurrent_marks: std::sync::Arc::new(
-                super::concurrent_bitmap::ConcurrentMarkBits::new(
-                    GC_TLAB_CHUNK_SIZE / GC_REGION_MARK_GRANULE,
-                ),
-            ),
-            header_offsets: Vec::with_capacity(GC_TLAB_CHUNK_SIZE / GC_HEADER_SIZE),
-        });
-        state.tlab_reserved_bytes += GC_TLAB_CHUNK_SIZE;
-        state.survivor_reserve_stats.admitted_bytes += GC_TLAB_CHUNK_SIZE as u64;
-        state.survivor_reserve_stats.available_bytes += GC_TLAB_CHUNK_SIZE as u64;
-        super::note_reservation_growth(state);
     }
+    state.survivor_reserve_stats.requested_bytes =
+        (count as u64).saturating_mul(super::GC_TLAB_CHUNK_SIZE as u64);
+}
+
+/// A TLAB installed between admission and the stop is one more evacuation
+/// source; admit its destination now so concurrent refills cannot exhaust
+/// the reserve. O(1) under the heap lock the refill already holds.
+pub(super) fn admit_refill_survivor(state: &mut GcState) {
+    if state.survivor_reserve_active {
+        state.survivor_reserve_stats.requested_bytes = state
+            .survivor_reserve_stats
+            .requested_bytes
+            .saturating_add(super::GC_TLAB_CHUNK_SIZE as u64);
+        admit_survivor_chunk(state);
+    }
+}
+
+fn admit_survivor_chunk(state: &mut GcState) -> bool {
+    use super::{BumpChunk, GC_TLAB_CHUNK_SIZE, RegionMarkBitmap};
+    if !super::can_reserve(state, GC_TLAB_CHUNK_SIZE) {
+        return false;
+    }
+    let layout =
+        Layout::from_size_align(GC_TLAB_CHUNK_SIZE, std::mem::align_of::<GcHeader>()).unwrap();
+    // SAFETY: valid aligned region; release_survivor_reserve or the normal
+    // chunk sweep owns it.
+    let base = unsafe { super::allocate_region_storage(layout) };
+    if base.is_null() {
+        return false;
+    }
+    state.survivor_reserve.push(BumpChunk {
+        base,
+        capacity: GC_TLAB_CHUNK_SIZE,
+        used: 0,
+        owner_state: None,
+        kind: RegionKind::Survivor,
+        live_bytes: 0,
+        mark_bitmap: RegionMarkBitmap::new(GC_TLAB_CHUNK_SIZE),
+        concurrent_marks: std::sync::Arc::new(super::concurrent_bitmap::ConcurrentMarkBits::new(
+            GC_TLAB_CHUNK_SIZE / GC_REGION_MARK_GRANULE,
+        )),
+        header_offsets: Vec::with_capacity(GC_TLAB_CHUNK_SIZE / GC_HEADER_SIZE),
+    });
+    state.tlab_reserved_bytes += GC_TLAB_CHUNK_SIZE;
+    state.survivor_reserve_stats.admitted_bytes += GC_TLAB_CHUNK_SIZE as u64;
+    state.survivor_reserve_stats.available_bytes += GC_TLAB_CHUNK_SIZE as u64;
+    super::note_reservation_growth(state);
+    true
 }
 
 pub(super) fn release_survivor_reserve(state: &mut GcState) {
