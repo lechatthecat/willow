@@ -25,6 +25,20 @@ fn bounded() -> bool {
     return gc_allocated_bytes() < 200000;
 }
 
+// Unawaited tasks stay live until a worker runs them, which a loaded host can
+// delay arbitrarily. Poll for reclamation with a cap so a leak still fails.
+async fn settles() -> bool {
+    let mut n = 0;
+    while n < 1000 {
+        if bounded() {
+            return true;
+        }
+        await sleep(10);
+        n = n + 1;
+    }
+    return false;
+}
+
 async fn main() {
     let rounds = 20000;
 
@@ -57,8 +71,7 @@ async fn main() {
         }
         i = i + 1;
     }
-    await sleep(10);
-    println(bounded());
+    println(await settles());
 
     // Cancelled tasks.
     i = 0;
@@ -67,8 +80,7 @@ async fn main() {
         t.cancel();
         i = i + 1;
     }
-    await sleep(10);
-    println(bounded());
+    println(await settles());
 
     // Tasks finished through a TaskScope and tasks talking over channels.
     let mut via = 0;
