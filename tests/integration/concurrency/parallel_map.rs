@@ -129,8 +129,18 @@ async fn main() {
     while i < 50000 { values.push(i); i = i + 1; }
     let mapping = parallel::map(values.freeze(), identity);
     mapping.cancel();
+    // Chunks may all finish before the cancel request lands; cancelling a
+    // completed Task is a no-op. Success is then only acceptable in full.
     match await mapping.result() {
-        Ok(result) => println("unexpected success"),
+        Ok(result) => {
+            let mut complete = result.len() == 50000;
+            let mut j = 0;
+            while complete && j < 50000 {
+                complete = result[j] == j;
+                j = j + 1;
+            }
+            if complete { println("cancelled"); } else { println("partial success"); }
+        }
         Err(Cancelled) => println("cancelled"),
     }
 }

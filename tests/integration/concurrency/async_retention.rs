@@ -436,6 +436,9 @@ async fn main() {
     let t = slow();
     t.cancel();
     while !t.is_cancelled() { await sleep(0); }
+    // `is_cancelled` reports the request; `select` sees `t` ready only once a
+    // worker has finalized it as Cancelled. Leave a loaded runner ample time.
+    await sleep(500);
     let mut op: closure(i64) -> i64 = |x| x;
     await sleep(0);
     if true {

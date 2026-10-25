@@ -117,10 +117,8 @@ pub(super) struct Feedback {
     pub occupied: u64,
     pub root_work: u64,
     pub barrier_work: u64,
-    pub pause_ns: u64,
     pub window_ns: u64,
     pub gc_cpu_ns: Option<u64>,
-    pub previous_peak: u64,
     pub pressure: bool,
     pub allocator_failed: bool,
     pub committed_bytes: Option<u64>,
@@ -216,19 +214,15 @@ pub(super) fn decide(input: Inputs) -> Decision {
         }
         None => floor / 2,
     };
-    let runway = runway.saturating_add(mul_div_ceil(
-        input.allocation_per_second,
-        feedback.pause_ns,
-        1_000_000_000,
-    ));
+    // Stopped mutators do not allocate, and the previous cycle's peak records
+    // how late it started rather than demand. Feeding either back into the
+    // goal compounds every scheduling delay of a starved collector.
     let floor = if reasons & CPU_NORMAL != 0 {
         floor.saturating_mul(2)
     } else {
         floor
     };
-    let desired = floor
-        .max(input.live.saturating_add(runway.saturating_mul(2)))
-        .max(feedback.previous_peak);
+    let desired = floor.max(input.live.saturating_add(runway.saturating_mul(2)));
     // Limit each inter-cycle adjustment to a factor of two. Live is always a
     // lower bound. Never shrink a goal while that cycle is active.
     let previous = input.previous_goal.max(MIN_GOAL);
@@ -782,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn work_pause_pressure_and_exhaustion_inputs() {
+    fn work_pressure_and_exhaustion_inputs() {
         let base = decide(input());
         for feedback in [
             Feedback {
@@ -791,10 +785,6 @@ mod tests {
             },
             Feedback {
                 barrier_work: MIN_GOAL,
-                ..Feedback::default()
-            },
-            Feedback {
-                pause_ns: 1_000_000_000,
                 ..Feedback::default()
             },
         ] {
@@ -829,14 +819,6 @@ mod tests {
                 .start_now
             );
         }
-        let d = decide(Inputs {
-            feedback: Feedback {
-                previous_peak: 8 * MIN_GOAL,
-                ..Feedback::default()
-            },
-            ..input()
-        });
-        assert_eq!(d.goal, 8 * MIN_GOAL);
     }
 
     #[test]

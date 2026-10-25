@@ -786,8 +786,6 @@ fn pacer_inputs(state: &GcState) -> pacer::Inputs {
                 .load(Ordering::Relaxed)
                 .saturating_sub(state.pacer.barrier_baseline)
                 .saturating_mul(8),
-            pause_ns: history.major_pauses.max_ns,
-            previous_peak: history.last_major_cycle.heap_before_bytes,
             resident_bytes: memory.process_resident,
             soft_limit: state.soft_memory.limit(),
             ..pacer::Feedback::default()
