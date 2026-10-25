@@ -139,7 +139,7 @@ async fn main() {
                 complete = result[j] == j;
                 j = j + 1;
             }
-            if complete { println("cancelled"); } else { println("partial success"); }
+            if complete { println("complete"); } else { println("partial success"); }
         }
         Err(Cancelled) => println("cancelled"),
     }
@@ -150,7 +150,7 @@ async fn main() {
     );
     assert!(!timed_out, "parallel cancellation parked forever: {out}");
     assert!(ok, "{out}");
-    assert_eq!(out, "cancelled\n");
+    assert!(out == "cancelled\n" || out == "complete\n", "{out}");
 }
 
 #[test]
