@@ -4254,6 +4254,111 @@ fn background_marker_snapshot_survives_registry_changes_and_mutator_allocations(
     reset_internal_for_test();
 }
 
+static RETRY_UNTIL_ALLOCATED: AtomicBool = AtomicBool::new(false);
+
+unsafe fn retry_until_mutator_allocated(
+    payload: *mut u8,
+    _: usize,
+    _: usize,
+    children: &mut Vec<*mut u8>,
+) -> TraceSliceProgress {
+    if !RETRY_UNTIL_ALLOCATED.load(Ordering::Acquire) {
+        return TraceSliceProgress::Retry;
+    }
+    children.push(unsafe { load_gc_reference(payload.cast()) });
+    TraceSliceProgress::Done
+}
+
+/// Regression (CI hang on every OS): a mutator allocating past an exhausted
+/// runway while it owns the only remaining (retrying) slice must not livelock
+/// in assist repayment or the allocation stall; the cycle then completes.
+#[test]
+fn exhausted_runway_allocation_returns_while_only_its_own_slice_retries() {
+    let _guard = runtime_test_guard();
+    for threads in [1, 4] {
+        reset_internal_for_test();
+        RETRY_UNTIL_ALLOCATED.store(false, Ordering::Relaxed);
+        const TYPE: u32 = 0xFA9A;
+        register_slot_type(TYPE);
+        runtime()
+            .concurrent_slice_registry
+            .lock()
+            .unwrap()
+            .insert(TYPE, retry_until_mutator_allocated);
+        let parent = willow_alloc_object(TYPE as i64, 8);
+        let child = willow_alloc(8);
+        unsafe {
+            store_gc_reference(parent.cast(), child);
+        }
+        let cycle = {
+            let mut state = runtime().heap.lock().unwrap();
+            let mut cycle = ConcurrentCycle::with_index(
+                epoch_index::EpochIndex::regions(epoch_index::RegionIndex::capture(&state)),
+                IdSet::from_iter([TYPE]),
+                runtime().concurrent_trace_registry.lock().unwrap().clone(),
+                1,
+            );
+            cycle.slices = runtime().concurrent_slice_registry.lock().unwrap().clone();
+            let cycle = Arc::new(cycle);
+            marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+            GC_MARK_PHASE.store(1, Ordering::Release);
+            cycle
+        };
+        cycle.enqueue(parent);
+        let (done, allocated) = std::sync::mpsc::channel();
+        let mutators: Vec<_> = (0..threads)
+            .map(|_| {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    willow_gc_register_mutator();
+                    // Fresh TLAB: the slow path charges and assists.
+                    for _ in 0..4 {
+                        willow_alloc(8);
+                    }
+                    willow_gc_unregister_mutator();
+                    done.send(()).unwrap();
+                })
+            })
+            .collect();
+        drop(done);
+        let marker = {
+            let cycle = cycle.clone();
+            std::thread::spawn(move || {
+                let pool = mark_workers::Pool::new(1).unwrap();
+                pool.run(&cycle, 0);
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        for _ in 0..threads {
+            let left = deadline.saturating_duration_since(Instant::now());
+            allocated
+                .recv_timeout(left)
+                .expect("allocation livelocked on a retrying slice");
+        }
+        assert!(cycle.assist_pacing.as_ref().unwrap().exhausted());
+        assert!(cycle.native_retries.load(Ordering::Acquire) > 0);
+        assert!(!cycle.is_marked(child as usize));
+        RETRY_UNTIL_ALLOCATED.store(true, Ordering::Release);
+        for mutator in mutators {
+            mutator.join().unwrap();
+        }
+        marker.join().unwrap();
+        cycle.drain(usize::MAX);
+        assert!(cycle.is_marked(parent as usize));
+        assert!(cycle.is_marked(child as usize));
+        assert!(!cycle.worker_failed.load(Ordering::Acquire));
+        assert_eq!(registered_mutator_count(), 0);
+        GC_MARK_PHASE.store(0, Ordering::Release);
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+        println!(
+            "retrying_slice_owner_threads={threads} retries={}",
+            cycle.native_retries.load(Ordering::Relaxed)
+        );
+        drop(cycle);
+    }
+    reset_internal_for_test();
+}
+
 #[test]
 fn pointer_free_leaf_fanout_uses_only_bounded_parent_jobs() {
     let _guard = runtime_test_guard();

@@ -48,6 +48,8 @@ pub(super) struct ConcurrentCycle {
     pub(super) stopped_completion_required: std::sync::atomic::AtomicBool,
     pub(super) recovering: std::sync::atomic::AtomicBool,
     pub(super) recovery_retry_generation: AtomicU64,
+    /// Every native slice Retry, in or out of recovery (assist stall exit).
+    pub(super) native_retries: AtomicU64,
     recovery_native_retries: Mutex<IdMap<usize, (usize, usize)>>,
     pub(super) closing: std::sync::atomic::AtomicBool,
     pub(super) tracing_enabled: std::sync::atomic::AtomicBool,
@@ -285,6 +287,7 @@ impl ConcurrentCycle {
             stopped_completion_required: std::sync::atomic::AtomicBool::new(false),
             recovering: std::sync::atomic::AtomicBool::new(false),
             recovery_retry_generation: AtomicU64::new(0),
+            native_retries: AtomicU64::new(0),
             recovery_native_retries: Mutex::new(IdMap::default()),
             closing: std::sync::atomic::AtomicBool::new(false),
             tracing_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -636,6 +639,7 @@ impl ConcurrentCycle {
             }
             TraceSliceProgress::Retry => {
                 assert_eq!(slots, 0, "retry must not publish a partial native slice");
+                self.native_retries.fetch_add(1, Ordering::Release);
                 self.enqueue_trace_slice(value, offset);
                 std::thread::yield_now();
             }
@@ -1151,11 +1155,16 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
             );
             // Phase 0 or a reinstalled cycle ends the wait: a later cycle's
             // phase 1 must not keep this thread parked on a finished one.
-            // Only retrying work left (e.g. a lock or channel slice this thread
-            // holds) cannot finish while it waits: without mark progress for
-            // STALL_NO_PROGRESS the allocation proceeds instead of livelocking
-            // or exhausting the collector's bounded recovery retries.
-            let mut progress = (completed_work(&cycle), std::time::Instant::now());
+            // Work that only retries (e.g. a lock or channel slice this thread
+            // holds) cannot finish while it waits. Native Retry results without
+            // intervening mark progress identify it; a merely slow marker
+            // publishes no Retry and keeps the stall. During recovery every
+            // retry costs the collector a bounded 1 ms allowance step, so one
+            // suffices there.
+            let mut progress = (
+                completed_work(&cycle),
+                cycle.native_retries.load(Ordering::Acquire),
+            );
             while GC_MARK_PHASE.load(Ordering::Acquire) != 0
                 && ASSIST_CYCLE_GENERATION.load(Ordering::Acquire) == generation
             {
@@ -1172,10 +1181,15 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
                 willow_gc_safepoint();
                 std::thread::yield_now();
                 let completed = completed_work(&cycle);
-                let now = std::time::Instant::now();
+                let retries = cycle.native_retries.load(Ordering::Acquire);
+                let limit = if cycle.recovering.load(Ordering::Acquire) {
+                    1
+                } else {
+                    STALL_RETRY_LIMIT
+                };
                 if completed != progress.0 {
-                    progress = (completed, now);
-                } else if now.duration_since(progress.1) >= STALL_NO_PROGRESS {
+                    progress = (completed, retries);
+                } else if retries.wrapping_sub(progress.1) >= limit {
                     break;
                 }
             }
@@ -1186,9 +1200,11 @@ pub(super) fn assist_concurrent_mark(allocated: u64) {
     willow_gc_safepoint();
 }
 
-/// Longer than the collector's 1 ms resumed recovery wait between native
-/// retries, far below its bounded retry allowance.
-const STALL_NO_PROGRESS: std::time::Duration = std::time::Duration::from_millis(2);
+/// Consecutive native Retry results without mark progress after which a
+/// stalled allocation stops waiting outside recovery. Brief contention by
+/// another owner lets at most this one allocation through (the next one
+/// stalls again); recovery's per-cursor allowance is far above.
+const STALL_RETRY_LIMIT: u64 = 16;
 
 fn completed_work(cycle: &ConcurrentCycle) -> u64 {
     let work = cycle.work.lock().unwrap();
