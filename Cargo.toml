@@ -54,3 +54,9 @@ toml_edit = "0.25.17"
 # away from their callers and stop being inlined (willow-vos2).
 [profile.release.package.willow_runtime]
 codegen-units = 1
+
+# The CLI hashes its own executable for the artifact compatibility stamp
+# (src/ai/storage.rs). Unoptimized SHA-256 over a debug binary with embedded
+# Linux debuginfo (~300 MB) cost seconds per invocation in tests.
+[profile.dev.package.sha2]
+opt-level = 3
