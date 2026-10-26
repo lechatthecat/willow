@@ -1,0 +1,17 @@
+fn read_value(ok: bool) -> Result<i64, String> {
+    return ok ? Ok(42) : Err("missing");
+}
+
+fn main() {
+    let value: Result<i64, String> = Ok(7);
+    match value {
+        Ok(v) => println(v),
+        Err(e) => println("fail " + e),
+    }
+    let empty: Option<i64> = None;
+    println(empty.is_none());
+    match read_value(false) {
+        Ok(v) => println(v),
+        Err(e) => println("fail " + e),
+    }
+}

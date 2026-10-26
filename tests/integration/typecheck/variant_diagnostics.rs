@@ -401,3 +401,39 @@ fn main() {}
         &["error[E0201]", "`Result::Ok` expects 1 argument(s), got 0"],
     );
 }
+
+#[test]
+fn test_constructor_inference_match_reports_missing_error_type() {
+    let stderr = compile_error_stderr(
+        r#"fn main() {
+    match Ok(0) {
+        Ok(v) => println(v),
+        Err(e) => println("fail " + e),
+    }
+}"#,
+    );
+    for expected in [
+        "error[E1803]",
+        "cannot infer error type `E` for `Result::Ok`",
+        "Result<i64, String>",
+        "match Ok(0)",
+    ] {
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+    assert!(!stderr.contains("toString"), "{stderr}");
+    assert!(!stderr.contains("cannot concatenate"), "{stderr}");
+}
+
+#[test]
+fn test_constructor_inference_void_concat_does_not_suggest_conversion() {
+    for expression in ["\"fail \" + nothing()", "nothing() + \"fail \""] {
+        let stderr = compile_error_stderr(&format!(
+            "fn nothing() {{}} fn main() {{ println({expression}); }}"
+        ));
+        assert!(
+            stderr.contains("cannot concatenate `String` with `void`"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("toString"), "{stderr}");
+    }
+}

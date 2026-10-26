@@ -184,8 +184,8 @@ fn option_context_18_bare_none_without_context_stays_unresolved() {
     assert_compile_error_contains(
         "fn main() { let value = None; }",
         &[
-            "error[E0202]",
-            "shorthand `None` needs an expected `Option` type",
+            "error[E1801]",
+            "cannot infer type parameter `T` for `Option::None`",
         ],
     );
 }

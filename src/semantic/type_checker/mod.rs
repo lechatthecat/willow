@@ -1479,18 +1479,9 @@ impl TypeChecker {
         self.push(diag);
     }
 
-    /// When a `let` has no type annotation, a bare `Option`/`Result` variant
-    /// constructor whose type parameters could not be inferred is represented
-    /// with `Type::Void` placeholders (e.g. `Option::None` → `Option<Void>`,
-    /// `Result::Ok(10)` → `Result<i64, Void>`). Such an unresolved type cannot
-    /// be the final type of a binding, so report the spec's E1801/E1803
-    /// diagnostics.
-    ///
-    /// This is gated on `init` being a direct `Option`/`Result` variant
-    /// construction: a `Void` placeholder reaching the binding through a method
-    /// chain (e.g. `r.and_then(|v| Result::Ok(v))`) is benign — the error type
-    /// is simply never observed — and must not be reported. Returns `None` for
-    /// fully-resolved types, non-constructor initializers, and other types.
+    /// Diagnose omitted Option/Result constructor parameters at an inference
+    /// boundary. Contextual calls and method receivers may still resolve them.
+    /// Also retains the binding diagnostic for fieldless user enum constructors.
     fn unresolved_generic_enum_diagnostic(
         &self,
         init: &Expr,
@@ -1523,31 +1514,40 @@ impl TypeChecker {
                 .with_help(format!("add a concrete type annotation to `{var}`")),
             );
         }
-        // Only a bare `Option::`/`Result::` variant constructor triggers this.
-        let is_variant_ctor = matches!(
-            init,
-            Expr::StaticCall(s)
-                if (s.class == "Option" && (s.method == "None" || s.method == "Some"))
-                    || (s.class == "Result" && (s.method == "Ok" || s.method == "Err"))
-        );
-        if !is_variant_ctor {
-            return None;
-        }
-        let Type::Generic(name, args) = ty else {
+        // Only omitted parameters are holes. An explicitly written `void`, or
+        // the inferred payload type of `Some(void_call())`, is a real type.
+        let (name, variant) = match init {
+            Expr::StaticCall(call) if call.type_args.is_empty() => {
+                (call.class.as_str(), call.method.as_str())
+            }
+            Expr::Call(call)
+                if matches!(call.callee.as_str(), "Ok" | "Err")
+                    && self
+                        .enum_variant_resolutions
+                        .get(&call.id)
+                        .is_some_and(|name| name == "Result") =>
+            {
+                ("Result", call.callee.as_str())
+            }
+            _ => return None,
+        };
+        let Type::Generic(actual_name, args) = ty else {
             return None;
         };
-        if !args.contains(&Type::Void) {
-            return None; // every type parameter is resolved
+        if actual_name != name {
+            return None;
         }
+        #[cfg(test)]
+        CONSTRUCTOR_INFERENCE_CHECKS.with(|checks| checks.set(checks.get() + 1));
         let var_label = if var == "_" { "x" } else { var };
-        let (code, message, label, hint) = match (name.as_str(), args.as_slice()) {
-            ("Option", _) => (
+        let (code, message, label, hint) = match (name, variant, args.as_slice()) {
+            ("Option", "None", [Type::Void]) => (
                 ErrorCode::E1801,
                 "cannot infer type parameter `T` for `Option::None`".to_string(),
                 "type annotation required",
                 format!("add a type annotation, e.g. `let {var_label}: Option<i64> = ...;`"),
             ),
-            ("Result", [ok, Type::Void]) if *ok != Type::Void => (
+            ("Result", "Ok", [_, Type::Void]) => (
                 ErrorCode::E1803,
                 "cannot infer error type `E` for `Result::Ok`".to_string(),
                 "error type is unknown",
@@ -1555,7 +1555,7 @@ impl TypeChecker {
                     "add a type annotation, e.g. `let {var_label}: Result<i64, String> = ...;`"
                 ),
             ),
-            ("Result", [Type::Void, err]) if *err != Type::Void => (
+            ("Result", "Err", [Type::Void, _]) => (
                 ErrorCode::E1803,
                 "cannot infer success type `T` for `Result::Err`".to_string(),
                 "success type is unknown",
@@ -1563,16 +1563,6 @@ impl TypeChecker {
                     "add a type annotation, e.g. `let {var_label}: Result<i64, String> = ...;`"
                 ),
             ),
-            ("Result", _) => (
-                ErrorCode::E1803,
-                "cannot infer type parameters `T` and `E` for `Result`".to_string(),
-                "type annotation required",
-                format!(
-                    "add a type annotation, e.g. `let {var_label}: Result<i64, String> = ...;`"
-                ),
-            ),
-            // Other generic enums are out of scope for E1801/E1803; leave their
-            // inference behavior unchanged.
             _ => return None,
         };
         Some(
@@ -8717,3 +8707,11 @@ thread_local! {
 
 #[cfg(test)]
 mod generic_variant_tests;
+
+#[cfg(test)]
+mod constructor_inference_tests;
+
+#[cfg(test)]
+thread_local! {
+    static CONSTRUCTOR_INFERENCE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}

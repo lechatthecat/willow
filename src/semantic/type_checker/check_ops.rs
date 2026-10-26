@@ -197,23 +197,25 @@ impl TypeChecker {
                     } else {
                         (&lty, "left")
                     };
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0202,
-                            format!(
-                                "cannot concatenate `String` with `{}`",
-                                type_name(non_str)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            b.span,
-                            format!("the {side} operand is `{}`, not `String`", type_name(non_str)),
-                        ))
-                        .with_help(
-                            "convert explicitly with `.toString()`, e.g. `\"x = \" + value.toString()`",
+                    let diagnostic = Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0202,
+                        format!("cannot concatenate `String` with `{}`", type_name(non_str)),
+                    )
+                    .with_label(Label::primary(
+                        b.span,
+                        format!(
+                            "the {side} operand is `{}`, not `String`",
+                            type_name(non_str)
                         ),
-                    );
+                    ));
+                    self.push(if *non_str == Type::Void {
+                        diagnostic.with_help("use an expression that produces a String value")
+                    } else {
+                        diagnostic.with_help(
+                            "convert explicitly with `.toString()`, e.g. `\"x = \" + value.toString()`",
+                        )
+                    });
                     return Type::String;
                 }
 

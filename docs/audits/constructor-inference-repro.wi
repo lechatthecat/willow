@@ -1,0 +1,6 @@
+fn main() {
+    match Ok(0) {
+        Ok(v) => println(v),
+        Err(e) => println("fail " + e),
+    }
+}

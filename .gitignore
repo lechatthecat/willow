@@ -390,3 +390,7 @@ AGENTS.md
 !/docs/audits/gc-churn-recovery/scheduler-tree.jsonl
 !/docs/audits/gc-churn-recovery/baseline-2026-10-23.jsonl
 !/docs/audits/gc-churn-recovery/baseline-2026-10-25.jsonl
+
+# Public constructor-inference audit and source-only reproducer.
+!/docs/audits/constructor-inference-diagnostics.md
+!/docs/audits/constructor-inference-repro.wi

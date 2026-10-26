@@ -395,14 +395,23 @@ impl TypeChecker {
         self.push(
             Diagnostic::new(
                 Severity::Error,
-                ErrorCode::E0202,
-                format!("shorthand `{name}` needs an expected `{enum_name}` type"),
+                if name == "None" {
+                    ErrorCode::E1801
+                } else {
+                    ErrorCode::E0202
+                },
+                if name == "None" {
+                    "cannot infer type parameter `T` for `Option::None`".to_string()
+                } else {
+                    format!("shorthand `{name}` needs an expected `{enum_name}` type")
+                },
             )
             .with_label(Label::primary(span, "expected enum type required"))
-            .with_help(format!(
-                "add a type annotation or use `{enum_name}::{name}{}`",
-                if name == "None" { "" } else { "(..)" }
-            )),
+            .with_help(if name == "None" {
+                "add a type annotation, e.g. `let x: Option<i64> = None;`".to_string()
+            } else {
+                format!("add a type annotation or use `{enum_name}::{name}(..)`")
+            }),
         );
         true
     }

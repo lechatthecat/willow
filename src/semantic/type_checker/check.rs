@@ -1547,19 +1547,17 @@ impl TypeChecker {
                     }
                     ann.clone()
                 } else {
-                    if let Expr::Call(call) = &s.init
-                        && matches!(call.callee.as_str(), "Ok" | "Err")
-                        && let Type::Generic(_, args) = &inferred
-                        && args.contains(&Type::Void)
+                    // Builtin constructor holes are finalized by check_expr,
+                    // including recovery from malformed payloads. Keep the
+                    // existing binding check for user-defined generic enums.
+                    if !matches!(&inferred, Type::Generic(name, _) if name == "Option" || name == "Result")
+                        && let Some(diag) = self.unresolved_generic_enum_diagnostic(
+                            &s.init,
+                            &inferred,
+                            s.init.span(),
+                            &s.name,
+                        )
                     {
-                        self.report_contextless_variant(&call.callee, call.span);
-                    }
-                    if let Some(diag) = self.unresolved_generic_enum_diagnostic(
-                        &s.init,
-                        &inferred,
-                        s.init.span(),
-                        &s.name,
-                    ) {
                         self.push(diag);
                     }
                     if matches!(&inferred, Type::Array(element) if **element == Type::Void) {
@@ -2360,7 +2358,14 @@ impl TypeChecker {
 
     pub(super) fn check_expr(&mut self, expr: &Expr) -> Type {
         let generation = self.error_generation;
-        let ty = self.check_expr_inner(expr);
+        let mut ty = self.check_expr_inner(expr);
+        if self.error_generation == generation
+            && matches!(&ty, Type::Generic(name, _) if name == "Option" || name == "Result")
+            && let Some(diag) = self.unresolved_generic_enum_diagnostic(expr, &ty, expr.span(), "x")
+        {
+            self.push(diag);
+            ty = Self::error_type();
+        }
         self.finish_checked_expr(expr, ty, generation)
     }
 
@@ -3398,7 +3403,15 @@ impl TypeChecker {
         }
         let obj_ty = match expected_receiver {
             Some(expected) => self.check_expr_expecting(&m.object, expected),
-            None => self.check_expr(&m.object),
+            None => {
+                // A method can resolve an omitted enum parameter (for example
+                // `Result::Ok(1).and_then(f)`). Check this receiver once without
+                // finalizing its holes; nested argument expressions still use
+                // the ordinary inference boundary.
+                let generation = self.error_generation;
+                let ty = self.check_expr_inner(&m.object);
+                self.finish_checked_expr(&m.object, ty, generation)
+            }
         };
         if Self::contains_error_type(&obj_ty) {
             for arg in &m.args {

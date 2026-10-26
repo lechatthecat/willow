@@ -73,14 +73,18 @@ fn p20_missing_context_diagnostics() {
     for (expression, name, qualified) in [
         ("Some(4)", "Some", "Option::Some(..)"),
         ("None", "None", "Option::None"),
-        ("Ok(4)", "Ok", "Result::Ok(..)"),
-        ("Err(4)", "Err", "Result::Err(..)"),
+        ("Ok(4)", "Ok", "Result::Ok"),
+        ("Err(4)", "Err", "Result::Err"),
     ] {
         let errors = check(&format!("fn main() {{ let x = {expression}; }}"));
         assert_eq!(errors.len(), 1, "{errors:?}");
         let text = format!("{:?}", errors[0]);
         assert!(
-            text.contains(&format!("shorthand `{name}` needs an expected")),
+            if name == "Some" {
+                text.contains(&format!("shorthand `{name}` needs an expected"))
+            } else {
+                text.contains("cannot infer")
+            },
             "{text}"
         );
         assert!(
