@@ -1,0 +1,16 @@
+// Bind variant payloads, then test literal values with match guards.
+enum Condition { Fracture(bool), Value(i64) }
+fn classify(c: Condition) -> i64 {
+    return match c {
+        Condition::Fracture(o) if o => 2,
+        Condition::Fracture(_) => 0,
+        Condition::Value(n) if n == -42 => 3,
+        Condition::Value(_) => 1,
+    };
+}
+fn main() {
+    println(classify(Condition::Fracture(true)));
+    println(classify(Condition::Fracture(false)));
+    println(classify(Condition::Value(-42)));
+    println(classify(Condition::Value(7)));
+}

@@ -301,3 +301,28 @@ fn irrefutable_if_let_still_runs() {
     assert!(ok, "{out}");
     assert_eq!(out, "4\n");
 }
+
+#[test]
+fn literal_payload_guard_workaround_runs() {
+    assert_runs(
+        include_str!("../../example/literal_payload_guards.wi"),
+        "2\n0\n3\n1\n",
+    );
+}
+
+#[test]
+fn literal_payload_patterns_have_actionable_cli_errors() {
+    for literal in ["true", "false", "42", "-42", "1.5", "\"text\""] {
+        assert_compile_error_contains(
+            &format!(
+                "fn main() {{ match value {{ Condition::Fracture({literal}) => println(1), }} }}"
+            ),
+            &[
+                "E0102",
+                "literal patterns",
+                "bind the payload",
+                "match guard",
+            ],
+        );
+    }
+}

@@ -443,3 +443,6 @@ AGENTS.md
 # Reviewed public import-cycle policy and implementation audit.
 !/docs/recursive-type-modules.md
 !/docs/audits/import-cycle-diagnostics.md
+
+# Public literal payload diagnostic audit.
+!/docs/audits/literal-payload-pattern-diagnostics.md

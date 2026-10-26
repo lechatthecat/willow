@@ -168,6 +168,28 @@ impl Parser {
         variant: Option<&str>,
     ) -> Result<String, Diagnostic> {
         let start = self.current_span();
+        let literal = matches!(
+            self.peek_kind(),
+            TokenKind::True
+                | TokenKind::False
+                | TokenKind::Nil
+                | TokenKind::Integer(_)
+                | TokenKind::Float(_)
+                | TokenKind::StringLiteral(_)
+        ) || (matches!(self.peek_kind(), TokenKind::Minus)
+            && matches!(
+                self.peek_kind_at(1),
+                TokenKind::Integer(_) | TokenKind::Float(_)
+            ));
+        if literal {
+            return Err(Diagnostic::new(
+                crate::diagnostics::Severity::Error,
+                ErrorCode::E0102,
+                "literal patterns are not supported in variant payloads",
+            )
+            .with_label(crate::diagnostics::Label::primary(start, "literal payload pattern"))
+            .with_help("bind the payload to a variable and use a match guard to test its value; for example, `Fracture(o) if o` for a true boolean payload, or `Value(n) if n == 42` for an integer payload"));
+        }
         let name = self.expect_ident()?;
         if matches!(self.peek_kind(), TokenKind::ColonColon | TokenKind::LParen) {
             let outer = variant.map_or_else(
@@ -205,6 +227,62 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use crate::{lexer::Lexer, parser::Parser};
+    #[test]
+    fn literal_payload_diagnostic_linear_token_reads() {
+        use crate::parser::PARSER_TOKEN_READS;
+        for count in [16, 64, 256] {
+            let prefix = "binding, ".repeat(count);
+            let source = format!("fn f() {{ match value {{ Value({prefix}-42) => 1, }} }}");
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            PARSER_TOKEN_READS.with(|reads| reads.set(0));
+            let (_, errors) = Parser::new(tokens).parse();
+            let reads = PARSER_TOKEN_READS.with(|reads| reads.get());
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].message.contains("literal patterns"));
+            assert!(reads < 20 * count + 200, "{count}: {reads}");
+            eprintln!("literal payload prefix bindings={count}, token reads={reads}");
+        }
+    }
+
+    #[test]
+    fn literal_payload_diagnostic_perspectives() {
+        for outer in [
+            "Condition::Fracture",
+            "Fracture",
+            "pkg::Condition::Fracture",
+            "Value",
+        ] {
+            for literal in [
+                "true", "false", "0", "42", "-42", "1.5", "-1.5", "\"text\"", "nil",
+            ] {
+                for prefix in ["", "first, "] {
+                    let source = format!(
+                        "fn f() {{ match value {{\n{outer}({prefix}{literal}) => println(1),\n}} }}\nasync fn main() {{ await sleep(0); }}"
+                    );
+                    let (program, errors) =
+                        Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+                    assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+                    let error = &errors[0];
+                    assert_eq!(error.code, crate::diagnostics::ErrorCode::E0102);
+                    assert!(
+                        error.message.contains("literal patterns"),
+                        "{source}: {error:?}"
+                    );
+                    assert!(!error.message.contains("reserved keyword"));
+                    assert!(error.helps.iter().all(|help| !help.contains("rename")));
+                    assert!(error.helps[0].contains("bind the payload"));
+                    assert!(error.helps[0].contains("match guard"));
+                    assert!(error.helps[0].contains("Fracture(o) if o"));
+                    assert_eq!(
+                        error.primary_span().unwrap().start,
+                        source.find(&format!("{literal})")).unwrap()
+                    );
+                    assert!(program.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(f) if f.name == "main" && f.is_async)));
+                }
+            }
+        }
+    }
+
     #[test]
     fn nested_pattern_twenty_diagnostic_perspectives() {
         for outer in ["Result::Err", "Err", "pkg::Result::Err", "Wrap::Value"] {
