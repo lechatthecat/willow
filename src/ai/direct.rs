@@ -372,7 +372,9 @@ impl DirectSession {
                 .sources
                 .get(path)
                 .context("invalid-location: file is outside the analyzed workspace")?;
-            let text = std::fs::read_to_string(path)?;
+            let text = bundled_source(path)
+                .map(str::to_owned)
+                .map_or_else(|| std::fs::read_to_string(path), Ok)?;
             ensure!(
                 hash(text.as_bytes()) == *expected,
                 "stale: source changed after analysis"
@@ -388,13 +390,12 @@ impl DirectSession {
         let line = line.parse().context("invalid-location: invalid line")?;
         let column = column.parse().context("invalid-location: invalid column")?;
         let path = PathBuf::from(file);
-        let path = if path.is_absolute() {
+        let path = if path.is_absolute() || bundled_source(file).is_some() {
             path
         } else {
             Path::new(self.workspace()).join(path)
         };
-        let path =
-            std::fs::canonicalize(path).context("invalid-location: source file not found")?;
+        let path = source_path(&path).context("invalid-location: source file not found")?;
         let path = path
             .to_str()
             .context("invalid-location: non UTF-8 path")?
@@ -1208,6 +1209,37 @@ impl DirectSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bundled_source_locations_use_embedded_bytes_and_verify_hash() {
+        let path = "<std>/collections.wi";
+        let mut snapshot = Snapshot {
+            edit_context: None,
+            version: 1,
+            compiler: storage::compiler_stamp(),
+            compatibility: String::new(),
+            workspace: "/virtual".into(),
+            revision: String::new(),
+            sources: BTreeMap::from([(path.into(), hash(bundled_source(path).unwrap()))]),
+            semantic: Default::default(),
+            functions: vec![],
+        };
+        snapshot.revision = snapshot.digest().unwrap();
+        let mut session = DirectSession::new(snapshot).unwrap();
+        assert_eq!(
+            session.location(&format!("{path}:1:1")).unwrap(),
+            Some((path.into(), 0))
+        );
+        assert!(session.location("<std>/missing.wi:1:1").is_err());
+        session.sources.clear();
+        session
+            .session
+            .snapshot
+            .sources
+            .insert(path.into(), "stale".into());
+        let error = session.location(&format!("{path}:1:1")).unwrap_err();
+        assert!(error.to_string().contains("stale: source changed"));
+    }
+
     #[test]
     fn lambda_projection_deduplicates_positions_and_preserves_snapshot() {
         for n in [16usize, 64, 256, 1024] {

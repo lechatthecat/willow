@@ -100,6 +100,17 @@ struct BodyTracking {
     units: HashMap<crate::module::UnitId, Vec<BodyId>>,
 }
 
+/// Snapshot-local record references preserve sharing without retaining offsets
+/// into the session's temporary artifact pack. Symbol identities use their
+/// existing name-based serializers.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct BodySnapshot {
+    records: Vec<TypedBody>,
+    typed: Vec<(BodyId, usize)>,
+    dependencies: Vec<(BodyId, Vec<SymbolRead>)>,
+    signatures: Vec<(SignatureKey, serde_json::Value)>,
+}
+
 pub(crate) struct BodyQueries {
     store: Rc<ArtifactStore>,
     index: Rc<BodyIndex>,
@@ -124,6 +135,85 @@ pub(crate) struct BodyQueries {
 }
 
 impl BodyQueries {
+    pub(crate) fn disk_snapshot(&self) -> Result<BodySnapshot> {
+        let mut records = Vec::new();
+        let mut typed = Vec::new();
+        let mut copied = HashMap::new();
+        for (id, _) in self.index.entries() {
+            let Some(record) = self.typed.ready(&id) else {
+                continue;
+            };
+            let slot = match copied.entry(*record) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let slot = records.len();
+                    records.push(self.store.read(*record)?);
+                    *entry.insert(slot)
+                }
+            };
+            typed.push((id, slot));
+        }
+        Ok(BodySnapshot {
+            records,
+            typed,
+            dependencies: self
+                .dependencies
+                .borrow()
+                .iter()
+                .map(|(&body, reads)| (body, reads.clone()))
+                .collect(),
+            signatures: self
+                .signatures
+                .borrow()
+                .iter()
+                .map(|(key, value)| (key.clone(), (**value).clone()))
+                .collect(),
+        })
+    }
+
+    pub(crate) fn from_disk(
+        snapshot: BodySnapshot,
+        store: Rc<ArtifactStore>,
+        index: Rc<BodyIndex>,
+    ) -> Result<Self> {
+        let mut seen = HashSet::new();
+        for &(body, slot) in &snapshot.typed {
+            anyhow::ensure!(index.owner(body).is_some(), "cached body has no owner");
+            anyhow::ensure!(slot < snapshot.records.len(), "invalid cached body record");
+            anyhow::ensure!(seen.insert(body), "duplicate cached body identity");
+        }
+        let queries = Self::new(store, index);
+        let records = snapshot
+            .records
+            .iter()
+            .map(|body| queries.store.write(body))
+            .collect::<Result<Vec<_>>>()?;
+        for (body, slot) in snapshot.typed {
+            queries.typed.seed(body, records[slot]);
+        }
+        for (body, reads) in snapshot.dependencies {
+            anyhow::ensure!(
+                queries
+                    .dependencies
+                    .borrow_mut()
+                    .insert(body, reads)
+                    .is_none(),
+                "duplicate cached body dependencies"
+            );
+        }
+        for (key, value) in snapshot.signatures {
+            anyhow::ensure!(
+                queries
+                    .signatures
+                    .borrow_mut()
+                    .insert(key, Rc::new(value))
+                    .is_none(),
+                "duplicate cached signature"
+            );
+        }
+        Ok(queries)
+    }
+
     pub(crate) fn interface_dispatch_targets(
         &self,
         unit: crate::module::UnitId,
@@ -1039,6 +1129,95 @@ mod tests {
         checker.finish_body_queries().unwrap();
         assert!(checker.errors.is_empty(), "{:?}", checker.errors);
         (program, queries, checker)
+    }
+
+    #[test]
+    fn disk_body_snapshot_preserves_shared_records_and_dependencies() {
+        let (_, queries, _) = prepare(
+            "interface I { fn value(self) -> i64 { return 7; } } class A implements I {} class B implements I {} fn main() {}",
+            true,
+        );
+        let ids: Vec<_> = queries.index.entries().map(|(id, _)| id).collect();
+        for &id in &ids {
+            queries.typed_record(id).unwrap();
+        }
+        let read = SymbolRead::Function("snapshot_dependency".into());
+        let signature = Rc::new(serde_json::json!({"return_type": "i64"}));
+        for &id in &ids {
+            queries
+                .dependencies
+                .borrow_mut()
+                .insert(id, vec![read.clone()]);
+            let (unit, _) = queries.index.owner(id).unwrap();
+            queries
+                .signatures
+                .borrow_mut()
+                .insert((unit, read.clone()), Rc::clone(&signature));
+        }
+        let snapshot = queries.disk_snapshot().unwrap();
+        assert!(snapshot.records.len() < snapshot.typed.len());
+        let record_count = snapshot.records.len();
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let index = serde_json::from_slice(&serde_json::to_vec(&*queries.index).unwrap()).unwrap();
+        let artifacts = UnitArtifacts::new().unwrap();
+        let store = Rc::clone(&artifacts.store);
+        let restored = BodyQueries::from_disk(
+            serde_json::from_slice(&bytes).unwrap(),
+            store,
+            Rc::new(index),
+        )
+        .unwrap();
+        assert_eq!(restored.signature_edge_count(), ids.len());
+        assert_eq!(
+            restored.distinct_signature_count(),
+            queries.distinct_signature_count()
+        );
+        assert_eq!(*restored.signatures.borrow(), *queries.signatures.borrow());
+        assert_eq!(
+            *restored.dependencies.borrow(),
+            *queries.dependencies.borrow()
+        );
+        assert!(restored.tracking.borrow().is_none());
+        assert_eq!(restored.stats().computations, 0);
+        assert_eq!(
+            restored.disk_snapshot().unwrap().records.len(),
+            record_count
+        );
+        for id in ids {
+            let before: TypedBody = queries
+                .store
+                .read(*queries.typed_record(id).unwrap())
+                .unwrap();
+            let after: TypedBody = restored
+                .store
+                .read(*restored.typed_record(id).unwrap())
+                .unwrap();
+            assert_eq!(
+                canonical_typed_body(&before).unwrap(),
+                canonical_typed_body(&after).unwrap()
+            );
+            assert_eq!(restored.dependencies(id), Some(vec![read.clone()]));
+        }
+        let mut invalid: BodySnapshot = serde_json::from_slice(&bytes).unwrap();
+        invalid.typed[0].1 = invalid.records.len();
+        assert!(
+            BodyQueries::from_disk(
+                invalid,
+                Rc::clone(&restored.store),
+                Rc::clone(&restored.index)
+            )
+            .is_err()
+        );
+        let mut duplicate: BodySnapshot = serde_json::from_slice(&bytes).unwrap();
+        duplicate.typed.push(duplicate.typed[0]);
+        assert!(
+            BodyQueries::from_disk(
+                duplicate,
+                Rc::clone(&restored.store),
+                Rc::clone(&restored.index)
+            )
+            .is_err()
+        );
     }
 
     fn roots(program: &Program) -> Vec<AstEvent<'_>> {

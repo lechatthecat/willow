@@ -1,0 +1,152 @@
+[
+  {
+    "shape": "independent-bodies",
+    "bodies": 9,
+    "dependency_edges_visited": 59,
+    "loaded": true,
+    "queries_recomputed": 62,
+    "queries_validated": 41,
+    "reused_bodies": 8,
+    "typechecks": 1
+  },
+  {
+    "shape": "independent-bodies",
+    "bodies": 33,
+    "dependency_edges_visited": 203,
+    "loaded": true,
+    "queries_recomputed": 158,
+    "queries_validated": 137,
+    "reused_bodies": 32,
+    "typechecks": 1
+  },
+  {
+    "shape": "independent-bodies",
+    "bodies": 129,
+    "dependency_edges_visited": 779,
+    "loaded": true,
+    "queries_recomputed": 542,
+    "queries_validated": 521,
+    "reused_bodies": 128,
+    "typechecks": 1
+  },
+  {
+    "shape": "chain",
+    "modules": 4,
+    "cache_bytes": 619495,
+    "dependency_edges_visited": 76,
+    "loaded": true,
+    "queries_recomputed": 66,
+    "queries_validated": 51,
+    "reused_bodies": 4,
+    "typechecks": 1
+  },
+  {
+    "shape": "chain",
+    "modules": 16,
+    "cache_bytes": 1107529,
+    "dependency_edges_visited": 262,
+    "loaded": true,
+    "queries_recomputed": 180,
+    "queries_validated": 165,
+    "reused_bodies": 16,
+    "typechecks": 1
+  },
+  {
+    "shape": "chain",
+    "modules": 64,
+    "cache_bytes": 3067143,
+    "dependency_edges_visited": 1006,
+    "loaded": true,
+    "queries_recomputed": 636,
+    "queries_validated": 621,
+    "reused_bodies": 64,
+    "typechecks": 1
+  },
+  {
+    "shape": "fanout",
+    "modules": 4,
+    "cache_bytes": 600772,
+    "dependency_edges_visited": 60,
+    "loaded": true,
+    "queries_recomputed": 62,
+    "queries_validated": 40,
+    "reused_bodies": 4,
+    "typechecks": 1
+  },
+  {
+    "shape": "fanout",
+    "modules": 16,
+    "cache_bytes": 875937,
+    "dependency_edges_visited": 148,
+    "loaded": true,
+    "queries_recomputed": 144,
+    "queries_validated": 96,
+    "reused_bodies": 16,
+    "typechecks": 1
+  },
+  {
+    "shape": "fanout",
+    "modules": 64,
+    "cache_bytes": 2099163,
+    "dependency_edges_visited": 532,
+    "loaded": true,
+    "queries_recomputed": 480,
+    "queries_validated": 336,
+    "reused_bodies": 64,
+    "typechecks": 1
+  },
+  {
+    "shape": "native-simple",
+    "identical_binaries": true,
+    "dependency_edges_visited": 17,
+    "loaded": true,
+    "queries_recomputed": 34,
+    "queries_validated": 13,
+    "reused_bodies": 1,
+    "typechecks": 1
+  },
+  {
+    "shape": "native-nested-lambda",
+    "identical_binaries": true,
+    "dependency_edges_visited": 23,
+    "loaded": true,
+    "queries_recomputed": 38,
+    "queries_validated": 15,
+    "reused_bodies": 3,
+    "typechecks": 1
+  },
+  {
+    "shape": "truncated",
+    "recovered": true,
+    "dependency_edges_visited": 0,
+    "loaded": false,
+    "queries_recomputed": 45,
+    "queries_validated": 0,
+    "reused_bodies": 0,
+    "typechecks": 4
+  },
+  {
+    "shape": "checksum",
+    "recovered": true,
+    "dependency_edges_visited": 0,
+    "loaded": false,
+    "queries_recomputed": 45,
+    "queries_validated": 0,
+    "reused_bodies": 0,
+    "typechecks": 4
+  },
+  {
+    "shape": "invalid-json",
+    "recovered": true,
+    "dependency_edges_visited": 0,
+    "loaded": false,
+    "queries_recomputed": 45,
+    "queries_validated": 0,
+    "reused_bodies": 0,
+    "typechecks": 4
+  },
+  {
+    "shape": "error-diagnostics",
+    "identical": true
+  }
+]

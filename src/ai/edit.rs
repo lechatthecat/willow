@@ -391,6 +391,9 @@ impl Workspace {
         let mut sources = BTreeMap::new();
         let mut inputs = BTreeMap::new();
         for (path, expected) in &snapshot.sources {
+            if verified_bundled_source(path, expected)? {
+                continue;
+            }
             let relative = Path::new(path)
                 .strip_prefix(&self.root)
                 .context("external source is not supported by isolated edits")?
@@ -565,6 +568,9 @@ impl Workspace {
         )
         .analysis_for_edit_with_emitter(&mut CandidatePaths::new(emitter, &root))?;
         for (path, digest) in &checked.sources {
+            if verified_bundled_source(path, digest)? {
+                continue;
+            }
             let relative = Path::new(path)
                 .strip_prefix(&root)
                 .context("candidate imported a source outside isolation")?
@@ -734,6 +740,9 @@ impl Workspace {
             );
         }
         for (path, digest) in &snapshot.sources {
+            if verified_bundled_source(path, digest)? {
+                continue;
+            }
             let relative = Path::new(path)
                 .strip_prefix(&self.root)?
                 .to_str()
@@ -968,6 +977,9 @@ pub(super) fn preview_analyzed(
     );
     let mut sources = BTreeMap::new();
     for (path, expected) in &snapshot.sources {
+        if verified_bundled_source(path, expected)? {
+            continue;
+        }
         let relative = Path::new(path)
             .strip_prefix(root)
             .context("external source is not editable")?
@@ -979,6 +991,9 @@ pub(super) fn preview_analyzed(
     }
     let (changes, work) = structured_changes(snapshot, root, &sources, request.operations)?;
     for (path, expected) in &snapshot.sources {
+        if verified_bundled_source(path, expected)? {
+            continue;
+        }
         ensure!(
             hash(fs::read(path)?) == *expected,
             "source changed during preview"
@@ -1523,6 +1538,17 @@ fn structured_changes(
         }
     }
     Ok((changes, work))
+}
+
+fn verified_bundled_source(path: &str, expected: &str) -> Result<bool> {
+    let Some(source) = super::bundled_source(path) else {
+        return Ok(false);
+    };
+    ensure!(
+        hash(source) == expected,
+        "bundled source changed during analysis"
+    );
+    Ok(true)
 }
 
 #[cfg(test)]

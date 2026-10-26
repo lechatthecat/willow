@@ -12,7 +12,7 @@ use crate::{
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DispatchDeclaration {
     pub(crate) exists: bool,
     pub(crate) base: Option<String>,

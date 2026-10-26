@@ -43,6 +43,22 @@ use std::{
     path::Path,
 };
 
+/// Compiler-owned source is queryable, but never a filesystem edit target.
+pub(crate) fn bundled_source(path: &str) -> Option<&'static str> {
+    (Path::new(path) == Path::new("<std>/collections.wi"))
+        .then_some(include_str!("../../std/collections.wi"))
+}
+pub(crate) fn source_path(path: &Path) -> Result<std::path::PathBuf> {
+    if path
+        .to_str()
+        .is_some_and(|path| bundled_source(path).is_some())
+    {
+        Ok(path.to_owned())
+    } else {
+        Ok(std::fs::canonicalize(path)?)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Location {
@@ -767,9 +783,7 @@ pub(crate) fn snapshot(
     };
     index_source(UnitId::ENTRY, paths[&UnitId::ENTRY].clone(), source)?;
     for m in &frontend.module_graph.files {
-        let path = std::fs::canonicalize(&m.path)?
-            .to_string_lossy()
-            .into_owned();
+        let path = source_path(&m.path)?.to_string_lossy().into_owned();
         paths.insert(m.id, path.clone());
         namespaces.insert(m.identity_path().to_string(), m.id);
         programs.insert(m.id, &m.program);

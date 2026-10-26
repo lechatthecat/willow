@@ -188,10 +188,48 @@ pub(crate) fn resolve_imports_in_graph(
     {
         let id = graph.reserve_module_id(bundled_path);
         let mut source = include_str!("../../std/collections.wi").to_owned();
-        match Lexer::with_file_id(&source, id.file_id()).tokenize() {
-            Ok(tokens) => {
-                let (mut program, diagnostics) = Parser::new(tokens).parse();
+        let path = Path::new("<std>/collections.wi");
+        let parsed = if let Some(queries) = graph
+            .artifacts
+            .as_ref()
+            .and_then(|a| a.syntax_queries.as_ref())
+        {
+            queries.borrow_mut().parse(path, id.file_id(), &source)
+        } else {
+            Ok(
+                match Lexer::with_file_id(&source, id.file_id()).tokenize() {
+                    Ok(tokens) => {
+                        let (program, diagnostics) = Parser::new(tokens).parse();
+                        (program, diagnostics, false)
+                    }
+                    Err(diagnostics) => (
+                        Program {
+                            instantiation_types: vec![],
+                            type_uses: vec![],
+                            module: None,
+                            imports: vec![],
+                            items: vec![],
+                        },
+                        diagnostics.into_iter().collect(),
+                        true,
+                    ),
+                },
+            )
+        };
+        match parsed {
+            Ok((mut program, diagnostics, false)) => {
                 errors.extend(diagnostics);
+                if let Some(artifacts) = &mut graph.artifacts
+                    && artifacts.revision_enabled
+                    && let Err(error) =
+                        artifacts.retain_parse(id.file_id(), path, &source, &mut program)
+                {
+                    errors.push(Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0700,
+                        format!("cannot retain bundled syntax: {error:#}"),
+                    ));
+                }
                 crate::stdlib_schema::attach_array_storage(&mut program);
                 if let Some(artifacts) = &mut graph.artifacts {
                     if let Err(error) = artifacts
@@ -217,7 +255,12 @@ pub(crate) fn resolve_imports_in_graph(
                 unit.symbol_namespace = Some(std::sync::Arc::from("$std::collections"));
                 unit.symbol_module = None;
             }
-            Err(diagnostics) => errors.extend(diagnostics),
+            Ok((_, diagnostics, true)) => errors.extend(diagnostics),
+            Err(error) => errors.push(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0700,
+                format!("cannot parse bundled source: {error:#}"),
+            )),
         }
     }
 

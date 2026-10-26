@@ -60,3 +60,6 @@ codegen-units = 1
 # Linux debuginfo (~300 MB) cost seconds per invocation in tests.
 [profile.dev.package.sha2]
 opt-level = 3
+
+[build-dependencies]
+sha2 = "0.11.0"

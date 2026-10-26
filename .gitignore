@@ -536,3 +536,13 @@ AGENTS.md
 
 !/docs/audits/fixed-arrays/constraint-counts.txt
 !/docs/audits/fixed-arrays/source-dispatch-counts.txt
+
+# Public persistent compiler-query audit and source-only reproducer.
+!/docs/audits/persistent-query-cache/
+/docs/audits/persistent-query-cache/*
+!/docs/audits/persistent-query-cache/audit.md
+!/docs/audits/persistent-query-cache/reproduce.py
+!/docs/audits/persistent-query-cache/measurements.json
+
+# Compiler analysis caches beside standalone sources.
+**/target/willow-query-cache/

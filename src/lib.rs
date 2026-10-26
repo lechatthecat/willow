@@ -617,7 +617,7 @@ fn run_frontend_with_inputs(
     inputs: compiler_db::inputs::CompilerInputs,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
 ) -> Result<Frontend> {
-    run_frontend_revision(source, root, map, inputs, emitter, None, None)
+    compiler_db::persistent::run(source, root, map, inputs, emitter)
 }
 
 fn run_frontend_revision(
@@ -631,6 +631,31 @@ fn run_frontend_revision(
         std::rc::Rc<std::cell::RefCell<compiler_db::incremental::SyntaxQueries>>,
     >,
 ) -> Result<Frontend> {
+    run_frontend_revision_cached(
+        source,
+        root,
+        map,
+        inputs,
+        emitter,
+        previous,
+        syntax_queries,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_frontend_revision_cached(
+    source: &str,
+    root: &std::path::Path,
+    map: &diagnostics::SourceMap,
+    inputs: compiler_db::inputs::CompilerInputs,
+    emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    previous: Option<&Frontend>,
+    syntax_queries: Option<
+        std::rc::Rc<std::cell::RefCell<compiler_db::incremental::SyntaxQueries>>,
+    >,
+    disk: Option<&compiler_db::persistent::DiskRevision>,
+) -> Result<Frontend> {
     let mut artifacts = module::artifacts::UnitArtifacts::new()?;
     let incremental = syntax_queries.is_some();
     artifacts.revision_enabled = incremental;
@@ -642,9 +667,18 @@ fn run_frontend_revision(
             .as_ref()
             .expect("revision artifacts");
         artifacts.previous_parsed = Some((std::rc::Rc::clone(&old.store), old.parsed.clone()));
+        artifacts.previous_expanded = Some((std::rc::Rc::clone(&old.store), old.expanded.clone()));
         artifacts
             .body_index_mut()
             .begin_revision(std::rc::Rc::clone(&old.bodies));
+    }
+    if let Some(disk) = disk {
+        artifacts.previous_parsed = Some((std::rc::Rc::clone(&disk.store), disk.parsed.clone()));
+        artifacts.previous_expanded =
+            Some((std::rc::Rc::clone(&disk.store), disk.expanded.clone()));
+        artifacts
+            .body_index_mut()
+            .begin_revision(std::rc::Rc::clone(&disk.index));
     }
     let ParsePhase {
         mut program,
@@ -930,6 +964,7 @@ fn run_frontend_revision(
                 generic_sources.insert(module.id, metadata);
             }
             checkers[index].expand_generics(&mut source, &mut fresh_ids);
+            storage.retain_expanded(module.id.file_id(), &mut source)?;
             storage.offload(&mut source)?;
             module.program = source.into_inner();
         }
@@ -944,6 +979,7 @@ fn run_frontend_revision(
             generic_sources.insert(module::UnitId::ENTRY, metadata);
         }
         checkers[entry].expand_generics(&mut body, &mut fresh_ids);
+        storage.retain_expanded(diagnostics::FileId::ENTRY, &mut body)?;
         storage.offload(&mut body)?;
         program = body.into_inner();
         storage.inherit_generated_owners(&fresh_ids, &registry.borrow().origins);
@@ -985,6 +1021,7 @@ fn run_frontend_revision(
     }
     artifacts.body_index_mut().finish_revision();
     artifacts.previous_parsed = None;
+    artifacts.previous_expanded = None;
     let syntax_queries = artifacts.syntax_queries.take();
     let mut db = compiler_db::CompilerDb::with_dependencies(
         inputs,
@@ -1035,8 +1072,8 @@ fn run_frontend_revision(
             }
         }
     }
-    if let Some(queries) = syntax_queries {
-        db.references.set_tracking(&queries);
+    if let Some(queries) = &syntax_queries {
+        db.references.set_tracking(queries);
         let mut paths: std::collections::HashMap<_, _> = graph
             .files
             .iter()
@@ -1044,14 +1081,14 @@ fn run_frontend_revision(
             .collect();
         paths.insert(module::UnitId::ENTRY, std::path::PathBuf::from(&map.path));
         db.declarations
-            .set_tracking(std::rc::Rc::clone(&queries), paths);
+            .set_tracking(std::rc::Rc::clone(queries), paths);
         db.lir.set_tracking(
-            std::rc::Rc::clone(&queries),
+            std::rc::Rc::clone(queries),
             std::rc::Rc::clone(&db.typed_bodies),
         );
-        db.layouts.set_tracking(std::rc::Rc::clone(&queries));
+        db.layouts.set_tracking(std::rc::Rc::clone(queries));
         db.effects.set_tracking(
-            std::rc::Rc::clone(&queries),
+            std::rc::Rc::clone(queries),
             std::rc::Rc::clone(&artifacts.bodies),
             std::rc::Rc::clone(&db.typed_bodies),
         );
@@ -1060,7 +1097,8 @@ fn run_frontend_revision(
             &graph.files,
             &artifacts,
         );
-        db.typed_bodies.configure_tracking(queries, owners);
+        db.typed_bodies
+            .configure_tracking(std::rc::Rc::clone(queries), owners);
     }
     if let Some(previous) = previous {
         db.effects.reuse_from(&previous.db.effects);
@@ -1071,6 +1109,39 @@ fn run_frontend_revision(
             &candidates,
             &artifacts.correspondence,
         )?;
+    }
+    if let Some(disk) = disk {
+        let current: Vec<_> = graph
+            .files
+            .iter()
+            .map(|m| (m.id, m.path.clone(), m.symbol_module))
+            .collect();
+        if current == disk.modules {
+            let mut candidates = compiler_db::revision::candidate_body_ids(
+                &disk.parsed,
+                &graph.files,
+                &artifacts,
+                &db,
+            );
+            if let Some(queries) = &syntax_queries {
+                let definitions = compiler_db::stable_path::inventory(
+                    std::path::Path::new(&map.path),
+                    &graph.files,
+                    &artifacts,
+                    &queries.borrow(),
+                )?;
+                candidates.retain(|id| {
+                    definitions
+                        .get(id)
+                        .is_some_and(|key| disk.definitions.get(key) == Some(id))
+                });
+            }
+            db.typed_bodies.reuse_body_candidates(
+                &disk.bodies,
+                &candidates,
+                &artifacts.correspondence,
+            )?;
+        }
     }
     if db.inputs().capture_analysis {
         *db.effects.analysis.borrow_mut() = Some(Default::default());

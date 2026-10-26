@@ -18,7 +18,7 @@ use std::{
     rc::Rc,
 };
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Source {
     file: FileId,
     text: String,
@@ -700,6 +700,18 @@ impl SyntaxQueries {
         self.symbols = HashMap::new();
         Ok((nodes, edges))
     }
+    pub(crate) fn signature_bytes(&self, path: &Path, owner: &str) -> Result<Vec<u8>> {
+        Ok(self
+            .table
+            .read(
+                &self.provider(),
+                QueryNode::SyntaxSignature(path.to_owned(), owner.to_owned()),
+            )?
+            .get::<CompactJson>()
+            .bytes
+            .to_vec())
+    }
+
     /// Owner is a declaration path, e.g. `Function:f` or `Class:C/methods:f`.
     #[cfg(test)]
     pub(crate) fn signature(&self, path: &Path, owner: &str) -> Result<Value> {
@@ -841,6 +853,7 @@ impl PartialEq for DerivedValue {
 }
 impl Eq for DerivedValue {}
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ParsedValue {
     wire: Vec<u8>,
     canonical: Vec<u8>,
@@ -872,7 +885,7 @@ struct PreparedBody {
 // entire syntax into every typed result costs O(body count * declaration size).
 // The table-local exact change stamp preserves syntax invalidation in O(1)
 // space per body, without relying on a hash for equality or retaining old trees.
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct TypedBodyValue {
     syntax_node: QueryNode,
     syntax_revision: super::tracked::Revision,
@@ -907,7 +920,7 @@ struct SyntaxProvider<'a> {
 }
 /// Immutable canonical JSON without the per-field allocation overhead of Value.
 /// Encoding happens once; equality and fingerprints compare the same bytes.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CompactJson {
     bytes: std::sync::Arc<[u8]>,
 }
@@ -2107,5 +2120,209 @@ mod tests {
         let mut next = accepted.candidate().unwrap();
         next.parse(path, FileId::ENTRY, source).unwrap();
         assert_eq!(next.stats().recomputed, 0);
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct SyntaxSnapshot {
+    table: super::tracked::DiskTable,
+    dispatch_classes: Vec<(UnitId, std::collections::BTreeSet<String>)>,
+}
+impl SyntaxQueries {
+    pub(crate) fn disk_snapshot(&self) -> Result<SyntaxSnapshot> {
+        Ok(SyntaxSnapshot {
+            table: self.table.disk_snapshot()?,
+            dispatch_classes: self
+                .dispatch_classes
+                .iter()
+                .map(|(unit, classes)| (*unit, classes.clone()))
+                .collect(),
+        })
+    }
+    pub(crate) fn from_disk(snapshot: SyntaxSnapshot) -> Result<Self> {
+        let mut dispatch_classes = HashMap::new();
+        for (unit, classes) in snapshot.dispatch_classes {
+            anyhow::ensure!(
+                dispatch_classes.insert(unit, classes).is_none(),
+                "duplicate dispatch inventory"
+            );
+        }
+        Ok(Self {
+            table: TrackedQueryTable::from_disk(snapshot.table)?,
+            dispatch_classes,
+            ..Self::default()
+        })
+    }
+}
+
+/// An explicit, closed codec keeps unrecognized Any payloads out of disk state.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct DiskValue {
+    kind: DiskKind,
+    payload: serde_json::Value,
+}
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum DiskKind {
+    Source,
+    Parsed,
+    Compact,
+    Typed,
+    Dispatch,
+    Children,
+}
+impl DiskValue {
+    fn query_kind(node: &QueryNode) -> Result<DiskKind> {
+        Ok(match node {
+            QueryNode::Parse(_) => DiskKind::Parsed,
+            QueryNode::TypedBody(_) => DiskKind::Typed,
+            QueryNode::CompilerEnvironment
+            | QueryNode::SyntaxDeclarations(_)
+            | QueryNode::SyntaxImports(_)
+            | QueryNode::SyntaxSignature(..)
+            | QueryNode::BodySyntax(..)
+            | QueryNode::SemanticSignature(..)
+            | QueryNode::DispatchTargets(..) => DiskKind::Compact,
+            _ => anyhow::bail!("unsupported disk query"),
+        })
+    }
+    fn input_kind(node: &InputNode) -> Result<DiskKind> {
+        Ok(match node {
+            InputNode::Source(_) => DiskKind::Source,
+            InputNode::SemanticSymbol(..)
+            | InputNode::CompilerStamp
+            | InputNode::StdlibStamp
+            | InputNode::RuntimeAbiRevision => DiskKind::Compact,
+            InputNode::DispatchDeclaration(..) => DiskKind::Dispatch,
+            InputNode::DispatchChildren(..) => DiskKind::Children,
+            _ => anyhow::bail!("unsupported disk input"),
+        })
+    }
+    fn encode(kind: DiskKind, value: &QueryValue) -> Result<Self> {
+        fn encode_as<T: serde::Serialize + 'static>(value: &QueryValue) -> Result<Value> {
+            let value = value
+                .downcast::<T>()
+                .ok_or_else(|| anyhow::anyhow!("disk payload type mismatch"))?;
+            Ok(serde_json::to_value(value)?)
+        }
+        let payload = match kind {
+            DiskKind::Source => encode_as::<Source>(value)?,
+            DiskKind::Parsed => encode_as::<ParsedValue>(value)?,
+            DiskKind::Compact => encode_as::<CompactJson>(value)?,
+            DiskKind::Typed => encode_as::<TypedBodyValue>(value)?,
+            DiskKind::Dispatch => encode_as::<super::dispatch::DispatchDeclaration>(value)?,
+            DiskKind::Children => encode_as::<Vec<String>>(value)?,
+        };
+        Ok(Self { kind, payload })
+    }
+    pub(crate) fn query(node: &QueryNode, value: &QueryValue) -> Result<Self> {
+        Self::encode(Self::query_kind(node)?, value)
+    }
+    pub(crate) fn input(node: &InputNode, value: &QueryValue) -> Result<Self> {
+        Self::encode(Self::input_kind(node)?, value)
+    }
+    pub(crate) fn decode_query(
+        self,
+        node: &QueryNode,
+        fingerprint: ResultFingerprint,
+    ) -> Result<QueryValue> {
+        anyhow::ensure!(
+            self.kind == Self::query_kind(node)?,
+            "wrong disk query payload"
+        );
+        self.decode(fingerprint)
+    }
+    pub(crate) fn decode_input(
+        self,
+        node: &InputNode,
+        fingerprint: ResultFingerprint,
+    ) -> Result<QueryValue> {
+        anyhow::ensure!(
+            self.kind == Self::input_kind(node)?,
+            "wrong disk input payload"
+        );
+        self.decode(fingerprint)
+    }
+    fn decode(self, fingerprint: ResultFingerprint) -> Result<QueryValue> {
+        fn decode_as<T: serde::de::DeserializeOwned + Eq + Retained + 'static>(
+            payload: Value,
+            fingerprint: ResultFingerprint,
+        ) -> Result<QueryValue> {
+            Ok(QueryValue::new(
+                serde_json::from_value::<T>(payload)?,
+                fingerprint,
+            ))
+        }
+        match self.kind {
+            DiskKind::Source => decode_as::<Source>(self.payload, fingerprint),
+            DiskKind::Parsed => decode_as::<ParsedValue>(self.payload, fingerprint),
+            DiskKind::Compact => decode_as::<CompactJson>(self.payload, fingerprint),
+            DiskKind::Typed => decode_as::<TypedBodyValue>(self.payload, fingerprint),
+            DiskKind::Dispatch => {
+                decode_as::<super::dispatch::DispatchDeclaration>(self.payload, fingerprint)
+            }
+            DiskKind::Children => decode_as::<Vec<String>>(self.payload, fingerprint),
+        }
+    }
+}
+
+#[cfg(test)]
+mod disk_snapshot_tests {
+    use super::*;
+
+    fn fixture() -> (SyntaxQueries, BodyId) {
+        let mut queries = SyntaxQueries::default().candidate().unwrap();
+        let path = Path::new("disk-entry.wi");
+        queries
+            .parse(path, FileId::ENTRY, "fn f() -> i64 { return 1; }")
+            .unwrap();
+        let body = BodyId::fresh();
+        queries.register_body(UnitId::ENTRY, body, path, "Function:f");
+        queries
+            .publish_body(UnitId::ENTRY, body, Value::Null, vec![], vec![])
+            .unwrap();
+        (queries, body)
+    }
+
+    #[test]
+    fn disk_snapshot_typed_closure_reuses_and_invalidates() {
+        let (queries, body) = fixture();
+        let bytes = serde_json::to_vec(&queries.disk_snapshot().unwrap()).unwrap();
+        for (source, expected) in [
+            ("fn f() -> i64 { return 1; }", true),
+            ("fn f() -> i64 { return 2; }", false),
+        ] {
+            let snapshot = serde_json::from_slice(&bytes).unwrap();
+            let restored = SyntaxQueries::from_disk(snapshot).unwrap();
+            let mut next = restored.candidate().unwrap();
+            let path = Path::new("disk-entry.wi");
+            next.parse(path, FileId::ENTRY, source).unwrap();
+            assert_eq!(
+                next.validate_body(UnitId::ENTRY, body, path, "Function:f", vec![])
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn disk_snapshot_rejects_missing_cycle_timestamp_and_wrong_payload() {
+        let (queries, _) = fixture();
+        let pristine = serde_json::to_value(queries.disk_snapshot().unwrap()).unwrap();
+        let mut missing = pristine.clone();
+        missing["table"]["inputs"] = serde_json::json!([]);
+        let mut timestamp = pristine.clone();
+        timestamp["table"]["revision"] = serde_json::json!(0);
+        let mut wrong = pristine.clone();
+        wrong["table"]["memos"][0]["value"]["kind"] = serde_json::json!("Children");
+        let mut cycle = pristine.clone();
+        let node = cycle["table"]["memos"][0]["node"].clone();
+        let revision = cycle["table"]["memos"][0]["changed_at"].clone();
+        cycle["table"]["memos"][0]["dependencies"] = serde_json::json!([
+            {"node":{"Query":node}, "observed_changed_at": revision}
+        ]);
+        for invalid in [missing, timestamp, wrong, cycle] {
+            let snapshot = serde_json::from_value(invalid).unwrap();
+            assert!(SyntaxQueries::from_disk(snapshot).is_err());
+        }
     }
 }

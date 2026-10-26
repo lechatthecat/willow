@@ -220,7 +220,7 @@ impl Snapshot {
         revision: Option<&str>,
     ) -> Result<&Function> {
         self.check_revision(revision)?;
-        let path = std::fs::canonicalize(path)?.to_string_lossy().into_owned();
+        let path = source_path(path)?.to_string_lossy().into_owned();
         let mut candidates = BTreeMap::new();
         let mut width = usize::MAX;
         for function in &self.functions {

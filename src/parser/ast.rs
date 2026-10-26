@@ -26,11 +26,9 @@ impl BodyId {
     pub fn fresh() -> Self {
         // Body identities use a separate typed namespace: registering blocks
         // must not renumber expressions or their stable textual LIR names.
-        static NEXT_RANGE: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(FIRST_RANGE_START);
         Self(BODY_IDS.with(|slot| {
             let mut ids = slot.get();
-            let id = ids.fresh_from(&NEXT_RANGE);
+            let id = ids.fresh_from(&NEXT_BODY_RANGE);
             slot.set(ids);
             id
         }))
@@ -75,9 +73,7 @@ struct NodeIds {
 
 impl NodeIds {
     fn fresh(&mut self) -> u64 {
-        static NEXT_RANGE: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(FIRST_RANGE_START);
-        self.fresh_from(&NEXT_RANGE)
+        self.fresh_from(&NEXT_NODE_RANGE)
     }
 
     /// The allocator behind [`NodeIds::fresh`], with the range source passed
@@ -98,6 +94,31 @@ impl NodeIds {
         self.next += 1;
         id
     }
+}
+
+static NEXT_BODY_RANGE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(FIRST_RANGE_START);
+static NEXT_NODE_RANGE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(FIRST_RANGE_START);
+
+/// Reserve cached identities before constructing any syntax in this session.
+pub(crate) fn reserve_cached_ids(ends: [u64; 2]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        ends.iter()
+            .all(|end| *end > 0 && *end <= u64::MAX - (1 << 32)),
+        "invalid cached syntax range"
+    );
+    NEXT_BODY_RANGE.fetch_max(ends[0], std::sync::atomic::Ordering::Relaxed);
+    NEXT_NODE_RANGE.fetch_max(ends[1], std::sync::atomic::Ordering::Relaxed);
+    BODY_IDS.with(|slot| slot.set(NodeIds::default()));
+    NODE_IDS.with(|slot| slot.set(NodeIds::default()));
+    Ok(())
+}
+pub(crate) fn cached_id_ends() -> [u64; 2] {
+    [
+        NEXT_BODY_RANGE.load(std::sync::atomic::Ordering::Relaxed),
+        NEXT_NODE_RANGE.load(std::sync::atomic::Ordering::Relaxed),
+    ]
 }
 
 thread_local! {

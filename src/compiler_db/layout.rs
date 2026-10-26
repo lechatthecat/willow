@@ -171,7 +171,7 @@ impl super::tracked::QueryProvider for LayoutProvider {
 /// One canonical class on one target: the key of every byte-level layout
 /// derived from a semantic field list. Two targets with the same pointer width
 /// and ABI revision place fields identically; anything else must not share.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TargetLayoutKey {
     pub(crate) ty: TypeId,
     /// Pointer width in bits.

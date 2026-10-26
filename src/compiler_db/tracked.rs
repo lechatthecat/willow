@@ -14,11 +14,38 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub(crate) struct Revision(pub u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ResultFingerprint(u128);
+impl serde::Serialize for ResultFingerprint {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+impl<'de> serde::Deserialize<'de> for ResultFingerprint {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        value.parse().map(Self).map_err(serde::de::Error::custom)
+    }
+}
 impl ResultFingerprint {
     /// Callers supply canonical bytes, never Debug output or numeric intern IDs.
     pub(crate) fn bytes(bytes: &[u8]) -> Self {
@@ -33,7 +60,18 @@ impl ResultFingerprint {
 }
 
 /// Stability of a captured input, ordered from frequently edited to immutable.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub(crate) enum Durability {
     #[default]
     Low,
@@ -41,7 +79,7 @@ pub(crate) enum Durability {
     High,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum InputNode {
     Source(PathBuf),
     SemanticSymbol(UnitId, String),
@@ -85,7 +123,7 @@ impl InputNode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum QueryNode {
     CompilerEnvironment,
     Parse(PathBuf),
@@ -121,12 +159,12 @@ pub(crate) enum QueryNode {
     AsyncFrameLayout(BodyId),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 enum DependencyNode {
     Input(InputNode),
     Query(QueryNode),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Dependency {
     node: DependencyNode,
     observed_changed_at: Revision,
@@ -159,6 +197,9 @@ impl QueryValue {
     }
     fn equivalent(&self, other: &Self) -> bool {
         self.fingerprint == other.fingerprint && (self.equivalent)(&*self.value, &*other.value)
+    }
+    pub(crate) fn downcast<V: 'static>(&self) -> Option<&V> {
+        self.value.downcast_ref()
     }
     pub(crate) fn get<V: 'static>(&self) -> &V {
         self.value
@@ -1572,5 +1613,213 @@ mod tests {
         });
         assert!(table.stack.borrow().is_empty());
         assert_frozen_read();
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct DiskTable {
+    revision: Revision,
+    last_changed: [Revision; 3],
+    inputs: Vec<(
+        InputNode,
+        super::incremental::DiskValue,
+        ResultFingerprint,
+        Revision,
+        Durability,
+    )>,
+    memos: Vec<DiskMemo>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DiskMemo {
+    node: QueryNode,
+    value: super::incremental::DiskValue,
+    fingerprint: ResultFingerprint,
+    verified_at: Revision,
+    changed_at: Revision,
+    dependencies: Vec<Dependency>,
+    durability: Durability,
+}
+impl TrackedQueryTable {
+    pub(crate) fn disk_snapshot(&self) -> Result<DiskTable> {
+        anyhow::ensure!(self.stack.borrow().is_empty(), "snapshot during evaluation");
+        let states = self.states.borrow();
+        let mut pending: Vec<_> = states
+            .iter()
+            .filter_map(|(node, state)| {
+                (matches!(node, QueryNode::TypedBody(_) | QueryNode::Parse(_))
+                    && matches!(state, State::Ready(Memo { result: Ok(_), .. })))
+                .then_some(node.clone())
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        let mut input_nodes = HashSet::new();
+        let mut memos = Vec::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            let Some(State::Ready(memo)) = states.get(&node) else {
+                anyhow::bail!("missing snapshot dependency");
+            };
+            let value = memo
+                .result
+                .as_ref()
+                .map_err(|_| anyhow::anyhow!("failed snapshot dependency"))?;
+            for dependency in memo.dependencies.iter() {
+                match &dependency.node {
+                    DependencyNode::Input(input) => {
+                        input_nodes.insert(input.clone());
+                    }
+                    DependencyNode::Query(query) => pending.push(query.clone()),
+                }
+            }
+            memos.push(DiskMemo {
+                value: super::incremental::DiskValue::query(&node, value)?,
+                fingerprint: value.fingerprint,
+                node,
+                verified_at: memo.verified_at,
+                changed_at: memo.changed_at,
+                dependencies: memo.dependencies.to_vec(),
+                durability: memo.durability,
+            });
+        }
+        let mut inputs = Vec::new();
+        for node in input_nodes {
+            let input = self.inputs.get(&node).context("missing snapshot input")?;
+            inputs.push((
+                node.clone(),
+                super::incremental::DiskValue::input(&node, &input.value)?,
+                input.value.fingerprint,
+                input.changed_at,
+                input.durability,
+            ));
+        }
+        Ok(DiskTable {
+            revision: self.revision,
+            last_changed: self.last_changed,
+            inputs,
+            memos,
+        })
+    }
+    pub(crate) fn from_disk(snapshot: DiskTable) -> Result<Self> {
+        let mut result = Self {
+            revision: snapshot.revision,
+            last_changed: snapshot.last_changed,
+            ..Self::default()
+        };
+        anyhow::ensure!(result.revision.0 < u64::MAX, "exhausted cached revision");
+        anyhow::ensure!(
+            result.last_changed.iter().all(|r| *r <= result.revision),
+            "invalid change watermark"
+        );
+        anyhow::ensure!(
+            result
+                .last_changed
+                .windows(2)
+                .all(|pair| pair[0] >= pair[1]),
+            "unordered change watermarks"
+        );
+        for (node, value, fingerprint, changed_at, durability) in snapshot.inputs {
+            anyhow::ensure!(
+                changed_at <= result.revision
+                    && changed_at <= result.last_changed[durability as usize],
+                "invalid input timestamp"
+            );
+            let value = value.decode_input(&node, fingerprint)?;
+            anyhow::ensure!(
+                result
+                    .inputs
+                    .insert(
+                        node,
+                        Input {
+                            value,
+                            changed_at,
+                            durability
+                        }
+                    )
+                    .is_none(),
+                "duplicate snapshot input"
+            );
+        }
+        let states = result.states.get_mut();
+        for memo in snapshot.memos {
+            anyhow::ensure!(
+                memo.changed_at <= memo.verified_at && memo.verified_at <= result.revision,
+                "invalid memo timestamp"
+            );
+            let value = memo.value.decode_query(&memo.node, memo.fingerprint)?;
+            let previous = states.insert(
+                memo.node,
+                State::Ready(Memo {
+                    result: Ok(value),
+                    verified_at: memo.verified_at,
+                    changed_at: memo.changed_at,
+                    dependencies: memo.dependencies.into(),
+                    durability: memo.durability,
+                }),
+            );
+            anyhow::ensure!(previous.is_none(), "duplicate snapshot memo");
+        }
+        // Kahn traversal validates every reference and rejects cycles in O(V+E).
+        let mut incoming: HashMap<QueryNode, usize> =
+            states.keys().cloned().map(|node| (node, 0)).collect();
+        let mut dependents: HashMap<QueryNode, Vec<QueryNode>> = HashMap::new();
+        for (node, state) in states.iter() {
+            let State::Ready(memo) = state else {
+                unreachable!()
+            };
+            let mut unique = HashSet::new();
+            for dependency in memo.dependencies.iter() {
+                anyhow::ensure!(
+                    unique.insert(dependency.node.clone()),
+                    "duplicate snapshot dependency"
+                );
+                let (changed_at, durability) = match &dependency.node {
+                    DependencyNode::Input(input) => {
+                        let input = result
+                            .inputs
+                            .get(input)
+                            .context("missing snapshot input dependency")?;
+                        (input.changed_at, input.durability)
+                    }
+                    DependencyNode::Query(query) => {
+                        let Some(State::Ready(target)) = states.get(query) else {
+                            anyhow::bail!("missing snapshot query dependency")
+                        };
+                        *incoming.get_mut(node).expect("indexed node") += 1;
+                        dependents
+                            .entry(query.clone())
+                            .or_default()
+                            .push(node.clone());
+                        (target.changed_at, target.durability)
+                    }
+                };
+                anyhow::ensure!(
+                    dependency.observed_changed_at <= changed_at
+                        && (dependency.observed_changed_at == changed_at
+                            || changed_at > memo.verified_at)
+                        && dependency.observed_changed_at <= memo.verified_at
+                        && memo.durability <= durability,
+                    "invalid dependency metadata"
+                );
+            }
+        }
+        let mut pending: Vec<_> = incoming
+            .iter()
+            .filter_map(|(node, count)| (*count == 0).then_some(node.clone()))
+            .collect();
+        let mut visited = 0;
+        while let Some(node) = pending.pop() {
+            visited += 1;
+            for dependent in dependents.remove(&node).unwrap_or_default() {
+                let count = incoming.get_mut(&dependent).expect("indexed dependent");
+                *count -= 1;
+                if *count == 0 {
+                    pending.push(dependent);
+                }
+            }
+        }
+        anyhow::ensure!(visited == states.len(), "cyclic snapshot dependencies");
+        Ok(result)
     }
 }

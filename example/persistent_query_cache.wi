@@ -1,0 +1,4 @@
+// Rebuild after changing the value body; the other bodies remain reusable.
+fn value() -> i64 { return 17; }
+fn stable() -> i64 { return 25; }
+fn main() { print(value() + stable()); }

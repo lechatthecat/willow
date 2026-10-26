@@ -51,7 +51,9 @@ pub(crate) fn collect_reference_debug_strings_in_program(program: &Program) -> V
         }
     }
 
-    out.into_iter().collect()
+    let mut out: Vec<_> = out.into_iter().collect();
+    out.sort_unstable();
+    out
 }
 
 pub(crate) fn collect_reference_debug_param_strings(params: &[Param], out: &mut HashSet<String>) {
@@ -215,7 +217,7 @@ fn collect_lambdas_from_walk(
 /// carries. Both are emitted as static bytes, so a name missing from this set
 /// has no data segment to point at and the site that wanted it is silently
 /// skipped.
-pub(crate) fn collect_nil_check_names(program: &Program) -> std::collections::HashSet<String> {
+pub(crate) fn collect_nil_check_names(program: &Program) -> Vec<String> {
     let mut out = std::collections::HashSet::new();
     for item in &program.items {
         match item {
@@ -232,6 +234,8 @@ pub(crate) fn collect_nil_check_names(program: &Program) -> std::collections::Ha
             Item::Interface(_) => {} // no bodies
         }
     }
+    let mut out: Vec<_> = out.into_iter().collect();
+    out.sort_unstable();
     out
 }
 

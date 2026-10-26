@@ -216,13 +216,22 @@ pub(crate) fn candidate_bodies(
         .artifacts
         .as_ref()
         .expect("revision artifacts");
+    candidate_body_ids(&old_artifacts.parsed, modules, artifacts, db)
+}
+
+pub(crate) fn candidate_body_ids(
+    old_parsed: &crate::module::artifacts::ParsedRecords,
+    modules: &[module::ResolvedModule],
+    artifacts: &UnitArtifacts,
+    db: &CompilerDb,
+) -> HashSet<crate::parser::ast::BodyId> {
     let unchanged_units: HashSet<_> = modules
         .iter()
         .map(|m| m.id)
         .chain(std::iter::once(UnitId::ENTRY))
         .filter(|unit| {
             matches!(
-                (artifacts.parsed.get(&unit.file_id()), old_artifacts.parsed.get(&unit.file_id())),
+                (artifacts.parsed.get(&unit.file_id()), old_parsed.get(&unit.file_id())),
                 (Some((a, _)), Some((b, _))) if a == b
             )
         })

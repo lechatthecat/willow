@@ -10,7 +10,7 @@ use crate::{
     semantic::ids::{FunctionId, TypeId},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct StaticId {
     pub unit: UnitId,
     pub owner: TypeId,
@@ -27,6 +27,29 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         program
     }
+    #[test]
+    fn disk_body_index_roundtrip_preserves_owners_and_skips_previous() {
+        let program = parse(
+            "fn f() { let a = |x: i64| x; } class C { pub static n: i64 = 1; pub init(self) {} pub fn g(self) {} } interface I { fn g(self) {} }",
+        );
+        let mut index = BodyIndex::default();
+        index.register_program(&program);
+        index.begin_revision(std::rc::Rc::new(BodyIndex::default()));
+        let bytes = serde_json::to_vec(&index).unwrap();
+        let restored: BodyIndex = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(index.owners, restored.owners);
+        assert_eq!(index.bodies, restored.bodies);
+        assert_eq!(index.units, restored.units);
+        assert_eq!(index.lambdas, restored.lambdas);
+        assert_eq!(index.static_ids, restored.static_ids);
+        assert_eq!(index.children, restored.children);
+        assert!(restored.previous.is_none());
+        assert_eq!(restored.visits, 0);
+        assert_eq!(restored.origin_visits, 0);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("previous").is_none());
+    }
+
     #[test]
     fn owners_lambdas_and_static_initializers_are_distinct_and_reused() {
         let program = parse(
@@ -172,7 +195,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BodyOwner {
     Function(FunctionId),
     Constructor { owner: TypeId, ordinal: u32 },
@@ -181,20 +204,24 @@ pub enum BodyOwner {
     StaticInitializer(StaticId),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct BodyIndex {
     owners: HashMap<BodyId, (UnitId, BodyOwner)>,
     units: HashMap<UnitId, Vec<BodyId>>,
     symbol_modules: HashMap<UnitId, crate::semantic::ids::SymbolModule>,
+    #[serde(with = "crate::compiler_db::map_entries")]
     bodies: HashMap<(UnitId, BodyOwner), BodyId>,
     lambdas: HashMap<ExprId, BodyId>,
     static_ids: HashMap<ExprId, StaticId>,
     origins: HashMap<BodyId, BodyId>,
     children: HashMap<BodyId, Vec<BodyId>>,
+    #[serde(skip)]
     previous: Option<std::rc::Rc<BodyIndex>>,
     #[cfg(test)]
+    #[serde(skip)]
     visits: usize,
     #[cfg(test)]
+    #[serde(skip)]
     origin_visits: usize,
 }
 

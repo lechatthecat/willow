@@ -80,6 +80,10 @@ pub(crate) struct UnitArtifacts {
     pub(crate) bodies: Rc<crate::compiler_db::ids::BodyIndex>,
     pub(crate) revision_enabled: bool,
     pub(crate) parsed: ParsedRecords,
+    pub(crate) expanded: HashMap<FileId, usize>,
+    reconciled_bodies: HashMap<BodyId, BodyId>,
+    reconciled_initializers: HashMap<crate::parser::ast::ExprId, crate::parser::ast::ExprId>,
+    pub(crate) previous_expanded: Option<(Rc<ArtifactStore>, HashMap<FileId, usize>)>,
     pub(crate) previous_parsed: Option<(Rc<ArtifactStore>, ParsedRecords)>,
     pub(crate) correspondence: crate::compiler_db::syntax::Correspondence,
     pub(crate) syntax_queries: Option<Rc<RefCell<crate::compiler_db::incremental::SyntaxQueries>>>,
@@ -362,6 +366,10 @@ impl UnitArtifacts {
                         bodies: Default::default(),
                         revision_enabled: false,
                         parsed: HashMap::new(),
+                        expanded: HashMap::new(),
+                        reconciled_bodies: HashMap::new(),
+                        reconciled_initializers: HashMap::new(),
+                        previous_expanded: None,
                         previous_parsed: None,
                         correspondence: Default::default(),
                         syntax_queries: None,
@@ -410,6 +418,28 @@ impl UnitArtifacts {
             .filter(|(hash, _)| hash == &fingerprint)
             .map(|(_, record)| store.read(*record))
             .transpose()
+    }
+
+    /// Preserve identities across generic expansion as well as parsed syntax.
+    /// Each expanded unit is reconciled once, before its executable trees spool.
+    pub(crate) fn retain_expanded(&mut self, file: FileId, program: &mut Program) -> Result<()> {
+        if !self.revision_enabled {
+            return Ok(());
+        }
+        if let Some((store, records)) = &self.previous_expanded
+            && let Some(record) = records.get(&file)
+        {
+            let old = store.read(*record)?;
+            let before = expanded_roots(program);
+            self.correspondence.reconcile(&old, program)?;
+            let after = expanded_roots(program);
+            self.reconciled_bodies
+                .extend(before.0.into_iter().zip(after.0));
+            self.reconciled_initializers
+                .extend(before.1.into_iter().zip(after.1));
+        }
+        self.expanded.insert(file, self.store.write(program)?);
+        Ok(())
     }
 
     pub(crate) fn retain_parse(
@@ -504,7 +534,10 @@ impl UnitArtifacts {
             .filter_map(|(source, fresh)| {
                 // Expansion renumbers an instance once more after creation.
                 let fresh = renumbered.get(fresh).unwrap_or(fresh);
-                Some((*fresh, self.syntax_owners.get(source)?.clone()))
+                Some((
+                    *self.reconciled_bodies.get(fresh).unwrap_or(fresh),
+                    self.syntax_owners.get(source)?.clone(),
+                ))
             })
             .collect();
         self.syntax_owners.extend(bodies);
@@ -516,7 +549,11 @@ impl UnitArtifacts {
             .iter()
             .filter_map(|(instance, template)| {
                 let owner = self.initializer_owners.get(template)?;
-                Some((*renumbered.get(instance).unwrap_or(instance), owner.clone()))
+                let fresh = renumbered.get(instance).unwrap_or(instance);
+                Some((
+                    *self.reconciled_initializers.get(fresh).unwrap_or(fresh),
+                    owner.clone(),
+                ))
             })
             .collect();
         self.initializer_owners.extend(initializers);
@@ -725,6 +762,32 @@ impl Drop for UnitArtifacts {
             );
         }
     }
+}
+
+fn expanded_roots(program: &Program) -> (Vec<BodyId>, Vec<crate::parser::ast::ExprId>) {
+    let mut bodies = Vec::new();
+    let mut initializers = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Function(f) => bodies.push(f.body.id),
+            Item::Class(c) => {
+                bodies.extend(c.methods.iter().map(|m| m.body.id));
+                bodies.extend(c.constructors.iter().map(|c| c.body.id));
+                initializers.extend(
+                    c.fields
+                        .iter()
+                        .filter_map(|f| f.initializer.as_ref().map(Expr::id)),
+                );
+            }
+            Item::Interface(i) => bodies.extend(
+                i.methods
+                    .iter()
+                    .filter_map(|m| m.default_body.as_ref().map(|b| b.id)),
+            ),
+            Item::Enum(_) => {}
+        }
+    }
+    (bodies, initializers)
 }
 
 #[cfg(test)]
