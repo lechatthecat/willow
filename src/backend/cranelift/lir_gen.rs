@@ -10224,7 +10224,25 @@ mod tests {
 
     #[test]
     fn local_string_maps_word_count_confinement() {
-        let source = include_str!("../../../docs/audits/map-workloads/word_count.wi");
+        let source = r#"import std::collections::Map;
+import std::collections::Array;
+fn main() {
+ let words: Array<String> = [];
+ let mut i = 0;
+ while i < 4096 { words.push("token_" + i.toString() + "_" + (i * 31).toString()); i = i + 1; }
+ let counts: Map<String, i64> = Map::new();
+ i = 0;
+ while i < 6000000 {
+  let word = words[i % 4096];
+  let count = match counts.get(word) { Some(v) => v, None => 0 };
+  counts.insert(word, count + 1);
+  i = i + 1;
+ }
+ let mut sum = 0;
+ i = 0;
+ while i < 4096 { sum = sum + counts.get(words[i]).unwrap(); i = i + 1; }
+ println(sum);
+}"#;
         let (program, _) = checked_lowering(source, &[]);
         let f = program
             .functions
