@@ -1,0 +1,14 @@
+class Item {
+    pub k: i64;
+}
+class Box<T> {
+    pub f: closure(T, T) -> bool;
+}
+fn less(a: Item, b: Item) -> bool {
+    return a.k < b.k;
+}
+fn main() {
+    let box = new Box<Item>(|a: Item, b: Item| less(a, b));
+    let compare = box.f;
+    println(compare(new Item(1), new Item(2)));
+}

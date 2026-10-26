@@ -864,6 +864,7 @@ impl TypeChecker {
                 match (&param.mode, &arg.mode) {
                     (ParamMode::Value, CallArgMode::Value) => {
                         if !self.types_compatible(&param.ty, aty) {
+                            let expected = self.diagnostic_type_name(&param.ty);
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
@@ -872,13 +873,13 @@ impl TypeChecker {
                                         "constructor argument {} of `{}` expects `{}`, found `{}`",
                                         i + 1,
                                         self.diagnostic_class_name(&resolved),
-                                        type_name(&param.ty),
-                                        type_name(aty)
+                                        expected,
+                                        self.diagnostic_type_name(aty)
                                     ),
                                 )
                                 .with_label(Label::primary(
                                     arg.expr.span(),
-                                    format!("expected `{}`", type_name(&param.ty)),
+                                    format!("expected `{expected}`"),
                                 )),
                             );
                         }

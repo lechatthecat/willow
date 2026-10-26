@@ -1902,6 +1902,13 @@ impl TypeChecker {
         })
     }
 
+    /// Resolve nominal instantiation aliases only in type slots of diagnostics.
+    pub(super) fn diagnostic_type_name(&self, ty: &Type) -> String {
+        type_name_with(ty, |name| {
+            self.generics.nominal_aliases.get(name).unwrap_or(name)
+        })
+    }
+
     /// Display a class using its declared generic parameters, so a diagnostic
     /// in a template body has the same spelling in every concrete instance.
     /// Only class-name slots use this helper; member names and fix text must

@@ -2036,6 +2036,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn constructor_closure_diagnostic_formatting_scales() {
+        for width in [1, 16, 256] {
+            let alias = "$type$mono$test".to_owned();
+            let ty = Type::Closure(
+                vec![Type::Named(alias.clone()); width],
+                Box::new(Type::Bool),
+            );
+            let replacement = "Item".to_owned();
+            let mut visits = 0;
+            let rendered = type_name_with(&ty, |name| {
+                visits += 1;
+                assert_eq!(name, &alias);
+                &replacement
+            });
+            assert_eq!(visits, width);
+            assert_eq!(rendered.matches("Item").count(), width);
+            assert_eq!(rendered.len(), 15 + 6 * width);
+            println!(
+                "closure_parameters={width} name_lookups={visits} output_bytes={}",
+                rendered.len()
+            );
+        }
+    }
+
+    #[test]
+    fn constructor_closure_diagnostic_nominal_arguments() {
+        for (argument, expected) in [
+            ("Item", "Item"),
+            ("i64", "i64"),
+            ("bool", "bool"),
+            ("String", "String"),
+            ("Array<Item>", "Array<Item>"),
+        ] {
+            for explicit in [false, true] {
+                for result in [false, true] {
+                    let signature = if result {
+                        format!("() -> {argument}")
+                    } else {
+                        format!("({argument}, {argument}) -> bool")
+                    };
+                    let field = if result {
+                        "closure() -> T"
+                    } else {
+                        "closure(T, T) -> bool"
+                    };
+                    let constructor = if explicit {
+                        format!("pub init(self, f: {field}) {{ self.f = f; }}")
+                    } else {
+                        String::new()
+                    };
+                    let source = format!(
+                        "class Item {{ pub k: i64; }} class Box<T> {{ pub f: {field}; {constructor} }} \n                         fn exercise(f: fn{signature}) {{ let b = new Box<{argument}>(f); }}"
+                    );
+                    let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+                    let (program, errors) = crate::parser::Parser::new(tokens).parse();
+                    assert!(errors.is_empty(), "{errors:?}");
+                    let mut checker = TypeChecker::new();
+                    checker.check_program(&program);
+                    let diagnostic = checker
+                        .errors
+                        .iter()
+                        .find(|d| d.message.contains("constructor argument 1"))
+                        .unwrap_or_else(|| panic!("{source}: {:?}", checker.errors));
+                    let expected = if result {
+                        format!("closure() -> {expected}")
+                    } else {
+                        format!("closure({expected}, {expected}) -> bool")
+                    };
+                    assert!(
+                        diagnostic
+                            .message
+                            .contains(&format!("expects `{expected}`")),
+                        "{source}: {diagnostic:?}"
+                    );
+                    assert_eq!(diagnostic.code, ErrorCode::E0201);
+                    assert_eq!(
+                        diagnostic.labels[0].message,
+                        format!("expected `{expected}`")
+                    );
+                    assert!(
+                        diagnostic
+                            .message
+                            .contains(&format!("found `fn{signature}`"))
+                    );
+                    assert!(
+                        !format!("{diagnostic:?}").contains("$type"),
+                        "{diagnostic:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn async_local_occurrences_survive_shared_spans() {
         // Twenty perspectives: ten colliding scalar counts, with the non-Send
         // local before or after them. All callable bodies also share spans,

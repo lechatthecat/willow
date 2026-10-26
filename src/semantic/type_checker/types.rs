@@ -62,6 +62,14 @@ pub(crate) fn await_output_type<N: TypeName + Clone + From<&'static str>>(
 }
 
 pub(crate) fn type_name<N: std::fmt::Display>(ty: &Type<N>) -> String {
+    type_name_with(ty, |name| name)
+}
+
+/// Render with borrowed nominal spellings, without cloning the type tree.
+pub(super) fn type_name_with<'a, N: std::fmt::Display>(
+    ty: &'a Type<N>,
+    mut name_for: impl FnMut(&'a N) -> &'a N,
+) -> String {
     enum Part<'a, N> {
         Type(&'a Type<N>),
         Text(&'static str),
@@ -75,7 +83,7 @@ pub(crate) fn type_name<N: std::fmt::Display>(ty: &Type<N>) -> String {
             Part::Name(name) => {
                 use std::fmt::Write;
                 let start = output.len();
-                write!(output, "{name}").expect("write into string");
+                write!(output, "{}", name_for(name)).expect("write into string");
                 // A real sibling mismatch may still mention a partially
                 // recovered type. Never expose the internal marker in prose.
                 if &output[start..] == "\0diagnostic-error" {

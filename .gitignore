@@ -450,3 +450,9 @@ AGENTS.md
 
 # Public generic parameter method diagnostic audit.
 !/docs/audits/generic-parameter-method-diagnostics.md
+
+# Public constructor closure diagnostic audit and reproduction.
+!/docs/audits/constructor-closure-diagnostics/
+/docs/audits/constructor-closure-diagnostics/*
+!/docs/audits/constructor-closure-diagnostics/audit.md
+!/docs/audits/constructor-closure-diagnostics/repro.wi
