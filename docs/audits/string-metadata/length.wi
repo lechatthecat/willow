@@ -1,0 +1,12 @@
+fn measure(text: String, rounds: i64) -> i64 {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < rounds {
+        sum = sum + text.len();
+        i = i + 1;
+    }
+    return sum;
+}
+fn main() {
+    println(measure("é水🌲", 100000000));
+}

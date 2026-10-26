@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::gc::{GcObjectKind, willow_alloc_with_layout, willow_gc_add_runtime_root};
 use willow_abi::string_concat::{PART_I64, PART_STRING};
+use willow_abi::string_layout::{DATA_OFFSET, LEN_OFFSET};
 
 // ---------------------------------------------------------------------------
 // Core allocation helpers
@@ -30,7 +31,9 @@ use willow_abi::string_concat::{PART_I64, PART_STRING};
 
 /// Include the length word and NUL without overflowing either size domain.
 fn string_payload_size(len: usize) -> Option<i64> {
-    let size = len.checked_add(9)?;
+    let size = len
+        .checked_add(willow_abi::string_layout::HEADER_BYTES)?
+        .checked_add(willow_abi::string_layout::TERMINATOR_BYTES)?;
     i64::try_from(size).ok()
 }
 
@@ -42,7 +45,7 @@ pub extern "C" fn willow_string_len(value: *const u8) -> i64 {
         return 0;
     }
     // SAFETY: a non-null argument is a live WillowString payload.
-    unsafe { *(value as *const i64) }
+    unsafe { *(value.add(LEN_OFFSET as usize) as *const i64) }
 }
 
 /// Allocate a new WillowString from a raw UTF-8 byte slice.
@@ -82,13 +85,13 @@ unsafe fn alloc_validated_bytes(bytes: *const u8, len_usize: usize, payload_size
         return ptr;
     }
     unsafe {
-        *(ptr as *mut i64) = len_usize as i64;
+        *(ptr.add(LEN_OFFSET as usize) as *mut i64) = len_usize as i64;
         if len_usize > 0 {
-            std::ptr::copy_nonoverlapping(bytes, ptr.add(8), len_usize);
+            std::ptr::copy_nonoverlapping(bytes, ptr.add(DATA_OFFSET), len_usize);
             #[cfg(test)]
             ALLOCATION_COPY_BYTES.set(ALLOCATION_COPY_BYTES.get() + len_usize);
         }
-        *ptr.add(8 + len_usize) = 0; // NUL terminator
+        *ptr.add(DATA_OFFSET + len_usize) = 0; // NUL terminator
     }
     ptr
 }
@@ -170,8 +173,8 @@ unsafe fn ws_as_bytes(s: *const u8) -> (*const u8, usize) {
     if s.is_null() {
         return (std::ptr::null(), 0);
     }
-    let len = unsafe { *(s as *const i64) } as usize;
-    (unsafe { s.add(8) }, len)
+    let len = unsafe { *(s.add(LEN_OFFSET as usize) as *const i64) } as usize;
+    (unsafe { s.add(DATA_OFFSET) }, len)
 }
 
 /// Content equality of two strings (willow-rpxh): `==` on `String` must
@@ -257,8 +260,8 @@ fn concat_parts(parts: &mut [u64]) -> *mut u8 {
     // SAFETY: the payload holds the length word, `total_len` bytes and a NUL;
     // the parts were measured above and are unchanged since.
     unsafe {
-        *(ptr as *mut i64) = total_len as i64;
-        let mut out = ptr.add(8);
+        *(ptr.add(LEN_OFFSET as usize) as *mut i64) = total_len as i64;
+        let mut out = ptr.add(DATA_OFFSET);
         for part in parts.chunks_exact(2) {
             if part[0] == PART_STRING {
                 let (bytes, len) = ws_as_bytes(part[1] as *const u8);
@@ -381,8 +384,8 @@ pub(crate) unsafe fn willow_string_as_bytes<'a>(s: *const u8) -> &'a [u8] {
     if s.is_null() {
         return &[];
     }
-    let len = unsafe { *(s as *const i64) } as usize;
-    unsafe { std::slice::from_raw_parts(s.add(8), len) }
+    let len = unsafe { *(s.add(LEN_OFFSET as usize) as *const i64) } as usize;
+    unsafe { std::slice::from_raw_parts(s.add(DATA_OFFSET), len) }
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +438,7 @@ mod tests {
                 "corrupt" => {
                     let ptr = willow_string_from_str("a");
                     unsafe {
-                        *ptr.add(8) = 0xff;
+                        *ptr.add(DATA_OFFSET) = 0xff;
                         willow_string_as_str(ptr);
                     }
                 }
@@ -479,7 +482,7 @@ mod tests {
             let ptr = willow_string_alloc(text.as_ptr(), text.len() as i64);
             assert!(!ptr.is_null());
             assert_eq!(unsafe { willow_string_as_str(ptr) }, text);
-            assert_eq!(unsafe { *ptr.add(8 + text.len()) }, 0);
+            assert_eq!(unsafe { *ptr.add(DATA_OFFSET + text.len()) }, 0);
         }
         static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
         let text = "literal é水🦀";
@@ -513,7 +516,10 @@ mod tests {
             crate::gc::willow_push_root(&mut rhs);
             let result = willow_string_concat(lhs, rhs);
             assert_eq!(unsafe { willow_string_as_str(result) }, left + &right);
-            assert_eq!(unsafe { *result.add(8 + left_len + right_len) }, 0);
+            assert_eq!(
+                unsafe { *result.add(DATA_OFFSET + left_len + right_len) },
+                0
+            );
             crate::gc::willow_pop_roots(2);
         }
     }
@@ -543,7 +549,10 @@ mod tests {
                 unsafe { willow_string_as_str(result) },
                 format!("{left}{right}")
             );
-            assert_eq!(unsafe { *result.add(8 + left.len() + right.len()) }, 0);
+            assert_eq!(
+                unsafe { *result.add(DATA_OFFSET + left.len() + right.len()) },
+                0
+            );
         }
         let depth = crate::gc::willow_root_depth();
         let result = willow_string_concat(std::ptr::null(), std::ptr::null());
@@ -647,7 +656,7 @@ mod tests {
             for ((slot, len), ptr) in SLOTS.iter().zip([0, 2, 7]).zip(&pointers) {
                 assert_eq!(willow_string_literal_slot(slot, TEXT.as_ptr(), len), *ptr);
                 assert_eq!(unsafe { willow_string_as_str(*ptr) }, &TEXT[..len as usize]);
-                assert_eq!(unsafe { *ptr.add(8 + len as usize) }, 0);
+                assert_eq!(unsafe { *ptr.add(DATA_OFFSET + len as usize) }, 0);
             }
             assert_ne!(pointers[0], pointers[1]);
             assert_ne!(pointers[1], pointers[2]);

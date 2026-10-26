@@ -1,6 +1,7 @@
 //! Core String operations. All positions are UTF-8 byte offsets.
 use super::{string_payload_size, ws_as_bytes};
 use crate::gc::{GcObjectKind, GcRootHandle, willow_alloc_with_layout};
+use willow_abi::string_layout::{DATA_OFFSET, LEN_OFFSET};
 
 // String creation validates UTF-8. These operations preserve that invariant;
 // rescanning the entire receiver for each substring would make splitting quadratic.
@@ -35,11 +36,15 @@ fn copy_range(value: *mut u8, start: usize, end: usize) -> *mut u8 {
     let result = willow_alloc_with_layout(GcObjectKind::String, 0, size, 0);
     if !result.is_null() {
         unsafe {
-            *(result as *mut i64) = len as i64;
+            *(result.add(LEN_OFFSET as usize) as *mut i64) = len as i64;
             if len != 0 {
-                copy_bytes(value.load().add(8 + start), result.add(8), len);
+                copy_bytes(
+                    value.load().add(DATA_OFFSET + start),
+                    result.add(DATA_OFFSET),
+                    len,
+                );
             }
-            *result.add(8 + len) = 0;
+            *result.add(DATA_OFFSET + len) = 0;
         }
     }
     result
@@ -115,19 +120,23 @@ pub extern "C" fn willow_string_repeat(value: *mut u8, count: i64) -> *mut u8 {
     let result = willow_alloc_with_layout(GcObjectKind::String, 0, size, 0);
     if !result.is_null() {
         unsafe {
-            *(result as *mut i64) = total as i64;
+            *(result.add(LEN_OFFSET as usize) as *mut i64) = total as i64;
             // Doubling copies avoid count-dependent work for empty inputs and
             // use O(log(count)) copy operations for nonempty inputs, O(total) bytes.
             if total != 0 {
-                copy_bytes(value.load().add(8), result.add(8), len);
+                copy_bytes(value.load().add(DATA_OFFSET), result.add(DATA_OFFSET), len);
                 let mut filled = len;
                 while filled < total {
                     let copied = filled.min(total - filled);
-                    copy_bytes(result.add(8), result.add(8 + filled), copied);
+                    copy_bytes(
+                        result.add(DATA_OFFSET),
+                        result.add(DATA_OFFSET + filled),
+                        copied,
+                    );
                     filled += copied;
                 }
             }
-            *result.add(8 + total) = 0;
+            *result.add(DATA_OFFSET + total) = 0;
         }
     }
     result
@@ -162,24 +171,24 @@ pub extern "C" fn willow_array_join(array: *mut u8, separator: *mut u8) -> *mut 
     let result = willow_alloc_with_layout(GcObjectKind::String, 0, size, 0);
     if !result.is_null() {
         unsafe {
-            *(result as *mut i64) = total as i64;
+            *(result.add(LEN_OFFSET as usize) as *mut i64) = total as i64;
             let mut offset = 0;
             for index in 0..count {
                 if index != 0 && separator_len != 0 {
                     copy_bytes(
-                        separator.load().add(8),
-                        result.add(8 + offset),
+                        separator.load().add(DATA_OFFSET),
+                        result.add(DATA_OFFSET + offset),
                         separator_len,
                     );
                     offset += separator_len;
                 }
                 let (bytes, len) = ws_as_bytes(join_element(array.load(), index));
                 if len != 0 {
-                    copy_bytes(bytes, result.add(8 + offset), len);
+                    copy_bytes(bytes, result.add(DATA_OFFSET + offset), len);
                     offset += len;
                 }
             }
-            *result.add(8 + total) = 0;
+            *result.add(DATA_OFFSET + total) = 0;
         }
     }
     result
@@ -258,7 +267,7 @@ mod tests {
                 assert_eq!(unsafe { willow_string_as_str(result) }, expected);
                 assert_eq!(JOIN_VISITS.get(), count as usize * 2);
                 assert_eq!(COPIED_BYTES.get(), expected.len());
-                assert_eq!(unsafe { *result.add(8 + expected.len()) }, 0);
+                assert_eq!(unsafe { *result.add(DATA_OFFSET + expected.len()) }, 0);
                 println!(
                     "word_bytes={} elements={count} visits={} copied_bytes={}",
                     word.len(),

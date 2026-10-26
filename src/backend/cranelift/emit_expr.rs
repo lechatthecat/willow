@@ -13,6 +13,34 @@ pub(super) const INT_OVERFLOW_SHL: i64 = 5;
 pub(super) const INT_OVERFLOW_SHR: i64 = 6;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    pub(super) fn emit_string_length(
+        &mut self,
+        receiver: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let present = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.append_block_param(done, types::I64);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let is_null = self.builder.ins().icmp_imm_u(IntCC::Equal, receiver, 0);
+        // Branch before loading: select with an unconditional load would
+        // dereference null. Null retains the runtime ABI's empty semantics.
+        self.builder
+            .ins()
+            .brif(is_null, done, &[zero.into()], present, &[]);
+        self.builder.switch_to_block(present);
+        self.builder.seal_block(present);
+        let len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            receiver,
+            willow_abi::string_layout::LEN_OFFSET,
+        );
+        self.builder.ins().jump(done, &[len.into()]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+        self.builder.block_params(done)[0]
+    }
+
     pub(super) fn emit_string_literal(&mut self, value: &str) -> cranelift_codegen::ir::Value {
         if let Some(data_id) = self.string_literals.get(value) {
             let data_id = *data_id;

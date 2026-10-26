@@ -1,0 +1,14 @@
+// Lengths and substring boundaries are UTF-8 byte offsets.
+fn length(text: String) -> i64 { return text.len(); }
+fn main() {
+    let text = "é水🌲";
+    println(length(""));
+    println(length(text));
+    println(text.substring(0, 2).len());
+    println(text.substring(2, 5).len());
+    println(text.substring(5, text.len()).len());
+    println(text.substring(text.len(), text.len()).len());
+    let copy = text.repeat(2);
+    gc_collect();
+    println(copy.len());
+}

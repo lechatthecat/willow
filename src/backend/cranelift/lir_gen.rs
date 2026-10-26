@@ -7615,6 +7615,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         _result: &Type,
         span: Span,
     ) -> cranelift_codegen::ir::Value {
+        // A plain metadata read has no safepoint and needs no transient roots.
+        if intrinsic == Intrinsic::StringLen {
+            return self.emit_string_length(receiver);
+        }
         // Length has no allocating/coercing successful path. Its only runtime
         // fallback receives null, so no transient receiver root is needed.
         if matches!(intrinsic, Intrinsic::ArrayLen | Intrinsic::FrozenArrayLen) {
@@ -7711,7 +7715,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_pair(tag, payload)
             }
             ArrayJoin => self.emit_value_runtime_call("willow_array_join", &[receiver, args[0]]),
-            StringLen => self.emit_value_runtime_call("willow_string_len", &[receiver]),
+            StringLen => self.emit_string_length(receiver),
             StringSubstring => self
                 .emit_value_runtime_call("willow_string_substring", &[receiver, args[0], args[1]]),
             StringSplit => {

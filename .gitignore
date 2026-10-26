@@ -475,3 +475,14 @@ AGENTS.md
 !/docs/audits/inline-satb-barrier/measurements.json
 !/docs/audits/inline-satb-barrier/examples.json
 !/docs/audits/inline-satb-barrier/integration.json
+
+# Public String metadata implementation audit and reproducible measurements.
+!/docs/audits/string-metadata/
+/docs/audits/string-metadata/*
+!/docs/audits/string-metadata/audit.md
+!/docs/audits/string-metadata/length.wi
+!/docs/audits/string-metadata/measure.py
+!/docs/audits/string-metadata/scaling.py
+!/docs/audits/string-metadata/before.json
+!/docs/audits/string-metadata/after.json
+!/docs/audits/string-metadata/scaling.json

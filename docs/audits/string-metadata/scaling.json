@@ -1,0 +1,64 @@
+[
+  {
+    "sites": 1,
+    "length_runtime_relocations": 0,
+    "function_sizes_bytes": [
+      399
+    ],
+    "total_function_bytes": 399
+  },
+  {
+    "sites": 8,
+    "length_runtime_relocations": 0,
+    "function_sizes_bytes": [
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399
+    ],
+    "total_function_bytes": 3192
+  },
+  {
+    "sites": 32,
+    "length_runtime_relocations": 0,
+    "function_sizes_bytes": [
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399,
+      399
+    ],
+    "total_function_bytes": 12768
+  }
+]

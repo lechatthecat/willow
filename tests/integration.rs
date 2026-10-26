@@ -369,3 +369,6 @@ mod uppercase_static_properties;
 
 #[path = "integration/sync_poll_gates.rs"]
 mod sync_poll_gates;
+
+#[path = "integration/string_metadata.rs"]
+mod string_metadata;

@@ -338,7 +338,7 @@ impl Intrinsic {
             StringToString | TaskResult => &[],
             I64WrappingAdd | I64WrappingSub | I64WrappingMul | I64WrappingNeg | I64CheckedAdd
             | I64CheckedSub | I64CheckedMul | I64CheckedNeg => &[],
-            StringLen => &["willow_string_len"],
+            StringLen => &[],
             StringSubstring => &["willow_string_substring"],
             StringSplit => &["willow_string_split"],
             StringContains => &["willow_string_contains"],

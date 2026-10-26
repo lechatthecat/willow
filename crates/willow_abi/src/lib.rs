@@ -43,6 +43,17 @@ pub const fn storage_word_bytes(pointer_bytes: u32) -> u32 {
     if pointer_bytes < 8 { 8 } else { pointer_bytes }
 }
 
+/// String references point to the payload, after the shared GC header.
+/// The payload contains an aligned i64 UTF-8 byte length followed by bytes and
+/// one trailing NUL. Null String references have length zero. No codepoint
+/// count or byte-index API is encoded by this layout.
+pub mod string_layout {
+    pub const LEN_OFFSET: i32 = 0;
+    pub const DATA_OFFSET: usize = 8;
+    pub const HEADER_BYTES: usize = DATA_OFFSET;
+    pub const TERMINATOR_BYTES: usize = 1;
+}
+
 /// Array payloads use fixed 64-bit slots, including on narrow-pointer targets.
 /// Buffer word zero publishes the traced prefix: logical length for ordinary
 /// arrays, initialized high-water mark for stable scalar-pair slot storage.
