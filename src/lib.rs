@@ -823,12 +823,27 @@ fn run_frontend_revision(
         }
         let dependencies =
             ModuleDependencies::with_packages(&graph.files, inputs.package_graph.as_deref());
+        // Template checking can report errors before the final checking phase.
+        // Give every source checker the same build-wide write summary so a
+        // structural marker failure cannot hide a cross-module reassignment.
+        // Body artifacts already hold the write facts; no hydration is needed.
+        let field_writes = std::rc::Rc::new(
+            storage.field_writes(
+                graph
+                    .files
+                    .iter()
+                    .map(|module| (module.identity_path(), &module.program))
+                    .chain(std::iter::once(("", &program))),
+                &dependencies,
+            ),
+        );
         let mut checkers = Vec::new();
         let mut owners = std::collections::HashMap::new();
         for module in &graph.files {
             let mut checker = semantic::TypeChecker::new();
             checker.generics.registry = std::rc::Rc::clone(&registry);
             checker.capture_generic_call_targets();
+            checker.set_field_writes(std::rc::Rc::clone(&field_writes));
             checker.set_enforce_send_sync(inputs.options.enforce_send_sync);
             register_prelude(&mut checker)?;
             register_module_imports_with_closure(
@@ -857,6 +872,7 @@ fn run_frontend_revision(
                     &inputs.options,
                     None,
                     Some(std::rc::Rc::clone(&registry)),
+                    Some(std::rc::Rc::clone(&field_writes)),
                 )?
                 .checker,
             );
@@ -1197,7 +1213,7 @@ fn typecheck_phase(
     options: &CompilerOptions,
     queries: Option<&compiler_db::CompilerDb>,
 ) -> Result<TypecheckPhase> {
-    typecheck_phase_with_generics(program, modules, artifacts, options, queries, None)
+    typecheck_phase_with_generics(program, modules, artifacts, options, queries, None, None)
 }
 
 fn typecheck_phase_with_generics(
@@ -1209,9 +1225,13 @@ fn typecheck_phase_with_generics(
     registry: Option<
         std::rc::Rc<std::cell::RefCell<semantic::type_checker::generics::TemplateRegistry>>,
     >,
+    source_field_writes: Option<std::rc::Rc<semantic::field_writes::FieldWrites>>,
 ) -> Result<TypecheckPhase> {
     let db = queries;
     let mut checker = semantic::TypeChecker::new();
+    if let Some(writes) = source_field_writes {
+        checker.set_field_writes(writes);
+    }
     if let Some(registry) = registry {
         checker.generics.registry = registry;
         checker.capture_generic_call_targets();

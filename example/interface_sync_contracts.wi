@@ -1,0 +1,23 @@
+// Sync interface implementations use immutable collections and atomic state.
+// Replacing these with Array and a reassigned i64 reports both violations.
+import std::collections::FrozenArray;
+
+interface Player extends Sync { fn score(self) -> i64; }
+class Blend implements Player {
+    pub values: FrozenArray<i64>;
+    pub fn score(self) -> i64 { return self.values[0]; }
+}
+class RandomPlayer implements Player {
+    pub seed: AtomicI64;
+    pub fn score(self) -> i64 { return self.seed.load(); }
+}
+fn id<T>(value: T) -> T { return value; }
+fn main() {
+    let blend: Player = id(new Blend([3].freeze()));
+    println(blend.score());
+    // The atomic changes; its containing field remains assigned only at construction.
+    let state = new RandomPlayer(AtomicI64::new(0));
+    state.seed.store(7);
+    let random: Player = id(state);
+    println(random.score());
+}

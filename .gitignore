@@ -495,3 +495,9 @@ AGENTS.md
 !/docs/audits/monotonic-clock/reproduce.sh
 !/docs/audits/monotonic-clock/integration.txt
 !/docs/audits/monotonic-clock/runtime.txt
+
+# Public Sync diagnostic batching audit and source-only reproducer.
+!/docs/audits/interface-sync-diagnostic-batching/
+/docs/audits/interface-sync-diagnostic-batching/*
+!/docs/audits/interface-sync-diagnostic-batching/audit.md
+!/docs/audits/interface-sync-diagnostic-batching/reproduce.py
