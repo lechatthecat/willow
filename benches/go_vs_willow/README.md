@@ -16,7 +16,11 @@ runs `run_sync.py` (all cases) and `run.py` (the seven standard scheduler cases)
 for the selected languages, writes `MEASUREMENT_<label>.jsonl` with every trial
 record, and renders `MEASUREMENT_<label>.md` with median tables, Willow/other
 ratios and optional deltas against a baseline JSONL. `compare.py report <jsonl>`
-re-renders a report without running. `run_sync.py` and `run.py` accept the same
+renders Markdown to stdout without running benchmarks or creating/changing a
+report file, including when `--baseline` is supplied. To save a report, pass
+`--out <path>` explicitly; this overwrites that path if it already exists.
+For example, `compare.py report <jsonl> --out /tmp/preview.md` saves a preview.
+`run_sync.py` and `run.py` accept the same
 `--languages willow,go,java` flag (default `willow,go`); a JSONL from a
 single-language run can be concatenated with an earlier run's JSONL and rendered
 with `report`.

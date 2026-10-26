@@ -4,8 +4,8 @@
 `run` executes both existing harnesses (`run_sync.py` and `run.py`) with the
 standard workloads for the selected languages, stores every trial record in
 `MEASUREMENT_<label>.jsonl`, and renders `MEASUREMENT_<label>.md`. `report`
-re-renders a report from an existing JSONL file, optionally with delta columns
-against a baseline JSONL.
+renders a report to stdout from an existing JSONL file, optionally with delta
+columns against a baseline JSONL. Only an explicit --out writes a report file.
 """
 
 from __future__ import annotations
@@ -442,7 +442,7 @@ def main() -> None:
     rep.add_argument("--label")
     rep.add_argument("--workers", type=int, default=8)
     rep.add_argument("--baseline", type=Path)
-    rep.add_argument("--out", type=Path)
+    rep.add_argument("--out", type=Path, help="write Markdown to this path (overwrites if it exists); default: stdout only")
 
     args = parser.parse_args()
     if args.command == "run":
@@ -463,11 +463,13 @@ def main() -> None:
         jsonl = args.jsonl
         env, rows = split_environment(json_lines(jsonl.read_text()))
         label = args.label or jsonl.stem.removeprefix("MEASUREMENT_")
-        md = args.out or jsonl.with_suffix(".md")
+        md = args.out
     baseline = split_environment(json_lines(args.baseline.read_text()))[1] if args.baseline else None
-    md.write_text(render(rows, label, baseline, args.workers, jsonl.name, env))
-    print(md)
-    print(md.read_text())
+    markdown = render(rows, label, baseline, args.workers, jsonl.name, env)
+    if md is not None:
+        md.write_text(markdown)
+        print(md)
+    print(markdown)
 
 
 if __name__ == "__main__":

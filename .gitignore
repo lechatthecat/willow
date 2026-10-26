@@ -330,3 +330,9 @@ AGENTS.md
 !/docs/audits/willow-6fv.5.8.4/measure.py
 !/docs/audits/willow-6fv.5.8.4/focused-tests.txt
 !/docs/audits/willow-6fv.5.8.4/measurement.txt
+
+# Report output regression proof and implementation audit.
+!/docs/audits/willow-n73q/
+/docs/audits/willow-n73q/*
+!/docs/audits/willow-n73q/audit.md
+!/docs/audits/willow-n73q/reproduce.py
