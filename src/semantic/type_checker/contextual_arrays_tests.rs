@@ -586,3 +586,103 @@ fn empty_array_binding_diagnostics_scale_per_binding() {
         eprintln!("empty array bindings={count} diagnostics={}", errors.len());
     }
 }
+
+#[test]
+fn static_frozen_array_freeze_hint_perspectives() {
+    let cases = [
+        ("integer literal", "FrozenArray<i64>", "[1, 2]", true),
+        ("singleton", "FrozenArray<i64>", "[1]", true),
+        ("empty literal", "FrozenArray<i64>", "[]", true),
+        ("bool", "FrozenArray<bool>", "[true]", true),
+        ("string", "FrozenArray<String>", "[\"a\"]", true),
+        ("nested array", "FrozenArray<Array<i64>>", "[[1]]", true),
+        (
+            "frozen element",
+            "FrozenArray<FrozenArray<i64>>",
+            "[[1].freeze()]",
+            true,
+        ),
+        ("constructor", "FrozenArray<i64>", "Array<i64>::new()", true),
+        ("parentheses", "FrozenArray<i64>", "([1, 2])", true),
+        ("conditional", "FrozenArray<i64>", "true ? [1] : [2]", true),
+        ("element mismatch", "FrozenArray<i64>", "[true]", true),
+        ("scalar", "FrozenArray<i64>", "1", false),
+        ("other target", "i64", "[1]", false),
+        ("other frozen target", "FrozenMap<i64, i64>", "[1]", false),
+        ("reverse", "Array<i64>", "[1].freeze()", false),
+        (
+            "frozen element mismatch",
+            "FrozenArray<bool>",
+            "[1].freeze()",
+            false,
+        ),
+        (
+            "fixed integer",
+            "FrozenArray<i64>",
+            "[1, 2].freeze()",
+            false,
+        ),
+        ("fixed empty", "FrozenArray<i64>", "[].freeze()", false),
+        ("fixed bool", "FrozenArray<bool>", "[true].freeze()", false),
+        (
+            "fixed nested",
+            "FrozenArray<Array<i64>>",
+            "[[1]].freeze()",
+            false,
+        ),
+        (
+            "fixed constructor",
+            "FrozenArray<i64>",
+            "Array<i64>::new().freeze()",
+            false,
+        ),
+    ];
+    for (name, ty, init, hint) in cases {
+        let source =
+            format!("import std::collections::Array; class C {{ pub static xs: {ty} = {init}; }}");
+        let (program, parse) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(parse.is_empty(), "{name}: {parse:?}");
+        let mut checker = TypeChecker::new();
+        checker.check_program(&program);
+        let mismatch = checker.errors.iter().find(|d| d.code == ErrorCode::E0301);
+        assert_eq!(
+            mismatch.is_some_and(|d| d.helps.iter().any(|h| h.contains(".freeze()"))),
+            hint,
+            "{name}: {:?}",
+            checker.errors
+        );
+        if hint {
+            assert!(mismatch.unwrap().message.contains("initializer"));
+        }
+        if name.starts_with("fixed") {
+            assert!(
+                checker.errors.iter().all(|d| d.severity != Severity::Error),
+                "{name}: {:?}",
+                checker.errors
+            );
+        } else if name == "frozen element mismatch" {
+            assert!(checker.errors.iter().any(|d| d.code == ErrorCode::E0201));
+        } else {
+            assert!(mismatch.is_some(), "{name}: {:?}", checker.errors);
+        }
+    }
+}
+
+#[test]
+fn static_frozen_array_freeze_hint_scales_per_initializer() {
+    for count in [1, 8, 64, 256] {
+        let fields = (0..count)
+            .map(|i| format!("pub static xs{i}: FrozenArray<i64> = [1, 2];"))
+            .collect::<String>();
+        let source = format!("class C {{ {fields} }}");
+        let (program, parse) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(parse.is_empty());
+        let mut checker = TypeChecker::new();
+        checker.check_program(&program);
+        assert_eq!(checker.errors.len(), count);
+        assert!(checker.errors.iter().all(|d| d.code == ErrorCode::E0301
+            && d.helps.len() == 1
+            && d.helps[0].contains(".freeze()")));
+        eprintln!("initializers={count} diagnostics={count} hints={count}");
+    }
+}

@@ -1019,20 +1019,26 @@ impl TypeChecker {
         self.local.current_effect_callable = previous_callable;
 
         if !self.types_compatible(&declared, &init_ty) && init_ty != Type::Void {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0301,
-                    format!(
-                        "static property `{}::{}` has type `{}` but its initializer is `{}`",
-                        c.name,
-                        field.name,
-                        type_name(&declared),
-                        type_name(&init_ty)
-                    ),
-                )
-                .with_label(Label::primary(init.span(), "initializer type mismatch")),
-            );
+            let mut diagnostic = Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0301,
+                format!(
+                    "static property `{}::{}` has type `{}` but its initializer is `{}`",
+                    c.name,
+                    field.name,
+                    type_name(&declared),
+                    type_name(&init_ty)
+                ),
+            )
+            .with_label(Label::primary(init.span(), "initializer type mismatch"));
+            if builtin_types::unary_arg(&declared, B::FrozenArray).is_some()
+                && builtin_types::unary_arg(&init_ty, B::Array).is_some()
+            {
+                diagnostic = diagnostic.with_help(
+                    "call `.freeze()` on the array initializer to produce a `FrozenArray`, e.g. `[1, 2].freeze()`; its element type must also match the declared element type",
+                );
+            }
+            self.push(diagnostic);
         }
         self.local.current_class = previous_class;
     }

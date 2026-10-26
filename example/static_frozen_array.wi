@@ -1,0 +1,10 @@
+// Freeze a literal before storing it in an immutable static collection.
+class Table {
+    pub static values: FrozenArray<i64> = [1, 2].freeze();
+}
+fn main() {
+    if Table::values.len() != 2 { panic("wrong length"); }
+    if Table::values[0] != 1 { panic("wrong first element"); }
+    if Table::values[1] != 2 { panic("wrong second element"); }
+    println("static frozen array ok");
+}
