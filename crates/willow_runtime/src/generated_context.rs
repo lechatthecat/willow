@@ -112,6 +112,8 @@ pub(crate) struct Context {
     helper: AtomicPtr<Helper>,
     tlab: AtomicPtr<crate::gc::GcTlabState>,
     panic_depth: AtomicPtr<AtomicUsize>,
+    sync_counter: Cell<*mut i32>,
+    gc_stop: Cell<*const u8>,
     pub(crate) roots: ShadowRoots,
     parent: Cell<*const Context>,
     parent_depth: Cell<usize>,
@@ -125,6 +127,8 @@ impl Context {
             helper: AtomicPtr::new(std::ptr::null_mut()),
             tlab: AtomicPtr::new(std::ptr::null_mut()),
             panic_depth: AtomicPtr::new((&raw const NO_PANIC).cast_mut()),
+            sync_counter: Cell::new(std::ptr::null_mut()),
+            gc_stop: Cell::new(std::ptr::null()),
             roots: ShadowRoots::new(),
             parent: Cell::new(std::ptr::null()),
             parent_depth: Cell::new(0),
@@ -142,6 +146,11 @@ impl Context {
 
     pub(crate) fn refresh(&self) {
         self.refresh_panic_depth();
+        // Refresh at native entry/resume, after the task context is installed.
+        // The pointees are task-owned (or null) and process-owned respectively.
+        self.sync_counter
+            .set(crate::preempt::willow_sync_poll_counter());
+        self.gc_stop.set(crate::gc::willow_gc_stop_flag());
         if !crate::gc::generated_roots_admitted() {
             self.roots.limit.set(0);
         }
@@ -170,6 +179,14 @@ impl Context {
 }
 
 const _: () = {
+    assert!(
+        std::mem::offset_of!(Context, sync_counter)
+            == willow_abi::generated_context::SYNC_COUNTER_OFFSET as usize
+    );
+    assert!(
+        std::mem::offset_of!(Context, gc_stop)
+            == willow_abi::generated_context::GC_STOP_OFFSET as usize
+    );
     assert!(std::mem::size_of::<Helper>() == willow_abi::generated_context::HELPER_DESCRIPTOR_SIZE);
     assert!(
         std::mem::offset_of!(Helper, len) == willow_abi::generated_context::HELPER_LENGTH_OFFSET
@@ -240,6 +257,13 @@ pub(crate) fn active() -> *const Context {
         return context;
     }
     THREAD.with(|context| context as *const Context)
+}
+
+/// Read exactly the pointers that generated gate loads consume.
+#[cfg(test)]
+pub(crate) fn published_sync_gates() -> (*mut i32, *const u8) {
+    let context = unsafe { &*active() };
+    (context.sync_counter.get(), context.gc_stop.get())
 }
 
 /// Test the exact published pointer, without borrowing panic TLS.
@@ -364,6 +388,27 @@ unsafe fn call_word(entry: *const (), argument: usize, context: *const Context) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_gates_thread_nested_and_restored_contexts() {
+        let _guard = crate::gc::runtime_test_guard();
+        let outer = active();
+        unsafe { &*outer }.refresh();
+        let expected = (
+            crate::preempt::willow_sync_poll_counter(),
+            crate::gc::willow_gc_stop_flag(),
+        );
+        assert!(expected.0.is_null());
+        assert!(!expected.1.is_null());
+        assert_eq!(published_sync_gates(), expected);
+        let inner = Context::new();
+        let previous = replace(&inner);
+        inner.refresh();
+        assert_eq!(published_sync_gates(), expected);
+        replace(previous);
+        assert_eq!(active(), outer);
+        assert_eq!(published_sync_gates(), expected);
+    }
 
     // Exact store/bump protocol emitted by the compiler, without a Rust Vec borrow.
     unsafe fn inline_push(roots: &ShadowRoots, slot: *mut *mut u8) {

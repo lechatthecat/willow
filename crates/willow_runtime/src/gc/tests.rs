@@ -321,7 +321,9 @@ fn multi_mutator_stw_keeps_other_thread_roots_alive_through_generated_gate() {
         let mut b_slot = b;
         willow_push_root(&mut b_slot as *mut *mut u8);
         assert!(crate::preempt::willow_sync_poll_counter().is_null());
-        let stop = willow_gc_stop_flag();
+        unsafe { &*crate::generated_context::active() }.refresh();
+        let (counter, stop) = crate::generated_context::published_sync_gates();
+        assert!(counter.is_null());
         assert_eq!(stop, willow_gc_stop_flag());
         r2.store(true, Ordering::SeqCst);
         while !d2.load(Ordering::SeqCst) {

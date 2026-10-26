@@ -19,6 +19,8 @@ const CONTRACT_CONSTANTS: &[u64] = &[
     generated_context::HELPER_OFFSET as u64,
     generated_context::TLAB_OFFSET as u64,
     generated_context::SIZE as u64,
+    generated_context::SYNC_COUNTER_OFFSET as u64,
+    generated_context::GC_STOP_OFFSET as u64,
     generated_context::ROOT_BASE_OFFSET as u64,
     generated_context::ROOT_TOP_OFFSET as u64,
     generated_context::ROOT_LIMIT_OFFSET as u64,

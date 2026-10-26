@@ -366,3 +366,6 @@ mod closed_world_dispatch;
 
 #[path = "integration/uppercase_static_properties.rs"]
 mod uppercase_static_properties;
+
+#[path = "integration/sync_poll_gates.rs"]
+mod sync_poll_gates;

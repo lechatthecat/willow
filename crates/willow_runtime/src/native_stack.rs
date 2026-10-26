@@ -880,7 +880,9 @@ mod tests {
 
     unsafe extern "C" fn counted_poll(frame: *mut c_void) -> i32 {
         let state = frame.cast::<CountedLoop>();
-        let counter = crate::preempt::willow_sync_poll_counter();
+        let (counter, stop) = crate::generated_context::published_sync_gates();
+        assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
+        assert_eq!(stop, crate::gc::willow_gc_stop_flag());
         assert!(!counter.is_null());
         unsafe {
             for index in 1..=(*state).safepoints {
@@ -956,7 +958,9 @@ mod tests {
 
     unsafe extern "C" fn boundary_budget_helper(frame: *mut c_void) -> i32 {
         let state = frame.cast::<BoundaryBudget>();
-        let counter = crate::preempt::willow_sync_poll_counter();
+        let (counter, stop) = crate::generated_context::published_sync_gates();
+        assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
+        assert_eq!(stop, crate::gc::willow_gc_stop_flag());
         unsafe {
             for _ in 0..(*state).polls_per_helper {
                 *counter -= 1;
@@ -1082,7 +1086,9 @@ mod tests {
 
     unsafe extern "C" fn batched_mixed_poll(frame: *mut c_void) -> i32 {
         let state = frame.cast::<MixedPolls>();
-        let counter = crate::preempt::willow_sync_poll_counter();
+        let (counter, stop) = crate::generated_context::published_sync_gates();
+        assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
+        assert_eq!(stop, crate::gc::willow_gc_stop_flag());
         unsafe {
             for index in 1..=(*state).total {
                 let before = (*state).resumes;
@@ -1196,7 +1202,9 @@ mod tests {
 
     unsafe extern "C" fn mixed_poll(frame: *mut c_void) -> i32 {
         let state = frame.cast::<MixedPolls>();
-        let counter = crate::preempt::willow_sync_poll_counter();
+        let (counter, stop) = crate::generated_context::published_sync_gates();
+        assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
+        assert_eq!(stop, crate::gc::willow_gc_stop_flag());
         unsafe {
             for index in 1..=(*state).total {
                 let before = (*state).resumes;
@@ -1249,7 +1257,9 @@ mod tests {
     }
 
     unsafe extern "C" fn partial_grant_across_wait(frame: *mut c_void) -> i32 {
-        let counter = crate::preempt::willow_sync_poll_counter();
+        let (counter, stop) = crate::generated_context::published_sync_gates();
+        assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
+        assert_eq!(stop, crate::gc::willow_gc_stop_flag());
         unsafe {
             // Charge one, then consume only part of a 64-poll grant.
             *counter -= 1;
@@ -1304,7 +1314,9 @@ mod tests {
     }
 
     unsafe extern "C" fn partial_grant_across_nested_quantum(frame: *mut c_void) -> i32 {
-        let counter = crate::preempt::willow_sync_poll_counter();
+        let (counter, stop) = crate::generated_context::published_sync_gates();
+        assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
+        assert_eq!(stop, crate::gc::willow_gc_stop_flag());
         unsafe {
             *counter -= 1;
             willow_sync_safepoint();
@@ -1353,7 +1365,9 @@ mod tests {
         use crate::preempt::{
             willow_preempt_check, willow_preempt_enter_no_preempt, willow_preempt_leave_no_preempt,
         };
-        let counter = crate::preempt::willow_sync_poll_counter();
+        let (counter, stop) = crate::generated_context::published_sync_gates();
+        assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
+        assert_eq!(stop, crate::gc::willow_gc_stop_flag());
         willow_preempt_enter_no_preempt();
         willow_preempt_enter_no_preempt();
         for _ in 0..100 {
@@ -1456,7 +1470,9 @@ mod tests {
 
     unsafe extern "C" fn timed_poll(frame: *mut c_void) -> i32 {
         let state = frame.cast::<CountedLoop>();
-        let counter = crate::preempt::willow_sync_poll_counter();
+        let (counter, stop) = crate::generated_context::published_sync_gates();
+        assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
+        assert_eq!(stop, crate::gc::willow_gc_stop_flag());
         unsafe {
             while (*state).resumes == 0 {
                 (*state).safepoints += 1;

@@ -66,7 +66,7 @@ fn method_delta(signature: &str, body: &str, symbol: &str) -> [usize; 2] {
 }
 
 const ROOT: &str = "root_push";
-const POLL: &str = "willow_gc_stop_flag";
+const POLL: &str = "inline_sync_gate";
 const PANIC_DEPTH: &str = "inline_panic_depth";
 const NO_EFFECTS: [(&str, &str); 1] = [("WILLOW_PANIC_EFFECTS", "0")];
 

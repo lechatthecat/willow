@@ -456,3 +456,11 @@ AGENTS.md
 /docs/audits/constructor-closure-diagnostics/*
 !/docs/audits/constructor-closure-diagnostics/audit.md
 !/docs/audits/constructor-closure-diagnostics/repro.wi
+
+# Reviewed sync poll gate audit and reproducible measurement sources.
+!/docs/audits/sync-poll-gates/
+/docs/audits/sync-poll-gates/*
+!/docs/audits/sync-poll-gates/audit.md
+!/docs/audits/sync-poll-gates/measure.py
+!/docs/audits/sync-poll-gates/baseline.jsonl
+!/docs/audits/sync-poll-gates/after.jsonl

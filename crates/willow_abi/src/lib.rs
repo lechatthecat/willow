@@ -857,14 +857,18 @@ pub mod generated_context {
     pub const TLAB_OFFSET: i32 = 8;
     /// Pointer to an AtomicUsize, valid for the current execution context.
     pub const PANIC_DEPTH_OFFSET: i32 = 16;
+    /// Task-owned countdown pointer, null outside native task execution.
+    pub const SYNC_COUNTER_OFFSET: i32 = 24;
+    /// Process-lifetime atomic GC stop gate pointer.
+    pub const GC_STOP_OFFSET: i32 = 32;
     /// Pointer to the context-owned root-slot pointer array.
-    pub const ROOT_BASE_OFFSET: i32 = 24;
+    pub const ROOT_BASE_OFFSET: i32 = 40;
     /// Initialized slot count, updated only by the running context owner.
-    pub const ROOT_TOP_OFFSET: i32 = 32;
+    pub const ROOT_TOP_OFFSET: i32 = 48;
     /// Admitted capacity; zero forces cold ownership/capacity admission.
-    pub const ROOT_LIMIT_OFFSET: i32 = 40;
+    pub const ROOT_LIMIT_OFFSET: i32 = 56;
     /// Size of the generated-code-visible prefix; runtime storage follows it.
-    pub const SIZE: usize = 48;
+    pub const SIZE: usize = 64;
     pub const HELPER_DESCRIPTOR_SIZE: usize = 16;
     pub const HELPER_LENGTH_OFFSET: usize = 8;
 }

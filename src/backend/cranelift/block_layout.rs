@@ -61,7 +61,6 @@ pub(super) fn sink_cold_regions(func: &mut Function) {
             for inst in func.layout.block_insts(block) {
                 if let cranelift_codegen::ir::InstructionData::Load { offset, .. } =
                     func.dfg.insts[inst]
-                    && i32::from(offset) == willow_abi::generated_context::PANIC_DEPTH_OFFSET
                 {
                     let address = func.dfg.inst_args(inst)[0];
                     if let cranelift_codegen::ir::ValueDef::Result(def, _) =
@@ -69,7 +68,15 @@ pub(super) fn sink_cold_regions(func: &mut Function) {
                         && func.dfg.insts[def].opcode()
                             == cranelift_codegen::ir::Opcode::GetPinnedReg
                     {
-                        eprintln!("[panic-depth-load]");
+                        match i32::from(offset) {
+                            willow_abi::generated_context::PANIC_DEPTH_OFFSET => {
+                                eprintln!("[panic-depth-load]")
+                            }
+                            willow_abi::generated_context::GC_STOP_OFFSET => {
+                                eprintln!("[sync-gate-load]")
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }

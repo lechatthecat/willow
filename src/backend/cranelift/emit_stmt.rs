@@ -389,8 +389,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Look up the gates of `emit_sync_safepoint` for the current invocation.
     pub(super) fn emit_sync_poll_gates(&mut self, spare: Option<StackSlot>) -> SyncPoll {
-        let active = self.emit_value_runtime_call("willow_sync_poll_counter", &[]);
-        let stop = self.emit_value_runtime_call("willow_gc_stop_flag", &[]);
+        let ptr_ty = reference_type(self.module.target_config());
+        let context = self.builder.ins().get_pinned_reg(ptr_ty);
+        let active = self.builder.ins().load(
+            ptr_ty,
+            MemFlagsData::trusted(),
+            context,
+            willow_abi::generated_context::SYNC_COUNTER_OFFSET,
+        );
+        let stop = self.builder.ins().load(
+            ptr_ty,
+            MemFlagsData::trusted(),
+            context,
+            willow_abi::generated_context::GC_STOP_OFFSET,
+        );
         let countdown = spare.map(|spare| {
             let ptr_ty = reference_type(self.module.target_config());
             let spare_addr = self.builder.ins().stack_addr(ptr_ty, spare, 0);
