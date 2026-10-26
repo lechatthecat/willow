@@ -407,6 +407,9 @@ pub struct FunctionDecl {
     pub is_async: bool,
     pub params: Vec<Param>,
     pub return_type: Type,
+    /// Source range of the explicit return annotation, absent for synthetic functions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_type_span: Option<Box<Span>>,
     pub body: Block,
     pub span: Span,
     /// `Some` for a module-level `const NAME: T = literal;` (willow-jz15.10).

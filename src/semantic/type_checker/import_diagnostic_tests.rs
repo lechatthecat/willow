@@ -371,3 +371,75 @@ fn iflh_default_implicit_collection_imports() {
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(errors[0].message, "unused import `unused`");
 }
+
+#[test]
+fn return_annotation_diagnostic_spans() {
+    for annotation in [
+        "Array",
+        "Array<i64>",
+        "Array<Array<i64>>",
+        "Map<i64, i64>",
+        "Array< Map<i64, i64> >",
+    ] {
+        for declaration in [
+            format!("pub fn all() -> {annotation} {{ return [1]; }}"),
+            format!("fn all() -> {annotation} {{ return [1]; }}"),
+            format!("async fn all() -> {annotation} {{ return [1]; }}"),
+            format!("fn all(x: i64) -> {annotation} {{ return [x]; }}"),
+            format!("fn all() ->\n /* before */ {annotation} /* after */ {{ return [1]; }}"),
+        ] {
+            let source = format!("{declaration} fn main() {{}}");
+            let errors = diagnostics(&source);
+            let relevant: Vec<_> = errors
+                .iter()
+                .filter(|d| {
+                    matches!(d.code, ErrorCode::E2001 | ErrorCode::E2002)
+                        || (annotation == "Array" && d.code == ErrorCode::E0201)
+                })
+                .collect();
+            let expected = if annotation == "Array" {
+                ErrorCode::E0201
+            } else if annotation.starts_with("Map") {
+                ErrorCode::E2002
+            } else {
+                ErrorCode::E2001
+            };
+            assert!(
+                relevant.iter().any(|d| d.code == expected),
+                "{source}: {errors:?}"
+            );
+            for error in relevant {
+                let span = error.primary_span().unwrap();
+                assert_eq!(
+                    &source[span.start..span.end],
+                    annotation,
+                    "{source}: {error:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn return_annotation_span_storage_scales_linearly() {
+    for count in [8, 16, 32, 64] {
+        let source: String = (0..count)
+            .map(|i| format!("fn f{i}() -> Array<i64> {{ return [1]; }}\n"))
+            .collect();
+        let (program, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(errors.is_empty());
+        let mut spans = 0;
+        for item in &program.items {
+            if let Item::Function(f) = item {
+                let span = *f.return_type_span.as_deref().unwrap();
+                assert_eq!(&source[span.start..span.end], "Array<i64>");
+                let restored: FunctionDecl =
+                    serde_json::from_str(&serde_json::to_string(f).unwrap()).unwrap();
+                assert_eq!(restored.return_type_span.as_deref(), Some(&span));
+                spans += 1;
+            }
+        }
+        assert_eq!(spans, count);
+        eprintln!("functions={count}, stored return spans={spans}");
+    }
+}

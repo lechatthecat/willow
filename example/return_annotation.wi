@@ -1,0 +1,9 @@
+import std::collections::Array;
+
+pub fn all() -> Array<i64> {
+    return [1];
+}
+
+fn main() {
+    println(all()[0]);
+}

@@ -4008,6 +4008,7 @@ mod tests {
                         module: None,
                         imports: vec![],
                         items: vec![Item::Function(FunctionDecl {
+                            return_type_span: None,
                             type_params: Vec::new(),
                             name: "main".into(),
                             public: false,

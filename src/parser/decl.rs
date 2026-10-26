@@ -834,10 +834,12 @@ impl Parser {
         }
         self.expect(TokenKind::RParen)?;
 
-        let return_type = if self.eat(TokenKind::Arrow) {
-            self.parse_type()?
+        let (return_type, return_type_span) = if self.eat(TokenKind::Arrow) {
+            let start = self.current_span();
+            let ty = self.parse_type()?;
+            (ty, Some(Box::new(start.to(self.previous_span()))))
         } else {
-            Type::Void
+            (Type::Void, None)
         };
 
         let body = self.parse_block()?;
@@ -849,6 +851,7 @@ impl Parser {
             is_async,
             params,
             return_type,
+            return_type_span,
             body,
             span,
             rust_bridge: None,
@@ -900,6 +903,7 @@ impl Parser {
             is_async: false,
             params: Vec::new(),
             return_type,
+            return_type_span: Some(Box::new(type_span)),
             body,
             span,
             rust_bridge: None,

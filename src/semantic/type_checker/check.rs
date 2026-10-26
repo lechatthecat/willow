@@ -311,7 +311,10 @@ impl TypeChecker {
                 }
                 let params = self.normalize_param_types(&f.params);
                 let param_infos = self.normalize_param_infos(&f.params);
-                let return_type = self.normalize_type(&f.return_type, f.span);
+                let return_type = self.normalize_type(
+                    &f.return_type,
+                    f.return_type_span.as_deref().copied().unwrap_or(f.span),
+                );
                 self.symbols.define_func(
                     f.name.clone(),
                     FuncInfo {

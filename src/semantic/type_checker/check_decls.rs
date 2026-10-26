@@ -1761,9 +1761,15 @@ impl TypeChecker {
         if f.rust_bridge.is_some() {
             return;
         }
-        let return_type = self.normalize_type(&f.return_type, f.span);
+        let return_type = self.normalize_type(
+            &f.return_type,
+            f.return_type_span.as_deref().copied().unwrap_or(f.span),
+        );
         let param_types = self.normalize_param_types(&f.params);
-        self.validate_type(&return_type, f.span);
+        self.validate_type(
+            &return_type,
+            f.return_type_span.as_deref().copied().unwrap_or(f.span),
+        );
         for (param, ty) in f.params.iter().zip(param_types.iter()) {
             self.validate_type(ty, param.type_span);
         }
