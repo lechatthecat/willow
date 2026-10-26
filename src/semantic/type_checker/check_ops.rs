@@ -72,7 +72,7 @@ impl TypeChecker {
             match next {
                 Work::Enter(Expr::Binary(binary)) => {
                     if matches!(binary.op, BinOp::Eq | BinOp::Ne)
-                        && self.is_unshadowed_bare_none(&binary.lhs)
+                        && is_option_none_expr(self, &binary.lhs)
                     {
                         // A bare None on the left derives its Option context
                         // from the right, retaining the original evaluation order.
@@ -92,7 +92,7 @@ impl TypeChecker {
                     let left = value;
                     if matches!(binary.op, BinOp::Eq | BinOp::Ne)
                         && is_option_type(&left)
-                        && self.is_unshadowed_bare_none(&binary.rhs)
+                        && is_option_none_expr(self, &binary.rhs)
                     {
                         let right = self.check_expr_expecting(&binary.rhs, &left);
                         value = self.finish_binary(binary, left, right);

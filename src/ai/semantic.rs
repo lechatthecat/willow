@@ -819,7 +819,19 @@ impl QuerySession {
         let typed: Vec<_> = symbols.iter().filter(|s| s.ty.is_some()).collect();
         if let Some(first) = typed.first() {
             if typed.iter().all(|s| s.ty == first.ty) {
-                let display = self.names.declaration(first, first.ty.as_ref().unwrap());
+                // A member token's receiver binds the owner's parameters, so
+                // only the declaration name itself shows the owner binder.
+                let ty = first.ty.as_ref().unwrap();
+                let at_declaration = first
+                    .location
+                    .as_ref()
+                    .is_some_and(|l| l.path == file && l.start <= byte && byte < l.end);
+                let display = if at_declaration || !first.details.type_params.is_empty() {
+                    self.names.declaration(first, ty)
+                } else {
+                    let module = first.identity.as_ref().map(|i| i.module.as_str());
+                    self.names.render(ty, module)
+                };
                 let mut result = json!({"status":"ok","type":first.ty,"type_display":display,"location":first.location});
                 if let [only] = typed[..] {
                     self.names.payload(only, &mut result);

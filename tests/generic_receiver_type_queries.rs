@@ -102,7 +102,17 @@ fn member_calls_substitute_receiver_type_arguments() {
 
 #[test]
 fn generic_bodies_report_template_types_without_aliases() {
-    for snapshot in both(snapshot(&[("main.wi", SOURCE)], "bodies")) {
+    for (restored, snapshot) in both(snapshot(&[("main.wi", SOURCE)], "bodies"))
+        .into_iter()
+        .enumerate()
+    {
+        // Declaration binders are live presentation metadata; a restored
+        // snapshot keeps the exact type without them.
+        let pop_declaration = if restored == 0 {
+            "fn<T>() -> Option<T>"
+        } else {
+            "fn() -> Option<T>"
+        };
         let revision = snapshot.revision.clone();
         let mut session = QuerySession::new(snapshot).unwrap();
         for (needle, occurrence, token, expected) in [
@@ -118,7 +128,7 @@ fn generic_bodies_report_template_types_without_aliases() {
             ("let found", 0, "found", "Option<T>"),
             ("let next", 0, "next", "Option<T>"),
             // Declarations keep their generic signatures.
-            ("fn pop(self) -> Option<T> {", 0, "pop", "fn() -> Option<T>"),
+            ("fn pop(self) -> Option<T> {", 0, "pop", pop_declaration),
             ("less: closure", 0, "less", "closure(T, T) -> bool"),
             // Concrete locals in the caller.
             ("let first", 0, "first", "Patient"),
@@ -169,7 +179,7 @@ fn builtin_members_and_plain_symbols_are_unchanged() {
     // A static generic function call keeps its declaration signature.
     let at = byte(SOURCE, "drain(waiting", 0, "drain");
     let result = type_at(&mut session, &revision, "main.wi", at);
-    assert_eq!(result["result"]["type_display"], "fn(PQueue<T>, T) -> T");
+    assert_eq!(result["result"]["type_display"], "fn<T>(PQueue<T>, T) -> T");
 }
 
 #[test]
@@ -263,7 +273,7 @@ fn typed_callee_evidence_grows_linearly_with_member_calls() {
             .semantic
             .references
             .iter()
-            .filter(|r| r.ty.is_some())
+            .filter(|r| r.ty.is_some() && !r.location.path.starts_with("<std>"))
             .collect();
         // One substituted callee type per call token; none for declarations.
         assert_eq!(typed.len(), n);
@@ -281,7 +291,14 @@ fn non_generic_member_calls_store_no_redundant_callee_type() {
     let source = "class Plain {\n    value: i64;\n    pub init(self, value: i64) { self.value = value; }\n    pub fn get(self) -> i64 { return self.value; }\n}\nfn main() {\n    let plain = new Plain(1);\n    println(plain.get());\n}\n";
     let snapshot = snapshot(&[("main.wi", source)], "plain");
     // The declaration already answers; no per-call copy is persisted.
-    assert!(snapshot.semantic.references.iter().all(|r| r.ty.is_none()));
+    assert!(
+        snapshot
+            .semantic
+            .references
+            .iter()
+            .filter(|r| !r.location.path.starts_with("<std>"))
+            .all(|r| r.ty.is_none())
+    );
     let revision = snapshot.revision.clone();
     let mut session = QuerySession::new(snapshot).unwrap();
     let at = byte(source, "plain.get", 0, "get");

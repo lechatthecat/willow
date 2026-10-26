@@ -15,7 +15,7 @@ thread_local! {
 #[willow_continuations::checker]
 impl TypeChecker {
     pub(super) fn check_try_propagate(&mut self, inner: &Expr, span: Span) -> Type {
-        let operand_ty = self.check_expr(inner);
+        let operand_ty = self.check_branch_value(inner);
 
         if let Some(some_ty) = builtin_types::unary_arg(&operand_ty, B::Option).cloned() {
             let return_ty = self.local.current_return_type.clone();
@@ -1619,7 +1619,7 @@ impl TypeChecker {
                         let expected = expected.clone();
                         self.check_expr_expecting(expr, &expected)
                     }
-                    None => self.check_expr(expr),
+                    None => self.check_branch_value(expr),
                 }
             }
             MatchBody::Block(block) => {

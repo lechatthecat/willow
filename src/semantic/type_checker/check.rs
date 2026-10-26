@@ -2495,12 +2495,50 @@ impl TypeChecker {
         let mut ty = self.check_expr_inner(expr);
         if self.error_generation == generation
             && matches!(&ty, Type::Generic(name, _) if name == "Option" || name == "Result")
-            && let Some(diag) = self.unresolved_generic_enum_diagnostic(expr, &ty, expr.span(), "x")
+            && self.report_constructor_holes(expr, &ty)
         {
-            self.push(diag);
             ty = Self::error_type();
         }
         self.finish_checked_expr(expr, ty, generation)
+    }
+
+    /// Check a value whose omitted enum parameters a sibling branch, the
+    /// enclosing operator or `?` may still supply. The enclosing inference
+    /// boundary reports whatever stays unresolved.
+    pub(super) fn check_branch_value(&mut self, expr: &Expr) -> Type {
+        let generation = self.error_generation;
+        let ty = self.check_expr_inner(expr);
+        self.finish_checked_expr(expr, ty, generation)
+    }
+
+    /// Report omitted Option/Result parameters left after branch merging on
+    /// each constructor leaf. Each branch node is visited once.
+    fn report_constructor_holes(&mut self, expr: &Expr, ty: &Type) -> bool {
+        let mut reported = false;
+        let mut pending = vec![expr];
+        while let Some(expr) = pending.pop() {
+            match expr {
+                Expr::Ternary(t) => {
+                    pending.push(&t.else_expr);
+                    pending.push(&t.then_expr);
+                }
+                Expr::Match(m) => {
+                    pending.extend(m.arms.iter().rev().filter_map(|arm| match &arm.body {
+                        MatchBody::Expr(expr) => Some(expr.as_ref()),
+                        _ => None,
+                    }))
+                }
+                _ => {
+                    if let Some(diag) =
+                        self.unresolved_generic_enum_diagnostic(expr, ty, expr.span(), "x")
+                    {
+                        self.push(diag);
+                        reported = true;
+                    }
+                }
+            }
+        }
+        reported
     }
 
     /// The common tail of [`Self::check_expr`], shared with contextual checks
@@ -3340,8 +3378,8 @@ impl TypeChecker {
                         )),
                     );
                 }
-                let then_ty = self.check_expr(&t.then_expr);
-                let else_ty = self.check_expr(&t.else_expr);
+                let then_ty = self.check_branch_value(&t.then_expr);
+                let else_ty = self.check_branch_value(&t.else_expr);
                 if let Some(unified_ty) = self.unify_ternary_types(&then_ty, &else_ty) {
                     self.resolve_generic_values([&t.then_expr, &t.else_expr], &unified_ty);
                     self.validate_type(&unified_ty, t.span);
@@ -3537,15 +3575,10 @@ impl TypeChecker {
         }
         let obj_ty = match expected_receiver {
             Some(expected) => self.check_expr_expecting(&m.object, expected),
-            None => {
-                // A method can resolve an omitted enum parameter (for example
-                // `Result::Ok(1).and_then(f)`). Check this receiver once without
-                // finalizing its holes; nested argument expressions still use
-                // the ordinary inference boundary.
-                let generation = self.error_generation;
-                let ty = self.check_expr_inner(&m.object);
-                self.finish_checked_expr(&m.object, ty, generation)
-            }
+            // A method can resolve an omitted enum parameter (for example
+            // `Result::Ok(1).and_then(f)`). Nested argument expressions still
+            // use the ordinary inference boundary.
+            None => self.check_branch_value(&m.object),
         };
         if Self::contains_error_type(&obj_ty) {
             for arg in &m.args {
