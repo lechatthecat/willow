@@ -1,0 +1,10 @@
+// Repeated concatenation exercises GC pacing and worker-count lookup.
+fn main() {
+    let mut s = "";
+    let mut i = 0;
+    while i < 40000 {
+        s = s + "abc";
+        i += 1;
+    }
+    println(s.len());
+}

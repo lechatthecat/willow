@@ -46,7 +46,20 @@ pub(super) struct Pool {
     threads: Vec<JoinHandle<()>>,
 }
 
+// Configuration is sampled on first use, consistently for pacer, queue and pool.
+// In particular, available_parallelism may walk the cgroup hierarchy on Linux.
+static CONFIGURED_COUNT: LazyLock<usize> = LazyLock::new(resolve_configured_count);
+
+#[cfg(test)]
+static CONFIGURATION_QUERIES: AtomicUsize = AtomicUsize::new(0);
+
 pub(super) fn configured_count() -> usize {
+    *CONFIGURED_COUNT
+}
+
+fn resolve_configured_count() -> usize {
+    #[cfg(test)]
+    CONFIGURATION_QUERIES.fetch_add(1, Ordering::Relaxed);
     std::env::var("WILLOW_GC_MARK_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -430,5 +443,71 @@ mod termination_tests {
         assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
         drop(pool);
         reset_internal_for_test();
+    }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+
+    #[test]
+    fn configured_count_preserves_environment_policy_in_fresh_processes() {
+        const CHILD: &str = "WILLOW_TEST_MARK_COUNT_EXPECTED";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let expected = if expected == "auto" {
+                std::thread::available_parallelism()
+                    .map(|count| count.get().saturating_sub(1).clamp(1, 4))
+                    .unwrap_or(1)
+            } else {
+                expected.parse::<usize>().unwrap()
+            };
+            for _ in 0..1_000 {
+                assert_eq!(configured_count(), expected);
+            }
+            assert_eq!(CONFIGURATION_QUERIES.load(Ordering::Relaxed), 1);
+            return;
+        }
+        for (setting, expected) in [
+            (None, "auto"),
+            (Some(""), "auto"),
+            (Some("invalid"), "auto"),
+            (Some("-1"), "auto"),
+            (Some(" 3"), "auto"),
+            (Some("999999999999999999999999999999999999"), "auto"),
+            (Some("0"), "0"),
+            (Some("1"), "1"),
+            (Some("3"), "3"),
+            (Some("64"), "64"),
+            (Some("65"), "64"),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "gc::mark_workers::configuration_tests::configured_count_preserves_environment_policy_in_fresh_processes",
+            ]).env(CHILD, expected).env_remove("WILLOW_GC_MARK_THREADS");
+            if let Some(setting) = setting {
+                command.env("WILLOW_GC_MARK_THREADS", setting);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "setting={setting:?}: {output:?}");
+        }
+    }
+
+    #[test]
+    fn configured_count_queries_source_once_under_repeated_concurrent_calls() {
+        // Exercise the production static, without resetting it or changing the
+        // process environment while other runtime tests may be using it.
+        for calls in [1, 10, 1_000, 10_000] {
+            std::thread::scope(|scope| {
+                for _ in 0..16 {
+                    scope.spawn(move || {
+                        for _ in 0..calls {
+                            assert!(configured_count() <= 64);
+                        }
+                    });
+                }
+            });
+            assert_eq!(CONFIGURATION_QUERIES.load(Ordering::Relaxed), 1);
+        }
     }
 }

@@ -336,3 +336,9 @@ AGENTS.md
 /docs/audits/willow-n73q/*
 !/docs/audits/willow-n73q/audit.md
 !/docs/audits/willow-n73q/reproduce.py
+
+# Public mark-worker configuration audit and focused measurements.
+!/docs/audits/gc-mark-worker-cache.md
+!/docs/audits/gc-mark-worker-cache-measure.py
+!/docs/audits/gc-mark-worker-cache-before.jsonl
+!/docs/audits/gc-mark-worker-cache-after.jsonl
