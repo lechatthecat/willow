@@ -3,6 +3,10 @@ fn value() -> i64 {
     let id = 1;
     return match true { true => id, false => 0 };
 }
+fn conditional_value() -> i64 {
+    let r = 11;
+    return if r > 0 { r } else { 0 };
+}
 fn early() -> i64 {
     match true { _ => { match true { _ => return 8 } } }
 }
@@ -30,4 +34,6 @@ fn main() {
     match true { _ => { let (a, b) = (4, 5); match true { _ => println(a + b) } } }
     // 10: nested loop does not inherit expression-tail restrictions.
     match true { _ => { while true { match true { _ => value() } break; } println(10); } }
+    // 11: move the complete block, including its binding and if tail, into a helper.
+    println(match true { true => conditional_value(), false => 0 });
 }

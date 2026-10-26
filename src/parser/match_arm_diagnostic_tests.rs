@@ -110,7 +110,7 @@ fn match_arm_targeted_diagnostics() {
         (
             "{ let y = 1; y }",
             "block arms cannot yield a value",
-            "helper function or an if-expression",
+            "helper function and call it as an expression arm",
             "y }",
         ),
         ("{ 1 }", "block arms cannot yield a value", "add `;`", "1"),
@@ -123,7 +123,7 @@ fn match_arm_targeted_diagnostics() {
         (
             "{ (n + v) }",
             "block arms cannot yield a value",
-            "if-expression",
+            "helper function",
             "+",
         ),
     ] {

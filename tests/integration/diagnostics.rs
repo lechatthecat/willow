@@ -1176,7 +1176,7 @@ fn match_arm_actionable_diagnostics() {
         (
             "{ let y = 1; y }",
             "block arms cannot yield a value",
-            "helper function or an if-expression",
+            "helper function and call it as an expression arm",
         ),
     ] {
         let source =
@@ -1343,6 +1343,7 @@ fn block_arm_control_value_tail_diagnostics() {
         "{ let id = 1; match false { true => id, false => 2 } }",
         "{ match false { _ => if true { 1 } else { 2 } } }",
         "{ if true { 1 } else { 2 } }",
+        "{ let r = 1; if r > 0 { r } else { 0 } }",
         "{ if true { if false { 1 } else { 2 } } else { 3 } }",
         "{ if true { 1 } else if false { 2 } else { 3 } }",
         "{ if true { match false { _ => 1 } } else { 2 } }",
@@ -1367,7 +1368,7 @@ fn block_arm_control_value_tail_diagnostics() {
                 "{body}: {stderr}"
             );
             assert!(
-                stderr.contains("helper function or an if-expression"),
+                stderr.contains("move the block arm logic into a helper function and call it as an expression arm"),
                 "{stderr}"
             );
             assert!(!stderr.contains("error[E1201]"), "{body}: {stderr}");
@@ -1379,7 +1380,7 @@ fn block_arm_control_value_tail_diagnostics() {
 fn block_arm_control_statement_workarounds_run() {
     let (out, ok) = compile_and_run(include_str!("../../example/block_arm_control_tails.wi"));
     assert!(ok, "{out}");
-    assert_eq!(out, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
+    assert_eq!(out, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n");
 }
 
 #[test]

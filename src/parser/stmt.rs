@@ -810,7 +810,7 @@ impl Parser {
         {
             return Err(self
                 .err_at(ErrorCode::E0101, "block arms cannot yield a value", expr.span())
-                .with_help("use a helper function or an if-expression to produce a value; add `;` if this is only a statement"));
+                .with_help("move the block arm logic into a helper function and call it as an expression arm; add `;` if this is only a statement"));
         }
         self.expect(TokenKind::Semicolon)?;
         Ok(Stmt::Expr(ExprStmt { expr, span }))
