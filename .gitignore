@@ -44,6 +44,7 @@ AGENTS.md
 !/docs/audits/
 /docs/audits/*
 !/docs/audits/builtin-method-diagnostics.md
+!/docs/audits/string-pattern-diagnostic.md
 !/docs/audits/gc-concurrent-foundations/
 /docs/audits/gc-concurrent-foundations/*
 !/docs/audits/gc-concurrent-foundations/audit.md

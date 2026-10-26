@@ -1,0 +1,15 @@
+// Use string equality in if/else to select among string values.
+fn classify(s: String) -> i64 {
+    if s == "a" {
+        return 1;
+    } else if s == "b" {
+        return 2;
+    } else {
+        return 0;
+    }
+}
+fn main() {
+    println(classify("a"));
+    println(classify("b"));
+    println(classify("other"));
+}

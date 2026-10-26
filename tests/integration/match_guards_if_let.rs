@@ -326,3 +326,20 @@ fn literal_payload_patterns_have_actionable_cli_errors() {
         );
     }
 }
+
+#[test]
+fn string_pattern_cli_diagnostic_and_if_else_workaround() {
+    assert_compile_error_contains(
+        r#"fn main() { let s = "a"; match s { "a" => println(1), _ => println(0), } }"#,
+        &[
+            "E0102",
+            "string literal patterns are not supported",
+            "if/else",
+            "==",
+        ],
+    );
+    assert_runs(
+        include_str!("../../example/string_pattern_if_else.wi"),
+        "1\n2\n0\n",
+    );
+}

@@ -54,6 +54,12 @@ impl Parser {
                 self.advance();
                 Ok(Pattern::LiteralInt(n, span, PatternId::fresh()))
             }
+            TokenKind::StringLiteral(_) => Err(self
+                .err(
+                    ErrorCode::E0102,
+                    "string literal patterns are not supported",
+                )
+                .with_help("use if/else with string equality (==) instead")),
             TokenKind::Minus => {
                 self.advance();
                 if let TokenKind::Integer(n) = self.peek_kind().clone() {
@@ -227,6 +233,62 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use crate::{lexer::Lexer, parser::Parser};
+    #[test]
+    fn string_pattern_diagnostic_perspectives() {
+        for literal in [
+            r#""""#,
+            r#""a""#,
+            r#""hello world""#,
+            r#""日本語""#,
+            r#""a\nb""#,
+        ] {
+            for body in [
+                format!("match value {{ {literal} => 1, _ => 0 }};"),
+                format!("match value {{ _ if false => 0, {literal} => 1, _ => 2 }};"),
+                format!("if let {literal} = value {{ println(1); }}"),
+                format!("while let {literal} = value {{ break; }}"),
+            ] {
+                let source = format!("fn f() {{ {body} }}\nasync fn main() {{ await sleep(0); }}");
+                let (program, errors) =
+                    Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+                assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+                let error = &errors[0];
+                assert_eq!(error.code, crate::diagnostics::ErrorCode::E0102);
+                assert_eq!(error.message, "string literal patterns are not supported");
+                assert!(
+                    error
+                        .helps
+                        .iter()
+                        .any(|help| help.contains("if/else") && help.contains("=="))
+                );
+                let span = error.primary_span().unwrap();
+                assert_eq!(span.start, source.find(literal).unwrap());
+                assert_eq!(span.end - span.start, literal.len());
+                assert!(program.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(f) if f.name == "main" && f.is_async)));
+            }
+        }
+    }
+
+    #[test]
+    fn string_pattern_diagnostic_linear_token_reads() {
+        use crate::parser::PARSER_TOKEN_READS;
+        for count in [16, 64, 256] {
+            let arms = "0 => 0, ".repeat(count);
+            let source = format!("fn f() {{ match value {{ {arms}\"text\" => 1, _ => 0 }}; }}");
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            PARSER_TOKEN_READS.with(|reads| reads.set(0));
+            let (_, errors) = Parser::new(tokens).parse();
+            let reads = PARSER_TOKEN_READS.with(|reads| reads.get());
+            assert_eq!(errors.len(), 1);
+            assert_eq!(
+                errors[0].message,
+                "string literal patterns are not supported"
+            );
+            assert!(reads < 100 * count + 200, "{count}: {reads}");
+            eprintln!("string pattern prefix arms={count}, token reads={reads}");
+        }
+    }
+
     #[test]
     fn literal_payload_diagnostic_linear_token_reads() {
         use crate::parser::PARSER_TOKEN_READS;
