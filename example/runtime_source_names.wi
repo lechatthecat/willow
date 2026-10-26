@@ -1,0 +1,16 @@
+// Normally prints 7 and 9. Pass any argument to see `last<i64>` in a panic
+// stack trace, with source names instead of compiler-generated hashes.
+import std::collections::Array;
+
+class Box<T> {
+    pub value: T;
+    pub fn get(self) -> T { return self.value; }
+}
+
+fn last<T>(values: Array<T>) -> T { return values.pop(); }
+
+fn main(args: Array<String>) {
+    println(new Box<i64>(7).get());
+    let values: Array<i64> = args.len() == 0 ? [9] : [];
+    println(last(values));
+}

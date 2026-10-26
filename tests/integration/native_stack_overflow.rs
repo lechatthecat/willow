@@ -346,3 +346,41 @@ mod depth_regression {
         check_result_depth(true);
     }
 }
+
+#[test]
+fn source_runtime_names_task_stack_overflow() {
+    let source = r#"
+import std::collections::Array;
+fn dive<T>(value: T, n: i64) -> i64 {
+    if n == 0 { return 0; }
+    return dive(value, n - 1) + 1;
+}
+async fn main(args: Array<String>) {
+    println(dive(1, args.len() == 0 ? 8 : 10000000));
+}
+"#;
+    for release in [false, true] {
+        let id = unique_test_id();
+        let path = temp_path(format!("source_runtime_names_{id}.wi"));
+        let binary = temp_path(format!("source_runtime_names_{id}"));
+        fs::write(&path, source).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
+        command.args(["build", &path, "-o", &binary]);
+        if release {
+            command.arg("--release");
+        }
+        let compiled = command.output().unwrap();
+        assert!(compiled.status.success(), "{compiled:?}");
+        let shallow = run_bounded(&binary, false);
+        let overflow = run_bounded(&binary, true);
+        fs::remove_file(path).unwrap();
+        remove_output_artifacts(&binary);
+        assert!(shallow.status.success(), "{shallow:?}");
+        assert_eq!(String::from_utf8_lossy(&shallow.stdout).trim(), "8");
+        assert!(!overflow.status.success(), "{overflow:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&overflow.stderr),
+            "Willow runtime error: task stack overflow while executing synchronous helper dive<i64>\n"
+        );
+    }
+}

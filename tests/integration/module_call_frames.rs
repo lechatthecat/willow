@@ -958,3 +958,160 @@ fn assert_cancel_cleanup_frames(worker: &str, call: &str, name: &str, message: &
         }
     }
 }
+
+#[test]
+fn source_runtime_names_generic_pop() {
+    let report = panic_report(
+        &[(
+            "main.wi",
+            r#"
+import std::collections::Array;
+fn a<T>(xs: Array<T>) -> T { return xs.pop(); }
+fn main() { let xs: Array<i64> = []; println(a(xs)); }
+"#,
+        )],
+        "cannot pop from an empty array",
+    );
+    assert!(report.contains("0: a<i64> at "), "{report}");
+    assert!(!report.contains("$mono$"), "{report}");
+}
+
+#[test]
+fn source_runtime_names_generic_call_paths() {
+    for (declarations, call, expected) in [
+        (
+            "fn fail<T>(x: T) { panic(\"named\"); }",
+            "fail(1);",
+            "fail<i64>",
+        ),
+        (
+            "fn fail<T>(x: T) { panic(\"named\"); }",
+            "fail(\"s\");",
+            "fail<String>",
+        ),
+        (
+            "fn fail<A, B>(x: A, y: B) { panic(\"named\"); }",
+            "fail(1, true);",
+            "fail<i64, bool>",
+        ),
+        (
+            "class Item {} fn fail<T>(x: T) { panic(\"named\"); }",
+            "fail(new Item());",
+            "fail<Item>",
+        ),
+        (
+            "class Box<T> { pub value: T; pub fn fail(self) { panic(\"named\"); } }",
+            "new Box<i64>(1).fail();",
+            "Box<i64>::fail",
+        ),
+        (
+            "class Box<T> { pub value: T; pub init(self, x: T) { self.value = x; panic(\"named\"); } }",
+            "let b = new Box<i64>(1);",
+            "Box<i64>::init",
+        ),
+        (
+            "class Box<T> { pub value: T; } fn fail<T>(x: T) { panic(\"named\"); }",
+            "fail(new Box<i64>(1));",
+            "fail<Box<i64>>",
+        ),
+        (
+            "fn fail<T>(x: T) { defer panic(\"named\"); }",
+            "fail(1);",
+            "fail<i64>",
+        ),
+    ] {
+        let source = format!("{declarations} fn main() {{ {call} }}");
+        let report = panic_report(&[("main.wi", &source)], "named");
+        assert!(report.contains(&format!("0: {expected} at ")), "{report}");
+        assert!(
+            !report.contains("$mono$") && !report.contains("$local") && !report.contains("$pkg"),
+            "{report}"
+        );
+    }
+}
+
+#[test]
+fn source_runtime_names_generic_async() {
+    for (declarations, call, expected) in [
+        (
+            "async fn fail<T>(x: i64) { await yield(); panic(\"async named\"); }",
+            "await fail<i64>(1);",
+            "fail<i64>",
+        ),
+        (
+            "class Box<T> { pub value: i64; pub async fn fail(self) { await yield(); panic(\"async named\"); } }",
+            "await new Box<i64>(1).fail();",
+            "Box<i64>::fail",
+        ),
+    ] {
+        let source = format!("{declarations} async fn main() {{ {call} }}");
+        for release in [false, true] {
+            let files = [("main.wi", source.as_str())];
+            let (ok, report) = if release {
+                compile_temp_project_release_run_stderr(&files, "main.wi")
+            } else {
+                compile_temp_project_with_env_run_stderr(&files, "main.wi", &ONE_WORKER)
+            };
+            assert!(ok, "{report}");
+            assert!(report.contains("runtime panic: async named"), "{report}");
+            assert!(report.contains(expected), "{report}");
+            assert!(
+                !report.contains("$mono$")
+                    && !report.contains("$local")
+                    && !report.contains("$pkg"),
+                "{report}"
+            );
+        }
+    }
+}
+
+#[test]
+fn source_runtime_names_generic_cancellation() {
+    assert_cancel_cleanup_frames(
+        "pub async fn waiting<T>(ready: AtomicBool) {\n    defer panic(\"cancel-named\");\n    ready.store(true);\n    await sleep(10000);\n}\n",
+        "worker::waiting<i64>(ready)",
+        "waiting<i64>",
+        "cancel-named",
+        2,
+    );
+    assert_cancel_cleanup_frames(
+        "pub class Worker<T> {\n    pub async fn waiting(self, ready: AtomicBool) {\n        defer panic(\"cancel-named\");\n        ready.store(true);\n        await sleep(10000);\n    }\n}\n",
+        "new worker::Worker<i64>().waiting(ready)",
+        "worker::Worker<i64>::waiting",
+        "cancel-named",
+        3,
+    );
+}
+
+#[test]
+fn source_runtime_names_imported_generic() {
+    let report = panic_report(
+        &[
+            (
+                "values.wi",
+                "pub class Item {} pub fn fail<T>(x: T) { panic(\"imported named\"); }",
+            ),
+            (
+                "main.wi",
+                "import values as v; fn main() { v::fail(new v::Item()); }",
+            ),
+        ],
+        "imported named",
+    );
+    assert!(report.contains("0: fail<values::Item> at "), "{report}");
+    assert!(
+        !report.contains("$mono$") && !report.contains("$local") && !report.contains("$pkg"),
+        "{report}"
+    );
+}
+
+#[test]
+fn source_runtime_names_example() {
+    let files = [(
+        "main.wi",
+        include_str!("../../example/runtime_source_names.wi"),
+    )];
+    let (stdout, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN);
+    assert!(ok, "{stdout}");
+    assert_eq!(stdout, "7\n9\n");
+}

@@ -1811,7 +1811,8 @@ impl UnitCodegenContext<'_> {
         f: &FunctionDecl,
         body: Option<crate::parser::ast::BodyId>,
     ) -> Result<()> {
-        self.declare_string_literal(&f.name)?;
+        let diagnostic_function = self.runtime_name(&f.name);
+        self.declare_string_literal(&diagnostic_function)?;
         let func_id = self.func_ids[name];
         // `willow_user_main` is always parameterless (the runtime calls it with
         // no arguments). A declared `fn main(args: Array<String>)` parameter is
@@ -1985,7 +1986,7 @@ impl UnitCodegenContext<'_> {
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
-            diagnostic_function: f.name.clone(),
+            diagnostic_function,
             diagnostic_async: false,
             overflow_helper_literal: None,
             stack_helper_established: false,
@@ -2895,12 +2896,7 @@ impl UnitCodegenContext<'_> {
         m: &MethodDecl,
         body: Option<crate::parser::ast::BodyId>,
     ) -> Result<()> {
-        // A foreign default's respelled receiver is shown by its own name
-        // (willow-kptd).
-        let shown = (class_name.strip_prefix("$local::"))
-            .or_else(|| class_name.strip_prefix(crate::semantic::ids::FOREIGN_RECEIVER_PREFIX))
-            .unwrap_or(class_name);
-        let diagnostic_function = format!("{shown}::{}", m.name);
+        let diagnostic_function = self.runtime_name(&format!("{class_name}::{}", m.name));
         self.declare_string_literal(&diagnostic_function)?;
         let mangled = self.class_method_symbol(class_name, &m.name);
         // LIR-walking path for a method body (willow-0g8j.2.18). `lower_program`

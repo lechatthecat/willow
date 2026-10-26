@@ -697,7 +697,8 @@ impl UnitCodegenContext<'_> {
                 lir_send_offsets,
             },
         )?;
-        self.compile_async_cancel_fn(cancel_fid, &f.name, &sites, &lock_sites)?;
+        let diagnostic_function = self.runtime_name(&f.name);
+        self.compile_async_cancel_fn(cancel_fid, &diagnostic_function, &sites, &lock_sites)?;
         Ok(())
     }
 
@@ -1000,7 +1001,8 @@ impl UnitCodegenContext<'_> {
                 lir_send_offsets,
             },
         )?;
-        self.compile_async_cancel_fn(cancel_fid, &poll_decl.name, &sites, &lock_sites)?;
+        let diagnostic_function = self.runtime_name(&poll_decl.name);
+        self.compile_async_cancel_fn(cancel_fid, &diagnostic_function, &sites, &lock_sites)?;
         Ok(())
     }
 
@@ -1327,8 +1329,9 @@ impl UnitCodegenContext<'_> {
         }
         let result_offset = body.result_offset;
         // Task identity remains available in release panic diagnostics.
-        self.declare_string_literal(&f.name)?;
-        let tag_name = Some(f.name.clone());
+        let diagnostic_function = self.runtime_name(&f.name);
+        self.declare_string_literal(&diagnostic_function)?;
+        let tag_name = Some(diagnostic_function.clone());
         let mut sig = self.output.module.make_signature();
         sig.params.push(AbiParam::new(reference_type(
             self.output.module.target_config(),
@@ -1475,7 +1478,7 @@ impl UnitCodegenContext<'_> {
                 }),
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
-                diagnostic_function: f.name.clone(),
+                diagnostic_function,
                 diagnostic_async: true,
                 overflow_helper_literal: None,
                 stack_helper_established: false,

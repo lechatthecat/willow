@@ -8,6 +8,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::ObjectBuilder;
 mod cleanup_stack;
+mod runtime_names;
 use cleanup_stack::Chain;
 mod runtime_module;
 use runtime_module::RuntimeObjectModule as ObjectModule;
@@ -162,6 +163,7 @@ pub struct BuildCodegenDb {
 
 /// Mutable object output, independent of unit resolution and frozen metadata.
 struct EmissionState {
+    runtime_names: HashMap<String, String>,
     rust_bridge_symbols: HashMap<(u32, String), String>,
     enum_payload_layouts: HashMap<Type, HashMap<String, std::sync::Arc<EnumPayloadLayout>>>,
     module: ObjectModule,
@@ -421,6 +423,7 @@ impl Codegen {
                 module_init_plan: ModuleInitPlan::default(),
             },
             output: EmissionState {
+                runtime_names: HashMap::new(),
                 rust_bridge_symbols: HashMap::new(),
                 enum_payload_layouts: HashMap::new(),
                 module,

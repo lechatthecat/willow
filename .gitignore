@@ -514,3 +514,7 @@ AGENTS.md
 !/docs/audits/closure-chain-stack/report.md
 !/docs/audits/closure-chain-stack/measure.py
 !/docs/audits/closure-chain-stack/measurements.jsonl
+
+# Runtime diagnostic source-name audit and focused reproducer.
+!/docs/audits/runtime-source-names.md
+!/docs/audits/runtime-source-names-check.sh

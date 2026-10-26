@@ -697,6 +697,7 @@ fn run_frontend_revision(
         )?;
     }
     let mut generic_sources = std::collections::HashMap::new();
+    let mut runtime_names = std::collections::HashMap::new();
     artifacts.snapshot_source(diagnostics::FileId::ENTRY, source)?;
     artifacts.offload(&mut program)?;
     let resolution = module::resolver::resolve_imports_spooled_entry(
@@ -946,6 +947,7 @@ fn run_frontend_revision(
         storage.offload(&mut body)?;
         program = body.into_inner();
         storage.inherit_generated_owners(&fresh_ids, &registry.borrow().origins);
+        runtime_names = std::mem::take(&mut registry.borrow_mut().runtime_names);
         graph.artifacts = Some(storage);
     }
     let mut artifacts = graph.artifacts.take().expect("spooled import graph");
@@ -992,6 +994,7 @@ fn run_frontend_revision(
         desugar_dependencies,
     );
     db.generic_sources = generic_sources;
+    db.runtime_names = runtime_names;
     db.source_imports_checked = source_imports_checked;
     db.field_writes = std::rc::Rc::new(
         artifacts.field_writes(
@@ -2471,7 +2474,7 @@ fn run_backend(
     let Frontend {
         program,
         mut module_graph,
-        db,
+        mut db,
     } = frontend;
     let module_init_plan = ir::module_init::ModuleInitPlan::from_graph(&module_graph);
     let artifacts = module_graph.artifacts.take().expect("spooled frontend");
@@ -2499,6 +2502,7 @@ fn run_backend(
         std::rc::Rc::clone(&db.lir),
         db.effects.static_initializers.order(),
     );
+    codegen.set_runtime_names(std::mem::take(&mut db.runtime_names));
     codegen.set_module_init_plan(module_init_plan);
     // Shared declaration metadata comes from the checked entry artifact.
     {

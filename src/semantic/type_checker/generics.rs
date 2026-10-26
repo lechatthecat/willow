@@ -48,6 +48,9 @@ pub(crate) struct TemplateRegistry {
     /// instance id -> template id. Revision tracking binds each generated
     /// body to its template's source syntax.
     pub origins: GeneratedOrigins,
+    /// Instance segment -> source spelling with concrete type arguments.
+    /// Shared across units; keys keep linker identity out of runtime reports.
+    pub runtime_names: HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -1863,6 +1866,7 @@ impl TypeChecker {
             name.clone()
         } else {
             let name = symbol(&template.name, &identity_args);
+            self.record_runtime_instance_name(&name, &template.name, &args);
             self.generics.instances.insert(key.clone(), name.clone());
             let Some(fresh) = self.reserve_instantiation(&key, span) else {
                 return Some(Self::error_type());
@@ -1900,6 +1904,36 @@ impl TypeChecker {
         } else {
             result
         })
+    }
+
+    fn record_runtime_instance_name(&self, symbol: &str, source: &str, args: &[Type]) {
+        if self
+            .generics
+            .registry
+            .borrow()
+            .runtime_names
+            .contains_key(symbol)
+        {
+            return;
+        }
+        let args = args
+            .iter()
+            .map(|arg| {
+                let logical =
+                    arg.substitute_names(|name| self.generics.logical_types.get(name).cloned());
+                let canonical = logical.map_names(|name| {
+                    let name = self.generics.nominal_aliases.get(name).unwrap_or(name);
+                    self.generic_type_identity(name)
+                });
+                self.diagnostic_type_name(&canonical)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.generics
+            .registry
+            .borrow_mut()
+            .runtime_names
+            .insert(symbol.to_owned(), format!("{source}<{args}>"));
     }
 
     /// Resolve nominal instantiation aliases only in type slots of diagnostics.
@@ -2005,6 +2039,7 @@ impl TypeChecker {
             .collect();
         let template_access = name.to_string();
         let local_name = symbol(&template.name, &identity_args);
+        self.record_runtime_instance_name(&local_name, &template.name, &args);
         let name = self
             .generics
             .class_paths
