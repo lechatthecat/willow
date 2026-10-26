@@ -390,10 +390,19 @@ fn closure_field_postfix_linear_ast_counts() {
         let mut node = &root;
         let mut calls = 0;
         let mut arguments = 0;
-        while let Expr::MethodCall(call) = node {
+        while let Expr::Match(binding) = node {
+            let MatchBody::Expr(body) = &binding.arms[0].body else {
+                panic!()
+            };
+            let Expr::Call(call) = body.as_ref() else {
+                panic!()
+            };
             calls += 1;
             arguments += call.args.len();
-            node = &call.object;
+            let Expr::FieldAccess(receiver, ..) = binding.scrutinee.as_ref() else {
+                panic!()
+            };
+            node = receiver;
         }
         assert!(matches!(node, Expr::Var(name, ..) if name == "obj"));
         assert_eq!((calls, arguments), (size, size));

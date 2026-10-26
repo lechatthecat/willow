@@ -1,17 +1,15 @@
-// Callable fields currently use a local binding before invocation.
+// Parentheses read a callable field before invoking it.
+// Direct receiver.f(args) retains method dispatch.
 class Plain {
     pub f: closure(i64) -> i64;
     pub fn run(self, x: i64) -> i64 {
-        // self.f(x) and (self.f)(x) explain this supported form.
-        let callback = self.f;
-        return (callback)(x);
+        return (self.f)(x);
     }
 }
 class Box<T> {
     pub f: closure(T) -> T;
     pub fn run(self, x: T) -> T {
-        let callback = self.f;
-        return ((callback))(x);
+        return ((self.f))(x);
     }
 }
 fn main() {

@@ -224,3 +224,94 @@ fn test_closure_field_binding_example() {
     assert!(ok, "compilation failed");
     assert_eq!(out, "10\n21\n");
 }
+
+#[test]
+fn test_parenthesized_callable_field_perspectives() {
+    let source = r#"
+class Holder {
+    pub f: closure(i64) -> i64;
+    pub fn run(self, x: i64) -> i64 { return (self.f)(x); }
+    pub fn method(self, x: i64) -> i64 { return x + 100; }
+}
+class Box<T> {
+    pub f: closure(T) -> T;
+    pub fn run(self, x: T) -> T { return ((self.f))(x); }
+}
+class Outer { pub inner: Holder; }
+class Zero { pub f: closure() -> i64; }
+class Two { pub f: closure(i64, i64) -> i64; }
+class Flag { pub f: closure(bool) -> bool; }
+class Text { pub f: closure(String) -> String; }
+fn make() -> Holder { println(90); return new Holder(|x: i64| x + 1); }
+fn argument() -> i64 { println(91); return 2; }
+fn main() {
+    let offset = 3;
+    let h = new Holder(|x: i64| x + offset);
+    let b = new Box<i64>(|x: i64| x * offset);
+    let o = new Outer(h);
+    let z = new Zero(|| offset);
+    let t = new Two(|x: i64, y: i64| x + y + offset);
+    let flag = new Flag(|x: bool| !x);
+    let text = new Text(|x: String| x);
+    println((h.f)(2));
+    println(((h.f))(3));
+    println(h.run(4));
+    println((b.f)(5));
+    println(b.run(6));
+    println((o.inner.f)(7));
+    println((z.f)());
+    println((t.f)(1, 2));
+    println((flag.f)(true));
+    println((text.f)("ok"));
+    println(1 + (h.f)(8));
+    println((h.f)((b.f)(2)));
+    println((h.f)(1,));
+    println(h.method(2));
+    let local = h.f;
+    println((local)(3));
+    println((make().f)(argument()));
+    let many = [h];
+    println((many[0].f)(4));
+    println([(h.f)(5)][0]);
+    println(if true { (h.f)(6) } else { 0 });
+    println((h.f)(1) + (h.f)(2));
+    let strings = new Box<String>(|x: String| x);
+    println((strings.f)("generic"));
+    println(strings.run("self"));
+}
+"#;
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "compilation failed: {out}");
+    assert_eq!(
+        out,
+        "5\n6\n7\n15\n18\n10\n3\n6\nfalse\nok\n12\n9\n4\n102\n6\n90\n91\n3\n7\n8\n9\n9\ngeneric\nself\n"
+    );
+}
+
+#[test]
+fn test_parenthesized_callable_field_snapshot_and_fn() {
+    let source = r#"
+class Holder { pub f: closure(i64) -> i64; }
+class Function { pub f: fn(i64) -> i64; }
+class Sink { pub f: closure(i64) -> void; }
+fn increment(x: i64) -> i64 { return x + 1; }
+fn replace(h: Holder) -> i64 {
+    h.f = |x: i64| x + 100;
+    return 2;
+}
+fn main() {
+    let offset = 5;
+    let h = new Holder(|x: i64| x + offset);
+    // Capture the old callable before evaluating the mutating argument.
+    println((h.f)(replace(h)));
+    println((h.f)(2));
+    let function = new Function(increment);
+    println((function.f)(3));
+    let sink = new Sink(|x: i64| { println(x); });
+    (sink.f)(4);
+}
+"#;
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "compilation failed: {out}");
+    assert_eq!(out, "7\n102\n4\n4\n");
+}

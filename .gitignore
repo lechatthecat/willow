@@ -394,3 +394,9 @@ AGENTS.md
 # Public constructor-inference audit and source-only reproducer.
 !/docs/audits/constructor-inference-diagnostics.md
 !/docs/audits/constructor-inference-repro.wi
+
+# Reviewed callable-field semantics audit and deterministic reproduction.
+!/docs/audits/parenthesized-callable-fields/
+/docs/audits/parenthesized-callable-fields/*
+!/docs/audits/parenthesized-callable-fields/audit.md
+!/docs/audits/parenthesized-callable-fields/count_codegen.py

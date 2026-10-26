@@ -494,8 +494,8 @@ impl Parser {
             } else if matches!(self.peek_kind(), TokenKind::LParen)
                 && matches!(lhs, Expr::Var(..) | Expr::FieldAccess(..))
             {
-                // Parentheses disappear from the AST. Reuse named-call/member
-                // resolution, including its closure-field binding diagnostic.
+                // A field reaching this branch was separated from its arguments
+                // by parentheses; direct `.method(args)` is handled above.
                 self.advance();
                 let args = self.parse_call_args_after_lparen()?;
                 lhs = match &mut lhs {
@@ -506,13 +506,35 @@ impl Parser {
                         span: *span,
                         id: ExprId::fresh(),
                     })),
-                    Expr::FieldAccess(object, method, span, _) => {
-                        Expr::MethodCall(Box::new(MethodCallExpr {
-                            object: object.take(),
-                            method: std::mem::take(method),
-                            args,
-                            span: *span,
+                    Expr::FieldAccess(..) => {
+                        // Reuse the existing scoped binding/call lowering. The
+                        // receiver is moved once, and `$` cannot occur in a
+                        // source identifier, so arguments cannot capture this
+                        // compiler-owned binding.
+                        let span = lhs.span();
+                        let name = "$field_callable".to_owned();
+                        Expr::Match(Box::new(MatchExpr {
+                            block_arm_tail: false,
                             id: ExprId::fresh(),
+                            scrutinee: Box::new(lhs.take()),
+                            arms: vec![MatchArm {
+                                pattern: Pattern::Binding {
+                                    name: name.clone(),
+                                    span,
+                                    id: PatternId::fresh(),
+                                },
+                                guard: None,
+                                body: MatchBody::Expr(Box::new(Expr::Call(Box::new(CallExpr {
+                                    type_args: vec![],
+                                    callee: name,
+                                    args,
+                                    span,
+                                    id: ExprId::fresh(),
+                                })))),
+                                span,
+                            }],
+                            span,
+                            source: MatchSource::Match,
                         }))
                     }
                     _ => unreachable!(),

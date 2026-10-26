@@ -240,30 +240,29 @@ fn ticket_52_annotation_span_preserves_file_identity() {
 fn closure_field_call_help_perspectives() {
     for (class, ty) in [("Plain", "i64"), ("Box<T>", "T")] {
         for callable in ["closure", "fn"] {
-            for call in ["self.f(x)", "(self.f)(x)", "((self.f))(x)"] {
-                let source = format!(
-                    "class {class} {{ f: {callable}({ty}) -> {ty}; pub fn run(self, x: {ty}) -> {ty} {{ return {call}; }} }} fn main() {{}}"
-                );
-                let errors = check_source(&source);
-                let error = errors
+            let call = "self.f(x)";
+            let source = format!(
+                "class {class} {{ f: {callable}({ty}) -> {ty}; pub fn run(self, x: {ty}) -> {ty} {{ return {call}; }} }} fn main() {{}}"
+            );
+            let errors = check_source(&source);
+            let error = errors
+                .iter()
+                .find(|d| d.code == ErrorCode::E0502)
+                .unwrap_or_else(|| panic!("{source}: {errors:?}"));
+            assert!(
+                error
+                    .helps
                     .iter()
-                    .find(|d| d.code == ErrorCode::E0502)
-                    .unwrap_or_else(|| panic!("{source}: {errors:?}"));
-                assert!(
-                    error
-                        .helps
-                        .iter()
-                        .any(|h| h.contains("let callback = receiver.f; callback(...)")),
-                    "{source}: {errors:?}"
-                );
-                assert!(
-                    error
-                        .labels
-                        .iter()
-                        .any(|l| l.message == "callable field declared here"),
-                    "{errors:?}"
-                );
-            }
+                    .any(|h| h.contains("let callback = receiver.f; callback(...)")),
+                "{source}: {errors:?}"
+            );
+            assert!(
+                error
+                    .labels
+                    .iter()
+                    .any(|l| l.message == "callable field declared here"),
+                "{errors:?}"
+            );
         }
     }
 }
@@ -281,7 +280,7 @@ fn closure_field_help_does_not_replace_missing_method_diagnostic() {
 
 #[test]
 fn closure_field_help_inherited_declaration() {
-    let source = "open class Base { pub f: closure(i64) -> i64; } class Child extends Base { pub fn run(self) { (self.f)(1); } } fn main() {}";
+    let source = "open class Base { pub f: closure(i64) -> i64; } class Child extends Base { pub fn run(self) { self.f(1); } } fn main() {}";
     let errors = check_source(source);
     let error = errors.iter().find(|d| d.code == ErrorCode::E0502).unwrap();
     let label = error
@@ -294,11 +293,11 @@ fn closure_field_help_inherited_declaration() {
 }
 
 #[test]
-fn closure_field_parentheses_preserve_named_method_dispatch() {
+fn closure_field_parentheses_require_field_read() {
     let errors = check_source(
         "class Plain { pub fn f(self, x: i64) -> i64 { return x; } pub fn run(self) -> i64 { return (self.f)(1); } } fn main() {}",
     );
-    assert!(errors.is_empty(), "{errors:?}");
+    assert!(!errors.is_empty(), "a method is not a field");
 }
 
 #[test]
@@ -583,5 +582,35 @@ fn sentinel_diagnostics_lock_target_work() {
         let visits = RECOVERY_TYPE_VISITS.with(|count| count.get());
         assert_eq!(visits, 2 * uses);
         println!("lock_targets={uses} recovery_visits={visits}");
+    }
+}
+
+#[test]
+fn parenthesized_callable_field_type_checks() {
+    for (class, ty) in [("Plain", "i64"), ("Box<T>", "T")] {
+        for callable in ["closure", "fn"] {
+            for call in ["(self.f)(x)", "((self.f))(x)"] {
+                let source = format!(
+                    "class {class} {{ f: {callable}({ty}) -> {ty}; pub fn run(self, x: {ty}) -> {ty} {{ return {call}; }} }} fn main() {{}}"
+                );
+                let errors = check_source(&source);
+                assert!(errors.is_empty(), "{source}: {errors:?}");
+            }
+        }
+    }
+    let inherited = "open class Base { pub f: closure(i64) -> i64; } class Child extends Base { pub fn run(self) -> i64 { return (self.f)(1); } } fn main() {}";
+    assert!(check_source(inherited).is_empty());
+    for source in [
+        "class H { pub f: i64; } fn main() { let h = new H(1); (h.f)(2); }",
+        "class H { pub f: closure(i64) -> i64; } fn main() { let h = new H(|x: i64| x); (h.f)(); }",
+        "class H { pub f: closure(i64) -> i64; } fn main() { let h = new H(|x: i64| x); (h.f)(1, 2); }",
+        "class H { pub f: closure(i64) -> i64; } fn main() { let h = new H(|x: i64| x); (h.f)(true); }",
+        "class H { f: closure(i64) -> i64; } fn read(h: H) { (h.f)(1); } fn main() {}",
+        "class H { pub f: closure(i64) -> i64; } fn read(h: H) { (h.absent)(1); } fn main() {}",
+    ] {
+        assert!(
+            !check_source(source).is_empty(),
+            "accepted invalid source: {source}"
+        );
     }
 }
