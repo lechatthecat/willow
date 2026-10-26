@@ -1,0 +1,11 @@
+fn main() {
+    let text = "日本語";
+    let index = text.find("本");
+    if index >= 0 {
+        println(text.slice(index, index + 3));
+    }
+    let missing = text.find("x");
+    println(missing == -1);
+    println(text.contains("本"));
+    println(text.find(""));
+}

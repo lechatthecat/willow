@@ -1629,14 +1629,28 @@ impl TypeChecker {
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
             _ => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!("type `{}` has no methods", type_name(obj_ty)),
+                let mut diagnostic = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!("type `{}` has no methods", type_name(obj_ty)),
+                )
+                .with_label(Label::primary(span, "method call on non-class type"));
+                if *obj_ty == Type::I64
+                    && matches!(
+                        method_name,
+                        "unwrap"
+                            | "expect"
+                            | "unwrap_or"
+                            | "is_some"
+                            | "is_none"
+                            | "map"
+                            | "and_then"
+                            | "or_else"
                     )
-                    .with_label(Label::primary(span, "method call on non-class type")),
-                );
+                {
+                    diagnostic = diagnostic.with_help(STRING_FIND_SENTINEL_HELP);
+                }
+                self.push(diagnostic);
                 return Type::Void;
             }
         };

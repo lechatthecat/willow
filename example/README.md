@@ -276,6 +276,13 @@ original allocation. `"日本語".find("本")` returns `3`, and
 would split a UTF-8 character. `split` returns a normal mutable array; an explicit
 `Array<String>` type annotation requires `import std::collections::Array;`.
 
+`String.find` deliberately retains its `i64` sentinel API for compatibility with
+existing offset arithmetic and comparisons. Unlike `Map.get`, it does not return
+an `Option`: `.unwrap_or(...)` and `Some`/`None` patterns cannot be used on its
+result. Check `index >= 0` before slicing; `0` is a successful match, and `-1`
+means absence. Use `contains` when only existence matters. See
+[string_find.wi](string_find.wi) for a runnable example.
+
 ### Default floating-point display
 
 `println(value)`, `value.toString()`, `format("{}", value)`, and

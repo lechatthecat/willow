@@ -305,3 +305,26 @@ fn array_join_generated_calls_scale_with_callsites() {
         }
     }
 }
+
+#[test]
+fn string_find_sentinel_example() {
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress,
+    ] {
+        let (out, ok) = run(include_str!("../../../example/string_find.wi"));
+        assert!(ok, "{out}");
+        assert_eq!(out, "本\ntrue\ntrue\n0\n");
+    }
+}
+
+#[test]
+fn string_find_sentinel_diagnostic_is_rendered() {
+    let stderr =
+        compile_error_stderr(r#"fn main() { let index = "abc".find("b"); index.unwrap_or(0); }"#);
+    assert!(stderr.contains("E0201"), "{stderr}");
+    assert!(stderr.contains("String.find(needle)"), "{stderr}");
+    assert!(stderr.contains("-1 means not found"), "{stderr}");
+    assert!(stderr.contains("index >= 0"), "{stderr}");
+}

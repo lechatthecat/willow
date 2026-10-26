@@ -430,3 +430,8 @@ AGENTS.md
 !/docs/audits/tlab-refill-accounting/audit.md
 !/docs/audits/tlab-refill-accounting/verify.py
 !/docs/audits/tlab-refill-accounting/validation.txt
+
+# Public String.find API decision and implementation audit.
+!/docs/audits/string-find-sentinel/
+/docs/audits/string-find-sentinel/*
+!/docs/audits/string-find-sentinel/README.md

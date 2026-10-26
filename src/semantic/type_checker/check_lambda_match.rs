@@ -59,9 +59,11 @@ impl TypeChecker {
                         ),
                     )
                     .with_label(Label::primary(span, "not a Result or Option"))
-                    .with_help(
-                        "wrap the value in `Result::Ok(...)`, `Result::Err(...)`, or `Option::Some(...)`",
-                    ),
+                    .with_help(if operand_ty == Type::I64 {
+                        STRING_FIND_SENTINEL_HELP
+                    } else {
+                        "wrap the value in `Result::Ok(...)`, `Result::Err(...)`, or `Option::Some(...)`"
+                    }),
                 );
                 return Type::Void;
             }
@@ -942,6 +944,9 @@ impl TypeChecker {
                         diagnostic = diagnostic.with_help(
                             "Channel::recv() returns T; use `recv_opt()` to receive an Option<T>",
                         );
+                    }
+                    if scrutinee_ty == Type::I64 && diagnostic.helps.is_empty() {
+                        diagnostic = diagnostic.with_help(STRING_FIND_SENTINEL_HELP);
                     }
                     self.push(diagnostic);
                 }
