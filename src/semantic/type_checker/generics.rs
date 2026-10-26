@@ -479,7 +479,8 @@ mod template_registry_tests {
                 let registry = checker.generics.registry.borrow();
                 assert_eq!(registry.class_requests, uses * depth);
                 assert_eq!(registry.class_specializations, depth);
-                assert_eq!(registry.class_copies, 1);
+                // `Wrap` and the bundled `Array` template are each copied once.
+                assert_eq!(registry.class_copies, 2);
                 println!(
                     "lambda annotations: uses={uses} depth={depth} requests={} specializations={} copies={}",
                     registry.class_requests, registry.class_specializations, registry.class_copies
@@ -514,7 +515,8 @@ mod template_registry_tests {
                     let registry = registry.borrow();
                     assert_eq!(registry.class_requests, consumers * uses);
                     assert_eq!(registry.class_specializations, 1);
-                    assert_eq!(registry.class_copies, 1);
+                    // `Box` and the bundled `Array` template are each copied once.
+                    assert_eq!(registry.class_copies, 2);
                     assert_eq!(pending, 1);
                     println!(
                         "WILLOW_GENERIC_MEMBER_AUDIT {}",

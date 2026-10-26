@@ -313,6 +313,22 @@ impl TypeChecker {
         body.import_type_hints = self.import_type_hints.clone();
         body.fully_qualified_collection_types = self.fully_qualified_collection_types.clone();
         body.missing_collection_imports_reported = self.missing_collection_imports_reported.clone();
+        // Array annotations in a body normalize through the bundled template,
+        // which is a declaration like any other the body reads.
+        for name in ["$std::collections::Array", "Array"] {
+            if let Some(template) = self.generics.classes.get(name)
+                && template.abi_storage.is_some()
+            {
+                body.generics
+                    .classes
+                    .insert(name.to_owned(), std::rc::Rc::clone(template));
+                if let Some(path) = self.generics.class_paths.get(name) {
+                    body.generics
+                        .class_paths
+                        .insert(name.to_owned(), path.clone());
+                }
+            }
+        }
         body
     }
 
@@ -709,14 +725,9 @@ mod tests {
     /// before body queries run: templates are checked by a checker without
     /// queries, and only the expanded, template-free program reaches the
     /// cached body checker (willow-r6v4).
+    /// Arrays instantiate the bundled source template, so every program
+    /// expands even without templates of its own.
     fn expand_generics(program: &mut Program) {
-        if !program.items.iter().any(|item| match item {
-            Item::Function(f) => !f.type_params.is_empty(),
-            Item::Class(c) => !c.type_params.is_empty(),
-            _ => false,
-        }) {
-            return;
-        }
         let mut checker = TypeChecker::new();
         crate::register_prelude(&mut checker).unwrap();
         checker.check_program(program);

@@ -486,11 +486,30 @@ fn records(report: &str) -> Vec<String> {
                 current.push('\n');
                 current.push_str(line);
             }
-            _ => records.push(line.to_string()),
+            _ => records.push(file_order_free(line)),
         }
     }
     records.sort();
     records
+}
+
+/// File ids follow import order, so per-file hydration counts are compared
+/// as a multiset: the same units are hydrated equally often in any order.
+fn file_order_free(line: &str) -> String {
+    line.split(' ')
+        .map(|field| match field.strip_prefix("hydrates_by_file=") {
+            Some(counts) => {
+                let mut counts: Vec<_> = counts
+                    .split(',')
+                    .filter_map(|entry| entry.split_once(':').map(|(_, count)| count))
+                    .collect();
+                counts.sort_unstable();
+                format!("hydrates_by_file={}", counts.join(","))
+            }
+            None => field.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Spec 9.4: results are a function of the inputs, never of the order in

@@ -705,13 +705,6 @@ pub(crate) fn snapshot(
         .take()
         .context("analysis capture disabled")?;
     generics::restore(&frontend.db.generic_sources, &mut captured);
-    // The bundled standard library is not workspace source: it has no
-    // editable symbols or references.
-    for file in &frontend.module_graph.files {
-        if file.is_bundled() {
-            captured.remove(&file.id);
-        }
-    }
     let mut paths = HashMap::from([(UnitId::ENTRY, entry.to_string_lossy().into_owned())]);
     let mut namespaces = HashMap::new();
     let mut programs = HashMap::from([(UnitId::ENTRY, &frontend.program)]);
@@ -1322,6 +1315,14 @@ pub(crate) fn snapshot(
             if let Ok(bytes) = std::fs::read(root.join(name)) {
                 config.push_str(&hash(bytes));
             }
+        }
+    }
+    // The bundled standard library is not workspace source. Its bodies give
+    // workspace calls their effects above, but it has no editable symbols or
+    // references.
+    for file in &frontend.module_graph.files {
+        if file.is_bundled() {
+            captured.remove(&file.id);
         }
     }
     let (symbol_definitions, symbol_references) =

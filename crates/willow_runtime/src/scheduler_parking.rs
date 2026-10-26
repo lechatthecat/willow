@@ -255,37 +255,66 @@ mod tests {
         }
     }
 
+    /// Wait until `count` waiters of a shared queue registered. Another
+    /// runtime test may publish an event on the same queue first, waking a
+    /// waiter before it registers: that reports `false`.
+    fn registered_since(waiters: &IdleWaiters, count: usize, generation: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while waiters.registered.load(Ordering::SeqCst) != count {
+            if waiters.generation() != generation {
+                return false;
+            }
+            assert!(Instant::now() < deadline, "waiter registration timed out");
+            std::thread::yield_now();
+        }
+        true
+    }
+
     #[test]
     fn idle_gc_stops_do_not_wake_workers_or_completion_drivers() {
         let _test = crate::gc::runtime_test_guard();
         for waiters in [&*IDLE_WAITERS, &*COMPLETION_WAITERS] {
             for workers in [1, 4, 16] {
                 for cycles in [1, 8, 64] {
-                    crate::gc::reset_internal_for_test();
-                    let generation = waiters.generation();
-                    let probes = AtomicUsize::new(0);
-                    std::thread::scope(|scope| {
-                        for _ in 0..workers {
-                            let probes = &probes;
-                            scope.spawn(move || {
-                                let _mutator = crate::gc::MutatorRegistration::new();
-                                assert!(waiters.wait_inner(generation, None, || {
-                                    probes.fetch_add(1, Ordering::SeqCst);
-                                }));
-                            });
+                    // An event another test publishes before the collections
+                    // start says nothing about GC; retry that round.
+                    let mut attempts = 0;
+                    let probes = loop {
+                        attempts += 1;
+                        assert!(attempts <= 100, "waiters never parked undisturbed");
+                        crate::gc::reset_internal_for_test();
+                        let generation = waiters.generation();
+                        let probes = AtomicUsize::new(0);
+                        let parked = std::thread::scope(|scope| {
+                            for _ in 0..workers {
+                                let probes = &probes;
+                                scope.spawn(move || {
+                                    let _mutator = crate::gc::MutatorRegistration::new();
+                                    assert!(waiters.wait_inner(generation, None, || {
+                                        probes.fetch_add(1, Ordering::SeqCst);
+                                    }));
+                                });
+                            }
+                            if !registered_since(waiters, workers, generation) {
+                                waiters.notify(true);
+                                return false;
+                            }
+                            for _ in 0..cycles {
+                                crate::gc::minor_collect_internal();
+                                crate::gc::willow_gc_collect();
+                            }
+                            let unchanged = waiters.generation() == generation;
+                            let still_waiting = waiters.registered.load(Ordering::SeqCst);
+                            // Always release workers before checking regressions.
+                            waiters.notify(true);
+                            assert!(unchanged, "GC must not publish a scheduler event");
+                            assert_eq!(still_waiting, workers);
+                            true
+                        });
+                        if parked {
+                            break probes;
                         }
-                        registered(waiters, workers);
-                        for _ in 0..cycles {
-                            crate::gc::minor_collect_internal();
-                            crate::gc::willow_gc_collect();
-                        }
-                        let unchanged = waiters.generation() == generation;
-                        let still_waiting = waiters.registered.load(Ordering::SeqCst);
-                        // Always release workers before checking regressions.
-                        waiters.notify(true);
-                        assert!(unchanged, "GC must not publish a scheduler event");
-                        assert_eq!(still_waiting, workers);
-                    });
+                    };
                     assert_eq!(probes.load(Ordering::SeqCst), workers);
                     assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
                     eprintln!(

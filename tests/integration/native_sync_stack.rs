@@ -72,7 +72,7 @@ async fn main() {
     let task = worker();
     await sleep(20);
     task.cancel();
-    await sleep(30);
+    let _ = await task.result();
     println(3);
 }
 "#,

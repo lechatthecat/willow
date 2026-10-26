@@ -1080,8 +1080,14 @@ impl TypeChecker {
                 },
             )
         };
-        if self.template_precheck {
+        if self.template_precheck
+            && !self
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.severity == Severity::Error)
+        {
             // The final checking phase solves and reports this unit's effects.
+            // A unit with errors aborts the build first, so it reports them here.
             self.record_annotation_uses(program);
             return;
         }

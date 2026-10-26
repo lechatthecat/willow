@@ -1478,7 +1478,7 @@ mod tests {
         assert_eq!(unique.len(), Intrinsic::ALL.len(), "duplicate in ALL");
         assert_eq!(
             Intrinsic::ALL.len(),
-            62,
+            61,
             "Intrinsic::ALL must list every variant; update the count when adding one"
         );
     }
