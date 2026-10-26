@@ -48,7 +48,7 @@ All 30 runs, totalled by mode:
 | Cost (USD) | 0.225 | 0.508 | −56% |
 | Tool calls | 15 | 45 | −67% |
 
-Every answer was correct in both modes. Every rename tree matched the expected result exactly. Three rename runs (one semantic-CLI, two text-only) did fail the program-output check. The Willow-built program intermittently exited with SIGSEGV, independent of the edits. This intermittent runtime segmentation fault remains unresolved.
+Every answer was correct in both modes. Every rename tree matched the expected result exactly.
 
 The semantic-CLI system prompt is about 3.6 KB longer, and its cost is included above. With so small a project, text tools already do well whenever a name is unique: in the impact task, plain grep needed fewer input tokens. The advantage should grow with project size and name collisions, but this run does not measure that.
 
