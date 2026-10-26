@@ -6205,7 +6205,8 @@ mod tests {
 
     #[test]
     fn l27_synthetic_locals_have_identity_without_source_spans() {
-        let p = lir("async fn f(xs: Array<i64>) { for x in xs { await yield(); print(x); } }");
+        let p =
+            lir_checked("async fn f(xs: Array<i64>) { for x in xs { await yield(); print(x); } }");
         let f = func(&p, "f");
         let synthetic: Vec<_> = f.locals.iter().filter(|local| local.synthetic).collect();
         assert!(!synthetic.is_empty());
@@ -6575,7 +6576,7 @@ async fn f(shape: Shape) -> i64 {
             "fn f(c: bool, xs: Array<i64>) { xs[c ? 0 : 1] = c ? 10 : 20; }",
             "fn g(a: &mut i64, b: i64) { a = b; } fn f(c: bool, xs: Array<i64>) { g(&xs[c ? 0 : 1], c ? 10 : 20); }",
         ] {
-            let p = lir(source);
+            let p = lir_checked(source);
             let f = func(&p, "f");
             assert!(
                 f.blocks

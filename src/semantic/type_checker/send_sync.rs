@@ -185,7 +185,9 @@ impl TypeChecker {
             end: body.span.start,
             ..span
         };
-        if !self.enforce_send_sync {
+        // The template pre-check aborts on its own errors; the frame rule is
+        // reported by the final pass next to the concurrency diagnostics.
+        if !self.enforce_send_sync || self.template_precheck {
             return;
         }
         // Parameters cross the initial scheduling boundary and results cross the

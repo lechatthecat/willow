@@ -43,6 +43,11 @@ impl SourceFile {
         &self.canonical_path
     }
 
+    /// The standard library unit bundled into every graph, not a project module.
+    pub fn is_bundled(&self) -> bool {
+        self.path.starts_with("<std>")
+    }
+
     /// First importing unit's access spelling, never an identity component.
     pub fn access_name(&self) -> &str {
         &self.name

@@ -2317,7 +2317,8 @@ fn lambda_human_anchors_and_legacy_selectors_round_trip() {
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(text.contains("Symbol: src/main.wi:3:13"), "{text}");
         if command == "effects" {
-            assert!(text.contains("via=src/main.wi:3:13"), "{text}");
+            // The lambda's effects come from the body it calls.
+            assert!(text.contains("via=main::leaf"), "{text}");
         }
     }
     for absolute in [false, true] {
@@ -5383,7 +5384,7 @@ fn sentinel_diagnostics_range_and_try() {
             // The unannotated shorthand lacks context independently of `bad`.
             "fn f() -> Result<i64, String> { let bad = absent; let x = Ok(bad); let y = x?; return Ok(1); } fn main() {}",
             2,
-            "E0202",
+            "E1803",
         ),
         (
             "fn f() -> Result<i64, String> { let bad = absent; let x: Result<i64, i64> = Ok(bad); let y = x?; return Ok(1); } fn main() {}",

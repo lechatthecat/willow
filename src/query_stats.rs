@@ -173,6 +173,14 @@ pub(crate) fn peaks(peaks: [usize; 4]) {
     });
 }
 
+/// Persistent query-cache reports are opt-in through `WILLOW_QUERY_CACHE_STATS=1`;
+/// printing lives here so compiler queries stay free of output.
+pub(crate) fn query_cache(message: impl FnOnce() -> String) {
+    if std::env::var_os("WILLOW_QUERY_CACHE_STATS").is_some_and(|v| v == "1") {
+        eprintln!("willow-query-cache {}", message());
+    }
+}
+
 pub(crate) fn timing_enabled() -> bool {
     ACTIVE.with(|slot| slot.borrow().is_some())
 }

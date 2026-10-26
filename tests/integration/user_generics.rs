@@ -1496,6 +1496,35 @@ fn generic_parameter_method_diagnostics_specializations() {
 }
 
 #[test]
+fn imported_template_collection_spelling_follows_provider_imports() {
+    let provider = "import std::collections::Array; pub class Bag<T> { pub xs: Array<T>; pub fn last(self) -> T { return self.xs.pop(); } }";
+    for entry in [
+        "import util; fn main() { println(new util::Bag<i64>([5, 6]).last()); }",
+        "import util::Bag; fn main() { println(new Bag<i64>([5, 6]).last()); }",
+    ] {
+        let (out, ok) =
+            compile_temp_project_and_run(&[("util.wi", provider), ("main.wi", entry)], "main.wi");
+        assert!(ok, "{out}");
+        assert_eq!(out, "6\n");
+    }
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "util.wi",
+                &provider["import std::collections::Array; ".len()..],
+            ),
+            (
+                "main.wi",
+                "import util; fn main() { println(new util::Bag<i64>([5, 6]).last()); }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert_eq!(stderr.matches("error[E2001]").count(), 1, "{stderr}");
+    assert!(stderr.contains("util.wi"), "{stderr}");
+}
+
+#[test]
 fn generic_parameter_method_diagnostics_example_runs() {
     runs(
         include_str!("../../example/generic_parameter_methods.wi"),

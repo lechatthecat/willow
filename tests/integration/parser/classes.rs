@@ -591,7 +591,7 @@ fn main() {
             "field `name` of class `User` is private",
             "private field",
             "field defined here",
-            "help: expose it using `pub name: i64` or provide a public getter method",
+            "help: private members are accessible only within their declaring class, even in the same module; expose it using `pub name: i64` or provide a public getter method",
         ],
     );
 }
@@ -619,7 +619,7 @@ fn main() {
             "method `secret` of class `User` is private",
             "private method",
             "method defined here",
-            "help: make it public with `pub fn secret`",
+            "help: private members are accessible only within their declaring class, even in the same module; make it public with `pub fn secret`",
         ],
     );
 }

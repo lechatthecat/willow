@@ -26,7 +26,9 @@ fn query_stats_reports_real_operations_and_keeps_empty_modules_distinct() {
             .arg("build")
             .arg(root.join("main.wi"))
             .arg("-o")
-            .arg(root.join("app"));
+            .arg(root.join("app"))
+            // Count a cold build; the persistent cache would reuse the first.
+            .env("WILLOW_QUERY_CACHE", "0");
         if enabled {
             build.env("WILLOW_QUERY_STATS", "1");
         } else {
@@ -58,13 +60,17 @@ fn query_stats_reports_real_operations_and_keeps_empty_modules_distinct() {
                     "{counter}: {stderr}"
                 );
             }
-            assert_eq!(fields["type_checkers"], "3", "{stderr}");
-            assert_eq!(fields["nonpreemptible_helpers"], "3", "{stderr}");
-            assert_eq!(fields["effect_solves"], "3", "{stderr}");
-            // The body-free `empty` unit has no IO fixpoint to run.
+            // Three source units plus the bundled `std::collections`. Each is
+            // checked by the template pre-pass and the final pass; the bundled
+            // templates are validated by one more checker.
+            assert_eq!(fields["type_checkers"], "9", "{stderr}");
+            assert_eq!(fields["nonpreemptible_helpers"], "4", "{stderr}");
+            assert_eq!(fields["effect_solves"], "4", "{stderr}");
+            // The body-free `empty` unit and the bundled unit have no IO
+            // fixpoint to run.
             assert_eq!(fields["effect_io_solves"], "2", "{stderr}");
             assert!(
-                lines[0].contains("unit_effects[calls=3,hits=0,computations=3,"),
+                lines[0].contains("unit_effects[calls=4,hits=0,computations=4,"),
                 "{stderr}"
             );
             let units: Vec<_> = fields["hydrates_by_file"]
@@ -73,7 +79,7 @@ fn query_stats_reports_real_operations_and_keeps_empty_modules_distinct() {
                 .collect();
             assert_eq!(
                 units.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                ["0", "1", "2"]
+                ["0", "1", "2", "3"]
             );
             assert_eq!(
                 units

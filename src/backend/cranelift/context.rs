@@ -141,6 +141,16 @@ impl Codegen {
         self.db.enum_infos.insert(info.name, info);
     }
 
+    /// Register an enum a unit only refers to. The entry registers first, so
+    /// an entry enum shadowing a prelude name (`enum Result`) keeps its own
+    /// metadata instead of being replaced by a later unit's prelude view.
+    pub fn register_referenced_enum_info(&mut self, info: EnumInfo) {
+        assert!(!self.frozen);
+        if self.db.enum_infos.get_canonical(&info.name).is_none() {
+            self.db.enum_infos.insert(info.name, info);
+        }
+    }
+
     pub fn register_interface_info(
         &mut self,
         identity: TypeId,

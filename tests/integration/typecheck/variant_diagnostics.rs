@@ -437,3 +437,23 @@ fn test_constructor_inference_void_concat_does_not_suggest_conversion() {
         assert!(!stderr.contains("toString"), "{stderr}");
     }
 }
+
+// A lambda that is not a call argument has no signature left to complete the
+// constructors it returns.
+#[test]
+fn test_e1803_unannotated_lambda_returns_report_holes() {
+    for lambda in ["|x: i64| Ok(x)", "|| { return Ok(1); }"] {
+        let call = if lambda.starts_with("||") {
+            "f()"
+        } else {
+            "f(1)"
+        };
+        assert_compile_error_contains(
+            &format!("fn main() {{ let f = {lambda}; {call}; }}"),
+            &[
+                "error[E1803]",
+                "cannot infer error type `E` for `Result::Ok`",
+            ],
+        );
+    }
+}

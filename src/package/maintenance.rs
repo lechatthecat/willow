@@ -77,9 +77,11 @@ fn tidy_report(packages: &super::PackageGraph, graph: &crate::module::ModuleGrap
         .collect();
     let mut used = HashSet::new();
     let mut imports = 0;
+    // The bundled standard library is not a project module.
+    let project_files = || graph.files.iter().filter(|file| !file.is_bundled());
     // Alias spelling matters: two aliases can name the same package. Inspect
     // root-owned ASTs only; transitive consumers cannot mark a root alias used.
-    for file in &graph.files {
+    for file in project_files() {
         if file.package != packages.root {
             continue;
         }
@@ -97,7 +99,7 @@ fn tidy_report(packages: &super::PackageGraph, graph: &crate::module::ModuleGrap
         ok: true,
         unused: Vec::new(),
         used: Vec::new(),
-        modules: graph.files.len(),
+        modules: project_files().count(),
         imports,
         #[cfg(test)]
         source_loads: graph.source_loads,

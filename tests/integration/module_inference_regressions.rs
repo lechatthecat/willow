@@ -175,17 +175,22 @@ fn inferred_result_match_perspectives() {
         assert!(ok, "{arms}: {out}");
         assert_eq!(out, expected);
     }
-    for expression in [
-        "true ? Ok(42) : Err(\"bad\")",
-        "match true { true => Ok(42), false => Ok(0) }",
-    ] {
-        let source = format!(
-            "fn main() {{ let r = {expression}; println(match r {{ Ok(n) => n, Err(e) => 0 }}); }}"
-        );
-        let (out, ok) = compile_and_run(&source);
-        assert!(ok, "{out}");
-        assert_eq!(out, "42\n");
-    }
+    let (out, ok) = compile_and_run(
+        "fn main() { let r = true ? Ok(42) : Err(\"bad\"); println(match r { Ok(n) => n, Err(e) => 0 }); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+    // All-Ok arms leave `E` unconstrained; each constructor reports it.
+    let errors = compile_error_stderr(
+        "fn main() { let r = match true { true => Ok(42), false => Ok(0) }; println(match r { Ok(n) => n, Err(e) => 0 }); }",
+    );
+    assert_eq!(
+        errors
+            .matches("error[E1803]: cannot infer error type `E` for `Result::Ok`")
+            .count(),
+        2,
+        "{errors}"
+    );
     let (out, ok) = compile_and_run(
         "fn Ok(x: i64) -> i64 { return x + 1; } fn main() { let r = match true { true => Ok(41), false => Ok(0) }; println(r); }",
     );

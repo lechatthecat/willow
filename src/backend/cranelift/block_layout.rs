@@ -365,7 +365,12 @@ mod tests {
                     INTERFACE_WORK.with(|w| w.set([0; 2]));
                     DESCENDANT_WORK.with(|w| w.set([0; 2]));
                     compiled_functions(&source);
-                    assert_eq!(INTERFACE_WORK.with(|w| w.get()), [32 * methods, methods]);
+                    // Every subclass inherits `implements Value` and so owns a
+                    // slot target; each target is visited once per method.
+                    assert_eq!(
+                        INTERFACE_WORK.with(|w| w.get()),
+                        [32 * methods, types * methods]
+                    );
                     assert_eq!(
                         DESCENDANT_WORK.with(|w| w.get()),
                         [types - 1, (types - 1) * methods]
@@ -389,10 +394,10 @@ mod tests {
         let mut baseline = None;
         for sites in [1, 8, 32, 128] {
             let source = format!(
-                "import std::collections::Array; fn work(xs: Array<i64>, n: i64) {{
+                "fn work(n: i64) {{
                  let mut i: i64 = 0; while i < n {{ {} i = i + 1; }}
-                 }} fn main() {{ work([1], 1); }}",
-                "xs.push(i); xs[0] = i;".repeat(sites),
+                 }} fn main() {{ work(1); }}",
+                "println(i); println(\"x\");".repeat(sites),
             );
             let functions = compiled_functions(&source);
             let mut counts = Vec::new();

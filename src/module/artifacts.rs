@@ -72,7 +72,9 @@ pub(crate) struct UnitArtifacts {
     pub(crate) store: Rc<ArtifactStore>,
     metrics: Rc<RefCell<UnitMetrics>>,
     blocks: HashMap<BodyId, usize>,
-    initializers: HashMap<crate::parser::ast::BodyId, usize>,
+    /// Keyed by expression: a parsed initializer and its expanded copy share
+    /// one body identity, so the body cannot tell their syntax apart.
+    initializers: HashMap<crate::parser::ast::ExprId, usize>,
     /// Field writes of each offloaded body or initializer, recorded while its
     /// syntax is still resident (willow-jz15.78).
     field_writes: HashMap<BodyId, HashSet<RawFieldWrite>>,
@@ -626,9 +628,9 @@ impl UnitArtifacts {
                                 .bodies
                                 .initializer_body(expr.id())
                                 .expect("indexed initializer");
-                            if !self.initializers.contains_key(&id) {
+                            if !self.initializers.contains_key(&expr.id()) {
                                 let artifact = self.write(expr)?;
-                                self.initializers.insert(id, artifact);
+                                self.initializers.insert(expr.id(), artifact);
                                 self.field_writes.insert(
                                     id,
                                     BodyRef::Initializer(expr).collect_with_bindings(
@@ -726,12 +728,7 @@ impl UnitArtifacts {
                             *expr = self.read(
                                 *self
                                     .initializers
-                                    .get(
-                                        &self
-                                            .bodies
-                                            .initializer_body(expr.id())
-                                            .context("missing static identity")?,
-                                    )
+                                    .get(&expr.id())
                                     .context("missing initializer artifact")?,
                             )?;
                         }
@@ -1011,7 +1008,8 @@ mod tests {
                     "{:?}",
                     resolution.diagnostics
                 );
-                assert_eq!(resolution.graph.files.len(), 1024);
+                // The imported units plus the bundled standard unit.
+                assert_eq!(resolution.graph.files.len(), 1025);
                 assert_eq!(
                     resolution.graph.artifacts.as_ref().unwrap().peaks(),
                     [1, 0, 0, 0]

@@ -21,6 +21,11 @@ pub(crate) struct Source {
     pub(super) items: HashMap<String, Declaration>,
 }
 impl Source {
+    /// Whether this unit declares a template or names an instance.
+    pub(super) fn has_workspace_generics(&self) -> bool {
+        !self.items.is_empty() || !self.logical_types.is_empty() || !self.nominal_aliases.is_empty()
+    }
+
     pub fn capture(program: &Program) -> Self {
         let items: Vec<_> = program
             .items

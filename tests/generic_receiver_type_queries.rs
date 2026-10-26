@@ -102,17 +102,8 @@ fn member_calls_substitute_receiver_type_arguments() {
 
 #[test]
 fn generic_bodies_report_template_types_without_aliases() {
-    for (restored, snapshot) in both(snapshot(&[("main.wi", SOURCE)], "bodies"))
-        .into_iter()
-        .enumerate()
-    {
-        // Declaration binders are live presentation metadata; a restored
-        // snapshot keeps the exact type without them.
-        let pop_declaration = if restored == 0 {
-            "fn<T>() -> Option<T>"
-        } else {
-            "fn() -> Option<T>"
-        };
+    // Live and restored snapshots render declarations identically.
+    for snapshot in both(snapshot(&[("main.wi", SOURCE)], "bodies")) {
         let revision = snapshot.revision.clone();
         let mut session = QuerySession::new(snapshot).unwrap();
         for (needle, occurrence, token, expected) in [
@@ -128,7 +119,12 @@ fn generic_bodies_report_template_types_without_aliases() {
             ("let found", 0, "found", "Option<T>"),
             ("let next", 0, "next", "Option<T>"),
             // Declarations keep their generic signatures.
-            ("fn pop(self) -> Option<T> {", 0, "pop", pop_declaration),
+            (
+                "fn pop(self) -> Option<T> {",
+                0,
+                "pop",
+                "fn<T>() -> Option<T>",
+            ),
             ("less: closure", 0, "less", "closure(T, T) -> bool"),
             // Concrete locals in the caller.
             ("let first", 0, "first", "Patient"),

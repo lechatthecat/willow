@@ -1040,7 +1040,8 @@ fn main() { println(new A().value() + new B().value()); }
             "{stderr}"
         );
     }
-    assert!(stderr.contains("effect_solves=2 "), "{stderr}");
+    // One solve per unit: the bundled collections module is a unit too.
+    assert!(stderr.contains("effect_solves=3 "), "{stderr}");
     assert!(stderr.contains("effect_io_solves=2 "), "{stderr}");
     let run = project.run();
     assert!(run.status.success());
@@ -1293,35 +1294,47 @@ fn inline_panic_snapshots_have_zero_runtime_relocations() {
 // willow-8hq4.30: literals have allocation effects, without recoverable panic.
 #[test]
 fn array_literal_allocation_only_calls_and_effects() {
+    let count =
+        |events: &[String], target: &str| events.iter().filter(|name| *name == target).count();
     for release in [false, true] {
+        // `Array::new` is a source method: calling any `Array<i64>` method
+        // instantiates the class with every method body.
+        let instantiated = compile_and_collect_panic_events_mode(
+            "import std::collections::Array; fn size(a: Array<i64>) -> i64 { return a.len(); } fn main() { }",
+            &[],
+            release,
+        );
         for expression in ["[]", "[1, 2, 3]", "Array::new()"] {
             let source = format!(
                 "import std::collections::Array; fn make() -> Array<i64> {{ return {expression}; }} fn main() {{ let a = make(); }}"
             );
             let events = compile_and_collect_panic_events_mode(&source, &[], release);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|name| *name == "willow_array_new_literal")
-                    .count(),
-                1,
-                "{events:?}"
-            );
+            if expression == "Array::new()" {
+                // `make` only calls the instantiated `new`, whose literal is
+                // already in the class; the cases above cover its lowering.
+                assert!(
+                    events
+                        .iter()
+                        .any(|name| name.starts_with("$std.collections.Array$mono$")
+                            && name.ends_with(".new")),
+                    "{events:?}"
+                );
+                assert_eq!(
+                    count(&events, "willow_array_new_literal"),
+                    count(&instantiated, "willow_array_new_literal"),
+                    "{events:?}"
+                );
+            } else {
+                assert_eq!(count(&events, "willow_array_new_literal"), 1, "{events:?}");
+                // Cold scalar-store fault paths retain their checked ABI calls.
+                // Only those calls may need panic snapshots, never allocation.
+                assert_eq!(
+                    count(&events, "inline_panic_depth"),
+                    count(&events, "willow_array_set") * 2,
+                    "{events:?}"
+                );
+            }
             assert!(!has_target(&events, "willow_array_new"), "{events:?}");
-            // Cold scalar-store fault paths retain their checked ABI calls.
-            // Only those calls may need panic snapshots, never allocation.
-            let stores = events
-                .iter()
-                .filter(|name| *name == "willow_array_set")
-                .count();
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|name| *name == "inline_panic_depth")
-                    .count(),
-                stores * 2,
-                "{events:?}"
-            );
             assert!(!has_target(&events, "willow_panic_depth"), "{events:?}");
             let compile = if release {
                 compile_release_with_compiler_env

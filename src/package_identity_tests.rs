@@ -16,7 +16,8 @@ fn package_identity_checked_declarations_and_bodies_preserve_origins() {
         let (frontend, diagnostics) = fixture.frontend(&format!("{imports} fn main() {{}}"), true);
         let frontend = frontend.unwrap_or_else(|e| panic!("{e}: {diagnostics:?}"));
         let graph = &frontend.module_graph;
-        assert_eq!(graph.files.len(), 2);
+        // Both packages' `util` plus the bundled standard unit.
+        assert_eq!(graph.files.len(), 3);
         let checked = frontend
             .db
             .unit_declarations(module::UnitId::ENTRY, graph.artifacts.as_ref().unwrap())
@@ -44,7 +45,7 @@ fn package_identity_checked_declarations_and_bodies_preserve_origins() {
         assert_eq!(function_of("first").module(), first.module());
 
         let mut functions = std::collections::BTreeMap::new();
-        for module in &graph.files {
+        for module in graph.files.iter().filter(|module| !module.is_bundled()) {
             let origin = module.symbol_module.unwrap();
             for item in &module.program.items {
                 if let parser::ast::Item::Function(function) = item {

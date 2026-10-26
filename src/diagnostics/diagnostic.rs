@@ -136,6 +136,7 @@ pub(crate) fn source_names(
         && !text.contains("$local")
         && !text.contains("$receiver")
         && !text.contains("$mono$")
+        && !text.contains("$std::")
     {
         return text;
     }
@@ -167,6 +168,14 @@ pub(crate) fn source_names(
                 };
             out.push_str(&text[copied..start]);
             copied = end;
+            continue;
+        }
+        // Bundled std items read as their imported spelling (`Array`).
+        if let Some(rest) = text[start..].strip_prefix("$std::")
+            && let Some(module) = rest.find("::")
+        {
+            out.push_str(&text[copied..start]);
+            copied = start + 6 + module + 2;
             continue;
         }
         // A copied default's receiver (willow-nvi6).

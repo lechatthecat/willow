@@ -54,6 +54,9 @@ pub(super) struct BodyState {
     /// Stack of lambda return types being inferred. When non-empty, `return` stmts
     /// record their type here instead of checking against `current_return_type`.
     pub(super) lambda_return_stack: Vec<Option<Type>>,
+    /// The inferred lambda is a call argument: the callee's signature may
+    /// still supply omitted Option/Result parameters of its returns.
+    pub(super) lambda_holes_deferred: bool,
     pub(super) current_class: Option<String>,
     /// While an interface default body is checked once for every receiver
     /// (willow-dnia): the interface type its opaque `Self` converts to.
@@ -100,6 +103,7 @@ impl Default for BodyState {
             match_expected: None,
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
+            lambda_holes_deferred: false,
             current_class: None,
             self_interface: None,
             current_async_context: false,

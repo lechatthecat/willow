@@ -2751,10 +2751,28 @@ impl TypeChecker {
             visit_item(
                 item,
                 &mut |ty| {
-                    self.normalized_types
+                    let normalized = self
+                        .normalized_types
                         .get(ty)
                         .cloned()
-                        .unwrap_or_else(|| ty.clone())
+                        .unwrap_or_else(|| ty.clone());
+                    // Keep a fully qualified collection spelling: the final
+                    // check accepts it without an import, a bare name not.
+                    let mut qualified = Vec::new();
+                    ty.map_names(|name| {
+                        if let Some(item) = name.strip_prefix("std::collections::") {
+                            qualified.push((item.to_owned(), name.clone()));
+                        }
+                    });
+                    if qualified.is_empty() {
+                        return normalized;
+                    }
+                    normalized.map_names(|name| {
+                        qualified
+                            .iter()
+                            .find(|(item, _)| item == name)
+                            .map_or_else(|| name.clone(), |(_, path)| path.clone())
+                    })
                 },
                 &mut |expr| {
                     if let Some(name) = self.generics.calls.get(&expr.id()) {

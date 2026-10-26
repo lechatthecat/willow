@@ -476,13 +476,19 @@ impl TypeChecker {
         let saved_return_stack = std::mem::take(&mut self.local.lambda_return_stack);
         let saved_block_depth = self.local.lexical_block_depth;
         self.local.lexical_block_depth = 0;
+        // Only a call argument has a signature left to complete its returns;
+        // anywhere else an omitted parameter is reported at the constructor.
+        let saved_holes_deferred = std::mem::replace(
+            &mut self.local.lambda_holes_deferred,
+            expected_params.is_some(),
+        );
 
         let body_ty = match &l.body {
             LambdaBody::Expr(e) => match expected_ret {
                 // Constructors need the complete return type before their
                 // expression type is recorded for lowering, just like `return`.
                 Some(expected) => self.check_expr_expecting(e, expected),
-                None => self.check_expr(e),
+                None => self.check_lambda_return_value(e),
             },
             LambdaBody::Block(b) => {
                 if let Some(ann) = expected_ret {
@@ -534,6 +540,7 @@ impl TypeChecker {
         self.local.lexical_block_depth = saved_block_depth;
         self.local.current_return_type = saved_ret_ty;
         self.local.lambda_return_stack = saved_return_stack;
+        self.local.lambda_holes_deferred = saved_holes_deferred;
         self.symbols.pop_scope();
 
         let ret_ty = match &annotated_return {

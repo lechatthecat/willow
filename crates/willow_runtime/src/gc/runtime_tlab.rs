@@ -625,6 +625,9 @@ mod tests {
         let _stress = StressModes::set("relocate");
         let mut outer = crate::array::willow_array_new_literal(2, 1);
         willow_push_root(&mut outer);
+        // Outer's collections are all high-survival evidence. Forget it so
+        // inner survives its own allocation young and must move below.
+        runtime().heap.lock().unwrap().tenuring = Default::default();
         let mut inner = crate::array::willow_array_new_literal(1, 0);
         willow_push_root(&mut inner);
         willow_array_set(inner, 0, 99);

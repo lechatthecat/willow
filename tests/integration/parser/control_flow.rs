@@ -815,12 +815,9 @@ fn string_length_generated_calls_scale_with_callsites() {
             let text = "x".repeat(bytes);
             let source = format!("fn main() {{ let s = \"{text}\"; {calls} }}");
             let symbols = compile_and_collect_relocation_targets_all(&source, &[]);
-            assert_eq!(
-                symbols
-                    .iter()
-                    .filter(|s| s.as_str() == "willow_string_len")
-                    .count(),
-                count,
+            // Length reads are inlined metadata loads at every call site.
+            assert!(
+                !symbols.iter().any(|s| s.as_str() == "willow_string_len"),
                 "callsites={count}, bytes={bytes}"
             );
         }

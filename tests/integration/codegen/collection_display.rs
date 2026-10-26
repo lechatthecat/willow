@@ -142,7 +142,10 @@ fn tostr_15_class_element_rejected() {
         &[],
     );
     assert!(!ok);
-    assert!(stderr.contains("E1402"), "{stderr}");
+    assert!(
+        stderr.contains("method `toString` is unavailable"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -152,7 +155,10 @@ fn tostr_16_nested_array_rejected() {
         &[],
     );
     assert!(!ok);
-    assert!(stderr.contains("E1402"), "{stderr}");
+    assert!(
+        stderr.contains("method `toString` is unavailable"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -172,7 +178,7 @@ fn tostr_18_arguments_rejected() {
         &[],
     );
     assert!(!ok);
-    assert!(stderr.contains("no arguments"), "{stderr}");
+    assert!(stderr.contains("takes 0 argument(s)"), "{stderr}");
 }
 
 #[test]

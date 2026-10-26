@@ -356,7 +356,14 @@ fn compiler_inputs_share_resolved_graph_without_loading_unused_modules() {
         &mut crate::diagnostics::HumanEmitter,
     )
     .unwrap();
-    assert!(frontend.module_graph.files.is_empty());
+    // Only the bundled standard unit; unused dependency modules stay unloaded.
+    assert!(
+        frontend
+            .module_graph
+            .files
+            .iter()
+            .all(|file| file.is_bundled())
+    );
     assert_eq!(frontend.db.inputs().root_package, Some(packages.root));
     assert!(std::sync::Arc::ptr_eq(
         frontend.db.inputs().package_graph.as_ref().unwrap(),

@@ -8,12 +8,25 @@ impl<N> Type<N> {
     where
         N: Clone,
     {
-        self.map_tree(Clone::clone, true)
+        self.map_tree(Clone::clone, true, Type::Generic)
     }
     pub fn map_names<M>(&self, map: impl FnMut(&N) -> M) -> Type<M> {
-        self.map_tree(map, false)
+        self.map_tree(map, false, Type::Generic)
     }
-    fn map_tree<M>(&self, mut map: impl FnMut(&N) -> M, erase_array_length: bool) -> Type<M> {
+    /// Rebuild every generic application bottom-up; `rewrite` receives the
+    /// already rewritten arguments.
+    pub(crate) fn rewrite_generics(&self, rewrite: impl FnMut(N, Vec<Self>) -> Self) -> Self
+    where
+        N: Clone,
+    {
+        self.map_tree(Clone::clone, false, rewrite)
+    }
+    fn map_tree<M>(
+        &self,
+        mut map: impl FnMut(&N) -> M,
+        erase_array_length: bool,
+        mut generic: impl FnMut(M, Vec<Type<M>>) -> Type<M>,
+    ) -> Type<M> {
         enum Work<'a, N> {
             Enter(&'a Type<N>),
             Build(&'a Type<N>, usize),
@@ -46,7 +59,7 @@ impl<N> Type<N> {
                                 Type::FixedArray(element, *n)
                             }
                         }
-                        Type::Generic(name, _) => Type::Generic(map(name), children),
+                        Type::Generic(name, _) => generic(map(name), children),
                         Type::Fn(..) => {
                             let result = children.pop().unwrap();
                             Type::Fn(children, Box::new(result))

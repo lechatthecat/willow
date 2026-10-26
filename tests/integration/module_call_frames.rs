@@ -972,8 +972,12 @@ fn main() { let xs: Array<i64> = []; println(a(xs)); }
         )],
         "cannot pop from an empty array",
     );
-    assert!(report.contains("0: a<i64> at "), "{report}");
-    assert!(!report.contains("$mono$"), "{report}");
+    assert!(
+        report.contains("0: Array<i64>::pop at <std>/collections.wi:"),
+        "{report}"
+    );
+    assert!(report.contains("1: a<i64> at "), "{report}");
+    assert!(!report.contains('$'), "{report}");
 }
 
 #[test]

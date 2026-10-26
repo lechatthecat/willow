@@ -63,13 +63,34 @@ impl DiagnosticEmitter for Collected {
     }
 }
 
+/// `check` leaves nothing beside the source except the compiler's query cache.
+fn assert_only_source_and_query_cache(directory: &std::path::Path) {
+    for entry in fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.file_name() == Some("target".as_ref()) {
+            let children = fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(children, ["willow-query-cache"], "{}", path.display());
+        } else {
+            assert_eq!(
+                path.file_name(),
+                Some("main.wi".as_ref()),
+                "{}",
+                path.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn check_needs_no_runtime_or_output_artifact() {
     let fixture = Fixture::new("fn main() { println(42); }");
     let mut collected = Collected::default();
     fixture.check(&mut collected).unwrap();
     assert!(collected.diagnostics.is_empty());
-    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+    assert_only_source_and_query_cache(&fixture.0);
 }
 
 #[test]

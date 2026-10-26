@@ -690,7 +690,15 @@ mod tests {
         use object::{Object, ObjectSection};
         let _symbols = revision.symbols.enter();
         let frontend = revision.frontend.as_ref().unwrap();
-        assert!(frontend.module_graph.files.is_empty());
+        // Single-file fixtures: the entry plus the bundled standard unit,
+        // whose object is emitted separately.
+        assert!(
+            frontend
+                .module_graph
+                .files
+                .iter()
+                .all(|file| file.is_bundled())
+        );
         let artifacts = frontend.module_graph.artifacts.as_ref().unwrap();
         let program = artifacts
             .hydrate(&frontend.program, diagnostics::FileId::ENTRY)
@@ -1416,7 +1424,8 @@ mod tests {
             f.write("m0.wi", "pub fn value() -> i64 { return 1000; }");
             assert!(f.compare(&mut warm));
             assert_eq!((warm.typechecks, warm.reused_bodies), (1, n));
-            assert_eq!(warm.input_visits, n + 1);
+            // Inputs also include the bundled standard unit.
+            assert_eq!(warm.input_visits, n + 2);
             assert_eq!(warm.invalidation_visits, 0);
             println!(
                 "revision modules={n} rechecked={} reused={} retained_bytes={}",
@@ -1553,7 +1562,8 @@ mod tests {
                 f.write("m0.wi", "pub fn value() -> i64 { return 2; }");
                 assert!(f.compare(&mut warm));
                 assert_eq!((warm.typechecks, warm.reused_bodies), (1, n + 1));
-                assert_eq!(warm.input_visits, n + 2);
+                // Inputs also include the bundled standard unit.
+                assert_eq!(warm.input_visits, n + 3);
                 assert_eq!(warm.invalidation_visits, 0);
                 println!(
                     "revision shape={} modules={n} invalidation_edges={} rechecked={} reused={}",
@@ -1711,8 +1721,25 @@ mod tests {
             }
         }
     }
+    /// Query nodes, edges and bytes of an empty program: the fixed share of
+    /// the bundled standard unit that bounds below are measured on top of.
+    fn empty_program_stats() -> (u64, u64, u64) {
+        let f = Fixture::new();
+        f.write("main.wi", "fn main() {}");
+        let mut revision = AnalysisRevision::default();
+        let _symbols = revision.symbols.enter();
+        assert!(f.compare(&mut revision));
+        let stat = |key: &str| revision.incremental_stats[key].as_u64().unwrap();
+        (
+            stat("query_nodes"),
+            stat("dependency_edges"),
+            stat("retained_query_bytes"),
+        )
+    }
+
     #[test]
     fn revision_long_edit_session_keeps_graph_and_artifacts_bounded() {
+        let (base_nodes, base_edges, base_bytes) = empty_program_stats();
         let f = Fixture::new();
         let mut warm = AnalysisRevision::default();
         let _symbols = warm.symbols.enter();
@@ -1723,14 +1750,15 @@ mod tests {
         for step in 0..200 {
             f.write("main.wi", &format!("fn renamed_{step}() -> i64 {{ return {step}; }} fn main() {{ println(renamed_{step}()); }}"));
             assert!(f.compare(&mut warm));
-            let nodes = warm.incremental_stats["query_nodes"].as_u64().unwrap();
-            let edges = warm.incremental_stats["dependency_edges"].as_u64().unwrap();
+            let nodes = warm.incremental_stats["query_nodes"].as_u64().unwrap() - base_nodes;
+            let edges = warm.incremental_stats["dependency_edges"].as_u64().unwrap() - base_edges;
             peak_nodes = peak_nodes.max(nodes);
             peak_edges = peak_edges.max(edges);
             peak_artifacts = peak_artifacts.max(warm.retained_artifact_bytes);
             let query_bytes = warm.incremental_stats["retained_query_bytes"]
                 .as_u64()
-                .unwrap();
+                .unwrap()
+                - base_bytes;
             peak_query_bytes = peak_query_bytes.max(query_bytes);
             assert!(nodes < 100, "edit {step}: {nodes} nodes");
             assert!(edges < 300, "edit {step}: {edges} edges");
@@ -1784,6 +1812,7 @@ mod tests {
     }
 
     fn assert_nested_revision_bytes(depth: usize) {
+        let (_, _, base_bytes) = empty_program_stats();
         let f = Fixture::new();
         use std::fmt::Write;
         let mut source = "fn f(x: i64) -> i64 { ".to_owned();
@@ -1803,7 +1832,8 @@ mod tests {
         assert_eq!((warm.typechecks, warm.reused_bodies), (0, depth + 2));
         let bytes = warm.incremental_stats["retained_query_bytes"]
             .as_u64()
-            .unwrap();
+            .unwrap()
+            - base_bytes;
         // A deterministic conservative bound, including map slack and
         // all query families, rules out per-lambda whole-tree copies.
         assert!(

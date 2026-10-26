@@ -1,3 +1,4 @@
+// test: manual -- prints a nondeterministic elapsed time; checked by monotonic_clock_example_runs.
 import std::time;
 
 async fn main() {

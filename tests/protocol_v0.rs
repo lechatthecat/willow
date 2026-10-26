@@ -66,6 +66,27 @@ fn events(output: &Output, code: i32, terminal: &str) -> Vec<Value> {
     result
 }
 
+/// `check` leaves nothing beside the source except the compiler's query cache.
+fn assert_only_source_and_query_cache(directory: &std::path::Path) {
+    for entry in fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.file_name() == Some("target".as_ref()) {
+            let children = fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(children, ["willow-query-cache"], "{}", path.display());
+        } else {
+            assert_eq!(
+                path.file_name(),
+                Some("main.wi".as_ref()),
+                "{}",
+                path.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn repeated_checks_leave_no_artifacts_and_have_unique_streams() {
     let f = Fixture::new("fn main() { println(42); }");
@@ -87,7 +108,7 @@ fn repeated_checks_leave_no_artifacts_and_have_unique_streams() {
         streams.push(values[0]["stream_id"].clone());
     }
     assert_ne!(streams[0], streams[1]);
-    assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
+    assert_only_source_and_query_cache(&f.0);
 }
 
 #[test]

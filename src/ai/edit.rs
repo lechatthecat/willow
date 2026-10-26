@@ -1015,11 +1015,26 @@ fn builtin_member_points<'a>(
     snapshot: &'a Snapshot,
     root: &Path,
 ) -> std::collections::HashSet<(&'a Path, usize)> {
+    // Methods the bundled standard source declares are compiler-owned like
+    // intrinsic builtins: a call to one is never a workspace rename target.
+    let bundled: std::collections::HashSet<_> = snapshot
+        .semantic
+        .symbols
+        .iter()
+        .filter(|s| {
+            s.location
+                .as_ref()
+                .is_some_and(|l| super::bundled_source(&l.path).is_some())
+        })
+        .map(|s| s.id.as_str())
+        .collect();
     snapshot
         .semantic
         .references
         .iter()
-        .filter(|r| r.target.starts_with("builtin:builtin-method:"))
+        .filter(|r| {
+            r.target.starts_with("builtin:builtin-method:") || bundled.contains(r.target.as_str())
+        })
         .filter_map(|r| {
             let path = Path::new(&r.location.path).strip_prefix(root).ok()?;
             Some((path, r.location.start))

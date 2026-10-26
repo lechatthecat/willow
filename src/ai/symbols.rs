@@ -13,7 +13,14 @@ pub struct Symbol {
     /// display metadata, not an additional persisted semantic fact.
     #[serde(skip)]
     pub source_name: Option<String>,
-    #[serde(skip)]
+    /// Only the declaration binders persist: a restored snapshot must render
+    /// declarations exactly like the live session.
+    #[serde(
+        default,
+        rename = "binders",
+        skip_serializing_if = "DeclarationDetails::has_no_binders",
+        with = "binders"
+    )]
     pub details: DeclarationDetails,
     pub kind: String,
     pub location: Option<Location>,
@@ -32,6 +39,57 @@ pub struct DeclarationDetails {
     pub implements: Vec<Type>,
     /// Payload types of an enum variant; empty for unit variants.
     pub payload: Vec<Type>,
+}
+
+impl DeclarationDetails {
+    fn has_no_binders(&self) -> bool {
+        self.type_params.is_empty() && self.owner_type_params.is_empty()
+    }
+}
+
+/// Persisted form of [`DeclarationDetails`]: its own and its owner's binders.
+mod binders {
+    use super::DeclarationDetails;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct Borrowed<'a> {
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        own: &'a [String],
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        owner: &'a [String],
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Owned {
+        #[serde(default)]
+        own: Vec<String>,
+        #[serde(default)]
+        owner: Vec<String>,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        details: &DeclarationDetails,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Borrowed {
+            own: &details.type_params,
+            owner: &details.owner_type_params,
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<DeclarationDetails, D::Error> {
+        let binders = Owned::deserialize(deserializer)?;
+        Ok(DeclarationDetails {
+            type_params: binders.own,
+            owner_type_params: binders.owner.into(),
+            ..Default::default()
+        })
+    }
 }
 
 pub(super) fn details(

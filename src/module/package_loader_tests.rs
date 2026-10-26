@@ -58,11 +58,13 @@ impl Fixture {
             stats: Default::default(),
         })
     }
+    /// Resolves `source` and keeps only project modules: assertions here
+    /// cover package loading, and the bundled standard unit is always added.
     fn resolve(&self, source: &str, graph: Arc<PackageGraph>, spooled: bool) -> ImportResolution {
         let (program, errors) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
         assert!(errors.is_empty(), "{errors:?}");
         let root = graph.get(graph.root).unwrap().source_root();
-        if spooled {
+        let mut result = if spooled {
             resolve_imports_spooled_entry(
                 &program,
                 &root,
@@ -76,7 +78,16 @@ impl Fixture {
             let mut modules = ModuleGraph::new(root.clone());
             modules.package_graph = Some(graph);
             resolve_imports_in_graph(&program, &root, modules, &Default::default())
+        };
+        if result
+            .graph
+            .files
+            .first()
+            .is_some_and(|file| file.is_bundled())
+        {
+            result.graph.files.remove(0);
         }
+        result
     }
 }
 impl Drop for Fixture {
@@ -528,7 +539,8 @@ fn project_check_additional_roots_load_each_module_once() {
             );
             success(&result);
             assert_eq!(result.graph.source_loads, size);
-            assert_eq!(result.graph.files.len(), size);
+            // The bundled standard unit is parsed in memory, never loaded.
+            assert_eq!(result.graph.files.len(), size + 1);
             assert_eq!(result.graph.import_routes, size);
             eprintln!(
                 "check roots={size} chain={chain} loads={} routes={}",

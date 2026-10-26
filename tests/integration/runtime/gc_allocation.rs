@@ -150,9 +150,11 @@ fn main() {
     println(gc_remembered_set_size());
 }
 "#;
+    // Two high-survival minors accelerate tenuring, so the moved child is
+    // promoted and no old-to-young edge remains remembered.
     assert_gc_allocation_modes(
         src,
-        "true\ntrue\n42\ntrue\n1\n",
+        "true\ntrue\n42\ntrue\n0\n",
         "false\nfalse\n42\nfalse\n0\n",
     );
 }
@@ -178,7 +180,8 @@ fn main() {
     println(gc_remembered_set_size());
 }
 "#;
-    assert_gc_allocation_modes(src, "true\n77\ntrue\n1\n", "false\n77\nfalse\n0\n");
+    // Accelerated tenuring promotes the moved Box out of the young generation.
+    assert_gc_allocation_modes(src, "true\n77\ntrue\n0\n", "false\n77\nfalse\n0\n");
 }
 
 #[test]

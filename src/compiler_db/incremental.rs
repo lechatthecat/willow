@@ -388,6 +388,9 @@ impl SyntaxQueries {
             Err(error) => Err(error),
         }
     }
+    pub(crate) fn has_typed_body(&self, body: BodyId) -> bool {
+        self.table.peek(&QueryNode::TypedBody(body)).is_some()
+    }
     pub(crate) fn publish_body(
         &mut self,
         unit: UnitId,

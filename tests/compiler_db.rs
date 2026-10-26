@@ -35,7 +35,10 @@ impl Project {
             .current_dir(&self.0)
             .arg("build")
             .arg("main.wi")
-            .env("WILLOW_QUERY_STATS", "1");
+            .env("WILLOW_QUERY_STATS", "1")
+            // Counts describe one cold build; the persistent query cache
+            // would let a repeated build reuse the first one's results.
+            .env("WILLOW_QUERY_CACHE", "0");
         command
     }
 
@@ -107,9 +110,13 @@ impl Project {
             .filter(|line| line.starts_with("[query-stats] "))
             .collect();
         assert_eq!(reports.len(), 1, "{stderr}");
+        // Source units plus the bundled `std::collections`. Each is checked
+        // by the template pre-pass and the final pass; the bundled templates
+        // are validated by one more checker.
+        let checked = units + BUNDLED_UNITS;
         for (key, expected) in [
-            ("type_checkers", units),
-            ("nonpreemptible_helpers", units),
+            ("type_checkers", 2 * checked + 1),
+            ("nonpreemptible_helpers", checked),
             ("peak_ast", 1),
             ("peak_checker", 1),
             ("peak_declared", 1),
@@ -122,14 +129,16 @@ impl Project {
                 .unwrap_or_else(|| panic!("missing {key}: {stderr}"));
             assert_eq!(value, expected.to_string(), "{key}: {stderr}");
         }
-        assert_two_hydrates_per_unit(reports[0], units, &stderr);
-        for query in [
-            "visible_scope",
-            "unit_scope",
-            "typed_body",
-            "normalized_body",
-            "lir_body",
-            "lir_unit",
+        assert_unit_hydrates(reports[0], units, &stderr);
+        // Unit queries also run for the bundled unit; its template bodies are
+        // only typed through instantiations, which these programs never make.
+        for (query, expected) in [
+            ("visible_scope", checked),
+            ("unit_scope", checked),
+            ("typed_body", units),
+            ("normalized_body", units),
+            ("lir_body", units),
+            ("lir_unit", checked),
         ] {
             let record = reports[0]
                 .split_whitespace()
@@ -139,7 +148,7 @@ impl Project {
                 .split(',')
                 .find_map(|field| field.strip_prefix("computations="))
                 .unwrap();
-            assert_eq!(computations, units.to_string(), "{query}: {stderr}");
+            assert_eq!(computations, expected.to_string(), "{query}: {stderr}");
         }
         let run = Command::new(self.0.join("app")).output().unwrap();
         assert!(run.status.success(), "{run:?}");
@@ -170,9 +179,15 @@ fn strip_ansi(line: &str) -> String {
     plain
 }
 
-/// Each unit is hydrated once to check it and once to declare it, in debug
-/// builds too: debug metadata reads the declare-pass tree (willow-afb5.13).
-fn assert_two_hydrates_per_unit(report: &str, units: usize, stderr: &str) {
+/// The bundled `std::collections` unit, resolved before project modules.
+const BUNDLED_UNITS: usize = 1;
+const BUNDLED_FILE: usize = 1;
+
+/// Each source unit is hydrated once for the template pre-pass (which also
+/// expands it), once to check it and once to declare it, in debug builds too:
+/// debug metadata reads the declare-pass tree. The bundled unit owns templates,
+/// so it is also hydrated to collect them and again to expand its instances.
+fn assert_unit_hydrates(report: &str, units: usize, stderr: &str) {
     let by_file = report
         .split_whitespace()
         .find_map(|field| field.strip_prefix("hydrates_by_file="))
@@ -181,9 +196,16 @@ fn assert_two_hydrates_per_unit(report: &str, units: usize, stderr: &str) {
         .split(',')
         .map(|pair| pair.split_once(':').unwrap().1)
         .collect();
-    assert_eq!(counts.len(), units, "hydrates_by_file: {stderr}");
+    assert_eq!(
+        counts.len(),
+        units + BUNDLED_UNITS,
+        "hydrates_by_file: {stderr}"
+    );
     assert!(
-        counts.iter().all(|count| *count == "2"),
+        counts
+            .iter()
+            .enumerate()
+            .all(|(file, count)| { *count == if file == BUNDLED_FILE { "5" } else { "3" } }),
         "hydrates_by_file: {stderr}"
     );
 }
@@ -195,7 +217,7 @@ impl Drop for Project {
 }
 
 #[test]
-fn debug_and_release_builds_hydrate_each_unit_twice() {
+fn debug_and_release_builds_hydrate_each_unit_a_bounded_number_of_times() {
     let project = Project::new();
     project.write("leaf", "pub fn value() -> i64 { return 1; }");
     project.write(
@@ -222,12 +244,13 @@ fn debug_and_release_builds_hydrate_each_unit_twice() {
             .lines()
             .find(|line| line.starts_with("[query-stats] "))
             .unwrap_or_else(|| panic!("no report: {stderr}"));
-        assert_two_hydrates_per_unit(report, 3, &stderr);
+        assert_unit_hydrates(report, 3, &stderr);
         let source_map = project.0.join("app.wsmap");
         assert_eq!(source_map.exists(), !release, "{stderr}");
         if !release {
             let text = std::fs::read_to_string(source_map).unwrap();
-            assert_eq!(text.matches("\n---\n").count(), 2, "{text}");
+            // One section per unit, including the bundled one.
+            assert_eq!(text.matches("\n---\n").count(), 3, "{text}");
         }
         let run = Command::new(project.0.join("app")).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&run.stdout), "3\n");

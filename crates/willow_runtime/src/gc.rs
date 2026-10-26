@@ -716,8 +716,16 @@ static SWEEP_BUDGET_WAITING: std::sync::atomic::AtomicBool =
 static ELECTION_BUDGET_WAITING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Give reclamation one opportunity before treating reservation pressure as
-/// exhaustion. Waiting mutators cooperate with remark and wait through sweep.
+/// Collections one failed allocation may wait for while each still releases
+/// storage that concurrent allocators claim first. Bounded so a request that
+/// never fits reports exhaustion even while other threads keep producing garbage.
+const BUDGET_COLLECTION_RETRIES: usize = 8;
+
+/// Give reclamation an opportunity before treating reservation pressure as
+/// exhaustion. Callers retry while each collection still releases storage:
+/// concurrent allocators may claim it first, so exhaustion is reported after a
+/// collection that freed nothing or after [`BUDGET_COLLECTION_RETRIES`].
+/// Waiting mutators cooperate with remark and wait through sweep.
 /// Allocation-failure path only; explicit `gc()` uses `cycle_wait` directly.
 fn collect_for_budget() {
     pacer::allocation_failure(&runtime().heap.lock().unwrap());
@@ -1416,7 +1424,11 @@ fn tlab_alloc_slow(
     let mut state = runtime().heap.lock().unwrap();
     register_tlab_state(&mut state, state_address);
     let mut base = tlab::install_tlab_chunk(&mut state, state_address, &mut storage);
-    if base.is_none() && (state.memory_limit_bytes.is_some() || state.soft_memory.enabled()) {
+    for _ in 0..BUDGET_COLLECTION_RETRIES {
+        if base.is_some() || (state.memory_limit_bytes.is_none() && !state.soft_memory.enabled()) {
+            break;
+        }
+        let released = state.released_bytes;
         drop(state);
         collect_for_budget();
         if storage.is_none() {
@@ -1425,6 +1437,9 @@ fn tlab_alloc_slow(
         state = runtime().heap.lock().unwrap();
         register_tlab_state(&mut state, state_address);
         base = tlab::install_tlab_chunk(&mut state, state_address, &mut storage);
+        if state.released_bytes == released {
+            break;
+        }
     }
     let Some(base) = base else {
         return allocation_failure(&state);
@@ -1790,11 +1805,20 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
             old_lab::refill_and_allocate(state, type_id, layout_id, gc_ref_mask, total, span)
         };
         let mut object = refill(&mut state);
-        if object.is_none() && (state.memory_limit_bytes.is_some() || state.soft_memory.enabled()) {
+        for _ in 0..BUDGET_COLLECTION_RETRIES {
+            if object.is_some()
+                || (state.memory_limit_bytes.is_none() && !state.soft_memory.enabled())
+            {
+                break;
+            }
+            let released = state.released_bytes;
             drop(state);
             collect_for_budget();
             state = runtime().heap.lock().unwrap();
             object = refill(&mut state);
+            if state.released_bytes == released {
+                break;
+            }
         }
         let Some(object) = object else {
             return allocation_failure(&state);
@@ -1841,7 +1865,12 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
         gc_ref_mask,
         true,
     );
-    if header.is_none() && (state.memory_limit_bytes.is_some() || state.soft_memory.enabled()) {
+    for _ in 0..BUDGET_COLLECTION_RETRIES {
+        if header.is_some() || (state.memory_limit_bytes.is_none() && !state.soft_memory.enabled())
+        {
+            break;
+        }
+        let released = state.released_bytes;
         drop(state);
         collect_for_budget();
         state = runtime().heap.lock().unwrap();
@@ -1853,6 +1882,9 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
             gc_ref_mask,
             true,
         );
+        if state.released_bytes == released {
+            break;
+        }
     }
     let Some(header) = header else {
         return allocation_failure(&state);

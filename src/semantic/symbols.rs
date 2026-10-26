@@ -665,7 +665,12 @@ impl SymbolTable {
             .get_or_insert_with(|| {
                 self.enums
                     .iter()
-                    .filter(|(alias, _)| !alias.to_string().contains("::"))
+                    // A `$type$mono$` instantiation alias is private, not a
+                    // spelling the unit wrote.
+                    .filter(|(alias, _)| {
+                        let alias = alias.to_string();
+                        !alias.contains("::") && !alias.starts_with('$')
+                    })
                     .map(|(_, info)| info.name.clone())
                     .collect()
             })

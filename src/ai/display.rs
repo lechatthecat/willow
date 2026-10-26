@@ -221,6 +221,10 @@ impl TypeNames {
     /// Serialize a declaration with its readable type beside the exact `ty`.
     pub(super) fn symbol(&self, symbol: &symbols::Symbol) -> serde_json::Value {
         let mut value = serde_json::to_value(symbol).expect("symbol serializes");
+        // Binders are snapshot storage; `type_display` presents them.
+        if let Some(object) = value.as_object_mut() {
+            object.remove("binders");
+        }
         if let Some(ty) = &symbol.ty {
             value["type_display"] = self.declaration(symbol, ty).into();
         }

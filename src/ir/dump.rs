@@ -536,6 +536,20 @@ mod tests {
         format_program(&hir)
     }
 
+    /// Like [`dump`], but checked first so std library methods resolve.
+    fn dump_checked(src: &str) -> String {
+        let source = format!("import std::collections::Array; {src}");
+        let (program, errs) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(errs.is_empty(), "parse errors: {errs:?}");
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).unwrap();
+        checker.check_program(&program);
+        let facts = crate::ir::lower::SemanticFacts::from_checker(&checker);
+        let (hir, diags) = crate::ir::lower::lower_program_with(&program, &facts);
+        assert!(diags.is_empty(), "lowering diagnostics: {diags:?}");
+        format_program(&hir)
+    }
+
     // 1. function signature renders params + return type
     #[test]
     fn dump_01_signature() {
@@ -742,11 +756,14 @@ mod tests {
         assert!(text.contains("Option::None => {"), "{text}");
     }
 
-    // 23. builtin collection methods render with their types
+    // 23. std collection methods inline to their typed runtime intrinsic
     #[test]
     fn dump_23_builtin_methods() {
-        let text = dump("fn f() -> i64 { let xs = [1, 2]; return xs.len(); }");
-        assert!(text.contains("return xs: Array<i64>.len(): i64;"), "{text}");
+        let text = dump_checked("fn f() -> i64 { let xs = [1, 2]; return xs.len(); }");
+        assert!(
+            text.contains("return xs: Array<i64>.__abi_len(): i64;"),
+            "{text}"
+        );
     }
 
     // 24. enum variant construction renders with the enum type

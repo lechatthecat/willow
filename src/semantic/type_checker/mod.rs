@@ -64,6 +64,10 @@ use std::collections::{HashMap, HashSet};
 pub struct ResolutionContext {
     pub(crate) array_classes: HashMap<Type, String>,
     pub(crate) array_abi_files: HashSet<crate::diagnostics::FileId>,
+    /// Files of imported modules whose generic templates this unit
+    /// instantiates. Their spellings follow the provider's imports, which the
+    /// provider's own check validates.
+    provider_template_files: HashSet<crate::diagnostics::FileId>,
     /// Whether the items being checked belong to the ENTRY program rather than
     /// an imported module. Only [`ReturnSite::EntryMain`] reads it, and only to
     /// decide whether a `main` is the real entry point — a module's `main` is
@@ -223,6 +227,9 @@ pub struct TypeChecker {
     capture_call_sites: bool,
     /// Source import diagnostics were already emitted before generic expansion.
     pub(crate) source_imports_checked: bool,
+    /// Template pre-check before generic expansion: effects are solved and
+    /// reported once by the final checking phase.
+    pub(crate) template_precheck: bool,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
     effect_inputs: crate::compiler_db::effects::EffectInputs,
     /// Function values and indirect calls for E2604 (willow-h4t7).
@@ -319,6 +326,7 @@ impl TypeChecker {
             imported_collection_types: HashSet::new(),
             array_classes: HashMap::new(),
             array_abi_files: HashSet::new(),
+            provider_template_files: HashSet::new(),
             imported_collection_aliases: HashMap::new(),
             imported_std_modules: HashMap::new(),
             imported_blocking_std_functions: HashMap::new(),
@@ -376,6 +384,7 @@ impl TypeChecker {
             member_uses: HashMap::new(),
             capture_call_sites: false,
             source_imports_checked: false,
+            template_precheck: false,
             task_method_calls: Vec::new(),
             effect_inputs: Default::default(),
             indirect_lock: Default::default(),
@@ -733,6 +742,15 @@ impl TypeChecker {
         } else {
             Type::Generic(builtin_name.to_string(), args)
         }
+    }
+
+    /// The source class owning one array storage type. The bundled module is
+    /// registered before the modules its instantiations name, so those
+    /// entries keep their canonical spelling instead of a declaration key.
+    pub(super) fn array_class(&self, storage: &Type) -> Option<&String> {
+        self.array_classes
+            .get(&self.array_storage_key(storage))
+            .or_else(|| self.array_classes.get(storage))
     }
 
     /// Shared generic signatures use nominal aliases. Key storage dispatch by
@@ -1720,7 +1738,15 @@ impl TypeChecker {
         let name_eq = |a: &str, b: &str| {
             a == b
                 || match (self.symbols.lookup_class(a), self.symbols.lookup_class(b)) {
-                    (Some(a), Some(b)) => a.name == b.name,
+                    // A shared instantiation alias may carry the declaring
+                    // module's qualified spelling of a locally named instance.
+                    // The instance name encodes its arguments, so one
+                    // declaration with one unqualified name is one type.
+                    (Some(a), Some(b)) => {
+                        a.name == b.name
+                            || (a.declaration_span == b.declaration_span
+                                && a.name.rsplit("::").next() == b.name.rsplit("::").next())
+                    }
                     _ => false,
                 }
                 || match (
@@ -8935,3 +8961,37 @@ thread_local! {
 
 #[cfg(test)]
 mod fn_closure_diagnostic_tests;
+
+/// A signature registered from another module keeps its source spelling, so a
+/// bundled storage class (`Array<T>`) must become its storage type there, as
+/// `normalize_type` does for a module's own annotations. `templates` holds only
+/// the storage-backed class templates. A unit that never names `Array` itself
+/// has no template for it, yet still meets it in an importer's signature;
+/// that spelling is the bundled class, whose storage is the array type.
+pub(super) fn bundled_storage_spelling(
+    templates: &HashMap<String, std::rc::Rc<ClassDecl>>,
+    ty: &Type,
+) -> Type {
+    ty.rewrite_generics(|name, mut args| {
+        let template = templates.get(&name).or_else(|| {
+            (name == "Array")
+                .then(|| templates.get("$std::collections::Array"))
+                .flatten()
+        });
+        match template {
+            Some(template)
+                if args.len() == template.type_params.len()
+                    && let Some(storage) = &template.abi_storage =>
+            {
+                let bindings = template.type_params.iter().cloned().zip(args).collect();
+                crate::semantic::generic_inference::substitute(storage, &bindings)
+            }
+            None if args.len() == 1
+                && matches!(name.as_str(), "Array" | "$std::collections::Array") =>
+            {
+                Type::Array(Box::new(args.pop().expect("one argument")))
+            }
+            _ => Type::Generic(name, args),
+        }
+    })
+}

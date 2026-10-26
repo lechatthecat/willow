@@ -47,6 +47,11 @@ impl Scalar {
             Type::Void => Self::Void,
             Type::String => Self::String,
             Type::Array(inner) if **inner == Type::I64 => Self::Bytes,
+            // `Array` is a source-defined class, so the parser keeps
+            // `Array<i64>` as a plain generic application.
+            Type::Generic(name, args) if name == "Array" && args.as_slice() == [Type::I64] => {
+                Self::Bytes
+            }
             Type::Generic(name, args) if name == "Option" && args.len() == 1 => {
                 Self::Option(Box::new(Self::from_type_with_opaque(&args[0], names)?))
             }

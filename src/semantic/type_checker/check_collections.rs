@@ -160,10 +160,7 @@ impl TypeChecker {
         if !m.method.starts_with("__abi_") {
             let storage = Type::Array(elem.clone());
             if template.is_none()
-                && let Some(owner) = self
-                    .array_classes
-                    .get(&self.array_storage_key(&storage))
-                    .cloned()
+                && let Some(owner) = self.array_class(&storage).cloned()
             {
                 self.static_call_classes
                     .insert(m.id, TypeId::from_source_name(&owner));

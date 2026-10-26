@@ -5,6 +5,46 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),
+        (
+            "example/array_join.wi",
+            "日本 / Willow / 😀\n119999\ntrue\n",
+        ),
+        ("example/async_growing_string.wi", "120000\n"),
+        (
+            "example/builtin_method_surface.wi",
+            "a\n5\n1.5\ntrue\n3\n1\n1\n",
+        ),
+        ("example/class_private_scope.wi", "true\n"),
+        ("example/closure_chain_stack.wi", "10000\n"),
+        ("example/constructor_closure_types.wi", "true\n"),
+        (
+            "example/constructor_type_annotations.wi",
+            "7\ntrue\nfail missing\n",
+        ),
+        ("example/function_closure_wrappers.wi", "true\ntrue\n"),
+        ("example/gc_inline_satb.wi", "8128\n"),
+        ("example/gc_mark_worker_count.wi", "120000\n"),
+        ("example/generic_parameter_methods.wi", "6\nhello\n9\n"),
+        (
+            "example/generic_signature_queries.wi",
+            "7\n8\n9\n10\n11\n4\n",
+        ),
+        ("example/interface_sync_contracts.wi", "3\n7\n"),
+        ("example/literal_payload_guards.wi", "2\n0\n3\n1\n"),
+        ("example/persistent_query_cache.wi", "42"),
+        ("example/recursive_type_modules/main.wi", "0\n0\n"),
+        ("example/return_annotation.wi", "1\n"),
+        ("example/runtime_source_names.wi", "7\n9\n"),
+        ("example/static_frozen_array.wi", "static frozen array ok\n"),
+        ("example/string_find.wi", "本\ntrue\ntrue\n0\n"),
+        ("example/string_metadata.wi", "0\n9\n2\n3\n4\n0\n18\n"),
+        ("example/string_pattern_if_else.wi", "1\n2\n0\n"),
+        ("example/sync_poll_gates.wi", "1\n2\n4\n8\n"),
+        (
+            "example/task_dispatch_effect_evidence.wi",
+            "20\n10\n40\n30\n50\n",
+        ),
+        ("example/task_effect_evidence.wi", "8\n"),
         ("example/fixed_arrays.wi", "42\nsecond\n0\n"),
         (
             "example/source_arrays.wi",

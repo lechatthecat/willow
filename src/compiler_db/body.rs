@@ -718,8 +718,16 @@ impl BodyQueries {
         let Some((syntax, path)) = tracking else {
             return compute();
         };
-        let deps =
-            extra.unwrap_or_else(|| vec![QueryNode::TypedBody(id), QueryNode::SyntaxImports(path)]);
+        // A default injected from another unit reuses that unit's check, so
+        // only its source body has a typed memo in the syntax queries.
+        let deps = extra.unwrap_or_else(|| {
+            let typed = if syntax.borrow().has_typed_body(id) {
+                id
+            } else {
+                self.index.source_body(id)
+            };
+            vec![QueryNode::TypedBody(typed), QueryNode::SyntaxImports(path)]
+        });
         let cached = syntax
             .borrow_mut()
             .validate_derived_typed::<V>(node.clone(), deps.clone())?;

@@ -250,6 +250,20 @@ impl DirectSession {
             .context("edit requires live analysis inputs")?
             .verify_manifest_entry()?;
         let mut resolved = self.resolve(selector, filter)?;
+        // Compiler-owned source is never an edit target, so its declarations
+        // do not compete with a project symbol of the same name.
+        if resolved["status"] == "ambiguous"
+            && let Some(candidates) = resolved["candidates"].as_array()
+        {
+            let mut editable = candidates.iter().filter(|candidate| {
+                candidate["location"]["path"]
+                    .as_str()
+                    .is_none_or(|path| bundled_source(path).is_none())
+            });
+            if let (Some(only), None) = (editable.next(), editable.next()) {
+                resolved = json!({"status":"ok","symbol":only.clone()});
+            }
+        }
         if resolved["status"] != "ok" {
             self.display_locations(&mut resolved, false)?;
             return Ok(resolved);

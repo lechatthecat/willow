@@ -921,9 +921,7 @@ impl TypeChecker {
     pub(super) fn method_effect_ids(&self, obj_ty: &Type, method: &str) -> Vec<FunctionId> {
         if let Type::Array(element) | Type::FixedArray(element, _) = obj_ty
             && !method.starts_with("__abi_")
-            && let Some(owner) = self
-                .array_classes
-                .get(&self.array_storage_key(&Type::Array(element.clone())))
+            && let Some(owner) = self.array_class(&Type::Array(element.clone()))
         {
             return vec![FunctionId::method(TypeId::from_source_name(owner), method)];
         }
@@ -1082,6 +1080,11 @@ impl TypeChecker {
                 },
             )
         };
+        if self.template_precheck {
+            // The final checking phase solves and reports this unit's effects.
+            self.record_annotation_uses(program);
+            return;
+        }
         let effects = match &self.effect_queries {
             Some((queries, unit)) => match queries.complete(*unit, compute) {
                 Ok(effects) => effects,
@@ -2316,7 +2319,7 @@ impl TypeChecker {
                         let expected = self.local.current_return_type.clone();
                         self.check_expr_expecting(v, &expected)
                     }
-                    Some(v) => self.check_expr(v),
+                    Some(v) => self.check_lambda_return_value(v),
                     None => Type::Void,
                 };
                 // Inside a lambda with no annotation: record the return type for inference.
@@ -2509,6 +2512,17 @@ impl TypeChecker {
         let generation = self.error_generation;
         let ty = self.check_expr_inner(expr);
         self.finish_checked_expr(expr, ty, generation)
+    }
+
+    /// Check a value an unannotated lambda returns. The call site may still
+    /// complete the inferred type of a call argument; any other lambda's type
+    /// is final here.
+    pub(super) fn check_lambda_return_value(&mut self, expr: &Expr) -> Type {
+        if self.local.lambda_holes_deferred {
+            self.check_branch_value(expr)
+        } else {
+            self.check_expr(expr)
+        }
     }
 
     /// Report omitted Option/Result parameters left after branch merging on

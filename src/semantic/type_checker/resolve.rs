@@ -726,6 +726,19 @@ impl TypeChecker {
                 (access != *registered).then(|| (access, registered.clone()))
             })
             .collect();
+        let storage_templates: HashMap<_, _> = self
+            .generics
+            .classes
+            .iter()
+            .filter(|(_, template)| template.abi_storage.is_some())
+            .map(|(name, template)| (name.clone(), template.clone()))
+            .collect();
+        self.provider_template_files
+            .extend(program.items.iter().filter_map(|item| match item {
+                Item::Function(f) if !f.type_params.is_empty() => Some(f.span.file_id),
+                Item::Class(c) if !c.type_params.is_empty() => Some(c.span.file_id),
+                _ => None,
+            }));
         let mut functions = crate::semantic::ids::FunctionMap::default();
         for item in &program.items {
             let qualify = |ty: &Type| {
@@ -737,13 +750,14 @@ impl TypeChecker {
                 let ty = qualify_local_type(&ty, name, &local_classes);
                 let ty = qualify_local_type(&ty, canonical, &local_enums);
                 let ty = rename_imported_type(&ty, &imported_types);
-                ty.map_names(|name| {
+                let ty = ty.map_names(|name| {
                     #[cfg(test)]
                     ENUM_IDENTITY_LOOKUPS.with(|count| count.set(count.get() + 1));
                     self.symbols
                         .lookup_enum(name)
                         .map_or_else(|| name.clone(), |info| info.name.clone())
-                })
+                });
+                super::bundled_storage_spelling(&storage_templates, &ty)
             };
 
             match item {
@@ -800,7 +814,14 @@ impl TypeChecker {
                     self.symbols.define_class(class_name, info);
                 }
                 Item::Enum(e) => {
-                    let info = imported_enum_info(e, canonical, &qualify);
+                    let mut info = imported_enum_info(e, canonical, &qualify);
+                    // Payloads are qualified name by name; the bundled storage
+                    // spelling is a whole-type rewrite.
+                    for variant in &mut info.variants {
+                        for ty in &mut variant.payload_types {
+                            *ty = super::bundled_storage_spelling(&storage_templates, ty);
+                        }
+                    }
                     let access = format!("{name}::{}", e.name);
                     if access != info.name {
                         self.symbols.define_enum(info.name.clone(), info.clone());
@@ -812,7 +833,7 @@ impl TypeChecker {
                     // `animals::Animal` resolves as a type and in `implements`.
                     let mut declaration = i.clone();
                     let qualify_bound = |ty: &Type| {
-                        ty.map_names(|n| {
+                        let ty = ty.map_names(|n| {
                             if n == "Self" || i.type_params.contains(n) {
                                 return n.clone();
                             }
@@ -820,7 +841,8 @@ impl TypeChecker {
                                 unreachable!()
                             };
                             result.clone()
-                        })
+                        });
+                        super::bundled_storage_spelling(&storage_templates, &ty)
                     };
                     for method in &mut declaration.methods {
                         method.return_type = qualify_bound(&method.return_type);

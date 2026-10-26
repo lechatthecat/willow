@@ -705,6 +705,13 @@ pub(crate) fn snapshot(
         .take()
         .context("analysis capture disabled")?;
     generics::restore(&frontend.db.generic_sources, &mut captured);
+    // The bundled standard library is not workspace source: it has no
+    // editable symbols or references.
+    for file in &frontend.module_graph.files {
+        if file.is_bundled() {
+            captured.remove(&file.id);
+        }
+    }
     let mut paths = HashMap::from([(UnitId::ENTRY, entry.to_string_lossy().into_owned())]);
     let mut namespaces = HashMap::new();
     let mut programs = HashMap::from([(UnitId::ENTRY, &frontend.program)]);
@@ -1267,6 +1274,8 @@ pub(crate) fn snapshot(
             node.runtime_effects = RuntimeEffects::ALL.bits();
         }
     }
+    // Instance graph node numbers follow this order; the node map has none.
+    functions.sort_by(|a, b| a.id.cmp(&b.id));
     let instance_ids: Vec<String> = functions.iter().map(|f| f.id.clone()).collect();
     let instance_callees: Vec<Vec<String>> = functions.iter().map(|f| f.callees.clone()).collect();
     let merged = generics::aggregate(
@@ -1379,7 +1388,22 @@ pub(crate) fn snapshot(
         functions,
         semantic,
     };
-    if !frontend.db.generic_sources.is_empty() {
+    // Every unit records its generic sources, but only workspace templates and
+    // instances introduce spellings that need presenting; the bundled
+    // standard templates alone do not.
+    let bundled: std::collections::HashSet<_> = frontend
+        .module_graph
+        .files
+        .iter()
+        .filter(|file| file.is_bundled())
+        .map(|file| file.id)
+        .collect();
+    if frontend
+        .db
+        .generic_sources
+        .iter()
+        .any(|(unit, source)| !bundled.contains(unit) && source.has_workspace_generics())
+    {
         generics::present_types(&mut snapshot);
     }
     snapshot.revision = snapshot.digest()?;

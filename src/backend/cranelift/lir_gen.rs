@@ -11132,7 +11132,7 @@ fn main() {
     #[test]
     fn e09_arrays_now_eligible() {
         let src = "fn f() -> i64 { let xs = [1, 2]; return xs.len(); }";
-        assert!(eligible(src, "f", &["f"]));
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
     // 10. f64 arithmetic + comparison is eligible
@@ -12530,9 +12530,9 @@ fn main() {
     #[test]
     fn j13_boxed_index_assign_eligible() {
         let src = format!(
-            "{NAMED} fn f(xs: Array<Named>) -> i64 {{ xs[0] = new Item(\"a\"); return xs.len(); }}"
+            "import std::collections::Array; {NAMED} fn f(xs: Array<Named>) -> i64 {{ xs[0] = new Item(\"a\"); return xs.len(); }}"
         );
-        assert!(eligible_lenient(&src, "f", &["f"]));
+        assert!(eligible_checked(&src, "f", &["f"]));
     }
 
     // j14. an interface value moved into the SAME interface is already boxed:

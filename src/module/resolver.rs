@@ -989,13 +989,13 @@ mod tests {
                 .iter()
                 .map(|file| file.canonical_path.as_str())
                 .collect::<Vec<_>>(),
-            ["c", "b", "a"]
+            ["std::collections", "c", "b", "a"]
         );
         assert_eq!(resolution.graph.dependencies("a"), ["b", "c"]);
         assert_eq!(resolution.graph.dependencies("b"), ["c"]);
         assert_eq!(
             resolution.graph.module_id("c"),
-            Some(super::super::ModuleId(3))
+            Some(super::super::ModuleId(4))
         );
     }
 
@@ -1005,7 +1005,8 @@ mod tests {
             TempProject::new(&[("a.wi", "module a; pub fn value() -> i64 { return 1; }")]);
         let entry = parse("import a; import a; fn main() {}");
         let resolution = resolve_imports(&entry, &project.0);
-        assert_eq!(resolution.graph.files.len(), 1);
+        // The bundled standard unit plus `a`, loaded once.
+        assert_eq!(resolution.graph.files.len(), 2);
         assert!(
             resolution
                 .diagnostics
@@ -1070,7 +1071,8 @@ mod tests {
         let entry = parse("import math::{add, sub as subtract}; fn main() {}");
         let resolution = resolve_imports(&entry, &project.0);
         assert!(resolution.diagnostics.is_empty());
-        assert_eq!(resolution.graph.files.len(), 1);
+        // The bundled standard unit plus `math`, loaded once.
+        assert_eq!(resolution.graph.files.len(), 2);
         assert_eq!(
             resolution
                 .item_imports
@@ -1105,7 +1107,7 @@ mod tests {
                 .iter()
                 .map(|module| module.canonical_path.as_str())
                 .collect::<Vec<_>>(),
-            ["math::add"]
+            ["std::collections", "math::add"]
         );
     }
 

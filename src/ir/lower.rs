@@ -2434,6 +2434,12 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
             ty: binding.ty.clone().into(),
             span: *span,
         };
+        // The checker types `super` as the base written in this unit (an item
+        // import's bare `Parcel`); the class tables key it canonically.
+        let base = match ctx.tables.normalize(&Type::Named(base.clone())) {
+            Type::Named(ref canonical) => canonical.clone(),
+            _ => base.clone(),
+        };
         let args = lower_value_args(&m.args, ctx)?;
         return Ok(HirExpr {
             kind: HirExprKind::MethodCall {

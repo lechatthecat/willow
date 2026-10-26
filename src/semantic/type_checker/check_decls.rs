@@ -197,6 +197,7 @@ impl TypeChecker {
 
     pub(super) fn check_collection_type_imported(&mut self, name: &str, span: Span) {
         if (name == "Array" && self.array_abi_files.contains(&span.file_id))
+            || self.provider_template_files.contains(&span.file_id)
             || self.imported_collection_types.contains(name)
             || self.fully_qualified_collection_types.contains(name)
             || self

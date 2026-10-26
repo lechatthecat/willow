@@ -244,17 +244,12 @@ pub(crate) fn run(
     )?;
     syntax.borrow_mut().finish()?;
     let stats = syntax.borrow().stats();
-    if std::env::var_os("WILLOW_QUERY_CACHE_STATS").is_some_and(|v| v == "1") {
-        eprintln!(
-            "willow-query-cache {}",
-            serde_json::json!({"loaded": hit, "typechecks": frontend.db.typed_bodies.typechecks(), "reused_bodies": frontend.db.typed_bodies.reused(), "queries_recomputed": stats.recomputed, "queries_validated": stats.validated, "dependency_edges_visited": stats.dependency_edges_visited})
-        );
-    }
+    crate::query_stats::query_cache(|| {
+        serde_json::json!({"loaded": hit, "typechecks": frontend.db.typed_bodies.typechecks(), "reused_bodies": frontend.db.typed_bodies.reused(), "queries_recomputed": stats.recomputed, "queries_validated": stats.validated, "dependency_edges_visited": stats.dependency_edges_visited}).to_string()
+    });
     // Cache failures never change successful compilation into a failure.
-    if let Err(error) = save(&path, key, &frontend, &syntax.borrow())
-        && std::env::var_os("WILLOW_QUERY_CACHE_STATS").is_some_and(|v| v == "1")
-    {
-        eprintln!("willow-query-cache write skipped: {error}");
+    if let Err(error) = save(&path, key, &frontend, &syntax.borrow()) {
+        crate::query_stats::query_cache(|| format!("write skipped: {error}"));
     }
     Ok(frontend)
 }

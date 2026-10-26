@@ -804,6 +804,17 @@ fn run_frontend_revision_cached(
             _ => false,
         })
     };
+    // Every copy of a nongeneric default shares its provider's body, so a
+    // unit holding one is expanded with the provider, never released early.
+    let has_foreign_default = |p: &parser::ast::Program| {
+        p.items.iter().any(|i| match i {
+            parser::ast::Item::Class(c) => c
+                .methods
+                .iter()
+                .any(|m| m.is_interface_default && m.body.span.file_id != c.span.file_id),
+            _ => false,
+        })
+    };
     let has_templates = |p: &parser::ast::Program| {
         has_generics(p)
             || p.items.iter().any(|i| match i {
@@ -817,7 +828,7 @@ fn run_frontend_revision_cached(
         .chain(graph.files.iter().map(|m| &m.program))
         .any(|p| has_generics(p) || has_foreign_generic_default(p));
     if source_imports_checked {
-        let storage = graph.artifacts.take().expect("spooled imports");
+        let mut storage = graph.artifacts.take().expect("spooled imports");
         let registry = std::rc::Rc::new(std::cell::RefCell::new(
             semantic::type_checker::generics::TemplateRegistry::default(),
         ));
@@ -872,49 +883,107 @@ fn run_frontend_revision_cached(
                 &dependencies,
             ),
         );
+        // Only units declaring templates receive instance checks after their
+        // own pass. Every other checker is final once its unit is checked: it
+        // expands and is released at once, and template owners are checked
+        // last, so live checkers are bounded by the owners, not the graph.
+        // A unit receiving foreign default copies waits too: the copies share
+        // bodies the provider checks only after every unit's own pass.
+        let mut fresh_ids = semantic::type_checker::generics::FreshIds::default();
+        let mut pending = std::collections::VecDeque::new();
         let mut checkers = Vec::new();
         let mut owners = std::collections::HashMap::new();
-        for module in &graph.files {
-            let mut checker = semantic::TypeChecker::new();
-            checker.generics.registry = std::rc::Rc::clone(&registry);
-            checker.capture_generic_call_targets();
-            checker.set_field_writes(std::rc::Rc::clone(&field_writes));
-            checker.set_enforce_send_sync(inputs.options.enforce_send_sync);
-            register_prelude(&mut checker)?;
-            register_module_imports_with_closure(
-                &mut checker,
-                &module.program,
-                &graph.files,
-                &dependencies,
-                None,
-            );
-            checker.set_module_path(module.identity_path());
-            checker.set_class_module_path(module.registration_name());
-            let source = storage.hydrate(&module.program, module.id.file_id())?;
-            checker.check_module_program(&source);
-            owners.insert(module.id.file_id(), checkers.len());
-            checkers.push(storage.track(UnitKind::Checker, checker));
-        }
-        let entry = checkers.len();
-        owners.insert(diagnostics::FileId::ENTRY, entry);
-        {
-            let body = storage.hydrate(&program, diagnostics::FileId::ENTRY)?;
-            checkers.push(
-                typecheck_phase_with_generics(
-                    &body,
+        // Per unit in source order (modules, then the entry): the index of a
+        // retained checker, or the diagnostics of a released one.
+        let mut reports: Vec<std::result::Result<usize, Vec<diagnostics::Diagnostic>>> = Vec::new();
+        reports.resize_with(graph.files.len() + 1, || Ok(usize::MAX));
+        let mut released_programs = Vec::new();
+        let mut released_entry = None;
+        for owners_pass in [false, true] {
+            for (index, module) in graph.files.iter().enumerate() {
+                if has_templates(&module.program) != owners_pass {
+                    continue;
+                }
+                let mut checker = semantic::TypeChecker::new();
+                checker.template_precheck = true;
+                checker.generics.registry = std::rc::Rc::clone(&registry);
+                checker.capture_generic_call_targets();
+                checker.set_field_writes(std::rc::Rc::clone(&field_writes));
+                checker.set_enforce_send_sync(inputs.options.enforce_send_sync);
+                register_prelude(&mut checker)?;
+                register_module_imports_with_closure(
+                    &mut checker,
+                    &module.program,
                     &graph.files,
-                    &storage,
-                    &inputs.options,
+                    &dependencies,
                     None,
-                    Some(std::rc::Rc::clone(&registry)),
-                    Some(std::rc::Rc::clone(&field_writes)),
-                )?
-                .checker,
-            );
-        }
-        let mut pending = std::collections::VecDeque::new();
-        for checker in &mut checkers {
+                );
+                checker.set_module_path(module.identity_path());
+                checker.set_class_module_path(module.registration_name());
+                let source = storage.hydrate(&module.program, module.id.file_id())?;
+                checker.check_module_program(&source);
+                let mut checker = storage.track(UnitKind::Checker, checker);
+                pending.append(&mut checker.generics.pending);
+                if owners_pass
+                    || diagnostic_error_count(&checker.errors) > 0
+                    || !checker.generics.default_copies.is_empty()
+                    || has_foreign_default(&module.program)
+                {
+                    owners.insert(module.id.file_id(), checkers.len());
+                    reports[index] = Ok(checkers.len());
+                    checkers.push(checker);
+                    continue;
+                }
+                let expanded = expand_prechecked_unit(
+                    &mut checker,
+                    source,
+                    module.id,
+                    &mut storage,
+                    &mut fresh_ids,
+                    inputs.capture_analysis.then_some(&mut generic_sources),
+                )?;
+                reports[index] = Err(std::mem::take(&mut checker.errors));
+                released_programs.push((index, expanded));
+            }
+            if has_templates(&program) != owners_pass {
+                continue;
+            }
+            let body = storage.hydrate(&program, diagnostics::FileId::ENTRY)?;
+            let mut checker = typecheck_phase_with_generics(
+                &body,
+                &graph.files,
+                &storage,
+                &inputs.options,
+                None,
+                Some(TemplatePrecheck {
+                    dependencies: &dependencies,
+                    registry: std::rc::Rc::clone(&registry),
+                    field_writes: std::rc::Rc::clone(&field_writes),
+                }),
+            )?
+            .checker;
             pending.append(&mut checker.generics.pending);
+            let entry = graph.files.len();
+            if owners_pass
+                || diagnostic_error_count(&checker.errors) > 0
+                || !checker.generics.default_copies.is_empty()
+                || has_foreign_default(&program)
+            {
+                owners.insert(diagnostics::FileId::ENTRY, checkers.len());
+                reports[entry] = Ok(checkers.len());
+                checkers.push(checker);
+                continue;
+            }
+            let expanded = expand_prechecked_unit(
+                &mut checker,
+                body,
+                module::UnitId::ENTRY,
+                &mut storage,
+                &mut fresh_ids,
+                inputs.capture_analysis.then_some(&mut generic_sources),
+            )?;
+            reports[entry] = Err(std::mem::take(&mut checker.errors));
+            released_entry = Some(expanded);
         }
         let mut seen = std::collections::HashSet::new();
         while let Some(item) = pending.pop_front() {
@@ -938,9 +1007,12 @@ fn run_frontend_revision_cached(
         graph.artifacts = Some(storage);
         let mut errors = 0;
         let mut seen_diagnostics = diagnostics::diagnostic::SourceDiagnosticSet::default();
-        for checker in &checkers {
-            let diagnostics: Vec<_> = checker
-                .errors
+        for report in &reports {
+            let unit = match report {
+                Ok(index) => &checkers[*index].errors,
+                Err(released) => released,
+            };
+            let diagnostics: Vec<_> = unit
                 .iter()
                 .filter_map(|diagnostic| {
                     seen_diagnostics.insert(diagnostic, &diagnostic_modules.package_names)
@@ -949,39 +1021,45 @@ fn run_frontend_revision_cached(
             emit_frontend_diagnostics(&diagnostics, map, &graph, &diagnostic_modules, emitter)?;
             errors += diagnostic_error_count(&diagnostics);
         }
-        anyhow::ensure!(errors == 0, "aborting due to {errors} error(s)");
+        if errors > 0 {
+            return Err(frontend_abort(&mut graph, errors));
+        }
         let mut storage = graph.artifacts.take().expect("generic source artifacts");
-        let mut fresh_ids = semantic::type_checker::generics::FreshIds::default();
+        for (index, released) in released_programs {
+            graph.files[index].program = released;
+        }
         for (index, module) in graph.files.iter_mut().enumerate() {
-            let mut source = storage.hydrate(&module.program, module.id.file_id())?;
-            if inputs.capture_analysis {
-                let mut metadata = ai::generics::Source::capture(&source);
-                metadata.class_templates = checkers[index].generics.class_template_spans();
-                metadata.logical_types = checkers[index].generics.logical_types.clone();
-                metadata.nominal_aliases =
-                    std::mem::take(&mut checkers[index].generics.nominal_aliases);
-                metadata.symbols = std::mem::take(&mut checkers[index].generics.source_symbols);
-                generic_sources.insert(module.id, metadata);
-            }
-            checkers[index].expand_generics(&mut source, &mut fresh_ids);
-            storage.retain_expanded(module.id.file_id(), &mut source)?;
-            storage.offload(&mut source)?;
-            module.program = source.into_inner();
+            let Ok(owner) = &reports[index] else {
+                continue;
+            };
+            let owner = *owner;
+            let source = storage.hydrate(&module.program, module.id.file_id())?;
+            module.program = expand_prechecked_unit(
+                &mut checkers[owner],
+                source,
+                module.id,
+                &mut storage,
+                &mut fresh_ids,
+                inputs.capture_analysis.then_some(&mut generic_sources),
+            )?;
         }
-        let mut body = storage.hydrate(&program, diagnostics::FileId::ENTRY)?;
-        if inputs.capture_analysis {
-            let mut metadata = ai::generics::Source::capture(&body);
-            metadata.class_templates = checkers[entry].generics.class_template_spans();
-            metadata.logical_types = checkers[entry].generics.logical_types.clone();
-            metadata.nominal_aliases =
-                std::mem::take(&mut checkers[entry].generics.nominal_aliases);
-            metadata.symbols = std::mem::take(&mut checkers[entry].generics.source_symbols);
-            generic_sources.insert(module::UnitId::ENTRY, metadata);
+        if let Some(released) = released_entry {
+            program = released;
+        } else {
+            let Ok(entry) = &reports[graph.files.len()] else {
+                unreachable!("a released entry keeps its expanded program")
+            };
+            let entry = *entry;
+            let body = storage.hydrate(&program, diagnostics::FileId::ENTRY)?;
+            program = expand_prechecked_unit(
+                &mut checkers[entry],
+                body,
+                module::UnitId::ENTRY,
+                &mut storage,
+                &mut fresh_ids,
+                inputs.capture_analysis.then_some(&mut generic_sources),
+            )?;
         }
-        checkers[entry].expand_generics(&mut body, &mut fresh_ids);
-        storage.retain_expanded(diagnostics::FileId::ENTRY, &mut body)?;
-        storage.offload(&mut body)?;
-        program = body.into_inner();
         storage.inherit_generated_owners(&fresh_ids, &registry.borrow().origins);
         runtime_names = std::mem::take(&mut registry.borrow_mut().runtime_names);
         graph.artifacts = Some(storage);
@@ -1221,11 +1299,7 @@ fn run_frontend_revision_cached(
     error_count += diagnostic_error_count(&entry);
     emit_frontend_diagnostics(&entry, map, &graph, &diagnostic_modules, emitter)?;
     if error_count > 0 {
-        if let Some(error) = graph.package_import_error.take() {
-            return Err(anyhow::Error::new(error)
-                .context(format!("aborting due to {error_count} error(s)")));
-        }
-        anyhow::bail!("aborting due to {} error(s)", error_count);
+        return Err(frontend_abort(&mut graph, error_count));
     }
     Ok(Frontend {
         program,
@@ -1279,6 +1353,42 @@ fn desugar_phase(
     PhaseDiagnostics::new(output.diagnostics)
 }
 
+/// Expand one template-prechecked unit, recording its checker's
+/// generic metadata first when analysis is captured.
+fn expand_prechecked_unit(
+    checker: &mut semantic::TypeChecker,
+    mut source: LiveUnit<parser::ast::Program>,
+    unit: module::UnitId,
+    storage: &mut UnitArtifacts,
+    fresh_ids: &mut semantic::type_checker::generics::FreshIds,
+    generic_sources: Option<&mut std::collections::HashMap<module::UnitId, ai::generics::Source>>,
+) -> Result<parser::ast::Program> {
+    if let Some(sources) = generic_sources {
+        let mut metadata = ai::generics::Source::capture(&source);
+        metadata.class_templates = checker.generics.class_template_spans();
+        metadata.logical_types = checker.generics.logical_types.clone();
+        metadata.nominal_aliases = std::mem::take(&mut checker.generics.nominal_aliases);
+        metadata.symbols = std::mem::take(&mut checker.generics.source_symbols);
+        sources.insert(unit, metadata);
+    }
+    checker.expand_generics(&mut source, fresh_ids);
+    storage.retain_expanded(unit.file_id(), &mut source)?;
+    // Offloading accounts the tree itself; the hydration lease ends first.
+    let mut program = source.into_inner();
+    storage.offload(&mut program)?;
+    Ok(program)
+}
+
+/// A failed frontend reports the package import that caused it, so package
+/// tooling keeps its stable error kind.
+fn frontend_abort(graph: &mut module::ModuleGraph, errors: usize) -> anyhow::Error {
+    let context = format!("aborting due to {errors} error(s)");
+    match graph.package_import_error.take() {
+        Some(error) => anyhow::Error::new(error).context(context),
+        None => anyhow::anyhow!(context),
+    }
+}
+
 /// Register prelude/module symbols and type-check the entry program.
 fn typecheck_phase(
     program: &parser::ast::Program,
@@ -1287,7 +1397,16 @@ fn typecheck_phase(
     options: &CompilerOptions,
     queries: Option<&compiler_db::CompilerDb>,
 ) -> Result<TypecheckPhase> {
-    typecheck_phase_with_generics(program, modules, artifacts, options, queries, None, None)
+    typecheck_phase_with_generics(program, modules, artifacts, options, queries, None)
+}
+
+/// State the template pre-check shares across the units it checks.
+struct TemplatePrecheck<'a> {
+    /// The pre-check has no session yet, but still resolves package aliases
+    /// through the build's dependency index.
+    dependencies: &'a ModuleDependencies,
+    registry: std::rc::Rc<std::cell::RefCell<semantic::type_checker::generics::TemplateRegistry>>,
+    field_writes: std::rc::Rc<semantic::field_writes::FieldWrites>,
 }
 
 fn typecheck_phase_with_generics(
@@ -1296,20 +1415,17 @@ fn typecheck_phase_with_generics(
     artifacts: &UnitArtifacts,
     options: &CompilerOptions,
     queries: Option<&compiler_db::CompilerDb>,
-    registry: Option<
-        std::rc::Rc<std::cell::RefCell<semantic::type_checker::generics::TemplateRegistry>>,
-    >,
-    source_field_writes: Option<std::rc::Rc<semantic::field_writes::FieldWrites>>,
+    precheck: Option<TemplatePrecheck<'_>>,
 ) -> Result<TypecheckPhase> {
     let db = queries;
     let mut checker = semantic::TypeChecker::new();
-    if let Some(writes) = source_field_writes {
-        checker.set_field_writes(writes);
-    }
-    if let Some(registry) = registry {
-        checker.generics.registry = registry;
+    checker.template_precheck = precheck.is_some();
+    let template_dependencies = precheck.map(|precheck| {
+        checker.set_field_writes(precheck.field_writes);
+        checker.generics.registry = precheck.registry;
         checker.capture_generic_call_targets();
-    }
+        precheck.dependencies
+    });
     if let Some(db) = queries {
         checker.source_imports_checked = db.source_imports_checked;
         checker.set_field_writes(std::rc::Rc::clone(&db.field_writes));
@@ -1327,9 +1443,10 @@ fn typecheck_phase_with_generics(
         db.declarations.set_prelude(&checker.symbols);
     }
     let fallback;
-    let dependencies = match db {
-        Some(db) => db.dependencies(),
-        None => {
+    let dependencies = match (db, template_dependencies) {
+        (Some(db), _) => db.dependencies(),
+        (None, Some(dependencies)) => dependencies,
+        (None, None) => {
             fallback = ModuleDependencies::with_packages(modules, None);
             &fallback
         }
@@ -2646,7 +2763,12 @@ fn run_backend(
         let tables = checker.tables();
         let declared = tables.declared_enum_identities(&module.program);
         for info in checker.symbols.enums.values() {
-            codegen.register_enum_info(tables.codegen_enum_info(info, &declared));
+            let canonical = tables.codegen_enum_info(info, &declared);
+            if declared.contains(&info.name) {
+                codegen.register_enum_info(canonical);
+            } else {
+                codegen.register_referenced_enum_info(canonical);
+            }
         }
         let scope = db.unit_scope(module.id, &body, &modules, &checker.symbols)?;
         let declared = codegen.declare_module(
@@ -3606,7 +3728,7 @@ mod frontend_phase_tests {
         ));
         let imports = import_phase(&program, &root);
         assert!(imports.outcome.error_count > 0);
-        assert!(imports.graph.files.is_empty());
+        assert!(imports.graph.files.iter().all(|file| file.is_bundled()));
         assert!(imports.item_imports.is_empty());
     }
 

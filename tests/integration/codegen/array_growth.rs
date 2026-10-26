@@ -175,7 +175,7 @@ fn main() {
     xs.push(true);
 }
 "#,
-        &["error[E0201]", "cannot push"],
+        &["error[E0201]", "expected `i64`, found `bool`"],
     );
 }
 
@@ -191,7 +191,7 @@ fn main() {
     xs.push();
 }
 "#,
-        &["error[E0201]", "`Array::push` expects 1 argument"],
+        &["error[E0201]", "method `push` takes 1 argument(s)"],
     );
 }
 
