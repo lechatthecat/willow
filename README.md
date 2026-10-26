@@ -168,3 +168,10 @@ The user-facing tool is:
 
 [MIT License](LICENSE)
 
+
+### Class member visibility
+
+Private class members are accessible only within their declaring class, even in
+the same module. Use `pub` for external access, `prot` for subclass access, or a
+public accessor/factory to preserve private state. See the
+[class privacy decision and example](docs/class-private-scope.md).

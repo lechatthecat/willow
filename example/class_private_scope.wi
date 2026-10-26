@@ -1,0 +1,21 @@
+// Public API around class-private state and implementation.
+class Parser {
+    finished: bool;
+
+    pub static fn make() -> Parser {
+        return new Parser(true);
+    }
+
+    fn done(self) -> bool {
+        return self.finished;
+    }
+
+    pub fn is_done(self) -> bool {
+        return self.done();
+    }
+}
+
+fn main() {
+    let parser = Parser::make();
+    println(parser.is_done());
+}

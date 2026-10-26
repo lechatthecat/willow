@@ -1486,7 +1486,7 @@ impl TypeChecker {
                             .with_label(Label::primary(span, "private field"))
                             .with_label(Label::secondary(fi.declaration_span, "field defined here"))
                             .with_help(format!(
-                                "expose it using `pub {}: {}` or provide a public getter method",
+                                "private members are accessible only within their declaring class, even in the same module; expose it using `pub {}: {}` or provide a public getter method",
                                 field_name,
                                 type_name(&fi.ty)
                             )),
@@ -1830,7 +1830,7 @@ impl TypeChecker {
                                 mi.declaration_span,
                                 "method defined here",
                             ))
-                            .with_help(format!("make it public with `pub fn {}`", method_name)),
+                            .with_help(format!("private members are accessible only within their declaring class, even in the same module; make it public with `pub fn {}`", method_name)),
                         );
                     }
                 }
@@ -2710,7 +2710,7 @@ impl TypeChecker {
                                 mi.declaration_span,
                                 "method defined here",
                             ))
-                            .with_help(format!("make it public with `pub fn {}`", method_name)),
+                            .with_help(format!("private members are accessible only within their declaring class, even in the same module; make it public with `pub fn {}`", method_name)),
                         );
                     }
                 }

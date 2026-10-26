@@ -960,7 +960,7 @@ impl TypeChecker {
                         "field defined here",
                     ))
                     .with_help(format!(
-                        "provide a public `init` or factory method on `{}`",
+                        "private members are accessible only within their declaring class, even in the same module; provide a public `init` or factory method on `{}`",
                         self.diagnostic_class_name(owner)
                     )),
                 );

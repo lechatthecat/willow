@@ -316,3 +316,68 @@ fn memberwise_owner_repeated_calls_field_walk_counts() {
         }
     }
 }
+
+#[test]
+fn class_private_scope_help_matrix() {
+    // 20 perspectives: file/module, free/other-class caller, five access paths.
+    for module in [false, true] {
+        for other_class in [false, true] {
+            for (members, body, remedy) in [
+                (
+                    "value: i64; pub init(self) { self.value = 1; }",
+                    "let p = new Parser(); let x = p.value;",
+                    "public getter",
+                ),
+                (
+                    "value: i64; pub init(self) { self.value = 1; }",
+                    "let p = new Parser(); p.value = 2;",
+                    "public getter",
+                ),
+                (
+                    "pub init(self) {} fn done(self) {}",
+                    "let p = new Parser(); p.done();",
+                    "pub fn done",
+                ),
+                ("static fn done() {}", "Parser::done();", "pub fn done"),
+                ("value: i64;", "let p = new Parser(1);", "factory method"),
+            ] {
+                let caller = if other_class {
+                    format!("class Other {{ pub static fn call() {{ {body} }} }}")
+                } else {
+                    format!("fn call() {{ {body} }}")
+                };
+                let errors = check(&format!("class Parser {{ {members} }} {caller}"), module);
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(errors[0].code, ErrorCode::E0501);
+                assert!(
+                    errors[0]
+                        .helps
+                        .iter()
+                        .any(|h| h.contains("only within their declaring class")
+                            && h.contains("even in the same module")
+                            && h.contains(remedy)),
+                    "{errors:?}"
+                );
+                assert_eq!(errors[0].labels.len(), 2);
+            }
+        }
+    }
+}
+
+#[test]
+fn class_private_scope_help_scales_per_diagnostic() {
+    for calls in [1, 8, 64] {
+        let body = "Parser::done();".repeat(calls);
+        let source = format!("class Parser {{ static fn done() {{}} }} fn caller() {{ {body} }}");
+        let errors = check(&source, true);
+        assert_eq!(errors.len(), calls);
+        for diagnostic in &errors {
+            assert_eq!(diagnostic.code, ErrorCode::E0501);
+            assert_eq!(diagnostic.helps.len(), 1);
+            assert_eq!(
+                diagnostic.helps[0],
+                "private members are accessible only within their declaring class, even in the same module; make it public with `pub fn done`"
+            );
+        }
+    }
+}

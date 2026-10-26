@@ -102,3 +102,10 @@ fn memberwise_owner_manifest_project() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n2\nkept\n");
 }
+
+#[test]
+fn class_private_scope_example_runs() {
+    let (out, ok) = compile_file_and_run("example/class_private_scope.wi");
+    assert!(ok, "class-private public API example failed: {out}");
+    assert_eq!(out, "true\n");
+}

@@ -519,3 +519,7 @@ AGENTS.md
 # Runtime diagnostic source-name audit and focused reproducer.
 !/docs/audits/runtime-source-names.md
 !/docs/audits/runtime-source-names-check.sh
+
+# Public class-private scope decision and source-derived diagnostic audit.
+!/docs/class-private-scope.md
+!/docs/audits/class-private-scope.md
