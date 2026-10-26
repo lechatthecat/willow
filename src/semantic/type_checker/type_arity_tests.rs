@@ -781,3 +781,97 @@ fn bound_parameters_shadow_module_enum_during_normalization() {
         assert_eq!(iface.methods["me"].return_type, Type::Named("Self".into()));
     }
 }
+
+#[test]
+fn missing_builtin_arguments_cover_all_families() {
+    for name in [
+        "Task",
+        "TaskResult",
+        "Future",
+        "JoinHandle",
+        "Array",
+        "FrozenArray",
+        "Map",
+        "FrozenMap",
+        "Channel",
+        "BlockingCell",
+        "BlockingRwCell",
+        "Mutex",
+        "RwLock",
+        "Range",
+        "Option",
+        "Result",
+    ] {
+        let diagnostics = check(&format!("fn f(x: {name}) {{}} fn main() {{}}"));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == ErrorCode::E0201 && d.message.contains("type argument")),
+            "{name}: {diagnostics:?}"
+        );
+        assert!(
+            !diagnostics.iter().any(|d| d.code == ErrorCode::E0350
+                || d.helps
+                    .iter()
+                    .any(|h| h.contains(&format!("did you mean `{name}`")))),
+            "{name}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn missing_task_arguments_cover_annotation_positions() {
+    for source in [
+        "fn f(x: Task) {} fn main() {}",
+        "fn f() -> Task {} fn main() {}",
+        "fn main() { let tasks: Array<Task> = []; }",
+        "fn f(x: Option<Task>) {} fn main() {}",
+        "fn f(x: fn(Task) -> i64) {} fn main() {}",
+        "fn f(x: fn(i64) -> Task) {} fn main() {}",
+        "enum Work { Pending(Task) } fn main() {}",
+        "interface Work { fn get(self) -> Task; } fn main() {}",
+    ] {
+        let diagnostics = check(source);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message == "type `Task` requires type arguments")
+            .collect();
+        assert_eq!(errors.len(), 1, "{source}: {diagnostics:?}");
+        assert_eq!(errors[0].code, ErrorCode::E0201);
+        assert!(errors[0].helps.iter().any(|h| h.contains("Task<()>")));
+        assert!(
+            !diagnostics.iter().any(|d| d.code == ErrorCode::E0350),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn missing_builtin_arguments_preserve_parameter_shadowing_and_typos() {
+    ok("enum Wrap<Task> { Value(Task) } fn main() {}");
+    let diagnostics = check("fn f(x: Tsk) {} fn main() {}");
+    assert!(
+        diagnostics.iter().any(|d| d.code == ErrorCode::E0350
+            && d.helps.iter().any(|h| h.contains("did you mean `Task`"))),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn missing_builtin_arguments_diagnostic_counts_scale_with_sites() {
+    for size in [1, 16, 256] {
+        let mut checker = crate::semantic::TypeChecker::new();
+        for _ in 0..size {
+            checker.validate_type(
+                &Type::Named("Task".into()),
+                crate::diagnostics::Span::new(0, 4, 1, 1),
+            );
+        }
+        assert_eq!(checker.errors.len(), size);
+        assert_eq!(checker.invalid_type_names.borrow().len(), 1);
+        println!(
+            "sites={size} diagnostics={} invalid_names=1",
+            checker.errors.len()
+        );
+    }
+}

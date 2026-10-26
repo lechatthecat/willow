@@ -443,3 +443,27 @@ fn module_type_parameters_shadow_enum_names_at_runtime() {
     assert!(ok, "{out}");
     assert_eq!(out, "42\n7\n");
 }
+
+#[test]
+fn missing_task_arguments_render_actionable_help_without_cascade() {
+    let stderr = compile_error_stderr(
+        "import std::collections::Array; async fn work() {} async fn main() { let ts: Array<Task> = []; ts.push(work()); for t in ts { await t; } }",
+    );
+    assert!(stderr.contains("error[E0201]"), "{stderr}");
+    assert!(
+        stderr.contains("type `Task` requires type arguments"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Task<()>"), "{stderr}");
+    assert!(
+        !stderr.contains("did you mean") && !stderr.contains("E0350") && !stderr.contains(NO_ICE),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn missing_task_arguments_corrected_example_runs() {
+    let (output, success) = compile_file_and_run("example/void_tasks_frozen_iteration.wi");
+    assert!(success, "{output}");
+    assert_eq!(output, "2\n60\n");
+}

@@ -1291,7 +1291,10 @@ impl TypeChecker {
             "Result",
             "Task",
         ];
-        if let Some(suggestion) = suggest_similar_name(name, builtins.iter()) {
+        if let Some(suggestion) = suggest_similar_name(
+            name,
+            builtins.iter().filter(|candidate| **candidate != name),
+        ) {
             return format!("did you mean `{suggestion}`?");
         }
         "define a class, enum, or interface with this name, or check the spelling".into()
@@ -1363,6 +1366,14 @@ impl TypeChecker {
                         .with_help(format!(
                             "a module is a namespace; import a type from it or write `{name}::TypeName`"
                         ))
+                    } else if let Some(arguments) = missing_builtin_type_arguments(name) {
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("type `{name}` requires type arguments"),
+                        )
+                        .with_label(Label::primary(span, "missing type arguments"))
+                        .with_help(format!("write `{name}<{arguments}>` with concrete types"))
                     } else {
                         Diagnostic::new(
                             Severity::Error,
@@ -2024,9 +2035,18 @@ fn imported_class_info_from_decl(
     }
 }
 
-/// Whether `name` heads a generic type the compiler knows without a symbol
-/// table entry: the builtin families plus the lock handles and the
-/// range type that `for` loops produce (willow-rlq9).
+fn missing_builtin_type_arguments(name: &str) -> Option<&'static str> {
+    match name {
+        "Task" => Some("()"),
+        "Map" | "FrozenMap" => Some("K, V"),
+        "Result" => Some("T, E"),
+        "Option" | "TaskResult" | "Future" | "JoinHandle" | "Array" | "FrozenArray" | "Channel"
+        | "BlockingCell" | "BlockingRwCell" | "Mutex" | "RwLock" | "Range" => Some("T"),
+        _ => None,
+    }
+}
+
+/// Whether a generic head is compiler-known without a symbol table entry.
 fn compiler_known_generic_head(name: &str) -> bool {
     B::from_name(name).is_some() || matches!(name, "Mutex" | "RwLock" | "Range")
 }

@@ -329,18 +329,21 @@ mod tests {
         for (source, messages) in [
             (
                 "async fn main() { let t: Task = unknown(); await t; }",
-                vec!["cannot find type `Task`", "cannot find function `unknown`"],
+                vec![
+                    "type `Task` requires type arguments",
+                    "cannot find function `unknown`",
+                ],
             ),
             (
                 "fn main() { let t: Task = 1; await t; }",
                 vec![
-                    "cannot find type `Task`",
+                    "type `Task` requires type arguments",
                     "`await` can only be used inside an async function",
                 ],
             ),
             (
                 "async fn main() -> i64 { let t: Task = 1; return await t; }",
-                vec!["cannot find type `Task`"],
+                vec!["type `Task` requires type arguments"],
             ),
             (
                 "async fn main() { await missing; }",
