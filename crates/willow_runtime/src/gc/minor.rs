@@ -1574,8 +1574,10 @@ fn admit_survivor_chunk(state: &mut GcState) -> bool {
     let layout =
         Layout::from_size_align(GC_TLAB_CHUNK_SIZE, std::mem::align_of::<GcHeader>()).unwrap();
     // SAFETY: valid aligned region; release_survivor_reserve or the normal
-    // chunk sweep owns it.
-    let base = unsafe { super::allocate_region_storage(layout) };
+    // chunk sweep owns it. Only initialized object starts below `used` are
+    // readable: evacuation writes the full header and copies the full payload
+    // before publishing the object. Empty reserve and unused tails stay opaque.
+    let base = unsafe { super::allocate_survivor_storage(layout) };
     if base.is_null() {
         return false;
     }

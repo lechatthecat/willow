@@ -532,11 +532,22 @@ impl OldRegion {
 thread_local! {
     pub(super) static STORAGE_FAILURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static STORAGE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static ZEROED_STORAGE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Allocate a validated, nonzero region layout. The test hook injects actual
 /// storage failures without affecting Rust metadata allocations or other threads.
 pub(super) unsafe fn allocate_region_storage(layout: Layout) -> *mut u8 {
+    unsafe { allocate_storage::<true>(layout) }
+}
+
+/// Evacuation overwrites each header and payload before publication. Unused
+/// reserve capacity is never inspected, so it need not be zero-filled.
+pub(super) unsafe fn allocate_survivor_storage(layout: Layout) -> *mut u8 {
+    unsafe { allocate_storage::<false>(layout) }
+}
+
+unsafe fn allocate_storage<const ZEROED: bool>(layout: Layout) -> *mut u8 {
     #[cfg(test)]
     {
         STORAGE_ATTEMPTS.set(STORAGE_ATTEMPTS.get() + 1);
@@ -545,7 +556,13 @@ pub(super) unsafe fn allocate_region_storage(layout: Layout) -> *mut u8 {
             return std::ptr::null_mut();
         }
     }
-    unsafe { alloc_zeroed(layout) }
+    if ZEROED {
+        #[cfg(test)]
+        ZEROED_STORAGE_BYTES.set(ZEROED_STORAGE_BYTES.get() + layout.size());
+        unsafe { alloc_zeroed(layout) }
+    } else {
+        unsafe { std::alloc::alloc(layout) }
+    }
 }
 
 impl Drop for OldRegion {

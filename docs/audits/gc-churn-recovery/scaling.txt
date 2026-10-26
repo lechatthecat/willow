@@ -1,0 +1,3 @@
+source_chunks=1 reserve_allocations=1 reserve_zeroed_bytes=0 stopped_storage_allocations=0
+source_chunks=16 reserve_allocations=16 reserve_zeroed_bytes=0 stopped_storage_allocations=0
+source_chunks=128 reserve_allocations=128 reserve_zeroed_bytes=0 stopped_storage_allocations=0

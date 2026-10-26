@@ -98,14 +98,17 @@ impl Object {
         // the successfully evacuated target owns its descriptor lifetime.
         unsafe {
             let source = &mut *source.as_ptr();
-            let header = &mut *target.as_ptr();
-            header.marked = false;
-            header.allocated = true;
-            header.generation = generation;
-            header.age = 0;
-            header.remembered = 0;
-            header.descriptor = source.descriptor;
-            header.descriptor_owned = source.descriptor_owned;
+            // The destination may be uninitialized storage; do not form a
+            // reference to a header containing uninitialized bool fields.
+            target.as_ptr().write(GcHeader {
+                marked: false,
+                allocated: true,
+                generation,
+                age: 0,
+                remembered: 0,
+                descriptor: source.descriptor,
+                descriptor_owned: source.descriptor_owned,
+            });
             source.descriptor_owned = false;
         }
         Some(Self(target))

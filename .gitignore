@@ -369,3 +369,24 @@ AGENTS.md
 !/docs/growing-allocation/after.json
 !/docs/growing-allocation/scaling.txt
 !/docs/growing-allocation/retry-progress.txt
+
+# Reviewed public survivor-storage performance evidence.
+!/docs/audits/gc-churn-recovery/
+/docs/audits/gc-churn-recovery/*
+!/docs/audits/gc-churn-recovery/audit.md
+!/docs/audits/gc-churn-recovery/measure-runtime.py
+!/docs/audits/gc-churn-recovery/provenance.json
+!/docs/audits/gc-churn-recovery/scaling.txt
+!/docs/audits/gc-churn-recovery/current-run-1.jsonl
+!/docs/audits/gc-churn-recovery/candidate-probe.jsonl
+!/docs/audits/gc-churn-recovery/after-1.jsonl
+!/docs/audits/gc-churn-recovery/after-2.jsonl
+!/docs/audits/gc-churn-recovery/history-4ca55d1-parent.jsonl
+!/docs/audits/gc-churn-recovery/history-4ca55d1.jsonl
+!/docs/audits/gc-churn-recovery/history-39db9a7-parent.jsonl
+!/docs/audits/gc-churn-recovery/history-39db9a7.jsonl
+!/docs/audits/gc-churn-recovery/scheduler-yield.jsonl
+!/docs/audits/gc-churn-recovery/scheduler-gc.jsonl
+!/docs/audits/gc-churn-recovery/scheduler-tree.jsonl
+!/docs/audits/gc-churn-recovery/baseline-2026-10-23.jsonl
+!/docs/audits/gc-churn-recovery/baseline-2026-10-25.jsonl

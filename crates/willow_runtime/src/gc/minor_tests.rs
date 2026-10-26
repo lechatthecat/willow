@@ -1360,10 +1360,17 @@ fn m4_survivor_admission_accounts_before_stop_and_transfers_without_storage_allo
         reset_internal();
         let mut tls = tlab_state_for_test();
         let mut payloads = fill_chunks(&mut tls, count, 8, |_| 0, 0);
+        for (index, payload) in payloads.iter().enumerate() {
+            unsafe { payload.cast::<usize>().write(index ^ 0x1234) };
+        }
         let mut state = runtime().heap.lock().unwrap();
         retire_all_tlabs_unindexed(&mut state);
         let before = state.tlab_reserved_bytes;
+        ZEROED_STORAGE_BYTES.set(0);
+        STORAGE_ATTEMPTS.set(0);
         super::prepare_survivor_reserve(&mut state);
+        assert_eq!(ZEROED_STORAGE_BYTES.get(), 0);
+        assert_eq!(STORAGE_ATTEMPTS.get(), count);
         assert_eq!(state.survivor_reserve.len(), count);
         assert_eq!(
             state.survivor_reserve_stats.admitted_bytes,
@@ -1381,6 +1388,11 @@ fn m4_survivor_admission_accounts_before_stop_and_transfers_without_storage_allo
             state.survivor_reserve.iter().all(|c| c.used == 0
                 && c.header_offsets.capacity() >= GC_TLAB_CHUNK_SIZE / GC_HEADER_SIZE)
         );
+        for chunk in &state.survivor_reserve {
+            // Poison even the unused tail: copying must initialize every live
+            // field and sweeping must never interpret an unpublished header.
+            unsafe { chunk.base.write_bytes(0xa5, chunk.capacity) };
+        }
         STORAGE_ATTEMPTS.set(0);
         let mut stop = Default::default();
         MinorCollector::new(&mut state, minor_registry_snapshot(), &mut stop).run(
@@ -1392,6 +1404,12 @@ fn m4_survivor_admission_accounts_before_stop_and_transfers_without_storage_allo
         );
         assert_eq!(STORAGE_ATTEMPTS.get(), 0);
         assert_eq!(state.survivor_stats.survivor_copies, (count * 8) as u64);
+        for (index, payload) in payloads.iter().enumerate() {
+            assert_eq!(unsafe { payload.cast::<usize>().read() }, index ^ 0x1234);
+        }
+        eprintln!(
+            "source_chunks={count} reserve_allocations={count} reserve_zeroed_bytes=0 stopped_storage_allocations=0"
+        );
         // Production admission releases unused storage only after with_stw.
         assert!(state.survivor_reserve_active);
         super::release_survivor_reserve(&mut state);
@@ -1409,6 +1427,31 @@ fn m4_survivor_admission_accounts_before_stop_and_transfers_without_storage_allo
         drop(state);
         reset_internal();
     }
+}
+
+#[test]
+fn survivor_storage_failure_preserves_reservation_accounting() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    let _stress = GcStressTestScope::normal();
+    reset_internal();
+    let mut tls = tlab_state_for_test();
+    let _payloads = fill_chunks(&mut tls, 2, 8, |_| 0, 0);
+    let mut state = runtime().heap.lock().unwrap();
+    retire_all_tlabs_unindexed(&mut state);
+    let before = state.tlab_reserved_bytes;
+    STORAGE_FAILURES.set(1);
+    STORAGE_ATTEMPTS.set(0);
+    super::prepare_survivor_reserve(&mut state);
+    assert_eq!(STORAGE_ATTEMPTS.get(), 1);
+    assert_eq!(STORAGE_FAILURES.get(), 0);
+    assert!(state.survivor_reserve.is_empty());
+    assert_eq!(state.survivor_reserve_stats.admitted_bytes, 0);
+    assert_eq!(state.tlab_reserved_bytes, before);
+    super::release_survivor_reserve(&mut state);
+    assert_eq!(state.tlab_reserved_bytes, before);
+    drop(state);
+    reset_internal();
 }
 
 #[test]

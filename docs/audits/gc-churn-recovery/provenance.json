@@ -1,0 +1,32 @@
+{
+  "date": "2026-10-26",
+  "head": "8e62d8a2a219d7c1ad23c27cabce40591451b08d",
+  "host": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+  "cpu": "AMD Ryzen 7 7800X3D",
+  "workers": 8,
+  "trials": 5,
+  "go": "go version go1.27.0 linux/amd64",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "initial_tree": "clean",
+  "final_tree": "uncommitted runtime changes described in audit.md",
+  "historical_runtimes": {
+    "4ca55d1-parent": {
+      "commit": "8af6c52ba8f6e95e7de14d84f12e9faf98d70995",
+      "runtime_sha256": "569ffb5157dc8eb23785c19bfde91a177dec26818d652fa767ac6e48a98d3125"
+    },
+    "4ca55d1": {
+      "commit": "4ca55d19fdd8f8c67f429710c22e96e437e4f453",
+      "runtime_sha256": "bd40ae3b08b0bcfbf79bda3195eaa29c9e41bacadaa157c7daea1995db41bc89"
+    },
+    "39db9a7-parent": {
+      "commit": "9b04969d5493b4b21e209ef85f4fcf5cc049a657",
+      "runtime_sha256": "6dd65121a9816bcf15a47fbf632149797720f5e03d67a0995238b0d87fbea9d1"
+    },
+    "39db9a7": {
+      "commit": "39db9a731869c622e7d3004531c863d21d481382",
+      "runtime_sha256": "c6c9d0bc0d90c456ed83a6d08a50298fc568f9ff2ba7fe284efaf81316855c52"
+    }
+  },
+  "historical_comparison": "current compiler, identical benchmark sources, explicit runtime archives; distinct target directory per revision",
+  "final_runs": "existing run_sync.py and run.py; built from modified working tree; no competing validation builds"
+}
