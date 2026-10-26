@@ -1,7 +1,0 @@
-N	default_lir	lambda_lir	typed_body	lir_body	checked_unit
-1	4	2	13	12	3
-2	8	4	23	21	3
-4	16	8	35	37	3
-8	32	16	59	69	3
-16	64	32	107	133	3
-32	128	64	203	261	3

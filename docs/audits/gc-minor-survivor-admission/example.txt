@@ -1,6 +1,0 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
-     Running `target/debug/willow run example/gc_linked_list.wi`
-   Compiling willow_runtime v0.1.6 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.84s
-compiled [debug]: /tmp/willow_run_210489_0/program
-6

@@ -1,7 +1,0 @@
-import std::collections::Array;
-interface Shape { fn area(self) -> i64; }
-class Square implements Shape { pub side: i64; pub fn area(self) -> i64 { return self.side*self.side; } }
-class Rect implements Shape { pub width: i64; pub height: i64; pub fn area(self) -> i64 { return self.width*self.height; } }
-fn main() { let shapes: Array<Shape> = []; let mut i = 0; println("@start");
- while i < 1000000 { if i % 2 == 0 { shapes.push(new Square(i % 10 + 1)); } else { shapes.push(new Rect(i % 10 + 1, i % 10 + 2)); } i = i + 1; } println("@setup");
- let mut sum = 0; i = 0; while i < 1000000 { sum = sum + shapes[i].area(); i = i + 1; } println("@end"); println(sum); }

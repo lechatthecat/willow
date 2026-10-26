@@ -1,9 +1,0 @@
-{
-  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
-  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-  "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
-  "mem_total": "MemTotal:       31463744 kB",
-  "contract_sha256": "27c53a459fa0247fa15f1c7db0b4727060809ae0ebfed9746fd147ad8510011d",
-  "probe_sha256": "a5298989a44bb9bd46a115b69550d7d7291cadf75ae5f3eac056e250007bae05",
-  "cargo_lock_sha256": "cdee077f67817e251fc94b1a8c9f56f740bcf97f05ddec4c7add7977a9929239"
-}

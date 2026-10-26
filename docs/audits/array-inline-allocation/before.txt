@@ -1,5 +1,0 @@
-Baseline HEAD before implementation; Linux x86_64; release Willow program; 4,000,000 evaluations per process.
-ns/iteration: 15.26629275 15.3087645 15.2576365 15.25221375 15.18248125 15.217246 15.32466675 15.188535 15.243232
-median: 15.25221375
-literal function: 839 bytes
-ELF text: 1096152 bytes; data: 55992; bss: 18440

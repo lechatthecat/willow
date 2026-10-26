@@ -1,7 +1,0 @@
-{"workload": "fibonacci", "seconds": 0.1666662629977509, "stdout": "102334155", "counts": "GATES 0 0"}
-{"workload": "closure_call", "seconds": 0.05944942100177286, "stdout": "START\nEND\n10557340000", "counts": "GATES 0 0"}
-{"workload": "virtual_dispatch", "seconds": 0.06723118799709482, "stdout": "START\nEND\n1180000000", "counts": "GATES 0 0"}
-{"workload": "recursive_8", "seconds": 0.0010823010015883483, "stdout": "256", "counts": "GATES 0 0"}
-{"workload": "recursive_12", "seconds": 0.001041816001816187, "stdout": "4096", "counts": "GATES 0 0"}
-{"workload": "recursive_16", "seconds": 0.0011680020033963956, "stdout": "65536", "counts": "GATES 0 0"}
-{"workload": "recursive_20", "seconds": 0.004136357001698343, "stdout": "1048576", "counts": "GATES 0 0"}

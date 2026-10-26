@@ -1,2 +1,0 @@
-    Checking willow_runtime v0.1.6 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.86s

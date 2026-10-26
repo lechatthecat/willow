@@ -42,20 +42,6 @@ AGENTS.md
 !/docs/gc_telemetry.md
 !/docs/function-closure-diagnostics-audit.md
 !/docs/block-arm-helper-help-audit.md
-!/docs/audits/
-/docs/audits/*
-!/docs/audits/gc-allocation-targets/
-!/docs/audits/builtin-method-diagnostics.md
-!/docs/audits/string-pattern-diagnostic.md
-!/docs/audits/semantic-cli-kind-validation.md
-!/docs/audits/gc-concurrent-foundations/
-/docs/audits/gc-concurrent-foundations/*
-!/docs/audits/gc-concurrent-foundations/audit.md
-!/docs/audits/gc-concurrent-foundations/reproduce.py
-!/docs/audits/gc-concurrent-foundations/barrier_proof.py
-!/docs/audits/gc-concurrent-foundations/validate_failure_json.py
-!/docs/audits/gc-concurrent-foundations/abi_layout.c
-!/docs/audits/gc-concurrent-foundations/wide_enum.wi
 
 # Publish the compiler harness and reconstructed async-safepoint workloads.
 /benches/*
@@ -100,271 +86,29 @@ AGENTS.md
 # Reconstructed Mutex acceptance probe (mutex-acceptance).
 !/benches/runtime_compare/probes/mutex_split.wi
 
-# Public telemetry implementation audit and source-only measurement reproducers.
-!/docs/audits/gc-observation-completion/
-/docs/audits/gc-observation-completion/*
-!/docs/audits/gc-observation-completion/audit.md
-!/docs/audits/gc-observation-completion/gc_observation_check.py
-!/docs/audits/gc-observation-completion/gc_observation_repro.py
-!/docs/audits/gc-observation-completion/costs.json
-
-# Public expression-lambda Result audit and generated-source reproducer.
-!/docs/audits/lambda-result-expression/
-/docs/audits/lambda-result-expression/*
-!/docs/audits/lambda-result-expression/audit.md
-!/docs/audits/lambda-result-expression/count_lir.py
-
-# Public imported-error identity audit and focused reproducer.
-!/docs/audits/imported-result-error-identity/
-/docs/audits/imported-result-error-identity/*
-!/docs/audits/imported-result-error-identity/audit.md
-!/docs/audits/imported-result-error-identity/verify.sh
-
 # Public memberwise-owner visibility audit and focused reproducer.
-!/docs/audits/memberwise-owner.md
-!/docs/audits/memberwise-owner-checks.sh
-
-# Public pending-minor budget regression audit and measurement evidence.
-!/docs/audits/gc-minor-refill-runway/
-/docs/audits/gc-minor-refill-runway/*
-!/docs/audits/gc-minor-refill-runway/audit.md
-!/docs/audits/gc-minor-refill-runway/measurements.json
-!/docs/audits/gc-minor-refill-runway/verify.sh
-
-# Stage 6 source-derived recovery diagnostic and audit only.
-!/docs/audits/gc-bounded-recovery/
-/docs/audits/gc-bounded-recovery/*
-!/docs/audits/gc-bounded-recovery/audit.md
-!/docs/audits/gc-bounded-recovery/reproduce.sh
-
-# Public, self-contained async allocation RSS regression evidence.
-!/docs/audits/async-nursery-startup/
-/docs/audits/async-nursery-startup/*
-!/docs/audits/async-nursery-startup/audit.md
-!/docs/audits/async-nursery-startup/measure.py
-!/docs/audits/async-nursery-startup/before.jsonl
-!/docs/audits/async-nursery-startup/after.jsonl
-
-# Public source-liveness audit; no private specification content.
-!/docs/audits/async-suspension-liveness/
-/docs/audits/async-suspension-liveness/*
-!/docs/audits/async-suspension-liveness/implementation-audit.md
-!/docs/audits/async-suspension-liveness/reproduce.sh
 
 # Public lambda Result context audit and focused reproduction commands.
-!/docs/audits/lambda-return-context.md
-!/docs/audits/lambda-return-context-check.sh
 
 # Reviewed lambda generic annotation audit (public source/test evidence only).
-!/docs/audits/lambda-generic-annotations.md
-
-# Public RwLock class-update decision and source-derived implementation audit.
-!/docs/audits/rwlock-class-updates/
-/docs/audits/rwlock-class-updates/*
-!/docs/audits/rwlock-class-updates/decision.md
-!/docs/audits/rwlock-class-updates/implementation-audit.md
 
 # Public generic enum context audit; contains only source-derived evidence.
-!/docs/audits/generic-variant-context.md
-
-# Public parallel-map performance audit and reproducible inputs only.
-!/docs/audits/parallel-map-chunks/
-/docs/audits/parallel-map-chunks/*
-!/docs/audits/parallel-map-chunks/audit.md
-!/docs/audits/parallel-map-chunks/measure.js
-!/docs/audits/parallel-map-chunks/parallel_map.wi
-!/docs/audits/parallel-map-chunks/parallel.go
-!/docs/audits/parallel-map-chunks/Parallel.java
-!/docs/audits/parallel-map-chunks/verify.py
-!/docs/audits/parallel-map-chunks/before.jsonl
-!/docs/audits/parallel-map-chunks/final.jsonl
-!/docs/audits/parallel-map-chunks/examples-codegen.jsonl
-!/docs/audits/parallel-map-chunks/scaling.txt
-!/docs/audits/parallel-map-chunks/zero-counts.txt
-!/docs/audits/parallel-map-chunks/validation.txt
-!/docs/audits/parallel-map-chunks/poll-chunk.txt
-
-# Public string-map performance audit and focused reproducible evidence.
-!/docs/audits/map-workloads/
-/docs/audits/map-workloads/*
-!/docs/audits/map-workloads/audit.md
-!/docs/audits/map-workloads/word_count.wi
-!/docs/audits/map-workloads/map_lookup_insert.wi
-!/docs/audits/map-workloads/maps.go
-!/docs/audits/map-workloads/Maps.java
-!/docs/audits/map-workloads/measure.js
-!/docs/audits/map-workloads/check_examples.py
-!/docs/audits/map-workloads/validate.py
-!/docs/audits/map-workloads/baseline.jsonl
-!/docs/audits/map-workloads/final.jsonl
-!/docs/audits/map-workloads/validation.txt
-
-# Public literal-slot fast-path audit; no private specifications.
-!/docs/audits/string-literal-fast-path/
-/docs/audits/string-literal-fast-path/*
-!/docs/audits/string-literal-fast-path/audit.md
-!/docs/audits/string-literal-fast-path/measure.py
-!/docs/audits/string-literal-fast-path/results.json
-
-# Reviewed public evidence for closed-world dispatch (closed-world-interface-dispatch).
-!/docs/audits/closed-world-interface-dispatch/
-/docs/audits/closed-world-interface-dispatch/*
-!/docs/audits/closed-world-interface-dispatch/audit.md
-!/docs/audits/closed-world-interface-dispatch/benchmark.md
-!/docs/audits/closed-world-interface-dispatch/benchmark.jsonl
-!/docs/audits/closed-world-interface-dispatch/analysis.txt
-!/docs/audits/closed-world-interface-dispatch/reproduce.sh
 
 # Public uppercase static property implementation audit.
-!/docs/audits/uppercase-static-properties.md
-
-# Public minor-GC survivor audit and reproducible evidence (gc-survivor-copy).
-!/docs/audits/gc-survivor-copy/
-/docs/audits/gc-survivor-copy/*
-!/docs/audits/gc-survivor-copy/audit.md
-!/docs/audits/gc-survivor-copy/verify.sh
-!/docs/audits/gc-survivor-copy/stress.sh
-!/docs/audits/gc-survivor-copy/paired.py
-!/docs/audits/gc-survivor-copy/object_churn_stress.wi
-!/docs/audits/gc-survivor-copy/array_literal_churn_stress.wi
-!/docs/audits/gc-survivor-copy/before-churn.txt
-!/docs/audits/gc-survivor-copy/after-churn.txt
-!/docs/audits/gc-survivor-copy/after-idle-churn.txt
-!/docs/audits/gc-survivor-copy/paired.jsonl
-!/docs/audits/gc-survivor-copy/checks.txt
-!/docs/audits/gc-survivor-copy/descriptor.txt
-!/docs/audits/gc-survivor-copy/graph-counts.txt
-!/docs/audits/gc-survivor-copy/scaling-debug.txt
-!/docs/audits/gc-survivor-copy/scaling-release.txt
-!/docs/audits/gc-survivor-copy/stress-checks.txt
-!/docs/audits/gc-survivor-copy/example-normal.txt
-!/docs/audits/gc-survivor-copy/example-minor.txt
-!/docs/audits/gc-survivor-copy/example-relocate.txt
-!/docs/audits/gc-survivor-copy/object_churn-minor.txt
-!/docs/audits/gc-survivor-copy/object_churn-relocate.txt
-!/docs/audits/gc-survivor-copy/array_literal_churn-minor.txt
-!/docs/audits/gc-survivor-copy/array_literal_churn-relocate.txt
-
-# Allocation-only array literal audit (array-literal-allocation).
-!/docs/audits/array-literal-allocation/
-/docs/audits/array-literal-allocation/*
-!/docs/audits/array-literal-allocation/audit.md
-!/docs/audits/array-literal-allocation/count_calls.py
-!/docs/audits/array-literal-allocation/call-counts.txt
-
-# Public inline Array TLAB audit and source-only reproducers (array-inline-allocation).
-!/docs/audits/array-inline-allocation/
-/docs/audits/array-inline-allocation/*
-!/docs/audits/array-inline-allocation/audit.md
-!/docs/audits/array-inline-allocation/probe.wi
-!/docs/audits/array-inline-allocation/measure.py
-!/docs/audits/array-inline-allocation/verify_codegen.py
-!/docs/audits/array-inline-allocation/before.txt
-!/docs/audits/array-inline-allocation/after.txt
-!/docs/audits/array-inline-allocation/codegen.txt
-!/docs/audits/array-inline-allocation/grow_after_ref_registration.wi
 
 # Public default-body sharing measurements (default-body-sharing).
-!/docs/audits/default-body-sharing.md
-!/docs/audits/default-body-sharing-measurements.txt
-!/docs/audits/default-body-sharing-generic-measurements.txt
-!/docs/audits/default-body-sharing-reproduce.sh
 
 # Public semantic-facts implementation audit and focused measurements.
-!/docs/audits/checked-semantic-boundary.md
-!/docs/audits/checked-semantic-boundary-measurements.txt
-!/docs/audits/checked-semantic-boundary-reproduce.sh
 
 # Public WSAPoll implementation audit and reproduction commands.
-!/docs/audits/windows-poll-reuse.md
 
 # Public cleanup CFG audit and focused reproduction evidence.
-!/docs/audits/cleanup-lowering.md
-!/docs/audits/cleanup-lowering-counts.txt
-!/docs/audits/cleanup-lowering-reproduce.sh
-!/docs/audits/cleanup-lowering-measure.py
-!/docs/audits/cleanup-lowering-baseline.json
-!/docs/audits/cleanup-lowering-comparison.json
 
 # Public retry measurement evidence (source/observations only).
-!/docs/audits/scheduler-retry-measurement.md
-!/docs/audits/scheduler-retry-measurement-measurements.txt
-!/docs/audits/scheduler-retry-measurement-reproduce.sh
-
-# Public M4 source-derived audit, reproducer and focused measurements only.
-!/docs/audits/gc-minor-survivor-admission/
-/docs/audits/gc-minor-survivor-admission/*
-!/docs/audits/gc-minor-survivor-admission/audit.md
-!/docs/audits/gc-minor-survivor-admission/measure.py
-!/docs/audits/gc-minor-survivor-admission/measurements.json
-!/docs/audits/gc-minor-survivor-admission/samples.jsonl
-!/docs/audits/gc-minor-survivor-admission/validation.txt
-!/docs/audits/gc-minor-survivor-admission/fmt.txt
-!/docs/audits/gc-minor-survivor-admission/clippy-x86_64-unknown-linux-gnu.txt
-!/docs/audits/gc-minor-survivor-admission/clippy-x86_64-pc-windows-msvc.txt
-!/docs/audits/gc-minor-survivor-admission/clippy-aarch64-apple-darwin.txt
-!/docs/audits/gc-minor-survivor-admission/clippy-x86_64-apple-darwin.txt
-!/docs/audits/gc-minor-survivor-admission/example.txt
-!/docs/audits/gc-minor-survivor-admission/replicates.json
-!/docs/audits/gc-minor-survivor-admission/replicates-samples.jsonl
-!/docs/audits/gc-minor-survivor-admission/contract.md
-!/docs/audits/gc-minor-survivor-admission/confirmation-lock.json
-!/docs/audits/gc-minor-survivor-admission/confirmation-01/
-!/docs/audits/gc-minor-survivor-admission/confirmation-01/**
-!/docs/audits/gc-minor-survivor-admission/review-scope.md
-!/docs/audits/gc-minor-survivor-admission/summarize_confirmation.py
-!/docs/audits/gc-minor-survivor-admission/confirmation-validation.txt
 
 # Reviewed M3 measurement sources and evidence.
-!/docs/audits/gc-worker-telemetry/
-
-# Generated Python cache is not audit evidence.
-/docs/audits/gc-worker-telemetry/**/__pycache__/
-
-# Public source-derived Pacer audit and reference-host measurements.
-!/docs/audits/gc-pacer/
-/docs/audits/gc-pacer/*
-!/docs/audits/gc-pacer/audit.md
-!/docs/audits/gc-pacer/measure.py
-!/docs/audits/gc-pacer/measurements.json
-
-# Reviewed public mutator-assist audit and focused reproduction evidence.
-!/docs/audits/gc-mutator-assist/
-/docs/audits/gc-mutator-assist/*
-!/docs/audits/gc-mutator-assist/audit.md
-!/docs/audits/gc-mutator-assist/verify.py
-!/docs/audits/gc-mutator-assist/measure.py
-!/docs/audits/gc-mutator-assist/focused-tests.txt
-!/docs/audits/gc-mutator-assist/measurement.txt
-
-# Report output regression proof and implementation audit.
-!/docs/audits/benchmark-report-output/
-/docs/audits/benchmark-report-output/*
-!/docs/audits/benchmark-report-output/audit.md
-!/docs/audits/benchmark-report-output/reproduce.py
 
 # Public mark-worker configuration audit and focused measurements.
-!/docs/audits/gc-mark-worker-cache.md
-!/docs/audits/gc-mark-worker-cache-measure.py
-!/docs/audits/gc-mark-worker-cache-before.jsonl
-!/docs/audits/gc-mark-worker-cache-after.jsonl
-
-# Public documentation verification and referenced source reproducer.
-!/docs/audits/generic-foreign-defaults-counts.sh
-!/docs/audits/public-documentation/
-/docs/audits/public-documentation/*
-!/docs/audits/public-documentation/audit.md
-!/docs/audits/public-documentation/verify.py
-
-# Public audit: GC idle ownership and bounded notifications.
-!/docs/audits/async-allocation-idle/
-/docs/audits/async-allocation-idle/*
-!/docs/audits/async-allocation-idle/audit.md
-!/docs/audits/async-allocation-idle/measure.py
-!/docs/audits/async-allocation-idle/before.jsonl
-!/docs/audits/async-allocation-idle/after.jsonl
-!/docs/audits/async-allocation-idle/root-publication.txt
-!/docs/audits/async-allocation-idle/waiter-scaling.txt
 
 # Reviewed public growing-allocation regression evidence.
 !/docs/growing-allocation/
@@ -376,173 +120,26 @@ AGENTS.md
 !/docs/growing-allocation/scaling.txt
 !/docs/growing-allocation/retry-progress.txt
 
-# Reviewed public survivor-storage performance evidence.
-!/docs/audits/gc-churn-recovery/
-/docs/audits/gc-churn-recovery/*
-!/docs/audits/gc-churn-recovery/audit.md
-!/docs/audits/gc-churn-recovery/measure-runtime.py
-!/docs/audits/gc-churn-recovery/provenance.json
-!/docs/audits/gc-churn-recovery/scaling.txt
-!/docs/audits/gc-churn-recovery/current-run-1.jsonl
-!/docs/audits/gc-churn-recovery/candidate-probe.jsonl
-!/docs/audits/gc-churn-recovery/after-1.jsonl
-!/docs/audits/gc-churn-recovery/after-2.jsonl
-!/docs/audits/gc-churn-recovery/history-4ca55d1-parent.jsonl
-!/docs/audits/gc-churn-recovery/history-4ca55d1.jsonl
-!/docs/audits/gc-churn-recovery/history-39db9a7-parent.jsonl
-!/docs/audits/gc-churn-recovery/history-39db9a7.jsonl
-!/docs/audits/gc-churn-recovery/scheduler-yield.jsonl
-!/docs/audits/gc-churn-recovery/scheduler-gc.jsonl
-!/docs/audits/gc-churn-recovery/scheduler-tree.jsonl
-!/docs/audits/gc-churn-recovery/baseline-2026-10-23.jsonl
-!/docs/audits/gc-churn-recovery/baseline-2026-10-25.jsonl
-
 # Public constructor-inference audit and source-only reproducer.
-!/docs/audits/constructor-inference-diagnostics.md
-!/docs/audits/constructor-inference-repro.wi
-
-# Reviewed callable-field semantics audit and deterministic reproduction.
-!/docs/audits/parenthesized-callable-fields/
-/docs/audits/parenthesized-callable-fields/*
-!/docs/audits/parenthesized-callable-fields/audit.md
-!/docs/audits/parenthesized-callable-fields/count_codegen.py
-
-# Public string assembly audit and deterministic measurement evidence.
-!/docs/audits/array-join/
-/docs/audits/array-join/*
-!/docs/audits/array-join/audit.md
-!/docs/audits/array-join/measurements.txt
-!/docs/audits/array-join/verify.sh
-
-# Public runtime-root registration audit and focused measurement evidence.
-!/docs/audits/runtime-root-registration/
-/docs/audits/runtime-root-registration/*
-!/docs/audits/runtime-root-registration/audit.md
-!/docs/audits/runtime-root-registration/measure.py
-!/docs/audits/runtime-root-registration/measurements.jsonl
-!/docs/audits/runtime-root-registration/measurements-initial.jsonl
-!/docs/audits/runtime-root-registration/measurements-pending-map.jsonl
-!/docs/audits/runtime-root-registration/measurements-short.jsonl
-!/docs/audits/runtime-root-registration/measurements-radix-long.jsonl
-!/docs/audits/runtime-root-registration/measurements-page-pilot.jsonl
-!/docs/audits/runtime-root-registration/focused-tests.txt
-!/docs/audits/runtime-root-registration/validation.txt
-
-!/docs/audits/runtime-root-registration/measurements-before-review.jsonl
-
-# Reviewed public TLAB refill accounting evidence.
-!/docs/audits/tlab-refill-accounting/
-/docs/audits/tlab-refill-accounting/*
-!/docs/audits/tlab-refill-accounting/audit.md
-!/docs/audits/tlab-refill-accounting/verify.py
-!/docs/audits/tlab-refill-accounting/validation.txt
-
-# Public String.find API decision and implementation audit.
-!/docs/audits/string-find-sentinel/
-/docs/audits/string-find-sentinel/*
-!/docs/audits/string-find-sentinel/README.md
 
 # Public generic declaration display audit.
-!/docs/audits/generic-declaration-signatures.md
 
 # Reviewed public import-cycle policy and implementation audit.
 !/docs/recursive-type-modules.md
-!/docs/audits/import-cycle-diagnostics.md
 
 # Public literal payload diagnostic audit.
-!/docs/audits/literal-payload-pattern-diagnostics.md
 
 # Public generic parameter method diagnostic audit.
-!/docs/audits/generic-parameter-method-diagnostics.md
-
-# Public constructor closure diagnostic audit and reproduction.
-!/docs/audits/constructor-closure-diagnostics/
-/docs/audits/constructor-closure-diagnostics/*
-!/docs/audits/constructor-closure-diagnostics/audit.md
-!/docs/audits/constructor-closure-diagnostics/repro.wi
-
-# Reviewed sync poll gate audit and reproducible measurement sources.
-!/docs/audits/sync-poll-gates/
-/docs/audits/sync-poll-gates/*
-!/docs/audits/sync-poll-gates/audit.md
-!/docs/audits/sync-poll-gates/measure.py
-!/docs/audits/sync-poll-gates/baseline.jsonl
-!/docs/audits/sync-poll-gates/after.jsonl
-
-# Public inline SATB protocol, focused validation and benchmark evidence.
-!/docs/audits/inline-satb-barrier/
-/docs/audits/inline-satb-barrier/*
-!/docs/audits/inline-satb-barrier/audit.md
-!/docs/audits/inline-satb-barrier/validate.py
-!/docs/audits/inline-satb-barrier/validation.json
-!/docs/audits/inline-satb-barrier/measure.py
-!/docs/audits/inline-satb-barrier/measurements.json
-!/docs/audits/inline-satb-barrier/examples.json
-!/docs/audits/inline-satb-barrier/integration.json
-
-# Public String metadata implementation audit and reproducible measurements.
-!/docs/audits/string-metadata/
-/docs/audits/string-metadata/*
-!/docs/audits/string-metadata/audit.md
-!/docs/audits/string-metadata/length.wi
-!/docs/audits/string-metadata/measure.py
-!/docs/audits/string-metadata/scaling.py
-!/docs/audits/string-metadata/before.json
-!/docs/audits/string-metadata/after.json
-!/docs/audits/string-metadata/scaling.json
 
 # Public monotonic clock API, audit and focused evidence only.
 !/docs/monotonic-clock.md
-!/docs/audits/monotonic-clock/
-/docs/audits/monotonic-clock/*
-!/docs/audits/monotonic-clock/audit.md
-!/docs/audits/monotonic-clock/reproduce.sh
-!/docs/audits/monotonic-clock/integration.txt
-!/docs/audits/monotonic-clock/runtime.txt
-
-# Public Sync diagnostic batching audit and source-only reproducer.
-!/docs/audits/interface-sync-diagnostic-batching/
-/docs/audits/interface-sync-diagnostic-batching/*
-!/docs/audits/interface-sync-diagnostic-batching/audit.md
-!/docs/audits/interface-sync-diagnostic-batching/reproduce.py
 
 # Public static frozen-array diagnostic audit.
-!/docs/audits/static-frozen-array-diagnostic.md
-
-# Public closure-chain stack measurements and documented limits.
-!/docs/audits/closure-chain-stack/
-/docs/audits/closure-chain-stack/*
-!/docs/audits/closure-chain-stack/report.md
-!/docs/audits/closure-chain-stack/measure.py
-!/docs/audits/closure-chain-stack/measurements.jsonl
 
 # Runtime diagnostic source-name audit and focused reproducer.
-!/docs/audits/runtime-source-names.md
-!/docs/audits/runtime-source-names-check.sh
 
 # Public class-private scope decision and source-derived diagnostic audit.
 !/docs/class-private-scope.md
-!/docs/audits/class-private-scope.md
-
-# Fixed-array implementation evidence.
-!/docs/audits/fixed-arrays/
-/docs/audits/fixed-arrays/*
-!/docs/audits/fixed-arrays/audit.md
-!/docs/audits/fixed-arrays/probe.wi
-!/docs/audits/fixed-arrays/measure.py
-!/docs/audits/fixed-arrays/measurements.txt
-!/docs/audits/fixed-arrays/source_migration_probe.py
-!/docs/audits/fixed-arrays/source-migration-results.txt
-
-!/docs/audits/fixed-arrays/constraint-counts.txt
-!/docs/audits/fixed-arrays/source-dispatch-counts.txt
-
-# Public persistent compiler-query audit and source-only reproducer.
-!/docs/audits/persistent-query-cache/
-/docs/audits/persistent-query-cache/*
-!/docs/audits/persistent-query-cache/audit.md
-!/docs/audits/persistent-query-cache/reproduce.py
-!/docs/audits/persistent-query-cache/measurements.json
 
 # Compiler analysis caches beside standalone sources.
 **/target/willow-query-cache/

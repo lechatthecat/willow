@@ -1,2 +1,0 @@
-[ perf record: Woken up 1 times to write data ]
-[ perf record: Captured and wrote 0.075 MB target/gc-allocation-profile.data (1905 samples) ]

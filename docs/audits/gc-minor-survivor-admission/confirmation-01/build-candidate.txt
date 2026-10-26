@@ -1,2 +1,0 @@
-   Compiling willow_runtime v0.1.6 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
-    Finished `release` profile [optimized] target(s) in 1m 06s

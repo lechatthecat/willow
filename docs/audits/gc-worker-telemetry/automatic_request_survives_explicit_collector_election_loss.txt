@@ -1,9 +1,0 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
-     Running unittests src/lib.rs (target/debug/deps/willow_runtime-1e0b099407f66920)
-
-running 1 test
-test gc::coordinator::tests::automatic_request_survives_explicit_collector_election_loss ... explicit_cycles=1 retained_automatic_cycles=1 additional_requests=0 cooperative_sleeps=3
-ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1894 filtered out; finished in 0.00s
-
