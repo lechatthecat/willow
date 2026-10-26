@@ -1575,6 +1575,7 @@ impl TypeChecker {
             )
         });
         let mut mismatched = false;
+        let mut failure_argument = None;
         // An argument whose type already carries the recovery marker has been
         // reported; matching it would only add a derived mismatch, and every
         // later call fed this call's result would add another (willow-jz15.64).
@@ -1605,6 +1606,9 @@ impl TypeChecker {
                 && let Err(message) = inference.constrain_partial(formal, &ty)
             {
                 mismatched = true;
+                if failure.is_none() {
+                    failure_argument = Some(i);
+                }
                 failure.get_or_insert_with(|| {
                     format!(
                         "argument {} (`{}`): expected `{}`, found `{}`; {message}",
@@ -1703,6 +1707,9 @@ impl TypeChecker {
                 && let Err(message) = inference.constrain(&inferred_params[i], &canonical)
             {
                 mismatched = true;
+                if failure.is_none() {
+                    failure_argument = Some(i);
+                }
                 failure.get_or_insert_with(|| {
                     format!(
                         "argument {} (`{}`): expected `{}`, found `{}`; {message}",
@@ -1719,7 +1726,20 @@ impl TypeChecker {
         }
         let actual: Vec<Type> = actual.into_iter().map(Option::unwrap).collect();
         if let Some(message) = failure {
-            self.generic_error(span, message);
+            if let Some(i) = failure_argument {
+                let diagnostic =
+                    Diagnostic::new(Severity::Error, ErrorCode::E0201, message).with_label(
+                        Label::primary(call_args[i].expr.span(), "argument type mismatch"),
+                    );
+                self.push(Self::with_fn_closure_help(
+                    diagnostic,
+                    &params[i],
+                    &actual[i],
+                    &call_args[i].expr,
+                ));
+            } else {
+                self.generic_error(span, message);
+            }
             return Some(Self::error_type());
         }
         if poisoned {

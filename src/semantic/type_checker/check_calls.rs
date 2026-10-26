@@ -205,22 +205,60 @@ impl TypeChecker {
         // (willow-60o.1).
         let arg_ty = self.check_expr_expecting(&arg.expr, param_ty);
         if !self.types_compatible(param_ty, &arg_ty) {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    self.type_mismatch_error_code(param_ty, &arg_ty),
-                    format!(
-                        "mismatched types: expected `{}`, found `{}`",
-                        type_name(param_ty),
-                        type_name(&arg_ty)
-                    ),
-                )
-                .with_label(Label::primary(
-                    arg.expr.span(),
-                    format!("expected `{}`", type_name(param_ty)),
-                )),
-            );
+            let diagnostic = Diagnostic::new(
+                Severity::Error,
+                self.type_mismatch_error_code(param_ty, &arg_ty),
+                format!(
+                    "mismatched types: expected `{}`, found `{}`",
+                    type_name(param_ty),
+                    type_name(&arg_ty)
+                ),
+            )
+            .with_label(Label::primary(
+                arg.expr.span(),
+                format!("expected `{}`", type_name(param_ty)),
+            ));
+            self.push(Self::with_fn_closure_help(
+                diagnostic, param_ty, &arg_ty, &arg.expr,
+            ));
         }
+    }
+
+    /// Advice only: a named function still requires an explicit closure wrapper.
+    pub(super) fn with_fn_closure_help(
+        diagnostic: Diagnostic,
+        expected: &Type,
+        actual: &Type,
+        expr: &Expr,
+    ) -> Diagnostic {
+        let (Type::Closure(_, _), Type::Fn(params, _)) = (expected, actual) else {
+            return diagnostic;
+        };
+        let Expr::Var(name, _, _) = expr else {
+            return diagnostic.with_help(
+                "wrap the function value in a typed lambda before passing it as a closure",
+            );
+        };
+        let names: Vec<_> = (0..params.len())
+            .map(|i| {
+                let candidate = format!("arg{i}");
+                if candidate == *name {
+                    format!("_{candidate}")
+                } else {
+                    candidate
+                }
+            })
+            .collect();
+        let declarations = names
+            .iter()
+            .zip(params)
+            .map(|(name, ty)| format!("{name}: {}", type_name(ty)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        diagnostic.with_help(format!(
+            "wrap the function in a lambda: `|{declarations}| {name}({})`",
+            names.join(", ")
+        ))
     }
 
     pub(super) fn check_fn_arg_with_param_context(

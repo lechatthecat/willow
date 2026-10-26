@@ -8722,3 +8722,6 @@ mod constructor_inference_tests;
 thread_local! {
     static CONSTRUCTOR_INFERENCE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+#[cfg(test)]
+mod fn_closure_diagnostic_tests;

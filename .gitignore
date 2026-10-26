@@ -40,6 +40,7 @@ AGENTS.md
 !/docs/
 /docs/*
 !/docs/gc_telemetry.md
+!/docs/function-closure-diagnostics-audit.md
 !/docs/audits/
 /docs/audits/*
 !/docs/audits/builtin-method-diagnostics.md
