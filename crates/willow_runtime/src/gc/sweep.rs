@@ -3,6 +3,18 @@
 //! wait for completion and the next mark epoch before allocator reuse.
 use super::*;
 mod batches;
+
+/// Shared fixed runway for old-region allocations during concurrent sweep.
+/// Fast small-object buffers retain their existing allocation policy.
+pub(super) const ALLOCATION_RUNWAY: u64 = 1024 * 1024;
+
+pub(super) fn allocation_budget_exhausted(state: &GcState) -> bool {
+    state.sweeping.is_some()
+        && state
+            .total_allocated_bytes
+            .saturating_sub(state.sweep_allocation_start)
+            >= ALLOCATION_RUNWAY
+}
 pub(super) fn assist() {
     batches::assist();
 }
@@ -30,6 +42,7 @@ fn begin_sweep(state: &mut GcState) {
     #[cfg(feature = "gc-acceptance-faults")]
     crate::gc_telemetry::footprint::mark_window_complete();
     state.sweeping = Some(std::thread::current().id());
+    state.sweep_allocation_start = state.total_allocated_bytes;
     state.pending_sweep_chunks = 0..state.tlab_chunks.len();
     publish_collection_busy(state);
     state.major_collections = state.major_collections.saturating_add(1);

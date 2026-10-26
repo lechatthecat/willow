@@ -10,6 +10,10 @@ std::thread_local! {
 
 pub(super) struct CollectorGuard(Option<std::sync::MutexGuard<'static, ()>>);
 
+pub(super) fn is_collector() -> bool {
+    IS_COLLECTOR.get()
+}
+
 impl CollectorGuard {
     pub(super) fn try_acquire() -> Option<Self> {
         if IS_COLLECTOR.get() {
@@ -74,6 +78,56 @@ pub(super) fn collect_for_budget() {
     wait_for_cycle(coord, generation);
 }
 
+#[cfg(test)]
+pub(super) static INITIAL_ALLOCATION_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static BEFORE_INITIAL_HANDSHAKE: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+/// Bound a delayed automatic request without making its allocating caller the
+/// collector. A native trace may Retry until this allocation returns, so only
+/// join initial publication, never marking or whole-cycle completion.
+pub(super) fn start_for_allocation() {
+    if IS_COLLECTOR.get() {
+        return;
+    }
+    let coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    let generation = coord.cycle_generation;
+    let request = coord.cycle_collector.is_none();
+    drop(coord);
+    if request && !coordinator::request() {
+        // Unregistered legacy roots or unavailable background collection must
+        // retain progress, not fall back to synchronous Retry-blind marking.
+        return;
+    }
+    let mut coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    while coord.cycle_generation == generation && GC_MARK_PHASE.load(Ordering::Acquire) == 0 {
+        if foreign_root_stack_owner_active_locked(&coord) {
+            return;
+        }
+        if coord.stop_requested {
+            drop(coord);
+            willow_gc_safepoint();
+            coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+            continue;
+        }
+        #[cfg(test)]
+        INITIAL_ALLOCATION_WAITS.fetch_add(1, Ordering::Release);
+        // Initial stop publication and collector retirement both notify under
+        // coord. No polling or missed wake between this predicate and sleep.
+        coord = runtime()
+            .budget_cv
+            .wait(coord)
+            .unwrap_or_else(|p| p.into_inner());
+    }
+    drop(coord);
+    // If publication exposed an exhausted runway, retain the normal native
+    // Retry escape. This call charges no allocation bytes a second time.
+    assist_concurrent_mark(0);
+}
+
 /// Wait for an elected collector without consuming an automatic request.
 /// The same condition-variable protocol joins sweep completion and services
 /// each subsequent stop while this registered waiter remains enrolled.
@@ -81,6 +135,27 @@ pub(super) fn wait_for_current_cycle() {
     let coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
     let generation = coord.cycle_generation;
     wait_for_cycle(coord, generation);
+}
+
+/// Revalidate sweep admission under coord -> heap lock order. A sweep may
+/// retire and a later mark may win election after the allocator dropped heap;
+/// never join that later mark on the strength of a stale sweep predicate.
+pub(super) fn wait_for_sweep_budget() -> bool {
+    if IS_COLLECTOR.get() {
+        return false;
+    }
+    let coord = runtime().coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    if coord.cycle_collector.is_none()
+        || !sweep::allocation_budget_exhausted(&runtime().heap.lock().unwrap())
+    {
+        return false;
+    }
+    let generation = coord.cycle_generation;
+    let _interval = crate::gc_telemetry::observations::Span::new(
+        crate::gc_telemetry::observations::Kind::AllocationStall,
+    );
+    wait_for_cycle(coord, generation);
+    true
 }
 
 /// Young refills without remaining debt budget join an elected owner instead of

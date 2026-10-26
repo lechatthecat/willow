@@ -326,6 +326,8 @@ struct GcState {
     hard_pressure_triggered: bool,
     soft_memory: memory_control::Controller,
     last_major_live_bytes: u64,
+    /// Allocation clock at sweep entry; bounds floating garbage during sweep.
+    sweep_allocation_start: u64,
     /// `last_major_live_bytes` in the major-policy domain, which excludes the
     /// nursery budget ([`major_policy_managed_bytes`]).
     last_major_policy_live_bytes: u64,
@@ -887,6 +889,7 @@ impl Default for GcState {
             hard_pressure_triggered: false,
             soft_memory: memory_control::Controller::from_env(),
             last_major_live_bytes: 0,
+            sweep_allocation_start: 0,
             last_major_policy_live_bytes: 0,
             last_major_mark_work: 0,
             pacer: pacer::Sampler::default(),
@@ -1754,6 +1757,14 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
         crate::failure::fatal_invariant("negative managed allocation size");
     }
     let payload_size = payload_size as usize;
+    // Large runtime allocations can consume an arbitrary number of bytes
+    // between generated loop polls. Service the initial handshake too, when
+    // no mark epoch exists yet and mark assists therefore return immediately.
+    if payload_size > GC_TLAB_MAX_OBJECT_SIZE.saturating_sub(GC_HEADER_SIZE)
+        && !cycle_wait::is_collector()
+    {
+        willow_gc_safepoint();
+    }
     if old_lab::enabled()
         && let Some((total, span)) = old_lab::span_for(payload_size)
         && total <= GC_TLAB_MAX_OBJECT_SIZE
@@ -1783,6 +1794,35 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
     // TLAB byte merging is O(TLABs); the policy checks and TLAB slow path that
     // read those bytes merge them, so the per-object path does not.
     let mut state = runtime().heap.lock().unwrap();
+    // A coordinator request can still be queued before collector election.
+    // Large allocations must not turn OS scheduling latency into unbounded
+    // heap growth. Request/join initial publication once the fixed request
+    // runway is spent, then use Retry-aware assists: marking may depend on
+    // a lock held by this allocator even if no epoch exists yet.
+    if state.concurrent_cycle.is_none()
+        && state.sweeping.is_none()
+        && major_policy_managed_bytes(&state)
+            > state
+                .threshold_bytes
+                .saturating_add(sweep::ALLOCATION_RUNWAY as usize)
+        && !cycle_wait::is_collector()
+    {
+        drop(state);
+        cycle_wait::start_for_allocation();
+        state = runtime().heap.lock().unwrap();
+    }
+    // New objects are outside the sweep snapshot. Bound this floating garbage
+    // rather than feeding unlimited sweep-time growth into the next live goal.
+    // Check under the allocation lock, so concurrent allocators share one
+    // budget and overshoot by at most one admitted object.
+    while sweep::allocation_budget_exhausted(&state) {
+        drop(state);
+        if !cycle_wait::wait_for_sweep_budget() {
+            state = runtime().heap.lock().unwrap();
+            break;
+        }
+        state = runtime().heap.lock().unwrap();
+    }
     let mut header = allocate_old_region_object_locked(
         &mut state,
         layout_id,
@@ -2095,6 +2135,10 @@ fn try_collect_internal() -> CollectionAttempt {
     };
     let pause_before = coordination_ns();
     let external_before = external_bytes() as u64;
+    #[cfg(test)]
+    if let Some(hook) = cycle_wait::BEFORE_INITIAL_HANDSHAKE.get() {
+        hook();
+    }
     let Some((heap_before, marking)) = root_handshake::begin() else {
         progress::record_skip(GcSkipReason::ForeignOwnerAtHandshake);
         return CollectionAttempt::ForeignOwner;
@@ -2439,6 +2483,7 @@ fn reset_internal() {
     state.hard_pressure_triggered = false;
     state.soft_memory = memory_control::Controller::from_env();
     state.last_major_live_bytes = 0;
+    state.sweep_allocation_start = 0;
     state.last_major_policy_live_bytes = 0;
     state.last_major_mark_work = 0;
     state.pacer = pacer::Sampler::default();
@@ -2736,3 +2781,6 @@ pub fn acceptance_inject(kind: &str) {
         _ => panic!("unknown acceptance fault"),
     }
 }
+
+#[cfg(test)]
+mod sweep_allocation_tests;

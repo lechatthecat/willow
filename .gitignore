@@ -359,3 +359,13 @@ AGENTS.md
 !/docs/audits/async-allocation-idle/after.jsonl
 !/docs/audits/async-allocation-idle/root-publication.txt
 !/docs/audits/async-allocation-idle/waiter-scaling.txt
+
+# Reviewed public growing-allocation regression evidence.
+!/docs/growing-allocation/
+/docs/growing-allocation/*
+!/docs/growing-allocation/audit.md
+!/docs/growing-allocation/measure.py
+!/docs/growing-allocation/before.json
+!/docs/growing-allocation/after.json
+!/docs/growing-allocation/scaling.txt
+!/docs/growing-allocation/retry-progress.txt

@@ -1,0 +1,10 @@
+// Runtime allocation polls must service collection before the next loop poll.
+async fn main() {
+    let mut text = "";
+    let mut i = 0;
+    while i < 40000 {
+        text = text + "abc";
+        i += 1;
+    }
+    println(text.len()); // 120000
+}
