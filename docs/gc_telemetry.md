@@ -199,7 +199,7 @@ disable the sink, increment `trace_errors()`, and never fail GC. Read the error
 counter after the final flush when making an independent endpoint.
 
 The source-only consumer in
-`docs/audits/willow-6fv.5.8.2-completion/gc_observation_check.py` requires independent
+`docs/audits/gc-observation-completion/gc_observation_check.py` requires independent
 before/after snapshots, complete thread lifetimes, individual progress evidence,
 matching reset generation, no active intervals, intact flags and zero trace errors.
 It rejects gaps, duplicate events, unmatched/aborted intervals, missing final

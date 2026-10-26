@@ -1,0 +1,365 @@
+$ cargo fmt --all -- --check
+exit=0
+$ cargo test -p willow_runtime map::tests:: -- --nocapture
+   Compiling hashbrown v0.17.1
+   Compiling willow_runtime v0.1.4 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.09s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-0de894f1968772f7)
+
+running 32 tests
+test gc::concurrent_bitmap::tests::for_each_set_visits_ascending_indices_across_words ... ok
+test gc::concurrent_bitmap::tests::stopped_sets_preserve_neighbours_across_words ... ok
+normalization calls=48, allocations=0
+normalization calls=384, allocations=0
+normalization calls=3072, allocations=0
+test map::tests::borrowed_word_keys_preserve_all_bits ... ok
+normalization calls=24576, allocations=0
+test map::tests::float_key_normalization_scales_without_allocations ... ok
+test map::tests::concurrent_slice_retries_a_busy_map_without_waiting_or_partial_children ... ok
+test gc::concurrent_bitmap::tests::concurrent_claims_have_exactly_one_owner_across_word_boundaries ... ok
+test map::tests::borrowed_string_keys_survive_copy_update_and_collection ... ok
+test map::tests::confined_constructor_keeps_reference_values_synchronized ... ok
+confined operations=80 mutual_exclusion_acquisitions=0
+confined operations=640 mutual_exclusion_acquisitions=0
+confined operations=5120 mutual_exclusion_acquisitions=0
+confined operations=40960 mutual_exclusion_acquisitions=0
+test map::tests::confined_scalar_accesses_never_acquire_mutual_exclusion ... ok
+test map::tests::copy_keeps_string_values_across_a_full_collection_in_its_allocation ... ok
+strings count=16 length=20 insertion_bytes=800 lookup_update_bytes=640 allocations=0
+strings count=16 length=128 insertion_bytes=5120 lookup_update_bytes=4096 allocations=0
+strings count=128 length=20 insertion_bytes=6960 lookup_update_bytes=5120 allocations=0
+strings count=128 length=128 insertion_bytes=44544 lookup_update_bytes=32768 allocations=0
+strings count=1024 length=20 insertion_bytes=56240 lookup_update_bytes=40960 allocations=0
+strings count=1024 length=128 insertion_bytes=359936 lookup_update_bytes=262144 allocations=0
+strings count=8192 length=20 insertion_bytes=450480 lookup_update_bytes=327680 allocations=0
+strings count=8192 length=128 insertion_bytes=2883072 lookup_update_bytes=2097152 allocations=0
+test map::tests::confined_string_maps_scale_without_lookup_allocation_and_skip_gc_borrows ... ok
+test map::tests::copy_of_young_values_is_updated_by_the_next_minor_collection ... ok
+test map::tests::float_keys_reject_all_nan_forms_without_mutating_or_holding_lock ... ok
+test map::tests::inline_maps_remain_stable_and_are_reclaimed_at_increasing_counts ... ok
+test map::tests::copy_stores_values_as_relocated_by_a_collection_inside_its_allocation ... ok
+test map::tests::map_get_into_preserves_payload_bits_without_allocating_wrappers ... ok
+test map::tests::scalar_storage_uncontended_access_does_not_take_the_parking_mutex ... ok
+test map::tests::map_layout_survives_freeze_and_drives_word_display ... ok
+test map::tests::float_keys_normalize_zero_preserve_numbers_and_copy ... ok
+test map::tests::map_unit_01_new_is_empty ... ok
+test map::tests::map_unit_02_int_key_insert_get ... ok
+test map::tests::map_unit_03_insert_overwrites ... ok
+test map::tests::map_unit_04_string_keys_compare_by_content ... ok
+test map::tests::map_unit_05_contains ... ok
+test map::tests::map_unit_06_reference_values_survive_collection ... ok
+test map::tests::map_unit_07_reference_option_uses_nullable_pointer_niche ... ok
+test map::tests::read_only_lookups_never_copy_the_key ... ok
+test map::tests::scalar_frozen_copy_supports_parallel_reads_and_independent_updates ... ok
+test map::tests::scalar_gc_hooks_do_not_borrow_mutating_storage ... ok
+test map::tests::scalar_map_aliases_share_one_gate_across_all_accessors ... ok
+scalar count=16 stride=1 insert_hashes=40 lookup_update_hashes=64 allocations=0
+scalar count=16 stride=2654435761 insert_hashes=40 lookup_update_hashes=64 allocations=0
+scalar count=16 stride=4294967296 insert_hashes=40 lookup_update_hashes=64 allocations=0
+scalar count=16 stride=-1 insert_hashes=40 lookup_update_hashes=64 allocations=0
+scalar count=128 stride=1 insert_hashes=348 lookup_update_hashes=512 allocations=0
+scalar count=128 stride=2654435761 insert_hashes=348 lookup_update_hashes=512 allocations=0
+scalar count=128 stride=4294967296 insert_hashes=348 lookup_update_hashes=512 allocations=0
+scalar count=128 stride=-1 insert_hashes=348 lookup_update_hashes=512 allocations=0
+scalar count=1024 stride=1 insert_hashes=2812 lookup_update_hashes=4096 allocations=0
+scalar count=1024 stride=2654435761 insert_hashes=2812 lookup_update_hashes=4096 allocations=0
+scalar count=1024 stride=4294967296 insert_hashes=2812 lookup_update_hashes=4096 allocations=0
+scalar count=1024 stride=-1 insert_hashes=2812 lookup_update_hashes=4096 allocations=0
+scalar count=8192 stride=1 insert_hashes=22524 lookup_update_hashes=32768 allocations=0
+scalar count=8192 stride=2654435761 insert_hashes=22524 lookup_update_hashes=32768 allocations=0
+scalar count=8192 stride=4294967296 insert_hashes=22524 lookup_update_hashes=32768 allocations=0
+scalar count=8192 stride=-1 insert_hashes=22524 lookup_update_hashes=32768 allocations=0
+test map::tests::scalar_map_hash_work_and_lookup_allocations_scale_linearly ... ok
+{"version":3,"event":"gc_failure","kind":"test_panic","reason":"release the storage gate on unwind","timestamp_ns":325976773,"epoch":60,"seed":0,"case":0,"heap_available":true,"heap_consistency":"metadata_without_lab_merge","actual_bytes":0,"limit_bytes":null,"managed_bytes":0,"external_bytes":0,"old_reserved_bytes":0,"young_reserved_bytes":0,"phase":0,"last_major_live_bytes":0,"allocated_bytes":0,"root_scan_bytes":0,"last_stop_reason":0,"last_stop_outcome":0,"minor_deferrals":0,"minor_deferral_age_bytes":0,"pin_fallback_count":0,"pinned_bytes":0,"registered_mutators":0,"parked_mutators":0,"pending_mutators":0,"os":"linux","arch":"x86_64","allocated_frame_bytes":0,"reclaimed_frame_bytes":0,"quarantined_frame_bytes":0,"task_frames_running":0,"task_frames_rooted":0,"task_frames_terminal":0,"task_frames_retired":0}
+
+thread 'map::tests::scalar_storage_gate_serializes_retained_aliases_and_releases_on_unwind' (380878) panicked at crates/willow_runtime/src/map.rs:1098:17:
+release the storage gate on unwind
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test map::tests::scalar_storage_gate_serializes_retained_aliases_and_releases_on_unwind ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 1802 filtered out; finished in 0.33s
+
+exit=0
+$ cargo test -p willow_runtime native_memory::tests:: -- --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-0de894f1968772f7)
+
+running 7 tests
+native accounting mutations=2 footprint_visits=3
+native accounting mutations=64 footprint_visits=65
+native accounting mutations=2048 footprint_visits=2049
+test native_memory::tests::accounting_visits_once_per_guard_independent_of_buffer_length ... ok
+native channels=1 reconciliations=2 requested_bytes=384 reset=false
+native channels=32 reconciliations=64 requested_bytes=12288 reset=false
+test native_memory::tests::capacity_arithmetic_rejects_overflow_without_wrapping ... ok
+native channels=1024 reconciliations=2048 requested_bytes=393216 reset=false
+native channels=1 reconciliations=2 requested_bytes=384 reset=true
+native channels=32 reconciliations=64 requested_bytes=12288 reset=true
+native channels=1024 reconciliations=2048 requested_bytes=393216 reset=true
+test native_memory::tests::increasing_channel_counts_have_linear_accounting_and_balanced_lifetimes ... ok
+test native_memory::tests::parallel_owners_reconcile_without_lost_updates ... ok
+{"version":3,"event":"gc_failure","kind":"test_panic","reason":"injected after shrink","timestamp_ns":16749823,"epoch":3,"seed":0,"case":0,"heap_available":true,"heap_consistency":"metadata_without_lab_merge","actual_bytes":1048,"limit_bytes":null,"managed_bytes":0,"external_bytes":1048,"old_reserved_bytes":0,"young_reserved_bytes":0,"phase":0,"last_major_live_bytes":0,"allocated_bytes":0,"root_scan_bytes":0,"last_stop_reason":0,"last_stop_outcome":0,"minor_deferrals":0,"minor_deferral_age_bytes":0,"pin_fallback_count":0,"pinned_bytes":0,"registered_mutators":0,"parked_mutators":0,"pending_mutators":0,"os":"linux","arch":"x86_64","allocated_frame_bytes":0,"reclaimed_frame_bytes":0,"quarantined_frame_bytes":0,"task_frames_running":0,"task_frames_rooted":0,"task_frames_terminal":0,"task_frames_retired":0}
+
+thread 'native_memory::tests::shrink_and_unwind_release_only_freed_capacity' (380910) panicked at crates/willow_runtime/src/native_memory.rs:330:17:
+injected after shrink
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test native_memory::tests::shrink_and_unwind_release_only_freed_capacity ... ok
+{"version":3,"event":"gc_failure","kind":"test_panic","reason":"injected after native growth","timestamp_ns":16930110,"epoch":3,"seed":0,"case":0,"heap_available":true,"heap_consistency":"metadata_without_lab_merge","actual_bytes":0,"limit_bytes":null,"managed_bytes":0,"external_bytes":0,"old_reserved_bytes":0,"young_reserved_bytes":0,"phase":0,"last_major_live_bytes":0,"allocated_bytes":0,"root_scan_bytes":0,"last_stop_reason":0,"last_stop_outcome":0,"minor_deferrals":0,"minor_deferral_age_bytes":0,"pin_fallback_count":0,"pinned_bytes":0,"registered_mutators":0,"parked_mutators":0,"pending_mutators":0,"os":"linux","arch":"x86_64","allocated_frame_bytes":0,"reclaimed_frame_bytes":0,"quarantined_frame_bytes":0,"task_frames_running":0,"task_frames_rooted":0,"task_frames_terminal":0,"task_frames_retired":0}
+
+thread 'native_memory::tests::poisoned_guard_accounts_growth_and_drop_releases_it' (380909) panicked at crates/willow_runtime/src/native_memory.rs:243:17:
+injected after native growth
+test native_memory::tests::poisoned_guard_accounts_growth_and_drop_releases_it ... ok
+test native_memory::tests::native_growth_enforces_hard_limit_without_managed_allocation ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 1827 filtered out; finished in 0.02s
+
+exit=0
+$ cargo test -p willow_runtime string::tests::utf8_byte_entries_preserve_content
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-0de894f1968772f7)
+
+running 1 test
+test string::tests::utf8_byte_entries_preserve_content ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1833 filtered out; finished in 0.00s
+
+exit=0
+$ cargo test -p willow_runtime string::tests::invalid_utf8_is_process_fatal
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-0de894f1968772f7)
+
+running 1 test
+test string::tests::invalid_utf8_is_process_fatal ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1833 filtered out; finished in 0.26s
+
+exit=0
+$ cargo test --lib local_maps_confinement -- --nocapture
+   Compiling indexmap v2.14.2
+   Compiling regalloc2 v0.15.2
+   Compiling wasmtime-internal-core v49.0.2
+   Compiling willow_runtime v0.1.4 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
+   Compiling cranelift-bitset v0.136.2
+   Compiling cranelift-entity v0.136.2
+   Compiling gimli v0.33.0
+   Compiling object v0.40.0
+   Compiling toml_edit v0.25.17+spec-1.1.0
+   Compiling cranelift-bforest v0.136.2
+   Compiling cranelift-codegen v0.136.2
+   Compiling cranelift-module v0.136.2
+   Compiling cranelift-frontend v0.136.2
+   Compiling cranelift-native v0.136.2
+   Compiling cranelift-object v0.136.2
+   Compiling willow v0.1.4 (/home/shu/Documents/gitproject/willow)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 45.16s
+     Running unittests src/lib.rs (target/debug/deps/willow_compiler-a66719873a78cf71)
+
+running 2 tests
+local-map key=i64 call_sites=16 analysis_visits=53
+local-map key=i64 call_sites=128 analysis_visits=389
+test backend::cranelift::lir_gen::tests::local_maps_confinement_twenty_perspectives ... ok
+local-map key=i64 call_sites=1024 analysis_visits=3077
+local-map key=String call_sites=16 analysis_visits=53
+local-map key=String call_sites=128 analysis_visits=389
+local-map key=String call_sites=1024 analysis_visits=3077
+test backend::cranelift::lir_gen::tests::local_maps_confinement_visits_each_instruction_once ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3237 filtered out; finished in 0.27s
+
+     Running unittests src/lib.rs (target/debug/deps/willow_abi-6d4773e8af997841)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/willow_continuations-e1c75fca36d86858)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-460c30f6d8747784)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1834 filtered out; finished in 0.00s
+
+exit=0
+$ cargo test --lib local_string_maps_ -- --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/willow_compiler-a66719873a78cf71)
+
+running 2 tests
+test backend::cranelift::lir_gen::tests::local_string_maps_word_count_confinement ... ok
+test backend::cranelift::lir_gen::tests::local_string_maps_confinement_twenty_perspectives ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3237 filtered out; finished in 0.05s
+
+     Running unittests src/lib.rs (target/debug/deps/willow_abi-6d4773e8af997841)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/willow_continuations-e1c75fca36d86858)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-460c30f6d8747784)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1834 filtered out; finished in 0.00s
+
+exit=0
+$ cargo test --test integration codegen::maps::
+   Compiling willow v0.1.4 (/home/shu/Documents/gitproject/willow)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.62s
+     Running tests/integration.rs (target/debug/deps/integration-39457a2b427fd170)
+
+running 22 tests
+test codegen::maps::test_map_get_wrong_arity_is_error ... ok
+test codegen::maps::test_map_new_with_args_is_error ... ok
+test codegen::maps::test_map_empty_len_zero ... ok
+test codegen::maps::test_map_unknown_method_is_error ... ok
+test codegen::maps::test_map_get_missing_returns_none ... ok
+test codegen::maps::test_map_wrong_key_type_is_error ... ok
+test codegen::maps::test_map_wrong_value_type_is_error ... ok
+test codegen::maps::test_map_contains ... ok
+test codegen::maps::test_map_get_result_in_variable ... ok
+test codegen::maps::test_map_len_distinct_keys ... ok
+test codegen::maps::test_map_string_keys_by_content ... ok
+test codegen::maps::map_new_in_field_assignment_uses_field_type ... ok
+test codegen::maps::test_map_insert_overwrites ... ok
+test codegen::maps::test_map_returned_from_function ... ok
+test codegen::maps::test_map_i64_keys ... ok
+test codegen::maps::test_map_string_values ... ok
+test codegen::maps::test_map_string_key_insert_get_len ... ok
+test codegen::maps::test_map_independent_instances ... ok
+test codegen::maps::test_map_as_parameter ... ok
+test codegen::maps::analogous_constructors_in_field_assignments_use_field_types ... ok
+test codegen::maps::test_map_string_values_survive_gc ... ok
+test codegen::maps::test_map_value_in_arithmetic ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 6013 filtered out; finished in 16.02s
+
+exit=0
+$ cargo test --test integration codegen::collection_inference::map_inference
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/integration.rs (target/debug/deps/integration-39457a2b427fd170)
+
+running 7 tests
+test codegen::collection_inference::map_inference_reports_early_content_use ... ok
+test codegen::collection_inference::map_inference_requires_evidence_for_empty_map ... ok
+test codegen::collection_inference::map_inference_rejects_conflicting_insertions ... ok
+test codegen::collection_inference::map_inference_insertion_in_nested_scope ... ok
+test codegen::collection_inference::map_inference_from_insert ... ok
+test codegen::collection_inference::map_inference_works_in_async_body ... ok
+test codegen::collection_inference::map_inference_preserves_types_and_shadowing ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 6028 filtered out; finished in 1.79s
+
+exit=0
+$ python3 docs/audits/map-workloads/check_examples.py
+PASS maps stress=off
+PASS maps stress=minor
+PASS map_inference stress=off
+PASS map_inference stress=minor
+PASS map_key_value_kinds stress=off
+PASS map_key_value_kinds stress=minor
+PASS map_scalar_storage stress=off
+PASS map_scalar_storage stress=minor
+PASS frozen_map stress=off
+PASS frozen_map stress=minor
+PASS frozen_map_gc stress=off
+PASS frozen_map_gc stress=minor
+PASS map_string_local stress=off
+PASS map_string_local stress=minor
+exit=0
+$ cargo clippy --workspace --all-targets -- -D warnings
+   Compiling willow v0.1.4 (/home/shu/Documents/gitproject/willow)
+    Checking willow_runtime v0.1.4 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.17s
+exit=0
+$ cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+    Checking hashbrown v0.17.1
+   Compiling willow v0.1.4 (/home/shu/Documents/gitproject/willow)
+    Checking wasmtime-internal-core v49.0.2
+    Checking indexmap v2.14.2
+    Checking regalloc2 v0.15.2
+    Checking willow_runtime v0.1.4 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
+    Checking cranelift-bitset v0.136.2
+    Checking cranelift-entity v0.136.2
+    Checking gimli v0.33.0
+    Checking object v0.40.0
+    Checking toml_edit v0.25.17+spec-1.1.0
+    Checking cranelift-bforest v0.136.2
+    Checking cranelift-codegen v0.136.2
+    Checking cranelift-module v0.136.2
+    Checking cranelift-native v0.136.2
+    Checking cranelift-frontend v0.136.2
+    Checking cranelift-object v0.136.2
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 30.40s
+exit=0
+$ cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+    Checking hashbrown v0.17.1
+   Compiling willow v0.1.4 (/home/shu/Documents/gitproject/willow)
+    Checking wasmtime-internal-core v49.0.2
+    Checking indexmap v2.14.2
+    Checking regalloc2 v0.15.2
+    Checking willow_runtime v0.1.4 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
+    Checking cranelift-bitset v0.136.2
+    Checking cranelift-entity v0.136.2
+    Checking gimli v0.33.0
+    Checking object v0.40.0
+    Checking toml_edit v0.25.17+spec-1.1.0
+    Checking cranelift-bforest v0.136.2
+    Checking cranelift-codegen v0.136.2
+    Checking cranelift-module v0.136.2
+    Checking cranelift-native v0.136.2
+    Checking cranelift-frontend v0.136.2
+    Checking cranelift-object v0.136.2
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 29.96s
+exit=0
+$ cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+    Checking hashbrown v0.17.1
+   Compiling willow v0.1.4 (/home/shu/Documents/gitproject/willow)
+    Checking wasmtime-internal-core v49.0.2
+    Checking indexmap v2.14.2
+    Checking regalloc2 v0.15.2
+    Checking willow_runtime v0.1.4 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
+    Checking cranelift-bitset v0.136.2
+    Checking cranelift-entity v0.136.2
+    Checking gimli v0.33.0
+    Checking object v0.40.0
+    Checking toml_edit v0.25.17+spec-1.1.0
+    Checking cranelift-bforest v0.136.2
+    Checking cranelift-codegen v0.136.2
+    Checking cranelift-module v0.136.2
+    Checking cranelift-frontend v0.136.2
+    Checking cranelift-native v0.136.2
+    Checking cranelift-object v0.136.2
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 28.98s
+exit=0
+$ cargo clippy --workspace --all-targets --target x86_64-apple-darwin -- -D warnings
+    Checking hashbrown v0.17.1
+   Compiling willow v0.1.4 (/home/shu/Documents/gitproject/willow)
+    Checking wasmtime-internal-core v49.0.2
+    Checking indexmap v2.14.2
+    Checking regalloc2 v0.15.2
+    Checking willow_runtime v0.1.4 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
+    Checking cranelift-bitset v0.136.2
+    Checking cranelift-entity v0.136.2
+    Checking gimli v0.33.0
+    Checking object v0.40.0
+    Checking toml_edit v0.25.17+spec-1.1.0
+    Checking cranelift-bforest v0.136.2
+    Checking cranelift-codegen v0.136.2
+    Checking cranelift-module v0.136.2
+    Checking cranelift-frontend v0.136.2
+    Checking cranelift-native v0.136.2
+    Checking cranelift-object v0.136.2
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 30.59s
+exit=0

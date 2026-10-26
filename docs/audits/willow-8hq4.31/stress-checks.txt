@@ -1,9 +1,0 @@
-    Finished `release` profile [optimized] target(s) in 0.04s
-compiled [release]: target/8hq4-31-object_churn
-    Finished `release` profile [optimized] target(s) in 0.01s
-compiled [release]: target/8hq4-31-array_literal_churn
-object_churn minor checksum 4471800 PASS
-object_churn relocate checksum 4471800 PASS
-array_literal_churn minor checksum 4471800 PASS
-array_literal_churn relocate checksum 4471800 PASS
-array_literal_churn example: normal/minor/relocate PASS

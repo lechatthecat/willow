@@ -9,14 +9,14 @@ const crypto = require('node:crypto');
 // existing reconstructed cases and the ticket's documented entry point.
 if (process.argv[2] === 'run' && process.argv[3] === 'parallel_map') {
   const result = spawnSync(process.execPath,
-    [path.resolve(__dirname, '../../docs/audits/willow-8hq4.46/measure.js'), ...process.argv.slice(4)],
+    [path.resolve(__dirname, '../../docs/audits/parallel-map-chunks/measure.js'), ...process.argv.slice(4)],
     {stdio: 'inherit'});
   if (result.error) throw result.error;
   process.exit(result.status ?? 1);
 }
 if (process.argv[2] === 'run' && ['word_count','map_lookup_insert'].includes(process.argv[3])) {
   const result = spawnSync(process.execPath,
-    [path.resolve(__dirname, '../../docs/audits/willow-8hq4.45/measure.js'), ...process.argv.slice(3)],
+    [path.resolve(__dirname, '../../docs/audits/map-workloads/measure.js'), ...process.argv.slice(3)],
     {stdio: 'inherit'});
   if (result.error) throw result.error;
   process.exit(result.status ?? 1);

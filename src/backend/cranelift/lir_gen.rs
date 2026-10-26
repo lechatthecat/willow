@@ -10163,7 +10163,7 @@ mod tests {
 
     #[test]
     fn local_string_maps_word_count_confinement() {
-        let source = include_str!("../../../docs/audits/willow-8hq4.45/word_count.wi");
+        let source = include_str!("../../../docs/audits/map-workloads/word_count.wi");
         let (program, _) = checked_lowering(source, &[]);
         let f = program
             .functions

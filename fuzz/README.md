@@ -84,8 +84,7 @@ mkdir -p fuzz/corpus/type_checker
 cargo +nightly fuzz run type_checker fuzz/corpus/type_checker fuzz/seeds/type_checker -- -seed=20260921 -runs=20000 -max_len=4096 -timeout=5 -rss_limit_mb=2048
 ```
 
-The compiler's process-global symbol interner retains spellings between inputs
-(willow-9tls.26). Bound RSS and campaign length and restart for longer campaigns.
+The compiler's process-global symbol interner retains spellings between inputs. Bound RSS and campaign length and restart for longer campaigns.
 
 ## Runtime properties and cancellation
 

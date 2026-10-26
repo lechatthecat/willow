@@ -1,6 +1,0 @@
-Linux x86_64, 2026-10-21; generated release programs; gdb breakpoint hit counts.
-Command: python3 docs/audits/willow-8hq4.30/count_calls.py
-literals=1 CALL_COUNTS {'willow_array_new_literal': 1, 'willow_array_new': 0, 'willow_panic_depth': 0, 'willow_array_set': 0}
-literals=8 CALL_COUNTS {'willow_array_new_literal': 8, 'willow_array_new': 0, 'willow_panic_depth': 0, 'willow_array_set': 0}
-literals=32 CALL_COUNTS {'willow_array_new_literal': 32, 'willow_array_new': 0, 'willow_panic_depth': 0, 'willow_array_set': 0}
-literals=128 CALL_COUNTS {'willow_array_new_literal': 128, 'willow_array_new': 0, 'willow_panic_depth': 0, 'willow_array_set': 0}

@@ -298,7 +298,7 @@ def render(
         out.append("## Scheduler phase CPU and throughput\n")
         out.append(
             "CPU is whole-process `utime + stime` at 10 ms resolution. Willow's driver thread "
-            "busy-spins during parallel phases (willow-8hq4.11), so `Willow CPU − wall` "
+            "busy-spins during parallel phases, so `Willow CPU − wall` "
             "approximates worker CPU for comparison with the others.\n"
         )
         header = "| Case | " + " | ".join(f"{n} wall / CPU (ms)" for n in names) + " |"

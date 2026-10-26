@@ -42,14 +42,14 @@ AGENTS.md
 !/docs/gc_telemetry.md
 !/docs/audits/
 /docs/audits/*
-!/docs/audits/willow-6fv.7.1/
-/docs/audits/willow-6fv.7.1/*
-!/docs/audits/willow-6fv.7.1/audit.md
-!/docs/audits/willow-6fv.7.1/reproduce.py
-!/docs/audits/willow-6fv.7.1/barrier_proof.py
-!/docs/audits/willow-6fv.7.1/validate_failure_json.py
-!/docs/audits/willow-6fv.7.1/abi_layout.c
-!/docs/audits/willow-6fv.7.1/wide_enum.wi
+!/docs/audits/gc-concurrent-foundations/
+/docs/audits/gc-concurrent-foundations/*
+!/docs/audits/gc-concurrent-foundations/audit.md
+!/docs/audits/gc-concurrent-foundations/reproduce.py
+!/docs/audits/gc-concurrent-foundations/barrier_proof.py
+!/docs/audits/gc-concurrent-foundations/validate_failure_json.py
+!/docs/audits/gc-concurrent-foundations/abi_layout.c
+!/docs/audits/gc-concurrent-foundations/wide_enum.wi
 
 # Publish the compiler harness and reconstructed async-safepoint workloads.
 /benches/*
@@ -91,254 +91,261 @@ AGENTS.md
 !/tests/fixtures/agent/v0/CLAUDE.md
 /scripts
 
-# Reconstructed Mutex acceptance probe (willow-8hq4.42).
+# Reconstructed Mutex acceptance probe (mutex-acceptance).
 !/benches/runtime_compare/probes/mutex_split.wi
 
 # Public telemetry implementation audit and source-only measurement reproducers.
-!/docs/audits/willow-6fv.5.8.2-completion/
-/docs/audits/willow-6fv.5.8.2-completion/*
-!/docs/audits/willow-6fv.5.8.2-completion/audit.md
-!/docs/audits/willow-6fv.5.8.2-completion/gc_observation_check.py
-!/docs/audits/willow-6fv.5.8.2-completion/gc_observation_repro.py
-!/docs/audits/willow-6fv.5.8.2-completion/costs.json
+!/docs/audits/gc-observation-completion/
+/docs/audits/gc-observation-completion/*
+!/docs/audits/gc-observation-completion/audit.md
+!/docs/audits/gc-observation-completion/gc_observation_check.py
+!/docs/audits/gc-observation-completion/gc_observation_repro.py
+!/docs/audits/gc-observation-completion/costs.json
 
 # Public expression-lambda Result audit and generated-source reproducer.
-!/docs/audits/willow-jz15.115/
-/docs/audits/willow-jz15.115/*
-!/docs/audits/willow-jz15.115/audit.md
-!/docs/audits/willow-jz15.115/count_lir.py
+!/docs/audits/lambda-result-expression/
+/docs/audits/lambda-result-expression/*
+!/docs/audits/lambda-result-expression/audit.md
+!/docs/audits/lambda-result-expression/count_lir.py
 
 # Public imported-error identity audit and focused reproducer.
-!/docs/audits/willow-jz15.114/
-/docs/audits/willow-jz15.114/*
-!/docs/audits/willow-jz15.114/audit.md
-!/docs/audits/willow-jz15.114/verify.sh
+!/docs/audits/imported-result-error-identity/
+/docs/audits/imported-result-error-identity/*
+!/docs/audits/imported-result-error-identity/audit.md
+!/docs/audits/imported-result-error-identity/verify.sh
 
 # Public memberwise-owner visibility audit and focused reproducer.
-!/docs/audits/willow-jz15.104-memberwise-owner.md
-!/docs/audits/willow-jz15.104-checks.sh
+!/docs/audits/memberwise-owner.md
+!/docs/audits/memberwise-owner-checks.sh
 
 # Public pending-minor budget regression audit and measurement evidence.
-!/docs/audits/willow-23fv/
-/docs/audits/willow-23fv/*
-!/docs/audits/willow-23fv/audit.md
-!/docs/audits/willow-23fv/measurements.json
-!/docs/audits/willow-23fv/verify.sh
+!/docs/audits/gc-minor-refill-runway/
+/docs/audits/gc-minor-refill-runway/*
+!/docs/audits/gc-minor-refill-runway/audit.md
+!/docs/audits/gc-minor-refill-runway/measurements.json
+!/docs/audits/gc-minor-refill-runway/verify.sh
 
 # Stage 6 source-derived recovery diagnostic and audit only.
-!/docs/audits/willow-6fv.5.6/
-/docs/audits/willow-6fv.5.6/*
-!/docs/audits/willow-6fv.5.6/audit.md
-!/docs/audits/willow-6fv.5.6/reproduce.sh
+!/docs/audits/gc-bounded-recovery/
+/docs/audits/gc-bounded-recovery/*
+!/docs/audits/gc-bounded-recovery/audit.md
+!/docs/audits/gc-bounded-recovery/reproduce.sh
 
 # Public, self-contained async allocation RSS regression evidence.
-!/docs/audits/willow-jz15.118/
-/docs/audits/willow-jz15.118/*
-!/docs/audits/willow-jz15.118/audit.md
-!/docs/audits/willow-jz15.118/measure.py
-!/docs/audits/willow-jz15.118/before.jsonl
-!/docs/audits/willow-jz15.118/after.jsonl
+!/docs/audits/async-nursery-startup/
+/docs/audits/async-nursery-startup/*
+!/docs/audits/async-nursery-startup/audit.md
+!/docs/audits/async-nursery-startup/measure.py
+!/docs/audits/async-nursery-startup/before.jsonl
+!/docs/audits/async-nursery-startup/after.jsonl
 
 # Public source-liveness audit; no private specification content.
-!/docs/audits/willow-jz15.117/
-/docs/audits/willow-jz15.117/*
-!/docs/audits/willow-jz15.117/implementation-audit.md
-!/docs/audits/willow-jz15.117/reproduce.sh
+!/docs/audits/async-suspension-liveness/
+/docs/audits/async-suspension-liveness/*
+!/docs/audits/async-suspension-liveness/implementation-audit.md
+!/docs/audits/async-suspension-liveness/reproduce.sh
 
 # Public lambda Result context audit and focused reproduction commands.
-!/docs/audits/willow-jz15.116.md
-!/docs/audits/willow-jz15.116-check.sh
+!/docs/audits/lambda-return-context.md
+!/docs/audits/lambda-return-context-check.sh
 
 # Reviewed lambda generic annotation audit (public source/test evidence only).
-!/docs/audits/willow-6d6o-lambda-generic-annotations.md
+!/docs/audits/lambda-generic-annotations.md
 
 # Public RwLock class-update decision and source-derived implementation audit.
-!/docs/audits/willow-jz15.110/
-/docs/audits/willow-jz15.110/*
-!/docs/audits/willow-jz15.110/decision.md
-!/docs/audits/willow-jz15.110/implementation-audit.md
+!/docs/audits/rwlock-class-updates/
+/docs/audits/rwlock-class-updates/*
+!/docs/audits/rwlock-class-updates/decision.md
+!/docs/audits/rwlock-class-updates/implementation-audit.md
 
 # Public generic enum context audit; contains only source-derived evidence.
-!/docs/audits/willow-jz15.105-generic-variant-context.md
+!/docs/audits/generic-variant-context.md
 
 # Public parallel-map performance audit and reproducible inputs only.
-!/docs/audits/willow-8hq4.46/
-/docs/audits/willow-8hq4.46/*
-!/docs/audits/willow-8hq4.46/audit.md
-!/docs/audits/willow-8hq4.46/measure.js
-!/docs/audits/willow-8hq4.46/parallel_map.wi
-!/docs/audits/willow-8hq4.46/parallel.go
-!/docs/audits/willow-8hq4.46/Parallel.java
-!/docs/audits/willow-8hq4.46/verify.py
-!/docs/audits/willow-8hq4.46/before.jsonl
-!/docs/audits/willow-8hq4.46/final.jsonl
-!/docs/audits/willow-8hq4.46/examples-codegen.jsonl
-!/docs/audits/willow-8hq4.46/scaling.txt
-!/docs/audits/willow-8hq4.46/zero-counts.txt
-!/docs/audits/willow-8hq4.46/validation.txt
-!/docs/audits/willow-8hq4.46/poll-chunk.txt
+!/docs/audits/parallel-map-chunks/
+/docs/audits/parallel-map-chunks/*
+!/docs/audits/parallel-map-chunks/audit.md
+!/docs/audits/parallel-map-chunks/measure.js
+!/docs/audits/parallel-map-chunks/parallel_map.wi
+!/docs/audits/parallel-map-chunks/parallel.go
+!/docs/audits/parallel-map-chunks/Parallel.java
+!/docs/audits/parallel-map-chunks/verify.py
+!/docs/audits/parallel-map-chunks/before.jsonl
+!/docs/audits/parallel-map-chunks/final.jsonl
+!/docs/audits/parallel-map-chunks/examples-codegen.jsonl
+!/docs/audits/parallel-map-chunks/scaling.txt
+!/docs/audits/parallel-map-chunks/zero-counts.txt
+!/docs/audits/parallel-map-chunks/validation.txt
+!/docs/audits/parallel-map-chunks/poll-chunk.txt
 
 # Public string-map performance audit and focused reproducible evidence.
-!/docs/audits/willow-8hq4.45/
-/docs/audits/willow-8hq4.45/*
-!/docs/audits/willow-8hq4.45/audit.md
-!/docs/audits/willow-8hq4.45/word_count.wi
-!/docs/audits/willow-8hq4.45/map_lookup_insert.wi
-!/docs/audits/willow-8hq4.45/maps.go
-!/docs/audits/willow-8hq4.45/Maps.java
-!/docs/audits/willow-8hq4.45/measure.js
-!/docs/audits/willow-8hq4.45/check_examples.py
-!/docs/audits/willow-8hq4.45/validate.py
-!/docs/audits/willow-8hq4.45/baseline.jsonl
-!/docs/audits/willow-8hq4.45/final.jsonl
-!/docs/audits/willow-8hq4.45/validation.txt
+!/docs/audits/map-workloads/
+/docs/audits/map-workloads/*
+!/docs/audits/map-workloads/audit.md
+!/docs/audits/map-workloads/word_count.wi
+!/docs/audits/map-workloads/map_lookup_insert.wi
+!/docs/audits/map-workloads/maps.go
+!/docs/audits/map-workloads/Maps.java
+!/docs/audits/map-workloads/measure.js
+!/docs/audits/map-workloads/check_examples.py
+!/docs/audits/map-workloads/validate.py
+!/docs/audits/map-workloads/baseline.jsonl
+!/docs/audits/map-workloads/final.jsonl
+!/docs/audits/map-workloads/validation.txt
 
 # Public literal-slot fast-path audit; no private specifications.
-!/docs/audits/willow-8hq4.39/
-/docs/audits/willow-8hq4.39/*
-!/docs/audits/willow-8hq4.39/audit.md
-!/docs/audits/willow-8hq4.39/measure.py
-!/docs/audits/willow-8hq4.39/results.json
+!/docs/audits/string-literal-fast-path/
+/docs/audits/string-literal-fast-path/*
+!/docs/audits/string-literal-fast-path/audit.md
+!/docs/audits/string-literal-fast-path/measure.py
+!/docs/audits/string-literal-fast-path/results.json
 
-# Reviewed public evidence for closed-world dispatch (willow-8hq4.34).
-!/docs/audits/willow-8hq4.34/
-/docs/audits/willow-8hq4.34/*
-!/docs/audits/willow-8hq4.34/audit.md
-!/docs/audits/willow-8hq4.34/benchmark.md
-!/docs/audits/willow-8hq4.34/benchmark.jsonl
-!/docs/audits/willow-8hq4.34/analysis.txt
-!/docs/audits/willow-8hq4.34/reproduce.sh
+# Reviewed public evidence for closed-world dispatch (closed-world-interface-dispatch).
+!/docs/audits/closed-world-interface-dispatch/
+/docs/audits/closed-world-interface-dispatch/*
+!/docs/audits/closed-world-interface-dispatch/audit.md
+!/docs/audits/closed-world-interface-dispatch/benchmark.md
+!/docs/audits/closed-world-interface-dispatch/benchmark.jsonl
+!/docs/audits/closed-world-interface-dispatch/analysis.txt
+!/docs/audits/closed-world-interface-dispatch/reproduce.sh
 
 # Public uppercase static property implementation audit.
-!/docs/audits/willow-jz15.103-uppercase-static-properties.md
+!/docs/audits/uppercase-static-properties.md
 
-# Public minor-GC survivor audit and reproducible evidence (willow-8hq4.31).
-!/docs/audits/willow-8hq4.31/
-/docs/audits/willow-8hq4.31/*
-!/docs/audits/willow-8hq4.31/audit.md
-!/docs/audits/willow-8hq4.31/verify.sh
-!/docs/audits/willow-8hq4.31/stress.sh
-!/docs/audits/willow-8hq4.31/paired.py
-!/docs/audits/willow-8hq4.31/object_churn_stress.wi
-!/docs/audits/willow-8hq4.31/array_literal_churn_stress.wi
-!/docs/audits/willow-8hq4.31/before-churn.txt
-!/docs/audits/willow-8hq4.31/after-churn.txt
-!/docs/audits/willow-8hq4.31/after-idle-churn.txt
-!/docs/audits/willow-8hq4.31/paired.jsonl
-!/docs/audits/willow-8hq4.31/checks.txt
-!/docs/audits/willow-8hq4.31/descriptor.txt
-!/docs/audits/willow-8hq4.31/graph-counts.txt
-!/docs/audits/willow-8hq4.31/scaling-debug.txt
-!/docs/audits/willow-8hq4.31/scaling-release.txt
-!/docs/audits/willow-8hq4.31/stress-checks.txt
-!/docs/audits/willow-8hq4.31/example-normal.txt
-!/docs/audits/willow-8hq4.31/example-minor.txt
-!/docs/audits/willow-8hq4.31/example-relocate.txt
-!/docs/audits/willow-8hq4.31/object_churn-minor.txt
-!/docs/audits/willow-8hq4.31/object_churn-relocate.txt
-!/docs/audits/willow-8hq4.31/array_literal_churn-minor.txt
-!/docs/audits/willow-8hq4.31/array_literal_churn-relocate.txt
+# Public minor-GC survivor audit and reproducible evidence (gc-survivor-copy).
+!/docs/audits/gc-survivor-copy/
+/docs/audits/gc-survivor-copy/*
+!/docs/audits/gc-survivor-copy/audit.md
+!/docs/audits/gc-survivor-copy/verify.sh
+!/docs/audits/gc-survivor-copy/stress.sh
+!/docs/audits/gc-survivor-copy/paired.py
+!/docs/audits/gc-survivor-copy/object_churn_stress.wi
+!/docs/audits/gc-survivor-copy/array_literal_churn_stress.wi
+!/docs/audits/gc-survivor-copy/before-churn.txt
+!/docs/audits/gc-survivor-copy/after-churn.txt
+!/docs/audits/gc-survivor-copy/after-idle-churn.txt
+!/docs/audits/gc-survivor-copy/paired.jsonl
+!/docs/audits/gc-survivor-copy/checks.txt
+!/docs/audits/gc-survivor-copy/descriptor.txt
+!/docs/audits/gc-survivor-copy/graph-counts.txt
+!/docs/audits/gc-survivor-copy/scaling-debug.txt
+!/docs/audits/gc-survivor-copy/scaling-release.txt
+!/docs/audits/gc-survivor-copy/stress-checks.txt
+!/docs/audits/gc-survivor-copy/example-normal.txt
+!/docs/audits/gc-survivor-copy/example-minor.txt
+!/docs/audits/gc-survivor-copy/example-relocate.txt
+!/docs/audits/gc-survivor-copy/object_churn-minor.txt
+!/docs/audits/gc-survivor-copy/object_churn-relocate.txt
+!/docs/audits/gc-survivor-copy/array_literal_churn-minor.txt
+!/docs/audits/gc-survivor-copy/array_literal_churn-relocate.txt
 
-# Allocation-only array literal audit (willow-8hq4.30).
-!/docs/audits/willow-8hq4.30/
-/docs/audits/willow-8hq4.30/*
-!/docs/audits/willow-8hq4.30/audit.md
-!/docs/audits/willow-8hq4.30/count_calls.py
-!/docs/audits/willow-8hq4.30/call-counts.txt
+# Allocation-only array literal audit (array-literal-allocation).
+!/docs/audits/array-literal-allocation/
+/docs/audits/array-literal-allocation/*
+!/docs/audits/array-literal-allocation/audit.md
+!/docs/audits/array-literal-allocation/count_calls.py
+!/docs/audits/array-literal-allocation/call-counts.txt
 
-# Public inline Array TLAB audit and source-only reproducers (willow-8hq4.33).
-!/docs/audits/willow-8hq4.33/
-/docs/audits/willow-8hq4.33/*
-!/docs/audits/willow-8hq4.33/audit.md
-!/docs/audits/willow-8hq4.33/probe.wi
-!/docs/audits/willow-8hq4.33/measure.py
-!/docs/audits/willow-8hq4.33/verify_codegen.py
-!/docs/audits/willow-8hq4.33/before.txt
-!/docs/audits/willow-8hq4.33/after.txt
-!/docs/audits/willow-8hq4.33/codegen.txt
-!/docs/audits/willow-8hq4.33/grow_after_ref_registration.wi
+# Public inline Array TLAB audit and source-only reproducers (array-inline-allocation).
+!/docs/audits/array-inline-allocation/
+/docs/audits/array-inline-allocation/*
+!/docs/audits/array-inline-allocation/audit.md
+!/docs/audits/array-inline-allocation/probe.wi
+!/docs/audits/array-inline-allocation/measure.py
+!/docs/audits/array-inline-allocation/verify_codegen.py
+!/docs/audits/array-inline-allocation/before.txt
+!/docs/audits/array-inline-allocation/after.txt
+!/docs/audits/array-inline-allocation/codegen.txt
+!/docs/audits/array-inline-allocation/grow_after_ref_registration.wi
 
-# Public default-body sharing measurements (willow-r52c.20).
-!/docs/audits/willow-r52c.20.md
-!/docs/audits/willow-r52c.20-measurements.txt
-!/docs/audits/willow-r52c.20-generic-measurements.txt
-!/docs/audits/willow-r52c.20-reproduce.sh
+# Public default-body sharing measurements (default-body-sharing).
+!/docs/audits/default-body-sharing.md
+!/docs/audits/default-body-sharing-measurements.txt
+!/docs/audits/default-body-sharing-generic-measurements.txt
+!/docs/audits/default-body-sharing-reproduce.sh
 
 # Public semantic-facts implementation audit and focused measurements.
-!/docs/audits/willow-r52c.19.md
-!/docs/audits/willow-r52c.19-measurements.txt
-!/docs/audits/willow-r52c.19-reproduce.sh
+!/docs/audits/checked-semantic-boundary.md
+!/docs/audits/checked-semantic-boundary-measurements.txt
+!/docs/audits/checked-semantic-boundary-reproduce.sh
 
 # Public WSAPoll implementation audit and reproduction commands.
-!/docs/audits/willow-r52c.18-wsapoll.md
+!/docs/audits/windows-poll-reuse.md
 
 # Public cleanup CFG audit and focused reproduction evidence.
-!/docs/audits/willow-r52c.15.md
-!/docs/audits/willow-r52c.15-counts.txt
-!/docs/audits/willow-r52c.15-reproduce.sh
-!/docs/audits/willow-r52c.15-measure.py
-!/docs/audits/willow-r52c.15-baseline.json
-!/docs/audits/willow-r52c.15-comparison.json
+!/docs/audits/cleanup-lowering.md
+!/docs/audits/cleanup-lowering-counts.txt
+!/docs/audits/cleanup-lowering-reproduce.sh
+!/docs/audits/cleanup-lowering-measure.py
+!/docs/audits/cleanup-lowering-baseline.json
+!/docs/audits/cleanup-lowering-comparison.json
 
 # Public retry measurement evidence (source/observations only).
-!/docs/audits/willow-r52c.14.md
-!/docs/audits/willow-r52c.14-measurements.txt
-!/docs/audits/willow-r52c.14-reproduce.sh
+!/docs/audits/scheduler-retry-measurement.md
+!/docs/audits/scheduler-retry-measurement-measurements.txt
+!/docs/audits/scheduler-retry-measurement-reproduce.sh
 
 # Public M4 source-derived audit, reproducer and focused measurements only.
-!/docs/audits/willow-6fv.7.5/
-/docs/audits/willow-6fv.7.5/*
-!/docs/audits/willow-6fv.7.5/audit.md
-!/docs/audits/willow-6fv.7.5/measure.py
-!/docs/audits/willow-6fv.7.5/measurements.json
-!/docs/audits/willow-6fv.7.5/samples.jsonl
-!/docs/audits/willow-6fv.7.5/validation.txt
-!/docs/audits/willow-6fv.7.5/fmt.txt
-!/docs/audits/willow-6fv.7.5/clippy-x86_64-unknown-linux-gnu.txt
-!/docs/audits/willow-6fv.7.5/clippy-x86_64-pc-windows-msvc.txt
-!/docs/audits/willow-6fv.7.5/clippy-aarch64-apple-darwin.txt
-!/docs/audits/willow-6fv.7.5/clippy-x86_64-apple-darwin.txt
-!/docs/audits/willow-6fv.7.5/example.txt
-!/docs/audits/willow-6fv.7.5/replicates.json
-!/docs/audits/willow-6fv.7.5/replicates-samples.jsonl
-!/docs/audits/willow-6fv.7.5/contract.md
-!/docs/audits/willow-6fv.7.5/confirmation-lock.json
-!/docs/audits/willow-6fv.7.5/confirmation-01/
-!/docs/audits/willow-6fv.7.5/confirmation-01/**
-!/docs/audits/willow-6fv.7.5/review-scope.md
-!/docs/audits/willow-6fv.7.5/summarize_confirmation.py
-!/docs/audits/willow-6fv.7.5/confirmation-validation.txt
+!/docs/audits/gc-minor-survivor-admission/
+/docs/audits/gc-minor-survivor-admission/*
+!/docs/audits/gc-minor-survivor-admission/audit.md
+!/docs/audits/gc-minor-survivor-admission/measure.py
+!/docs/audits/gc-minor-survivor-admission/measurements.json
+!/docs/audits/gc-minor-survivor-admission/samples.jsonl
+!/docs/audits/gc-minor-survivor-admission/validation.txt
+!/docs/audits/gc-minor-survivor-admission/fmt.txt
+!/docs/audits/gc-minor-survivor-admission/clippy-x86_64-unknown-linux-gnu.txt
+!/docs/audits/gc-minor-survivor-admission/clippy-x86_64-pc-windows-msvc.txt
+!/docs/audits/gc-minor-survivor-admission/clippy-aarch64-apple-darwin.txt
+!/docs/audits/gc-minor-survivor-admission/clippy-x86_64-apple-darwin.txt
+!/docs/audits/gc-minor-survivor-admission/example.txt
+!/docs/audits/gc-minor-survivor-admission/replicates.json
+!/docs/audits/gc-minor-survivor-admission/replicates-samples.jsonl
+!/docs/audits/gc-minor-survivor-admission/contract.md
+!/docs/audits/gc-minor-survivor-admission/confirmation-lock.json
+!/docs/audits/gc-minor-survivor-admission/confirmation-01/
+!/docs/audits/gc-minor-survivor-admission/confirmation-01/**
+!/docs/audits/gc-minor-survivor-admission/review-scope.md
+!/docs/audits/gc-minor-survivor-admission/summarize_confirmation.py
+!/docs/audits/gc-minor-survivor-admission/confirmation-validation.txt
 
 # Reviewed M3 measurement sources and evidence.
-!/docs/audits/willow-6fv.7.4/
+!/docs/audits/gc-worker-telemetry/
 
 # Generated Python cache is not audit evidence.
-/docs/audits/willow-6fv.7.4/**/__pycache__/
+/docs/audits/gc-worker-telemetry/**/__pycache__/
 
 # Public source-derived Pacer audit and reference-host measurements.
-!/docs/audits/willow-6fv.5.8.3/
-/docs/audits/willow-6fv.5.8.3/*
-!/docs/audits/willow-6fv.5.8.3/audit.md
-!/docs/audits/willow-6fv.5.8.3/measure.py
-!/docs/audits/willow-6fv.5.8.3/measurements.json
+!/docs/audits/gc-pacer/
+/docs/audits/gc-pacer/*
+!/docs/audits/gc-pacer/audit.md
+!/docs/audits/gc-pacer/measure.py
+!/docs/audits/gc-pacer/measurements.json
 
 # Reviewed public mutator-assist audit and focused reproduction evidence.
-!/docs/audits/willow-6fv.5.8.4/
-/docs/audits/willow-6fv.5.8.4/*
-!/docs/audits/willow-6fv.5.8.4/audit.md
-!/docs/audits/willow-6fv.5.8.4/verify.py
-!/docs/audits/willow-6fv.5.8.4/measure.py
-!/docs/audits/willow-6fv.5.8.4/focused-tests.txt
-!/docs/audits/willow-6fv.5.8.4/measurement.txt
+!/docs/audits/gc-mutator-assist/
+/docs/audits/gc-mutator-assist/*
+!/docs/audits/gc-mutator-assist/audit.md
+!/docs/audits/gc-mutator-assist/verify.py
+!/docs/audits/gc-mutator-assist/measure.py
+!/docs/audits/gc-mutator-assist/focused-tests.txt
+!/docs/audits/gc-mutator-assist/measurement.txt
 
 # Report output regression proof and implementation audit.
-!/docs/audits/willow-n73q/
-/docs/audits/willow-n73q/*
-!/docs/audits/willow-n73q/audit.md
-!/docs/audits/willow-n73q/reproduce.py
+!/docs/audits/benchmark-report-output/
+/docs/audits/benchmark-report-output/*
+!/docs/audits/benchmark-report-output/audit.md
+!/docs/audits/benchmark-report-output/reproduce.py
 
 # Public mark-worker configuration audit and focused measurements.
 !/docs/audits/gc-mark-worker-cache.md
 !/docs/audits/gc-mark-worker-cache-measure.py
 !/docs/audits/gc-mark-worker-cache-before.jsonl
 !/docs/audits/gc-mark-worker-cache-after.jsonl
+
+# Public documentation verification and referenced source reproducer.
+!/docs/audits/generic-foreign-defaults-counts.sh
+!/docs/audits/public-documentation/
+/docs/audits/public-documentation/*
+!/docs/audits/public-documentation/audit.md
+!/docs/audits/public-documentation/verify.py

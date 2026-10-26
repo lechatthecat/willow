@@ -129,7 +129,7 @@ operation each, and four more target the allocator, the map and dispatch:
   counters, Go `MemStats`, JVM `GarbageCollectorMXBean`.
 - `array_literal_churn`: the array analogue of `object_churn` — ten million
   three-element `i64` array literals written into a 1,024-slot ring, with the
-  same GC counters (willow-jz15.94).
+  same GC counters.
 - `map_lookup_insert`: one million inserts of strided `i64` keys into
   `Map<i64,i64>` / `map[int64]int64` / `HashMap<Long,Long>` (Java boxes), then
   two million lookups of which half miss.
