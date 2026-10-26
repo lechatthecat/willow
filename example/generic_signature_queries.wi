@@ -1,0 +1,29 @@
+// Query declarations with: willow symbol generic_signature_queries::iterate --source example/generic_signature_queries.wi
+fn identity<T>(value: T) -> T { return value; }
+fn choose<A, B>(first: A, second: B) -> A { return first; }
+fn iterate<T>(start: T, n: i64, step: closure(T) -> T) -> T {
+    let mut value = start;
+    let mut i = 0;
+    while i < n { value = step(value); i = i + 1; }
+    return value;
+}
+class Box<T> {
+    pub value: T;
+    pub fn get(self) -> T { return self.value; }
+}
+class Pair<A, B> {
+    pub left: A;
+    pub right: B;
+    pub fn first(self) -> A { return self.left; }
+}
+fn plain(value: i64) -> i64 { return value; }
+fn main() {
+    println(identity(7));
+    println(choose(8, true));
+    let box = new Box<i64>(9);
+    let pair = new Pair<i64, bool>(10, false);
+    println(box.get());
+    println(pair.first());
+    println(plain(11));
+    println(iterate(1, 3, |value: i64| value + 1));
+}

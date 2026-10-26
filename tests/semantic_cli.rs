@@ -3240,7 +3240,7 @@ fn generic_closure_value_calls_keep_queries_available() {
     assert!(
         position["result"]["type_display"]
             .as_str()
-            .is_some_and(|ty| ty.starts_with("fn(")),
+            .is_some_and(|ty| ty.starts_with("fn<")),
         "{position}"
     );
     let preview = f.json(&["rename", "coll::apply", "run", "--dry-run", "--diff"], 0);
@@ -3273,7 +3273,10 @@ fn generic_source_queries() {
     assert!(!text.contains("$mono$"));
     assert!(!text.contains("$pkg"));
     let callee = f.json(&["type", "src/main.wi:3:21"], 0);
-    assert_eq!(callee["result"]["type_display"], "fn(T) -> T", "{callee}");
+    assert_eq!(
+        callee["result"]["type_display"], "fn<T>(T) -> T",
+        "{callee}"
+    );
     let unused = f.json(&["symbol", "coll::unused"], 0);
     assert_eq!(
         unused["result"]["selected"]["selector"], "coll::unused",
@@ -3304,7 +3307,7 @@ fn generic_source_queries() {
                 assert!(
                     value["result"]["type_display"]
                         .as_str()
-                        .is_some_and(|ty| ty.starts_with("fn(")),
+                        .is_some_and(|ty| ty.starts_with("fn<")),
                     "callee/declaration must report callable type: {text}"
                 );
             }
@@ -3383,7 +3386,7 @@ fn generic_source_queries() {
     fs::write(f.0.join("src/main.wi"), format!("import other;\n{main}")).unwrap();
     let source = fs::read_to_string(f.0.join("src/other.wi")).unwrap();
     for (token, command, expected) in [
-        ("preserve(bucket", "type", "fn(T) -> T"),
+        ("preserve(bucket", "type", "fn<T>(T) -> T"),
         ("Bucket<i64>", "symbol", "coll::Ring"),
     ] {
         let start = source.find(token).unwrap();
@@ -3483,7 +3486,7 @@ fn uninstantiated_generic_body_refs_and_rename() {
             "{symbol}"
         );
         let typed = f.json(&["type", &position], 0);
-        assert_eq!(typed["result"]["type_display"], "fn(T) -> T", "{typed}");
+        assert_eq!(typed["result"]["type_display"], "fn<T>(T) -> T", "{typed}");
         let impact = f.json(&["impact", selector], 0);
         assert!(impact.to_string().contains(caller), "{impact}");
         if !cross_module {
@@ -5950,5 +5953,42 @@ fn task_effect_dispatch_imported_and_keyed_contracts_keep_call_site() {
             .as_u64()
             .unwrap() as usize;
         assert_eq!(&api[start..end], "read", "{value}");
+    }
+}
+
+#[test]
+fn generic_declaration_signatures() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/generic_signature_queries.wi"),
+    )
+    .unwrap();
+    for (name, expected) in [
+        ("identity", "fn<T>(T) -> T"),
+        ("choose", "fn<A, B>(A, B) -> A"),
+        ("iterate", "fn<T>(T, i64, closure(T) -> T) -> T"),
+        ("Box", "main::Box<T>"),
+        ("Pair", "main::Pair<A, B>"),
+        ("Box::get", "fn<T>() -> T"),
+        ("Pair::first", "fn<A, B>() -> A"),
+        ("plain", "fn(i64) -> i64"),
+    ] {
+        let selector = format!("main::{name}");
+        for command in ["symbol", "type"] {
+            let value = f.json(&[command, &selector], 0);
+            let displayed = if command == "symbol" {
+                value["result"]["symbol"]
+                    .get("type_display")
+                    .unwrap_or(&value["result"]["type_display"])
+            } else {
+                &value["result"]["type_display"]
+            };
+            assert_eq!(displayed, expected, "{command} {selector}: {value}");
+            let human = f.run(&[command, &selector]);
+            assert!(human.status.success());
+            let text = String::from_utf8(human.stdout).unwrap();
+            assert!(text.contains(expected), "{command} {selector}: {text}");
+        }
     }
 }

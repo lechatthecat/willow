@@ -181,12 +181,34 @@ impl TypeNames {
         out
     }
 
+    /// Generic binders belong to declarations, not to callable value types.
+    /// Keep instantiated receiver/call types on the ordinary render path.
+    pub(super) fn declaration(&self, symbol: &symbols::Symbol, ty: &Type) -> String {
+        let module = symbol.identity.as_ref().map(|i| i.module.as_str());
+        let mut display = self.render(ty, module);
+        let params = if symbol.details.type_params.is_empty() {
+            symbol.details.owner_type_params.as_ref()
+        } else {
+            &symbol.details.type_params
+        };
+        if !params.is_empty() {
+            let binder = format!("<{}>", params.join(", "));
+            if matches!(ty, Type::Fn(..)) {
+                display.insert_str(2, &binder);
+            } else if matches!(ty, Type::Named(_))
+                && matches!(symbol.kind.as_str(), "class" | "interface" | "enum")
+            {
+                display.push_str(&binder);
+            }
+        }
+        display
+    }
+
     /// Serialize a declaration with its readable type beside the exact `ty`.
     pub(super) fn symbol(&self, symbol: &symbols::Symbol) -> serde_json::Value {
         let mut value = serde_json::to_value(symbol).expect("symbol serializes");
         if let Some(ty) = &symbol.ty {
-            let module = symbol.identity.as_ref().map(|i| i.module.as_str());
-            value["type_display"] = self.render(ty, module).into();
+            value["type_display"] = self.declaration(symbol, ty).into();
         }
         self.payload(symbol, &mut value);
         value
@@ -220,6 +242,39 @@ mod tests {
         TypeNames {
             packages: HashMap::new(),
             local: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn generic_declaration_display_scales_with_output() {
+        for n in [1, 2, 16, 128] {
+            let params: Vec<_> = (0..n).map(|i| format!("T{i}")).collect();
+            let ty = Type::Fn(
+                params.iter().cloned().map(Type::Named).collect(),
+                Box::new(Type::I64),
+            );
+            let symbol = symbols::Symbol {
+                identity: None,
+                id: "generic".into(),
+                name: "generic".into(),
+                source_name: None,
+                kind: "function".into(),
+                location: None,
+                details: symbols::DeclarationDetails {
+                    type_params: params.clone(),
+                    ..Default::default()
+                },
+                ty: Some(ty.clone()),
+            };
+            TYPE_VISITS.with(|count| count.set(0));
+            let value = names().symbol(&symbol);
+            assert_eq!(TYPE_VISITS.with(|count| count.get()), n + 2);
+            assert_eq!(
+                value["type_display"],
+                format!("fn<{}>({}) -> i64", params.join(", "), params.join(", "))
+            );
+            assert_eq!(value["ty"], serde_json::to_value(&ty).unwrap());
+            assert_eq!(symbol.ty.as_ref(), Some(&ty));
         }
     }
 

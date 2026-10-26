@@ -435,3 +435,6 @@ AGENTS.md
 !/docs/audits/string-find-sentinel/
 /docs/audits/string-find-sentinel/*
 !/docs/audits/string-find-sentinel/README.md
+
+# Public generic declaration display audit.
+!/docs/audits/generic-declaration-signatures.md

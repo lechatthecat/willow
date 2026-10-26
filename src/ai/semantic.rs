@@ -819,8 +819,7 @@ impl QuerySession {
         let typed: Vec<_> = symbols.iter().filter(|s| s.ty.is_some()).collect();
         if let Some(first) = typed.first() {
             if typed.iter().all(|s| s.ty == first.ty) {
-                let module = first.identity.as_ref().map(|i| i.module.as_str());
-                let display = self.names.render(first.ty.as_ref().unwrap(), module);
+                let display = self.names.declaration(first, first.ty.as_ref().unwrap());
                 let mut result = json!({"status":"ok","type":first.ty,"type_display":display,"location":first.location});
                 if let [only] = typed[..] {
                     self.names.payload(only, &mut result);

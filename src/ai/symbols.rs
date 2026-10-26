@@ -26,6 +26,8 @@ pub struct DeclarationDetails {
     pub is_async: bool,
     pub is_const: bool,
     pub type_params: Vec<String>,
+    /// Shared class binders for methods, avoiding a copy per member.
+    pub owner_type_params: std::sync::Arc<[String]>,
     pub extends: Vec<Type>,
     pub implements: Vec<Type>,
     /// Payload types of an enum variant; empty for unit variants.
@@ -86,12 +88,14 @@ pub(super) fn details_of<'a>(
                         ..Default::default()
                     },
                 );
+                let owner_params: std::sync::Arc<[String]> = c.type_params.clone().into();
                 for m in &c.methods {
-                    if m.is_async && c.span.contains(m.span) {
+                    if (m.is_async || !c.type_params.is_empty()) && c.span.contains(m.span) {
                         result.insert(
                             m.span,
                             DeclarationDetails {
-                                is_async: true,
+                                is_async: m.is_async,
+                                owner_type_params: owner_params.clone(),
                                 ..Default::default()
                             },
                         );
@@ -705,6 +709,38 @@ pub(super) fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_method_binders_share_owner_storage() {
+        for n in [1, 8, 64] {
+            let params = (0..n)
+                .map(|i| format!("T{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let methods = (0..n)
+                .map(|i| format!("pub fn get{i}(self, x: T0) -> T0 {{ return x; }}"))
+                .collect::<String>();
+            let source = format!("class Box<{params}> {{ {methods} }}");
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            let captured = details(&program, &Default::default());
+            let owners: Vec<_> = captured
+                .values()
+                .filter(|d| !d.owner_type_params.is_empty())
+                .collect();
+            assert_eq!(owners.len(), n);
+            assert_eq!(owners[0].owner_type_params.len(), n);
+            for owner in &owners {
+                assert!(std::sync::Arc::ptr_eq(
+                    &owners[0].owner_type_params,
+                    &owner.owner_type_params
+                ));
+                assert!(owner.type_params.is_empty());
+                assert!(!owner.is_async);
+            }
+        }
+    }
 
     #[test]
     fn generic_metadata_is_stored_once_per_container_not_per_parameter() {
