@@ -22,7 +22,10 @@
 // outside a `RelocationSafeScope` defers the minor collection while it
 // publishes a young referent; only a hard memory budget pins instead.
 
+mod condition;
 mod cycle_wait;
+pub(crate) use condition::GcCondvar;
+
 mod safepoint;
 pub use safepoint::*;
 mod marking;
@@ -964,7 +967,7 @@ struct GcCoord {
     mutators: HashMap<ThreadId, PublishedRoots>,
     /// A collector has requested all mutators to reach a safepoint and park.
     stop_requested: bool,
-    /// Mutators currently parked at a safepoint.
+    /// Mutators with published roots at a safepoint or scheduler idle wait.
     parked: HashSet<ThreadId>,
     /// Outstanding registered owners for the current stop. Updated once per
     /// park/unregister, rather than rescanning the registry after every wake.
@@ -996,10 +999,13 @@ struct GcRuntime {
     pin_lease_slots: RuntimeRootSet,
     parked_stack_roots: Mutex<HashMap<u64, PublishedRoots>>,
     next_parked_stack: AtomicU64,
-    coord: (crate::gc_telemetry::observations::GcMutex<GcCoord>, Condvar),
+    coord: (
+        crate::gc_telemetry::observations::GcMutex<GcCoord>,
+        GcCondvar,
+    ),
     /// Only cycle/participation transitions wake budget waiters. Mutator
     /// acknowledgements use coord.1, avoiding quadratic wakeup fan-out.
-    budget_cv: Condvar,
+    budget_cv: GcCondvar,
     /// Lock-free fast-path mirror of `GcCoord::stop_requested`.
     stop_requested: std::sync::atomic::AtomicBool,
     poll_requested: std::sync::atomic::AtomicBool,
@@ -1030,9 +1036,9 @@ impl Default for GcRuntime {
             next_parked_stack: AtomicU64::new(1),
             coord: (
                 crate::gc_telemetry::observations::GcMutex::coordination(GcCoord::default()),
-                Condvar::new(),
+                GcCondvar::new(),
             ),
-            budget_cv: Condvar::new(),
+            budget_cv: GcCondvar::new(),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
             poll_requested: std::sync::atomic::AtomicBool::new(false),
             trace_registry: Mutex::new(HashMap::new()),

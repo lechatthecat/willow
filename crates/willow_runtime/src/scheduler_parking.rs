@@ -157,6 +157,10 @@ impl IdleWaiters {
             super::idle_backoff_tests::record_stale_retry();
             return true;
         }
+        // SAFETY: the remaining interval only operates on native wait-list
+        // metadata and parks. Drop resumes GC ownership after the list locks
+        // are released, including both registration-race and timeout returns.
+        let _idle_mutator = unsafe { crate::gc::IdleMutator::enter() };
         let index = {
             let mut list = self.list.lock().unwrap_or_else(|p| p.into_inner());
             self.registered.fetch_add(1, Ordering::SeqCst);
@@ -196,7 +200,7 @@ impl IdleWaiters {
 
 static IDLE_WAITERS: LazyLock<IdleWaiters> = LazyLock::new(IdleWaiters::default);
 // Drivers cannot consume a worker's work notification or hide worker 0's
-// targeted registration. Only completion, shutdown and GC wake this list.
+// targeted registration. Only completion and shutdown wake this list.
 static COMPLETION_WAITERS: LazyLock<IdleWaiters> = LazyLock::new(IdleWaiters::default);
 
 pub(super) fn completion_wake_generation() -> u64 {
@@ -249,6 +253,48 @@ mod tests {
             assert!(Instant::now() < deadline, "waiter registration timed out");
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn idle_gc_stops_do_not_wake_workers_or_completion_drivers() {
+        let _test = crate::gc::runtime_test_guard();
+        for waiters in [&*IDLE_WAITERS, &*COMPLETION_WAITERS] {
+            for workers in [1, 4, 16] {
+                for cycles in [1, 8, 64] {
+                    crate::gc::reset_internal_for_test();
+                    let generation = waiters.generation();
+                    let probes = AtomicUsize::new(0);
+                    std::thread::scope(|scope| {
+                        for _ in 0..workers {
+                            let probes = &probes;
+                            scope.spawn(move || {
+                                let _mutator = crate::gc::MutatorRegistration::new();
+                                assert!(waiters.wait_inner(generation, None, || {
+                                    probes.fetch_add(1, Ordering::SeqCst);
+                                }));
+                            });
+                        }
+                        registered(waiters, workers);
+                        for _ in 0..cycles {
+                            crate::gc::minor_collect_internal();
+                            crate::gc::willow_gc_collect();
+                        }
+                        let unchanged = waiters.generation() == generation;
+                        let still_waiting = waiters.registered.load(Ordering::SeqCst);
+                        // Always release workers before checking regressions.
+                        waiters.notify(true);
+                        assert!(unchanged, "GC must not publish a scheduler event");
+                        assert_eq!(still_waiting, workers);
+                    });
+                    assert_eq!(probes.load(Ordering::SeqCst), workers);
+                    assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
+                    eprintln!(
+                        "idle workers={workers} minor+major cycles={cycles} probes={workers} gc_wakes=0"
+                    );
+                }
+            }
+        }
+        crate::gc::reset_internal_for_test();
     }
 
     #[test]

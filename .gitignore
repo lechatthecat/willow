@@ -349,3 +349,13 @@ AGENTS.md
 /docs/audits/public-documentation/*
 !/docs/audits/public-documentation/audit.md
 !/docs/audits/public-documentation/verify.py
+
+# Public audit: GC idle ownership and bounded notifications.
+!/docs/audits/async-allocation-idle/
+/docs/audits/async-allocation-idle/*
+!/docs/audits/async-allocation-idle/audit.md
+!/docs/audits/async-allocation-idle/measure.py
+!/docs/audits/async-allocation-idle/before.jsonl
+!/docs/audits/async-allocation-idle/after.jsonl
+!/docs/audits/async-allocation-idle/root-publication.txt
+!/docs/audits/async-allocation-idle/waiter-scaling.txt

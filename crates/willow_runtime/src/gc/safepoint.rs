@@ -349,7 +349,7 @@ fn handshake_timeout() -> Option<std::time::Duration> {
 /// the id from the registry would let a merely slow thread run unscanned. So
 /// report the ids and abort rather than block with no diagnostic.
 pub(super) fn wait_for_mutators<'a>(
-    cv: &Condvar,
+    cv: &GcCondvar,
     mut coord: std::sync::MutexGuard<'a, GcCoord>,
     phase: &str,
     ready: impl Fn(&GcCoord) -> bool,
@@ -442,6 +442,60 @@ pub extern "C" fn willow_gc_safepoint() {
     coord.parked.remove(&id);
 }
 
+/// Keeps a scheduler waiter visible to collectors without waking it for every
+/// stop. The owner publishes slots once; stopped collectors can use them until
+/// Drop takes the same coordination lock and observes the world running again.
+pub(crate) struct IdleMutator {
+    registered: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl IdleMutator {
+    /// # Safety
+    /// Until this guard is dropped, the caller must not access managed objects,
+    /// root slots, TLAB state, or SATB buffers, or call back into managed code.
+    /// It may only wait on native scheduler synchronization. Relocation safety
+    /// is inherited from the caller; raw runtime references remain pinned.
+    pub(crate) unsafe fn enter() -> Self {
+        let registered = current_thread_is_registered();
+        if registered {
+            flush_satb_current(false);
+            crate::gc_mark_queue::assert_no_queue_lock_held("idle mutator");
+            let (lock, cv) = &runtime().coord;
+            let mut coord = lock.lock().unwrap();
+            let id = std::thread::current().id();
+            let roots = PublishedRoots::current(snapshot_local_root_slots());
+            *coord
+                .mutators
+                .get_mut(&id)
+                .expect("registered idle mutator") = roots;
+            assert!(coord.parked.insert(id), "nested idle mutator guard");
+            coord.stw_pending.remove(&id);
+            if coord.stop_requested && coord.stw_pending.is_empty() {
+                cv.notify_all();
+            }
+        }
+        Self {
+            registered,
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for IdleMutator {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let (lock, cv) = &runtime().coord;
+        let mut coord = lock.lock().unwrap();
+        while coord.stop_requested {
+            coord = cv.wait(coord).unwrap();
+        }
+        coord.parked.remove(&std::thread::current().id());
+    }
+}
+
 /// Run `collect` with the world stopped: request a safepoint, wait until every
 /// other registered mutator has parked, then run `collect` (which scans all
 /// published roots), then resume the world (willow-6fv.5.6).
@@ -467,7 +521,6 @@ pub(super) fn with_stw<R>(
         .filter(|id| *id != me && !coord.parked.contains(id))
         .collect();
     runtime().budget_cv.notify_all();
-    crate::scheduler::wake_idle_mutators_for_gc();
     coord = wait_for_mutators(
         cv,
         coord,
@@ -552,3 +605,7 @@ pub(super) fn all_registered_stack_roots(coord: &GcCoord) -> Vec<*mut u8> {
         .map(GcPayload::as_ptr)
         .collect()
 }
+
+#[cfg(test)]
+#[path = "idle_tests.rs"]
+mod idle_tests;

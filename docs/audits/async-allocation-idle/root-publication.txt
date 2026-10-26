@@ -1,0 +1,29 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-fa8af3024813d13e)
+
+running 5 tests
+test gc::safepoint::idle_tests::idle_entry_acknowledges_an_already_requested_stop ... ok
+test gc::safepoint::idle_tests::idle_publication_is_reused_across_increasing_stop_counts_and_root_counts ... idle roots=0 stops=1 publications=1 acknowledgements=0 gc_notifications=0
+idle roots=0 stops=8 publications=1 acknowledgements=0 gc_notifications=0
+idle roots=0 stops=64 publications=1 acknowledgements=0 gc_notifications=0
+idle roots=1 stops=1 publications=1 acknowledgements=0 gc_notifications=0
+idle roots=1 stops=8 publications=1 acknowledgements=0 gc_notifications=0
+idle roots=1 stops=64 publications=1 acknowledgements=0 gc_notifications=0
+idle roots=64 stops=1 publications=1 acknowledgements=0 gc_notifications=0
+idle roots=64 stops=8 publications=1 acknowledgements=0 gc_notifications=0
+idle roots=64 stops=64 publications=1 acknowledgements=0 gc_notifications=0
+idle roots=1024 stops=1 publications=1 acknowledgements=0 gc_notifications=0
+idle roots=1024 stops=8 publications=1 acknowledgements=0 gc_notifications=0
+idle roots=1024 stops=64 publications=1 acknowledgements=0 gc_notifications=0
+ok
+test gc::safepoint::idle_tests::idle_resume_waits_for_active_stop ... ok
+test gc::safepoint::idle_tests::idle_roots_survive_minor_major_and_relocation ... ok
+test gc::safepoint::idle_tests::idle_unregistered_and_unwind_paths_release_ownership ... {"version":3,"event":"gc_failure","kind":"test_panic","reason":"idle unwind probe","timestamp_ns":25653600,"epoch":6,"seed":0,"case":0,"heap_available":true,"heap_consistency":"metadata_without_lab_merge","actual_bytes":0,"limit_bytes":null,"managed_bytes":0,"external_bytes":0,"old_reserved_bytes":0,"young_reserved_bytes":0,"phase":0,"last_major_live_bytes":0,"allocated_bytes":0,"root_scan_bytes":0,"last_stop_reason":0,"last_stop_outcome":0,"minor_deferrals":0,"minor_deferral_age_bytes":0,"pin_fallback_count":0,"pinned_bytes":0,"registered_mutators":1,"parked_mutators":1,"pending_mutators":0,"os":"linux","arch":"x86_64","allocated_frame_bytes":0,"reclaimed_frame_bytes":0,"quarantined_frame_bytes":0,"task_frames_running":0,"task_frames_rooted":0,"task_frames_terminal":0,"task_frames_retired":0}
+
+thread 'gc::safepoint::idle_tests::idle_unregistered_and_unwind_paths_release_ownership' (132468) panicked at crates/willow_runtime/src/gc/idle_tests.rs:174:9:
+idle unwind probe
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1941 filtered out; finished in 0.03s
+

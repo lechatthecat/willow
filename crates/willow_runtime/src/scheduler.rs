@@ -3052,13 +3052,6 @@ use parking::{
     wait_for_event_since, wait_for_wake_since,
 };
 
-/// Wake every idle-parked scheduler thread so it reaches its safepoint now.
-/// Idle threads remain GC mutators; without this each stop or handshake round
-/// waits out their bounded park.
-pub(crate) fn wake_idle_mutators_for_gc() {
-    notify_all_idle_waiters();
-}
-
 /// Record an explicit panic location for the current task (cold path).
 pub(crate) fn set_current_execution_site(frame: crate::stack_trace::RuntimeFrame) {
     if let Some(id) = current_task_id() {
@@ -3911,8 +3904,8 @@ impl ParallelCompletion {
 
     fn wait(&self) {
         loop {
-            // The driver remains a registered mutator. Wait on the idle-waiter
-            // list so both completion and a GC request cut the park short.
+            // The waiter publishes its roots for the whole idle interval, so
+            // only completion needs to interrupt its park.
             let generation = completion_wake_generation();
             crate::gc::relocatable_safepoint();
             if self.remaining.load(Ordering::SeqCst) == 0 {
@@ -4337,8 +4330,8 @@ fn deadline_bounded(wait: Duration, deadline: Option<Instant>) -> Duration {
     }
 }
 
-// Timed/event-source and transient-claim fallback. GC separately wakes all
-// registered waiters; pure compute does not need this periodic fallback.
+// Timed/event-source and transient-claim fallback. Idle waiters publish GC
+// roots across their wait; pure compute needs no periodic fallback.
 fn idle_wait_bound(deadline: Option<Instant>) -> Duration {
     let wait = global_next_timer_deadline()
         .map(|(_, timer)| bounded_parallel_wait(duration_until(timer)))
@@ -4346,7 +4339,7 @@ fn idle_wait_bound(deadline: Option<Instant>) -> Duration {
     deadline_bounded(wait, deadline)
 }
 
-// Pure compute has no timed event to service. GC, work publication and poll
+// Pure compute has no timed event to service. Work publication and poll
 // completion explicitly wake this wait. Retain bounded polling for netpoll,
 // whose readiness is supplied by the OS rather than the scheduler wait list.
 // Nested drives also retain bounded waits: a peer completion targets worker 0,

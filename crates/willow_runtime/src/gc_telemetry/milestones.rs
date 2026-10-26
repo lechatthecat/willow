@@ -1,7 +1,8 @@
 //! Bounded, process-lifetime cycle identities. No heap traversal or I/O here.
 use super::timestamp_ns;
+use crate::gc::GcCondvar;
 use std::collections::VecDeque;
-use std::sync::{Condvar, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 const CAPACITY: usize = 64;
@@ -47,8 +48,8 @@ struct State {
     finished: Option<u64>,
     records: VecDeque<CycleMilestones>,
 }
-static STATE: LazyLock<(Mutex<State>, Condvar)> =
-    LazyLock::new(|| (Mutex::new(State::default()), Condvar::new()));
+static STATE: LazyLock<(Mutex<State>, GcCondvar)> =
+    LazyLock::new(|| (Mutex::new(State::default()), GcCondvar::new()));
 #[cfg(test)]
 static WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 thread_local! {
@@ -263,6 +264,25 @@ pub fn wait_gc_for_test(
 mod tests {
     use super::*;
     use crate::gc::*;
+
+    #[test]
+    fn milestone_unobserved_cycles_emit_no_wake_calls() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let before = STATE.1.notifications();
+        for cycles in [1, 8, 64] {
+            for _ in 0..cycles {
+                let cycle = super::super::Cycle::begin(super::super::CycleKind::Minor);
+                reached(GcStage::MarkComplete);
+                reached(GcStage::SweepComplete);
+                cycle.finish(0, 0, Default::default());
+                quiescent();
+            }
+            assert_eq!(STATE.1.notifications(), before);
+            assert_eq!(snapshot().stage, GcStage::Quiescent as u32);
+        }
+        reset_internal_for_test();
+    }
 
     #[test]
     fn milestone_repeated_owned_cycles_in_one_election_do_not_nest() {
