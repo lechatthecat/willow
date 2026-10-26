@@ -97,7 +97,7 @@ impl TypeChecker {
             return Self::error_type();
         }
         match &arr_ty {
-            Type::Array(elem) => (**elem).clone(),
+            Type::Array(elem) | Type::FixedArray(elem, _) => (**elem).clone(),
             // Read-only indexing of an immutable `FrozenArray<T>` (willow-dgwo.7).
             Type::Generic(_, _)
                 if let Some(elem) = builtin_types::unary_arg(&arr_ty, B::FrozenArray) =>
@@ -121,167 +121,200 @@ impl TypeChecker {
         }
     }
 
-    /// Builtin methods on `Array<T>`. Returns `Some(ret)` when `obj_ty` is an
+    /// Source methods on array storage. Returns `Some(ret)` when `obj_ty` is an
     /// array (handling the method or reporting an unknown one), `None` otherwise.
     pub(super) fn check_array_method_call(
         &mut self,
         obj_ty: &Type,
         m: &MethodCallExpr,
     ) -> Option<Type> {
-        let Type::Array(elem) = obj_ty else {
+        let (Type::Array(elem) | Type::FixedArray(elem, _)) = obj_ty else {
             return None;
         };
-        match m.method.as_str() {
-            "join" => {
-                self.check_call_argument_count("Array::join", 1, m.args.len(), m.span);
-                self.check_value_call_args(&[Type::String], &m.args);
-                if **elem != Type::String {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            "`join` requires an Array<String>",
-                        )
-                        .with_label(Label::primary(m.span, "expected string elements")),
-                    );
-                }
-                Some(Type::String)
+        if matches!(obj_ty, Type::FixedArray(..)) && matches!(m.method.as_str(), "push" | "pop") {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    "fixed arrays cannot be resized",
+                )
+                .with_label(Label::primary(m.span, "resizing a fixed array")),
+            );
+            for arg in &m.args {
+                self.check_expr(&arg.expr);
             }
-
-            "len" => {
-                if !m.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            "`Array::len` takes no arguments",
-                        )
-                        .with_label(Label::primary(m.span, "unexpected arguments")),
-                    );
-                }
-                Some(Type::I64)
+            return Some(Self::error_type());
+        }
+        let template = self
+            .generics
+            .classes
+            .get("$std::collections::Array")
+            .cloned()
+            .or_else(|| {
+                self.generics
+                    .classes
+                    .get("Array")
+                    .filter(|c| c.abi_storage.is_some())
+                    .cloned()
+            });
+        if !m.method.starts_with("__abi_") {
+            let storage = Type::Array(elem.clone());
+            if template.is_none()
+                && let Some(owner) = self
+                    .array_classes
+                    .get(&self.array_storage_key(&storage))
+                    .cloned()
+            {
+                self.static_call_classes
+                    .insert(m.id, TypeId::from_source_name(&owner));
+                self.record_lock_effect_call(
+                    FunctionId::method(TypeId::from_source_name(&owner), &m.method),
+                    m.span,
+                );
+                return Some(self.resolve_method(&Type::Named(owner), m, false));
             }
-            "push" => {
-                let elem_ty = (**elem).clone();
-                if m.args.len() != 1 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("`Array::push` expects 1 argument, got {}", m.args.len()),
-                        )
-                        .with_label(Label::primary(m.span, "expected `push(value)`")),
-                    );
-                } else {
-                    let v = self.check_expr_expecting(&m.args[0].expr, &elem_ty);
-                    if !self.types_compatible(&elem_ty, &v) {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "cannot push `{}` to `Array<{}>`",
-                                    type_name(&v),
-                                    type_name(&elem_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(
-                                m.args[0].expr.span(),
-                                "wrong element type",
-                            )),
-                        );
-                    }
-                }
-                Some(Type::Void)
-            }
-            "pop" => {
-                if !m.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            "`Array::pop` takes no arguments",
-                        )
-                        .with_label(Label::primary(m.span, "unexpected arguments")),
-                    );
-                }
-                Some((**elem).clone())
-            }
-            // `.freeze()` -> an immutable `FrozenArray<T>` copy that is Sync when
-            // T is Sync, so it can be shared across tasks (willow-dgwo.7).
-            "toString" => {
-                if !m.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            "`Array::toString` takes no arguments",
-                        )
-                        .with_label(Label::primary(m.span, "unexpected arguments")),
-                    );
-                }
-                if !matches!(**elem, Type::I64 | Type::F64 | Type::Bool | Type::String) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E1402,
-                            format!("cannot toString an array of `{}`", type_name(elem)),
-                        )
-                        .with_label(Label::primary(
-                            m.span,
-                            "element types supported by toString are i64, f64, bool, and String",
-                        )),
-                    );
-                }
-                Some(Type::String)
-            }
-            "freeze" => {
-                if !m.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            "`Array::freeze` takes no arguments",
-                        )
-                        .with_label(Label::primary(m.span, "unexpected arguments")),
-                    );
-                }
-                if **elem == Type::Void {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            "cannot freeze array before its element type is known",
-                        )
-                        .with_label(Label::primary(m.span, "array needs type information"))
-                        .with_help("add an Array<T> or FrozenArray<T> annotation"),
-                    );
-                    return Some(Self::error_type());
-                }
-                Some(Type::Generic(
-                    "FrozenArray".to_string(),
-                    vec![(**elem).clone()],
-                ))
-            }
-            other => {
-                let mut diagnostic = Diagnostic::new(
+            if let Some(template) = template {
+                let declared = template
+                    .methods
+                    .iter()
+                    .find(|method| method.name == m.method);
+                if declared.is_none() {
+                    let methods = template
+                        .methods
+                        .iter()
+                        .filter(|method| method.public && !method.is_static)
+                        .map(|method| method.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut diagnostic = Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
-                        format!("no method `{}` on type `Array<{}>`", other, type_name(elem)),
+                        format!("no method `{}` on type `{}`", m.method, type_name(obj_ty)),
                     )
-                    .with_label(Label::primary(m.span, "unknown array method"))
-                    .with_help(
-                        "arrays support `.len()`, `.push(v)`, `.pop()`, `.freeze()`, `.join(separator)`, `.toString()`, and indexing `arr[i]`",
+                    .with_label(Label::primary(m.span, "unknown method"))
+                    .with_help(format!("available methods: {methods}"));
+                    Self::label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
+                    self.push(diagnostic);
+                    for arg in &m.args {
+                        self.check_expr(&arg.expr);
+                    }
+                    return Some(Self::error_type());
+                }
+                if **elem == Type::Void {
+                    let method = declared.expect("checked source declaration");
+                    let depends = |ty: &Type| {
+                        super::generics::mentions(ty, |name| {
+                            template
+                                .type_params
+                                .iter()
+                                .any(|parameter| parameter == name)
+                        })
+                    };
+                    if method.constraint.is_some()
+                        || depends(&method.return_type)
+                        || method.params.iter().any(|parameter| depends(&parameter.ty))
+                    {
+                        self.generic_error(m.span, "array method requires a known element type");
+                        return Some(Self::error_type());
+                    }
+                    // An empty literal has no element representation yet. Source
+                    // signatures independent of that element can still be checked;
+                    // executable storage continues to require a concrete type.
+                    self.check_call_argument_count(
+                        &m.method,
+                        method.params.len(),
+                        m.args.len(),
+                        m.span,
                     );
-                Self::label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
-                self.push(diagnostic);
-                Some(Type::Void)
+                    self.check_value_call_args(
+                        &method
+                            .params
+                            .iter()
+                            .map(|parameter| parameter.ty.clone())
+                            .collect::<Vec<_>>(),
+                        &m.args,
+                    );
+                    return Some(method.return_type.clone());
+                }
+                if let Some(bound) = template
+                    .methods
+                    .iter()
+                    .find(|method| method.name == m.method)
+                    .and_then(|method| method.constraint.as_ref())
+                    && !bound.alternatives.contains(elem.as_ref())
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "method `{}` is unavailable for `{}`",
+                                m.method,
+                                type_name(obj_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(m.span, "method constraint is not satisfied")),
+                    );
+                    for arg in &m.args {
+                        self.check_expr(&arg.expr);
+                    }
+                    return Some(Self::error_type());
+                }
+                let access = if self
+                    .generics
+                    .classes
+                    .contains_key("$std::collections::Array")
+                {
+                    "$std::collections::Array"
+                } else {
+                    "Array"
+                };
+                if let Some(receiver) =
+                    self.instantiate_class(access, &[elem.as_ref().clone()], m.span)
+                {
+                    if let Type::Named(owner) = &receiver {
+                        self.static_call_classes
+                            .insert(m.id, TypeId::from_source_name(owner));
+                    }
+                    for callee in self.method_effect_ids(&Type::Array(elem.clone()), &m.method) {
+                        self.record_lock_effect_call(callee, m.span);
+                    }
+                    return Some(self.resolve_method(&receiver, m, false));
+                }
+                self.generic_error(
+                    template.span,
+                    "bundled Array declaration could not be instantiated",
+                );
+            } else {
+                self.generic_error(m.span, "bundled Array declaration is unavailable");
             }
+            return Some(Self::error_type());
         }
+        if !self.array_abi_files.contains(&m.span.file_id) {
+            self.generic_error(
+                m.span,
+                "array ABI operations are private to the bundled declaration",
+            );
+            return Some(Self::error_type());
+        }
+        let (params, result) = match m.method.as_str() {
+            "__abi_len" => (vec![], Type::I64),
+            "__abi_resize" => (vec![Type::I64], Type::Void),
+            "__abi_copy" => (
+                vec![],
+                Type::Generic("FrozenArray".into(), vec![elem.as_ref().clone()]),
+            ),
+            "__abi_concat" if **elem == Type::String => (vec![], Type::String),
+            _ => {
+                self.generic_error(m.span, "unknown array storage operation");
+                return Some(Self::error_type());
+            }
+        };
+        self.check_call_argument_count(&m.method, params.len(), m.args.len(), m.span);
+        self.check_value_call_args(&params, &m.args);
+        Some(result)
     }
 
-    /// Builtin methods on the immutable `FrozenArray<T>` (willow-dgwo.7): only
-    /// `.len()` plus read-only indexing `fa[i]`; mutation methods are rejected.
     pub(super) fn check_frozen_array_method_call(
         &mut self,
         obj_ty: &Type,

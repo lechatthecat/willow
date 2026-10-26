@@ -95,7 +95,7 @@ impl Retained for crate::parser::ast::Type<crate::semantic::ids::TypeId> {
     fn heap_bytes(&self) -> usize {
         use crate::parser::ast::Type;
         match self {
-            Type::Array(t) => t.retained_bytes(),
+            Type::Array(t) | Type::FixedArray(t, _) => t.retained_bytes(),
             Type::Generic(_, args) => args.heap_bytes(),
             Type::Fn(args, ret) | Type::Closure(args, ret) => {
                 args.heap_bytes() + ret.retained_bytes()

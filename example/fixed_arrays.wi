@@ -1,0 +1,14 @@
+// Fixed lengths are part of the type; indexed elements remain mutable.
+fn sum(values: [i64; 2]) -> i64 {
+    return values[0] + values[1];
+}
+fn main() {
+    let mut values: [i64; 2] = [20, 21];
+    values[1] = 22;
+    println(sum(values));
+    let rows: [[String; 1]; 2] = [["first"], ["second"]];
+    gc_collect();
+    println(rows[1][0]);
+    let empty: [bool; 0] = [];
+    println(empty.len());
+}

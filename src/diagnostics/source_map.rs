@@ -690,6 +690,7 @@ fn type_name(ty: &Type) -> String {
         Type::Void => "void".to_string(),
         Type::Never => "!".to_string(),
         Type::Named(name) => name.clone(),
+        Type::FixedArray(element, n) => format!("[{}; {n}]", type_name(element)),
         Type::Array(element) => format!("Array<{}>", type_name(element)),
         Type::Generic(name, args) => {
             let args = args.iter().map(type_name).collect::<Vec<_>>().join(",");

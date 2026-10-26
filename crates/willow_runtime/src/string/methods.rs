@@ -147,6 +147,19 @@ pub extern "C" fn willow_string_repeat(value: *mut u8, count: i64) -> *mut u8 {
 /// The array retains its children; reload all managed addresses after allocation.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_concat_array(array: *mut u8) -> *mut u8 {
+    willow_array_join(array, std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_debug(value: *mut u8) -> *mut u8 {
+    let text = unsafe { crate::string::willow_string_as_str(value) };
+    crate::string::willow_string_from_str(&format!("{text:?}"))
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_join(array: *mut u8, separator: *mut u8) -> *mut u8 {
     if array.is_null() {
         return fail("cannot join a null array");

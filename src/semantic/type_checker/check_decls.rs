@@ -196,7 +196,8 @@ impl TypeChecker {
     }
 
     pub(super) fn check_collection_type_imported(&mut self, name: &str, span: Span) {
-        if self.imported_collection_types.contains(name)
+        if (name == "Array" && self.array_abi_files.contains(&span.file_id))
+            || self.imported_collection_types.contains(name)
             || self.fully_qualified_collection_types.contains(name)
             || self
                 .imported_collection_aliases
@@ -248,6 +249,14 @@ impl TypeChecker {
         self.check_static_property_initializers(c);
         let instantiated = self.instantiate_foreign_defaults(c);
         for m in &c.methods {
+            if self.generics.abstract_check && m.constraint.is_some() {
+                self.check_constrained_method(m, c);
+                continue;
+            }
+            if m.constraint.is_some() && c.type_params.is_empty() {
+                self.generic_error(m.span, "method constraint requires a generic class");
+                continue;
+            }
             // Checked with its interface instance in the declaring unit.
             if instantiated.contains(m.name.as_str()) {
                 continue;

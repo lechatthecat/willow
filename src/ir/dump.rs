@@ -439,11 +439,16 @@ fn type_str<N: std::fmt::Display>(ty: &Type<N>) -> String {
     enum Part<'a, N> {
         Ty(&'a Type<N>),
         Text(&'static str),
+        Length(u64),
     }
     let mut pending = vec![Part::Ty(ty)];
     let mut out = String::new();
     while let Some(part) = pending.pop() {
         let ty = match part {
+            Part::Length(n) => {
+                out.push_str(&n.to_string());
+                continue;
+            }
             Part::Ty(ty) => ty,
             Part::Text(text) => {
                 out.push_str(text);
@@ -469,6 +474,15 @@ fn type_str<N: std::fmt::Display>(ty: &Type<N>) -> String {
                         "",
                     );
                 }
+            }
+            Type::FixedArray(inner, n) => {
+                out.push('[');
+                pending.extend([
+                    Part::Text("]"),
+                    Part::Length(*n),
+                    Part::Text("; "),
+                    Part::Ty(inner),
+                ]);
             }
             Type::Array(inner) => {
                 out.push_str("Array<");

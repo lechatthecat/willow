@@ -73,6 +73,7 @@ pub(super) fn type_name_with<'a, N: std::fmt::Display>(
     enum Part<'a, N> {
         Type(&'a Type<N>),
         Text(&'static str),
+        Length(u64),
         Name(&'a N),
     }
     let mut output = String::new();
@@ -80,6 +81,7 @@ pub(super) fn type_name_with<'a, N: std::fmt::Display>(
     while let Some(part) = work.pop() {
         match part {
             Part::Text(text) => output.push_str(text),
+            Part::Length(n) => output.push_str(&n.to_string()),
             Part::Name(name) => {
                 use std::fmt::Write;
                 let start = output.len();
@@ -102,6 +104,15 @@ pub(super) fn type_name_with<'a, N: std::fmt::Display>(
                 Type::Void => output.push_str("void"),
                 Type::Never => output.push('!'),
                 Type::Named(name) => work.push(Part::Name(name)),
+                Type::FixedArray(element, n) => {
+                    work.extend([
+                        Part::Text("]"),
+                        Part::Length(*n),
+                        Part::Text("; "),
+                        Part::Type(element),
+                        Part::Text("["),
+                    ]);
+                }
                 Type::Array(element) => {
                     work.push(Part::Text(">"));
                     work.push(Part::Type(element));

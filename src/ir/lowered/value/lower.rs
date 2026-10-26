@@ -282,9 +282,19 @@ fn argument_types(
             .constructor
             .as_ref()
             .map(|signature| signature.params.clone()),
-        HirExprKind::MethodCall { object, method, .. } => {
-            super::super::method_signature(&callables.resolution, &object.ty, method)
-                .map(|signature| signature.params)
+        HirExprKind::MethodCall {
+            object,
+            method,
+            super_class,
+            ..
+        } => {
+            let dispatch = super_class.map(Type::Named);
+            super::super::method_signature(
+                &callables.resolution,
+                dispatch.as_ref().unwrap_or(&object.ty),
+                method,
+            )
+            .map(|signature| signature.params)
         }
         HirExprKind::StaticCall { class, method, .. } => {
             if let Some(namespace) = callables.resolution.namespaces.get(class)
@@ -375,8 +385,8 @@ fn scalar(
         HirExprKind::Var(name) => names.contains_key(name),
         HirExprKind::Lambda { captures, .. } => captures.iter().all(|capture| names.contains_key(&capture.source)),
         HirExprKind::Print { value, .. } => matches!(value.ty, Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never),
-        HirExprKind::MethodCall { object, method, args, .. } => crate::semantic::intrinsics::resolve(&object.ty, method, args.len()).is_some_and(|resolved|
-            !(is_async && resolved.intrinsic.is_suspension_point()) && resolved.return_type(|i| args.get(i).map(|arg| arg.ty.clone())) == node.ty) || enum_method(&object.ty, method) || instance_method(&object.ty, method, args, callables),
+        HirExprKind::MethodCall { object, method, args, super_class } => crate::semantic::intrinsics::resolve(&object.ty, method, args.len()).is_some_and(|resolved|
+            !(is_async && resolved.intrinsic.is_suspension_point()) && resolved.return_type(|i| args.get(i).map(|arg| arg.ty.clone())) == node.ty) || enum_method(&object.ty, method) || instance_method(super_class.map(Type::Named).as_ref().unwrap_or(&object.ty), method, args, callables),
         HirExprKind::Invoke { callee, args, .. } => matches!(&callee.ty, Type::Fn(params, result) | Type::Closure(params, result) if **result == node.ty && params.len() == args.len() && !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution))),
         HirExprKind::Call { callee, args } => if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
             matches!(&locals[local.0 as usize].ty, Type::Fn(params, result) | Type::Closure(params, result) if !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && **result == node.ty && params.len() == args.len() && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution)))
@@ -891,8 +901,14 @@ fn lower(
                         object,
                         method,
                         args,
-                        ..
-                    } if instance_method(&object.ty, method, args, callables) => {
+                        super_class,
+                    } if instance_method(
+                        super_class.map(Type::Named).as_ref().unwrap_or(&object.ty),
+                        method,
+                        args,
+                        callables,
+                    ) =>
+                    {
                         work.push(Work::Finish(node));
                         work.extend(arguments(args, targets.as_deref()));
                         work.push(Work::PrepareMethod(node));

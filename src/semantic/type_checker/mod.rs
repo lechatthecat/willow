@@ -62,6 +62,8 @@ use std::collections::{HashMap, HashSet};
 /// this allocation; declaration registration is the only mutating phase.
 #[derive(Clone)]
 pub struct ResolutionContext {
+    pub(crate) array_classes: HashMap<Type, String>,
+    pub(crate) array_abi_files: HashSet<crate::diagnostics::FileId>,
     /// Whether the items being checked belong to the ENTRY program rather than
     /// an imported module. Only [`ReturnSite::EntryMain`] reads it, and only to
     /// decide whether a `main` is the real entry point — a module's `main` is
@@ -315,6 +317,8 @@ impl TypeChecker {
             registration_import_paths: std::rc::Rc::new(HashMap::new()),
             signature_only_modules: HashSet::new(),
             imported_collection_types: HashSet::new(),
+            array_classes: HashMap::new(),
+            array_abi_files: HashSet::new(),
             imported_collection_aliases: HashMap::new(),
             imported_std_modules: HashMap::new(),
             imported_blocking_std_functions: HashMap::new(),
@@ -457,6 +461,11 @@ impl TypeChecker {
             return true;
         };
         if self.signature_metadata
+            || crate::module::std_registry::is_std_path(name)
+            || self.symbols.lookup_class(name).is_some_and(|class| {
+                self.array_abi_files
+                    .contains(&class.declaration_span.file_id)
+            })
             || !self.signature_only_modules.contains(module)
             || self.symbols.lookup_module(module).is_some()
         {
@@ -490,7 +499,9 @@ impl TypeChecker {
                     self.check_source_type_access(arg, span);
                 }
             }
-            Type::Array(element) => self.check_source_type_access(element, span),
+            Type::Array(element) | Type::FixedArray(element, _) => {
+                self.check_source_type_access(element, span)
+            }
             Type::Fn(params, ret) | Type::Closure(params, ret) => {
                 for param in params {
                     self.check_source_type_access(param, span);
@@ -502,6 +513,39 @@ impl TypeChecker {
     }
 
     fn normalize_type(&mut self, ty: &Type, span: Span) -> Type {
+        if let Type::Generic(name, args) = ty
+            && let Some(template) = self.generics.classes.get(name).cloned()
+            && let Some(storage) = &template.abi_storage
+        {
+            if name == "Array" {
+                self.check_collection_type_imported("Array", span);
+            }
+            if let Some((module, item)) = self.resolve_fully_qualified_std_item(name, span)
+                && module == "collections"
+            {
+                self.fully_qualified_collection_types.insert(item);
+            }
+            if args.len() != template.type_params.len() {
+                self.generic_error(
+                    span,
+                    "wrong number of type arguments for bundled declaration",
+                );
+                return Self::error_type();
+            }
+            let normalized: Vec<_> = args
+                .iter()
+                .map(|arg| self.normalize_type(arg, span))
+                .collect();
+            let bindings = template
+                .type_params
+                .iter()
+                .cloned()
+                .zip(normalized)
+                .collect();
+            let concrete = crate::semantic::generic_inference::substitute(storage, &bindings);
+            self.normalized_types.insert(ty.clone(), concrete.clone());
+            return concrete;
+        }
         if let Type::Generic(name, args) = ty
             && let Some(concrete) = self.instantiate_class(name, args, span)
         {
@@ -549,6 +593,9 @@ impl TypeChecker {
             return ty.clone();
         }
         match ty {
+            Type::FixedArray(element, n) => {
+                Type::FixedArray(Box::new(self.normalize_type(element, span)), *n)
+            }
             Type::Array(element) => {
                 Type::Array(Box::new(self.normalize_type(element.as_ref(), span)))
             }
@@ -557,6 +604,10 @@ impl TypeChecker {
                     .iter()
                     .map(|arg| self.normalize_type(arg, span))
                     .collect::<Vec<_>>();
+                if name == "Array" {
+                    self.check_collection_type_imported("Array", span);
+                    return self.normalize_std_type_item(name, "collections", "Array", args, span);
+                }
                 if let Some(item) = self.imported_collection_aliases.get(name).cloned() {
                     return self.normalize_std_type_item(name, "collections", &item, args, span);
                 }
@@ -684,12 +735,52 @@ impl TypeChecker {
         }
     }
 
+    /// Shared generic signatures use nominal aliases. Key storage dispatch by
+    /// declaration identity so inferred local spellings and imported aliases agree.
+    pub(super) fn array_storage_key(&self, storage: &Type) -> Type {
+        storage.map_names(|name| {
+            let identity = self
+                .symbols
+                .lookup_class(name)
+                .map(|info| (&info.name, info.declaration_span))
+                .or_else(|| {
+                    self.symbols
+                        .lookup_enum(name)
+                        .map(|info| (&info.name, info.declaration_span))
+                })
+                .or_else(|| {
+                    self.symbols
+                        .lookup_interface(name)
+                        .map(|info| (&info.name, info.declaration_span))
+                });
+            identity.map_or_else(
+                || name.clone(),
+                |(identity, span)| {
+                    // Specializations share a declaration span but remain distinct.
+                    let specialization = identity.split_once("$mono$").map_or("", |(_, hash)| hash);
+                    format!(
+                        "$declaration${}:{}:{specialization}",
+                        span.file_id.0, span.start
+                    )
+                },
+            )
+        })
+    }
+
     fn class_info_from_decl(
         &mut self,
         class: &ClassDecl,
         registered_name: &str,
         module_prefix: Option<&str>,
     ) -> ClassInfo {
+        if let Some(storage) = &class.abi_storage {
+            let storage = self.normalize_decl_type(storage, class.span, module_prefix);
+            let key = self.array_storage_key(&storage);
+            self.array_classes.insert(key, registered_name.to_owned());
+            self.array_abi_files.insert(class.span.file_id);
+            self.normalized_types
+                .insert(Type::Named(registered_name.to_owned()), storage);
+        }
         let mut fields = HashMap::new();
         let mut methods = HashMap::new();
         let mut static_props = HashMap::new();
@@ -749,6 +840,7 @@ impl TypeChecker {
             methods.insert(
                 method.name.clone(),
                 MethodInfo {
+                    array_body_optimization: method.array_body_optimization,
                     param_infos: self.normalize_decl_param_infos(&method.params, module_prefix),
                     params,
 
@@ -1208,7 +1300,7 @@ impl TypeChecker {
             RECOVERY_TYPE_VISITS.with(|visits| visits.set(visits.get() + 1));
             match ty {
                 Type::Named(name) if Self::is_error_name(name) => return true,
-                Type::Array(element) => {
+                Type::Array(element) | Type::FixedArray(element, _) => {
                     current = element;
                     continue;
                 }
@@ -1305,10 +1397,8 @@ impl TypeChecker {
             // Recovery and partial-inference markers are compiler-owned, not source names.
             ty if Self::is_error_type(ty)
                 || crate::semantic::generic_inference::is_enum_hole(ty) => {}
-            Type::Array(element) => {
-                self.check_collection_type_imported("Array", span);
-                self.validate_type(element, span);
-            }
+            Type::FixedArray(element, _) => self.validate_type(element, span),
+            Type::Array(element) => self.validate_type(element, span),
             Type::Generic(name, args) => {
                 if builtin_types::is(ty, B::Map) {
                     self.check_collection_type_imported("Map", span);
@@ -1657,6 +1747,11 @@ impl TypeChecker {
                     || Self::is_error_type(a)
                     || Self::is_error_type(b) => {}
                 (Type::Named(a), Type::Named(b)) if name_eq(a, b) => {}
+                (Type::FixedArray(a, n), Type::FixedArray(b, m)) if n == m => {
+                    expected = a;
+                    actual = b;
+                    continue;
+                }
                 (Type::Array(a), Type::Array(b)) => {
                     expected = a;
                     actual = b;
@@ -1990,6 +2085,7 @@ fn imported_class_info_from_decl(
         methods.insert(
             method.name.clone(),
             MethodInfo {
+                array_body_optimization: method.array_body_optimization,
                 param_infos: qualify_params(&method.params),
                 params,
 

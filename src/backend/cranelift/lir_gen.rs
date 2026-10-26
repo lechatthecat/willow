@@ -254,7 +254,7 @@ fn assignable_repr(target: &Type, value: &Type) -> bool {
     // below must handle them before reaching this exhaustive fallback.
     fn gc_managed_for_assignable_catchall(ty: &Type) -> bool {
         match ty {
-            Type::String | Type::Array(_) | Type::Closure(_, _) => true,
+            Type::String | Type::FixedArray(_, _) | Type::Array(_) | Type::Closure(_, _) => true,
             Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never | Type::Fn(_, _) => false,
             Type::Named(_) | Type::Generic(_, _) => {
                 unreachable!("nominal type reached assignable representation catch-all")
@@ -270,15 +270,19 @@ fn assignable_repr(target: &Type, value: &Type) -> bool {
         // element types agree exactly. Empty `Array<Void>` literals do not reach
         // HIR today; supporting them later requires contextual element typing at
         // allocation time, not a blanket handle reinterpretation.
-        (Type::Array(a), Type::Array(b)) => a == b,
+        (Type::Array(a) | Type::FixedArray(a, _), Type::Array(b) | Type::FixedArray(b, _)) => {
+            a.same_array_storage_type(b)
+        }
         // The collection generics carry their element semantics the same way,
         // and they all lower to one pointer-sized word — so without an exact
         // test the fallback below would call a `Map<String, i64>` and a
         // `FrozenArray<i64>` interchangeable (willow-0g8j.7).
-        (Type::Generic(..), Type::Generic(..)) => target == value,
+        (Type::Generic(..), Type::Generic(..)) => target.same_array_storage_type(value),
         (Type::Generic(..), _) | (_, Type::Generic(..)) => false,
         // Both the calling convention and signature belong to the representation.
-        (Type::Fn(..), Type::Fn(..)) | (Type::Closure(..), Type::Closure(..)) => target == value,
+        (Type::Fn(..), Type::Fn(..)) | (Type::Closure(..), Type::Closure(..)) => {
+            target.same_array_storage_type(value)
+        }
         (Type::Fn(..) | Type::Closure(..), _) | (_, Type::Fn(..) | Type::Closure(..)) => false,
         _ => {
             clif_type(types::I64, target) == clif_type(types::I64, value)
@@ -665,7 +669,7 @@ impl LirTypeCtx<'_> {
 
     fn supported_type_inner(&self, ty: &Type, open: &mut SupportedTypes) -> bool {
         match ty {
-            Type::Array(elem) => {
+            Type::Array(elem) | Type::FixedArray(elem, _) => {
                 !matches!(**elem, Type::Void) && self.supported_type_inner(elem, open)
             }
             // The atomic cells (willow-0g8j.2.13): a GC-allocated word with no
@@ -1035,7 +1039,9 @@ impl LirTypeCtx<'_> {
                     || self.same_enum(a, b, open)
                     || self.same_iface(a, b)
             }
-            (Type::Array(a), Type::Array(b)) => self.same_repr_inner(a, b, open),
+            (Type::Array(a) | Type::FixedArray(a, _), Type::Array(b) | Type::FixedArray(b, _)) => {
+                self.same_repr_inner(a, b, open)
+            }
             (Type::Generic(a, ta), Type::Generic(b, tb)) => {
                 (a == b || self.same_iface(a, b) || self.same_enum(a, b, open))
                     && ta.len() == tb.len()
@@ -4210,32 +4216,36 @@ fn supported_expr_node<'n>(
                     .is_some_and(|(_, fty)| ctx.same_repr(fty, &e.ty))
             }) && child_supported(object)
         }
-        // The builtin array methods the walker emits, plus a direct call to a
-        // method of a simple class. Anything else on an array (`freeze`,
-        // `map`, …) and every other receiver is refused.
+        // Array public calls use the source-selected owner. Only storage
+        // operations resolve through the intrinsic table.
         HirExprKind::MethodCall {
             object,
             method,
             args,
-            ..
+            super_class,
         } => match &object.ty {
-            Type::Array(elem) => {
-                let shape_ok = match method.as_str() {
-                    "len" | "pop" => args.is_empty(),
-                    "push" => args.len() == 1 && ctx.storable(elem, &args[0].ty),
-                    // `toString` renders elements in the runtime, which only
-                    // knows the four scalar/string element kinds.
-                    "toString" => args.is_empty() && collection_elem_kind(elem).is_some(),
-                    // `freeze` copies the handle into a `FrozenArray<T>` over
-                    // the SAME element type. The result type is checked rather
-                    // than assumed: the emitter returns the copy unchanged, so
-                    // a different element type would be a reinterpretation.
-                    "freeze" => {
-                        args.is_empty()
-                            && matches!(lir_collection(&e.ty), Some((LirCollection::FrozenArray, a))
-                                if a.as_slice() == std::slice::from_ref(&**elem))
-                    }
-                    _ => false,
+            Type::Array(_) | Type::FixedArray(_, _) => {
+                let shape_ok = if let Some(owner) = super_class {
+                    let Some(mangled) = ctx.resolve_class_method(owner, method) else {
+                        return false;
+                    };
+                    ctx.callable(&mangled, args, true)
+                        && ctx.fn_types.get(&mangled).is_some_and(
+                            |ty| matches!(ty, Type::Fn(_, ret) if ctx.repr_compatible(ret, &e.ty)),
+                        )
+                } else {
+                    let arg_types: Vec<_> = args.iter().map(|arg| arg.ty.clone()).collect();
+                    intrinsics::resolve(&object.ty, method, args.len()).is_some_and(|resolution| {
+                        let result = resolution.return_type(|index| arg_types.get(index).cloned());
+                        ctx.same_repr(&result, &e.ty)
+                            && flat_intrinsic_supported(
+                                resolution.intrinsic,
+                                &object.ty,
+                                &arg_types,
+                                &e.ty,
+                                ctx,
+                            )
+                    })
                 };
                 shape_ok && child_supported(object) && args.iter().all(child_supported)
             }
@@ -7463,7 +7473,8 @@ fn flat_intrinsic_supported(
         return false;
     }
     match intrinsic {
-        ArrayPush | ChannelSend => {
+        ArrayResize => args == [Type::I64],
+        ChannelSend => {
             let element = match receiver {
                 Type::Array(element) => &**element,
                 _ => match builtin_types::unary_arg(receiver, B::Channel) {
@@ -7473,9 +7484,7 @@ fn flat_intrinsic_supported(
             };
             args.len() == 1 && ctx.storable(element, &args[0])
         }
-        ArrayToString => {
-            matches!(receiver, Type::Array(element) if collection_elem_kind(element).is_some())
-        }
+        StringDebug => *receiver == Type::String && args.is_empty(),
         MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapInsert | MapToString => {
             let Some((_, types)) = lir_collection(receiver) else {
                 return false;
@@ -7624,14 +7633,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if matches!(intrinsic, Intrinsic::ArrayLen | Intrinsic::FrozenArrayLen) {
             return self.emit_array_access(receiver, None, None);
         }
-        if intrinsic == Intrinsic::ArrayPush {
-            let element = array_element_type(receiver_ty);
-            if matches!(element, Type::I64 | Type::F64 | Type::Bool) {
-                // Primitive coercions cannot allocate. Root only on growth.
-                let value = self.coerce_to_target(args[0], &arg_types[0], &element);
-                let word = self.emit_to_storage_word(value, &element);
-                return self.emit_scalar_array_push(receiver, word);
-            }
+        if intrinsic == Intrinsic::ArrayResize
+            && matches!(
+                array_element_type(receiver_ty),
+                Type::I64 | Type::F64 | Type::Bool
+            )
+        {
+            return self.emit_scalar_array_resize(receiver, args[0]);
         }
         // Arguments have already been evaluated and rooted by LIR. Atomic
         // instructions cannot allocate, block, or safepoint, so they need no
@@ -7714,7 +7722,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let payload = self.builder.ins().select(overflowed, zero, value);
                 self.emit_pair(tag, payload)
             }
-            ArrayJoin => self.emit_value_runtime_call("willow_array_join", &[receiver, args[0]]),
+            StringConcatArray => {
+                self.emit_value_runtime_call("willow_string_concat_array", &[receiver])
+            }
             StringLen => self.emit_string_length(receiver),
             StringSubstring => self
                 .emit_value_runtime_call("willow_string_substring", &[receiver, args[0], args[1]]),
@@ -7845,54 +7855,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().iconst(types::I8, 0)
             }
             ArrayLen | FrozenArrayLen => self.emit_array_access(receiver, None, None),
-            ArrayPush => {
+            ArrayResize => {
                 let element = array_element_type(receiver_ty);
-                // Only boxing an inline-pair element allocates.
-                let value = self.coerce_to_target(args[0], &arg_types[0], &element);
-                let word = self.emit_to_storage_word(value, &element);
-                let receiver = if self.is_inline_pair(&element) {
-                    self.emit_push_call_root(word);
-                    self.emit_reload_operand(roots.receiver, receiver)
+                let mask = if self.is_interface_pair(&element) {
+                    1
+                } else if self.is_inline_pair(&element) {
+                    0
                 } else {
-                    receiver
+                    -1
                 };
-                let runtime = if self.is_inline_pair(&element) {
-                    // emit_to_storage_word just allocated this pair box;
-                    // its mutable storage has no alias outside the push.
-                    "willow_array_push_owned_pair"
-                } else {
-                    "willow_array_push"
-                };
-                self.emit_void_runtime_call(runtime, &[receiver, word]);
+                let mask = self.builder.ins().iconst(types::I64, mask);
+                self.emit_void_runtime_call("willow_array_resize", &[receiver, args[0], mask]);
                 self.builder.ins().iconst(types::I8, 0)
             }
-            ArrayPop => {
-                let element = array_element_type(receiver_ty);
-                if self.is_inline_pair(&element) {
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        16,
-                        3,
-                    ));
-                    let ptr_ty = reference_type(self.module.target_config());
-                    let address = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-                    self.emit_void_runtime_call(
-                        "willow_array_pop_scalar_pair_into",
-                        &[receiver, address],
-                    );
-                    self.stack_load(types::I128, slot)
-                } else {
-                    let word = self.emit_value_runtime_call("willow_array_pop", &[receiver]);
-                    self.emit_from_storage_word(word, &element)
-                }
-            }
-            ArrayToString => {
-                let kind = collection_elem_kind(&array_element_type(receiver_ty))
-                    .expect("validated array rendering kind");
-                let kind = self.builder.ins().iconst(types::I64, kind);
-                self.emit_value_runtime_call("willow_array_to_string", &[receiver, kind])
-            }
-            ArrayFreeze => {
+            StringDebug => self.emit_value_runtime_call("willow_string_debug", &[receiver]),
+            ArrayCopy => {
                 let runtime = if self.is_inline_pair(&array_element_type(receiver_ty)) {
                     "willow_array_copy_scalar_pairs"
                 } else {
@@ -8666,8 +8643,12 @@ fn flat_rvalue_supported(
             && flat_argument_modes_match(args, ctx.func_param_modes.get_id(callee).map(Vec::as_slice).unwrap_or(&[])),
         V::AwaitFuture { result, .. } => ctx.supported_type(result),
         V::SelectIdleWait { .. } => true,
-        V::PrepareMethod { receiver_ty, method, .. } => flat_method_signature(receiver_ty, method, ctx).is_some(),
-        V::MethodCall { receiver_ty, method, args, arg_types, result, .. } => flat_argument_modes_match(args, &flat_method_modes(receiver_ty, method, ctx)) && flat_method_signature(receiver_ty, method, ctx).is_some_and(|(params, ret)| params.len() == arg_types.len() && params.iter().zip(arg_types).all(|(param, arg)| ctx.same_repr(param, arg)) && ctx.same_repr(&ret, result)),
+        V::PrepareMethod { receiver_ty, method, .. } => matches!(receiver_ty, Type::Array(_)) || flat_method_signature(receiver_ty, method, ctx).is_some(),
+        V::MethodCall { receiver_ty, method, args, arg_types, result, super_class, .. } => {
+            let dispatch = super_class.map(Type::Named);
+            let receiver_ty = dispatch.as_ref().unwrap_or(receiver_ty);
+            flat_argument_modes_match(args, &flat_method_modes(receiver_ty, method, ctx)) && flat_method_signature(receiver_ty, method, ctx).is_some_and(|(params, ret)| params.len() == arg_types.len() && params.iter().zip(arg_types).all(|(param, arg)| ctx.same_repr(param, arg)) && ctx.same_repr(&ret, result))
+        },
         V::IndirectCall { callee, params, result, .. } => ty(callee).is_some_and(|callee| ctx.supported_type(&callee)) && params.iter().all(|param| ctx.supported_type(param)) && ctx.supported_type(result),
         V::RebindResultError { source, target, .. } => ctx.supported_enum_type(source) && ctx.supported_enum_type(target)
             && builtin_types::binary_args(source, B::Result).zip(builtin_types::binary_args(target, B::Result)).is_some_and(|((_, source), (_, target))| ctx.same_repr(source, target)),
@@ -9614,37 +9595,112 @@ mod tests {
         }
     }
 
-    /// Parse, desugar and TYPE CHECK, then lower with the checker's side
-    /// tables — the pipeline `compile_program` runs, minus module resolution.
-    ///
-    /// The plain [`eligible`] path lowers with empty `PartialCheckerTables`, which is
-    /// enough for anything the lowering can derive structurally. An interface
-    /// method call is not: `lower_expr` finds no such method on the receiver's
-    /// class and falls back to `tables.expr_type(span)`, so without the checker
-    /// it fails with E0800 and the function never reaches the LIR at all.
-    /// Desugaring matters for the same reason — it is what composes an
-    /// `extends` interface's inherited methods into the list the vtable slots
-    /// come from.
+    /// Use the frontend's bundled declarations, generic specialization and
+    /// checked signatures before lowering. The raw eligibility helpers remain
+    /// available for malformed-HIR tests that intentionally bypass semantics.
+    /// Fixtures without an entry point receive a temporary empty main, which
+    /// is removed from the returned LIR so function-count assertions stay exact.
     fn checked_lowering(src: &str, fns: &[&str]) -> (crate::ir::lowered::LirProgram, TestTables) {
-        let tokens = Lexer::new(src).tokenize().expect("lex");
-        let (mut program, errs) = Parser::new(tokens).parse();
-        assert!(errs.is_empty(), "{errs:?}");
-        crate::desugar::DesugarPass::run(&mut program, &mut []);
-        let mut checker = crate::semantic::TypeChecker::new();
-        crate::register_prelude(&mut checker).expect("prelude");
-        checker.check_program(&program);
-        let errors: Vec<_> = checker
-            .errors
-            .iter()
-            .filter(|d| d.severity == crate::diagnostics::Severity::Error)
-            .collect();
+        let (parsed, errors) = Parser::new(Lexer::new(src).tokenize().expect("lex")).parse();
         assert!(errors.is_empty(), "{errors:?}");
-        let tables = crate::ir::lower::SemanticFacts::from_checker(&checker);
-        let (hir, diags) = crate::ir::lower::lower_program_with(&program, &tables);
-        assert!(diags.is_empty(), "{diags:?}");
-        let lir = crate::ir::lowered::lower_program(&hir);
-        let tables = TestTables::build(&program, fns, &lir.lambdas);
+        let added_entry = !parsed.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(function) if function.name == "main"));
+        let source = if added_entry {
+            format!("{src}\nfn main() {{}}")
+        } else {
+            src.to_owned()
+        };
+        let src = source.as_str();
+        let map = crate::diagnostics::SourceMap::new("<backend-test>.wi", src);
+        let frontend = crate::run_frontend(
+            src,
+            std::path::Path::new("."),
+            &map,
+            &crate::CompilerOptions::debug(),
+        )
+        .expect("checked frontend");
+        let artifacts = frontend
+            .module_graph
+            .artifacts
+            .as_ref()
+            .expect("source artifacts");
+        let program = artifacts
+            .hydrate(&frontend.program, crate::diagnostics::FileId::ENTRY)
+            .expect("entry body");
+        let checked = frontend
+            .db
+            .checked_unit(crate::module::UnitId::ENTRY, artifacts)
+            .expect("checked entry");
+        let facts = checked.tables();
+        let (hir, diagnostics) = crate::ir::lower::lower_program_with(&program, &facts);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let mut lir = crate::ir::lowered::lower_program(&hir);
+        if added_entry {
+            lir.functions
+                .retain(|function| function.name.to_string() != "main");
+        }
+        let mut declarations = program.clone();
+        normalize_test_signatures(&mut declarations, &facts);
+        for module in &frontend.module_graph.files {
+            let checked = frontend
+                .db
+                .checked_unit(module.id, artifacts)
+                .expect("checked source module");
+            let mut source = module.program.clone();
+            normalize_test_signatures(&mut source, &checked.tables());
+            for item in &mut source.items {
+                if let crate::parser::ast::Item::Class(class) = item {
+                    class.name = format!("{}::{}", module.identity_path(), class.name);
+                }
+            }
+            declarations.items.extend(source.items);
+        }
+        let tables = TestTables::build(&declarations, fns, &lir.lambdas);
         (lir, tables)
+    }
+
+    fn normalize_test_signatures(
+        program: &mut crate::parser::ast::Program,
+        facts: &crate::ir::lower::SemanticFacts<'_>,
+    ) {
+        use crate::parser::ast::Item;
+        let normalize_params = |params: &mut Vec<crate::parser::ast::Param>| {
+            for param in params {
+                param.ty = facts.normalize(&param.ty);
+            }
+        };
+        for item in &mut program.items {
+            match item {
+                Item::Function(function) => {
+                    normalize_params(&mut function.params);
+                    function.return_type = facts.normalize(&function.return_type);
+                }
+                Item::Class(class) => {
+                    for field in &mut class.fields {
+                        field.ty = facts.normalize(&field.ty);
+                    }
+                    for method in &mut class.methods {
+                        normalize_params(&mut method.params);
+                        method.return_type = facts.normalize(&method.return_type);
+                    }
+                    for constructor in &mut class.constructors {
+                        normalize_params(&mut constructor.params);
+                    }
+                }
+                Item::Interface(interface) => {
+                    for method in &mut interface.methods {
+                        normalize_params(&mut method.params);
+                        method.return_type = facts.normalize(&method.return_type);
+                    }
+                }
+                Item::Enum(declaration) => {
+                    for variant in &mut declaration.variants {
+                        for ty in &mut variant.payload {
+                            *ty = facts.normalize(ty);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -11216,7 +11272,7 @@ mod tests {
     #[test]
     fn e24_string_array_now_eligible() {
         let src = "fn f() -> i64 { let xs = [\"a\", \"b\"]; return xs.len(); }";
-        assert!(eligible(src, "f", &["f"]));
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
     // 25. (updated by willow-0g8j.5) a static call returning a class object is
@@ -11258,15 +11314,17 @@ mod tests {
     // 26. array parameters and array returns are eligible
     #[test]
     fn e26_array_param_and_return_eligible() {
-        let src = "fn f(xs: Array<i64>) -> Array<i64> { return xs; }";
-        assert!(eligible(src, "f", &["f"]));
+        let src =
+            "import std::collections::Array; fn f(xs: Array<i64>) -> Array<i64> { return xs; }";
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
     // 27. reading through an index is eligible
     #[test]
     fn e27_array_index_eligible() {
-        let src = "fn f(xs: Array<i64>, i: i64) -> i64 { return xs[i]; }";
-        assert!(eligible(src, "f", &["f"]));
+        let src =
+            "import std::collections::Array; fn f(xs: Array<i64>, i: i64) -> i64 { return xs[i]; }";
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
     // 28. index-assignment is eligible (a LIR instruction, not an expression)
@@ -11280,7 +11338,7 @@ mod tests {
     #[test]
     fn e29_push_pop_eligible() {
         let src = "fn f() -> i64 { let mut xs = [1]; xs.push(2); return xs.pop(); }";
-        assert!(eligible(src, "f", &["f"]));
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
     // 30. toString is eligible for each element kind the runtime can render
@@ -11293,9 +11351,9 @@ mod tests {
             ("String", "[\"a\"]"),
         ] {
             let src = format!(
-                "fn f() -> String {{ let xs: Array<{decl}> = {lit}; return xs.toString(); }}"
+                "import std::collections::Array; fn f() -> String {{ let xs: Array<{decl}> = {lit}; return xs.toString(); }}"
             );
-            assert!(eligible(&src, "f", &["f"]), "{decl} array toString");
+            assert!(eligible_checked(&src, "f", &["f"]), "{decl} array toString");
         }
     }
 
@@ -11318,9 +11376,8 @@ mod tests {
     // 33. `for x in arr` is eligible: the LIR desugars it into `len()` + index
     #[test]
     fn e33_for_over_array_eligible() {
-        let src =
-            "fn f(xs: Array<i64>) -> i64 { let mut t = 0; for x in xs { t = t + x; } return t; }";
-        assert!(eligible(src, "f", &["f"]));
+        let src = "import std::collections::Array; fn f(xs: Array<i64>) -> i64 { let mut t = 0; for x in xs { t = t + x; } return t; }";
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
     // 34. arrays of SIMPLE class objects are eligible since willow-0g8j.5 (the
@@ -11328,13 +11385,13 @@ mod tests {
     // joined them in willow-j260, once the walker learned to box on the way in.
     #[test]
     fn e34_class_and_interface_element_arrays_eligible() {
-        let src = "class Item { pub name: String; } \
+        let src = "import std::collections::Array; class Item { pub name: String; } \
                    fn f(xs: Array<Item>) -> i64 { return xs.len(); }";
-        assert!(eligible_lenient(src, "f", &["f"]));
+        assert!(eligible_checked(src, "f", &["f"]));
 
-        let iface = "interface Named { fn name(self) -> String; } \
+        let iface = "import std::collections::Array; interface Named { fn name(self) -> String; } \
                      fn f(xs: Array<Named>) -> i64 { return xs.len(); }";
-        assert!(eligible_lenient(iface, "f", &["f"]));
+        assert!(eligible_checked(iface, "f", &["f"]));
     }
 
     // 35. (updated by willow-0g8j.7) `freeze` completed the array method
@@ -11993,9 +12050,9 @@ mod tests {
     // 49. an `Array<T>` field is eligible: the element type is checked too
     #[test]
     fn e49_array_field_eligible() {
-        let src = "class Bag { pub xs: Array<i64>; } \
+        let src = "import std::collections::Array; class Bag { pub xs: Array<i64>; } \
                    fn f(b: Bag) -> i64 { return b.xs.len(); }";
-        assert!(eligible_lenient(src, "f", &["f"]));
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
     // 50. a class local that lives across a loop is eligible: its root slot is
@@ -12119,8 +12176,10 @@ mod tests {
     // 60. an array of simple class objects, indexed and field-read, is eligible
     #[test]
     fn e60_class_array_field_read_eligible() {
-        let src = format!("{POINT} fn f(ps: Array<Point>) -> i64 {{ return ps[0].x; }}");
-        assert!(eligible_lenient(&src, "f", &["f"]));
+        let src = format!(
+            "import std::collections::Array; {POINT} fn f(ps: Array<Point>) -> i64 {{ return ps[0].x; }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f"]));
     }
 
     // 61. Option-wrapped class types are in the subset as of willow-0g8j.2.1:
@@ -12407,10 +12466,10 @@ mod tests {
     #[test]
     fn j08_boxed_array_push_eligible() {
         let src = format!(
-            "{NAMED} fn f(xs: Array<Named>) -> i64 {{ \
+            "import std::collections::Array; {NAMED} fn f(xs: Array<Named>) -> i64 {{ \
              xs.push(new Item(\"a\")); return xs.len(); }}"
         );
-        assert!(eligible_lenient(&src, "f", &["f"]));
+        assert!(eligible_checked(&src, "f", &["f"]));
     }
 
     // j09. the implicit memberwise constructor boxes into an interface field

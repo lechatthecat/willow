@@ -94,6 +94,14 @@ pub(super) fn sink_cold_regions(func: &mut Function) {
 thread_local! {
     /// Final CLIF of every function placed while a test capture is active.
     static CAPTURE: std::cell::RefCell<Option<Vec<Function>>> = const { std::cell::RefCell::new(None) };
+    static ENTRY_CAPTURE_START: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn mark_entry_capture_start() {
+    CAPTURE.with(|capture| {
+        ENTRY_CAPTURE_START.with(|start| start.set(capture.borrow().as_ref().map_or(0, Vec::len)));
+    });
 }
 
 /// Loop nesting of each LIR block.
@@ -233,12 +241,20 @@ mod tests {
     use cranelift_codegen::ir::{Block, Opcode};
 
     fn compiled_functions(source: &str) -> Vec<Function> {
+        compiled_function_scopes(source).1
+    }
+
+    fn compiled_function_scopes(source: &str) -> (Vec<Function>, Vec<Function>) {
+        ENTRY_CAPTURE_START.with(|start| start.set(0));
         CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
         super::super::emit_interface::tests::compile_fixture_with(
             source,
             &CompilerOptions::release(),
         );
-        CAPTURE.with(|capture| capture.borrow_mut().take().expect("capture active"))
+        let mut modules =
+            CAPTURE.with(|capture| capture.borrow_mut().take().expect("capture active"));
+        let entry = modules.split_off(ENTRY_CAPTURE_START.with(|start| start.get()));
+        (modules, entry)
     }
 
     #[test]
@@ -423,6 +439,7 @@ mod tests {
         hot.into_iter().chain(cold).collect()
     }
 
+    #[derive(Debug)]
     struct LoopShape {
         hot_blocks: usize,
         contiguous: bool,
@@ -517,6 +534,19 @@ mod tests {
         shapes
     }
 
+    #[test]
+    fn source_array_helper_loops_are_shared_across_calls() {
+        for calls in [1, 8, 32] {
+            let source = format!(
+                "fn main() {{ let xs = [1]; {} }}",
+                "xs.push(2);".repeat(calls)
+            );
+            let (modules, entry) = compiled_function_scopes(&source);
+            assert_eq!(modules.iter().flat_map(loop_shapes).count(), 3);
+            assert_eq!(entry.iter().flat_map(loop_shapes).count(), 0);
+        }
+    }
+
     fn assert_compact_loops(source: &str, expected_loops: usize) -> Vec<LoopShape> {
         let shapes: Vec<LoopShape> = compiled_functions(source)
             .iter()
@@ -527,7 +557,7 @@ mod tests {
             assert!(shape.hot_blocks > 0);
             assert!(
                 shape.contiguous,
-                "a hot loop is split by other code:\n{source}"
+                "a hot loop is split by other code: {shape:?}\n{source}"
             );
             assert_eq!(
                 shape.hot_calls, 0,

@@ -234,7 +234,9 @@ impl<'a> PartialCheckerTables<'a> {
                         .map(|info| Type::Named(info.name.clone()))
                 })
                 .unwrap_or_else(|| ty.clone()),
-            Type::Array(elem) => Type::Array(Box::new(self.normalize_declared(elem, bound))),
+            Type::Array(elem) | Type::FixedArray(elem, _) => {
+                Type::Array(Box::new(self.normalize_declared(elem, bound)))
+            }
             Type::Generic(name, args) => Type::Generic(
                 self.symbols
                     .and_then(|symbols| symbols.lookup_interface(name))
@@ -394,7 +396,9 @@ impl<'a> PartialCheckerTables<'a> {
     }
 
     fn expr_type(&self, id: &ExprId) -> Option<Type> {
-        self.expr_types.and_then(|m| m.get(id).cloned())
+        self.expr_types
+            .and_then(|m| m.get(id))
+            .map(Type::array_storage_type)
     }
 
     /// The checker's enums, re-keyed by the name they are WRITTEN with —
@@ -410,7 +414,15 @@ impl<'a> PartialCheckerTables<'a> {
                     variants: info
                         .variants
                         .iter()
-                        .map(|v| (v.name.clone(), v.payload_types.clone()))
+                        .map(|v| {
+                            (
+                                v.name.clone(),
+                                v.payload_types
+                                    .iter()
+                                    .map(Type::array_storage_type)
+                                    .collect(),
+                            )
+                        })
                         .collect(),
                 },
             )
@@ -1276,6 +1288,117 @@ fn lower_block(block: &Block, ctx: &mut LowerCtx) -> Result<Vec<HirStmt>, Diagno
     ctx.push_scope();
     let mut out = Vec::with_capacity(block.stmts.len());
     for stmt in &block.stmts {
+        // Expand only a declaration-proven storage append in statement position.
+        // Operand temporaries preserve call evaluation order and managed roots;
+        // the length must be read after evaluating the argument.
+        if let Stmt::Expr(statement) = stmt
+            && let Expr::MethodCall(call) = &statement.expr
+            && call.args.len() == 1
+            && ctx
+                .tables
+                .static_call_classes
+                .and_then(|owners| owners.get(&call.id))
+                .and_then(|owner| {
+                    ctx.tables
+                        .symbols
+                        .and_then(|symbols| symbols.lookup_class(&owner.to_string()))
+                })
+                .and_then(|class| class.methods.get(&call.method))
+                .is_some_and(|method| {
+                    method.array_body_optimization
+                        == crate::parser::ast::ArrayBodyOptimization::Append
+                })
+        {
+            let object = lower_expr(&call.object, ctx)?;
+            let Type::Array(ref element) = object.ty.to_source() else {
+                return Err(unsupported(
+                    call.span,
+                    "storage append requires an array receiver",
+                ));
+            };
+            let value = lower_expr(&call.args[0].expr, ctx)?;
+            let counter = ctx.binds_seen.entry("$storage_append".into()).or_default();
+            let prefix = format!("$storage_append{}", *counter);
+            *counter += 1;
+            let receiver_name = format!("{prefix}_receiver");
+            let value_name = format!("{prefix}_value");
+            let index_name = format!("{prefix}_index");
+            let receiver = HirExpr {
+                kind: HirExprKind::Var(receiver_name.clone()),
+                ty: object.ty.clone(),
+                span: call.span,
+            };
+            let argument = HirExpr {
+                kind: HirExprKind::Var(value_name.clone()),
+                ty: (**element).clone().into(),
+                span: call.span,
+            };
+            let index = HirExpr {
+                kind: HirExprKind::Var(index_name.clone()),
+                ty: Type::I64,
+                span: call.span,
+            };
+            out.push(HirStmt::Let {
+                name: receiver_name,
+                mutable: false,
+                ty: object.ty.clone(),
+                value: object,
+                span: call.span,
+            });
+            out.push(HirStmt::Let {
+                name: value_name,
+                mutable: false,
+                ty: argument.ty.clone(),
+                value,
+                span: call.span,
+            });
+            out.push(HirStmt::Let {
+                name: index_name,
+                mutable: false,
+                ty: Type::I64,
+                value: HirExpr {
+                    kind: HirExprKind::MethodCall {
+                        object: Box::new(receiver.clone()),
+                        method: "__abi_len".into(),
+                        args: vec![],
+                        super_class: None,
+                    },
+                    ty: Type::I64,
+                    span: call.span,
+                },
+                span: call.span,
+            });
+            let length = HirExpr {
+                kind: HirExprKind::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(index.clone()),
+                    rhs: Box::new(HirExpr {
+                        kind: HirExprKind::Int(1),
+                        ty: Type::I64,
+                        span: call.span,
+                    }),
+                },
+                ty: Type::I64,
+                span: call.span,
+            };
+            out.push(HirStmt::Expr(HirExpr {
+                kind: HirExprKind::MethodCall {
+                    object: Box::new(receiver.clone()),
+                    method: "__abi_resize".into(),
+                    args: vec![length],
+                    super_class: None,
+                },
+                ty: Type::Void,
+                span: call.span,
+            }));
+            out.push(HirStmt::IndexAssign {
+                array: receiver,
+                index,
+                value: argument,
+                span: call.span,
+            });
+            continue;
+        }
         out.push(lower_stmt(stmt, ctx)?);
     }
     ctx.pop_scope();
@@ -1654,14 +1777,6 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
         Expr::MethodCall(m) => lower_method_call_expr(m, ctx),
         Expr::ObjectLiteral(o) => lower_object_literal_expr(o, ctx),
         Expr::StaticField(s) => lower_static_field_expr(s, ctx),
-        Expr::StaticCall(s)
-            if s.method == "new"
-                && s.args.is_empty()
-                && ctx.tables.static_call_class(&s.id, &s.class) == "Array"
-                && matches!(ctx.expr_type(&s.id), Some(Type::Array(_))) =>
-        {
-            lower_array_literal_expr(expr, &[], s.span, ctx)
-        }
         Expr::StaticCall(s) => lower_static_call_expr(s, ctx),
         Expr::Range(r) => lower_range_expr(r, ctx),
         Expr::Select(select) => lower_select_expr(select, ctx),
@@ -2345,12 +2460,30 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
             .ok_or_else(|| unsupported(m.span, "method not found on receiver"))?
     };
     let args = lower_value_args(&m.args, ctx)?;
+    let owner = ctx
+        .tables
+        .static_call_classes
+        .and_then(|owners| owners.get(&m.id))
+        .cloned();
+    let forward_length = owner.as_ref().is_some_and(|owner| {
+        ctx.tables
+            .symbols
+            .and_then(|symbols| symbols.lookup_class(&owner.to_string()))
+            .and_then(|class| class.methods.get(&m.method))
+            .is_some_and(|method| {
+                method.array_body_optimization == crate::parser::ast::ArrayBodyOptimization::Length
+            })
+    });
     Ok(HirExpr {
         kind: HirExprKind::MethodCall {
             object: Box::new(object),
-            method: m.method.clone(),
+            method: if forward_length {
+                "__abi_len".into()
+            } else {
+                m.method.clone()
+            },
             args,
-            super_class: None,
+            super_class: if forward_length { None } else { owner },
         },
         ty: ty.into(),
         span: m.span,
@@ -3299,11 +3432,10 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
     match receiver {
         Type::String if method == "len" => Some(Type::I64),
         Type::Array(elem) => match method {
-            "len" => Some(Type::I64),
-            "toString" => Some(Type::String),
-            "push" => Some(Type::Void),
-            "pop" => Some((**elem).clone()),
-            "freeze" => Some(B::FrozenArray.apply(vec![(**elem).clone()])),
+            "__abi_len" => Some(Type::I64),
+            "__abi_resize" => Some(Type::Void),
+            "__abi_concat" if **elem == Type::String => Some(Type::String),
+            "__abi_copy" => Some(B::FrozenArray.apply(vec![(**elem).clone()])),
             _ => None,
         },
         Type::Generic(_, args) => match (
@@ -4871,26 +5003,32 @@ mod tests {
         assert_eq!(return_ty(src), Type::Named("Color".into()));
     }
 
-    // 74. builtin array methods: len/pop/freeze types
+    // Source array signatures supply len/pop/freeze expression types.
     #[test]
-    fn p74_array_builtin_methods() {
-        assert_eq!(
-            return_ty("fn f() -> i64 { let xs = [1]; return xs.len(); }"),
-            Type::I64
-        );
-        assert_eq!(
-            return_ty("fn f() -> i64 { let mut xs = [1]; return xs.pop(); }"),
-            Type::I64
-        );
-        let body = lower_body("fn f() { let xs = [1]; let fr = xs.freeze(); }");
-        match &body[1] {
-            HirStmt::Let { value, .. } => {
-                assert_eq!(
-                    value.ty,
-                    Type::Generic("FrozenArray".into(), vec![Type::I64])
-                );
-            }
-            other => panic!("expected let, got {other:?}"),
+    fn p74_array_source_methods() {
+        for (source, expected) in [
+            (
+                "fn f() -> i64 { let xs = [1]; return xs.len(); }",
+                Type::I64,
+            ),
+            (
+                "fn f() -> i64 { let xs = [1]; return xs.pop(); }",
+                Type::I64,
+            ),
+            (
+                "fn f() -> FrozenArray<i64> { let xs = [1]; return xs.freeze(); }",
+                Type::Generic("FrozenArray".into(), vec![Type::I64]),
+            ),
+        ] {
+            let (hir, diagnostics) = lower_with_checker(source);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let HirStmt::Return {
+                value: Some(value), ..
+            } = hir.functions[0].body.last().unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(value.ty.to_source(), expected);
         }
     }
 
@@ -4941,6 +5079,31 @@ mod tests {
         );
         let tables = SemanticFacts::from_checker(&checker);
         lower_program_with(&program, &tables)
+    }
+
+    #[test]
+    fn source_append_expansion_has_constant_operations_per_call() {
+        for calls in [1, 8, 32] {
+            let source = format!(
+                "fn main() {{ let xs = [0]; {} }}",
+                "xs.push(1);".repeat(calls)
+            );
+            let (hir, errors) = lower_with_checker(&source);
+            assert!(errors.is_empty(), "{errors:?}");
+            let body = &hir.functions[0].body;
+            assert_eq!(body.len(), 1 + 5 * calls);
+            for expansion in body[1..].chunks_exact(5) {
+                assert!(matches!(&expansion[0], HirStmt::Let { .. }));
+                assert!(matches!(&expansion[1], HirStmt::Let { .. }));
+                assert!(
+                    matches!(&expansion[2], HirStmt::Let { value: HirExpr { kind: HirExprKind::MethodCall { method, .. }, .. }, .. } if method == "__abi_len")
+                );
+                assert!(
+                    matches!(&expansion[3], HirStmt::Expr(HirExpr { kind: HirExprKind::MethodCall { method, .. }, .. }) if method == "__abi_resize")
+                );
+                assert!(matches!(&expansion[4], HirStmt::IndexAssign { .. }));
+            }
+        }
     }
 
     // 76. an unannotated lambda types via the checker's inferred fn(..) table

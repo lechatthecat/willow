@@ -5,6 +5,11 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),
+        ("example/fixed_arrays.wi", "42\nsecond\n0\n"),
+        (
+            "example/source_arrays.wi",
+            "source methods\nmethods\n2\n[\"source\"]\n42\n",
+        ),
         (
             "example/array_literal_allocation.wi",
             "0\ntrue\nabcd\n8\n2016\n36\nouter\n42\n",

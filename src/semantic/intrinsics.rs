@@ -151,17 +151,15 @@ pub enum Intrinsic {
     /// `Channel<T>::close()`.
     ChannelClose,
 
-    /// `Array<T>::len()`.
+    /// Raw array storage length.
     ArrayLen,
-    ArrayJoin,
-    /// `Array<T>::push(v)`.
-    ArrayPush,
-    /// `Array<T>::pop()`.
-    ArrayPop,
-    /// `Array<T>::toString()` → `"[1, 2, 3]"`.
-    ArrayToString,
-    /// `Array<T>::freeze()` → `FrozenArray<T>`.
-    ArrayFreeze,
+    StringConcatArray,
+    /// Allocate or release logical array slots, retaining the handle.
+    ArrayResize,
+    /// Scalar string debug formatting (including quotes/escapes).
+    StringDebug,
+    /// Allocate independent immutable array storage.
+    ArrayCopy,
 
     /// `FrozenArray<T>::len()` — the only method on a frozen array.
     FrozenArrayLen,
@@ -291,11 +289,10 @@ impl Intrinsic {
         Intrinsic::ChannelRecvOpt,
         Intrinsic::ChannelClose,
         Intrinsic::ArrayLen,
-        Intrinsic::ArrayJoin,
-        Intrinsic::ArrayPush,
-        Intrinsic::ArrayPop,
-        Intrinsic::ArrayToString,
-        Intrinsic::ArrayFreeze,
+        Intrinsic::StringConcatArray,
+        Intrinsic::ArrayResize,
+        Intrinsic::StringDebug,
+        Intrinsic::ArrayCopy,
         Intrinsic::FrozenArrayLen,
         Intrinsic::MapInsert,
         Intrinsic::MapGet,
@@ -385,12 +382,11 @@ impl Intrinsic {
             ],
             ChannelRecvOpt => &["willow_channel_recv_opt_into"],
             ChannelClose => &["willow_channel_close"],
-            ArrayJoin => &["willow_array_join"],
+            StringConcatArray => &["willow_string_concat_array"],
             ArrayLen | FrozenArrayLen => &["willow_array_len"],
-            ArrayPush => &["willow_array_push", "willow_array_push_owned_pair"],
-            ArrayPop => &["willow_array_pop", "willow_array_pop_scalar_pair_into"],
-            ArrayToString => &["willow_array_to_string"],
-            ArrayFreeze => &["willow_array_copy", "willow_array_copy_scalar_pairs"],
+            ArrayResize => &["willow_array_resize"],
+            StringDebug => &["willow_string_debug"],
+            ArrayCopy => &["willow_array_copy", "willow_array_copy_scalar_pairs"],
             MapInsert => &["willow_map_insert"],
             MapGet | FrozenMapGet => &["willow_map_get", "willow_map_get_into"],
             MapContains | FrozenMapContains => &["willow_map_contains"],
@@ -635,22 +631,28 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
         }
     }
 
-    // `Array<T>` has its own `Type` constructor rather than a generic name.
-    if let Type::Array(elem) = recv {
+    if method == "__abi_debug" && arity == 0 {
+        return match recv {
+            Type::String => Some(ResolvedMethod::fixed(Intrinsic::StringDebug, Type::String)),
+            Type::I64 => Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String)),
+            Type::F64 => Some(ResolvedMethod::fixed(Intrinsic::F64ToString, Type::String)),
+            Type::Bool => Some(ResolvedMethod::fixed(Intrinsic::BoolToString, Type::String)),
+            _ => None,
+        };
+    }
+    if let Type::Array(elem) | Type::FixedArray(elem, _) = recv {
         return match (method, arity) {
-            ("join", 1) if matches!(**elem, Type::String) => {
-                Some(ResolvedMethod::fixed(Intrinsic::ArrayJoin, Type::String))
-            }
-            ("len", 0) => Some(ResolvedMethod::fixed(Intrinsic::ArrayLen, Type::I64)),
-            ("push", 1) => Some(ResolvedMethod::fixed(Intrinsic::ArrayPush, Type::Void)),
-            ("pop", 0) => Some(ResolvedMethod::fixed(Intrinsic::ArrayPop, (**elem).clone())),
-            ("toString", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::ArrayToString,
+            ("__abi_concat", 0) if matches!(**elem, Type::String) => Some(ResolvedMethod::fixed(
+                Intrinsic::StringConcatArray,
                 Type::String,
             )),
-            ("freeze", 0) => Some(ResolvedMethod::fixed(
-                Intrinsic::ArrayFreeze,
-                Type::Generic("FrozenArray".into(), vec![(**elem).clone()]),
+            ("__abi_len", 0) => Some(ResolvedMethod::fixed(Intrinsic::ArrayLen, Type::I64)),
+            ("__abi_resize", 1) if !matches!(recv, Type::FixedArray(..)) => {
+                Some(ResolvedMethod::fixed(Intrinsic::ArrayResize, Type::Void))
+            }
+            ("__abi_copy", 0) => Some(ResolvedMethod::fixed(
+                Intrinsic::ArrayCopy,
+                Type::Generic("FrozenArray".into(), vec![elem.as_ref().clone()]),
             )),
             _ => None,
         };
@@ -910,53 +912,39 @@ mod tests {
         assert_eq!(resolve(&Type::String, "toString", 2), None);
     }
 
-    /// Perspective 3: `Array<T>::toString` is an intrinsic that the backend's
-    /// structural type walk did not know before this table existed — it fell
-    /// through to the `i64` default. Its result is String regardless of element
-    /// type; whether the element is renderable is the checker's business.
     #[test]
-    fn array_to_string_resolves_and_returns_string() {
-        assert_eq!(
-            resolve_intrinsic(&array(Type::I64), "toString", 0),
-            Some(Intrinsic::ArrayToString)
-        );
-        assert_eq!(ret_of(&array(Type::I64), "toString", 0), Some(Type::String));
-        assert_eq!(
-            ret_of(&array(named("Point")), "toString", 0),
-            Some(Type::String)
-        );
+    fn array_public_methods_are_source_defined() {
+        for (method, arity) in [
+            ("len", 0),
+            ("push", 1),
+            ("pop", 0),
+            ("join", 1),
+            ("toString", 0),
+            ("freeze", 0),
+        ] {
+            for element in [Type::I64, Type::String, named("Point")] {
+                assert_eq!(resolve(&array(element), method, arity), None);
+            }
+        }
     }
 
-    /// Perspective 4: `Array<T>::pop` produces the element type, so the result
-    /// type has to be read out of the receiver rather than fixed in the table.
     #[test]
-    fn array_pop_returns_the_element_type() {
-        assert_eq!(ret_of(&array(Type::String), "pop", 0), Some(Type::String));
+    fn array_storage_intrinsics_preserve_types_and_arity() {
+        assert_eq!(ret_of(&array(Type::I64), "__abi_len", 0), Some(Type::I64));
         assert_eq!(
-            ret_of(&array(named("Point")), "pop", 0),
-            Some(named("Point"))
+            ret_of(&array(Type::I64), "__abi_resize", 1),
+            Some(Type::Void)
         );
-    }
-
-    /// Perspective 5: `Array<T>::freeze` produces `FrozenArray<T>` — the one
-    /// intrinsic whose result is a *different* container of the same element.
-    #[test]
-    fn array_freeze_returns_a_frozen_array_of_the_same_element() {
         assert_eq!(
-            ret_of(&array(Type::I64), "freeze", 0),
-            Some(generic("FrozenArray", vec![Type::I64]))
+            ret_of(&array(Type::String), "__abi_copy", 0),
+            Some(generic("FrozenArray", vec![Type::String]))
         );
-    }
-
-    /// Perspective 6: array arity. `push` needs exactly one argument and `len`
-    /// exactly none; the mismatched forms are the checker's errors and must not
-    /// reach a lowering.
-    #[test]
-    fn array_methods_are_keyed_by_arity() {
-        assert_eq!(resolve(&array(Type::I64), "push", 0), None);
-        assert_eq!(resolve(&array(Type::I64), "push", 2), None);
-        assert_eq!(resolve(&array(Type::I64), "len", 1), None);
-        assert_eq!(resolve(&array(Type::I64), "pop", 1), None);
+        assert_eq!(resolve(&array(Type::I64), "__abi_resize", 0), None);
+        assert_eq!(resolve(&array(Type::I64), "__abi_len", 1), None);
+        assert_eq!(
+            resolve(&Type::FixedArray(Box::new(Type::I64), 2), "__abi_resize", 1),
+            None
+        );
     }
 
     /// Perspective 7: a `FrozenArray<T>` answers `len` only. `push` and `pop`
@@ -1370,12 +1358,15 @@ mod tests {
     }
 
     /// Perspective 33: nested receivers resolve on their outermost family, so
-    /// `Array<Array<i64>>::pop` produces the inner array rather than `i64`.
+    /// Array copy retains the nested element rather than flattening it.
     #[test]
     fn nested_receivers_resolve_on_the_outer_family() {
         let nested = array(array(Type::I64));
-        assert_eq!(ret_of(&nested, "pop", 0), Some(array(Type::I64)));
-        assert_eq!(ret_of(&nested, "len", 0), Some(Type::I64));
+        assert_eq!(
+            ret_of(&nested, "__abi_copy", 0),
+            Some(generic("FrozenArray", vec![array(Type::I64)]))
+        );
+        assert_eq!(ret_of(&nested, "__abi_len", 0), Some(Type::I64));
 
         let map_of_arrays = generic("Map", vec![Type::String, array(Type::I64)]);
         assert_eq!(
@@ -1410,6 +1401,11 @@ mod tests {
             named("TaskScope"),
         ];
         let methods = [
+            "__abi_len",
+            "__abi_resize",
+            "__abi_copy",
+            "__abi_concat",
+            "__abi_debug",
             "join",
             "substring",
             "slice",
@@ -1588,11 +1584,25 @@ mod checker_agreement_tests {
     /// assertion that passes because the walker found nothing is worse than one
     /// that fails.
     fn assert_agrees(src: &str, expected: usize) -> Vec<Intrinsic> {
+        assert_agrees_with_access(src, expected, false)
+    }
+
+    fn assert_agrees_with_access(src: &str, expected: usize, abi: bool) -> Vec<Intrinsic> {
         let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
         let (program, parse_errors) = crate::parser::Parser::new(tokens).parse();
         assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
         let mut checker = crate::semantic::TypeChecker::new();
         crate::register_prelude(&mut checker).expect("prelude registers");
+        if abi {
+            // Bootstrap declarations, then emulate the bundled file capability.
+            let (empty, _) =
+                crate::parser::Parser::new(crate::lexer::Lexer::new("").tokenize().unwrap())
+                    .parse();
+            checker.check_program(&empty);
+            checker
+                .array_abi_files
+                .insert(crate::diagnostics::FileId(0));
+        }
         checker.check_program(&program);
         assert!(
             checker.errors.is_empty(),
@@ -1618,7 +1628,15 @@ mod checker_agreement_tests {
                 })
                 .clone();
             let Some(resolved) = resolve(&recv, &call.method, call.args.len()) else {
-                // Not a builtin: a user method, which class dispatch owns.
+                if matches!(recv, Type::Array(_)) {
+                    // Public array methods must have an ordinary source target.
+                    let owner = checker
+                        .static_call_classes
+                        .get(&call.id)
+                        .expect("source array method target");
+                    assert!(owner.to_string().contains("Array"));
+                    builtin_calls += 1;
+                }
                 continue;
             };
             builtin_calls += 1;
@@ -2006,6 +2024,20 @@ fn f() {
         ] {
             reached.extend(assert_agrees(src, expected));
         }
+        reached.extend(assert_agrees_with_access(
+            r#"
+fn f() {
+    let xs = [1];
+    xs.__abi_resize(2);
+    let n = xs.__abi_len();
+    let frozen = xs.__abi_copy();
+    let text = ["a", "b"].__abi_concat();
+    let quoted = "x".__abi_debug();
+}
+"#,
+            5,
+            true,
+        ));
         let missing: Vec<Intrinsic> = Intrinsic::ALL
             .iter()
             .copied()

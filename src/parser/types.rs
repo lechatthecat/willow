@@ -8,6 +8,7 @@ impl Parser {
     pub(super) fn parse_type(&mut self) -> Result<Type, Diagnostic> {
         enum Frame {
             Generic(String, Vec<Type>),
+            FixedArray,
             Tuple(Vec<Type>),
             Params(bool, Vec<Type>),
             Return(bool, Vec<Type>),
@@ -19,10 +20,8 @@ impl Parser {
                 Type::Fn(params, Box::new(ret))
             }
         }
-        fn generic(name: String, mut args: Vec<Type>) -> Type {
-            if name == "Array" && args.len() == 1 {
-                Type::Array(Box::new(args.remove(0)))
-            } else if name == "JoinHandle" && args.len() == 1 {
+        fn generic(name: String, args: Vec<Type>) -> Type {
+            if name == "JoinHandle" && args.len() == 1 {
                 Type::Generic("Task".into(), args)
             } else {
                 Type::Generic(name, args)
@@ -43,6 +42,11 @@ impl Parser {
                 });
             }
             let mut value = match self.peek_kind().clone() {
+                TokenKind::LBracket => {
+                    self.advance();
+                    frames.push(Frame::FixedArray);
+                    continue;
+                }
                 TokenKind::I64 => {
                     self.advance();
                     Type::I64
@@ -132,6 +136,23 @@ impl Parser {
                 }
                 match frames.pop() {
                     None => return Ok(value),
+                    Some(Frame::FixedArray) => {
+                        self.expect(TokenKind::Semicolon)?;
+                        let TokenKind::Integer(size) = self.peek_kind().clone() else {
+                            return Err(self.err(
+                                ErrorCode::E0107,
+                                "expected a non-negative integer array length",
+                            ));
+                        };
+                        if size < 0 {
+                            return Err(
+                                self.err(ErrorCode::E0107, "array length must be non-negative")
+                            );
+                        }
+                        self.advance();
+                        self.expect(TokenKind::RBracket)?;
+                        value = Type::FixedArray(Box::new(value), size as u64);
+                    }
                     Some(Frame::Return(closure, params)) => {
                         value = callable(closure, params, value);
                     }

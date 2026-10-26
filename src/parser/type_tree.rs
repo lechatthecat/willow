@@ -3,7 +3,17 @@ use super::Type;
 use std::hash::{Hash, Hasher};
 
 impl<N> Type<N> {
-    pub fn map_names<M>(&self, mut map: impl FnMut(&N) -> M) -> Type<M> {
+    /// Erase only the checked length constraint at the runtime representation boundary.
+    pub(crate) fn array_storage_type(&self) -> Self
+    where
+        N: Clone,
+    {
+        self.map_tree(Clone::clone, true)
+    }
+    pub fn map_names<M>(&self, map: impl FnMut(&N) -> M) -> Type<M> {
+        self.map_tree(map, false)
+    }
+    fn map_tree<M>(&self, mut map: impl FnMut(&N) -> M, erase_array_length: bool) -> Type<M> {
         enum Work<'a, N> {
             Enter(&'a Type<N>),
             Build(&'a Type<N>, usize),
@@ -28,6 +38,14 @@ impl<N> Type<N> {
                         Type::Never => Type::Never,
                         Type::Named(name) => Type::Named(map(name)),
                         Type::Array(_) => Type::Array(Box::new(children.pop().unwrap())),
+                        Type::FixedArray(_, n) => {
+                            let element = Box::new(children.pop().unwrap());
+                            if erase_array_length {
+                                Type::Array(element)
+                            } else {
+                                Type::FixedArray(element, *n)
+                            }
+                        }
                         Type::Generic(name, _) => Type::Generic(map(name), children),
                         Type::Fn(..) => {
                             let result = children.pop().unwrap();
@@ -78,6 +96,9 @@ impl<N> Type<N> {
                         Type::Never => Type::Never,
                         Type::Named(name) => Type::Named(name.clone()),
                         Type::Array(_) => Type::Array(Box::new(children.pop().unwrap())),
+                        Type::FixedArray(_, n) => {
+                            Type::FixedArray(Box::new(children.pop().unwrap()), *n)
+                        }
                         Type::Generic(name, _) => Type::Generic(name.clone(), children),
                         Type::Fn(..) => {
                             let result = children.pop().unwrap();
@@ -96,7 +117,7 @@ impl<N> Type<N> {
     }
     fn children(&self) -> Vec<&Self> {
         match self {
-            Self::Array(element) => vec![element],
+            Self::Array(element) | Self::FixedArray(element, _) => vec![element],
             Self::Generic(_, args) => args.iter().collect(),
             Self::Fn(args, result) | Self::Closure(args, result) => args
                 .iter()
@@ -107,7 +128,9 @@ impl<N> Type<N> {
     }
     fn take_children(&mut self, pending: &mut Vec<Self>) {
         match self {
-            Self::Array(element) => pending.push(std::mem::replace(element.as_mut(), Self::Void)),
+            Self::Array(element) | Self::FixedArray(element, _) => {
+                pending.push(std::mem::replace(element.as_mut(), Self::Void))
+            }
             Self::Generic(_, args) => pending.append(args),
             Self::Fn(args, result) | Self::Closure(args, result) => {
                 pending.append(args);
@@ -131,14 +154,29 @@ impl<N> Drop for Type<N> {
         }
     }
 }
-impl<N: PartialEq> PartialEq for Type<N> {
-    fn eq(&self, other: &Self) -> bool {
+impl<N: PartialEq> Type<N> {
+    /// Runtime array slots have the same representation regardless of their
+    /// checked length constraint. Nominal identities and all other shapes stay exact.
+    pub(crate) fn same_array_storage_type(&self, other: &Self) -> bool {
+        self.equal_tree(other, true)
+    }
+    fn equal_tree(&self, other: &Self, erase_array_length: bool) -> bool {
         let mut pending = vec![(self, other)];
         while let Some((left, right)) = pending.pop() {
+            if erase_array_length
+                && let (
+                    Self::Array(a) | Self::FixedArray(a, _),
+                    Self::Array(b) | Self::FixedArray(b, _),
+                ) = (left, right)
+            {
+                pending.push((a, b));
+                continue;
+            }
             if std::mem::discriminant(left) != std::mem::discriminant(right) {
                 return false;
             }
             match (left, right) {
+                (Self::FixedArray(_, a), Self::FixedArray(_, b)) if a != b => return false,
                 (Self::Named(a), Self::Named(b)) | (Self::Generic(a, _), Self::Generic(b, _))
                     if a != b =>
                 {
@@ -156,6 +194,11 @@ impl<N: PartialEq> PartialEq for Type<N> {
         true
     }
 }
+impl<N: PartialEq> PartialEq for Type<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.equal_tree(other, false)
+    }
+}
 impl<N: Eq> Eq for Type<N> {}
 impl<N: Hash> Hash for Type<N> {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -164,6 +207,7 @@ impl<N: Hash> Hash for Type<N> {
             std::mem::discriminant(ty).hash(state);
             match ty {
                 Self::Named(name) | Self::Generic(name, _) => name.hash(state),
+                Self::FixedArray(_, n) => n.hash(state),
                 _ => {}
             }
             let children = ty.children();
@@ -183,6 +227,7 @@ enum FlatType<N> {
     Never,
     Named(N),
     Array(usize),
+    FixedArray(usize, u64),
     Generic(N, Vec<usize>),
     Fn(Vec<usize>, usize),
     Closure(Vec<usize>, usize),
@@ -213,6 +258,7 @@ impl<N: serde::Serialize> serde::Serialize for Type<N> {
                 Type::Never => FlatType::Never,
                 Type::Named(name) => FlatType::Named(name),
                 Type::Array(element) => FlatType::Array(index(element)),
+                Type::FixedArray(element, n) => FlatType::FixedArray(index(element), *n),
                 Type::Generic(name, args) => {
                     FlatType::Generic(name, args.iter().map(index).collect())
                 }
@@ -254,6 +300,7 @@ impl<'de, N: serde::Deserialize<'de>> serde::Deserialize<'de> for Type<N> {
                 FlatType::Never => Self::Never,
                 FlatType::Named(name) => Self::Named(name),
                 FlatType::Array(child) => Self::Array(Box::new(take(child)?)),
+                FlatType::FixedArray(child, n) => Self::FixedArray(Box::new(take(child)?), n),
                 FlatType::Generic(name, args) => Self::Generic(
                     name,
                     args.into_iter().map(&mut take).collect::<Result<_, _>>()?,
@@ -304,6 +351,10 @@ impl<N: std::fmt::Debug> std::fmt::Debug for Type<N> {
                         f.write_str("Array(")?;
                         work.extend([Work::Text(")"), Work::Type(element)]);
                     }
+                    Type::FixedArray(element, n) => {
+                        write!(f, "FixedArray({n}, ")?;
+                        work.extend([Work::Text(")"), Work::Type(element)]);
+                    }
                     Type::Generic(name, args) => {
                         f.write_str("Generic(")?;
                         std::fmt::Debug::fmt(name, f)?;
@@ -339,6 +390,36 @@ impl<N: std::fmt::Debug> std::fmt::Debug for Type<N> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fixed_array_type_tree_scaling_and_identity() {
+        use super::Type;
+        for depth in [1, 32, 128, 512] {
+            let mut ty: Type = Type::Named("T".into());
+            for n in 0..depth {
+                ty = Type::FixedArray(Box::new(ty), n as u64);
+            }
+            let wire = serde_json::to_value(&ty).unwrap();
+            assert_eq!(wire.as_array().unwrap().len(), depth + 1);
+            let copy: Type = serde_json::from_value(wire).unwrap();
+            assert_eq!(copy, ty);
+            assert_eq!(ty.clone(), ty);
+            let replaced = ty.substitute_names(|_| Some(Type::I64));
+            let storage = replaced.array_storage_type();
+            let mut current = &storage;
+            let mut nodes = 1;
+            while let Type::Array(element) = current {
+                current = element;
+                nodes += 1;
+            }
+            assert_eq!(nodes, depth + 1);
+            assert_eq!(*current, Type::I64);
+        }
+        let a: Type = Type::FixedArray(Box::new(Type::I64), 1);
+        let b: Type = Type::FixedArray(Box::new(Type::I64), 2);
+        assert_ne!(a, b);
+        assert_ne!(a, Type::Array(Box::new(Type::I64)));
+    }
+
     use super::*;
     use crate::semantic::ids::{SemanticType, TypeId};
     #[test]

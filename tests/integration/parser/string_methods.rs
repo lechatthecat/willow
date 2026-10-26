@@ -299,8 +299,21 @@ fn array_join_generated_calls_scale_with_callsites() {
             );
             let symbols = compile_and_collect_relocation_targets_all(&source, &[]);
             assert_eq!(
-                symbols.iter().filter(|s| *s == "willow_array_join").count(),
-                count
+                symbols
+                    .iter()
+                    .filter(|s| s.contains("Array") && s.ends_with(".join"))
+                    .count(),
+                count,
+                "{symbols:?}"
+            );
+            // Both source rendering and joining share one linear string assembly
+            // operation each, independent of user callsite count or input bytes.
+            assert_eq!(
+                symbols
+                    .iter()
+                    .filter(|s| *s == "willow_string_concat_array")
+                    .count(),
+                2
             );
         }
     }

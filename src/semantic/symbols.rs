@@ -218,6 +218,8 @@ pub struct StaticPropInfo {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MethodInfo {
+    #[serde(default)]
+    pub array_body_optimization: crate::parser::ast::ArrayBodyOptimization,
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
     /// `static fn` — class-level method with no receiver, called as
@@ -464,6 +466,11 @@ impl SymbolTable {
             Type::F64 => key.push('f'),
             Type::Bool => key.push('b'),
             Type::String => key.push('s'),
+            Type::FixedArray(element, n) => {
+                key.push_str(&format!("[{n};"));
+                self.type_key_into(element, key)?;
+                key.push(']');
+            }
             Type::Array(element) => {
                 key.push('[');
                 self.type_key_into(element, key)?;

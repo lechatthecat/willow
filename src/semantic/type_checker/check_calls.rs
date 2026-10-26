@@ -295,6 +295,20 @@ impl TypeChecker {
         if let (Expr::ArrayLiteral(elements, _, _), Type::Array(elem)) = (expr, expected) {
             return self.check_array_literal_expecting(elements, Some(elem));
         }
+        if let (Expr::ArrayLiteral(elements, _, _), Type::FixedArray(elem, n)) = (expr, expected) {
+            self.check_array_literal_expecting(elements, Some(elem));
+            if elements.len() as u64 != *n {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("fixed array expects {n} elements, found {}", elements.len()),
+                    )
+                    .with_label(Label::primary(expr.span(), "array length mismatch")),
+                );
+            }
+            return expected.clone();
+        }
         // Freeze preserves type arguments while changing collection mutability.
         // Check the receiver once with that context; ordinary values and explicit
         // constructor arguments retain their actual types in the normal checker.

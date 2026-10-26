@@ -123,6 +123,7 @@ impl TypeNames {
         enum Work<'a> {
             Type(&'a Type),
             Text(&'static str),
+            Length(u64),
         }
         fn list<'a>(work: &mut Vec<Work<'a>>, items: &'a [Type]) {
             for (i, item) in items.iter().enumerate().rev() {
@@ -140,6 +141,10 @@ impl TypeNames {
                     out.push_str(text);
                     continue;
                 }
+                Work::Length(n) => {
+                    out.push_str(&n.to_string());
+                    continue;
+                }
                 Work::Type(ty) => ty,
             };
             #[cfg(test)]
@@ -152,6 +157,15 @@ impl TypeNames {
                 Type::Void => out.push_str("void"),
                 Type::Never => out.push('!'),
                 Type::Named(name) => out.push_str(&self.name(name, module)),
+                Type::FixedArray(element, n) => {
+                    out.push('[');
+                    work.extend([
+                        Work::Text("]"),
+                        Work::Length(*n),
+                        Work::Text("; "),
+                        Work::Type(element),
+                    ]);
+                }
                 Type::Array(element) => {
                     out.push_str("Array<");
                     work.extend([Work::Text(">"), Work::Type(element)]);

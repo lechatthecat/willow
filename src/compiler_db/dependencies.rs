@@ -31,6 +31,7 @@ impl ModulePaths<'_> {
 }
 
 pub(crate) struct ModuleDependencies {
+    pub(crate) bundled_collections: Option<usize>,
     by_package: std::collections::HashMap<
         crate::package::PackageId,
         std::collections::HashMap<String, usize>,
@@ -131,6 +132,9 @@ impl ModuleDependencies {
                 .insert(module.canonical_path.clone(), index);
         }
         let mut result = Self {
+            bundled_collections: modules
+                .iter()
+                .position(|module| module.canonical_path == "std::collections"),
             by_package,
             aliases: packages
                 .into_iter()
@@ -505,6 +509,7 @@ mod tests {
         for size in [16, 64, 256, 1024] {
             for chain in [false, true] {
                 let index = ModuleDependencies {
+                    bundled_collections: None,
                     by_package: Default::default(),
                     aliases: Default::default(),
                     root_package: crate::package::PackageId(0),

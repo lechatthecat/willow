@@ -378,7 +378,12 @@ impl ConcurrencyAnalyzer {
             if let ParamMode::Reference { mutable, .. } = &param.mode {
                 if matches!(
                     param.ty,
-                    Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Array(_)
+                    Type::I64
+                        | Type::F64
+                        | Type::Bool
+                        | Type::String
+                        | Type::Array(_)
+                        | Type::FixedArray(..)
                 ) || matches!(&param.ty, Type::Named(name) if self.reference_classes.contains(name))
                     || matches!(&param.ty, Type::Generic(name, _) if name == "Array" || self.reference_classes.contains(name))
                 {

@@ -50,6 +50,7 @@ pub(crate) fn merge_enum_holes(left: &Type, right: &Type) -> Option<Type> {
                 pending.extend(aa.iter_mut().zip(bb));
             }
             (Type::Array(a), Type::Array(b)) => pending.push((a, b)),
+            (Type::FixedArray(a, n), Type::FixedArray(b, m)) if n == m => pending.push((a, b)),
             (Type::Fn(aa, ar), Type::Fn(ba, br))
             | (Type::Closure(aa, ar), Type::Closure(ba, br)) => {
                 pending.push((ar, br));
@@ -72,6 +73,7 @@ enum Shape<'a> {
     Never,
     Named(&'a str),
     Array,
+    FixedArray(u64),
     Generic(&'a str, usize),
     Function(usize),
     Closure(usize),
@@ -92,6 +94,7 @@ fn shape(ty: &Type) -> Shape<'_> {
         Type::Never => Shape::Never,
         Type::Named(name) => Shape::Named(name),
         Type::Array(_) => Shape::Array,
+        Type::FixedArray(_, n) => Shape::FixedArray(*n),
         Type::Generic(name, args) => Shape::Generic(name, args.len()),
         Type::Fn(args, _) => Shape::Function(args.len()),
         Type::Closure(args, _) => Shape::Closure(args.len()),
@@ -100,7 +103,7 @@ fn shape(ty: &Type) -> Shape<'_> {
 
 fn push_children<'a>(ty: &'a Type, pending: &mut Vec<&'a Type>) {
     match ty {
-        Type::Array(element) => pending.push(element),
+        Type::Array(element) | Type::FixedArray(element, _) => pending.push(element),
         Type::Generic(_, args) => pending.extend(args.iter().rev()),
         Type::Fn(args, result) | Type::Closure(args, result) => {
             pending.push(result);

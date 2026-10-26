@@ -173,6 +173,7 @@ fn freeze_inference_native() {
 
 #[test]
 fn freeze_inference_allocation_sites_scale_linearly() {
+    let mut shared_array_sites = None;
     for n in [1, 8, 32, 128] {
         let mut source = String::from(
             "import std::collections::Array; import std::collections::Map; fn a(xs: FrozenArray<i64>) { println(xs.len()); } fn m(xs: FrozenMap<String, i64>) { println(xs.len()); } fn main() {",
@@ -180,13 +181,20 @@ fn freeze_inference_allocation_sites_scale_linearly() {
         source.push_str(&"a(Array::new().freeze()); m(Map::new().freeze());".repeat(n));
         source.push('}');
         let names = compile_and_collect_relocation_targets_all(&source, &[]);
-        for symbol in [
-            "willow_array_new_literal",
-            "willow_array_copy",
-            "willow_map_new",
-            "willow_map_copy",
-        ] {
-            // Non-escaping maps may use the existing local-map constructor.
+        // Allocation/copy live in shared source specializations. Callsites grow
+        // linearly, but neither source body is duplicated per consumer call.
+        let shared = ["willow_array_new_literal", "willow_array_copy"]
+            .map(|symbol| names.iter().filter(|name| name.as_str() == symbol).count());
+        assert!(shared.iter().all(|count| *count > 0));
+        assert_eq!(*shared_array_sites.get_or_insert(shared), shared);
+        for method in [".new", ".freeze"] {
+            let count = names
+                .iter()
+                .filter(|name| name.contains("Array") && name.ends_with(method))
+                .count();
+            assert_eq!(count, n, "Array{method}/{n}");
+        }
+        for symbol in ["willow_map_new", "willow_map_copy"] {
             let count = names
                 .iter()
                 .filter(|name| {
@@ -195,8 +203,11 @@ fn freeze_inference_allocation_sites_scale_linearly() {
                 })
                 .count();
             assert_eq!(count, n, "{symbol}/{n}");
-            println!("freeze sites={n} {symbol}={count}");
         }
+        println!(
+            "freeze sites={n} shared_array_allocations={} shared_array_copies={} source_new_calls={n} source_freeze_calls={n}",
+            shared[0], shared[1]
+        );
     }
 }
 

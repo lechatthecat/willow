@@ -173,6 +173,8 @@ pub enum Type<Name = String> {
     Void,
     Named(Name),
     Array(Box<Type<Name>>),
+    /// Statically sized, non-resizable array.
+    FixedArray(Box<Type<Name>>, u64),
     Generic(Name, Vec<Type<Name>>),
     /// `fn(T1, T2) -> R` — plain function pointer type (non-capturing)
     Fn(Vec<Type<Name>>, Box<Type<Name>>),
@@ -299,6 +301,9 @@ impl TypePath {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClassDecl {
+    /// Compiler-assigned storage for a bundled ABI declaration; never parsed from user source.
+    #[serde(default)]
+    pub abi_storage: Option<Type>,
     #[serde(default)]
     pub type_params: Vec<String>,
     pub name: String,
@@ -325,6 +330,9 @@ impl ClassDecl {
     /// The receiver in this declaration's type-parameter scope.
     /// Concrete monomorphizations have no parameters and use their own name.
     pub(crate) fn receiver_type(&self) -> Type {
+        if let Some(storage) = &self.abi_storage {
+            return storage.clone();
+        }
         if self.type_params.is_empty() {
             Type::Named(self.name.clone())
         } else {
@@ -366,7 +374,26 @@ pub struct FieldDecl {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MethodConstraint {
+    pub parameter: String,
+    pub alternatives: Vec<Type>,
+}
+
+/// Exact source-body proofs used by bounded storage-operation lowering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ArrayBodyOptimization {
+    #[default]
+    None,
+    Length,
+    Append,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MethodDecl {
+    #[serde(default)]
+    pub array_body_optimization: ArrayBodyOptimization,
+    /// A finite, declaration-checked domain for this method.
+    pub constraint: Option<Box<MethodConstraint>>,
     pub name: String,
     pub public: bool,
     pub protected: bool,

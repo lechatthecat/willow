@@ -36,6 +36,7 @@ pub(crate) fn clif_type<N: builtin_types::TypeName>(
         // Never uses the reference representation for unreachable values.
         crate::parser::ast::Type::String
         | crate::parser::ast::Type::Never
+        | crate::parser::ast::Type::FixedArray(_, _)
         | crate::parser::ast::Type::Array(_)
         | crate::parser::ast::Type::Generic(_, _)
         | crate::parser::ast::Type::Fn(_, _)
@@ -53,6 +54,9 @@ pub(crate) fn debug_type_name<N: std::fmt::Display>(ty: &crate::parser::ast::Typ
         crate::parser::ast::Type::Void => "void".to_string(),
         crate::parser::ast::Type::Never => "!".to_string(),
         crate::parser::ast::Type::Named(name) => name.to_string(),
+        crate::parser::ast::Type::FixedArray(element, n) => {
+            format!("[{}; {n}]", debug_type_name(element))
+        }
         crate::parser::ast::Type::Array(element) => format!("Array<{}>", debug_type_name(element)),
         crate::parser::ast::Type::Generic(name, args) => {
             let args = args

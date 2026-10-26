@@ -523,3 +523,16 @@ AGENTS.md
 # Public class-private scope decision and source-derived diagnostic audit.
 !/docs/class-private-scope.md
 !/docs/audits/class-private-scope.md
+
+# Fixed-array implementation evidence.
+!/docs/audits/fixed-arrays/
+/docs/audits/fixed-arrays/*
+!/docs/audits/fixed-arrays/audit.md
+!/docs/audits/fixed-arrays/probe.wi
+!/docs/audits/fixed-arrays/measure.py
+!/docs/audits/fixed-arrays/measurements.txt
+!/docs/audits/fixed-arrays/source_migration_probe.py
+!/docs/audits/fixed-arrays/source-migration-results.txt
+
+!/docs/audits/fixed-arrays/constraint-counts.txt
+!/docs/audits/fixed-arrays/source-dispatch-counts.txt

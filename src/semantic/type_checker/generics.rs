@@ -187,6 +187,11 @@ impl InstantiationTypeRef<'_> {
 }
 
 #[cfg(test)]
+thread_local! {
+    static CONSTRAINED_BODY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod template_registry_tests {
     use super::*;
     use crate::diagnostics::FileId;
@@ -197,6 +202,38 @@ mod template_registry_tests {
         let (program, diagnostics) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         program
+    }
+
+    #[test]
+    fn constrained_method_body_work_scales_with_selected_bodies() {
+        for methods in [1, 8, 32] {
+            for statements in [1, 8, 32] {
+                let bodies: String = (0..methods)
+                    .map(|i| {
+                        format!(
+                            "pub fn m{i}() -> i64 where T: i64 | String {{ {} return 1; }}",
+                            "let x = 1;".repeat(statements)
+                        )
+                    })
+                    .collect();
+                // Distinct names keep the body valid while preserving its shape.
+                let bodies = bodies.replace("let x = 1;", "1;");
+                let program = parse(&format!("class Buffer<T> {{ {bodies} }}"));
+                CONSTRAINED_BODY_VISITS.with(|count| count.set(0));
+                let mut checker = TypeChecker::new();
+                checker.check_program(&program);
+                assert!(
+                    checker.errors.iter().all(|d| d.severity != Severity::Error),
+                    "{:?}",
+                    checker.errors
+                );
+                let visits = CONSTRAINED_BODY_VISITS.with(|count| count.get());
+                assert_eq!(visits, 2 * methods * (statements + 1));
+                eprintln!(
+                    "methods={methods} statements={statements} substituted_expressions={visits}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -824,6 +861,7 @@ fn class_signature(class: &ClassDecl) -> ClassDecl {
         span: body.span,
     };
     ClassDecl {
+        abi_storage: class.abi_storage.clone(),
         type_params: class.type_params.clone(),
         name: class.name.clone(),
         public: class.public,
@@ -850,6 +888,8 @@ fn class_signature(class: &ClassDecl) -> ClassDecl {
             .methods
             .iter()
             .map(|m| MethodDecl {
+                array_body_optimization: m.array_body_optimization,
+                constraint: m.constraint.clone(),
                 name: m.name.clone(),
                 public: m.public,
                 protected: m.protected,
@@ -889,7 +929,7 @@ pub(super) fn mentions(ty: &Type, matches: impl Fn(&str) -> bool) -> bool {
     while let Some(ty) = pending.pop() {
         match ty {
             Type::Named(name) if matches(name) => return true,
-            Type::Array(element) => pending.push(element),
+            Type::Array(element) | Type::FixedArray(element, _) => pending.push(element),
             Type::Generic(name, args) => {
                 if matches(name) {
                     return true;
@@ -927,7 +967,7 @@ impl TypeChecker {
                 return false;
             }
             match ty {
-                Type::Array(element) => pending.push(element),
+                Type::Array(element) | Type::FixedArray(element, _) => pending.push(element),
                 Type::Generic(_, args) => pending.extend(args),
                 Type::Fn(args, result) | Type::Closure(args, result) => {
                     pending.extend(args);
@@ -1093,7 +1133,45 @@ impl TypeChecker {
     /// identity, remembering the first spelling of each so bindings can be
     /// reported back in the caller's terms.
     fn canonical_generic_type(&self, ty: &Type, spellings: &mut HashMap<String, String>) -> Type {
-        ty.map_names(|name| {
+        // Inference compares declaration shapes without instantiating symbolic
+        // user classes. Source-backed ABI declarations must nevertheless use
+        // the same storage shape as checked values. Their declaration owns
+        // this substitution; source access was checked at the written type site.
+        let mut storage = ty.clone();
+        let mut pending = vec![&mut storage];
+        while let Some(node) = pending.pop() {
+            if let Type::Generic(name, args) = node {
+                let template = self.generics.classes.get(name).or_else(|| {
+                    let resolved = self.resolve_static_call_class_quiet(name)?;
+                    self.generics
+                        .classes
+                        .get(&format!("$std::collections::{resolved}"))
+                });
+                if let Some(template) = template
+                    && let Some(Type::Array(element)) = &template.abi_storage
+                    && let Type::Named(parameter) = element.as_ref()
+                    && args.len() == template.type_params.len()
+                    && let Some(index) = template
+                        .type_params
+                        .iter()
+                        .position(|name| name == parameter)
+                {
+                    // Move the subtree: cloning it at each nested source array
+                    // would make normalization quadratic in nesting depth.
+                    *node = Type::Array(Box::new(args.swap_remove(index)));
+                }
+            }
+            match node {
+                Type::Array(element) | Type::FixedArray(element, _) => pending.push(element),
+                Type::Generic(_, args) => pending.extend(args.iter_mut()),
+                Type::Fn(args, result) | Type::Closure(args, result) => {
+                    pending.extend(args.iter_mut());
+                    pending.push(result);
+                }
+                _ => {}
+            }
+        }
+        storage.map_names(|name| {
             let identity = self.generic_type_identity(name);
             spellings
                 .entry(identity.clone())
@@ -1167,10 +1245,37 @@ impl TypeChecker {
         if !uses_parameters(expected, parameters) {
             return self.check_expr_expecting(expr, expected);
         }
-        let Type::Generic(enum_name, expected_args) = expected else {
-            return self.check_expr(expr);
-        };
-        if matches!(expr, Expr::Ternary(_) | Expr::Match(_)) {
+        if let (Expr::ArrayLiteral(elements, _, _), Type::FixedArray(element, _)) = (expr, expected)
+        {
+            let mut actual = crate::semantic::generic_inference::enum_hole();
+            for item in elements {
+                let ty = self.check_generic_enum_argument(item, element, parameters);
+                if crate::semantic::generic_inference::is_enum_hole(&actual) {
+                    actual = ty;
+                } else if crate::semantic::generic_inference::has_enum_hole(&actual)
+                    || crate::semantic::generic_inference::has_enum_hole(&ty)
+                {
+                    if let Some(merged) =
+                        crate::semantic::generic_inference::merge_enum_holes(&actual, &ty)
+                    {
+                        actual = merged;
+                    } else {
+                        self.generic_error(
+                            item.span(),
+                            "fixed array elements must have the same type",
+                        );
+                    }
+                } else if !self.types_compatible(&actual, &ty) {
+                    self.generic_error(item.span(), "fixed array elements must have the same type");
+                }
+            }
+            let ty = Type::FixedArray(Box::new(actual), elements.len() as u64);
+            self.expr_types.insert(expr.id(), ty.clone());
+            return ty;
+        }
+        if matches!(expected, Type::Generic(..) | Type::FixedArray(..))
+            && matches!(expr, Expr::Ternary(_) | Expr::Match(_))
+        {
             let context = expected.substitute_names(|name| {
                 parameters
                     .contains(name.as_str())
@@ -1189,6 +1294,9 @@ impl TypeChecker {
             self.expr_types.insert(expr.id(), ty.clone());
             return ty;
         }
+        let Type::Generic(enum_name, expected_args) = expected else {
+            return self.check_expr(expr);
+        };
         // Only enum constructors produce inference holes. Ordinary values keep
         // their own type, even when their formal parameter is a generic enum.
         let (variant, args) = match expr {
@@ -1995,8 +2103,12 @@ impl TypeChecker {
             return Some(Self::error_type());
         }
         let args: Vec<_> = args.iter().map(|t| self.normalize_type(t, span)).collect();
-        for ty in &args {
-            self.validate_type(ty, span);
+        // ABI source receivers are inferred from already checked values. Import
+        // access is checked at written type sites, not at literal method calls.
+        if template.abi_storage.is_none() {
+            for ty in &args {
+                self.validate_type(ty, span);
+            }
         }
         if let Err(message) =
             crate::semantic::generic_inference::infer(&template.type_params, &[], &[], &args)
@@ -2031,7 +2143,7 @@ impl TypeChecker {
             .symbols
             .lookup_class(name)
             .map_or_else(|| name.to_string(), |info| info.name.clone());
-        let bindings = template
+        let bindings: HashMap<String, Type> = template
             .type_params
             .iter()
             .cloned()
@@ -2085,6 +2197,16 @@ impl TypeChecker {
         } else {
             (*template).clone()
         };
+        class.methods.retain(|m| {
+            m.constraint.as_ref().is_none_or(|bound| {
+                bindings
+                    .get(&bound.parameter)
+                    .is_some_and(|arg| bound.alternatives.contains(arg))
+            })
+        });
+        for method in &mut class.methods {
+            method.constraint = None;
+        }
         class.name = name.clone();
         class.type_params.clear();
         let (bindings, classes) = self.instantiation_bindings(span, &bindings);
@@ -2125,6 +2247,16 @@ impl TypeChecker {
             // checked in the provider. Only the consumer's signature copy may
             // use its import path for the template's own receiver type.
             let mut signature = class_signature(&template);
+            signature.methods.retain(|m| {
+                m.constraint.as_ref().is_none_or(|bound| {
+                    bindings
+                        .get(&bound.parameter)
+                        .is_some_and(|arg| bound.alternatives.contains(arg))
+                })
+            });
+            for method in &mut signature.methods {
+                method.constraint = None;
+            }
             signature.name = name.clone();
             signature.type_params.clear();
             let mut signature = Item::Class(signature);
@@ -2369,6 +2501,73 @@ impl TypeChecker {
         Some(instance)
     }
 
+    pub(super) fn check_constrained_method(&mut self, method: &MethodDecl, class: &ClassDecl) {
+        let bound = method.constraint.as_ref().expect("constrained method");
+        if !class.type_params.contains(&bound.parameter) {
+            self.generic_error(
+                method.span,
+                "method constraint must name an enclosing type parameter",
+            );
+            return;
+        }
+        // Each alternative is checked at declaration time, including alternatives
+        // that no program ever instantiates. No dynamic dispatch is introduced.
+        let mut seen = HashSet::new();
+        for alternative in &bound.alternatives {
+            if !matches!(
+                alternative,
+                Type::I64 | Type::F64 | Type::Bool | Type::String
+            ) {
+                self.generic_error(
+                    method.span,
+                    "method constraint alternatives must be scalar types (i64, f64, bool, String)",
+                );
+                continue;
+            }
+            if !seen.insert(alternative.clone()) {
+                self.generic_error(method.span, "duplicate method constraint alternative");
+                continue;
+            }
+            let bindings = [(bound.parameter.clone(), alternative.clone())]
+                .into_iter()
+                .collect();
+            let receiver =
+                crate::semantic::generic_inference::substitute(&class.receiver_type(), &bindings);
+            let receiver = self.normalize_type(&receiver, method.span);
+            let copy = ClassDecl {
+                abi_storage: None,
+                type_params: Vec::new(),
+                name: class.name.clone(),
+                public: class.public,
+                is_open: false,
+                base_class: None,
+                implements: Vec::new(),
+                source_implements_len: 0,
+                fields: Vec::new(),
+                methods: vec![method.clone()],
+                constructors: Vec::new(),
+                span: class.span,
+            };
+            let mut item = Item::Class(copy);
+            visit_item(
+                &mut item,
+                &mut |ty| crate::semantic::generic_inference::substitute(ty, &bindings),
+                &mut |_| {
+                    #[cfg(test)]
+                    CONSTRAINED_BODY_VISITS.with(|count| count.set(count.get() + 1));
+                },
+                true,
+                false,
+                None,
+                &mut FreshIds::default(),
+            );
+            let Item::Class(copy) = item else {
+                unreachable!()
+            };
+            self.check_method(&copy.methods[0], &copy, &receiver);
+        }
+    }
+
     pub(crate) fn validate_generic_templates(&mut self, file: crate::diagnostics::FileId) {
         // Abstract checking has a separate symbol/output epoch: no symbolic
         // type or speculative body can escape into the concrete artifact set.
@@ -2409,8 +2608,9 @@ impl TypeChecker {
             checker.check_function(&f);
             checker.generics.pending.clear();
         }
+        let mut checked_classes = HashSet::new();
         for c in classes {
-            if c.span.file_id != file {
+            if c.span.file_id != file || !checked_classes.insert(c.span) {
                 continue;
             }
             for name in &c.type_params {
@@ -2642,6 +2842,9 @@ fn visit_item(
             blocks.push(&mut f.body);
         }
         Item::Class(c) => {
+            if let Some(storage) = &mut c.abi_storage {
+                *storage = ty(storage);
+            }
             for t in &mut c.implements {
                 *t = ty(t);
             }

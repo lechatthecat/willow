@@ -374,6 +374,7 @@ impl Parser {
         let span = start.to(end);
 
         Ok(ClassDecl {
+            abi_storage: None,
             type_params,
             name,
             public,
@@ -727,10 +728,27 @@ impl Parser {
         } else {
             Type::Void
         };
+        let constraint = if matches!(self.peek_kind(), TokenKind::Ident(n) if n == "where") {
+            self.advance();
+            let parameter = self.expect_ident()?;
+            self.expect(TokenKind::Colon)?;
+            let mut alternatives = vec![self.parse_type()?];
+            while self.eat(TokenKind::Pipe) {
+                alternatives.push(self.parse_type()?);
+            }
+            Some(Box::new(MethodConstraint {
+                parameter,
+                alternatives,
+            }))
+        } else {
+            None
+        };
         let body = self.parse_block()?;
         let span = start.to(body.span);
 
         Ok(MethodDecl {
+            array_body_optimization: crate::parser::ast::ArrayBodyOptimization::None,
+            constraint,
             name,
             public,
             protected,
@@ -1007,9 +1025,9 @@ fn const_value(
 fn is_array_const(declared: &Type, value: &Expr) -> bool {
     matches!(value, Expr::ArrayLiteral(..))
         || match declared {
-            Type::Array(_) => true,
+            Type::Array(_) | Type::FixedArray(..) => true,
             Type::Named(name) => name == "Array" || name == "FrozenArray",
-            Type::Generic(name, _) => name == "FrozenArray",
+            Type::Generic(name, _) => name == "Array" || name == "FrozenArray",
             _ => false,
         }
 }
@@ -1019,7 +1037,9 @@ fn is_array_const(declared: &Type, value: &Expr) -> bool {
 /// array on every call (willow-jz15.93).
 fn frozen_array_static_help(declared: &Type) -> String {
     let element = match declared {
-        Type::Array(element) => crate::semantic::type_checker::types::type_name::<String>(element),
+        Type::Array(element) | Type::FixedArray(element, _) => {
+            crate::semantic::type_checker::types::type_name::<String>(element)
+        }
         Type::Generic(_, args) if args.len() == 1 => {
             crate::semantic::type_checker::types::type_name::<String>(&args[0])
         }

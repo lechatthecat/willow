@@ -50,6 +50,30 @@ pub struct UnitBody<'a> {
     target: BodyTarget<'a>,
 }
 
+// Ordinary methods borrow the parsed declaration. Only synthesized constructor
+// methods need ownership; keep that uncommon payload out of every body entry.
+enum MethodBody<'a> {
+    Borrowed(&'a MethodDecl),
+    Synthetic(Box<MethodDecl>),
+}
+
+impl std::ops::Deref for MethodBody<'_> {
+    type Target = MethodDecl;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(method) => method,
+            Self::Synthetic(method) => method,
+        }
+    }
+}
+
+impl AsRef<MethodDecl> for MethodBody<'_> {
+    fn as_ref(&self) -> &MethodDecl {
+        self
+    }
+}
+
 enum BodyTarget<'a> {
     Lambda {
         name: &'a str,
@@ -65,7 +89,7 @@ enum BodyTarget<'a> {
     /// declaration phase built — qualified, for a module class.
     Method {
         class: &'a ClassDecl,
-        method: std::borrow::Cow<'a, MethodDecl>,
+        method: MethodBody<'a>,
     },
 }
 
@@ -430,7 +454,7 @@ impl BodyPlanner {
                 body: self.semantic_body(method.body.id),
                 target: BodyTarget::Method {
                     class,
-                    method: std::borrow::Cow::Borrowed(method),
+                    method: MethodBody::Borrowed(method),
                 },
             });
         }
@@ -442,7 +466,7 @@ impl BodyPlanner {
                 body: self.semantic_body(ctor.body.id),
                 target: BodyTarget::Method {
                     class,
-                    method: std::borrow::Cow::Owned(constructor_to_method(ctor)),
+                    method: MethodBody::Synthetic(Box::new(constructor_to_method(ctor))),
                 },
             });
         }

@@ -85,6 +85,8 @@ mod tests {
                     (
                         name.to_string(),
                         MethodInfo {
+                            array_body_optimization:
+                                crate::parser::ast::ArrayBodyOptimization::None,
                             params: vec![],
                             param_infos: vec![],
                             is_static: false,

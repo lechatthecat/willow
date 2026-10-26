@@ -467,7 +467,7 @@ impl TypeChecker {
 
             // A mutable array/map may be sent if its contents are Send, but it is
             // NOT Sync (concurrent push/set/insert races).
-            Type::Array(elem) => {
+            Type::Array(elem) | Type::FixedArray(elem, _) => {
                 send && self.marker_holds_with_reason(elem, Marker::Send, visiting, reasons)
             }
             // Plain pointers returned above; closures retain unknown environments.

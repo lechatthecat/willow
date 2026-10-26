@@ -130,6 +130,28 @@ impl TypeChecker {
     /// [`Self::check_module_program`] for an imported module, whose `main`, if
     /// it has one, is an ordinary function.
     pub fn check_program(&mut self, program: &Program) {
+        if self.array_abi_files.is_empty() && !self.source_imports_checked {
+            // Standalone semantic clients have no module loader. They consume
+            // the same source declaration, with an unspellable private route.
+            static BUNDLED: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+            let bundled = BUNDLED.get_or_init(|| {
+                let tokens = crate::lexer::Lexer::with_file_id(
+                    include_str!("../../../std/collections.wi"),
+                    crate::diagnostics::FileId(u32::MAX),
+                )
+                .tokenize()
+                .expect("bundled source lexes");
+                let (mut program, errors) = crate::parser::Parser::new(tokens).parse();
+                assert!(errors.is_empty(), "bundled source parses");
+                crate::stdlib_schema::attach_array_storage(&mut program);
+                program
+            });
+            self.register_module_type_signatures(
+                "$std::collections",
+                "<std>/collections.wi",
+                bundled,
+            );
+        }
         self.entry_program = true;
         self.check_program_items(program);
     }
@@ -897,6 +919,14 @@ impl TypeChecker {
     /// Interface receivers resolve to the single synthetic union node connected
     /// to every known implementation by `connect_interface_lock_effects`.
     pub(super) fn method_effect_ids(&self, obj_ty: &Type, method: &str) -> Vec<FunctionId> {
+        if let Type::Array(element) | Type::FixedArray(element, _) = obj_ty
+            && !method.starts_with("__abi_")
+            && let Some(owner) = self
+                .array_classes
+                .get(&self.array_storage_key(&Type::Array(element.clone())))
+        {
+            return vec![FunctionId::method(TypeId::from_source_name(owner), method)];
+        }
         let class = match obj_ty {
             Type::Named(class) | Type::Generic(class, _) => class,
             _ => return Vec::new(),
@@ -1694,7 +1724,7 @@ impl TypeChecker {
                     );
                 }
                 match &arr_ty {
-                    Type::Array(elem) => {
+                    Type::Array(elem) | Type::FixedArray(elem, _) => {
                         let val_ty = self.check_expr_expecting(&s.value, elem);
                         if !self.types_compatible(elem, &val_ty) {
                             self.push(
@@ -1918,7 +1948,7 @@ impl TypeChecker {
                 let iterable_ty = self.check_expr(&s.iterable);
                 let elem_ty = match &iterable_ty {
                     ty if Self::contains_error_type(ty) => Self::error_type(),
-                    Type::Array(elem) => (**elem).clone(),
+                    Type::Array(elem) | Type::FixedArray(elem, _) => (**elem).clone(),
                     ty if builtin_types::unary_arg(ty, B::FrozenArray).is_some() => {
                         builtin_types::unary_arg(ty, B::FrozenArray)
                             .unwrap()
@@ -2329,6 +2359,107 @@ impl TypeChecker {
         s: &StaticCallExpr,
         expected: Option<&Type>,
     ) -> Type {
+        // Constructor syntax supplies a class argument from the expected array
+        // when omitted, then uses the declaration's ordinary static dispatch.
+        if s.method == "new"
+            && self.resolve_static_call_class_quiet(&s.class).as_deref() == Some("Array")
+            && self
+                .generics
+                .classes
+                .contains_key("$std::collections::Array")
+        {
+            if self
+                .resolve_static_call_class_name(&s.class, s.span)
+                .is_none()
+            {
+                return Self::error_type();
+            }
+            self.check_collection_type_imported("Array", s.span);
+            let inferred;
+            let arguments = if s.type_args.is_empty() {
+                inferred = match expected {
+                    Some(Type::Array(element)) => vec![element.as_ref().clone()],
+                    _ => vec![Type::Void],
+                };
+                &inferred
+            } else {
+                &s.type_args
+            };
+            if arguments == &[Type::Void] && s.type_args.is_empty() {
+                // Keep an unresolved empty container as a semantic placeholder.
+                // Its declaration still owns argument modes, arity and result;
+                // only concrete contexts request executable specializations.
+                let template = self.generics.classes["$std::collections::Array"].clone();
+                let Some(method) = template
+                    .methods
+                    .iter()
+                    .find(|method| method.name == s.method)
+                else {
+                    self.generic_error(s.span, "constructor is not declared by Array");
+                    return Self::error_type();
+                };
+                if !method.public || !method.is_static || method.constraint.is_some() {
+                    self.generic_error(
+                        s.span,
+                        "constructor is not available without a known element type",
+                    );
+                    return Self::error_type();
+                }
+                let bindings = template
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(arguments.iter().cloned())
+                    .collect();
+                let params: Vec<_> = method
+                    .params
+                    .iter()
+                    .map(|parameter| ParamInfo {
+                        ty: crate::semantic::generic_inference::substitute(
+                            &parameter.ty,
+                            &bindings,
+                        ),
+                        mode: parameter.mode.clone(),
+                        span: parameter.span,
+                        type_span: parameter.type_span,
+                    })
+                    .collect();
+                self.check_call_argument_count(&s.method, params.len(), s.args.len(), s.span);
+                self.check_call_args_against_param_infos(&params, &s.args);
+                self.check_async_call_captures(&params, &s.args, method.is_async);
+                self.record_method_use(&s.method, "method", s.span, method.span, &s.args);
+                let result =
+                    crate::semantic::generic_inference::substitute(&method.return_type, &bindings);
+                let result = self.normalize_type(&result, s.span);
+                return if method.is_async {
+                    B::Task.apply(vec![result])
+                } else {
+                    result
+                };
+            }
+            let Some(Type::Named(ref owner)) =
+                self.instantiate_class("$std::collections::Array", arguments, s.span)
+            else {
+                return Self::error_type();
+            };
+            self.generics.objects.insert(s.id, owner.clone());
+            self.static_call_classes
+                .insert(s.id, TypeId::from_source_name(owner));
+            let result = self.resolve_static_call(
+                owner,
+                &[],
+                &s.method,
+                &s.args,
+                s.span,
+                s.method_span,
+                expected,
+            );
+            self.record_lock_effect_call(
+                FunctionId::method(TypeId::from_source_name(owner), &s.method),
+                s.span,
+            );
+            return result;
+        }
         let generic_name = format!("{}::{}", s.class, s.method);
         if self.generics.functions.contains_key(&generic_name)
             && let Some(ty) = self.check_generic_call_parts(
@@ -4550,5 +4681,80 @@ mod condition_recovery_tests {
             errors.iter().any(|d| d.code == ErrorCode::E0203),
             "{errors:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod source_array_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn source_array_unresolved_constructor_checks_declared_arguments() {
+        assert!(
+            check_source(
+                "import std::collections::Array; fn main() { println(Array::new().len()); }"
+            )
+            .is_empty()
+        );
+        let errors = check_source(
+            "import std::collections::Array; fn main() { println(Array::new(1).len()); }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("argument")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn source_array_constructor_signature_is_authoritative() {
+        for (parameters, succeeds) in [("", true), ("value: i64", false)] {
+            let source = format!(
+                "pub class Array<T> {{ pub static fn new({parameters}) -> i64 {{ return 73; }} }}"
+            );
+            let tokens =
+                crate::lexer::Lexer::with_file_id(&source, crate::diagnostics::FileId(u32::MAX))
+                    .tokenize()
+                    .unwrap();
+            let (mut bundled, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            let Item::Class(class) = &mut bundled.items[0] else {
+                unreachable!()
+            };
+            class.abi_storage = Some(Type::Array(Box::new(Type::Named("T".into()))));
+            let mut checker = TypeChecker::new();
+            checker.register_module_type_signatures(
+                "$std::collections",
+                "<std>/collections.wi",
+                &bundled,
+            );
+            let tokens = crate::lexer::Lexer::new(
+                "import std::collections::Array; fn main() { let value: i64 = Array<i64>::new(); let inferred: i64 = Array::new(); }",
+            )
+            .tokenize()
+            .unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            checker.check_program(&program);
+            assert_eq!(checker.errors.is_empty(), succeeds, "{:?}", checker.errors);
+            if succeeds {
+                assert!(
+                    checker
+                        .static_call_classes
+                        .values()
+                        .any(|owner| owner.to_string().starts_with("$std::collections::"))
+                );
+            } else {
+                assert!(
+                    checker
+                        .errors
+                        .iter()
+                        .any(|error| error.message.contains("argument")),
+                    "{:?}",
+                    checker.errors
+                );
+            }
+        }
     }
 }

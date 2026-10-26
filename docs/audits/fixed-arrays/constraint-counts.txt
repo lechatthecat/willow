@@ -1,0 +1,11 @@
+Measured by constrained_method_body_work_scales_with_selected_bodies:
+methods=1 statements=1 substituted_expressions=4
+methods=1 statements=8 substituted_expressions=18
+methods=1 statements=32 substituted_expressions=66
+methods=8 statements=1 substituted_expressions=32
+methods=8 statements=8 substituted_expressions=144
+methods=8 statements=32 substituted_expressions=528
+methods=32 statements=1 substituted_expressions=128
+methods=32 statements=8 substituted_expressions=576
+methods=32 statements=32 substituted_expressions=2112
+Two alternatives: visits = 2 * methods * (statements + 1).

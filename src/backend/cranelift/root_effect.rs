@@ -45,7 +45,7 @@ pub(super) fn preserves_stack_helper(function: &LirFunction) -> bool {
                         receiver_ty,
                         ..
                     } => {
-                        matches!(intrinsic, Intrinsic::ArrayPush | Intrinsic::ArrayLen)
+                        matches!(intrinsic, Intrinsic::ArrayLen)
                             && matches!(receiver_ty, Type::Array(element) if immediate(element))
                     }
                     _ => false,

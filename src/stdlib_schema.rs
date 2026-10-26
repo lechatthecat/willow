@@ -1,9 +1,8 @@
 //! Declarative description of Willow's public standard-library namespace.
 //!
 //! Import validation, type-argument checking, and builtin module registration
-//! all consume this table. Semantics that require bespoke lowering (notably
-//! `Array`) remain in their respective compiler phases, but names and public
-//! signatures are defined here exactly once.
+//! consume this export index. Source-backed types derive their arity and public
+//! methods from the bundled declaration; this table only routes their names.
 
 use crate::parser::ast::Type;
 
@@ -97,6 +96,8 @@ impl StdType {
 /// The public shape of a standard-library item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdItemKind {
+    /// Export of a declaration in the bundled collections source.
+    SourceType,
     Type {
         type_params: usize,
         /// Name used after the compiler has resolved an import.
@@ -160,7 +161,10 @@ const LISTENER_IO: StdType = T::Result(&TCP_LISTENER, &IO_ERROR);
 const STREAM_IO: StdType = T::Result(&TCP_STREAM, &IO_ERROR);
 
 const COLLECTIONS: &[StdItemSchema] = &[
-    std_type!("Array", 1, "Array"),
+    StdItemSchema {
+        name: "Array",
+        kind: StdItemKind::SourceType,
+    },
     std_type!("Map", 2, "Map"),
     std_type!("FrozenArray", 1, "FrozenArray"),
     std_type!("FrozenMap", 2, "FrozenMap"),
@@ -274,6 +278,28 @@ pub fn type_item(module_name: &str, item_name: &str) -> Option<(usize, &'static 
             type_params,
             builtin_name,
         } => Some((type_params, builtin_name)),
+        StdItemKind::SourceType => {
+            static ARITIES: std::sync::OnceLock<std::collections::HashMap<String, usize>> =
+                std::sync::OnceLock::new();
+            let arities = ARITIES.get_or_init(|| {
+                let tokens = crate::lexer::Lexer::new(include_str!("../std/collections.wi"))
+                    .tokenize()
+                    .expect("bundled source lexes");
+                let (program, errors) = crate::parser::Parser::new(tokens).parse();
+                assert!(errors.is_empty(), "bundled source parses");
+                program
+                    .items
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        crate::parser::ast::Item::Class(class) if class.public => {
+                            Some((class.name, class.type_params.len()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            });
+            Some((*arities.get(item_name)?, item(module_name, item_name)?.name))
+        }
         StdItemKind::Function { .. } => None,
     }
 }
@@ -765,5 +791,141 @@ mod recursive_schema_tests {
         assert_ne!(ast(STRING_IO), ast(VOID_IO));
         assert_ne!(ast(STRING_IO), ast(StdType::Task(&STRING_IO)));
         assert_ne!(ast(LISTENER_IO), ast(STREAM_IO));
+    }
+}
+
+/// Assign only representation metadata and derive a forwarding optimization
+/// from the actual bundled body, never from a public method's spelling.
+pub(crate) fn attach_array_storage(program: &mut crate::parser::ast::Program) {
+    use crate::parser::ast::{Expr, Item, Stmt, Type};
+    for item in &mut program.items {
+        let Item::Class(class) = item else { continue };
+        if class.name != "Array" {
+            continue;
+        }
+        assert_eq!(
+            class.type_params.len(),
+            1,
+            "array storage has one element type"
+        );
+        class.abi_storage = Some(Type::Array(Box::new(Type::Named(
+            class.type_params[0].clone(),
+        ))));
+        for method in &mut class.methods {
+            let append = !method.is_static
+                && !method.is_async
+                && method.constraint.is_none()
+                && method.return_type == Type::Void
+                && method.params.len() == 1
+                && method.params[0].ty == Type::Named(class.type_params[0].clone())
+                && method.params[0].mode == crate::parser::ast::ParamMode::Value
+                && matches!(method.body.stmts.as_slice(), [Stmt::Let(index), Stmt::Expr(resize), Stmt::IndexAssign(store)]
+                    if !index.mutable && index.name != method.params[0].name && index.name != "self"
+                        && index.ty.as_ref().is_none_or(|ty| *ty == Type::I64)
+                        && matches!(&index.init, Expr::MethodCall(call)
+                            if matches!(&call.object, Expr::Var(name, _, _) if name == "self")
+                                && call.method == "__abi_len" && call.args.is_empty())
+                        && matches!(&resize.expr, Expr::MethodCall(call)
+                            if matches!(&call.object, Expr::Var(name, _, _) if name == "self")
+                                && call.method == "__abi_resize" && call.args.len() == 1
+                                && call.args[0].mode == crate::parser::ast::CallArgMode::Value
+                                && matches!(&call.args[0].expr, Expr::Binary(sum)
+                                    if sum.op == crate::parser::ast::BinOp::Add
+                                        && matches!(&sum.lhs, Expr::Var(name, _, _) if name == &index.name)
+                                        && matches!(&sum.rhs, Expr::Integer(1, _, _))))
+                        && matches!(&store.array, Expr::Var(name, _, _) if name == "self")
+                        && matches!(&store.index, Expr::Var(name, _, _) if name == &index.name)
+                        && matches!(&store.value, Expr::Var(name, _, _) if name == &method.params[0].name));
+            let length = !method.is_static
+                && !method.is_async
+                && method.params.is_empty()
+                && method.return_type == Type::I64
+                && matches!(method.body.stmts.as_slice(), [Stmt::Return(statement)]
+                    if matches!(&statement.value, Some(Expr::MethodCall(call))
+                        if matches!(&call.object, Expr::Var(name, _, _) if name == "self")
+                            && call.method == "__abi_len" && call.args.is_empty()));
+            method.array_body_optimization = if append {
+                crate::parser::ast::ArrayBodyOptimization::Append
+            } else if length {
+                crate::parser::ast::ArrayBodyOptimization::Length
+            } else {
+                crate::parser::ast::ArrayBodyOptimization::None
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_forwarding_tests {
+    #[test]
+    fn array_append_expansion_is_derived_from_body_not_name() {
+        let body =
+            "let index = self.__abi_len(); self.__abi_resize(index + 1); self[index] = value;";
+        for (declaration, expected) in [
+            (format!("pub fn append(value: T) {{ {body} }}"), true),
+            (
+                format!("pub fn push(value: T) {{ {} }}", body.replace("+ 1", "+ 2")),
+                false,
+            ),
+            (
+                format!("pub fn push(value: T) {{ println(1); {body} }}"),
+                false,
+            ),
+            (format!("pub async fn push(value: T) {{ {body} }}"), false),
+            (format!("pub fn push(value: i64) {{ {body} }}"), false),
+            (
+                format!(
+                    "pub fn push(value: T) {{ {} }}",
+                    body.replace("let index", "let mut index")
+                ),
+                false,
+            ),
+        ] {
+            let source = format!("class Array<T> {{ {declaration} }}");
+            let (mut program, errors) =
+                crate::parser::Parser::new(crate::lexer::Lexer::new(&source).tokenize().unwrap())
+                    .parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            super::attach_array_storage(&mut program);
+            let crate::parser::ast::Item::Class(class) = &program.items[0] else {
+                panic!()
+            };
+            assert_eq!(
+                (class.methods[0].array_body_optimization
+                    == crate::parser::ast::ArrayBodyOptimization::Append),
+                expected,
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn array_length_forwarding_is_derived_from_body_not_name() {
+        let source = r#"
+class Array<T> {
+    pub fn count() -> i64 { return self.__abi_len(); }
+    pub fn len() -> i64 { return 7; }
+    pub fn effect() -> i64 { println(1); return self.__abi_len(); }
+    pub fn argument(x: i64) -> i64 { return self.__abi_len(); }
+    pub async fn suspended() -> i64 { return self.__abi_len(); }
+}
+"#;
+        let (mut program, errors) =
+            crate::parser::Parser::new(crate::lexer::Lexer::new(source).tokenize().unwrap())
+                .parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        super::attach_array_storage(&mut program);
+        let crate::parser::ast::Item::Class(class) = &program.items[0] else {
+            panic!()
+        };
+        let forwarded: Vec<_> = class
+            .methods
+            .iter()
+            .filter(|method| {
+                method.array_body_optimization == crate::parser::ast::ArrayBodyOptimization::Length
+            })
+            .map(|method| method.name.as_str())
+            .collect();
+        assert_eq!(forwarded, ["count"]);
     }
 }

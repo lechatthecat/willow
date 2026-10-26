@@ -1222,6 +1222,8 @@ fn inject_default_interface_methods(
                 chosen.push((
                     iface_name.to_string(),
                     MethodDecl {
+                        array_body_optimization: crate::parser::ast::ArrayBodyOptimization::None,
+                        constraint: None,
                         name: dm.name.clone(),
                         public: true, // interface methods are public by contract
                         protected: false,

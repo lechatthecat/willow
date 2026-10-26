@@ -375,3 +375,9 @@ mod string_metadata;
 
 #[path = "integration/monotonic_clock.rs"]
 mod monotonic_clock;
+
+#[path = "integration/fixed_arrays.rs"]
+mod fixed_arrays;
+
+#[path = "integration/constrained_methods.rs"]
+mod constrained_methods;

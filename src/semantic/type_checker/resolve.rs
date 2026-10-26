@@ -786,9 +786,17 @@ impl TypeChecker {
                         self.generics.class_paths.insert(key, name.to_string());
                     }
                     let class_name = format!("{name}::{}", c.name);
+                    let storage = c.abi_storage.as_ref().map(&qualify);
                     let info = imported_class_info_from_decl(c, &class_name, &qualify, &|field| {
                         self.field_reassigned(field)
                     });
+                    if let Some(storage) = storage {
+                        let key = self.array_storage_key(&storage);
+                        self.array_classes.insert(key, class_name.clone());
+                        self.array_abi_files.insert(c.span.file_id);
+                        self.normalized_types
+                            .insert(Type::Named(class_name.clone()), storage);
+                    }
                     self.symbols.define_class(class_name, info);
                 }
                 Item::Enum(e) => {
@@ -1130,6 +1138,12 @@ impl TypeChecker {
                 .or(self.module_path.as_ref())
                 .map_or_else(|| c.name.clone(), |module| format!("{module}::{}", c.name))
         };
+        if let Some(storage) = &c.abi_storage {
+            self.normalized_types
+                .insert(Type::Named(c.name.clone()), storage.clone());
+            self.normalized_types
+                .insert(Type::Named(identity.clone()), storage.clone());
+        }
         let info = self.class_info_from_decl(c, &identity, None);
         if identity != c.name {
             self.symbols.define_class(identity, info.clone());
@@ -1555,6 +1569,13 @@ impl TypeChecker {
         let args = call.args.as_slice();
         let span = call.span;
         let receiver = &call.object;
+        if method_name == "__abi_debug"
+            && self.array_abi_files.contains(&span.file_id)
+            && matches!(obj_ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
+        {
+            self.check_call_argument_count(method_name, 0, args.len(), span);
+            return Type::String;
+        }
         if *obj_ty == Type::String {
             let params: Option<&[Type]> = match method_name {
                 "len" | "trim" => Some(&[]),
@@ -2023,26 +2044,6 @@ impl TypeChecker {
             .map(|ty| self.normalize_type(ty, span))
             .collect::<Vec<_>>();
         let type_args = type_args.as_slice();
-
-        // Array::new is the constructor spelling of the empty array literal.
-        if class_name == "Array" && method_name == "new" {
-            self.check_collection_type_imported("Array", span);
-            if !args.is_empty() || type_args.len() > 1 {
-                for arg in args {
-                    self.check_expr(&arg.expr);
-                }
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        "`Array::new` expects no arguments and at most 1 type argument",
-                    )
-                    .with_label(Label::primary(span, "invalid array constructor")),
-                );
-                return Self::error_type();
-            }
-            return Type::Array(Box::new(type_args.first().cloned().unwrap_or(Type::Void)));
-        }
 
         // Built-in `Map<K, V>` constructor. The type parameters are resolved
         // from the binding's annotation (Map<Void, Void> is a placeholder, like

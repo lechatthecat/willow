@@ -1,0 +1,17 @@
+freeze_inference_allocation_sites_scale_linearly:
+freeze sites=1 shared_array_allocations=5 shared_array_copies=2 source_new_calls=1 source_freeze_calls=1
+freeze sites=8 shared_array_allocations=5 shared_array_copies=2 source_new_calls=8 source_freeze_calls=8
+freeze sites=32 shared_array_allocations=5 shared_array_copies=2 source_new_calls=32 source_freeze_calls=32
+freeze sites=128 shared_array_allocations=5 shared_array_copies=2 source_new_calls=128 source_freeze_calls=128
+
+array_join_generated_calls_scale_with_callsites:
+sites in {1,8,32}, input bytes in {1,1024}
+source_join_calls = sites; willow_string_concat_array calls = 2 for every case.
+
+source_append_expansion_has_constant_operations_per_call:
+source callsites 1, 8, 32 -> generated HIR statements 5, 40, 160.
+array_append_expansion_is_derived_from_body_not_name: PASS.
+source_array_helper_loops_are_shared_across_calls:
+consumer callsites 1, 8, 32 -> shared source helper loops 3, 3, 3.
+Original array_read_loop_is_contiguous_and_call_free and
+array_write_loop_reuses_condition_facts: PASS unchanged assertions.

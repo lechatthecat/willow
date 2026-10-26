@@ -1446,6 +1446,24 @@ fn prepare_module_registration(
     module: &module::ResolvedModule,
     dependencies: &ModuleDependencies,
 ) {
+    if module.canonical_path == "std::collections" {
+        for item in &module.program.items {
+            if let parser::ast::Item::Class(class) = item
+                && let Some(storage) = &class.abi_storage
+            {
+                checker.array_abi_files.insert(class.span.file_id);
+                checker.array_classes.insert(
+                    storage.clone(),
+                    format!("{}::{}", module.identity_path(), class.name),
+                );
+            }
+        }
+        checker.register_module_type_signatures(
+            module.identity_path(),
+            &module.path.to_string_lossy(),
+            &module.program,
+        );
+    }
     // Translate source paths into the unspellable canonical namespace.
     if module.symbol_namespace.is_none() {
         return;
@@ -1460,6 +1478,9 @@ fn register_module_imports_with_closure(
     dependencies: &ModuleDependencies,
     needed: Option<&[usize]>,
 ) {
+    if let Some(index) = dependencies.bundled_collections {
+        prepare_module_registration(checker, &modules[index], dependencies);
+    }
     let ModuleImportBindings {
         imported, items, ..
     } = ModuleImportBindings::new(program, dependencies);
@@ -2349,6 +2370,8 @@ impl ForeignBatch {
                 defaults.insert(
                     body.id,
                     parser::ast::MethodDecl {
+                        array_body_optimization: crate::parser::ast::ArrayBodyOptimization::None,
+                        constraint: None,
                         name: method.name.clone(),
                         public: true,
                         protected: false,

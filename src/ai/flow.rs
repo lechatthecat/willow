@@ -327,7 +327,9 @@ impl Body {
                         // element type just as an index read does.
                         let ty = match stmt {
                             Stmt::IndexAssign(s) => match types.get(&s.array.id()) {
-                                Some(Type::Array(element)) => Some((**element).clone()),
+                                Some(Type::Array(element) | Type::FixedArray(element, _)) => {
+                                    Some((**element).clone())
+                                }
                                 _ => None,
                             },
                             _ => None,

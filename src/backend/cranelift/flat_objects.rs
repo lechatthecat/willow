@@ -361,7 +361,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Scalar buffers have no concurrent GC tracer. Update their live length
     /// with ordinary stores; reference buffers retain runtime atomic publication
     /// and barriers. No raw buffer survives the allocating slow path.
-    pub(super) fn emit_scalar_array_push(&mut self, array: Value, word: Value) -> Value {
+    pub(super) fn emit_scalar_array_resize(&mut self, array: Value, length: Value) -> Value {
         use willow_abi::array_layout as layout;
         let inspect = self.builder.create_block();
         let fast = self.builder.create_block();
@@ -385,6 +385,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             layout::handle_offset(layout::H_CAP),
         );
         let available = self.builder.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+        let next = self.builder.ins().iadd_imm_s(len, 1);
+        let appending = self.builder.ins().icmp(IntCC::Equal, length, next);
+        let available = self.builder.ins().band(available, appending);
         self.builder.ins().brif(available, fast, &[], slow, &[]);
         self.builder.switch_to_block(fast);
         self.builder.seal_block(fast);
@@ -405,9 +408,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.ins().ireduce(ptr_ty, offset)
         };
         let slot = self.builder.ins().iadd(buffer, offset);
+        let zero = self.builder.ins().iconst(types::I64, 0);
         self.builder.ins().store(
             MemFlagsData::new(),
-            word,
+            zero,
             slot,
             layout::BUFFER_HEADER_WORDS as i32 * layout::WORD_BYTES,
         );
@@ -428,7 +432,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Also root frame-backed SSA receivers while runtime growth allocates;
         // nothing uses `array` after the call.
         self.emit_push_call_root(array);
-        self.emit_void_runtime_call("willow_array_push", &[array, word]);
+        let mask = self.builder.ins().iconst(types::I64, -1);
+        self.emit_void_runtime_call("willow_array_resize", &[array, length, mask]);
         self.emit_pop_roots_n(1);
         self.gc_root_count -= 1;
         self.builder.ins().jump(done, &[]);

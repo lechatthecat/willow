@@ -567,7 +567,9 @@ pub(crate) fn normalize_std_collection_call_arg(arg: &mut CallArg, imports: &Std
 )]
 pub(crate) fn normalize_std_collection_type(ty: &mut Type, imports: &StdCollectionImports) {
     match ty {
-        Type::Array(element) => normalize_std_collection_type(element, imports),
+        Type::Array(element) | Type::FixedArray(element, _) => {
+            normalize_std_collection_type(element, imports)
+        }
         Type::Generic(name, args) => {
             for arg in args.iter_mut() {
                 normalize_std_collection_type(arg, imports);

@@ -1,0 +1,37 @@
+import std::collections::FrozenArray;
+
+// The declaration owns the public API; storage operations use the runtime ABI.
+pub class Array<T> {
+    pub static fn new() -> Array<T> { return []; }
+    pub fn len() -> i64 { return self.__abi_len(); }
+    pub fn push(value: T) {
+        let index = self.__abi_len();
+        self.__abi_resize(index + 1);
+        self[index] = value;
+    }
+    pub fn pop() -> T {
+        let length = self.__abi_len();
+        if length == 0 { panic("cannot pop from an empty array"); }
+        let value = self[length - 1];
+        self.__abi_resize(length - 1);
+        return value;
+    }
+    pub fn freeze() -> FrozenArray<T> { return self.__abi_copy(); }
+    pub fn join(separator: String) -> String where T: String {
+        let parts = [""];
+        for index in 0..self.__abi_len() {
+            if index > 0 { parts.push(separator); }
+            parts.push(self[index]);
+        }
+        return parts.__abi_concat();
+    }
+    pub fn toString() -> String where T: i64 | f64 | bool | String {
+        let parts = ["["];
+        for index in 0..self.__abi_len() {
+            if index > 0 { parts.push(", "); }
+            parts.push(self[index].__abi_debug());
+        }
+        parts.push("]");
+        return parts.__abi_concat();
+    }
+}

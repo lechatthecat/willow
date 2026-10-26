@@ -1,0 +1,20 @@
+import std::collections::Array;
+
+class Display<T> {
+    pub value: T;
+    pub fn text() -> String where T: i64 | f64 | bool | String {
+        return self.value.toString();
+    }
+}
+
+fn main() {
+    let words: Array<String> = Array::new();
+    words.push("source");
+    words.push("methods");
+    println(words.join(" "));
+    let snapshot = words.freeze();
+    println(words.pop());
+    println(snapshot.len());
+    println(words.toString());
+    println(new Display<i64>(42).text());
+}

@@ -180,6 +180,46 @@ pub(crate) fn resolve_imports_in_graph(
 
     let mut errors: Vec<Diagnostic> = Vec::new();
     let mut item_imports: Vec<ItemImport> = Vec::new();
+    let bundled_path = "std::collections";
+    if !graph
+        .files
+        .iter()
+        .any(|unit| unit.canonical_path == bundled_path)
+    {
+        let id = graph.reserve_module_id(bundled_path);
+        let mut source = include_str!("../../std/collections.wi").to_owned();
+        match Lexer::with_file_id(&source, id.file_id()).tokenize() {
+            Ok(tokens) => {
+                let (mut program, diagnostics) = Parser::new(tokens).parse();
+                errors.extend(diagnostics);
+                crate::stdlib_schema::attach_array_storage(&mut program);
+                if let Some(artifacts) = &mut graph.artifacts {
+                    if let Err(error) = artifacts
+                        .snapshot_source(id.file_id(), &source)
+                        .and_then(|()| artifacts.offload(&mut program))
+                    {
+                        errors.push(Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0700,
+                            format!("cannot store bundled source: {error:#}"),
+                        ));
+                    }
+                    source.clear();
+                }
+                graph.add_file(
+                    "$collections".into(),
+                    bundled_path.into(),
+                    PathBuf::from("<std>/collections.wi"),
+                    source,
+                    program,
+                );
+                let unit = graph.files.last_mut().expect("bundled module inserted");
+                unit.symbol_namespace = Some(std::sync::Arc::from("$std::collections"));
+                unit.symbol_module = None;
+            }
+            Err(diagnostics) => errors.extend(diagnostics),
+        }
+    }
 
     // Names each entry import introduces (module access name or item local),
     // for detecting import-vs-import collisions (duplicate aliases / items).

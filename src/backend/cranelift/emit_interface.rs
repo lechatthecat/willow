@@ -1257,46 +1257,121 @@ fn main() {}
         source: &str,
         options: &CompilerOptions,
     ) -> Vec<u8> {
-        let tokens = crate::lexer::Lexer::new(source)
-            .tokenize()
-            .expect("fixture should lex");
-        let (program, parse_errors) = crate::parser::Parser::new(tokens).parse();
-        assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
-
-        let mut checker = crate::semantic::TypeChecker::new();
-        crate::register_prelude(&mut checker).expect("prelude should register");
-        checker.check_program(&program);
-        assert!(
-            checker.errors.is_empty(),
-            "type errors: {:?}",
-            checker.errors
+        let map = crate::diagnostics::SourceMap::new("interface_fixture.wi", source);
+        let frontend = crate::run_frontend(source, std::path::Path::new("."), &map, options)
+            .expect("fixture frontend");
+        let db = &frontend.db;
+        let artifacts = frontend
+            .module_graph
+            .artifacts
+            .as_ref()
+            .expect("fixture artifacts");
+        let modules = &frontend.module_graph.files;
+        let mut codegen = Codegen::new(options, std::rc::Rc::clone(&db.layouts))
+            .expect("codegen should initialize");
+        codegen.configure_queries(
+            std::rc::Rc::clone(&db.typed_bodies),
+            std::rc::Rc::clone(&db.lir),
+            db.effects.static_initializers.order(),
         );
-
-        let mut codegen = Codegen::for_tests(options).expect("codegen should initialize");
-        for info in checker.symbols.enums.values() {
+        codegen.set_module_init_plan(crate::ir::module_init::ModuleInitPlan::from_graph(
+            &frontend.module_graph,
+        ));
+        let entry = crate::module::UnitId::ENTRY;
+        let checked = db.checked_unit(entry, artifacts).expect("checked entry");
+        for info in checked.symbols.enums.values() {
             codegen.register_enum_info(info.to_semantic());
         }
-        for info in checker.symbols.interfaces.values() {
+        for info in checked.symbols.interfaces.values() {
             codegen
                 .register_interface_info(TypeId::from_source_name(&info.name), || {
                     info.to_semantic()
                 })
-                .unwrap();
+                .expect("register interface");
         }
-        let expr_types = checker
-            .expr_types
-            .iter()
-            .map(|(id, ty)| (*id, ty.into()))
-            .collect();
-        let tables = crate::ir::lower::SemanticFacts::from_checker(&checker);
-        let (hir, gaps) = crate::ir::lower::lower_program_with(&program, &tables);
-        assert!(gaps.is_empty(), "fixture lowering gaps: {gaps:?}");
-        let input = StandaloneUnitInput {
-            expr_types,
-            lir: Some(crate::ir::lowered::lower_program(&hir)),
-        };
+        let mut declared_modules = Vec::new();
+        for module in modules {
+            let body = artifacts
+                .hydrate(&module.program, module.id.file_id())
+                .expect("module body");
+            let checked = db
+                .checked_unit(module.id, artifacts)
+                .expect("checked module");
+            let scope = db
+                .unit_scope(module.id, &body, modules, &checked.symbols)
+                .expect("module scope");
+            declared_modules.push(
+                codegen
+                    .declare_module(
+                        module.registration_name(),
+                        module.identity_path(),
+                        &body,
+                        &module.path.to_string_lossy(),
+                        crate::backend::cranelift::CheckedUnitInput {
+                            checked: &checked,
+                            scope,
+                            effects: std::rc::Rc::clone(&db.effects),
+                            unit: module.id,
+                        },
+                    )
+                    .expect("declare source module"),
+            );
+        }
+        let body = artifacts
+            .hydrate(&frontend.program, crate::diagnostics::FileId::ENTRY)
+            .expect("entry body");
+        let scope = db
+            .unit_scope(entry, &body, modules, &checked.symbols)
+            .expect("entry scope");
+        let unit = codegen
+            .declare_program(
+                &body,
+                "interface_fixture.wi",
+                crate::backend::cranelift::CheckedUnitInput {
+                    checked: &checked,
+                    scope,
+                    effects: std::rc::Rc::clone(&db.effects),
+                    unit: entry,
+                },
+            )
+            .expect("declare entry");
+        for (module, unit) in modules.iter().zip(&declared_modules) {
+            let checked = db
+                .checked_unit(module.id, artifacts)
+                .expect("checked module body");
+            let mut facts = checked.tables();
+            facts.expr_types = unit.normalized_expr_types();
+            let gaps = db
+                .lir
+                .lower_unit(module.id, unit.normalized_program(), db.bodies(), &facts)
+                .expect("lower module");
+            assert!(gaps.is_empty(), "module lowering gaps: {gaps:?}");
+            let plan = codegen.module_body_plan(unit);
+            codegen
+                .with_module_bodies(unit, &checked, |backend| {
+                    for target in &plan {
+                        backend.compile_body(target)?;
+                    }
+                    Ok(())
+                })
+                .expect("compile module");
+        }
+        let mut facts = checked.tables();
+        facts.expr_types = unit.normalized_expr_types();
+        let gaps = db
+            .lir
+            .lower_unit(entry, unit.normalized_program(), db.bodies(), &facts)
+            .expect("lower entry");
+        assert!(gaps.is_empty(), "entry lowering gaps: {gaps:?}");
+        super::super::block_layout::mark_entry_capture_start();
+        let plan = codegen.program_body_plan(&unit);
         codegen
-            .compile_program(&program, "interface_invalid_box_fixture.wi", input)
+            .with_program_bodies(&unit, &checked, |backend| {
+                for target in &plan {
+                    backend.compile_body(target)?;
+                }
+                Ok(())
+            })
             .expect("fixture should compile");
         codegen.finish().expect("fixture object should finish")
     }

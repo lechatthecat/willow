@@ -1414,10 +1414,21 @@ fn expression_executes_call(expr: &HirExpr) -> bool {
         {
             return false;
         }
-        if let HirExprKind::MethodCall { object, method, .. } = &expr.kind
-            && method == "len"
-            && (matches!(object.ty, Type::Array(_))
-                || builtin_types::unary_arg(&object.ty, B::FrozenArray).is_some())
+        if let HirExprKind::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } = &expr.kind
+            && crate::semantic::intrinsics::resolve(&object.ty, method, args.len()).is_some_and(
+                |resolution| {
+                    matches!(
+                        resolution.intrinsic,
+                        crate::semantic::intrinsics::Intrinsic::ArrayLen
+                            | crate::semantic::intrinsics::Intrinsic::FrozenArrayLen
+                    )
+                },
+            )
         {
             return false;
         }
@@ -4748,7 +4759,12 @@ impl Builder {
                 bound_expr = HirExpr {
                     kind: HirExprKind::MethodCall {
                         object: Box::new(arr_var.clone()),
-                        method: "len".to_string(),
+                        method: if matches!(arr_var.ty, Type::Array(_)) {
+                            "__abi_len"
+                        } else {
+                            "len"
+                        }
+                        .to_string(),
                         args: vec![],
                         super_class: None,
                     },
@@ -5146,13 +5162,12 @@ mod tests {
     fn async_array_reads_have_only_backedge_safepoints() {
         for ty in ["Array<i64>", "FrozenArray<i64>"] {
             for loops in [1, 4, 16, 64] {
-                let body =
-                    "let mut i = 0; while i < xs.len() { total = total + xs[i]; i = i + 1; }";
+                let body = "i = 0; while i < xs.len() { total = total + xs[i]; i = i + 1; }";
                 let source = format!(
-                    "async fn f(xs: {ty}) -> i64 {{ let mut total = 0; {} return total; }}",
+                    "async fn f(xs: {ty}) -> i64 {{ let mut total = 0; let mut i = 0; {} return total; }}",
                     body.repeat(loops)
                 );
-                let program = lir(&source);
+                let program = lir_checked(&source);
                 let f = func(&program, "f");
                 let polls = f
                     .blocks
@@ -5179,7 +5194,7 @@ mod tests {
     #[test]
     fn async_array_operand_calls_keep_their_safepoints() {
         for expr in ["xs[index(i)]", "get(xs)[i]", "get(xs).len()"] {
-            let program = lir(&format!(
+            let program = lir_checked(&format!(
                 "fn index(i: i64) -> i64 {{ return i; }} fn get(xs: Array<i64>) -> Array<i64> {{ return xs; }} async fn f(xs: Array<i64>) -> i64 {{ let mut i = 0; let mut total = 0; while i < xs.len() {{ total = total + {expr}; i = i + 1; }} return total; }}"
             ));
             let f = func(&program, "f");
@@ -5524,6 +5539,27 @@ mod tests {
         lower_source_program(&hir)
     }
 
+    fn lir_checked(src: &str) -> SourceProgram {
+        let source = format!("import std::collections::Array; {src}");
+        let (program, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).unwrap();
+        checker.check_program(&program);
+        assert!(
+            checker
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.severity != crate::diagnostics::Severity::Error),
+            "{:?}",
+            checker.errors
+        );
+        let facts = crate::ir::lower::SemanticFacts::from_checker(&checker);
+        let (hir, errors) = crate::ir::lower::lower_program_with(&program, &facts);
+        assert!(errors.is_empty(), "{errors:?}");
+        lower_source_program(&hir)
+    }
+
     fn func<'a>(p: &'a SourceProgram, name: &str) -> &'a SourceFunction {
         p.functions
             .iter()
@@ -5541,7 +5577,7 @@ mod tests {
                     .repeat(count);
             let mut shapes = Vec::new();
             for ty in ["Array<i64>", "FrozenArray<i64>"] {
-                let program = lir(&format!("fn visit(values: {ty}) {{ {body} }}"));
+                let program = lir_checked(&format!("fn visit(values: {ty}) {{ {body} }}"));
                 let f = func(&program, "visit");
                 let shape = (
                     f.blocks.len(),
@@ -5953,7 +5989,7 @@ mod tests {
         };
         let header_instructions = &f.blocks[header.0].instrs;
         assert!(header_instructions.iter().any(|inst| matches!(inst,
-            SourceInst::Compute { value: LirRvalue::IntrinsicCall { method, .. }, .. } if method == "len")));
+            SourceInst::Compute { value: LirRvalue::IntrinsicCall { method, .. }, .. } if method == "__abi_len")));
         assert!(header_instructions.iter().any(|inst| matches!(inst,
             SourceInst::Compute { local, value: LirRvalue::Binary { op: crate::parser::ast::BinOp::Lt, .. }, .. }
                 if f.locals[local.0 as usize].name == *condition)));

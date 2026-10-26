@@ -530,6 +530,42 @@ unsafe fn expose_pair_storage(arr: *mut u8) {
     }
 }
 
+/// Change allocated logical storage while retaining the stable array handle.
+/// `pair_mask` is -1 for word elements, or the GC mask of a two-word slot.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_array_resize(arr: *mut u8, length: i64, pair_mask: i64) {
+    if arr.is_null() || length < 0 || !(-1..=1).contains(&pair_mask) {
+        raise_with("invalid array storage resize");
+        return;
+    }
+    let root = crate::gc::GcRootHandle::new(arr);
+    while willow_array_len(root.load()) < length {
+        let value = if pair_mask < 0 {
+            0
+        } else {
+            let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, pair_mask as u64);
+            if pair.is_null() {
+                return;
+            }
+            pair as i64
+        };
+        let previous = willow_array_len(root.load());
+        array_push(root.load(), value, pair_mask >= 0, true);
+        if willow_array_len(root.load()) == previous {
+            return;
+        }
+    }
+    while willow_array_len(root.load()) > length {
+        if pair_mask < 0 {
+            willow_array_pop(root.load());
+        } else {
+            let mut words = [0_i64; 2];
+            willow_array_pop_scalar_pair_into(root.load(), words.as_mut_ptr());
+        }
+    }
+}
+
 /// Append `value`, growing the buffer (doubling, min 4) when full.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
