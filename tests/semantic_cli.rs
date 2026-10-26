@@ -5992,3 +5992,59 @@ fn generic_declaration_signatures() {
         }
     }
 }
+
+#[test]
+fn direct_kind_rejects_effect_names_and_unknown_values() {
+    let f = Fixture::new();
+    // Invalid arguments must be diagnosed before project discovery/compilation.
+    fs::remove_file(f.0.join("project.toml")).unwrap();
+    for command in [
+        "effects",
+        "refs",
+        "references",
+        "symbol",
+        "type",
+        "impact",
+        "rename",
+    ] {
+        for kind in ["may-suspend", "may-allocate", "no-such-kind", "Function"] {
+            for format in ["human", "json", "ndjson"] {
+                for inline in [false, true] {
+                    let option = format!("--kind={kind}");
+                    let mut args = vec![command, "main::parallel"];
+                    if command == "rename" {
+                        args.extend(["new_name", "--dry-run"]);
+                    }
+                    if inline {
+                        args.push(&option);
+                    } else {
+                        args.extend(["--kind", kind]);
+                    }
+                    args.extend(["--format", format]);
+                    let output = f.run(&args);
+                    assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+                    let message = if format == "human" {
+                        assert!(output.stdout.is_empty());
+                        String::from_utf8(output.stderr).unwrap()
+                    } else {
+                        assert!(output.stderr.is_empty());
+                        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                        assert_eq!(value["status"], "invalid-arguments");
+                        value["message"].as_str().unwrap().to_owned()
+                    };
+                    assert!(
+                        message.contains(&format!("invalid --kind '{kind}'")),
+                        "{message}"
+                    );
+                    assert!(message.contains("Valid symbol kinds:"), "{message}");
+                    assert!(message.contains("type-parameter"), "{message}");
+                    assert!(
+                        message.contains("--kind filters symbol kinds, not effect names"),
+                        "{message}"
+                    );
+                    assert!(message.contains("no effect filter"), "{message}");
+                }
+            }
+        }
+    }
+}

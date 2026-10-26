@@ -20,6 +20,25 @@ pub(super) fn requested(args: &[String]) -> bool {
     }
 }
 
+// Includes lexical symbols omitted from the overview's declaration-only list.
+const SYMBOL_KINDS: &[&str] = &[
+    "module",
+    "import",
+    "function",
+    "const",
+    "class",
+    "interface",
+    "enum",
+    "field",
+    "static-field",
+    "method",
+    "constructor",
+    "variant",
+    "parameter",
+    "binding",
+    "type-parameter",
+];
+
 struct Options {
     command: String,
     selector: String,
@@ -114,7 +133,17 @@ impl Options {
                             "--format" => result.format = value.into(),
                             "--source" => result.source = Some(value.into()),
                             "--project-dir" => result.project = Some(value.into()),
-                            "--kind" => result.filter.kind = Some(value.into()),
+                            "--kind" => {
+                                anyhow::ensure!(
+                                    SYMBOL_KINDS.contains(&value),
+                                    "invalid --kind '{value}'. Valid symbol kinds: {}. \
+                                     --kind filters symbol kinds, not effect names; \
+                                     the effects command currently has no effect filter. \
+                                     Use willow effects SELECTOR without --kind to inspect effects.",
+                                    SYMBOL_KINDS.join(", ")
+                                );
+                                result.filter.kind = Some(value.into());
+                            }
                             "--module" => result.filter.module = Some(value.into()),
                             _ => result.filter.package = Some(value.into()),
                         }
@@ -1562,5 +1591,26 @@ mod tests {
         assert_eq!(effect_names(&json!(0)), "none");
         assert_eq!(effect_names(&Value::Null), "unavailable");
         assert_eq!(effect_names(&json!(63)).split(", ").count(), 6);
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    #[test]
+    fn direct_kind_accepts_every_symbol_kind() {
+        for kind in SYMBOL_KINDS {
+            for inline in [false, true] {
+                let mut args = vec!["effects".to_owned(), "main::parallel".to_owned()];
+                if inline {
+                    args.push(format!("--kind={kind}"));
+                } else {
+                    args.extend(["--kind".to_owned(), (*kind).to_owned()]);
+                }
+                let options = Options::parse(&args).unwrap();
+                assert_eq!(options.filter.kind.as_deref(), Some(*kind));
+            }
+        }
     }
 }
