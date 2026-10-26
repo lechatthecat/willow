@@ -215,17 +215,17 @@ fn package_loader_validates_conflicts_before_loading_even_without_imports() {
 }
 
 #[test]
-fn package_loader_cycles_are_package_qualified() {
+fn package_loader_cycles_show_module_names() {
     let f = Fixture::new();
     f.file(1, "a.wi", "module a; import b;");
     f.file(1, "b.wi", "module b; import a;");
     let result = f.resolve("import dep::a;", f.graph(&[&[("dep", 1)], &[]]), true);
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.code == ErrorCode::E0403)
-    );
+    let diagnostic = result
+        .diagnostics
+        .iter()
+        .find(|d| d.code == ErrorCode::E0403)
+        .unwrap();
+    assert_eq!(diagnostic.notes, ["import cycle: a -> b -> a"]);
 }
 
 #[test]
@@ -535,5 +535,102 @@ fn project_check_additional_roots_load_each_module_once() {
                 result.graph.source_loads, result.graph.import_routes
             );
         }
+    }
+}
+
+#[test]
+fn package_loader_cycle_diagnostic_perspectives() {
+    // Ten import shapes through both resident and spooled loaders.
+    for spooled in [false, true] {
+        for shape in 0..10 {
+            let f = Fixture::new();
+            let (a, b, entry, expected) = match shape {
+                0 => ("import b;", "import a;", "import a;", "a -> b -> a"),
+                1 => ("import a;", "", "import a;", "a -> a"),
+                2 => (
+                    "import b as other;",
+                    "import a as back;",
+                    "import a as start;",
+                    "a -> b -> a",
+                ),
+                3 => (
+                    "import b::B; pub class A {}",
+                    "import a::A; pub class B {}",
+                    "import a;",
+                    "a -> b -> a",
+                ),
+                4 => (
+                    "import b; import b;",
+                    "import a;",
+                    "import a;",
+                    "a -> b -> a",
+                ),
+                5 => (
+                    "import b; pub class A { value: b::B }",
+                    "import a; pub class B { value: a::A }",
+                    "import a;",
+                    "a -> b -> a",
+                ),
+                6 => (
+                    "import b; pub enum A { Item(b::B) }",
+                    "import a; pub class B { value: a::A }",
+                    "import a;",
+                    "a -> b -> a",
+                ),
+                7 => ("import b;", "import c;", "import a;", "a -> b -> c -> a"),
+                8 => ("import b;", "import a;", "import b;", "b -> a -> b"),
+                _ => (
+                    "import nested::b;",
+                    "import a;",
+                    "import a;",
+                    "a -> nested::b -> a",
+                ),
+            };
+            f.file(0, "a.wi", a);
+            f.file(0, if shape == 9 { "nested/b.wi" } else { "b.wi" }, b);
+            f.file(0, "c.wi", "import a;");
+            let result = f.resolve(entry, f.graph(&[&[]]), spooled);
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|d| d.code == ErrorCode::E0403)
+                .unwrap();
+            assert_eq!(
+                diagnostic.notes,
+                [format!("import cycle: {expected}")],
+                "shape={shape} spooled={spooled}"
+            );
+        }
+    }
+}
+
+#[test]
+fn package_loader_cycle_diagnostic_scaling() {
+    for count in [4, 16, 64] {
+        let f = Fixture::new();
+        for i in 0..count {
+            f.file(
+                0,
+                &format!("m{i}.wi"),
+                &format!("import m{};", (i + 1) % count),
+            );
+        }
+        let result = f.resolve("import m0;", f.graph(&[&[]]), true);
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == ErrorCode::E0403)
+            .unwrap();
+        let expected = (0..=count)
+            .map(|i| format!("m{}", i % count))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        assert_eq!(diagnostic.notes, [format!("import cycle: {expected}")]);
+        assert_eq!(result.graph.source_loads, count);
+        eprintln!(
+            "cycle modules={count} loads={} displayed_nodes={}",
+            result.graph.source_loads,
+            count + 1
+        );
     }
 }

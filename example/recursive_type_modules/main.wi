@@ -1,0 +1,10 @@
+import model;
+import scope;
+import value;
+
+fn main() {
+    let env = scope::empty();
+    let proc = new model::Lambda(env);
+    println(value::captured_count(model::Value::Proc(proc))); // 0
+    println(value::captured_count(model::Value::Number(42))); // 0
+}

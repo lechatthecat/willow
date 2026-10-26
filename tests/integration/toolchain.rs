@@ -1546,3 +1546,10 @@ fn test_runtime_direct_call_operations() {
         assert_eq!(output, "190\n100\n99\nruntime direct calls\n");
     }
 }
+
+#[test]
+fn test_import_recursive_types_shared_model_runs() {
+    let (output, ok) = compile_file_and_run("example/recursive_type_modules/main.wi");
+    assert!(ok, "shared recursive model failed to compile or run");
+    assert_eq!(output, "0\n0\n");
+}

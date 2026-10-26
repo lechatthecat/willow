@@ -457,11 +457,7 @@ fn resolve_one(
                     "import cycle: {}",
                     cycle
                         .iter()
-                        .map(|key| if routing.is_some() {
-                            format!("{}:{}", key.package.0, key.path.0)
-                        } else {
-                            key.path.0.clone()
-                        })
+                        .map(|key| key.path.0.as_str())
                         .collect::<Vec<_>>()
                         .join(" -> ")
                 ))

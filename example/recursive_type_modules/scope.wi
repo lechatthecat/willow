@@ -1,0 +1,7 @@
+import std::collections::Map;
+import model;
+
+pub fn empty() -> model::Scope {
+    let vars: Map<String, model::Value> = Map::new();
+    return new model::Scope(vars);
+}

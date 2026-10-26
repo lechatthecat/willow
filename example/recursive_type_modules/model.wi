@@ -1,0 +1,15 @@
+import std::collections::Map;
+
+// Keep mutually recursive declarations together; behavior can stay separate.
+pub enum Value {
+    Number(i64),
+    Proc(Lambda),
+}
+
+pub class Lambda {
+    pub env: Scope;
+}
+
+pub class Scope {
+    pub vars: Map<String, Value>;
+}

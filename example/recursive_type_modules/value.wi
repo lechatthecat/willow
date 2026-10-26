@@ -1,0 +1,8 @@
+import model;
+
+pub fn captured_count(value: model::Value) -> i64 {
+    return match value {
+        model::Value::Number(_) => 0,
+        model::Value::Proc(proc) => proc.env.vars.len(),
+    };
+}
