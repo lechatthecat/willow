@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-fa8af3024813d13e)
+
+running 1 test
+survivors=32 source_chunks=1 pages=2 capacity=3 index_growths=0 moved=32 elapsed_ns=60403 ns_per_move=1887.59
+survivors=128 source_chunks=4 pages=5 capacity=14 index_growths=0 moved=128 elapsed_ns=79559 ns_per_move=621.55
+survivors=512 source_chunks=16 pages=18 capacity=56 index_growths=0 moved=512 elapsed_ns=256900 ns_per_move=501.76
+survivors=2048 source_chunks=64 pages=68 capacity=224 index_growths=0 moved=2048 elapsed_ns=889011 ns_per_move=434.09
+test gc::minor::tests::minor_survivor_cost_and_page_index_scale ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1976 filtered out; finished in 0.01s
+

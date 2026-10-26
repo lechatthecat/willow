@@ -1,0 +1,8 @@
+class Node { pub value: i64; pub next: Option<Node>; }
+fn main() {
+ let mut list: Option<Node> = None; let mut i = 0;
+ println("@start"); while i < 3000000 { list = Some(new Node(i, list)); i = i + 1; } println("@setup");
+ let mut sum = 0; let mut round = 0;
+ while round < 5 { let mut cursor = list; while cursor.is_some() { let node = cursor.unwrap(); sum = sum + node.value; cursor = node.next; } round = round + 1; }
+ println("@end"); println(sum);
+}

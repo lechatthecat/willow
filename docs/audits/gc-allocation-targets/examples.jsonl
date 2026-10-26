@@ -1,0 +1,24 @@
+{"example": "gc_linked_list", "release": false, "stress": "", "status": 0, "stdout": "6\n", "stderr": ""}
+{"example": "gc_linked_list", "release": false, "stress": "alloc", "status": 0, "stdout": "6\n", "stderr": ""}
+{"example": "gc_linked_list", "release": false, "stress": "minor", "status": 0, "stdout": "6\n", "stderr": ""}
+{"example": "gc_old_cycle", "release": false, "stress": "", "status": 0, "stdout": "499500\n499500\n499500\n", "stderr": ""}
+{"example": "gc_old_cycle", "release": false, "stress": "alloc", "status": 0, "stdout": "499500\n499500\n499500\n", "stderr": ""}
+{"example": "gc_old_cycle", "release": false, "stress": "minor", "status": 0, "stdout": "499500\n499500\n499500\n", "stderr": ""}
+{"example": "gc_safety_temporaries", "release": false, "stress": "", "status": 0, "stdout": "Hx!\na!b!\nv!\np!q!r!\nn!\nbad!\n7!\n", "stderr": ""}
+{"example": "gc_safety_temporaries", "release": false, "stress": "alloc", "status": 0, "stdout": "Hx!\na!b!\nv!\np!q!r!\nn!\nbad!\n7!\n", "stderr": ""}
+{"example": "gc_safety_temporaries", "release": false, "stress": "minor", "status": 0, "stdout": "Hx!\na!b!\nv!\np!q!r!\nn!\nbad!\n7!\n", "stderr": ""}
+{"example": "match_binding_gc_roots", "release": false, "stress": "", "status": 0, "stdout": "99\n10\n55\n9\n[note] kept!\n300\n7\n", "stderr": ""}
+{"example": "match_binding_gc_roots", "release": false, "stress": "alloc", "status": 0, "stdout": "99\n10\n55\n9\n[note] kept!\n300\n7\n", "stderr": ""}
+{"example": "match_binding_gc_roots", "release": false, "stress": "minor", "status": 0, "stdout": "99\n10\n55\n9\n[note] kept!\n300\n7\n", "stderr": ""}
+{"example": "gc_linked_list", "release": true, "stress": "", "status": 0, "stdout": "6\n", "stderr": ""}
+{"example": "gc_linked_list", "release": true, "stress": "alloc", "status": 0, "stdout": "6\n", "stderr": ""}
+{"example": "gc_linked_list", "release": true, "stress": "minor", "status": 0, "stdout": "6\n", "stderr": ""}
+{"example": "gc_old_cycle", "release": true, "stress": "", "status": 0, "stdout": "499500\n499500\n499500\n", "stderr": ""}
+{"example": "gc_old_cycle", "release": true, "stress": "alloc", "status": 0, "stdout": "499500\n499500\n499500\n", "stderr": ""}
+{"example": "gc_old_cycle", "release": true, "stress": "minor", "status": 0, "stdout": "499500\n499500\n499500\n", "stderr": ""}
+{"example": "gc_safety_temporaries", "release": true, "stress": "", "status": 0, "stdout": "Hx!\na!b!\nv!\np!q!r!\nn!\nbad!\n7!\n", "stderr": ""}
+{"example": "gc_safety_temporaries", "release": true, "stress": "alloc", "status": 0, "stdout": "Hx!\na!b!\nv!\np!q!r!\nn!\nbad!\n7!\n", "stderr": ""}
+{"example": "gc_safety_temporaries", "release": true, "stress": "minor", "status": 0, "stdout": "Hx!\na!b!\nv!\np!q!r!\nn!\nbad!\n7!\n", "stderr": ""}
+{"example": "match_binding_gc_roots", "release": true, "stress": "", "status": 0, "stdout": "99\n10\n55\n9\n[note] kept!\n300\n7\n", "stderr": ""}
+{"example": "match_binding_gc_roots", "release": true, "stress": "alloc", "status": 0, "stdout": "99\n10\n55\n9\n[note] kept!\n300\n7\n", "stderr": ""}
+{"example": "match_binding_gc_roots", "release": true, "stress": "minor", "status": 0, "stdout": "99\n10\n55\n9\n[note] kept!\n300\n7\n", "stderr": ""}

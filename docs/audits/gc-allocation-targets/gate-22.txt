@@ -1,0 +1,9 @@
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running unittests src/lib.rs (target/release/deps/willow_runtime-99ff4888792ffc45)
+
+running 2 tests
+test gc::nursery::tests::tenuring_feedback_requires_persistent_survival_and_recovers ... ok
+test gc::minor::tests::persistent_survival_skips_intermediate_copy_and_churn_restores_it ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.48s
+

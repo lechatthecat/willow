@@ -158,8 +158,12 @@ pub(super) struct Decision {
 // its live work. A fixed 256 KiB floor could repeatedly scan an arbitrarily
 // large unchanged live set when a noisy runway estimate exceeded the bounded
 // goal. The hard/soft reservation controllers still enforce their own limits.
-fn minimum_trigger(live: u64) -> u64 {
-    live.saturating_add((live / 4).max(MIN_GOAL / 4))
+fn minimum_trigger(live: u64, work: u64) -> u64 {
+    // Major occupancy excludes the nursery, but tracing may still visit its
+    // surviving objects to find old edges. Budget at most one byte of repeated
+    // trace work per four allocated bytes. This is a throughput/memory tradeoff,
+    // not a CPU percentage guarantee; soft/hard memory limits still win.
+    live.saturating_add(work.saturating_mul(4).max(live / 4).max(MIN_GOAL / 4))
 }
 
 fn mul_div_ceil(a: u64, b: u64, divisor: u128) -> u64 {
@@ -223,8 +227,10 @@ pub(super) fn decide(input: Inputs) -> Decision {
         floor
     };
     let desired = floor.max(input.live.saturating_add(runway.saturating_mul(2)));
-    // Limit each inter-cycle adjustment to a factor of two. Live is always a
-    // lower bound. Never shrink a goal while that cycle is active.
+    // Limit estimated inter-cycle growth, but retain allocation runway after
+    // a promotion burst overtakes the previous goal. Clamping to live alone
+    // would immediately repeat a completed scan without allocation progress.
+    // Never shrink a goal while that cycle is active.
     let previous = input.previous_goal.max(MIN_GOAL);
     let lower = if input.active { previous } else { previous / 2 };
     let goal = if input.fixed_goal {
@@ -232,7 +238,7 @@ pub(super) fn decide(input: Inputs) -> Decision {
     } else {
         desired
             .clamp(lower, previous.saturating_mul(2))
-            .max(input.live)
+            .max(minimum_trigger(input.live, expected_work))
     };
     // Apply before deriving trigger, background work and Assist demand so
     // all published decisions describe the same soft-bounded goal.
@@ -241,14 +247,14 @@ pub(super) fn decide(input: Inputs) -> Decision {
         .map_or(goal, |limit| goal.min(limit).max(input.live));
     let trigger = goal
         .saturating_sub(runway)
-        .max(minimum_trigger(input.live).min(goal));
+        .max(minimum_trigger(input.live, expected_work).min(goal));
     if feedback.pressure {
         reasons |= PRESSURE;
     }
     if feedback.allocator_failed {
         reasons |= ALLOCATOR_FAILED;
     }
-    let predicted_late = feedback.occupied >= minimum_trigger(input.live)
+    let predicted_late = feedback.occupied >= minimum_trigger(input.live, expected_work)
         && feedback.occupied >= goal.saturating_sub(runway);
     if predicted_late {
         reasons |= PREDICTED_LATE;
@@ -474,6 +480,69 @@ mod tests {
     }
 
     #[test]
+    fn young_trace_work_buys_progress_even_with_small_old_live_set() {
+        for work in [MIN_GOAL, 16 * MIN_GOAL, 256 * MIN_GOAL] {
+            for live in [0, MIN_GOAL / 8, work] {
+                let base = Inputs {
+                    live,
+                    expected_work: work,
+                    previous_goal: MIN_GOAL,
+                    allocation_per_second: u64::MAX,
+                    mark_per_cpu_second: Some(1),
+                    feedback: Feedback {
+                        occupied: live,
+                        ..Feedback::default()
+                    },
+                    ..input()
+                };
+                let decision = decide(base);
+                let progress = decision.trigger - live;
+                assert!(progress >= 4 * work);
+                assert!(!decision.start_now);
+                eprintln!("old_live={live} trace_work={work} minimum_progress={progress}");
+                // Explicit pressure still starts a collection, and a soft cap
+                // overrides the throughput floor without undercutting live.
+                let capped = decide(Inputs {
+                    feedback: Feedback {
+                        soft_limit: Some(live + MIN_GOAL / 8),
+                        pressure: true,
+                        ..base.feedback
+                    },
+                    ..base
+                });
+                assert_eq!(capped.goal, live + MIN_GOAL / 8);
+                assert!(capped.start_now);
+            }
+        }
+    }
+
+    #[test]
+    fn promotion_bursts_preserve_progress_beyond_previous_goal() {
+        for live in [MIN_GOAL, 16 * MIN_GOAL, 256 * MIN_GOAL, 4096 * MIN_GOAL] {
+            for previous_goal in [MIN_GOAL, live / 2, live] {
+                for rate in [None, Some(1), Some(u64::MAX)] {
+                    let decision = decide(Inputs {
+                        live,
+                        previous_goal,
+                        expected_work: live,
+                        allocation_per_second: u64::MAX,
+                        mark_per_cpu_second: rate,
+                        feedback: Feedback {
+                            occupied: live,
+                            ..Feedback::default()
+                        },
+                        ..input()
+                    });
+                    assert!(decision.goal >= minimum_trigger(live, live));
+                    assert!(decision.trigger >= minimum_trigger(live, live));
+                    assert!(!decision.start_now);
+                    assert!(live.div_ceil(decision.trigger - live) <= 4);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn saturated_runway_requires_proportional_allocation_progress() {
         for live in [MIN_GOAL, 16 * MIN_GOAL, 256 * MIN_GOAL, 4096 * MIN_GOAL] {
             for rate in [1, MIN_GOAL, u64::MAX] {
@@ -496,8 +565,8 @@ mod tests {
                 assert!(live.div_ceil(decision.trigger - live) <= 4);
             }
         }
-        assert_eq!(minimum_trigger(u64::MAX), u64::MAX);
-        assert_eq!(minimum_trigger(0), MIN_GOAL / 4);
+        assert_eq!(minimum_trigger(u64::MAX, u64::MAX), u64::MAX);
+        assert_eq!(minimum_trigger(0, 0), MIN_GOAL / 4);
     }
 
     #[test]

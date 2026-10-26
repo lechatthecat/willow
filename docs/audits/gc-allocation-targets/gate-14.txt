@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-fa8af3024813d13e)
+
+running 14 tests
+test gc::memory_control::tests::live_floor_saturates_and_relief_allows_progress ... ok
+test gc::memory_control::tests::resident_history_handles_recovery_invalidity_and_irreducible_live ... ok
+test gc::memory_control::tests::process_sampling_is_disabled_or_cached_between_slow_paths ... ok
+test gc::memory_control::tests::resident_pressure_is_independent_and_invalid_is_not_zero_commit ... ok
+test gc::memory_control::tests::unlimited_and_compatible_commit_scopes ... ok
+test gc::memory_control::tests::stagnant_resident_with_heap_reclamation_has_bounded_collection_counts ... ok
+test gc::memory_control::tests::updates_cannot_erase_relief_or_allocation_history ... ok
+test gc::memory_control::tests::extreme_accounting_never_wraps_or_lowers_goal_below_live ... ok
+test gc::memory_control::tests::allocator_failure_gets_exactly_one_recovery_and_one_retry ... ok
+test gc::memory_control::tests::cached_process_pressure_relief_preserves_live_runtime_root ... ok
+test gc::memory_control::tests::concurrent_updates_preserve_roots_and_relief ... ok
+test gc::memory_control::tests::process_pressure_reaches_pacer_but_relief_does_not ... ok
+test gc::memory_control::tests::runtime_soft_pressure_collects_without_changing_hard_cap ... ok
+test gc::memory_control::tests::environment_limit_parsing_in_fresh_process ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 1963 filtered out; finished in 0.01s
+

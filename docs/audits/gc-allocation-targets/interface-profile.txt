@@ -1,0 +1,29 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cycles:u'
+# Event count (approx.): 930641793
+#
+# Overhead  Command          Shared Object         Symbol                                                                               
+# ........  ...............  ....................  .....................................................................................
+#
+    25.39%  virtual_dispatc  virtual_dispatch      [.] willow_runtime::gc::sweep::batches::Cursor::batch_with_clock
+    10.84%  virtual_dispatc  virtual_dispatch      [.] willow_runtime::gc::epoch_index::RegionIndex::locate_region_id
+    10.25%  virtual_dispatc  virtual_dispatch      [.] willow_runtime::gc::minor::MinorCollector::evacuate_source
+     9.55%  willow-gc-mark-  virtual_dispatch      [.] willow_runtime::gc::marking::ConcurrentCycle::drain_worker_until_stride
+     7.09%  virtual_dispatc  virtual_dispatch      [.] willow_runtime::gc::minor::MinorCollector::run
+     6.06%  virtual_dispatc  virtual_dispatch      [.] willow_user_main
+     4.92%  willow-gc-mark-  virtual_dispatch      [.] willow_runtime::gc::marking::ConcurrentCycle::discover_child
+     1.79%  willow-gc-mark-  libc.so.6             [.] realloc
+     1.61%  virtual_dispatc  virtual_dispatch      [.] willow_runtime::gc::tlab::index_retired_chunk
+     1.47%  willow-gc-mark-  virtual_dispatch      [.] std::thread::current::current
+     1.14%  virtual_dispatc  virtual_dispatch      [.] willow_runtime::array::array_push
+     1.13%  willow-gc-mark-  virtual_dispatch      [.] willow_runtime::gc::epoch_index::RegionIndex::locate_extent_cached
+     1.08%  virtual_dispatc  virtual_dispatch      [.] willow_runtime::gc::marking::ConcurrentCycle::discover_child
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

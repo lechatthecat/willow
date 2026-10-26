@@ -1,0 +1,4 @@
+import std::collections::Array;
+class Point { pub x: i64; pub y: i64; }
+fn main() { println("@start");let ring: Array<Point> = []; let mut i = 0; while i < 1024 { ring.push(new Point(0,0)); i = i + 1; }
+ let mut sum = 0; i = 0; while i < 20000000 { let slot = i % 1024; sum = sum + ring[slot].x; ring[slot] = new Point(i,i); i = i + 1; }println("@end"); println(sum); }

@@ -333,6 +333,7 @@ impl RegionIndex {
         let (id, bit) = self.locate_region_id(address)?;
         Some((self.regions[id].as_ref().unwrap(), bit))
     }
+    #[inline]
     fn locate_extent_cached(
         &self,
         address: usize,
@@ -400,6 +401,7 @@ impl EpochReader<'_> {
     }
 
     /// Allocations were validated by the sweep index; starts may be rebuilding.
+    #[inline]
     pub(super) fn retains_allocated_cached(
         &self,
         address: usize,

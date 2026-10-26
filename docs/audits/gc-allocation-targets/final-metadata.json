@@ -1,0 +1,27 @@
+{
+  "head": "22778abdc7f3d816922b0d1a12c8086a4e66434c",
+  "source_tree_sha256": "0d2374b7d0c47353c9ce50b898d9a6e481f5f2b2d846c63594734f77d85dcc01",
+  "changed_source_sha256": {
+    "crates/willow_runtime/src/gc/epoch_index.rs": "f5555f1e89c3fdf7eb1924d940d65c2ca3fca229311e8affb1286fa8cdc7973c",
+    "crates/willow_runtime/src/gc/marking.rs": "a86ce3c93ed044806b8524e7f7802b162fe60901299aadbbc3085813081bea6a",
+    "crates/willow_runtime/src/gc/minor.rs": "26a15962c6cafa266106b8588df4c9a8d39b0f511b6d7f1f174a1679a46107a2",
+    "crates/willow_runtime/src/gc/minor_tests.rs": "735b45ac7132115c07ff34e5a5486977e57e5325b246598da90e806186d7ab73",
+    "crates/willow_runtime/src/gc/nursery.rs": "6a798ca79c6409f0d4a527b9b9804450d400d447f1cd51eca35d33c1868a3159",
+    "crates/willow_runtime/src/gc/pacer.rs": "8f44669ff26fd658ae1380e79d4b9dea601ebf49a3be6adb99ae374e070a9726"
+  },
+  "affinity": "0-7",
+  "workers": 8,
+  "asset_sha256": {
+    "AllocationBench.java": "a14f1d9b2e4bea49c62bb904d02b51ea4c4d7774e7947f5f1749b47256c436ac",
+    "chain_1000000.wi": "7da760c89e1700334043889ef3f9e69940017526a0a2dee7f7ce9ff4bb71dcc4",
+    "chain_300000.wi": "8cdb5a319526ad33acf182a4f11cf6b9a3d792d5d3aec6d5903694ccedd61844",
+    "chain_3000000.wi": "7b67346e823be7ccb55037c55b94b451540012593d4df272ac0d81023a3be10d",
+    "gc_scheduler.wi": "6287a2305ada46b998d1c2b8b19bd12c12d17cdb2640b35cdce2f00ab0891e96",
+    "harness.js": "9813acd94fe563644c75deb0b04eac9829c76a6ed42b3bfd676f46d5617fbac0",
+    "linked_list.wi": "3073c9e26134101456660921fe9f97b5f677a939f3a3e592c130444138884b53",
+    "main.go": "77cab70cacc03fbda1eb1a38827306195229d2240da8af2a95d0adb2a96c3949",
+    "object_churn.wi": "f38c96f740d29a0a313cf4050e78ccf9efd92fe2d58c1bf34912262f4285018c",
+    "probe.js": "220d18cb7d7ba2bb91de165f2e43bae98cadaab028f30e4d004f3aead27b67a5",
+    "virtual_dispatch.wi": "030618d43911c387c37c4b4e0e954ab14e3feb63c9e541d4740c706cb3909413"
+  }
+}

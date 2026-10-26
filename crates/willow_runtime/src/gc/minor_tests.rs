@@ -1201,11 +1201,11 @@ fn persistent_survival_skips_intermediate_copy_and_churn_restores_it() {
             let state = runtime().heap.lock().unwrap();
             assert_eq!(
                 state.survivor_stats.survivor_copies - before,
-                if round >= 3 { 0 } else { count as u64 }
+                if round >= 2 { 0 } else { count as u64 }
             );
             assert_eq!(
                 unsafe { (*payload_to_header(head)).generation },
-                if round >= 3 {
+                if round >= 2 {
                     GC_GENERATION_OLD
                 } else {
                     GC_GENERATION_YOUNG

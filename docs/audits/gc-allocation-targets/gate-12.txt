@@ -1,0 +1,62 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/willow_runtime-fa8af3024813d13e)
+
+running 11 tests
+concurrent-minor nodes=1000 pass=0 page_queries=1 copies=1000 live_marks=1000 publications=0
+concurrent-minor nodes=1000 pass=1 page_queries=1 copies=1000 live_marks=1000 publications=0
+concurrent-minor nodes=10000 pass=0 page_queries=23 copies=10000 live_marks=10000 publications=0
+concurrent-minor nodes=10000 pass=1 page_queries=31 copies=10000 live_marks=10000 publications=0
+concurrent-minor nodes=100000 pass=0 page_queries=221 copies=100000 live_marks=100000 publications=0
+concurrent-minor nodes=100000 pass=1 page_queries=295 copies=100000 live_marks=100000 publications=0
+test gc::minor::overlap_tests::concurrent_minor_snapshot_and_relocation_scale_linearly ... ok
+test gc::minor::overlap_tests::overlap_containers_and_async_frame_preserve_rewritten_edges ... ok
+overlap shape=chain nodes=1 pass=0 copies=1 live_marks=1
+overlap shape=chain nodes=1 pass=1 copies=1 live_marks=1
+overlap shape=chain nodes=16 pass=0 copies=16 live_marks=16
+overlap shape=chain nodes=16 pass=1 copies=16 live_marks=16
+overlap shape=chain nodes=64 pass=0 copies=64 live_marks=64
+overlap shape=chain nodes=64 pass=1 copies=64 live_marks=64
+overlap shape=chain nodes=256 pass=0 copies=256 live_marks=256
+overlap shape=chain nodes=256 pass=1 copies=256 live_marks=256
+overlap shape=cycle nodes=1 pass=0 copies=1 live_marks=1
+overlap shape=cycle nodes=1 pass=1 copies=1 live_marks=1
+overlap shape=cycle nodes=16 pass=0 copies=16 live_marks=16
+overlap shape=cycle nodes=16 pass=1 copies=16 live_marks=16
+overlap shape=cycle nodes=64 pass=0 copies=64 live_marks=64
+overlap shape=cycle nodes=64 pass=1 copies=64 live_marks=64
+overlap shape=cycle nodes=256 pass=0 copies=256 live_marks=256
+overlap shape=cycle nodes=256 pass=1 copies=256 live_marks=256
+overlap shape=fanout nodes=1 pass=0 copies=1 live_marks=1
+overlap shape=fanout nodes=1 pass=1 copies=1 live_marks=1
+overlap shape=fanout nodes=16 pass=0 copies=16 live_marks=16
+overlap shape=fanout nodes=16 pass=1 copies=16 live_marks=16
+overlap shape=fanout nodes=64 pass=0 copies=64 live_marks=64
+overlap shape=fanout nodes=64 pass=1 copies=64 live_marks=64
+overlap shape=fanout nodes=256 pass=0 copies=256 live_marks=256
+overlap shape=fanout nodes=256 pass=1 copies=256 live_marks=256
+overlap shape=shared nodes=1 pass=0 copies=1 live_marks=1
+overlap shape=shared nodes=1 pass=1 copies=1 live_marks=1
+overlap shape=shared nodes=16 pass=0 copies=16 live_marks=16
+overlap shape=shared nodes=16 pass=1 copies=16 live_marks=16
+overlap shape=shared nodes=64 pass=0 copies=64 live_marks=64
+overlap shape=shared nodes=64 pass=1 copies=64 live_marks=64
+overlap shape=shared nodes=256 pass=0 copies=256 live_marks=256
+overlap shape=shared nodes=256 pass=1 copies=256 live_marks=256
+test gc::minor::overlap_tests::overlap_graph_copy_promotion_and_snapshot_only_reachability ... ok
+test gc::minor::overlap_tests::overlap_minor_inline_credit_publishes_old_descendants ... ok
+test gc::minor::overlap_tests::overlap_minor_requests_coalesce_under_major_owner_and_registration_changes ... ok
+test gc::minor::overlap_tests::overlap_native_async_frame_and_marker_pool_pause_resume ... ok
+test gc::minor::overlap_tests::overlap_native_recovery_retry_history_follows_minor_relocation ... ok
+test gc::minor::overlap_tests::overlap_phase_requests_and_remark_election_keep_epoch_ownership_distinct ... ok
+test gc::minor::overlap_tests::overlap_post_snapshot_tlab_black_allocation_survives_minor_and_old_sweep ... ok
+overlap SATB parked_mutators=1 closing=false old_descendants=1 sweep=retained
+overlap SATB parked_mutators=1 closing=true old_descendants=1 sweep=retained
+overlap SATB parked_mutators=4 closing=false old_descendants=4 sweep=retained
+overlap SATB parked_mutators=4 closing=true old_descendants=4 sweep=retained
+overlap SATB parked_mutators=16 closing=false old_descendants=16 sweep=retained
+overlap SATB parked_mutators=16 closing=true old_descendants=16 sweep=retained
+test gc::minor::overlap_tests::overlap_satb_deletions_parked_mutators_and_old_descendants_survive_sweep ... ok
+test gc::minor::overlap_tests::post_snapshot_extent_publications_do_not_build_per_object_pending_sets ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 1966 filtered out; finished in 0.89s
+

@@ -1,0 +1,34 @@
+[
+  {
+    "case": "linked_list",
+    "max_rss_kib": 196156,
+    "checksum": "22499992500000",
+    "command": [
+      "/usr/bin/time",
+      "-f",
+      "%M",
+      "-o",
+      "docs/audits/gc-allocation-targets/linked_list-rss.txt",
+      "taskset",
+      "-c",
+      "0-7",
+      "target/runtime_compare/allocation/linked_list"
+    ]
+  },
+  {
+    "case": "virtual_dispatch",
+    "max_rss_kib": 235488,
+    "checksum": "41500000",
+    "command": [
+      "/usr/bin/time",
+      "-f",
+      "%M",
+      "-o",
+      "docs/audits/gc-allocation-targets/virtual_dispatch-rss.txt",
+      "taskset",
+      "-c",
+      "0-7",
+      "target/runtime_compare/allocation/virtual_dispatch"
+    ]
+  }
+]

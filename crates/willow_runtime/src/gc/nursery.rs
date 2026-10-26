@@ -100,7 +100,7 @@ impl Policy {
     }
 }
 
-/// Three consistently high-survival cycles justify skipping the intermediate
+/// Two consistently high-survival cycles justify skipping the intermediate
 /// survivor copy. Low survival resets immediately; empty cycles are no evidence.
 /// This changes only destination generation, never liveness or reservation limits.
 #[derive(Default)]
@@ -109,14 +109,14 @@ pub(super) struct Tenuring {
 }
 impl Tenuring {
     pub(super) fn age(&self) -> u8 {
-        if self.high_survival == 3 { 1 } else { 2 }
+        if self.high_survival == 2 { 1 } else { 2 }
     }
     pub(super) fn complete(&mut self, young: usize, survived: u64) {
         if young == 0 {
             return;
         }
         if survived >= (young - young / 8) as u64 {
-            self.high_survival = self.high_survival.saturating_add(1).min(3);
+            self.high_survival = self.high_survival.saturating_add(1).min(2);
         } else if survived < (young - young / 4) as u64 {
             self.high_survival = 0;
         }
@@ -134,7 +134,7 @@ mod tests {
             assert_eq!(policy.age(), 2);
             for cycle in 0..3 {
                 policy.complete(young, (young - young / 8) as u64);
-                assert_eq!(policy.age(), if cycle == 2 { 1 } else { 2 });
+                assert_eq!(policy.age(), if cycle >= 1 { 1 } else { 2 });
             }
             policy.complete(0, 0);
             assert_eq!(policy.age(), 1);

@@ -789,8 +789,8 @@ impl ConcurrentCycle {
         self.drain_worker_until(limit, children, worker, None)
     }
 
-    fn assist_stop_requested(&self) -> bool {
-        std::thread::current().id() != self.collector
+    fn assist_stop_requested(&self, is_collector: bool) -> bool {
+        !is_collector
             && (self.closing.load(Ordering::Acquire)
                 || runtime().poll_requested.load(Ordering::Acquire))
     }
@@ -857,17 +857,20 @@ impl ConcurrentCycle {
         // Declared after `batch`, so it drops before active_drains is released.
         let mut inline_reader: Option<epoch_index::EpochReader<'_>> = None;
         let retry_generation = self.recovery_retry_generation.load(Ordering::Acquire);
+        // A drain cannot migrate between OS threads. Resolve its role once,
+        // while still sampling stop/recovery flags for every work item.
+        let is_collector = std::thread::current().id() == self.collector;
         while scanned < limit {
             // Recovery owns retry pacing. Mutator assists/background consumers
             // relinquish work so they cannot consume the allowance while the
             // collector is giving a contended owner time to run.
-            if self.recovering.load(Ordering::Acquire)
-                && std::thread::current().id() != self.collector
-            {
+            if self.recovering.load(Ordering::Acquire) && !is_collector {
                 break;
             }
             // Always permit one work item, even after descheduling at entry.
-            if scanned != 0 && (expired() || minor::requested() || self.assist_stop_requested()) {
+            if scanned != 0
+                && (expired() || minor::requested() || self.assist_stop_requested(is_collector))
+            {
                 break;
             }
             let (work, metadata) = if let Some((child, metadata)) = batch.local_child.take() {
@@ -944,7 +947,9 @@ impl ConcurrentCycle {
                             self.trace(object.addr(), Some(metadata), children, &mut batch);
                         }
                         scanned += 1;
-                        if (expired() || minor::requested() || self.assist_stop_requested())
+                        if (expired()
+                            || minor::requested()
+                            || self.assist_stop_requested(is_collector))
                             && objects.len() != 0
                         {
                             // Publish the unfinished tail before completing the

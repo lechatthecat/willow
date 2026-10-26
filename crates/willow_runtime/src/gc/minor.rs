@@ -160,6 +160,7 @@ impl<'a> MinorCollector<'a> {
     // This cycle's fixed-size chunks have at most two candidates per page.
     // Expected O(1) lookup; no ordered-region search for every live child.
     // The map is used only before sweep compacts the chunk vector.
+    #[inline]
     fn chunk_index(&self, header: usize) -> Option<usize> {
         // Sequential graph edges usually stay in the same retired chunk. The
         // range is rechecked against current `used`; indices stay stable until
@@ -580,6 +581,7 @@ impl<'a> MinorCollector<'a> {
 
     // Both registries and the current major epoch are immutable throughout
     // this stopped minor. Cache only type dispatch, never payloads or liveness.
+    #[inline]
     fn inline_policy(&mut self, metadata: super::raw_heap::TraceMetadata) -> (bool, bool) {
         let index = metadata.type_id as usize % self.inline_types.len();
         if let Some((id, inline, major)) = self.inline_types[index]

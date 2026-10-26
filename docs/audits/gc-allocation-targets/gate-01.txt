@@ -1,0 +1,3 @@
+   Compiling willow v0.1.7 (/home/shu/Documents/gitproject/willow)
+    Checking willow_runtime v0.1.7 (/home/shu/Documents/gitproject/willow/crates/willow_runtime)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.09s

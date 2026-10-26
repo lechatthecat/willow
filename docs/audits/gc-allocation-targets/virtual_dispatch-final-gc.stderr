@@ -1,0 +1,28 @@
+[gc] threshold goal=1048576 trigger=524288 previous_goal=1048576 previous_trigger=1048576 reason=allocation_sample
+[gc] stop reason=3 collector_ns=308165 resume_gate_ns=110 coordination_hold_ns=308275
+[gc] concurrent_prepare regions=73 index_entries=640 bitmap_words=4931 bitmap_bytes=39448 heap_hold_ns=1012
+[gc] stop reason=1 collector_ns=5811 resume_gate_ns=100 coordination_hold_ns=5911
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=66 used_bytes=0 checked_work_ns=3126 checks=67 yields=0 published_regions=0 region_slots=0 region_bytes=0
+[gc] stop reason=2 collector_ns=3216 resume_gate_ns=100 coordination_hold_ns=3316
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=5 used_bytes=152 checked_work_ns=1934 checks=8 yields=0 published_regions=4 region_slots=4 region_bytes=136
+[gc] stop reason=2 collector_ns=2745 resume_gate_ns=101 coordination_hold_ns=2846
+[gc] sweep background_limits=256/1048576/1000000 assist_limits=32/65536/100000 Report { objects: 66542, bytes: 3483719, batches: 264, assists: 0, yields: 263, overshoots: 0, work_ns: 1751726, setup_ns: 5400, sweep_wall_ns: 1933141, partial_batches: 259, heap_holds: 4427, heap_hold_ns: 1227098, heap_wait_ns: 104886, heap_max_hold_ns: 2545, heap_max_wait_ns: 80, max_batch_ns: 11351, assist_max_ns: 0, hook_ns: 0, release_ns: 340, assist_objects: 0, assist_bytes: 0, reclaimed_bytes: 520360, metadata_items: 8606, swept_objects: 66331, swept_bytes: 3299663, assist_cpu_ns: 0, assist_cpu_incomplete: false }
+[gc] threshold goal=13764307 trigger=13764307 previous_goal=1048576 previous_trigger=524288 reason=cycle_paced
+[gc] soft_memory goal=13764307 trigger=13764307 overshoot=0 reason=Unlimited native_requested_bytes=0 native_requested_exact=false native_committed_valid=false process_resident_bytes=0 resident_valid=false process_commit_valid=false process_limit_coverage_complete=false
+gc: heap_before=3299663B freed=520360B heap_after=2779303B total_allocs=66339 total_frees=15
+[gc] threshold goal=13764307 trigger=13764083 previous_goal=13764307 previous_trigger=13764307 reason=allocation_sample
+[gc] threshold goal=13764307 trigger=13764115 previous_goal=13764307 previous_trigger=13764083 reason=allocation_sample
+[gc] stop reason=3 collector_ns=9305922 resume_gate_ns=151 coordination_hold_ns=9306073
+[gc] threshold goal=13764307 trigger=13764147 previous_goal=13764307 previous_trigger=13764115 reason=allocation_sample
+[gc] threshold goal=13764307 trigger=13764179 previous_goal=13764307 previous_trigger=13764147 reason=allocation_sample
+[gc] concurrent_prepare regions=1088 index_entries=9277 bitmap_words=70661 bitmap_bytes=565288 heap_hold_ns=26710
+[gc] stop reason=1 collector_ns=4238 resume_gate_ns=90 coordination_hold_ns=4328
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=66 used_bytes=0 checked_work_ns=4308 checks=67 yields=0 published_regions=0 region_slots=0 region_bytes=0
+[gc] stop reason=2 collector_ns=4439 resume_gate_ns=160 coordination_hold_ns=4599
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=8 used_bytes=272 checked_work_ns=1382 checks=10 yields=0 published_regions=8 region_slots=8 region_bytes=272
+[gc] stop reason=2 collector_ns=2394 resume_gate_ns=150 coordination_hold_ns=2544
+[gc] sweep background_limits=256/1048576/1000000 assist_limits=32/65536/100000 Report { objects: 1051578, bytes: 55574229, batches: 4120, assists: 0, yields: 4119, overshoots: 4, work_ns: 27837495, setup_ns: 1002, sweep_wall_ns: 30577665, partial_batches: 4100, heap_holds: 69852, heap_hold_ns: 19673160, heap_wait_ns: 1700921, heap_max_hold_ns: 24115, heap_max_wait_ns: 4559, max_batch_ns: 30487, assist_max_ns: 0, hook_ns: 0, release_ns: 460, assist_objects: 0, assist_bytes: 0, reclaimed_bytes: 7864416, metadata_items: 265638, swept_objects: 1048588, swept_bytes: 51904879, assist_cpu_ns: 0, assist_cpu_incomplete: false }
+[gc] threshold goal=218395899 trigger=218395899 previous_goal=13764307 previous_trigger=13764179 reason=cycle_paced
+[gc] soft_memory goal=218395899 trigger=218395899 overshoot=0 reason=Unlimited native_requested_bytes=0 native_requested_exact=false native_committed_valid=false process_resident_bytes=0 resident_valid=false process_commit_valid=false process_limit_coverage_complete=false
+gc: heap_before=51904879B freed=7864416B heap_after=44040463B total_allocs=1048603 total_frees=19
+[gc] stop reason=3 collector_ns=83454060 resume_gate_ns=291 coordination_hold_ns=83454351

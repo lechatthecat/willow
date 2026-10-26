@@ -1,0 +1,25 @@
+[gc] threshold goal=1048576 trigger=524288 previous_goal=1048576 previous_trigger=1048576 reason=allocation_sample
+[gc] stop reason=3 collector_ns=258493 resume_gate_ns=431 coordination_hold_ns=258924
+[gc] stop reason=3 collector_ns=8228590 resume_gate_ns=120 coordination_hold_ns=8228710
+[gc] stop reason=3 collector_ns=61454942 resume_gate_ns=150 coordination_hold_ns=61455092
+[gc] concurrent_prepare regions=1807 index_entries=18335 bitmap_words=132224 bitmap_bytes=1057792 heap_hold_ns=30437
+[gc] stop reason=1 collector_ns=6783 resume_gate_ns=100 coordination_hold_ns=6883
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=66 used_bytes=0 checked_work_ns=2796 checks=67 yields=0 published_regions=0 region_slots=0 region_bytes=0
+[gc] stop reason=2 collector_ns=3046 resume_gate_ns=260 coordination_hold_ns=3306
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=38 used_bytes=1274 checked_work_ns=3797 checks=41 yields=0 published_regions=37 region_slots=37 region_bytes=1258
+[gc] stop reason=2 collector_ns=4558 resume_gate_ns=121 coordination_hold_ns=4679
+[gc] sweep background_limits=256/1048576/1000000 assist_limits=32/65536/100000 Report { objects: 1689157, bytes: 79018727, batches: 6613, assists: 0, yields: 6612, overshoots: 0, work_ns: 44259743, setup_ns: 922, sweep_wall_ns: 48862951, partial_batches: 6541, heap_holds: 112196, heap_hold_ns: 32080050, heap_wait_ns: 2866559, heap_max_hold_ns: 6222, heap_max_wait_ns: 3637, max_batch_ns: 11762, assist_max_ns: 0, hook_ns: 0, release_ns: 0, assist_objects: 0, assist_bytes: 0, reclaimed_bytes: 0, metadata_items: 1449669, swept_objects: 1685503, swept_bytes: 67420111, assist_cpu_ns: 0, assist_cpu_incomplete: false }
+[gc] threshold goal=11793638 trigger=11793638 previous_goal=1048576 previous_trigger=524288 reason=cycle_paced
+[gc] soft_memory goal=11793638 trigger=11793638 overshoot=0 reason=Unlimited native_requested_bytes=0 native_requested_exact=false native_committed_valid=false process_resident_bytes=0 resident_valid=false process_commit_valid=false process_limit_coverage_complete=false
+gc: heap_before=67420111B freed=0B heap_after=67420111B total_allocs=1685503 total_frees=0
+[gc] stop reason=3 collector_ns=76549027 resume_gate_ns=150 coordination_hold_ns=76549177
+[gc] concurrent_prepare regions=293 index_entries=19045 bitmap_words=150016 bitmap_bytes=1200128 heap_hold_ns=9958
+[gc] stop reason=1 collector_ns=8816 resume_gate_ns=90 coordination_hold_ns=8906
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=66 used_bytes=0 checked_work_ns=2745 checks=67 yields=0 published_regions=0 region_slots=0 region_bytes=0
+[gc] stop reason=2 collector_ns=2915 resume_gate_ns=571 coordination_hold_ns=3486
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=293 used_bytes=9962 checked_work_ns=14297 checks=295 yields=0 published_regions=293 region_slots=293 region_bytes=9962
+[gc] stop reason=2 collector_ns=15088 resume_gate_ns=100 coordination_hold_ns=15188
+[gc] sweep background_limits=256/1048576/1000000 assist_limits=32/65536/100000 Report { objects: 1914884, bytes: 76571871, batches: 7597, assists: 0, yields: 7596, overshoots: 0, work_ns: 42858813, setup_ns: 942, sweep_wall_ns: 48151122, partial_batches: 7302, heap_holds: 127369, heap_hold_ns: 29019725, heap_wait_ns: 3263179, heap_max_hold_ns: 4689, heap_max_wait_ns: 4177, max_batch_ns: 11612, assist_max_ns: 0, hook_ns: 0, release_ns: 0, assist_objects: 0, assist_bytes: 0, reclaimed_bytes: 0, metadata_items: 293, swept_objects: 1914004, swept_bytes: 76560151, assist_cpu_ns: 0, assist_cpu_incomplete: false }
+[gc] threshold goal=95700188 trigger=95700188 previous_goal=11793638 previous_trigger=11793638 reason=cycle_paced
+[gc] soft_memory goal=95700188 trigger=95700188 overshoot=0 reason=Unlimited native_requested_bytes=0 native_requested_exact=false native_committed_valid=false process_resident_bytes=0 resident_valid=false process_commit_valid=false process_limit_coverage_complete=false
+gc: heap_before=76560151B freed=0B heap_after=76560151B total_allocs=1914004 total_frees=0

@@ -1,0 +1,45 @@
+[gc] threshold goal=1048576 trigger=524288 previous_goal=1048576 previous_trigger=1048576 reason=allocation_sample
+[gc] stop reason=3 collector_ns=257230 resume_gate_ns=120 coordination_hold_ns=257350
+[gc] stop reason=3 collector_ns=8314931 resume_gate_ns=121 coordination_hold_ns=8315052
+[gc] stop reason=3 collector_ns=63520120 resume_gate_ns=271 coordination_hold_ns=63520391
+[gc] concurrent_prepare regions=1807 index_entries=18322 bitmap_words=132224 bitmap_bytes=1057792 heap_hold_ns=29625
+[gc] stop reason=1 collector_ns=6903 resume_gate_ns=100 coordination_hold_ns=7003
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=66 used_bytes=0 checked_work_ns=2725 checks=67 yields=0 published_regions=0 region_slots=0 region_bytes=0
+[gc] stop reason=2 collector_ns=2805 resume_gate_ns=151 coordination_hold_ns=2956
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=38 used_bytes=1274 checked_work_ns=2906 checks=41 yields=0 published_regions=37 region_slots=37 region_bytes=1258
+[gc] stop reason=2 collector_ns=3497 resume_gate_ns=110 coordination_hold_ns=3607
+[gc] sweep background_limits=256/1048576/1000000 assist_limits=32/65536/100000 Report { objects: 1689157, bytes: 79018727, batches: 6613, assists: 0, yields: 6612, overshoots: 0, work_ns: 44199236, setup_ns: 942, sweep_wall_ns: 48781479, partial_batches: 6541, heap_holds: 112196, heap_hold_ns: 31924369, heap_wait_ns: 2956522, heap_max_hold_ns: 12333, heap_max_wait_ns: 4548, max_batch_ns: 23774, assist_max_ns: 0, hook_ns: 0, release_ns: 0, assist_objects: 0, assist_bytes: 0, reclaimed_bytes: 0, metadata_items: 1449669, swept_objects: 1685503, swept_bytes: 67420111, assist_cpu_ns: 0, assist_cpu_incomplete: false }
+[gc] threshold goal=9434911 trigger=9434911 previous_goal=1048576 previous_trigger=524288 reason=cycle_paced
+[gc] soft_memory goal=9434911 trigger=9434911 overshoot=0 reason=Unlimited native_requested_bytes=0 native_requested_exact=false native_committed_valid=false process_resident_bytes=0 resident_valid=false process_commit_valid=false process_limit_coverage_complete=false
+gc: heap_before=67420111B freed=0B heap_after=67420111B total_allocs=1685503 total_frees=0
+[gc] concurrent_prepare regions=1808 index_entries=18331 bitmap_words=132288 bitmap_bytes=1058304 heap_hold_ns=18605
+[gc] stop reason=1 collector_ns=5280 resume_gate_ns=100 coordination_hold_ns=5380
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=66 used_bytes=0 checked_work_ns=2314 checks=67 yields=0 published_regions=0 region_slots=0 region_bytes=0
+[gc] stop reason=2 collector_ns=2394 resume_gate_ns=431 coordination_hold_ns=2825
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=37 used_bytes=1258 checked_work_ns=2274 checks=39 yields=0 published_regions=37 region_slots=37 region_bytes=1258
+[gc] stop reason=2 collector_ns=2705 resume_gate_ns=120 coordination_hold_ns=2825
+[gc] sweep background_limits=256/1048576/1000000 assist_limits=32/65536/100000 Report { objects: 1689979, bytes: 79053125, batches: 6616, assists: 0, yields: 6615, overshoots: 0, work_ns: 43973499, setup_ns: 821, sweep_wall_ns: 48546540, partial_batches: 6544, heap_holds: 112250, heap_hold_ns: 31709604, heap_wait_ns: 2957910, heap_max_hold_ns: 4779, heap_max_wait_ns: 4218, max_batch_ns: 12052, assist_max_ns: 0, hook_ns: 0, release_ns: 0, assist_objects: 0, assist_bytes: 0, reclaimed_bytes: 0, metadata_items: 1449670, swept_objects: 1686322, swept_bytes: 67452871, assist_cpu_ns: 0, assist_cpu_incomplete: false }
+[gc] threshold goal=18869822 trigger=18869822 previous_goal=9434911 previous_trigger=9434911 reason=cycle_paced
+[gc] soft_memory goal=18869822 trigger=18869822 overshoot=0 reason=Unlimited native_requested_bytes=0 native_requested_exact=false native_committed_valid=false process_resident_bytes=0 resident_valid=false process_commit_valid=false process_limit_coverage_complete=false
+gc: heap_before=67452871B freed=0B heap_after=67452871B total_allocs=1686322 total_frees=0
+[gc] stop reason=3 collector_ns=77917192 resume_gate_ns=221 coordination_hold_ns=77917413
+[gc] concurrent_prepare regions=293 index_entries=19045 bitmap_words=150016 bitmap_bytes=1200128 heap_hold_ns=11441
+[gc] stop reason=1 collector_ns=9017 resume_gate_ns=110 coordination_hold_ns=9127
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=66 used_bytes=0 checked_work_ns=2836 checks=67 yields=0 published_regions=0 region_slots=0 region_bytes=0
+[gc] stop reason=2 collector_ns=2936 resume_gate_ns=130 coordination_hold_ns=3066
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=293 used_bytes=9962 checked_work_ns=15509 checks=295 yields=0 published_regions=293 region_slots=293 region_bytes=9962
+[gc] stop reason=2 collector_ns=16220 resume_gate_ns=110 coordination_hold_ns=16330
+[gc] sweep background_limits=256/1048576/1000000 assist_limits=32/65536/100000 Report { objects: 1914884, bytes: 76571871, batches: 7597, assists: 0, yields: 7596, overshoots: 0, work_ns: 42558202, setup_ns: 661, sweep_wall_ns: 47828770, partial_batches: 7302, heap_holds: 127369, heap_hold_ns: 28624992, heap_wait_ns: 3356747, heap_max_hold_ns: 6362, heap_max_wait_ns: 4248, max_batch_ns: 11892, assist_max_ns: 0, hook_ns: 0, release_ns: 0, assist_objects: 0, assist_bytes: 0, reclaimed_bytes: 0, metadata_items: 293, swept_objects: 1914004, swept_bytes: 76560151, assist_cpu_ns: 0, assist_cpu_incomplete: false }
+[gc] threshold goal=76560151 trigger=76560151 previous_goal=18869822 previous_trigger=18869822 reason=cycle_paced
+[gc] soft_memory goal=76560151 trigger=76560151 overshoot=0 reason=Unlimited native_requested_bytes=0 native_requested_exact=false native_committed_valid=false process_resident_bytes=0 resident_valid=false process_commit_valid=false process_limit_coverage_complete=false
+gc: heap_before=76560151B freed=0B heap_after=76560151B total_allocs=1914004 total_frees=0
+[gc] concurrent_prepare regions=294 index_entries=19054 bitmap_words=150080 bitmap_bytes=1200640 heap_hold_ns=3026
+[gc] stop reason=1 collector_ns=3717 resume_gate_ns=90 coordination_hold_ns=3807
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=66 used_bytes=0 checked_work_ns=2625 checks=67 yields=0 published_regions=0 region_slots=0 region_bytes=0
+[gc] stop reason=2 collector_ns=2695 resume_gate_ns=120 coordination_hold_ns=2815
+[gc] remark_budget max_slots=4096 max_bytes=1048576 max_work_ns=1000000 used_slots=293 used_bytes=9962 checked_work_ns=14797 checks=295 yields=0 published_regions=293 region_slots=293 region_bytes=9962
+[gc] stop reason=2 collector_ns=15298 resume_gate_ns=110 coordination_hold_ns=15408
+[gc] sweep background_limits=256/1048576/1000000 assist_limits=32/65536/100000 Report { objects: 1915706, bytes: 76606269, batches: 7600, assists: 0, yields: 7599, overshoots: 0, work_ns: 42614680, setup_ns: 481, sweep_wall_ns: 47889884, partial_batches: 7305, heap_holds: 127423, heap_hold_ns: 28686443, heap_wait_ns: 3351186, heap_max_hold_ns: 14647, heap_max_wait_ns: 3988, max_batch_ns: 20098, assist_max_ns: 0, hook_ns: 0, release_ns: 0, assist_objects: 0, assist_bytes: 0, reclaimed_bytes: 0, metadata_items: 294, swept_objects: 1914823, swept_bytes: 76592911, assist_cpu_ns: 0, assist_cpu_incomplete: false }
+[gc] threshold goal=153120302 trigger=153120302 previous_goal=76560151 previous_trigger=76560151 reason=cycle_paced
+[gc] soft_memory goal=153120302 trigger=153120302 overshoot=0 reason=Unlimited native_requested_bytes=0 native_requested_exact=false native_committed_valid=false process_resident_bytes=0 resident_valid=false process_commit_valid=false process_limit_coverage_complete=false
+gc: heap_before=76592911B freed=0B heap_after=76592911B total_allocs=1914823 total_frees=0

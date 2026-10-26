@@ -1,0 +1,8 @@
+import std::collections::Array;
+class Node { pub value: i64; pub next: Option<Node>; }
+class Point { pub x: i64; pub y: i64; }
+fn main() {
+let seed = new Node(7, None); let mut list: Option<Node> = None; let mut sum = 0; let mut i = 0;
+i = 0; println("@start"); while i < 3000000 { list = Some(new Node(i, list)); i = i + 1; } println("@end");
+let mut cursor = list; while cursor.is_some() { let node = cursor.unwrap(); sum = sum + node.value; cursor = node.next; }
+println(sum); println(gc_minor_collections()); println(gc_major_collections()); println(gc_moved_objects()); println(gc_promoted_objects()); }
