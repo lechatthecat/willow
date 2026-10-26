@@ -4435,3 +4435,103 @@ fn tlab_chunk_storage_is_kept_when_refused_and_taken_when_installed() {
     // An uninstalled value releases its storage on drop.
     drop(tlab::ChunkStorage::allocate());
 }
+
+// Keep several inactive/partially filled owners while one owner repeatedly
+// refills: accounting must neither visit the idle owners nor accumulate lag
+// across the hot owner's retired chunks.
+#[test]
+fn refill_accounting_constant_visits_and_bounded_lag() {
+    let _guard = gc_test_guard();
+    let bytes = GC_HEADER_SIZE + 8;
+    for count in [1, 4, 16, 64] {
+        reset_gc();
+        willow_gc_register_mutator();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.nursery_threshold_bytes = usize::MAX;
+            state.pacer.set_enabled_for_test(false);
+        }
+        let mut states: Vec<_> = (0..count).map(|_| new_tlab_state()).collect();
+        for tls in &mut states {
+            assert!(!willow_gc_alloc_slow(tls, 1, 0, 8, 0).is_null());
+            fast_alloc_for_test(tls, bytes);
+        }
+        let mut expected = (2 * count * bytes) as u64;
+        TLAB_ACCOUNTING_RECORD_VISITS.store(0, Ordering::Relaxed);
+        for round in 1..=8 {
+            // Both fragmented tails and full chunks exercise retirement.
+            let tls = &mut states[0];
+            if round % 2 == 0 {
+                while tls.limit.load(Ordering::Acquire) - tls.cursor.load(Ordering::Acquire)
+                    >= bytes
+                {
+                    fast_alloc_for_test(tls, bytes);
+                    expected += bytes as u64;
+                }
+            }
+            assert!(!willow_gc_alloc_slow(tls, 1, 0, 8, 0).is_null());
+            expected += bytes as u64;
+            assert_eq!(TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed), round);
+            let state = runtime().heap.lock().unwrap();
+            let lag = expected - state.total_allocated_bytes;
+            assert_eq!(lag, ((count - 1) * bytes) as u64);
+            assert!(lag <= ((count - 1) * GC_TLAB_CHUNK_SIZE) as u64);
+            assert_eq!(state.young_allocation_clock, state.total_allocated_bytes);
+        }
+        println!(
+            "refill accounting T={count} refills=8 record_visits=8 lag={}",
+            (count - 1) * bytes
+        );
+        // A later full sync and unregister must not double charge any delta.
+        assert_eq!(willow_gc_total_allocated_bytes() as u64, expected);
+        assert_eq!(willow_gc_total_allocated_bytes() as u64, expected);
+        willow_gc_unregister_mutator();
+        assert_eq!(willow_gc_total_allocated_bytes() as u64, expected);
+        reset_gc();
+    }
+}
+
+#[test]
+fn refill_accounting_triggers_without_registry_rescan() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    willow_gc_register_mutator();
+    let mut tls = new_tlab_state();
+    let bytes = GC_HEADER_SIZE + 8;
+    assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
+    fast_alloc_for_test(&tls, bytes);
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        state.nursery_threshold_bytes = 2 * bytes;
+        assert!(!minor_allocation_due(&state));
+        sync_tlab_record_bytes(&mut state, &tls as *const _ as usize);
+        assert!(minor_allocation_due(&state));
+    }
+    TLAB_ACCOUNTING_RECORD_VISITS.store(0, Ordering::Relaxed);
+    assert!(allocation_should_minor_collect());
+    // Queued-minor retries consume the same monotonic published clock.
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        state.minor_deferral_start_bytes = Some(state.young_allocation_clock);
+        state.minor_retry_bytes = state.young_allocation_clock + 1;
+    }
+    assert!(!allocation_should_minor_collect());
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        state.minor_retry_bytes = state.young_allocation_clock;
+    }
+    assert!(allocation_should_minor_collect());
+    for paced in [false, true] {
+        let mut state = runtime().heap.lock().unwrap();
+        state.nursery_threshold_bytes = 0;
+        state.threshold_bytes = 1;
+        state.pacer_trigger = 1;
+        state.pacer.set_enabled_for_test(paced);
+        drop(state);
+        assert!(allocation_should_collect_with_sync(false));
+    }
+    assert_eq!(TLAB_ACCOUNTING_RECORD_VISITS.load(Ordering::Relaxed), 0);
+    willow_gc_unregister_mutator();
+    reset_gc();
+}

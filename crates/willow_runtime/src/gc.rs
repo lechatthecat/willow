@@ -1121,6 +1121,12 @@ fn publish_collection_busy(state: &GcState) {
 }
 
 fn allocation_should_collect() -> bool {
+    allocation_should_collect_with_sync(true)
+}
+
+// TLAB refills already publish their own bytes; other live buffers may lag by
+// at most their current chunk. Telemetry and non-TLAB callers retain full sync.
+fn allocation_should_collect_with_sync(sync: bool) -> bool {
     let stress = gc_stress_enabled("alloc");
     if !stress && COLLECTION_BUSY.load(Ordering::Acquire) {
         return false;
@@ -1129,7 +1135,9 @@ fn allocation_should_collect() -> bool {
     if !stress && (state.concurrent_cycle.is_some() || state.sweeping.is_some()) {
         return false;
     }
-    sync_tlab_bytes(&mut state);
+    if sync {
+        sync_tlab_bytes(&mut state);
+    }
     let bytes = policy_allocated_total(&state);
     if state.pacer.sample_due(bytes) {
         state
@@ -1160,8 +1168,7 @@ fn minor_stress_enabled() -> bool {
 
 fn allocation_should_minor_collect() -> bool {
     let stress = minor_stress_enabled();
-    let mut state = runtime().heap.lock().unwrap();
-    sync_tlab_bytes(&mut state);
+    let state = runtime().heap.lock().unwrap();
     stress || minor_allocation_due(&state)
 }
 
@@ -1365,14 +1372,14 @@ fn tlab_alloc_slow(
         let fast = fast_bytes_total(record);
         let fast_bytes = fast.saturating_sub(record.assist_observed_fast_bytes);
         record.assist_observed_fast_bytes = fast;
-        sync_tlab_bytes(&mut state);
+        sync_tlab_record_bytes(&mut state, state_address);
         if small {
             // A small-object miss means the active chunk has insufficient tail
             // space. Seal it before collection/refill.
             retire_tlab_locked(&mut state, state_address);
         }
-        // Reuse this critical section's TLAB sync for the minor trigger:
-        // every sync scans all registered TLABs (willow-jz15.120).
+        // The refilling record is current; other owners publish at their own
+        // refill, bounding unobserved nursery bytes by one chunk per TLAB.
         (fast_bytes, minor_allocation_due(&state))
     };
     sweep::assist();
@@ -1397,7 +1404,7 @@ fn tlab_alloc_slow(
         }
     }
 
-    if stress || allocation_should_collect() {
+    if stress || allocation_should_collect_with_sync(false) {
         automatic_collect(stress);
     }
 

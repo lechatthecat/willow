@@ -423,3 +423,10 @@ AGENTS.md
 !/docs/audits/runtime-root-registration/validation.txt
 
 !/docs/audits/runtime-root-registration/measurements-before-review.jsonl
+
+# Reviewed public TLAB refill accounting evidence.
+!/docs/audits/tlab-refill-accounting/
+/docs/audits/tlab-refill-accounting/*
+!/docs/audits/tlab-refill-accounting/audit.md
+!/docs/audits/tlab-refill-accounting/verify.py
+!/docs/audits/tlab-refill-accounting/validation.txt

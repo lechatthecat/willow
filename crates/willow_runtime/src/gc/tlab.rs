@@ -77,6 +77,20 @@ pub(super) fn add_tlab_accounting(state: &mut GcState, allocations: u64, bytes: 
     state.young_allocated_bytes = state.young_allocated_bytes.saturating_add(bytes as usize);
 }
 
+/// Publish only the refilling owner's bytes: O(1) expected lookup and one
+/// cursor read. Every refill publishes before replacing its chunk, so missing
+/// bytes are bounded by one active chunk per TLAB, independent of refill count.
+/// Old buffers likewise publish at refill/retirement and have one carve of lag.
+/// Exact telemetry and collection snapshots still merge all records.
+pub(super) fn sync_tlab_record_bytes(state: &mut GcState, address: usize) {
+    let record = state
+        .tlab_states
+        .get_mut(&address)
+        .expect("registered TLAB");
+    let bytes = read_tlab_bytes_delta(record);
+    add_tlab_accounting(state, 0, bytes);
+}
+
 /// Merge fast-path bytes for pacing and nursery triggers: O(TLABs), one cursor
 /// load each. Object counts lag until [`sync_tlab_accounting`] or retirement.
 pub(super) fn sync_tlab_bytes(state: &mut GcState) {
