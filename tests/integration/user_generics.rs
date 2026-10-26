@@ -1439,3 +1439,103 @@ fn generic_variant_context_rejects_concrete_void_payload() {
         "argument 1",
     );
 }
+
+#[test]
+fn generic_parameter_method_diagnostics_specializations() {
+    let declarations = [
+        "pub fn bad<T>(xs: Array<T>) -> T { return xs.pop().unwrap(); }",
+        "pub class Bad<T> { pub xs: Array<T>; pub fn get(self) -> T { return self.xs.pop().unwrap(); } }",
+    ];
+    for (index, declaration) in declarations.iter().enumerate() {
+        for imported in [false, true] {
+            for called in [false, true] {
+                let prefix = if imported { "util::" } else { "" };
+                let calls = if !called {
+                    String::new()
+                } else if index == 0 {
+                    format!(
+                        "{prefix}bad([5, 6]); {prefix}bad([true]); {prefix}bad<Option<i64>>([Some(1)]);"
+                    )
+                } else {
+                    format!(
+                        "new {prefix}Bad<i64>([5, 6]).get(); new {prefix}Bad<bool>([true]).get(); new {prefix}Bad<Option<i64>>([Option::Some(1)]).get();"
+                    )
+                };
+                let template = format!("import std::collections::Array; {declaration}");
+                let source = if imported {
+                    format!("import util; fn main() {{ {calls} }}")
+                } else {
+                    format!("{template} fn main() {{ {calls} }}")
+                };
+                let stderr = if imported {
+                    compile_temp_project_error_stderr(
+                        &[("util.wi", &template), ("main.wi", &source)],
+                        "main.wi",
+                    )
+                } else {
+                    compile_error_stderr(&source)
+                };
+                assert_eq!(stderr.matches("error[E0201]").count(), 1, "{stderr}");
+                assert!(
+                    stderr.contains("type parameter `T` has no method `unwrap`"),
+                    "{stderr}"
+                );
+                assert!(
+                    stderr.contains("this call returns `T`, the receiver type"),
+                    "{stderr}"
+                );
+                assert!(stderr.contains("aborting due to 1 error(s)"), "{stderr}");
+                assert!(!stderr.contains("error[E0350]"), "{stderr}");
+                assert!(
+                    !stderr.contains("no method `unwrap` on type `i64`"),
+                    "{stderr}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_parameter_method_diagnostics_example_runs() {
+    runs(
+        include_str!("../../example/generic_parameter_methods.wi"),
+        "6\nhello\n9\n",
+    );
+}
+
+#[test]
+fn generic_parameter_method_diagnostics_builtin_identity_preserved() {
+    let template = "pub fn identity<T>(x: T) -> T { return x; }";
+    for imported in [false, true] {
+        let prefix = if imported { "util::" } else { "" };
+        let body = format!(
+            "fn main() {{ let o: Option<i64> = Some(7); let r: Result<i64,String> = Ok(8); println({prefix}identity(o).unwrap()); println({prefix}identity(r).unwrap()); }}"
+        );
+        if imported {
+            custom_module_runs(template, &format!("import util; {body}"), "7\n8\n");
+        } else {
+            runs(&format!("{template} {body}"), "7\n8\n");
+        }
+    }
+}
+
+#[test]
+fn generic_parameter_method_diagnostics_distinct_errors_preserved() {
+    let stderr = compile_error_stderr(
+        "fn bad<T,U>(x: T, y: U) { x.missing(); y.missing(); } fn main() { bad(1, true); bad(2.0, false); unknown(); }",
+    );
+    assert_eq!(stderr.matches("error[E0201]").count(), 2, "{stderr}");
+    assert!(
+        stderr.contains("type parameter `T` has no method `missing`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("type parameter `U` has no method `missing`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("cannot find function `unknown`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("aborting due to 3 error(s)"), "{stderr}");
+}

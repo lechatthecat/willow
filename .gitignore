@@ -446,3 +446,6 @@ AGENTS.md
 
 # Public literal payload diagnostic audit.
 !/docs/audits/literal-payload-pattern-diagnostics.md
+
+# Public generic parameter method diagnostic audit.
+!/docs/audits/generic-parameter-method-diagnostics.md

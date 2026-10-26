@@ -1,0 +1,14 @@
+import std::collections::Array;
+
+// pop already returns the element; only an actual Option needs unwrap.
+fn last<T>(xs: Array<T>) -> T { return xs.pop(); }
+class Values<T> {
+    pub xs: Array<T>;
+    pub fn last(self) -> T { return self.xs.pop(); }
+}
+fn main() {
+    println(last([5, 6]));
+    println(new Values<String>(["hello"]).last());
+    let optional: Array<Option<i64>> = [Some(9)];
+    println(last<Option<i64>>(optional).unwrap());
+}

@@ -84,3 +84,82 @@ fn builtin_method_diagnostic_output_scales_linearly() {
         );
     }
 }
+
+#[test]
+fn generic_parameter_method_diagnostics_declaration_shapes() {
+    // Five receiver shapes by four names exercise twenty independent cases.
+    for receiver in ["x", "xs.pop()", "identity(x)", "xs[0]", "(x)"] {
+        for method in ["unwrap", "missing", "toString", "len"] {
+            let source = format!(
+                "import std::collections::Array; fn identity<T>(x: T) -> T {{ return x; }} fn bad<T>(x: T, xs: Array<T>) {{ {receiver}.{method}(); }}"
+            );
+            let diagnostics = check_source(&source);
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+            assert_eq!(
+                diagnostics[0].message,
+                format!("type parameter `T` has no method `{method}`")
+            );
+            if receiver == "xs.pop()" || receiver == "identity(x)" {
+                assert!(
+                    diagnostics[0]
+                        .labels
+                        .iter()
+                        .any(|l| l.message == "this call returns `T`, the receiver type")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_parameter_method_diagnostics_recover_and_scale() {
+    for count in [1, 8, 64, 256] {
+        let source = format!(
+            "fn bad<T>(x: T) {{ {} }}",
+            "x.missing().again();".repeat(count)
+        );
+        let diagnostics = check_source(&source);
+        assert_eq!(diagnostics.len(), count, "{diagnostics:?}");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.message == "type parameter `T` has no method `missing`")
+        );
+    }
+    let diagnostics = check_source("fn bad<T>(x: T) { x.missing(unknown); }");
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+    assert!(diagnostics.iter().any(|d| d.message.contains("unknown")));
+}
+
+#[test]
+fn generic_parameter_method_diagnostics_specialization_counts() {
+    use super::TypeChecker;
+    use crate::{lexer::Lexer, parser::Parser};
+    for count in [1, 8, 64] {
+        let mut source = String::from("fn bad<T>(x: T) { x.missing(); } ");
+        for i in 0..count {
+            source.push_str(&format!("class Value{i} {{}} "));
+        }
+        source.push_str("fn main() {");
+        for i in 0..count {
+            source.push_str(&format!("bad(new Value{i}());"));
+        }
+        source.push('}');
+        let (program, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut checker = TypeChecker::new();
+        checker.check_program(&program);
+        let mut checked = 0;
+        while let Some(instance) = checker.generics.pending.pop_front() {
+            checker.check_generic_instance(instance);
+            checked += 1;
+        }
+        assert_eq!(checked, count);
+        assert_eq!(checker.generics.rejected_parameter_methods.len(), 1);
+        assert_eq!(checker.errors.len(), 1, "{:?}", checker.errors);
+        assert_eq!(
+            checker.errors[0].message,
+            "type parameter `T` has no method `missing`"
+        );
+    }
+}

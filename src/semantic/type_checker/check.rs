@@ -3428,6 +3428,30 @@ impl TypeChecker {
 
     /// Member calls on an already-checked, non-error receiver.
     fn check_receiver_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) -> Type {
+        if let Type::Named(name) = obj_ty
+            && self.generics.parameter_names.contains(name)
+        {
+            if self.generics.rejected_parameter_methods.insert(m.span) {
+                let mut diagnostic = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!("type parameter `{name}` has no method `{}`", m.method),
+                )
+                .with_label(Label::primary(m.span, "unknown method on a type parameter"));
+                Self::label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
+                self.push(diagnostic);
+            }
+            for arg in &m.args {
+                self.check_expr(&arg.expr);
+            }
+            return Self::error_type();
+        }
+        if self.generics.rejected_parameter_methods.contains(&m.span) {
+            for arg in &m.args {
+                self.check_expr(&arg.expr);
+            }
+            return Self::error_type();
+        }
         self.record_builtin_lock_effect(obj_ty, m);
         if let Some(ret) = self.check_option_result_method_call(obj_ty, m) {
             return ret;

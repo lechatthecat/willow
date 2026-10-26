@@ -110,6 +110,11 @@ impl TemplateRegistry {
 pub(crate) struct Generics {
     pub registry: Rc<RefCell<TemplateRegistry>>,
     pub abstract_check: bool,
+    /// Opaque parameters of the template currently being validated.
+    pub parameter_names: HashSet<String>,
+    /// Source calls rejected on an opaque declaration parameter. Concrete
+    /// checking reuses the rejection instead of exposing specialization types.
+    pub rejected_parameter_methods: HashSet<Span>,
     pub source_symbols: crate::semantic::analysis_symbols::Facts,
     pub functions: HashMap<String, std::rc::Rc<FunctionDecl>>,
     pub classes: HashMap<String, std::rc::Rc<ClassDecl>>,
@@ -992,6 +997,18 @@ impl TypeChecker {
             .map(|(param, ty)| {
                 let ty = self.normalize_type(ty, span);
                 let ty = ty.map_names(|name| {
+                    // Builtins have stable identities in every unit. Aliasing
+                    // Option/Result would hide their intrinsic methods when
+                    // the concrete signature is checked again.
+                    if matches!(
+                        crate::semantic::builtin_types::BuiltinTypeId::from_name(name),
+                        Some(
+                            crate::semantic::builtin_types::BuiltinTypeId::Option
+                                | crate::semantic::builtin_types::BuiltinTypeId::Result
+                        )
+                    ) {
+                        return name.clone();
+                    }
                     let Some(info) = self
                         .symbols
                         .lookup_class(name)
@@ -2325,6 +2342,7 @@ impl TypeChecker {
                     );
                 }
             }
+            checker.generics.parameter_names = f.type_params.iter().cloned().collect();
             checker.local.declared_type_params = f.type_params.clone();
             checker.check_function(&f);
             checker.generics.pending.clear();
@@ -2346,6 +2364,7 @@ impl TypeChecker {
                     );
                 }
             }
+            checker.generics.parameter_names = c.type_params.iter().cloned().collect();
             checker.local.declared_type_params = c.type_params.clone();
             checker.register_class(&c);
             checker.check_class(&c);
@@ -2359,6 +2378,9 @@ impl TypeChecker {
                 .source_symbols
                 .extend(checker.analysis_symbols);
         }
+        self.generics
+            .rejected_parameter_methods
+            .extend(checker.generics.rejected_parameter_methods);
         self.errors.extend(checker.errors);
     }
 
