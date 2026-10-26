@@ -194,6 +194,24 @@ impl Snapshot {
             }
         }
         ensure!(
+            self.semantic
+                .async_functions
+                .iter()
+                .all(|id| ids.contains(id)),
+            "invalid async-function identity"
+        );
+        for (owner, sites) in &self.semantic.effect_calls {
+            ensure!(ids.contains(owner), "invalid effect-call owner");
+            for site in sites {
+                ensure!(ids.contains(&site.target), "invalid effect-call target");
+                ensure!(
+                    site.location.start <= site.location.end
+                        && self.sources.contains_key(&site.location.path),
+                    "invalid effect-call location"
+                );
+            }
+        }
+        ensure!(
             self.semantic.witnesses.keys().all(|id| ids.contains(id)),
             "invalid witness identity"
         );

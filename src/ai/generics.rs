@@ -489,6 +489,33 @@ pub(super) fn aggregate(
         calls.dedup_by(|a, b| key(a) == key(b));
     }
     semantic.unresolved_calls = unresolved;
+    semantic.async_functions = std::mem::take(&mut semantic.async_functions)
+        .into_iter()
+        .map(|mut id| {
+            remap(&mut id);
+            id
+        })
+        .collect();
+    let mut effect_calls = BTreeMap::<String, Vec<semantic::EffectCall>>::new();
+    for (mut id, mut sites) in std::mem::take(&mut semantic.effect_calls) {
+        remap(&mut id);
+        for site in &mut sites {
+            remap(&mut site.target);
+        }
+        effect_calls.entry(id).or_default().extend(sites);
+    }
+    for sites in effect_calls.values_mut() {
+        let mut seen = std::collections::HashSet::new();
+        sites.retain(|site| {
+            seen.insert((
+                site.target.clone(),
+                site.location.path.clone(),
+                site.location.start,
+                site.location.end,
+            ))
+        });
+    }
+    semantic.effect_calls = effect_calls;
     let mut witnesses = BTreeMap::<String, Vec<serde_json::Value>>::new();
     for (mut id, mut values) in std::mem::take(&mut semantic.witnesses) {
         remap(&mut id);

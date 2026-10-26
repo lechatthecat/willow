@@ -305,6 +305,9 @@ pub(crate) fn capture(
                 patterns,
             },
         );
+        if is_async {
+            result.semantic.async_functions.insert(id);
+        }
         if let Some(summary) = facts.get(&id) {
             result.semantic.compiler_effects.insert(
                 id,
@@ -320,6 +323,11 @@ pub(crate) fn capture(
                     Some(crate::compiler_db::effects::EffectWitness::Helper { reason, owner, source }) => serde_json::json!({"kind":"nonpreemptible", "owner_key":owner, "reason":format!("{reason:?}: synchronous helper may run in a nonpreemptible region; loop safepoints are separate potential preemption points, subject to runtime/platform gating"), "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0),"operation":match reason { crate::semantic::concurrency::NonpreemptibleReason::Loop => "synchronous-loop", crate::semantic::concurrency::NonpreemptibleReason::Recursion => "synchronous-recursion" }}}),
                     None => serde_json::json!({"kind":"unavailable"}),
                 };
+                // Fixed-point witnesses may belong to a callee. Capture only
+                // this body's facts; query traversal explains transitive ones.
+                if witness.get("owner_key").is_some_and(|owner| *owner != serde_json::json!(id)) {
+                    return None;
+                }
                 Some(serde_json::json!({"effect":effect.bits(), "witness":witness}))
             }).collect();
             result.semantic.witnesses.insert(id, witnesses);
@@ -608,7 +616,9 @@ pub(crate) fn capture(
                             Expr::MethodCall(call) => types.get(&call.object.id()),
                             _ => None,
                         };
-                        result.interfaces.site(symbols, id, *target, receiver);
+                        result
+                            .interfaces
+                            .site(symbols, id, *target, receiver, e.span());
                     }
                     if let Expr::MethodCall(call) = e
                         && let Some(Type::Named(name) | Type::Generic(name, _)) =
@@ -1087,7 +1097,7 @@ pub(crate) fn snapshot(
             }
         }
     }
-    let interface_functions = interfaces::route(
+    let interface_routing = interfaces::route(
         captured
             .iter()
             .map(|(&unit, capture)| (unit, &capture.interfaces)),
@@ -1196,6 +1206,38 @@ pub(crate) fn snapshot(
             expression.target = Some(target.clone());
         }
     }
+    for (caller, target, span) in interface_routing.calls {
+        if let Some(path) = paths.get(&crate::module::ModuleId(span.file_id.0)) {
+            semantic
+                .effect_calls
+                .entry(caller)
+                .or_default()
+                .push(semantic::EffectCall {
+                    target,
+                    location: Location {
+                        path: path.clone(),
+                        start: span.start,
+                        end: span.end,
+                    },
+                });
+        }
+    }
+    for sites in semantic.effect_calls.values_mut() {
+        // Keep the source call location for both the checked target and its
+        // shared dispatch edge. Asyncness is decided per executable candidate.
+        let dispatch_calls: Vec<_> = sites
+            .iter()
+            .filter_map(|site| {
+                let l = &site.location;
+                let target = dispatch_sites.get(&(l.path.as_str(), l.start, l.end))?;
+                Some(semantic::EffectCall {
+                    target: target.clone(),
+                    location: l.clone(),
+                })
+            })
+            .collect();
+        sites.extend(dispatch_calls);
+    }
     for (key, targets) in edges {
         nodes.get_mut(&key).unwrap().callees = targets.into_iter().collect();
     }
@@ -1203,7 +1245,7 @@ pub(crate) fn snapshot(
         .into_values()
         .chain(dispatch.functions)
         .chain(indirect_functions)
-        .chain(interface_functions)
+        .chain(interface_routing.functions)
         .collect();
     for node in &mut functions {
         if node.synthetic && node.callees.is_empty() {

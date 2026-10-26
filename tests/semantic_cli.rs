@@ -5644,3 +5644,311 @@ fn main() {}
         );
     }
 }
+
+#[test]
+fn task_effect_evidence_keeps_local_sites_and_labels_task_boundaries() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    let source = include_str!("../example/task_effect_evidence.wi");
+    fs::write(f.0.join("src/main.wi"), source).unwrap();
+    for source_mode in [false, true] {
+        for name in ["parent", "child", "waits"] {
+            let mut args = vec!["effects"];
+            if source_mode {
+                args.extend(["--source", "src/main.wi"]);
+            }
+            args.extend([name, "--explain"]);
+            let value = f.json(&args, 0);
+            let result = &value["result"];
+            let expected_path = if source_mode {
+                "main.wi"
+            } else {
+                "src/main.wi"
+            };
+            let start = source.find(&format!("async fn {name}")).unwrap();
+            let end = source[start..].find("\n}").unwrap() + start + 2;
+            for fact in result["compiler_witnesses"].as_array().unwrap() {
+                let loc = &fact["witness"]["cause"]["location"];
+                assert_eq!(loc["path"], expected_path, "{value}");
+                assert!(loc["start"].as_u64().unwrap() >= start as u64, "{value}");
+                assert!(loc["end"].as_u64().unwrap() <= end as u64, "{value}");
+                assert!(
+                    fact["witness"]["owner"]
+                        .as_str()
+                        .is_none_or(|owner| owner == result["selected"]["id"].as_str().unwrap()),
+                    "{value}"
+                );
+            }
+            for key in ["effect_evidence", "compiler_witnesses"] {
+                let mut seen = std::collections::HashSet::new();
+                for fact in result[key].as_array().unwrap() {
+                    assert!(
+                        seen.insert((
+                            fact["effect"].to_string(),
+                            fact["witness"]["cause"]["location"].to_string()
+                        )),
+                        "duplicate: {value}"
+                    );
+                }
+            }
+            let evidence = result["effect_evidence"].as_array().unwrap();
+            if name == "parent" {
+                let send = evidence
+                    .iter()
+                    .find(|fact| fact["witness"]["cause"]["operation"] == "channel-send")
+                    .unwrap();
+                assert_eq!(send["task_relationship"]["kind"], "spawn", "{value}");
+                assert_eq!(send["task_relationship"]["location"]["line"], 13, "{value}");
+                assert_eq!(send["witness"]["cause"]["location"]["line"], 3, "{value}");
+                let wait = evidence
+                    .iter()
+                    .find(|fact| {
+                        fact["effect"] == E::MAY_SUSPEND.bits()
+                            && fact["witness"]["cause"]["operation"] == "await"
+                    })
+                    .unwrap();
+                assert_eq!(wait["task_relationship"]["kind"], "await", "{value}");
+                assert_eq!(wait["task_relationship"]["location"]["line"], 14, "{value}");
+                for explain in [false, true] {
+                    let mut human = args.clone();
+                    if !explain {
+                        human.pop();
+                    }
+                    let out = f.run(&human);
+                    assert!(out.status.success());
+                    let text = String::from_utf8(out.stdout).unwrap();
+                    assert!(
+                        text.contains("task=spawn") && text.contains("task=await"),
+                        "{text}"
+                    );
+                    assert!(
+                        text.contains(&format!("task-site={expected_path}:13:")),
+                        "{text}"
+                    );
+                }
+            } else if name == "child" {
+                assert_eq!(
+                    evidence
+                        .iter()
+                        .filter(|fact| fact["effect"] == E::MAY_SUSPEND.bits())
+                        .count(),
+                    1,
+                    "{value}"
+                );
+                assert!(
+                    evidence
+                        .iter()
+                        .all(|fact| fact["task_relationship"].is_null()),
+                    "{value}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn task_effect_evidence_imports_generics_methods_and_sync_relays() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/order.wi"), "module order;\npub async fn send(ch: Channel<i64>) { ch.send(1); ch.send(2); }\npub fn worker<T>(ch: Channel<i64>, tag: T) -> Task<()> { return send(ch); }\npub class Worker { pub async fn run(self, ch: Channel<i64>) { ch.send(3); } }\n").unwrap();
+    fs::write(f.0.join("src/main.wi"), "import order;\nfn sync_send(ch: Channel<i64>) { ch.send(4); }\nasync fn nested(ch: Channel<i64>) { sync_send(ch); }\nfn relay(ch: Channel<i64>) { nested(ch); }\nasync fn generic(ch: Channel<i64>) { let a = order::worker(ch, 1); let b = order::worker(ch, true); await a; await b; }\nasync fn method(w: order::Worker, ch: Channel<i64>) { await w.run(ch); }\nfn direct(ch: Channel<i64>) { sync_send(ch); }\nfn hop(ch: Channel<i64>) { direct(ch); }\nfn mixed(ch: Channel<i64>) { nested(ch); hop(ch); }\nfn main() {}\n").unwrap();
+    for (name, expected, task) in [
+        ("generic", 2, true),
+        ("method", 1, true),
+        ("relay", 1, true),
+        ("direct", 1, false),
+        ("mixed", 1, false),
+    ] {
+        let value = f.json(&["effects", name, "--explain"], 0);
+        if name == "method" {
+            let panic = value["result"]["effect_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|fact| fact["effect"] == 32)
+                .unwrap();
+            assert_eq!(panic["task_relationship"]["kind"], "await", "{value}");
+        }
+        let sites: Vec<_> = value["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|fact| fact["witness"]["cause"]["operation"] == "channel-send")
+            .collect();
+        assert_eq!(sites.len(), expected, "{value}");
+        for site in sites {
+            assert_eq!(
+                site["task_relationship"]["kind"] == "spawn",
+                task,
+                "{value}"
+            );
+            if task {
+                assert_eq!(
+                    site["task_relationship"]["location"]["path"],
+                    if name == "generic" {
+                        "src/order.wi"
+                    } else {
+                        "src/main.wi"
+                    },
+                    "{value}"
+                );
+            }
+        }
+        for fact in value["result"]["compiler_witnesses"].as_array().unwrap() {
+            assert_ne!(
+                fact["witness"]["cause"]["operation"], "channel-send",
+                "{value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn task_effect_dispatch_candidates_use_body_asyncness_and_call_location() {
+    for interface in [false, true] {
+        for inherited in [false, true] {
+            let f = Fixture::new();
+            let contract = if interface {
+                "interface Reading { fn read(self, ch: Channel<i64>) -> Task<()>; }"
+            } else {
+                "open class Reading { pub open fn read(self, ch: Channel<i64>) -> Task<()> { ch.send(10); return done(); } }"
+            };
+            let sync = if interface {
+                "class SyncReader implements Reading { pub fn read(self, ch: Channel<i64>) -> Task<()> { ch.send(10); return done(); } }"
+            } else {
+                ""
+            };
+            let asynchronous = match (interface, inherited) {
+                (true, false) => {
+                    "class AsyncReader implements Reading { pub async fn read(self, ch: Channel<i64>) { ch.send(20); } }"
+                }
+                (true, true) => {
+                    "open class Parent { pub async fn read(self, ch: Channel<i64>) { ch.send(20); } }\nclass AsyncReader extends Parent implements Reading {}"
+                }
+                (false, false) => {
+                    "class AsyncReader extends Reading { pub override async fn read(self, ch: Channel<i64>) { ch.send(20); } }"
+                }
+                (false, true) => {
+                    "open class Parent extends Reading { pub override async fn read(self, ch: Channel<i64>) { ch.send(20); } }\nclass AsyncReader extends Parent {}"
+                }
+            };
+            let source = format!(
+                "async fn done() {{}}\n{contract}\n{sync}\n{asynchronous}\nfn invoke(r: Reading, ch: Channel<i64>) -> Task<()> {{ return r.read(ch); }}\nfn main() {{}}\n"
+            );
+            fs::write(f.0.join("src/main.wi"), &source).unwrap();
+            let line = |needle| {
+                source[..source.find(needle).unwrap()]
+                    .bytes()
+                    .filter(|&b| b == b'\n')
+                    .count()
+                    + 1
+            };
+            let value = f.json(&["effects", "invoke", "--explain"], 0);
+            let sites: Vec<_> = value["result"]["effect_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|fact| fact["witness"]["cause"]["operation"] == "channel-send")
+                .collect();
+            assert_eq!(
+                sites.len(),
+                2,
+                "interface={interface} inherited={inherited}: {value}"
+            );
+            for (needle, spawned) in [("ch.send(10)", false), ("ch.send(20)", true)] {
+                let site = sites
+                    .iter()
+                    .find(|site| site["witness"]["cause"]["location"]["line"] == line(needle))
+                    .unwrap();
+                assert_eq!(
+                    site["task_relationship"]["kind"] == "spawn",
+                    spawned,
+                    "interface={interface} inherited={inherited}: {value}"
+                );
+                if spawned {
+                    assert_eq!(
+                        site["task_relationship"]["location"]["path"], "src/main.wi",
+                        "{value}"
+                    );
+                    assert_eq!(
+                        site["task_relationship"]["location"]["line"],
+                        line("return r.read"),
+                        "{value}"
+                    );
+                    let start = site["task_relationship"]["location"]["start"]
+                        .as_u64()
+                        .unwrap() as usize;
+                    let end = site["task_relationship"]["location"]["end"]
+                        .as_u64()
+                        .unwrap() as usize;
+                    assert_eq!(&source[start..end], "read", "{value}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn task_effect_dispatch_imported_and_keyed_contracts_keep_call_site() {
+    for kind in ["interface", "generic", "virtual"] {
+        let f = Fixture::new();
+        let (contract, ty, sync, asynchronous, noise) = match kind {
+            "interface" => (
+                "pub interface Reading { fn read(self, ch: Channel<i64>) -> Task<()>; }",
+                "Reading",
+                "class SyncReader implements order::Reading { pub fn read(self, ch: Channel<i64>) -> Task<()> { ch.send(10); return done(); } }",
+                "class AsyncReader implements order::Reading { pub async fn read(self, ch: Channel<i64>) { ch.send(20); } }",
+                "",
+            ),
+            "generic" => (
+                "pub interface Reading<T> { fn read(self, ch: Channel<i64>) -> Task<()>; }",
+                "Reading<i64>",
+                "class SyncReader implements order::Reading<i64> { pub fn read(self, ch: Channel<i64>) -> Task<()> { ch.send(10); return done(); } }",
+                "class AsyncReader implements order::Reading<i64> { pub async fn read(self, ch: Channel<i64>) { ch.send(20); } }",
+                "",
+            ),
+            _ => (
+                "pub open class Reading { pub open fn read(self, ch: Channel<i64>) -> Task<()> { ch.send(10); return done(); } }",
+                "Reading",
+                "",
+                "class AsyncReader extends order::Reading { pub override async fn read(self, ch: Channel<i64>) { ch.send(20); } }",
+                "",
+            ),
+        };
+        let api = format!(
+            "module order;\n{contract}\npub fn invoke(r: {ty}, ch: Channel<i64>) -> Task<()> {{ return r.read(ch); }}\nasync fn done() {{}}\n"
+        );
+        fs::write(f.0.join("src/order.wi"), &api).unwrap();
+        fs::write(f.0.join("src/main.wi"), format!("import order;\nasync fn done() {{}}\n{sync}\n{asynchronous}\n{noise}\nfn main() {{}}\n")).unwrap();
+        let value = f.json(&["effects", "order::invoke", "--explain"], 0);
+        let sites: Vec<_> = value["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|fact| fact["witness"]["cause"]["operation"] == "channel-send")
+            .collect();
+        assert_eq!(sites.len(), 2, "{kind}: {value}");
+        let spawned: Vec<_> = sites
+            .iter()
+            .filter(|fact| fact["task_relationship"]["kind"] == "spawn")
+            .collect();
+        assert_eq!(spawned.len(), 1, "{kind}: {value}");
+        let fact = spawned[0];
+        assert_eq!(
+            fact["witness"]["cause"]["location"]["path"], "src/main.wi",
+            "{value}"
+        );
+        assert_eq!(fact["witness"]["cause"]["location"]["line"], 4, "{value}");
+        assert_eq!(
+            fact["task_relationship"]["location"]["path"], "src/order.wi",
+            "{value}"
+        );
+        assert_eq!(fact["task_relationship"]["location"]["line"], 3, "{value}");
+        let start = fact["task_relationship"]["location"]["start"]
+            .as_u64()
+            .unwrap() as usize;
+        let end = fact["task_relationship"]["location"]["end"]
+            .as_u64()
+            .unwrap() as usize;
+        assert_eq!(&api[start..end], "read", "{value}");
+    }
+}

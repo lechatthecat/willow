@@ -1,0 +1,48 @@
+// Query interface_read and virtual_read with `willow effects --source ... --explain`.
+interface Reading extends Sync {
+    fn read(self, ch: Channel<i64>) -> Task<()>;
+}
+async fn done() {}
+class SyncReader implements Reading {
+    pub fn read(self, ch: Channel<i64>) -> Task<()> {
+        ch.send(10);
+        return done();
+    }
+}
+class AsyncReader implements Reading {
+    pub async fn read(self, ch: Channel<i64>) { ch.send(20); }
+}
+open class Base {
+    pub open fn read(self, ch: Channel<i64>) -> Task<()> {
+        ch.send(30);
+        return done();
+    }
+}
+class AsyncOverride extends Base {
+    pub override async fn read(self, ch: Channel<i64>) { ch.send(40); }
+}
+async fn interface_read(r: Reading, ch: Channel<i64>) -> i64 {
+    await r.read(ch);
+    return ch.recv();
+}
+async fn virtual_read(r: Base, ch: Channel<i64>) -> i64 {
+    await r.read(ch);
+    return ch.recv();
+}
+async fn main() {
+    println(await interface_read(new AsyncReader(), Channel<i64>::new()));
+    println(await interface_read(new SyncReader(), Channel<i64>::new()));
+    println(await virtual_read(new AsyncOverride(), Channel<i64>::new()));
+    println(await virtual_read(new Base(), Channel<i64>::new()));
+    let worker_channel = Channel<i64>::with_capacity(1);
+    invoke_worker(worker_wrapper, worker_channel);
+    println(worker_channel.recv());
+}
+
+
+// Query invoke_worker: evidence stays at f(ch), with the spawn at worker(ch).
+fn invoke_worker(f: fn(Channel<i64>) -> i64, ch: Channel<i64>) -> i64 {
+    return f(ch);
+}
+async fn worker(ch: Channel<i64>) { ch.send(50); }
+fn worker_wrapper(ch: Channel<i64>) -> i64 { worker(ch); return 1; }

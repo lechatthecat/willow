@@ -682,6 +682,9 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
                     detail.push_str(&format!("; {name}={value}"));
                 }
             }
+            if let Some(task) = task_relationship_label(fact) {
+                detail.push_str(&format!("; {task}"));
+            }
             if witness["cause"]["location"].is_object() {
                 detail.push_str(&format!(" at {}", location(&witness["cause"]["location"])));
             }
@@ -695,6 +698,19 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
         }
     }
     lines.push(result["meaning"].as_str().unwrap_or("").into());
+}
+
+fn task_relationship_label(fact: &Value) -> Option<String> {
+    let task = &fact["task_relationship"];
+    let kind = task["kind"].as_str()?;
+    if task["location"] == fact["witness"]["cause"]["location"] {
+        Some(format!("task={kind}"))
+    } else {
+        Some(format!(
+            "task={kind}; task-site={}",
+            location(&task["location"])
+        ))
+    }
 }
 
 /// `table: Mutex<Map<i64, i64>>` for the value a `lock` statement acquires,
@@ -721,7 +737,7 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
     use std::collections::{HashMap, HashSet};
     // Facts merged at one site keep one field per key; distinct values of a
     // key are listed together so a merged line never repeats `status=`/`kind=`.
-    const KEYS: [&str; 7] = [
+    const KEYS: [&str; 8] = [
         "status",
         "kind",
         "via",
@@ -729,6 +745,7 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
         "owner",
         "operation",
         "locked",
+        "task",
     ];
     #[derive(Default)]
     struct Entry {
@@ -781,6 +798,9 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
         let entry = &mut entries[index];
         entry.bits |= fact["effect"].as_u64().unwrap_or(0);
         let locked = locked_label(cause);
+        let task = task_relationship_label(fact)
+            .map(|label| Value::from(label.trim_start_matches("task=")))
+            .unwrap_or(Value::Null);
         for (key, value) in [
             &fact["status"],
             &witness["kind"],
@@ -789,6 +809,7 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
             &witness["owner"],
             &cause["operation"],
             &locked,
+            &task,
         ]
         .into_iter()
         .enumerate()

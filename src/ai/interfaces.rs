@@ -10,13 +10,13 @@ use super::*;
 use crate::semantic::symbols::SymbolTable;
 use std::collections::HashSet;
 
-/// `sites`: (caller, interface method, receiver key); `targets`: (interface
+/// `sites`: (caller, interface method, receiver key, source span); `targets`: (interface
 /// method, implementation, every instantiation key its class implements, or
 /// `None` when any of them is unknown); `monos`: (method of a `$mono$`
 /// instance, the same method of its template).
 #[derive(Default)]
 pub(super) struct Captured {
-    sites: Vec<(FunctionId, FunctionId, Option<String>)>,
+    sites: Vec<(FunctionId, FunctionId, Option<String>, Span)>,
     targets: Vec<(FunctionId, FunctionId, Option<Vec<String>>)>,
     monos: Vec<(FunctionId, FunctionId)>,
 }
@@ -32,6 +32,7 @@ impl Captured {
         caller: FunctionId,
         target: FunctionId,
         receiver: Option<&Type>,
+        span: Span,
     ) {
         let Some(interface) = generic_interface(symbols, target) else {
             return;
@@ -44,7 +45,7 @@ impl Captured {
                 }))
             })
             .and_then(|receiver| symbols.interface_instance_key(receiver));
-        self.sites.push((caller, target, key));
+        self.sites.push((caller, target, key, span));
     }
 
     /// The implementations of the unit's generic interface methods, keyed by
@@ -136,6 +137,12 @@ struct Method {
     wild: BTreeSet<String>,
 }
 
+pub(super) struct Routing {
+    pub functions: Vec<Function>,
+    /// One source-bearing edge per routed call site, not sites × candidates.
+    pub calls: Vec<(String, String, Span)>,
+}
+
 /// Reroute `edges` of callers whose every call of a known, complete generic
 /// interface method is keyed; returns the new unions. Linear in sites +
 /// targets + distinct (method, key) pairs: each union holds its own targets
@@ -145,12 +152,13 @@ pub(super) fn route<'a>(
     nodes: &HashMap<Key, Function>,
     resolve: &impl Fn(UnitId, FunctionId) -> Key,
     edges: &mut HashMap<Key, BTreeSet<String>>,
-) -> Vec<Function> {
+) -> Routing {
     // Units see one implementation through different aliases; a unit that
     // cannot resolve them yields no key, and any unit's key is the class's.
     let mut implemented = HashMap::<(Key, &str), Option<BTreeSet<&String>>>::new();
     let mut calls = HashMap::<(Key, Key), Option<BTreeSet<&str>>>::new();
     let mut monos = Vec::new();
+    let mut source_sites = HashMap::<(Key, Key), Vec<(Option<&str>, Span)>>::new();
     for (unit, capture) in captured {
         monos.extend(
             capture
@@ -168,7 +176,11 @@ pub(super) fn route<'a>(
                 }
             }
         }
-        for (caller, method, key) in &capture.sites {
+        for (caller, method, key, span) in &capture.sites {
+            source_sites
+                .entry((resolve(unit, *caller), resolve(unit, *method)))
+                .or_default()
+                .push((key.as_deref(), *span));
             let keys = calls
                 .entry((resolve(unit, *caller), resolve(unit, *method)))
                 .or_insert_with(|| Some(BTreeSet::new()));
@@ -220,6 +232,7 @@ pub(super) fn route<'a>(
         }
     }
     let mut functions = Vec::new();
+    let mut routed_calls = Vec::new();
     let mut made = HashSet::new();
     for ((caller, method_key), keys) in calls {
         let (Some(keys), Some(method), Some(node)) =
@@ -237,6 +250,7 @@ pub(super) fn route<'a>(
         if !caller_edges.remove(&node.id) {
             continue;
         }
+        let mut routed = HashMap::new();
         for key in keys {
             // No implementation of this instantiation is known: keep the
             // whole union rather than claim the call reaches nothing.
@@ -246,6 +260,7 @@ pub(super) fn route<'a>(
             }
             let id = hash(serde_json::to_vec(&(&node.id, key)).unwrap());
             caller_edges.insert(id.clone());
+            routed.insert(key, id.clone());
             if !made.insert(id.clone()) {
                 continue;
             }
@@ -270,8 +285,19 @@ pub(super) fn route<'a>(
             }
             functions.push(union(id, node, key, callees));
         }
+        for (key, span) in source_sites
+            .remove(&(caller, method_key))
+            .unwrap_or_default()
+        {
+            if let Some(target) = key.and_then(|key| routed.get(key)) {
+                routed_calls.push((nodes[&caller].id.clone(), target.clone(), span));
+            }
+        }
     }
-    functions
+    Routing {
+        functions,
+        calls: routed_calls,
+    }
 }
 
 fn union(id: String, method: &Function, key: &str, mut callees: Vec<String>) -> Function {
@@ -357,7 +383,9 @@ mod tests {
         let mut interfaces = Captured::default();
         interfaces.targets.push((method, a, Some(vec!["a".into()])));
         interfaces.targets.push((method, b, Some(vec!["b".into()])));
-        interfaces.sites.push((caller, method, Some("a".into())));
+        interfaces
+            .sites
+            .push((caller, method, Some("a".into()), Span::dummy()));
         let nodes = HashMap::from([
             ((unit, method), node("I::m", bits)),
             ((unit, a), node("A::m", 0)),
@@ -371,6 +399,16 @@ mod tests {
             &|unit, id| (unit, id),
             &mut edges,
         );
+        assert_eq!(unions.calls.len(), 1);
+        assert_eq!(
+            unions.calls[0],
+            (
+                "caller".into(),
+                unions.functions[0].id.clone(),
+                Span::dummy()
+            )
+        );
+        let unions = unions.functions;
         assert_eq!(unions.len(), 1);
         assert_eq!(unions[0].callees, ["A::m"]);
         assert_eq!(unions[0].runtime_effects, bits);

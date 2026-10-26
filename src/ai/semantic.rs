@@ -23,9 +23,19 @@ pub struct SemanticFacts {
     pub witnesses: BTreeMap<String, Vec<Value>>,
     pub compiler_effects: BTreeMap<String, u8>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub effect_calls: BTreeMap<String, Vec<EffectCall>>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub async_functions: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unresolved_calls: BTreeMap<String, Vec<UnresolvedCall>>,
     #[serde(default, skip_serializing_if = "graph::Instances::is_empty")]
     pub instances: graph::Instances,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectCall {
+    pub target: String,
+    pub location: Location,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +86,7 @@ impl std::ops::Deref for CaptureContext<'_> {
 #[derive(Default)]
 pub(super) struct Captured {
     pub rename_relations: super::rename::Relations,
+    pub async_functions: std::collections::HashSet<FunctionId>,
     bodies: Vec<Body>,
     pub call_sites: Vec<(FunctionId, Span, Option<FunctionId>, String)>,
     pub witnesses: HashMap<FunctionId, Vec<Value>>,
@@ -188,10 +199,13 @@ impl Captured {
             )
         };
         if let Some(witnesses) = self.witnesses.get_mut(&function) {
+            let site = json!(span);
             for entry in witnesses {
                 let witness = &mut entry["witness"];
-                if witness["cause"]["operation"] == "await"
-                    && witness["cause"]["span"] == json!(span)
+                // Panic witnesses reconstruct spans without line/column caches.
+                if ["file_id", "start", "end"]
+                    .iter()
+                    .all(|key| witness["cause"]["span"][key] == site[key])
                 {
                     witness["awaited_type"] = json!(operand);
                     witness["reason"] = json!(reason);
@@ -241,11 +255,46 @@ pub(super) fn finish(
             end: span.end,
         })
     };
-    let mut result = SemanticFacts::default();
+    let async_functions = captures
+        .iter()
+        .flat_map(|(&unit, capture)| {
+            capture
+                .semantic
+                .async_functions
+                .iter()
+                .filter_map(move |&id| {
+                    functions
+                        .get(&resolve(unit, id))
+                        .map(|function| function.id.clone())
+                })
+        })
+        .collect();
+    let mut result = SemanticFacts {
+        async_functions,
+        ..SemanticFacts::default()
+    };
     let mut units: Vec<_> = captures.keys().copied().collect();
     units.sort();
     for unit in units {
         for (caller, span, target, operation) in &captures[&unit].semantic.call_sites {
+            // Virtual calls may deliberately have no single checked target.
+            // Their receiver/method identity still locates the dispatch edge.
+            let effect_target = captures[&unit].dispatch_sites.get(span).or(target.as_ref());
+            if let Some(target) = effect_target
+                && let (Some(caller), Some(target)) = (
+                    functions.get(&resolve(unit, *caller)),
+                    functions.get(&resolve(unit, *target)),
+                )
+            {
+                result
+                    .effect_calls
+                    .entry(caller.id.clone())
+                    .or_default()
+                    .push(EffectCall {
+                        target: target.id.clone(),
+                        location: location(*span)?,
+                    });
+            }
             // Calls whose effects are already known without a body (variant
             // constructors, intrinsics) do not explain an unknown caller.
             if target.is_some_and(|target| {
@@ -371,7 +420,61 @@ pub(super) fn finish(
             }
         }
     }
+    for facts in result.witnesses.values_mut() {
+        deduplicate_evidence(facts);
+    }
     Ok(result)
+}
+
+/// Disjoint sorted declaration ranges support local-site membership without
+/// multiplying the number of witnesses by the number of declaration ranges.
+fn local_ranges(locations: &[Location]) -> Vec<(&str, usize, usize)> {
+    let mut ranges: Vec<_> = locations
+        .iter()
+        .map(|l| (l.path.as_str(), l.start, l.end))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(&str, usize, usize)> = Vec::with_capacity(ranges.len());
+    for (path, start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && last.0 == path
+            && start <= last.2
+        {
+            last.2 = last.2.max(end);
+        } else {
+            merged.push((path, start, end));
+        }
+    }
+    merged
+}
+
+/// One source site/effect is one explanation, even when both the compiler
+/// and runtime ABI observed it. Keep source-less evidence independent.
+fn deduplicate_evidence(facts: &mut Vec<Value>) {
+    let mut seen = HashMap::new();
+    let mut unique: Vec<Value> = Vec::with_capacity(facts.len());
+    for fact in facts.drain(..) {
+        let location = &fact["witness"]["cause"]["location"];
+        if !location.is_object() {
+            unique.push(fact);
+            continue;
+        }
+        let key = (fact["effect"].as_u64(), location.to_string());
+        if let Some(&index) = seen.get(&key) {
+            // Channel capability has the precise parking explanation and a
+            // canonical operation name, unlike the generic compiler wait fact.
+            if fact["witness"]["cause"]["operation"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("channel-"))
+            {
+                unique[index] = fact;
+            }
+        } else {
+            seen.insert(key, unique.len());
+            unique.push(fact);
+        }
+    }
+    *facts = unique;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -440,6 +543,7 @@ pub struct QuerySession {
     /// sorted by `(start, end)`; values index `semantic.references`.
     typed_calls: HashMap<String, Vec<(usize, usize, usize)>>,
     callees: Vec<Vec<usize>>,
+    async_functions: std::collections::HashSet<usize>,
     dispatch_callers: Vec<Vec<usize>>,
     indirect_references: HashMap<Type, Vec<usize>>,
     pub queries: usize,
@@ -463,7 +567,7 @@ const WRITE: u8 = 2;
 impl QuerySession {
     pub fn new(snapshot: Snapshot) -> Result<Self> {
         snapshot.validate()?;
-        let functions = snapshot
+        let functions: HashMap<String, usize> = snapshot
             .functions
             .iter()
             .enumerate()
@@ -643,6 +747,12 @@ impl QuerySession {
             calls.sort_unstable();
         }
         let names = display::TypeNames::new(&snapshot);
+        let async_functions = snapshot
+            .semantic
+            .async_functions
+            .iter()
+            .filter_map(|id| functions.get(id).copied())
+            .collect();
         Ok(Self {
             packages,
             names,
@@ -655,6 +765,7 @@ impl QuerySession {
             positions,
             typed_calls,
             callees,
+            async_functions,
             dispatch_callers,
             indirect_references,
             queries: 0,
@@ -1048,9 +1159,24 @@ impl QuerySession {
                     // the reaching function rather than the foreign body. They are
                     // visited only after every directly reachable function, so a
                     // body reachable both ways keeps its own evidence.
-                    let mut foreign = std::collections::VecDeque::<(usize, usize, usize)>::new();
+                    // Queue provenance with the edge; do not assign it to a body
+                    // until that path wins against directly reachable paths.
+                    let mut foreign =
+                        std::collections::VecDeque::<(usize, usize, usize, Option<Value>)>::new();
+                    let mut unlocated_foreign = std::collections::VecDeque::new();
                     let mut origins: HashMap<usize, usize> = HashMap::new();
                     let mut call_sites: HashMap<usize, Option<Value>> = HashMap::new();
+                    let mut task_routes: HashMap<usize, Value> = HashMap::new();
+                    // Shared dispatch nodes carry a call site, not a task
+                    // boundary. Only an async executable candidate starts one.
+                    let mut dispatch_sites: HashMap<usize, Value> = HashMap::new();
+                    // Prefer a synchronous path when a body is reachable both
+                    // in this task and in a spawned task. Each body still runs
+                    // through the evidence walk only once.
+                    let mut tasks = std::collections::VecDeque::<(usize, usize, Value)>::new();
+                    // Some compiler graph edges bypass a shared dispatch node.
+                    // Defer these until its source-bearing path has been visited.
+                    let mut unlocated_tasks = std::collections::VecDeque::<(usize, usize)>::new();
                     let nested = |k: usize| {
                         self.snapshot.functions[k].locations.iter().any(|inner| {
                             f.locations.iter().any(|outer| {
@@ -1069,11 +1195,45 @@ impl QuerySession {
                     loop {
                         let (j, via) = if let Some(next) = queue.pop_front() {
                             next
-                        } else if let Some((k, j, origin)) = foreign.pop_front() {
+                        } else if let Some((k, j, route)) = tasks.pop_front() {
+                            if !seen.insert(k) {
+                                continue;
+                            }
+                            task_routes.insert(k, route);
+                            witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
+                            (k, Some(j))
+                        } else if let Some((k, j, origin, call)) = foreign
+                            .pop_front()
+                            .or_else(|| unlocated_foreign.pop_front())
+                        {
                             if !seen.insert(k) {
                                 continue;
                             }
                             origins.insert(k, origin);
+                            if let Some(route) = task_routes.get(&j) {
+                                task_routes.insert(k, route.clone());
+                            } else if self.async_functions.contains(&k) {
+                                let mut route = call.unwrap_or_else(|| json!({
+                                    "kind":"spawn", "function":self.snapshot.functions[j].id,
+                                    "location":null,
+                                    "reason":"No source call site is available for this async graph edge."
+                                }));
+                                route["target"] = json!(self.snapshot.functions[k].id);
+                                task_routes.insert(k, route);
+                            } else if self.snapshot.functions[k].synthetic
+                                && let Some(call) = call
+                            {
+                                dispatch_sites.insert(k, call);
+                            }
+                            witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
+                            (k, Some(j))
+                        } else if let Some((k, j)) = unlocated_tasks.pop_front() {
+                            if !seen.insert(k) {
+                                continue;
+                            }
+                            task_routes.insert(k, json!({"kind":"spawn", "function":self.snapshot.functions[j].id,
+                                "target":self.snapshot.functions[k].id, "location":null,
+                                "reason":"No source call site is available for this async graph edge."}));
                             witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
                             (k, Some(j))
                         } else {
@@ -1134,39 +1294,99 @@ impl QuerySession {
                                 {
                                     continue;
                                 }
-                                if effect == u64::from(RuntimeEffects::MAY_SUSPEND.bits())
+                                let channel = effect
+                                    == u64::from(RuntimeEffects::MAY_SUSPEND.bits())
                                     && fact["witness"]["cause"]["operation"]
                                         .as_str()
-                                        .is_some_and(|op| op.starts_with("channel-"))
-                                {
-                                    suspension_sites.push(json!({"effect":effect,"status":if fact["witness"]["cause"]["location"].is_object() {"conservative-bound"} else {"missing-source"},
-                                        "via_function":self.snapshot.functions[via_function].id,"witness":fact["witness"]}));
-                                    continue;
-                                }
-                                let entry = evidence.entry(effect).or_insert(Value::Null);
-                                if !entry.is_null()
-                                    && !prefer_allocation(
-                                        effect as u8,
-                                        &fact["witness"],
-                                        &entry["witness"],
-                                    )
+                                        .is_some_and(|op| op.starts_with("channel-"));
+                                if !channel
+                                    && evidence.get(&effect).is_some_and(|entry: &Value| {
+                                        !prefer_allocation(
+                                            effect as u8,
+                                            &fact["witness"],
+                                            &entry["witness"],
+                                        )
+                                    })
                                 {
                                     continue;
                                 }
-                                *entry = json!({"effect":effect,
+                                let mut explained = json!({"effect":effect,
                                     "status":evidence_status(&fact["witness"]),
                                     "via_function":self.snapshot.functions[via_function].id,"witness":fact["witness"]});
+                                if let Some(route) = task_routes.get(&j) {
+                                    explained["task_relationship"] = route.clone();
+                                } else if fact["witness"]["cause"]["operation"] == "await"
+                                    || fact["witness"].get("awaited_type").is_some()
+                                {
+                                    explained["task_relationship"] = json!({"kind":"await", "function":self.snapshot.functions[via_function].id,
+                                        "location":fact["witness"]["cause"]["location"]});
+                                }
+                                if channel {
+                                    suspension_sites.push(explained);
+                                } else {
+                                    evidence.insert(effect, explained);
+                                }
                             }
                         }
+                        let sites: HashMap<_, _> = self
+                            .snapshot
+                            .semantic
+                            .effect_calls
+                            .get(&cause.id)
+                            .into_iter()
+                            .flatten()
+                            .map(|site| (site.target.as_str(), site))
+                            .collect();
                         let bucket = cause.id.starts_with("$indirect-arity:");
                         for &k in &self.callees[j] {
                             self.effect_edge_visits += 1;
                             let origin = origin.or(via.filter(|_| bucket && !nested(k)));
+                            if seen.contains(&k) {
+                                continue;
+                            }
+                            let target = &self.snapshot.functions[k];
+                            let asynchronous = self.async_functions.contains(&k);
+                            let call = if asynchronous || target.synthetic {
+                                sites
+                                    .get(target.id.as_str())
+                                    .map(|site| {
+                                        json!({"kind":"spawn", "function":cause.id,
+                                            "target":target.id, "location":site.location})
+                                    })
+                                    .or_else(|| dispatch_sites.get(&j).cloned())
+                            } else {
+                                None
+                            };
                             if let Some(origin) = origin {
-                                if !seen.contains(&k) {
-                                    foreign.push_back((k, j, origin));
+                                let pending = (k, j, origin, call);
+                                if asynchronous
+                                    && pending.3.is_none()
+                                    && !task_routes.contains_key(&j)
+                                {
+                                    unlocated_foreign.push_back(pending);
+                                } else {
+                                    foreign.push_back(pending);
                                 }
-                            } else if seen.insert(k) {
+                            } else {
+                                if asynchronous {
+                                    if let Some(mut route) = task_routes.get(&j).cloned().or(call) {
+                                        if !task_routes.contains_key(&j) {
+                                            route["target"] = json!(target.id);
+                                        }
+                                        tasks.push_back((k, j, route));
+                                    } else {
+                                        unlocated_tasks.push_back((k, j));
+                                    }
+                                    continue;
+                                } else if target.synthetic
+                                    && let Some(call) = call
+                                {
+                                    dispatch_sites.insert(k, call);
+                                }
+                                seen.insert(k);
+                                if let Some(route) = task_routes.get(&j) {
+                                    task_routes.insert(k, route.clone());
+                                }
                                 queue.push_back((k, Some(j)));
                                 witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
                             }
@@ -1196,14 +1416,41 @@ impl QuerySession {
                     }
                     let mut evidence: Vec<_> = evidence.into_values().collect();
                     evidence.extend(suspension_sites);
+                    deduplicate_evidence(&mut evidence);
                     self.present_lock_types(&mut evidence);
                     let mut compiler_witnesses =
                         self.snapshot.semantic.witnesses.get(&f.id).cloned();
                     if let Some(facts) = &mut compiler_witnesses {
+                        let ranges = local_ranges(&f.locations);
+                        facts.retain(|fact| {
+                            let w = &fact["witness"];
+                            let loc = &w["cause"]["location"];
+                            let (Some(path), Some(start), Some(end)) = (
+                                loc["path"].as_str(),
+                                loc["start"].as_u64(),
+                                loc["end"].as_u64(),
+                            ) else {
+                                return false;
+                            };
+                            let index =
+                                ranges.partition_point(|&(p, s, _)| (p, s as u64) <= (path, start));
+                            w["owner"].as_str().is_none_or(|owner| owner == f.id)
+                                && index.checked_sub(1).is_some_and(|index| {
+                                    let (p, _, e) = ranges[index];
+                                    p == path && start <= end && end <= e as u64
+                                })
+                        });
+                        deduplicate_evidence(facts);
                         self.present_lock_types(facts);
                         // Every evidence line carries a status, local ones too.
                         for fact in facts.iter_mut() {
                             fact["status"] = json!(evidence_status(&fact["witness"]));
+                            if fact["witness"]["cause"]["operation"] == "await"
+                                || fact["witness"].get("awaited_type").is_some()
+                            {
+                                fact["task_relationship"] = json!({"kind":"await", "function":f.id,
+                                    "location":fact["witness"]["cause"]["location"]});
+                            }
                         }
                     }
                     json!({"status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
@@ -1614,6 +1861,183 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn task_effect_local_ranges_merge_overlap_and_keep_source_boundaries() {
+        let locations: Vec<_> = [
+            ("b", 1, 4),
+            ("a", 10, 20),
+            ("a", 2, 8),
+            ("a", 4, 6),
+            ("a", 8, 12),
+            ("a", 30, 40),
+        ]
+        .into_iter()
+        .map(|(path, start, end)| Location {
+            path: path.into(),
+            start,
+            end,
+        })
+        .collect();
+        assert_eq!(
+            local_ranges(&locations),
+            vec![("a", 2, 20), ("a", 30, 40), ("b", 1, 4)]
+        );
+        assert!(local_ranges(&[]).is_empty());
+    }
+
+    #[test]
+    fn task_effect_dispatch_mixed_candidates_scale_without_cross_products() {
+        let directory =
+            std::env::temp_dir().join(format!("willow-dispatch-evidence-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("main.wi");
+        for n in [8, 32, 128] {
+            let mut source = String::from(
+                "interface Reading<T> { fn read(self, ch: Channel<i64>) -> Task<()>; }\nasync fn done() {}\n",
+            );
+            for i in 0..n {
+                source.push_str(&format!("class Sync{i} implements Reading<i64> {{ pub fn read(self, ch: Channel<i64>) -> Task<()> {{ ch.send(10); return done(); }} }}\nclass Async{i} implements Reading<i64> {{ pub async fn read(self, ch: Channel<i64>) {{ ch.send(20); }} }}\n"));
+            }
+            source.push_str("fn invoke(r: Reading<i64>, ch: Channel<i64>) -> Task<()> { return r.read(ch); }\nfn main() {}\n");
+            std::fs::write(&path, &source).unwrap();
+            let snapshot = crate::CompilerSession::new(
+                path.to_str().unwrap(),
+                "",
+                &crate::CompilerOptions::debug(),
+                None,
+            )
+            .analysis_with_emitter(&mut crate::diagnostics::HumanEmitter)
+            .unwrap();
+            let function = snapshot
+                .functions
+                .iter()
+                .find(|f| f.name == "invoke")
+                .unwrap()
+                .id
+                .clone();
+            let stored = snapshot
+                .semantic
+                .effect_calls
+                .values()
+                .map(Vec::len)
+                .sum::<usize>();
+            assert!(stored <= n + 3, "n={n} stored={stored}");
+            let snapshot: Snapshot =
+                serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
+            let revision = snapshot.revision.clone();
+            let mut session = QuerySession::new(snapshot).unwrap();
+            let value = session.query(QueryRequest::Effects { revision, function });
+            let sites: Vec<_> = value["result"]["effect_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|fact| fact["witness"]["cause"]["operation"] == "channel-send")
+                .collect();
+            assert_eq!(sites.len(), 2 * n, "{value}");
+            let spawned: Vec<_> = sites
+                .iter()
+                .filter(|fact| fact["task_relationship"]["kind"] == "spawn")
+                .collect();
+            assert_eq!(spawned.len(), n, "{value}");
+            let start = source.find("r.read(ch)").unwrap() + 2;
+            assert!(
+                spawned
+                    .iter()
+                    .all(|fact| fact["task_relationship"]["location"]["start"] == start),
+                "{value}"
+            );
+            assert!(session.effect_edge_visits <= 4 * n + 4);
+            println!(
+                "mixed candidates={}: stored calls={stored}, emitted sends={}, spawned={}, visited edges={}",
+                2 * n,
+                sites.len(),
+                spawned.len(),
+                session.effect_edge_visits
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn task_effect_evidence_scales_with_sites_and_reachable_edges() {
+        let directory =
+            std::env::temp_dir().join(format!("willow-task-evidence-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("main.wi");
+        for n in [8, 32, 128] {
+            let mut source = format!(
+                "async fn leaf(ch: Channel<i64>) {{ {} }}\n",
+                "ch.send(1);".repeat(n)
+            );
+            for i in 0..n {
+                let callee = if i == 0 {
+                    "leaf".to_owned()
+                } else {
+                    format!("relay{}", i - 1)
+                };
+                source.push_str(&format!(
+                    "async fn relay{i}(ch: Channel<i64>) {{ {callee}(ch); {callee}(ch); }}\n"
+                ));
+            }
+            source.push_str("fn main() { let ch = Channel<i64>::new();");
+            for i in 0..n {
+                source.push_str(&format!("relay{i}(ch);"));
+            }
+            source.push('}');
+            std::fs::write(&path, source).unwrap();
+            let snapshot = crate::CompilerSession::new(
+                path.to_str().unwrap(),
+                "",
+                &crate::CompilerOptions::debug(),
+                None,
+            )
+            .analysis_with_emitter(&mut crate::diagnostics::HumanEmitter)
+            .unwrap();
+            assert_eq!(
+                snapshot
+                    .semantic
+                    .effect_calls
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                3 * n
+            );
+            // Task edges survive persisted snapshots, including generic-free IDs.
+            let snapshot: Snapshot =
+                serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
+            let function = snapshot
+                .functions
+                .iter()
+                .find(|f| f.name == "main")
+                .unwrap()
+                .id
+                .clone();
+            let revision = snapshot.revision.clone();
+            let mut session = QuerySession::new(snapshot).unwrap();
+            let result = session.query(QueryRequest::Effects { revision, function });
+            let sends: Vec<_> = result["result"]["effect_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|fact| fact["witness"]["cause"]["operation"] == "channel-send")
+                .collect();
+            assert_eq!(sends.len(), n);
+            assert!(
+                sends
+                    .iter()
+                    .all(|fact| fact["task_relationship"]["kind"] == "spawn")
+            );
+            assert_eq!(session.effect_edge_visits, 2 * n);
+            println!(
+                "task sites={} send sites={n} emitted sends={} edge visits={}",
+                3 * n,
+                sends.len(),
+                session.effect_edge_visits
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn channel_capture_keeps_summary_scans_bounded() {
         for n in [1, 8, 64, 512] {

@@ -460,3 +460,81 @@ fn closure_effects_foreign_candidates_visit_each_edge_once() {
         println!("foreign candidates n={n} effect_edge_visits={visits}");
     }
 }
+
+#[test]
+fn closure_effects_foreign_sync_wrapper_tracks_async_transition() {
+    for (asynchronous, depth) in [(false, 1), (true, 1), (true, 8), (true, 32), (true, 128)] {
+        let mut source = format!(
+            "fn apply(f: fn(Channel<i64>) -> i64, ch: Channel<i64>) -> i64 {{ return f(ch); }}\n{}fn worker(ch: Channel<i64>) {{ ch.send(1); }}\nfn wrapper(ch: Channel<i64>) -> i64 {{ worker(ch); return 1; }}\nfn main() {{ apply(relay_0, Channel<i64>::with_capacity(1)); }}",
+            if asynchronous { "async " } else { "" }
+        );
+        for i in 0..depth {
+            let next = if i + 1 == depth {
+                "wrapper".to_owned()
+            } else {
+                format!("relay_{}", i + 1)
+            };
+            source.push_str(&format!(
+                "\nfn relay_{i}(ch: Channel<i64>) -> i64 {{ return {next}(ch); }}"
+            ));
+        }
+        let snapshot = snapshot(&source, &format!("foreign-task-{asynchronous}"));
+        let wrapper = snapshot
+            .functions
+            .iter()
+            .find(|f| f.name == "wrapper")
+            .unwrap()
+            .id
+            .clone();
+        let function = snapshot
+            .functions
+            .iter()
+            .find(|f| f.name == "apply")
+            .unwrap()
+            .id
+            .clone();
+        let revision = snapshot.revision.clone();
+        let mut session = QuerySession::new(snapshot).unwrap();
+        let result = session.query(QueryRequest::Effects {
+            revision,
+            function: function.clone(),
+        })["result"]
+            .take();
+        assert_eq!(session.effect_edge_visits, depth + 3);
+        println!(
+            "foreign task async={asynchronous} depth={depth} edges={}",
+            session.effect_edge_visits
+        );
+        let suspension = result["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["effect"] == 4)
+            .unwrap();
+        assert_eq!(
+            suspension["witness"]["cause"]["operation"], "indirect-call",
+            "{result}"
+        );
+        assert_eq!(
+            suspension["witness"]["cause"]["location"]["start"],
+            source.find("f(ch)").unwrap(),
+            "{result}"
+        );
+        assert_eq!(suspension["via_function"], function);
+        assert_eq!(suspension["status"], "conservative-bound");
+        if asynchronous {
+            assert_eq!(suspension["task_relationship"]["kind"], "spawn", "{result}");
+            assert_eq!(
+                suspension["task_relationship"]["function"], wrapper,
+                "{result}"
+            );
+            assert_eq!(
+                suspension["task_relationship"]["location"]["start"],
+                source.rfind("worker(ch)").unwrap(),
+                "{result}"
+            );
+        } else {
+            assert!(suspension.get("task_relationship").is_none(), "{result}");
+        }
+    }
+}

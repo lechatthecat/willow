@@ -1,0 +1,19 @@
+// Query child and parent with `willow effects --source ... --explain`.
+async fn child(out: Channel<i64>, n: i64) {
+    out.send(n * 2);
+}
+async fn waits(ch: Channel<i64>) -> i64 {
+    select {
+        let value = ch.recv() => { return value; }
+        sleep(50) => { return -1; }
+    }
+}
+async fn parent() -> i64 {
+    let ch = Channel<i64>::new();
+    let task = child(ch, 4);
+    await task;
+    return await waits(ch);
+}
+async fn main() {
+    println(await parent());
+}
