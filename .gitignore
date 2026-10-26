@@ -506,3 +506,10 @@ AGENTS.md
 
 # Public static frozen-array diagnostic audit.
 !/docs/audits/static-frozen-array-diagnostic.md
+
+# Public closure-chain stack measurements and documented limits.
+!/docs/audits/closure-chain-stack/
+/docs/audits/closure-chain-stack/*
+!/docs/audits/closure-chain-stack/report.md
+!/docs/audits/closure-chain-stack/measure.py
+!/docs/audits/closure-chain-stack/measurements.jsonl
