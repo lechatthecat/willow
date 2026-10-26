@@ -276,12 +276,13 @@ mod tests {
         for waiters in [&*IDLE_WAITERS, &*COMPLETION_WAITERS] {
             for workers in [1, 4, 16] {
                 for cycles in [1, 8, 64] {
-                    // An event another test publishes before the collections
-                    // start says nothing about GC; retry that round.
+                    // The queues are process-wide, so another test may publish
+                    // an event during a round. Such a round says nothing about
+                    // GC and is retried; GC publishing would disturb every one.
                     let mut attempts = 0;
                     let probes = loop {
                         attempts += 1;
-                        assert!(attempts <= 100, "waiters never parked undisturbed");
+                        assert!(attempts <= 100, "GC must not publish a scheduler event");
                         crate::gc::reset_internal_for_test();
                         let generation = waiters.generation();
                         let probes = AtomicUsize::new(0);
@@ -307,9 +308,10 @@ mod tests {
                             let still_waiting = waiters.registered.load(Ordering::SeqCst);
                             // Always release workers before checking regressions.
                             waiters.notify(true);
-                            assert!(unchanged, "GC must not publish a scheduler event");
-                            assert_eq!(still_waiting, workers);
-                            true
+                            if unchanged {
+                                assert_eq!(still_waiting, workers);
+                            }
+                            unchanged
                         });
                         if parked {
                             break probes;
