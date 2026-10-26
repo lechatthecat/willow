@@ -7710,6 +7710,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let payload = self.builder.ins().select(overflowed, zero, value);
                 self.emit_pair(tag, payload)
             }
+            ArrayJoin => self.emit_value_runtime_call("willow_array_join", &[receiver, args[0]]),
             StringLen => self.emit_value_runtime_call("willow_string_len", &[receiver]),
             StringSubstring => self
                 .emit_value_runtime_call("willow_string_substring", &[receiver, args[0], args[1]]),

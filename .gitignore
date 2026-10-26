@@ -400,3 +400,10 @@ AGENTS.md
 /docs/audits/parenthesized-callable-fields/*
 !/docs/audits/parenthesized-callable-fields/audit.md
 !/docs/audits/parenthesized-callable-fields/count_codegen.py
+
+# Public string assembly audit and deterministic measurement evidence.
+!/docs/audits/array-join/
+/docs/audits/array-join/*
+!/docs/audits/array-join/audit.md
+!/docs/audits/array-join/measurements.txt
+!/docs/audits/array-join/verify.sh

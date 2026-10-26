@@ -132,6 +132,22 @@ impl TypeChecker {
             return None;
         };
         match m.method.as_str() {
+            "join" => {
+                self.check_call_argument_count("Array::join", 1, m.args.len(), m.span);
+                self.check_value_call_args(&[Type::String], &m.args);
+                if **elem != Type::String {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            "`join` requires an Array<String>",
+                        )
+                        .with_label(Label::primary(m.span, "expected string elements")),
+                    );
+                }
+                Some(Type::String)
+            }
+
             "len" => {
                 if !m.args.is_empty() {
                     self.push(

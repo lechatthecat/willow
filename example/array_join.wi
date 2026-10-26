@@ -1,0 +1,10 @@
+import std::collections::Array;
+
+fn main() {
+    println(["日本", "Willow", "😀"].join(" / "));
+    let words: Array<String> = [];
+    for i in 0..20000 { words.push("word!"); }
+    let text = words.join(" ");
+    println(text.len());
+    println(text.starts_with("word! word!"));
+}

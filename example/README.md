@@ -233,6 +233,22 @@ and prefix `!` on `i64`, with the compound forms `&=`, `|=`, `^=`, `<<=` and
 - `<<` and `>>` are written without a space between the two characters.
   A generic type such as `Option<Option<i64>>` still closes normally.
 
+## String assembly
+
+`Array<String>.join(separator: String) -> String` assembles elements in order,
+placing the separator only between elements. Empty arrays return `""`; singleton
+arrays return their element's text. Empty elements are preserved, and an empty
+separator concatenates directly. Unicode and embedded NUL bytes are preserved
+without normalization. Other element types must first be converted to strings.
+The array is unchanged and the result is an independent string. Size overflow
+raises a recoverable panic.
+
+The runtime makes two element passes, allocates one output string, and copies
+exactly the output bytes: O(n + B) time for n elements and B output bytes,
+O(B) output space and O(1) auxiliary space (excluding GC work). Accumulate pieces
+with `push`, then call `join` once instead of repeatedly extending a string with
+`+`. See [the runnable example](array_join.wi).
+
 ## String methods
 
 `String.len()` returns an `i64` UTF-8 byte count in constant time, excluding

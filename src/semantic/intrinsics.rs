@@ -153,6 +153,7 @@ pub enum Intrinsic {
 
     /// `Array<T>::len()`.
     ArrayLen,
+    ArrayJoin,
     /// `Array<T>::push(v)`.
     ArrayPush,
     /// `Array<T>::pop()`.
@@ -290,6 +291,7 @@ impl Intrinsic {
         Intrinsic::ChannelRecvOpt,
         Intrinsic::ChannelClose,
         Intrinsic::ArrayLen,
+        Intrinsic::ArrayJoin,
         Intrinsic::ArrayPush,
         Intrinsic::ArrayPop,
         Intrinsic::ArrayToString,
@@ -383,6 +385,7 @@ impl Intrinsic {
             ],
             ChannelRecvOpt => &["willow_channel_recv_opt_into"],
             ChannelClose => &["willow_channel_close"],
+            ArrayJoin => &["willow_array_join"],
             ArrayLen | FrozenArrayLen => &["willow_array_len"],
             ArrayPush => &["willow_array_push", "willow_array_push_owned_pair"],
             ArrayPop => &["willow_array_pop", "willow_array_pop_scalar_pair_into"],
@@ -635,6 +638,9 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
     // `Array<T>` has its own `Type` constructor rather than a generic name.
     if let Type::Array(elem) = recv {
         return match (method, arity) {
+            ("join", 1) if matches!(**elem, Type::String) => {
+                Some(ResolvedMethod::fixed(Intrinsic::ArrayJoin, Type::String))
+            }
             ("len", 0) => Some(ResolvedMethod::fixed(Intrinsic::ArrayLen, Type::I64)),
             ("push", 1) => Some(ResolvedMethod::fixed(Intrinsic::ArrayPush, Type::Void)),
             ("pop", 0) => Some(ResolvedMethod::fixed(Intrinsic::ArrayPop, (**elem).clone())),
@@ -1389,6 +1395,7 @@ mod tests {
             Type::Bool,
             Type::String,
             array(Type::I64),
+            array(Type::String),
             generic("FrozenArray", vec![Type::I64]),
             generic("Map", vec![Type::String, Type::I64]),
             generic("FrozenMap", vec![Type::String, Type::I64]),
@@ -1403,6 +1410,7 @@ mod tests {
             named("TaskScope"),
         ];
         let methods = [
+            "join",
             "substring",
             "slice",
             "split",
@@ -1474,7 +1482,7 @@ mod tests {
         assert_eq!(unique.len(), Intrinsic::ALL.len(), "duplicate in ALL");
         assert_eq!(
             Intrinsic::ALL.len(),
-            61,
+            62,
             "Intrinsic::ALL must list every variant; update the count when adding one"
         );
     }
@@ -1696,6 +1704,7 @@ fn f() {
     let text = xs.toString();
     let frozen = xs.freeze();
     let frozen_size = frozen.len();
+    let joined = ["a", "b"].join(",");
 }
 "#;
 
@@ -1821,7 +1830,7 @@ async fn f() {
     /// waterfall would get wrong.
     #[test]
     fn p38_array_and_frozen_array_agree() {
-        assert_agrees(ARRAYS, 6);
+        assert_agrees(ARRAYS, 7);
     }
 
     /// Perspective 39: the `Map<K,V>` surface plus the `FrozenMap<K,V>` reads.
@@ -1986,7 +1995,7 @@ fn f() {
             (SCALARS, 5),
             (INTEGERS, 8),
             (STRINGS, 7),
-            (ARRAYS, 6),
+            (ARRAYS, 7),
             (MAPS, 9),
             (ATOMICS, 10),
             (CELLS, 4),

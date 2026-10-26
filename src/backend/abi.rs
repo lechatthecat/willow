@@ -475,6 +475,7 @@ mod alloc_effects_tests {
         "willow_string_concat_n",
         "willow_string_alloc",
         "willow_string_literal_slot",
+        "willow_array_join",
         "willow_string_repeat",
         "willow_string_split",
         "willow_string_substring",

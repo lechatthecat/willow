@@ -133,6 +133,64 @@ pub extern "C" fn willow_string_repeat(value: *mut u8, count: i64) -> *mut u8 {
     result
 }
 
+/// Join string elements in order, with separators only between elements.
+/// Two element passes and exactly one output allocation: O(n + output bytes).
+/// The array retains its children; reload all managed addresses after allocation.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_array_join(array: *mut u8, separator: *mut u8) -> *mut u8 {
+    if array.is_null() {
+        return fail("cannot join a null array");
+    }
+    let count = crate::array::willow_array_len(array);
+    let separator_len = unsafe { ws_as_bytes(separator).1 };
+    let Some(mut total) = separator_len.checked_mul((count as usize).saturating_sub(1)) else {
+        return fail("Array.join size overflow");
+    };
+    for index in 0..count {
+        let part = join_element(array, index);
+        let Some(next) = total.checked_add(unsafe { ws_as_bytes(part).1 }) else {
+            return fail("Array.join size overflow");
+        };
+        total = next;
+    }
+    let Some(size) = string_payload_size(total) else {
+        return fail("Array.join size overflow");
+    };
+    let array = GcRootHandle::new(array);
+    let separator = GcRootHandle::new(separator);
+    let result = willow_alloc_with_layout(GcObjectKind::String, 0, size, 0);
+    if !result.is_null() {
+        unsafe {
+            *(result as *mut i64) = total as i64;
+            let mut offset = 0;
+            for index in 0..count {
+                if index != 0 && separator_len != 0 {
+                    copy_bytes(
+                        separator.load().add(8),
+                        result.add(8 + offset),
+                        separator_len,
+                    );
+                    offset += separator_len;
+                }
+                let (bytes, len) = ws_as_bytes(join_element(array.load(), index));
+                if len != 0 {
+                    copy_bytes(bytes, result.add(8 + offset), len);
+                    offset += len;
+                }
+            }
+            *result.add(8 + total) = 0;
+        }
+    }
+    result
+}
+
+fn join_element(array: *mut u8, index: i64) -> *mut u8 {
+    #[cfg(test)]
+    JOIN_VISITS.set(JOIN_VISITS.get() + 1);
+    crate::array::willow_array_get(array, index) as *mut u8
+}
+
 /// Literal, non-overlapping separator. Preserve empty fields. An empty separator
 /// yields leading/trailing empty fields with Unicode scalar values between them.
 #[unsafe(no_mangle)]
@@ -170,6 +228,7 @@ pub extern "C" fn willow_string_split(value: *mut u8, separator: *const u8) -> *
 
 #[cfg(test)]
 thread_local! {
+    static JOIN_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -178,6 +237,37 @@ mod tests {
     use super::*;
     use crate::gc::{willow_pop_roots, willow_push_root};
     use crate::string::{willow_string_as_str, willow_string_from_str};
+
+    #[test]
+    fn array_join_measured_linear_work() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        for word in ["", "é\0日", "a moderately long field"] {
+            for count in [0, 1, 8, 64, 512, 4096, 20000] {
+                let array = GcRootHandle::new(crate::array::willow_array_new(count, 1));
+                // Distinct allocated elements exercise fragmented input storage.
+                for index in 0..count {
+                    let part = willow_string_from_str(word);
+                    crate::array::willow_array_set(array.load(), index, part as i64);
+                }
+                let separator = GcRootHandle::new(willow_string_from_str("😀\0"));
+                COPIED_BYTES.set(0);
+                JOIN_VISITS.set(0);
+                let result = willow_array_join(array.load(), separator.load());
+                let expected = vec![word; count as usize].join("😀\0");
+                assert_eq!(unsafe { willow_string_as_str(result) }, expected);
+                assert_eq!(JOIN_VISITS.get(), count as usize * 2);
+                assert_eq!(COPIED_BYTES.get(), expected.len());
+                assert_eq!(unsafe { *result.add(8 + expected.len()) }, 0);
+                println!(
+                    "word_bytes={} elements={count} visits={} copied_bytes={}",
+                    word.len(),
+                    JOIN_VISITS.get(),
+                    COPIED_BYTES.get()
+                );
+            }
+        }
+    }
 
     #[test]
     fn string_methods_copy_work_scales_with_output() {

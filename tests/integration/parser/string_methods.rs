@@ -195,3 +195,113 @@ async fn main() {
         assert_eq!(out, "32\n");
     }
 }
+
+#[test]
+fn array_join_semantics() {
+    // Twenty independent semantic perspectives, plus native debug/release/GC paths.
+    let cases = [
+        r#"empty.join(",") == """#,
+        r#"empty.join("") == """#,
+        r#"["a"].join(",") == "a""#,
+        r#"[""].join("日") == """#,
+        r#"["a", "b"].join(",") == "a,b""#,
+        r#"["a", "b", "c"].join("::") == "a::b::c""#,
+        r#"["a", "b"].join("") == "ab""#,
+        r#"["", ""].join(",") == ",""#,
+        r#"["", "a"].join(",") == ",a""#,
+        r#"["a", ""].join(",") == "a,""#,
+        r#"["a", "", "b"].join(",") == "a,,b""#,
+        r#"["日本", "語"].join("") == "日本語""#,
+        r#"["a", "b"].join("😀") == "a😀b""#,
+        r#"["é", "😀"].join("日") == "é日😀""#,
+        r#"["é", "é"].join("") == "éé""#,
+        r#"["a,b", "c"].join(",") == "a,b,c""#,
+        r#""a,,b,".split(",").join(",") == "a,,b,""#,
+        r#""😀é".split("").join("") == "😀é""#,
+        r#"["b", "a", "b"].join("-") == "b-a-b""#,
+        r#"["a", "b"].join("日".repeat(100)).len() == 302"#,
+    ];
+    let body: String = cases
+        .iter()
+        .map(|expr| format!("println({expr});\n"))
+        .collect();
+    let source = format!(
+        "import std::collections::Array; fn main() {{ let empty: Array<String> = []; {body} }}"
+    );
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(&source);
+        assert!(ok, "{out}");
+        assert_eq!(out, "true\n".repeat(cases.len()));
+    }
+}
+
+#[test]
+fn array_join_invalid_arguments() {
+    for expr in [
+        r#"["a"].join()"#,
+        r#"["a"].join(",", ".")"#,
+        r#"["a"].join(1)"#,
+        r#"[1].join(",")"#,
+        r#"[true].join(",")"#,
+        r#"[["a"]].join(",")"#,
+    ] {
+        let source = format!("fn main() {{ println({expr}); }}");
+        assert!(compile_error_stderr(&source).contains("E0201"), "{source}");
+    }
+    assert!(
+        compile_error_stderr(r#"fn main() { let s = ","; ["a"].join(&s); }"#).contains("E1703")
+    );
+}
+
+#[test]
+fn array_join_example_and_dynamic_gc() {
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(include_str!("../../../example/array_join.wi"));
+        assert!(ok, "{out}");
+        assert_eq!(out, "日本 / Willow / 😀\n119999\ntrue\n");
+        let (out, ok) = run(r#"
+import std::collections::Array;
+fn assemble(parts: Array<String>, sep: String) -> String { return parts.join(sep); }
+async fn process() -> String {
+    let parts = ["日".repeat(2), "😀".repeat(2)];
+    let sep = "-".repeat(2);
+    await sleep(1);
+    gc_collect();
+    let result = assemble(parts, sep);
+    parts.push("changed");
+    parts[0] = "changed";
+    gc_collect();
+    return result;
+}
+async fn main() { println(await process()); }
+"#);
+        assert!(ok, "{out}");
+        assert_eq!(out, "日日--😀😀\n");
+    }
+}
+
+#[test]
+fn array_join_generated_calls_scale_with_callsites() {
+    for count in [1, 8, 32] {
+        for bytes in [1, 1024] {
+            let source = format!(
+                "fn main() {{ let parts = [\"{}\", \"b\"]; {} }}",
+                "a".repeat(bytes),
+                "parts.join(\",\");".repeat(count)
+            );
+            let symbols = compile_and_collect_relocation_targets_all(&source, &[]);
+            assert_eq!(
+                symbols.iter().filter(|s| *s == "willow_array_join").count(),
+                count
+            );
+        }
+    }
+}
