@@ -684,7 +684,7 @@ impl TypeChecker {
                 m.span,
             );
         }
-        self.resolve_method(&receiver, &m.method, &m.args, m.span, false)
+        self.resolve_method(&receiver, m, false)
     }
 
     /// The one body `super.method(...)` runs, for the call graph; `None` when

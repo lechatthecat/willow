@@ -1528,14 +1528,33 @@ impl TypeChecker {
             .map(|resolution| resolution.return_type(|_| None))
     }
 
+    /// Label the already-checked receiver without rechecking or walking its expression tree.
+    pub(super) fn label_receiver_call_origin(
+        diagnostic: &mut Diagnostic,
+        receiver: &Expr,
+        ty: &Type,
+    ) {
+        if matches!(
+            receiver,
+            Expr::Call(_) | Expr::MethodCall(_) | Expr::StaticCall(_)
+        ) {
+            diagnostic.labels.push(Label::secondary(
+                receiver.span(),
+                format!("this call returns `{}`, the receiver type", type_name(ty)),
+            ));
+        }
+    }
+
     pub(super) fn resolve_method(
         &mut self,
         obj_ty: &Type,
-        method_name: &str,
-        args: &[CallArg],
-        span: Span,
+        call: &MethodCallExpr,
         virtual_dispatch: bool,
     ) -> Type {
+        let method_name = call.method.as_str();
+        let args = call.args.as_slice();
+        let span = call.span;
+        let receiver = &call.object;
         if *obj_ty == Type::String {
             let params: Option<&[Type]> = match method_name {
                 "len" | "trim" => Some(&[]),
@@ -1632,9 +1651,23 @@ impl TypeChecker {
                 let mut diagnostic = Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0201,
-                    format!("type `{}` has no methods", type_name(obj_ty)),
+                    format!("no method `{method_name}` on type `{}`", type_name(obj_ty)),
                 )
-                .with_label(Label::primary(span, "method call on non-class type"));
+                .with_label(Label::primary(span, "unknown method"));
+                let methods = match obj_ty {
+                    Type::String => {
+                        "len, trim, substring, slice, repeat, split, contains, find, starts_with, toString"
+                    }
+                    Type::I64 => {
+                        "wrapping_add, wrapping_sub, wrapping_mul, wrapping_neg, checked_add, checked_sub, checked_mul, checked_neg, toString"
+                    }
+                    Type::F64 | Type::Bool => "toString",
+                    _ => "",
+                };
+                if !methods.is_empty() {
+                    diagnostic = diagnostic.with_help(format!("available methods: {methods}"));
+                }
+                Self::label_receiver_call_origin(&mut diagnostic, receiver, obj_ty);
                 if *obj_ty == Type::I64
                     && matches!(
                         method_name,

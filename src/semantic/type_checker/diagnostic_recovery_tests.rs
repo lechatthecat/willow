@@ -94,7 +94,7 @@ fn diagnostic_recovery_real_void_still_errors() {
     assert!(
         errors
             .iter()
-            .any(|e| e.message.contains("void") && e.message.contains("no methods")),
+            .any(|e| e.message.contains("void") && e.message.contains("no method `len`")),
         "{errors:?}"
     );
 }

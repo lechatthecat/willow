@@ -370,7 +370,7 @@ fn main() {
     m.clear();
 }
 "#,
-        &["error[E0201]", "no method `clear` on `Map<"],
+        &["error[E0201]", "no method `clear` on type `Map<"],
     );
 }
 

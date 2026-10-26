@@ -264,17 +264,17 @@ impl TypeChecker {
                 ))
             }
             other => {
-                self.push(
-                    Diagnostic::new(
+                let mut diagnostic = Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
-                        format!("no method `{}` on `Array<{}>`", other, type_name(elem)),
+                        format!("no method `{}` on type `Array<{}>`", other, type_name(elem)),
                     )
                     .with_label(Label::primary(m.span, "unknown array method"))
                     .with_help(
-                        "arrays support `.len()`, `.push(v)`, `.pop()`, `.freeze()`, and indexing `arr[i]`",
-                    ),
-                );
+                        "arrays support `.len()`, `.push(v)`, `.pop()`, `.freeze()`, `.join(separator)`, `.toString()`, and indexing `arr[i]`",
+                    );
+                Self::label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
+                self.push(diagnostic);
                 Some(Type::Void)
             }
         }
@@ -520,12 +520,11 @@ impl TypeChecker {
                 Some(B::FrozenMap.apply(vec![key_ty, val_ty]))
             }
             other => {
-                self.push(
-                    Diagnostic::new(
+                let mut diagnostic = Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
                         format!(
-                            "no method `{}` on `Map<{}, {}>`",
+                            "no method `{}` on type `Map<{}, {}>`",
                             other,
                             type_name(&key_ty),
                             type_name(&val_ty)
@@ -533,9 +532,10 @@ impl TypeChecker {
                     )
                     .with_label(Label::primary(m.span, "unknown map method"))
                     .with_help(
-                        "maps support `.insert(k, v)`, `.get(k)`, `.contains(k)`, `.len()`, `.freeze()`",
-                    ),
-                );
+                        "maps support `.insert(k, v)`, `.get(k)`, `.contains(k)`, `.len()`, `.freeze()`, `.toString()`",
+                    );
+                Self::label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
+                self.push(diagnostic);
                 Some(Type::Void)
             }
         }

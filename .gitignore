@@ -42,6 +42,7 @@ AGENTS.md
 !/docs/gc_telemetry.md
 !/docs/audits/
 /docs/audits/*
+!/docs/audits/builtin-method-diagnostics.md
 !/docs/audits/gc-concurrent-foundations/
 /docs/audits/gc-concurrent-foundations/*
 !/docs/audits/gc-concurrent-foundations/audit.md

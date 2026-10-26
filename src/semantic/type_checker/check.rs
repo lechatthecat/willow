@@ -3453,7 +3453,7 @@ impl TypeChecker {
             self.record_lock_effect_call(callee, m.span);
         }
 
-        self.resolve_method(obj_ty, &m.method, &m.args, m.span, true)
+        self.resolve_method(obj_ty, m, true)
     }
 }
 

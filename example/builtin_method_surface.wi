@@ -1,0 +1,15 @@
+import std::collections::{Array, Map};
+// These successful calls demonstrate the methods listed by unknown-method errors.
+fn main() {
+    println("abc".substring(0, 1));
+    println(3.wrapping_add(2).toString());
+    println(1.5.toString());
+    println(true.toString());
+    let values: Array<i64> = [1, 2];
+    values.push(3);
+    println(values.len().toString());
+    let entries = Map<String, i64>::new();
+    entries.insert("key", 7);
+    println(entries.len().toString());
+    println("abc".find("b").toString());
+}

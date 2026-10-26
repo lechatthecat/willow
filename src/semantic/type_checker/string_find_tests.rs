@@ -81,7 +81,7 @@ fn string_find_guidance_scales_with_invalid_uses() {
         assert!(
             errors
                 .iter()
-                .all(|d| d.helps.len() == 1 && d.helps[0] == STRING_FIND_SENTINEL_HELP)
+                .all(|d| d.helps.len() == 2 && d.helps[1] == STRING_FIND_SENTINEL_HELP)
         );
     }
 }

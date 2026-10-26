@@ -13,6 +13,8 @@ mod check_lambda_match;
 pub(crate) mod generics;
 pub use check_lambda_match::LambdaCapture;
 mod async_retention;
+#[cfg(test)]
+mod builtin_method_diagnostic_tests;
 mod check_ops;
 #[cfg(test)]
 mod class_cycle_tests;
@@ -6225,7 +6227,7 @@ fn f() {{
         assert_task_error(
             "fn f() { let x = 1; let r = x.result(); }",
             ErrorCode::E0201,
-            "type `i64` has no methods",
+            "no method `result` on type `i64`",
         );
     }
 

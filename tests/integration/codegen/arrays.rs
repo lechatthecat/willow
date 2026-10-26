@@ -485,7 +485,7 @@ fn main() {
     println(xs.first());
 }
 "#,
-        &["error[E0201]", "no method `first` on `Array<i64>`"],
+        &["error[E0201]", "no method `first` on type `Array<i64>`"],
     );
 }
 
