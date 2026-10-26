@@ -45,8 +45,12 @@ std::thread_local! {
 
 /// Successfully published prefixes remain in place until the buffer empties.
 /// This keeps partial transfer O(entries) cumulatively, without shifting tails.
-#[derive(Default)]
+#[repr(C)]
 struct EntryBuffer {
+    base: std::cell::Cell<usize>,
+    length: std::cell::Cell<usize>,
+    inline_limit: std::cell::Cell<usize>,
+    closing: std::cell::Cell<usize>,
     values: Vec<usize>,
     published: usize,
 }
@@ -55,27 +59,61 @@ impl std::ops::Deref for EntryBuffer {
     fn deref(&self) -> &[usize] {
         #[cfg(test)]
         ENTRY_READS.set(ENTRY_READS.get() + 1);
-        &self.values[self.published..]
+        // Only the owner can append without this buffer's mutex. Foreign reads
+        // require stopped ownership; the Vec allocation is stable while admitted.
+        unsafe { std::slice::from_raw_parts(self.values.as_ptr(), self.length.get()) }
+            .get(self.published..)
+            .expect("published SATB prefix")
     }
 }
+impl Default for EntryBuffer {
+    fn default() -> Self {
+        Self::with_capacity(0)
+    }
+}
+const _: () = {
+    use willow_abi::barrier_buffer as abi;
+    assert!(std::mem::offset_of!(EntryBuffer, base) == abi::BASE_OFFSET as usize);
+    assert!(std::mem::offset_of!(EntryBuffer, length) == abi::LENGTH_OFFSET as usize);
+    assert!(std::mem::offset_of!(EntryBuffer, inline_limit) == abi::LIMIT_OFFSET as usize);
+    assert!(std::mem::offset_of!(EntryBuffer, closing) == abi::CLOSING_OFFSET as usize);
+};
 impl EntryBuffer {
     fn with_capacity(capacity: usize) -> Self {
+        let values = Vec::with_capacity(capacity);
         Self {
-            values: Vec::with_capacity(capacity),
+            base: std::cell::Cell::new(values.as_ptr() as usize),
+            length: std::cell::Cell::new(0),
+            inline_limit: std::cell::Cell::new(0),
+            closing: std::cell::Cell::new(0),
+            values,
             published: 0,
         }
     }
     fn capacity(&self) -> usize {
         self.values.capacity()
     }
+    fn sync_length(&mut self) {
+        assert!(self.length.get() <= self.values.capacity());
+        // Generated stores initialize every word before publishing length.
+        unsafe {
+            self.values.set_len(self.length.get());
+        }
+    }
     fn reserve_exact(&mut self, capacity: usize) {
+        self.sync_length();
         self.values.reserve_exact(capacity);
+        self.base.set(self.values.as_ptr() as usize);
     }
     fn push(&mut self, value: usize) {
+        self.sync_length();
         self.values.push(value);
+        self.base.set(self.values.as_ptr() as usize);
+        self.length.set(self.values.len());
     }
     fn clear(&mut self) {
         self.values.clear();
+        self.length.set(0);
         self.published = 0;
     }
 }
@@ -419,6 +457,7 @@ impl SatbShards {
         if let Some(buffer) = buffers.get(&owner).cloned() {
             let mut entries =
                 crate::gc_telemetry::m3::lock(&buffer.0, crate::gc_telemetry::m3::Kind::SatbBuffer);
+            entries.inline_limit.set(0);
             if !entries.is_empty() {
                 // Closure may have revoked private publication before this
                 // owner reaches unregister. Transfer before removing storage.
@@ -502,6 +541,7 @@ impl SatbShards {
                     .0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                entries.inline_limit.set(0);
                 if !transfer_bounded(&mut entries, budget, &mut now, &mut publish) {
                     return false;
                 }
@@ -553,6 +593,7 @@ impl SatbShards {
                     .0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                entries.inline_limit.set(0);
                 if !entries.is_empty() {
                     publish(&entries);
                     entries.clear();
@@ -596,6 +637,17 @@ pub(super) struct ShardBuffer<'a> {
 }
 
 impl ShardBuffer<'_> {
+    pub(super) fn admit_inline(&mut self, closing: &AtomicBool) -> usize {
+        self.entries
+            .closing
+            .set(closing as *const AtomicBool as usize);
+        assert_eq!(self.entries.published, 0);
+        self.entries
+            .inline_limit
+            .set(self.capacity.min(self.entries.capacity()));
+        self.entries as *mut EntryBuffer as usize
+    }
+
     pub(super) fn record(&mut self, value: usize, mut publish: impl FnMut(&[usize])) {
         if value == 0 {
             return;
@@ -625,6 +677,130 @@ impl ShardBuffer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static OPEN_EPOCH: AtomicBool = AtomicBool::new(false);
+
+    // Execute the same ABI accesses as generated code, with no Rust Vec borrow.
+    unsafe fn inline_pair(address: usize, pair: [usize; 2]) -> bool {
+        use willow_abi::barrier_buffer as abi;
+        unsafe {
+            let field = |offset: i32| (address + offset as usize) as *mut usize;
+            let length = field(abi::LENGTH_OFFSET).read();
+            let limit = field(abi::LIMIT_OFFSET).read();
+            if length + 2 > limit {
+                return false;
+            }
+            let closing = field(abi::CLOSING_OFFSET).read() as *const AtomicBool;
+            if (*closing).load(Ordering::Acquire) {
+                return false;
+            }
+            let base = field(abi::BASE_OFFSET).read() as *mut usize;
+            base.add(length).write(pair[0]);
+            base.add(length + 1).write(pair[1]);
+            field(abi::LENGTH_OFFSET).write(length + 2);
+        }
+        true
+    }
+
+    #[test]
+    fn inline_satb_pairs_preserve_capacity_order_and_runtime_interoperation() {
+        for capacity in [1, 2, 3, 32, 256] {
+            for pairs in [1, 16, 256] {
+                let buffers = SatbShards::new(capacity);
+                let mut published = Vec::new();
+                let mut expected = Vec::new();
+                for i in 0..pairs {
+                    let address = buffers
+                        .with_current(|| true, |buffer| buffer.admit_inline(&OPEN_EPOCH))
+                        .unwrap();
+                    let pair = [i * 2 + 1, i * 2 + 2];
+                    if !unsafe { inline_pair(address, pair) } {
+                        buffers
+                            .with_current(
+                                || true,
+                                |buffer| {
+                                    for value in pair {
+                                        buffer.record(value, |v| published.extend_from_slice(v));
+                                    }
+                                },
+                            )
+                            .unwrap();
+                    }
+                    expected.extend(pair);
+                }
+                buffers.retire_current(|v| published.extend_from_slice(v));
+                assert_eq!(published, expected, "capacity={capacity} pairs={pairs}");
+                assert!(buffers.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn inline_satb_closing_revokes_append_before_stopped_seal() {
+        let closing = AtomicBool::new(false);
+        let buffers = SatbShards::new(32);
+        let address = buffers
+            .with_current(|| true, |buffer| buffer.admit_inline(&closing))
+            .unwrap();
+        assert!(unsafe { inline_pair(address, [7, 9]) });
+        closing.store(true, Ordering::Release);
+        assert!(!unsafe { inline_pair(address, [11, 13]) });
+        let coord = super::super::GcCoord {
+            stop_requested: true,
+            ..Default::default()
+        };
+        let mut values = Vec::new();
+        buffers.seal_stopped(&coord, |v| values.extend_from_slice(v));
+        assert_eq!(values, [7, 9]);
+    }
+
+    #[test]
+    fn inline_satb_bounded_seal_preserves_suffix_and_revokes_reused_storage() {
+        let _guard = super::super::runtime_test_guard();
+        super::super::reset_internal_for_test();
+        super::super::willow_gc_register_mutator();
+        let buffers = SatbShards::new(256);
+        let address = buffers
+            .with_current(|| true, |buffer| buffer.admit_inline(&OPEN_EPOCH))
+            .unwrap();
+        for i in 0..64 {
+            assert!(unsafe { inline_pair(address, [i * 2, i * 2 + 1]) });
+        }
+        let coord = super::super::GcCoord {
+            stop_requested: true,
+            ..Default::default()
+        };
+        let mut published = Vec::new();
+        let mut rounds = 0;
+        loop {
+            let mut budget = super::super::old_cycle::RemarkBudget::new(4096, 8, u64::MAX, 0);
+            rounds += 1;
+            if buffers.seal_stopped_bounded_with_clock(
+                &coord,
+                &mut budget,
+                || 0,
+                |v| published.extend_from_slice(v),
+            ) {
+                break;
+            }
+            assert!(rounds < 200);
+            assert!(!unsafe { inline_pair(address, [999, 999]) });
+        }
+        assert_eq!(published, (0..128).collect::<Vec<_>>());
+        assert!(!unsafe { inline_pair(address, [999, 999]) });
+        buffers.reopen_stopped(&coord);
+        assert!(!unsafe { inline_pair(address, [999, 999]) });
+        let readmitted = buffers
+            .with_current(|| true, |buffer| buffer.admit_inline(&OPEN_EPOCH))
+            .unwrap();
+        assert_eq!(address, readmitted);
+        assert!(unsafe { inline_pair(address, [129, 130]) });
+        buffers.retire_current(|v| published.extend_from_slice(v));
+        assert_eq!(&published[128..], &[129, 130]);
+        assert!(!unsafe { inline_pair(address, [999, 999]) });
+        super::super::willow_gc_unregister_mutator();
+        super::super::reset_internal_for_test();
+    }
 
     #[test]
     fn foreign_drain_rejects_running_owners_and_accepts_parked_or_unregistered() {

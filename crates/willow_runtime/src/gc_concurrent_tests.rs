@@ -5162,3 +5162,69 @@ fn allocation_assist_pressure_preserves_hard_reservation_bound() {
     }
     reset_internal_for_test();
 }
+
+#[test]
+fn inline_satb_roots_survive_minor_overlap_and_unregister_without_runtime_calls() {
+    let _guard = runtime_test_guard();
+    for count in [1, 16, 64] {
+        reset_internal_for_test();
+        willow_gc_register_mutator();
+        let mut tls = tlab_state_for_test();
+        let children: Vec<_> = (0..2 * count)
+            .map(|_| willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0))
+            .collect();
+        let (_, cycle) = root_handshake::begin().unwrap();
+        // A real runtime barrier admits storage, without publishing our graph.
+        let owner = willow_alloc(8);
+        willow_gc_write_barrier(
+            owner,
+            std::ptr::null_mut(),
+            owner,
+            GcStoreDestination::ObjectField as i64
+                | willow_abi::GC_STORE_OWNER_HAS_HEADER
+                | willow_abi::GC_STORE_VALUE_HAS_HEADER,
+        );
+        let calls = runtime().write_barrier_calls.load(Ordering::Relaxed);
+        let context = crate::generated_context::active() as usize;
+        let address = unsafe {
+            *((context + willow_abi::generated_context::BARRIER_BUFFER_OFFSET as usize)
+                as *const usize)
+        };
+        assert_ne!(address, 0);
+        use willow_abi::barrier_buffer as abi;
+        for pair in children.chunks_exact(2) {
+            unsafe {
+                let length = (address + abi::LENGTH_OFFSET as usize) as *mut usize;
+                let limit = *((address + abi::LIMIT_OFFSET as usize) as *const usize);
+                let n = *length;
+                assert!(n + 2 <= limit);
+                let base = *(address as *const *mut usize);
+                base.add(n).write(pair[0] as usize);
+                base.add(n + 1).write(pair[1] as usize);
+                *length = n + 2;
+            }
+        }
+        assert_eq!(runtime().write_barrier_calls.load(Ordering::Relaxed), calls);
+        // No stack/root slot points to these children. Only the inline buffer
+        // retains both deletion and insertion references across nursery moves.
+        minor::collect_owned();
+        cycle.drain(usize::MAX);
+        assert!(cycle.objects.marked_count() >= 2 * count);
+        assert_eq!(
+            runtime().heap.lock().unwrap().moved_objects,
+            2 * count as u64
+        );
+        willow_gc_unregister_mutator();
+        assert_eq!(
+            unsafe {
+                *((context + willow_abi::generated_context::BARRIER_BUFFER_OFFSET as usize)
+                    as *const usize)
+            },
+            0
+        );
+        GC_MARK_PHASE.store(0, Ordering::Release);
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+        cycle.queue.end_epoch();
+        reset_internal_for_test();
+    }
+}

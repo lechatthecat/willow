@@ -1,0 +1,24 @@
+// Reference replacement across nursery collection, major collection and yields.
+// Run with WILLOW_WORKERS=2 WILLOW_TASK_BUDGET=1 and GC verification enabled.
+import std::collections::Array;
+class Leaf { pub value: i64; }
+class Holder { pub leaf: Leaf; }
+
+async fn churn() -> i64 {
+    let holder = new Holder(new Leaf(0));
+    let ring: Array<Leaf> = [new Leaf(0), new Leaf(0)];
+    let mut i = 0;
+    let mut sum = 0;
+    while i < 128 {
+        holder.leaf = new Leaf(i);
+        ring[i % 2] = holder.leaf;
+        if i % 8 == 0 { gc_minor_collect(); }
+        if i % 32 == 0 { gc_collect(); }
+        await yield();
+        if holder.leaf.value != i { panic("lost reference"); }
+        sum = sum + ring[i % 2].value;
+        i = i + 1;
+    }
+    return sum;
+}
+async fn main() { println(await churn()); }

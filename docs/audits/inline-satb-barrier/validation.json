@@ -1,0 +1,360 @@
+[
+  {
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "seconds": 2.5928237109983456,
+    "results": []
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "inline_satb"
+    ],
+    "exit_code": 0,
+    "seconds": 0.03562560800128267,
+    "results": [
+      "test gc::satb::tests::inline_satb_closing_revokes_append_before_stopped_seal ... ok",
+      "test gc::satb::tests::inline_satb_pairs_preserve_capacity_order_and_runtime_interoperation ... ok",
+      "test gc::concurrent_tests::inline_satb_roots_survive_minor_overlap_and_unregister_without_runtime_calls ... ok",
+      "test gc::satb::tests::inline_satb_bounded_seal_preserves_suffix_and_revokes_reused_storage ... ok",
+      "test generated_context::tests::inline_satb_admission_is_revoked_across_nested_retirement_and_worker_transfer ... ok",
+      "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1966 filtered out; finished in 0.01s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "gc::satb::tests::"
+    ],
+    "exit_code": 0,
+    "seconds": 0.09961556000052951,
+    "results": [
+      "test gc::satb::tests::capacity_setting_accepts_one_and_rejects_out_of_range_values ... ok",
+      "test gc::satb::tests::inline_satb_closing_revokes_append_before_stopped_seal ... ok",
+      "test gc::satb::tests::publication_panic_keeps_entries_for_the_final_drain ... ok",
+      "test gc::satb::tests::foreign_drain_rejects_running_owners_and_accepts_parked_or_unregistered ... ok",
+      "test gc::satb::tests::retirement_publication_unwind_preserves_buffer_for_authoritative_seal ... ok",
+      "test gc::satb::tests::bounded_stopped_satb_transfer_rejects_running_owner_and_retains_unadmitted_entries ... ok",
+      "test gc::satb::tests::inline_satb_bounded_seal_preserves_suffix_and_revokes_reused_storage ... ok",
+      "test gc::satb::tests::satb_registry_resume_subchunk_budgets_finish_large_buffers ... ok",
+      "test gc::satb::tests::satb_registry_resume_handles_unregister_reregister_and_reopen ... ok",
+      "test gc::satb::tests::inline_satb_pairs_preserve_capacity_order_and_runtime_interoperation ... ok",
+      "test gc::satb::tests::remark_drains_every_mutator_and_reuses_registered_buffers ... ok",
+      "test gc::satb::tests::shards_publish_full_buffers_and_seal_once ... ok",
+      "test gc::satb::tests::concurrent_seal_and_unregister_transfer_each_entry_exactly_once ... ok",
+      "test gc::satb::tests::more_mutators_than_registry_shards_keep_independent_buffers ... ok",
+      "test gc::satb::tests::capacity_one_and_partial_flush_publish_every_deleted_edge_once ... ok",
+      "test gc::satb::tests::satb_registry_resume_scales_with_pending_owners_not_retry_prefixes ... ok",
+      "test gc::satb::tests::legacy_final_remark_many_owner_emptiness_is_constant_and_unwind_safe ... ok",
+      "test gc::satb::tests::satb_many_owners_tiny_budget_and_fake_clock_have_constant_ownership_checks ... ok",
+      "test gc::satb::tests::satb_both_buffers_fake_clock_preserves_mid_publication_suffix_exactly_once ... ok",
+      "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 1952 filtered out; finished in 0.07s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "satb_child_first_filter_preserves"
+    ],
+    "exit_code": 0,
+    "seconds": 0.029788674997689668,
+    "results": [
+      "test gc::barrier::filter_tests::satb_child_first_filter_preserves_phase_and_generational_truth_table ... ok",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.00s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "satb_registration_owns_buffer_and_unwind_unregister_drains_it"
+    ],
+    "exit_code": 0,
+    "seconds": 0.02976107399808825,
+    "results": [
+      "test gc::concurrent_tests::satb_registration_owns_buffer_and_unwind_unregister_drains_it ... ok",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.00s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "closing_phase_publishes_deletions_directly"
+    ],
+    "exit_code": 0,
+    "seconds": 0.028681546998996055,
+    "results": [
+      "test gc::concurrent_tests::closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work ... ok",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.00s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "concurrent_closure_and_sweep_preserve_a_new_active_tlab"
+    ],
+    "exit_code": 0,
+    "seconds": 0.031158222998783458,
+    "results": [
+      "test gc::concurrent_tests::concurrent_closure_and_sweep_preserve_a_new_active_tlab_after_stopped_ownership_transfer ... ok",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.00s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "overlap_graph_copy_promotion_and_snapshot_only_reachability"
+    ],
+    "exit_code": 0,
+    "seconds": 0.06806810100169969,
+    "results": [
+      "test gc::minor::overlap_tests::overlap_graph_copy_promotion_and_snapshot_only_reachability ... ok",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.04s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "overlap_containers_and_async_frame_preserve_rewritten_edges"
+    ],
+    "exit_code": 0,
+    "seconds": 0.030181638998328708,
+    "results": [
+      "test gc::minor::overlap_tests::overlap_containers_and_async_frame_preserve_rewritten_edges ... ok",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.00s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "stress_region_05_minor_major_and_remembered_set_interleave",
+      "--",
+      "--ignored"
+    ],
+    "exit_code": 0,
+    "seconds": 0.13459688399962033,
+    "results": [
+      "test gc::stress_viewpoint_tests::stress_region_05_minor_major_and_remembered_set_interleave ... ok",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.11s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "stress_region_11_generated_graph_preserves_edges_through_moving_collection",
+      "--",
+      "--ignored"
+    ],
+    "exit_code": 0,
+    "seconds": 0.036272987999836914,
+    "results": [
+      "test gc::stress_viewpoint_tests::stress_region_11_generated_graph_preserves_edges_through_moving_collection ... ok",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.01s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "bridge_installs_thread_and_nested_stable_contexts"
+    ],
+    "exit_code": 0,
+    "seconds": 0.027781504999438766,
+    "results": [
+      "test generated_context::tests::bridge_installs_thread_and_nested_stable_contexts ... ok",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.00s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_runtime",
+      "--lib",
+      "shadow_roots_unregister_empty_bridge_keeps_admission"
+    ],
+    "exit_code": 0,
+    "seconds": 0.028054275000613416,
+    "results": [
+      "test generated_context::tests::shadow_roots_unregister_empty_bridge_keeps_admission ... ok",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 0.00s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow",
+      "--lib",
+      "inline_satb_codegen",
+      "--",
+      "--nocapture"
+    ],
+    "exit_code": 0,
+    "seconds": 9.525271432001318,
+    "results": [
+      "sites=1 inline_instructions=30 calls=0",
+      "sites=16 inline_instructions=480 calls=0",
+      "sites=256 inline_instructions=7680 calls=0",
+      "test backend::cranelift::gc_codegen::tests::inline_satb_codegen_is_call_free_and_linear_in_store_sites ... ok",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3371 filtered out; finished in 0.05s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.46s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "willow_abi",
+      "--lib",
+      "fingerprint::tests"
+    ],
+    "exit_code": 0,
+    "seconds": 0.11586027500015916,
+    "results": [
+      "test fingerprint::tests::abi_hash_distinguishes_parameter_order_and_semantic_kinds ... ok",
+      "test fingerprint::tests::implicit_preemption_affinity_rejects_revision_three_runtime ... ok",
+      "test fingerprint::tests::abi_hash_is_repeatable_and_target_sensitive ... ok",
+      "test fingerprint::tests::abi_hash_covers_layout_inventory_and_type_metadata ... ok",
+      "test fingerprint::tests::abi_hash_covers_every_contract_constant ... ok",
+      "test fingerprint::tests::abi_hash_covers_each_signature_and_effect ... ok",
+      "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.09s",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--target",
+      "x86_64-unknown-linux-gnu",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "seconds": 14.765996811998775,
+    "results": [
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.72s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--target",
+      "x86_64-pc-windows-msvc",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "seconds": 17.20610827999917,
+    "results": [
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.16s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--target",
+      "aarch64-apple-darwin",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "seconds": 13.10391244299899,
+    "results": [
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.06s"
+    ]
+  },
+  {
+    "command": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--target",
+      "x86_64-apple-darwin",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "seconds": 12.548487784002646,
+    "results": [
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.51s"
+    ]
+  }
+]

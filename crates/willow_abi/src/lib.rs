@@ -861,14 +861,35 @@ pub mod generated_context {
     pub const SYNC_COUNTER_OFFSET: i32 = 24;
     /// Process-lifetime atomic GC stop gate pointer.
     pub const GC_STOP_OFFSET: i32 = 32;
+    /// Current registered mutator SATB buffer; null requires runtime admission.
+    pub const BARRIER_BUFFER_OFFSET: i32 = 40;
     /// Pointer to the context-owned root-slot pointer array.
-    pub const ROOT_BASE_OFFSET: i32 = 40;
+    pub const ROOT_BASE_OFFSET: i32 = 48;
     /// Initialized slot count, updated only by the running context owner.
-    pub const ROOT_TOP_OFFSET: i32 = 48;
+    pub const ROOT_TOP_OFFSET: i32 = 56;
     /// Admitted capacity; zero forces cold ownership/capacity admission.
-    pub const ROOT_LIMIT_OFFSET: i32 = 56;
+    pub const ROOT_LIMIT_OFFSET: i32 = 64;
     /// Size of the generated-code-visible prefix; runtime storage follows it.
-    pub const SIZE: usize = 64;
+    pub const SIZE: usize = 72;
     pub const HELPER_DESCRIPTOR_SIZE: usize = 16;
     pub const HELPER_LENGTH_OFFSET: usize = 8;
+}
+
+/// Owner-only SATB enqueue prefix. Admission is through the existing runtime
+/// barrier, which registers storage with the current marking epoch. Generated
+/// code may append the overwritten and inserted reference (including nulls)
+/// only in concurrent phase, with no possible new generational edge, room
+/// for both words, and an acquire-loaded false epoch closing flag. Write entries
+/// before LENGTH; no safepoint may intervene.
+/// The buffer is revoked on context refresh, safepoint, unregister and stopped
+/// seal. Full/unadmitted buffers and generational edges use the original barrier.
+/// Foreign consumers require stopped ownership, and retain bounded drain cursors.
+pub mod barrier_buffer {
+    pub const BASE_OFFSET: i32 = 0;
+    pub const LENGTH_OFFSET: i32 = 8;
+    pub const LIMIT_OFFSET: i32 = 16;
+    /// Pointer to the current epoch's atomic closing flag.
+    pub const CLOSING_OFFSET: i32 = 24;
+    pub const PAIR_ENTRIES: i64 = 2;
+    pub const CONCURRENT_PHASE: i64 = 1;
 }

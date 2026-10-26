@@ -144,6 +144,7 @@ pub(super) fn current_satb_buffer() -> Option<Arc<satb::MutatorBuffer>> {
 
 /// Called with the coordination lock held after the registry is cleared.
 pub(super) fn invalidate_mutator_registrations() {
+    crate::generated_context::revoke_barrier_buffers();
     MUTATOR_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
@@ -192,6 +193,7 @@ pub extern "C" fn willow_gc_register_mutator() {
 pub extern "C" fn willow_gc_unregister_mutator() {
     assist::reset();
     flush_satb_current(true);
+    crate::generated_context::revoke_barrier_buffers();
     let id = std::thread::current().id();
     let (lock, cv) = &runtime().coord;
     let mut coord = lock.lock().unwrap();

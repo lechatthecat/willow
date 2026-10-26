@@ -1,0 +1,42 @@
+[
+  {
+    "stress": "none",
+    "workers": 2,
+    "task_budget": 1,
+    "verify_barrier": true,
+    "exit_code": 0,
+    "stdout": "8128\n",
+    "stderr": "",
+    "seconds": 0.001996819999476429
+  },
+  {
+    "stress": "minor",
+    "workers": 2,
+    "task_budget": 1,
+    "verify_barrier": true,
+    "exit_code": 0,
+    "stdout": "8128\n",
+    "stderr": "",
+    "seconds": 0.0018022270014625974
+  },
+  {
+    "stress": "relocate",
+    "workers": 2,
+    "task_budget": 1,
+    "verify_barrier": true,
+    "exit_code": 0,
+    "stdout": "8128\n",
+    "stderr": "",
+    "seconds": 0.002710884000407532
+  },
+  {
+    "stress": "all",
+    "workers": 2,
+    "task_budget": 1,
+    "verify_barrier": true,
+    "exit_code": 0,
+    "stdout": "8128\n",
+    "stderr": "",
+    "seconds": 0.04331250800169073
+  }
+]

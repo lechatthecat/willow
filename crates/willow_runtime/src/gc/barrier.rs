@@ -129,7 +129,7 @@ pub(super) fn record_satb_locked(state: &mut GcState, old: *mut u8) {
 /// validity checks run under the shard lock, and so does every queue
 /// publication, so a seal's flush observes all of them.
 fn publish_marking_unlocked(old: *mut u8, value: *mut u8, phase: u8) -> bool {
-    if phase != 1 {
+    if phase != willow_abi::barrier_buffer::CONCURRENT_PHASE as u8 {
         return false;
     }
     // May take the heap lock on a cache miss: before any shard lock.
@@ -149,6 +149,11 @@ fn publish_marking_unlocked(old: *mut u8, value: *mut u8, phase: u8) -> bool {
                 if !value.is_null() {
                     cycle.enqueue(value);
                 }
+                if safepoint::current_thread_is_registered() {
+                    crate::generated_context::set_barrier_buffer(
+                        buffer.admit_inline(&cycle.closing),
+                    );
+                }
             },
         )
         .is_some()
@@ -167,6 +172,7 @@ pub(crate) fn satb_delete(old: *mut u8) {
 }
 
 pub(super) fn flush_satb_current(retire: bool) {
+    crate::generated_context::set_barrier_buffer(0);
     if !retire && GC_MARK_PHASE.load(Ordering::Acquire) == 0 {
         return;
     }

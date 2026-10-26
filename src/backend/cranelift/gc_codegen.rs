@@ -842,6 +842,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(barrier);
         let word_ty = self.builder.func.dfg.value_type(word);
         let previous = self.builder.ins().atomic_load(word_ty, flags, slot);
+        let publish = self.builder.create_block();
+        emit_inline_satb_enqueue(
+            self.builder,
+            ptr_ty,
+            phase,
+            new_edge,
+            previous,
+            word,
+            publish,
+        );
         let destination_kind = if refinement == BarrierRefinement::OldValueSkips {
             destination as i64 | willow_abi::GC_STORE_VALUE_HAS_HEADER
         } else {
@@ -860,12 +870,99 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .call(barrier_ref, &[owner, previous, word, destination]);
+        self.builder.ins().jump(publish, &[]);
+        self.builder.switch_to_block(publish);
+        self.builder.seal_block(publish);
         self.builder.ins().atomic_store(flags, word, slot);
         self.builder.ins().jump(done, &[]);
 
         self.builder.switch_to_block(done);
         self.builder.seal_block(done);
     }
+}
+
+/// Append both deletion and insertion roots to an admitted, owner-only buffer.
+/// The slow continuation retains the original fused barrier. No call, poll or
+/// allocation separates publication from the atomic reference store.
+fn emit_inline_satb_enqueue(
+    builder: &mut FunctionBuilder<'_>,
+    ptr_ty: cranelift_codegen::ir::Type,
+    phase: Value,
+    new_edge: Value,
+    previous: Value,
+    word: Value,
+    done: cranelift_codegen::ir::Block,
+) {
+    use willow_abi::barrier_buffer as abi;
+    let slow = builder.create_block();
+    builder.set_cold_block(slow);
+    let check_buffer = builder.create_block();
+    let check_capacity = builder.create_block();
+    let check_closing = builder.create_block();
+    let append = builder.create_block();
+    let concurrent = builder
+        .ins()
+        .icmp_imm_s(IntCC::Equal, phase, abi::CONCURRENT_PHASE);
+    let no_edge = builder.ins().icmp_imm_s(IntCC::Equal, new_edge, 0);
+    let eligible = builder.ins().band(concurrent, no_edge);
+    builder.ins().brif(eligible, check_buffer, &[], slow, &[]);
+    builder.switch_to_block(check_buffer);
+    builder.seal_block(check_buffer);
+    let context = builder.ins().get_pinned_reg(ptr_ty);
+    let buffer = builder.ins().load(
+        ptr_ty,
+        MemFlagsData::trusted(),
+        context,
+        willow_abi::generated_context::BARRIER_BUFFER_OFFSET,
+    );
+    let admitted = builder.ins().icmp_imm_s(IntCC::NotEqual, buffer, 0);
+    builder.ins().brif(admitted, check_capacity, &[], slow, &[]);
+    builder.switch_to_block(check_capacity);
+    builder.seal_block(check_capacity);
+    let length = builder
+        .ins()
+        .load(ptr_ty, MemFlagsData::trusted(), buffer, abi::LENGTH_OFFSET);
+    let limit = builder
+        .ins()
+        .load(ptr_ty, MemFlagsData::trusted(), buffer, abi::LIMIT_OFFSET);
+    let next = builder.ins().iadd_imm_s(length, abi::PAIR_ENTRIES);
+    // Length is bounded by the runtime capacity (at most 65536), so no wrap.
+    let room = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, next, limit);
+    builder.ins().brif(room, check_closing, &[], slow, &[]);
+    builder.switch_to_block(check_closing);
+    builder.seal_block(check_closing);
+    let closing_addr =
+        builder
+            .ins()
+            .load(ptr_ty, MemFlagsData::trusted(), buffer, abi::CLOSING_OFFSET);
+    let closing = builder
+        .ins()
+        .atomic_load(types::I8, MemFlagsData::trusted(), closing_addr);
+    builder.ins().brif(closing, slow, &[], append, &[]);
+    builder.switch_to_block(append);
+    builder.seal_block(append);
+    let base = builder
+        .ins()
+        .load(ptr_ty, MemFlagsData::trusted(), buffer, abi::BASE_OFFSET);
+    let offset = builder.ins().imul_imm_s(length, i64::from(ptr_ty.bytes()));
+    let address = builder.ins().iadd(base, offset);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), previous, address, 0);
+    builder.ins().store(
+        MemFlagsData::trusted(),
+        word,
+        address,
+        ptr_ty.bytes() as i32,
+    );
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), next, buffer, abi::LENGTH_OFFSET);
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(slow);
+    builder.seal_block(slow);
 }
 
 /// Extra conditions of [`FuncGen::emit_filtered_reference_store`].
@@ -1154,6 +1251,71 @@ mod tests {
                 );
                 assert_eq!(codegen.output.gc_bitmap_descriptors.len(), 2);
             }
+        }
+    }
+
+    #[test]
+    fn inline_satb_codegen_is_call_free_and_linear_in_store_sites() {
+        use cranelift_codegen::ir::{AbiParam, Opcode};
+        let mut per_site = None;
+        for sites in [1, 16, 256] {
+            let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let codegen = codegen_build.declaration_context();
+            let mut ctx = codegen.output.module.make_context();
+            ctx.func.signature.params.extend([
+                AbiParam::new(types::I8),
+                AbiParam::new(types::I8),
+                AbiParam::new(types::I64),
+                AbiParam::new(types::I64),
+                AbiParam::new(types::I64),
+            ]);
+            let mut frontend = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut frontend);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let p = builder.block_params(entry).to_vec();
+            for _ in 0..sites {
+                let done = builder.create_block();
+                emit_inline_satb_enqueue(&mut builder, types::I64, p[0], p[1], p[2], p[3], done);
+                builder.ins().jump(done, &[]);
+                builder.switch_to_block(done);
+                builder.seal_block(done);
+                builder
+                    .ins()
+                    .atomic_store(MemFlagsData::trusted(), p[3], p[4]);
+            }
+            builder.ins().return_(&[]);
+            builder.finalize(codegen.output.module.target_config());
+            let opcodes: Vec<_> = ctx
+                .func
+                .layout
+                .blocks()
+                .flat_map(|block| {
+                    ctx.func
+                        .layout
+                        .block_insts(block)
+                        .map(|inst| ctx.func.dfg.insts[inst].opcode())
+                })
+                .collect();
+            assert!(!opcodes.contains(&Opcode::Call));
+            assert!(!opcodes.contains(&Opcode::CallIndirect));
+            assert_eq!(
+                opcodes.iter().filter(|&&op| op == Opcode::Store).count(),
+                3 * sites
+            );
+            assert_eq!(
+                opcodes
+                    .iter()
+                    .filter(|&&op| op == Opcode::AtomicStore)
+                    .count(),
+                sites
+            );
+            let count = opcodes.len() - 1;
+            assert_eq!(count, *per_site.get_or_insert(count) * sites);
+            cranelift_codegen::verify_function(&ctx.func, codegen.output.module.isa()).unwrap();
+            println!("sites={sites} inline_instructions={count} calls=0");
         }
     }
 

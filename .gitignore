@@ -464,3 +464,14 @@ AGENTS.md
 !/docs/audits/sync-poll-gates/measure.py
 !/docs/audits/sync-poll-gates/baseline.jsonl
 !/docs/audits/sync-poll-gates/after.jsonl
+
+# Public inline SATB protocol, focused validation and benchmark evidence.
+!/docs/audits/inline-satb-barrier/
+/docs/audits/inline-satb-barrier/*
+!/docs/audits/inline-satb-barrier/audit.md
+!/docs/audits/inline-satb-barrier/validate.py
+!/docs/audits/inline-satb-barrier/validation.json
+!/docs/audits/inline-satb-barrier/measure.py
+!/docs/audits/inline-satb-barrier/measurements.json
+!/docs/audits/inline-satb-barrier/examples.json
+!/docs/audits/inline-satb-barrier/integration.json

@@ -114,6 +114,7 @@ pub(crate) struct Context {
     panic_depth: AtomicPtr<AtomicUsize>,
     sync_counter: Cell<*mut i32>,
     gc_stop: Cell<*const u8>,
+    barrier_buffer: Cell<usize>,
     pub(crate) roots: ShadowRoots,
     parent: Cell<*const Context>,
     parent_depth: Cell<usize>,
@@ -129,6 +130,7 @@ impl Context {
             panic_depth: AtomicPtr::new((&raw const NO_PANIC).cast_mut()),
             sync_counter: Cell::new(std::ptr::null_mut()),
             gc_stop: Cell::new(std::ptr::null()),
+            barrier_buffer: Cell::new(0),
             roots: ShadowRoots::new(),
             parent: Cell::new(std::ptr::null()),
             parent_depth: Cell::new(0),
@@ -145,6 +147,7 @@ impl Context {
     }
 
     pub(crate) fn refresh(&self) {
+        self.barrier_buffer.set(0);
         self.refresh_panic_depth();
         // Refresh at native entry/resume, after the task context is installed.
         // The pointees are task-owned (or null) and process-owned respectively.
@@ -178,7 +181,27 @@ impl Context {
     }
 }
 
+pub(crate) fn set_barrier_buffer(address: usize) {
+    // Context refresh on resume prevents caching a previous worker's buffer.
+    unsafe { &*active() }.barrier_buffer.set(address);
+}
+
+pub(crate) fn revoke_barrier_buffers() {
+    // Registration retirement can occur in a nested native callback. Revoke
+    // ancestors before releasing the Arc that keeps their pointers alive.
+    let mut context = active();
+    while !context.is_null() {
+        let state = unsafe { &*context };
+        state.barrier_buffer.set(0);
+        context = state.parent.get();
+    }
+}
+
 const _: () = {
+    assert!(
+        std::mem::offset_of!(Context, barrier_buffer)
+            == willow_abi::generated_context::BARRIER_BUFFER_OFFSET as usize
+    );
     assert!(
         std::mem::offset_of!(Context, sync_counter)
             == willow_abi::generated_context::SYNC_COUNTER_OFFSET as usize
@@ -388,6 +411,32 @@ unsafe fn call_word(entry: *const (), argument: usize, context: *const Context) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_satb_admission_is_revoked_across_nested_retirement_and_worker_transfer() {
+        let _guard = crate::gc::runtime_test_guard();
+        let outer = active();
+        set_barrier_buffer(123);
+        let nested = Context::new();
+        let old = replace(&nested);
+        set_barrier_buffer(456);
+        revoke_barrier_buffers();
+        assert_eq!(nested.barrier_buffer.get(), 0);
+        assert_eq!(unsafe { &*outer }.barrier_buffer.get(), 0);
+        replace(old);
+        let context = Box::new(Context::new());
+        context.barrier_buffer.set(789);
+        // Transfer exclusive ownership as native scheduler contexts do. No
+        // thread retains a reference while the receiving worker refreshes it.
+        let address = Box::into_raw(context) as usize;
+        std::thread::spawn(move || {
+            let context = unsafe { Box::from_raw(address as *mut Context) };
+            context.refresh();
+            assert_eq!(context.barrier_buffer.get(), 0);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn sync_gates_thread_nested_and_restored_contexts() {
