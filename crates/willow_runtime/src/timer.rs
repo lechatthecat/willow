@@ -83,6 +83,18 @@ impl GcTrace for RuntimeSleepFuture {
 // returns, discarded values, panic recovery and cancellation need no cleanup.
 static VALUE_EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
 
+/// Process-local monotonic nanoseconds, sharing the timer epoch. Saturates
+/// after i64::MAX nanoseconds; this is not a wall-clock timestamp.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_time_now_ns() -> i64 {
+    duration_ns(VALUE_EPOCH.elapsed())
+}
+
+fn duration_ns(elapsed: Duration) -> i64 {
+    elapsed.as_nanos().min(i64::MAX as u128) as i64
+}
+
 /// Make an allocation-free sleep value. Round the deadline up: millisecond
 /// quantization must never shorten the requested delay. u64 accommodates every
 /// nonnegative i64 duration plus process uptime (saturating at the ABI limit).
@@ -179,6 +191,54 @@ mod tests {
         assert_eq!(willow_timer_value_await(value), 0);
         let huge = willow_timer_value_sleep(i64::MAX);
         assert!(huge >= i64::MAX as u64);
+    }
+
+    #[test]
+    fn monotonic_clock_conversion_boundaries() {
+        for (duration, expected) in [
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(1), 1),
+            (Duration::from_secs(1), 1_000_000_000),
+            (Duration::from_nanos(i64::MAX as u64), i64::MAX),
+            (Duration::from_nanos(i64::MAX as u64 + 1), i64::MAX),
+            (Duration::MAX, i64::MAX),
+        ] {
+            assert_eq!(duration_ns(duration), expected);
+        }
+    }
+
+    #[test]
+    fn monotonic_clock_elapsed_and_threads() {
+        let before = willow_time_now_ns();
+        assert!(before >= 0);
+        std::thread::sleep(Duration::from_millis(2));
+        let other = std::thread::spawn(willow_time_now_ns_wrapper)
+            .join()
+            .unwrap();
+        let after = willow_time_now_ns();
+        assert!(other - before >= 2_000_000);
+        assert!(after >= other);
+    }
+
+    fn willow_time_now_ns_wrapper() -> i64 {
+        willow_time_now_ns()
+    }
+
+    #[test]
+    fn monotonic_clock_scaling_no_allocations() {
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+        let mut previous = willow_time_now_ns();
+        for count in [1, 16, 256, 4096] {
+            let before = counter::thread_allocations();
+            for _ in 0..count {
+                let now = willow_time_now_ns();
+                assert!(now >= previous);
+                previous = now;
+            }
+            let allocations = counter::thread_allocations() - before;
+            assert_eq!(allocations, 0);
+            println!("clock reads={count} allocations={allocations}");
+        }
     }
 
     fn await_and_release(raw: *mut std::ffi::c_void) -> u8 {

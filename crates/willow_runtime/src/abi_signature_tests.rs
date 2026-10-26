@@ -623,3 +623,13 @@ fn fused_mutex_out_slots_have_native_pointer_signatures() {
     );
     assert_schema("willow_async_mutex_poll_load", &[Ptr, I64, Ptr], Some(I32));
 }
+
+#[test]
+fn monotonic_clock_abi() {
+    let _: extern "C" fn() -> i64 = crate::timer::willow_time_now_ns;
+    assert_schema("willow_time_now_ns", &[], Some(I64));
+    assert_eq!(
+        runtime_symbol("willow_time_now_ns").unwrap().effects,
+        willow_abi::RuntimeEffects::NONE
+    );
+}

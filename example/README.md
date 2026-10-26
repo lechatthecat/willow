@@ -318,3 +318,8 @@ We do not vendor regex or substitute a path crate here: exercising a real regist
 dependency is the purpose of this example. Existing `rust_value_bridge` and
 `tests/fixtures/rust_bridge/path` cover bridge behavior with offline path crates;
 they do not establish that regex resolves from crates.io.
+
+## Monotonic time
+
+`monotonic_clock.wi` measures elapsed nanoseconds across a sleep using
+`std::time::now_ns`. See [clock semantics](../docs/monotonic-clock.md).

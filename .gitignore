@@ -486,3 +486,12 @@ AGENTS.md
 !/docs/audits/string-metadata/before.json
 !/docs/audits/string-metadata/after.json
 !/docs/audits/string-metadata/scaling.json
+
+# Public monotonic clock API, audit and focused evidence only.
+!/docs/monotonic-clock.md
+!/docs/audits/monotonic-clock/
+/docs/audits/monotonic-clock/*
+!/docs/audits/monotonic-clock/audit.md
+!/docs/audits/monotonic-clock/reproduce.sh
+!/docs/audits/monotonic-clock/integration.txt
+!/docs/audits/monotonic-clock/runtime.txt

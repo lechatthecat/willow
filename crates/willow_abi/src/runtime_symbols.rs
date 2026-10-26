@@ -137,6 +137,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     ALLOC; "willow_string_alloc" => ([Ptr, I64] -> Some(Ptr));
     ALLOC; "willow_string_literal_slot" => ([Ptr, Ptr, I64] -> Some(Ptr));
     // --- args ---
+    NONE; "willow_time_now_ns" => ([] -> Some(I64));
     NONE; "willow_runtime_args_len" => ([] -> Some(I64));
     ALLOC; "willow_runtime_arg" => ([I64] -> Some(Ptr));
     ALLOC; "willow_runtime_program_name" => ([] -> Some(Ptr));

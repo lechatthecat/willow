@@ -3432,7 +3432,7 @@ fn lower_resolution_partial(
         is_async,
     };
     let mut out = HirResolution::default();
-    for namespace in ["env", "fs", "net", "parallel", "f64"] {
+    for namespace in ["time", "env", "fs", "net", "parallel", "f64"] {
         out.namespaces
             .insert(TypeId::local(namespace), namespace.to_owned());
     }
@@ -3441,7 +3441,7 @@ fn lower_resolution_partial(
         if std_registry::is_std_path(&import.path) {
             if let Ok(std_registry::StdImport::Module { module }) =
                 std_registry::resolve_std_import(&import.path, import.span)
-                && matches!(module.as_str(), "env" | "fs" | "net" | "parallel")
+                && matches!(module.as_str(), "time" | "env" | "fs" | "net" | "parallel")
             {
                 out.namespaces.insert(
                     TypeId::local(import.alias.as_deref().unwrap_or(&module)),

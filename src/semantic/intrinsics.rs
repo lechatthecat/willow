@@ -2141,6 +2141,7 @@ pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBu
         };
     }
     let runtime = match (class, method) {
+        ("time", "now_ns") => "willow_time_now_ns",
         ("env", "args_len") => "willow_runtime_args_len",
         ("env", "args") => "willow_runtime_args_array",
         ("env", "program_name") => "willow_runtime_program_name",

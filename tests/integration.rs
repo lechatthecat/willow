@@ -372,3 +372,6 @@ mod sync_poll_gates;
 
 #[path = "integration/string_metadata.rs"]
 mod string_metadata;
+
+#[path = "integration/monotonic_clock.rs"]
+mod monotonic_clock;

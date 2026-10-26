@@ -1,0 +1,10 @@
+import std::time;
+
+async fn main() {
+    let start = time::now_ns();
+    await sleep(10);
+    let elapsed = time::now_ns() - start;
+    println("Elapsed nanoseconds:");
+    println(elapsed);
+    println(elapsed >= 10000000);
+}

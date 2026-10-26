@@ -342,7 +342,7 @@ impl TypeChecker {
     }
 
     pub(super) fn register_builtin_modules(&mut self) {
-        for module_name in ["env", "fs", "net", "parallel"] {
+        for module_name in ["time", "env", "fs", "net", "parallel"] {
             self.register_schema_module(module_name);
         }
     }
@@ -1003,7 +1003,7 @@ impl TypeChecker {
                     self.imported_names
                         .insert(local.to_string(), Some(import.span));
                     if import.alias.is_some()
-                        && matches!(*module, "env" | "fs" | "net" | "parallel")
+                        && matches!(*module, "time" | "env" | "fs" | "net" | "parallel")
                     {
                         self.register_schema_module_as(module, local);
                     }

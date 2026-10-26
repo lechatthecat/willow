@@ -186,6 +186,8 @@ const FS: &[StdItemSchema] = &[
     std_function!("remove_file_async", [T::String] -> T::Task(&VOID_IO)),
 ];
 
+const TIME: &[StdItemSchema] = &[std_function!("now_ns", [] -> T::I64)];
+
 const ENV: &[StdItemSchema] = &[
     std_function!("args", [] -> T::Array(&T::String)),
     std_function!("arg", [T::I64] -> T::Option(&T::String)),
@@ -232,6 +234,10 @@ pub const STDLIB_SCHEMA: &[StdModuleSchema] = &[
     StdModuleSchema {
         name: "io",
         items: IO,
+    },
+    StdModuleSchema {
+        name: "time",
+        items: TIME,
     },
     StdModuleSchema {
         name: "env",
@@ -724,6 +730,7 @@ mod recursive_schema_tests {
                 "option",
                 "result",
                 "io",
+                "time",
                 "env",
                 "fs",
                 "net",
@@ -735,6 +742,7 @@ mod recursive_schema_tests {
             ("option", 1),
             ("result", 1),
             ("io", 3),
+            ("time", 1),
             ("env", 4),
             ("fs", 9),
             ("net", 10),
