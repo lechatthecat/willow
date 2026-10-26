@@ -358,6 +358,12 @@ fn survivor_direct_root_and_budget_fallback_promote_in_place() {
             unsafe { (*payload_to_header(survivor)).generation },
             GC_GENERATION_OLD
         );
+        assert_eq!(
+            runtime().root_tlabs.generation(survivor as usize),
+            Some(GC_GENERATION_OLD)
+        );
+        willow_gc_add_runtime_root(survivor);
+        willow_gc_remove_runtime_root(survivor);
         assert_eq!(willow_gc_pinned_promotions(), 1);
         assert_eq!(willow_gc_tenured_objects(), 0);
         reset_internal();
@@ -1597,5 +1603,109 @@ fn m4_actual_stop_components_sum_to_complete_request_and_release() {
     assert!(stats.by_reason[2].iter().all(|h| h.count == 1));
     assert!(!stats.last.aborted);
     willow_gc_remove_runtime_root_slot(&raw mut root);
+    reset_internal();
+}
+
+#[test]
+fn address_root_initial_children_survive_transfer_to_old_parent() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    for major_first in [false, true] {
+        reset_internal();
+        let parent = willow_alloc_typed(8, 1);
+        willow_gc_add_runtime_root(parent);
+        let mut tls = tlab_state_for_test();
+        let child = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+        unsafe { *child.cast::<u64>() = 91 };
+        let owner = willow_alloc_typed(8, 1);
+        unsafe { *owner.cast::<*mut u8>() = child };
+        willow_gc_add_runtime_root(owner);
+        willow_gc_write_barrier(
+            parent,
+            std::ptr::null_mut(),
+            owner,
+            GcStoreDestination::ObjectField as i64,
+        );
+        unsafe { *parent.cast::<*mut u8>() = owner };
+        willow_gc_remove_runtime_root(owner);
+        assert_eq!(runtime_root_count(), 1);
+        assert_eq!(runtime().runtime_roots.pending_count(), 1);
+        if major_first {
+            willow_gc_collect();
+            assert_eq!(
+                runtime().runtime_roots.pending_count(),
+                1,
+                "live owner keeps its scan obligation across major sweep"
+            );
+        }
+        with_stw(
+            crate::gc_telemetry::stops::StopReason::Minor,
+            super::collect_stopped,
+        )
+        .unwrap();
+        let retained = unsafe { *owner.cast::<*mut u8>() };
+        // Validate before dereferencing: the buggy path may have freed the nursery.
+        assert!(
+            super::super::barrier::payload_generation(&runtime().heap.lock().unwrap(), retained)
+                .is_some(),
+            "transferred owner's initial child was reclaimed"
+        );
+        assert_eq!(unsafe { *retained.cast::<u64>() }, 91);
+        assert_eq!(unsafe { *parent.cast::<*mut u8>() }, owner);
+        willow_gc_remove_runtime_root(parent);
+    }
+    reset_internal();
+}
+
+#[test]
+fn pending_address_owner_reclamation_clears_obligations_in_both_major_sweeps() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    for stopped in [false, true] {
+        reset_internal();
+        let mut tls = tlab_state_for_test();
+        let pinned = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+        collect(vec![pinned]);
+        assert_eq!(
+            runtime().root_tlabs.generation(pinned as usize),
+            Some(GC_GENERATION_OLD)
+        );
+        let old = willow_alloc_typed(8, 0);
+        for owner in [old, pinned] {
+            willow_gc_add_runtime_root(owner);
+            willow_gc_remove_runtime_root(owner);
+        }
+        assert_eq!(
+            runtime_root_count(),
+            0,
+            "pending work must not become a major root"
+        );
+        assert_eq!(runtime().runtime_roots.pending_count(), 2);
+        // Exercise both reclaim implementations directly with every object
+        // proven dead, independently of major-policy selection in test builds.
+        for owner in [old, pinned] {
+            HeapObject::from_payload(GcPayload::from_raw(owner).unwrap()).clear_mark();
+        }
+        if stopped {
+            sweep::stopped(&mut Default::default());
+        } else {
+            let plan = sweep::prepare(&mut runtime().heap.lock().unwrap(), None);
+            sweep::concurrent(plan);
+        }
+        assert_eq!(runtime().runtime_roots.pending_count(), 0);
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        // Fresh registrations still work after sweep removes pending entries;
+        // allocator storage may be reused without inheriting an old obligation.
+        let replacement = willow_alloc_typed(8, 0);
+        willow_gc_add_runtime_root(replacement);
+        assert_eq!(runtime().runtime_roots.pending_count(), 1);
+        willow_gc_remove_runtime_root(replacement);
+        with_stw(
+            crate::gc_telemetry::stops::StopReason::Minor,
+            super::collect_stopped,
+        )
+        .unwrap();
+        assert_eq!(runtime().runtime_roots.pending_count(), 0);
+    }
     reset_internal();
 }

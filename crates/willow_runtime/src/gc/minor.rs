@@ -308,6 +308,7 @@ impl<'a> MinorCollector<'a> {
             self.state.survivor_reserve_stats.consumed_bytes += chunk.capacity as u64;
             let index = self.state.tlab_chunks.len();
             self.state.tlab_addresses.insert(chunk.base as usize, index);
+            runtime().root_tlabs.insert(&chunk);
             self.state.tlab_chunks.push(chunk);
             self.index_chunk(index);
             self.state.survivor_stats.survivor_space_reserved += GC_TLAB_CHUNK_SIZE as u64;
@@ -1138,6 +1139,7 @@ impl<'a> MinorCollector<'a> {
     /// Free a source chunk none of whose objects remain allocated.
     fn release_chunk(&mut self, chunk_index: usize, chunk_identities: &mut Vec<usize>) {
         let chunk = self.state.tlab_chunks.swap_remove(chunk_index);
+        runtime().root_tlabs.remove(chunk.base as usize);
         chunk_identities.swap_remove(chunk_index);
         let layout = Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
             .expect("TLAB chunk layout remains valid");
@@ -1245,12 +1247,23 @@ fn minor_collect_with_roots(
                     .map(|value| (value.as_ptr(), PinSource::ScopedLoan))
             }),
     );
-    // Address runtime roots are old. Their initial children are remembered at
-    // registration and subsequent stores use the old-to-young barrier. Scanning
+    // Address runtime roots are old. Newly registered owners are remembered
+    // below and subsequent stores use the old-to-young barrier. Scanning
     // the complete registry here would revisit every suspended task each minor.
     drop(root_scan);
     let registry = minor_registry_snapshot();
     let mut state = runtime().heap.lock().unwrap();
+    runtime().runtime_roots.drain_pending(|address| {
+        // A root may have been removed after transferring the owner elsewhere.
+        // Pending addresses are obligations, not retention: under the heap lock
+        // validate managed old storage before touching any header. Major sweep
+        // removes reclaimed owners before their addresses become reusable.
+        if super::barrier::payload_generation(&state, address as *mut u8)
+            == Some(super::GC_GENERATION_OLD)
+        {
+            super::barrier::remember_owner(&mut state, address);
+        }
+    });
     // Promotion raises `occupied` per object; drop the lock-free headrooms
     // once instead of charging each copy.
     super::invalidate_external_headroom();

@@ -807,6 +807,7 @@ impl Cursor {
                 if chunk.kind == RegionKind::Survivor {
                     state.survivor_stats.survivor_space_reserved -= chunk.capacity as u64;
                 }
+                runtime().root_tlabs.remove(chunk.base as usize);
                 state.tlab_addresses.remove(chunk.base as usize);
                 if index < state.tlab_chunks.len() {
                     state
@@ -839,6 +840,9 @@ fn sweep_drop(type_id: u32) -> Result<Option<DropFn>, ()> {
 
 fn reclaim(state: &mut GcState, object: HeapObject, size: usize, permit: raw_heap::ReclaimPermit) {
     let payload = object.payload().as_ptr() as usize;
+    if object.generation() == GC_GENERATION_OLD {
+        runtime().runtime_roots.forget_pending(payload);
+    }
     if state.remembered_set.remove(&payload) {
         let card = payload / GC_CARD_SIZE;
         if !state.remembered_set.contains_card(card) {

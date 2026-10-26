@@ -348,6 +348,11 @@ fn sweep_region(
                         );
                         drops.push((drop_fn, object.payload().as_ptr()));
                     }
+                    if object.generation() == GC_GENERATION_OLD {
+                        runtime()
+                            .runtime_roots
+                            .forget_pending(object.payload().as_ptr() as usize);
+                    }
                     remembered_set.remove(&(object.payload().as_ptr() as usize));
                     if object.generation() == GC_GENERATION_YOUNG {
                         *young_allocated_bytes = young_allocated_bytes.saturating_sub(size);
@@ -449,6 +454,9 @@ fn sweep_chunk(
                 .saturating_add(size);
         } else {
             let payload = object.payload().as_ptr() as usize;
+            if object.generation() == GC_GENERATION_OLD {
+                runtime().runtime_roots.forget_pending(payload);
+            }
             state.remembered_set.remove(&payload);
             if let Some(drop_fn) = lookup_drop(object.type_id()) {
                 crate::frame_lifetime::pending_drop(
@@ -547,6 +555,7 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
                 state.survivor_stats.survivor_space_reserved -= chunk.capacity as u64;
             }
             assert!(chunk.owner_state.is_none());
+            runtime().root_tlabs.remove(chunk.base as usize);
             positions.push(None);
             let layout =
                 Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>()).unwrap();

@@ -407,3 +407,19 @@ AGENTS.md
 !/docs/audits/array-join/audit.md
 !/docs/audits/array-join/measurements.txt
 !/docs/audits/array-join/verify.sh
+
+# Public runtime-root registration audit and focused measurement evidence.
+!/docs/audits/runtime-root-registration/
+/docs/audits/runtime-root-registration/*
+!/docs/audits/runtime-root-registration/audit.md
+!/docs/audits/runtime-root-registration/measure.py
+!/docs/audits/runtime-root-registration/measurements.jsonl
+!/docs/audits/runtime-root-registration/measurements-initial.jsonl
+!/docs/audits/runtime-root-registration/measurements-pending-map.jsonl
+!/docs/audits/runtime-root-registration/measurements-short.jsonl
+!/docs/audits/runtime-root-registration/measurements-radix-long.jsonl
+!/docs/audits/runtime-root-registration/measurements-page-pilot.jsonl
+!/docs/audits/runtime-root-registration/focused-tests.txt
+!/docs/audits/runtime-root-registration/validation.txt
+
+!/docs/audits/runtime-root-registration/measurements-before-review.jsonl

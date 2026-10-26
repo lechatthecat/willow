@@ -7,9 +7,20 @@ struct Roots {
     // The map is only an index; snapshots never enumerate retained buckets.
     indices: IdMap<usize, usize>,
     entries: Vec<(usize, usize)>, // (address, owner count)
+    pending_indices: IdMap<usize, usize>,
+    pending: Vec<usize>,
 }
 
 impl Roots {
+    fn remove_pending(&mut self, address: usize) {
+        if let Some(index) = self.pending_indices.remove(&address) {
+            self.pending.swap_remove(index);
+            if let Some(&moved) = self.pending.get(index) {
+                *self.pending_indices.get_mut(&moved).unwrap() = index;
+            }
+        }
+    }
+
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -35,6 +46,14 @@ impl RuntimeRootSet {
     }
 
     pub(super) fn add(&self, object: *mut u8) {
+        self.add_inner(object, false);
+    }
+
+    pub(super) fn add_pending(&self, object: *mut u8) {
+        self.add_inner(object, true);
+    }
+
+    fn add_inner(&self, object: *mut u8, pending: bool) {
         if object.is_null() {
             return;
         }
@@ -46,6 +65,11 @@ impl RuntimeRootSet {
             let index = roots.entries.len();
             roots.entries.push((root, 1));
             roots.indices.insert(root, index);
+        }
+        if pending && !roots.pending_indices.contains_key(&root) {
+            let index = roots.pending.len();
+            roots.pending_indices.insert(root, index);
+            roots.pending.push(root);
         }
     }
 
@@ -64,6 +88,28 @@ impl RuntimeRootSet {
                 if let Some(&(moved, _)) = roots.entries.get(index) {
                     *roots.indices.get_mut(&moved).unwrap() = index;
                 }
+            }
+        }
+    }
+
+    /// Reclamation, unlike root removal, ends an owner's scan obligation.
+    /// Call under the heap lock before managed storage becomes reusable.
+    pub(super) fn forget_pending(&self, address: usize) {
+        self.shards[Self::shard_index(address)]
+            .lock()
+            .unwrap()
+            .remove_pending(address);
+    }
+
+    /// Visit initial-child scan obligations, including owners no longer rooted
+    /// here. The caller holds the heap lock and validates addresses before use;
+    /// neither a pending address nor its shard lock keeps its object alive.
+    pub(super) fn drain_pending(&self, mut visit: impl FnMut(usize)) {
+        for shard in &self.shards {
+            let mut roots = shard.lock().unwrap();
+            while let Some(root) = roots.pending.pop() {
+                roots.pending_indices.remove(&root);
+                visit(root);
             }
         }
     }
@@ -110,6 +156,14 @@ impl RuntimeRootSet {
         self.lock_all().iter().map(|shard| shard.len()).sum()
     }
 
+    #[cfg(test)]
+    pub(super) fn pending_count(&self) -> usize {
+        self.lock_all()
+            .iter()
+            .map(|shard| shard.pending.len())
+            .sum()
+    }
+
     pub(super) fn clear(&self) {
         for shard in &mut self.lock_all() {
             **shard = Roots::default();
@@ -121,6 +175,45 @@ impl RuntimeRootSet {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn pending_owners_survive_root_removal_until_scan_or_reclamation() {
+        for count in [64, 256, 1024, 4096] {
+            let roots = RuntimeRootSet::default();
+            for i in 1..=count {
+                roots.add_pending((i * 16) as *mut u8);
+                roots.add_pending((i * 16) as *mut u8);
+                roots.remove((i * 16) as *mut u8);
+                if i % 16 != 0 {
+                    roots.remove((i * 16) as *mut u8);
+                }
+            }
+            assert_eq!(roots.len(), count / 16);
+            assert_eq!(roots.snapshot().len(), count / 16);
+            // Repeated registrations after losing all roots still deduplicate.
+            roots.add_pending(16 as *mut u8);
+            roots.remove(16 as *mut u8);
+            for i in (1..=count).filter(|i| i % 16 != 0 && i % 2 == 0) {
+                roots.forget_pending(i * 16);
+            }
+            let mut visits = 0;
+            roots.drain_pending(|address| {
+                visits += 1;
+                assert!(address / 16 % 2 == 1 || address % 256 == 0);
+            });
+            assert_eq!(visits, count / 2 + count / 16);
+            roots.drain_pending(|_| panic!("unchanged roots must not be scanned again"));
+            // Re-registration of an existing owner may introduce new children.
+            roots.add_pending(256 as *mut u8);
+            roots.drain_pending(|address| assert_eq!(address, 256));
+            roots.clear();
+            roots.drain_pending(|_| panic!("reset must clear pending work"));
+            eprintln!(
+                "registrations={} pending_visits={visits} repeated_visits=0",
+                count * 2
+            );
+        }
+    }
 
     #[test]
     fn lifecycle_touches_only_the_address_shard() {

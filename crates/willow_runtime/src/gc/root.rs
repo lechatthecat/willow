@@ -190,7 +190,7 @@ pub(crate) unsafe fn discard_parked_roots(token: u64) {
 /// The holder keeps the raw address, which a moving collection cannot rewrite,
 /// so `object` must not be young: register only runtime allocations (always
 /// old) or objects that already survived promotion. Old objects are never
-/// moved. Registration remembers its initial children; subsequent reference
+/// moved. Registration queues its initial children for the next minor scan; subsequent reference
 /// stores must use the GC write barrier. Minors scan remembered owners rather
 /// than enumerating persistent address roots. Registering a young object is fatal. A holder of a
 /// possibly young object registers its storage with
@@ -207,31 +207,20 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
     // The activation handshake crosses it before taking runtime roots, just
     // as it crosses the corresponding phase-gated SATB deletion below.
     let marking = GC_MARK_PHASE.load(Ordering::Acquire) != 0;
-    if marking || runtime().tlab_ever_allocated.load(Ordering::Acquire) {
-        let mut state = runtime().heap.lock().unwrap();
-        if tlab_payload_generation(&state, object as usize) == Some(GC_GENERATION_YOUNG) {
-            drop(state);
-            crate::failure::fatal_invariant(
-                "young object registered as an address runtime root; \
-                 use willow_gc_add_runtime_root_slot",
-            );
-        }
-        if marking && let Some(cycle) = state.concurrent_cycle.as_ref() {
-            cycle.enqueue(object);
-        }
-        if runtime().tlab_ever_allocated.load(Ordering::Acquire) {
-            // Debug root diagnostics belong to collection. Do not dereference
-            // an invalid root while remembering it merely because a TLAB exists.
-            #[cfg(debug_assertions)]
-            let valid = validate_payload_pointer_locked(&state, object).is_ok();
-            #[cfg(not(debug_assertions))]
-            let valid = true;
-            if valid {
-                barrier::remember_owner(&mut state, object as usize);
-            }
-        }
+    if runtime().root_tlabs.generation(object as usize) == Some(GC_GENERATION_YOUNG) {
+        crate::failure::fatal_invariant(
+            "young object registered as an address runtime root; \
+             use willow_gc_add_runtime_root_slot",
+        );
     }
-    runtime().runtime_roots.add(object);
+    if marking && let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref() {
+        cycle.enqueue(object);
+    }
+    if runtime().tlab_ever_allocated.load(Ordering::Acquire) {
+        runtime().runtime_roots.add_pending(object);
+    } else {
+        runtime().runtime_roots.add(object);
+    }
 }
 
 /// Remove a persistent runtime root when the owning runtime structure no
@@ -443,6 +432,53 @@ pub(crate) fn parked_root_counts_for_test() -> (usize, usize) {
 #[cfg(test)]
 mod inline_root_tests {
     use super::*;
+
+    #[test]
+    fn runtime_root_registration_publishes_during_marking() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let object = willow_alloc_typed(8, 0);
+        let index = epoch_index::RegionIndex::capture(&runtime().heap.lock().unwrap());
+        let cycle = Arc::new(ConcurrentCycle::with_index(
+            epoch_index::EpochIndex::regions(index),
+            IdSet::default(),
+            IdMap::default(),
+            0,
+        ));
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), Some(cycle.clone()));
+        GC_MARK_PHASE.store(1, Ordering::Release);
+        assert!(!cycle.is_marked(object as usize));
+        willow_gc_add_runtime_root(object);
+        cycle.drain(usize::MAX);
+        assert!(cycle.is_marked(object as usize));
+        willow_gc_remove_runtime_root(object);
+        GC_MARK_PHASE.store(0, Ordering::Release);
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn runtime_root_registration_with_nursery_does_not_lock_heap() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let mut tls = Box::new(GcTlabState::new());
+        willow_gc_alloc_slow(&mut *tls, 0, 0, 8, 0);
+        let object = willow_alloc_typed(8, 0);
+        assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+        // A recursive heap acquisition would deadlock: registration/removal
+        // must finish while this caller already owns the mutex.
+        let state = runtime().heap.lock().unwrap();
+        for _ in 0..1024 {
+            willow_gc_add_runtime_root(object);
+        }
+        assert_eq!(runtime_root_count(), 1);
+        for _ in 0..1024 {
+            willow_gc_remove_runtime_root(object);
+        }
+        assert_eq!(runtime_root_count(), 0);
+        drop(state);
+        reset_internal_for_test();
+    }
 
     #[test]
     fn owner_cached_push_pop_has_two_slow_paths_per_live_stack() {

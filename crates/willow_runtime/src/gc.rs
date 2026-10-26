@@ -73,6 +73,7 @@ mod pending_registry;
 mod region_cache;
 mod region_candidates;
 mod root_handshake;
+mod root_tlabs;
 mod runtime_roots;
 mod satb;
 mod sweep;
@@ -996,6 +997,7 @@ struct GcRuntime {
     root_stack_owner: Mutex<Option<ThreadId>>,
     skipped_foreign_owner_collections: std::sync::atomic::AtomicU64,
     runtime_roots: RuntimeRootSet,
+    root_tlabs: root_tlabs::RootTlabs,
     /// Runtime-owned slots a moving collection rewrites (counted per slot).
     runtime_root_slots: RuntimeRootSet,
     /// Subset of runtime slots whose owners lend a fixed address.
@@ -1033,6 +1035,7 @@ impl Default for GcRuntime {
             root_stack_owner: Mutex::new(None),
             skipped_foreign_owner_collections: std::sync::atomic::AtomicU64::new(0),
             runtime_roots: RuntimeRootSet::default(),
+            root_tlabs: root_tlabs::RootTlabs::default(),
             runtime_root_slots: RuntimeRootSet::default(),
             pin_lease_slots: RuntimeRootSet::default(),
             parked_stack_roots: Mutex::new(HashMap::new()),
@@ -2452,6 +2455,7 @@ fn reset_internal() {
     state.old_regions.clear();
     state.old_addresses.clear();
     state.tlab_addresses.clear();
+    runtime().root_tlabs.clear();
     state.old_region_candidates.clear();
     state.old_reserved_bytes = 0;
     state.region_cache.shrink_to(0);

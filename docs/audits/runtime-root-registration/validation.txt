@@ -1,0 +1,10 @@
+cargo fmt --all -- --check
+exit=0
+cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+exit=0
+cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+exit=0
+cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+exit=0
+cargo clippy --workspace --all-targets --target x86_64-apple-darwin -- -D warnings
+exit=0

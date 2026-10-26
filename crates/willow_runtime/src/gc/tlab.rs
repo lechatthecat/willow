@@ -424,6 +424,7 @@ pub(super) fn install_tlab_chunk(
         header_offsets: Vec::new(),
     });
     let chunk = state.tlab_chunks.last().unwrap();
+    runtime().root_tlabs.insert(chunk);
     // SAFETY: the generated TLS is owned by this allocation's mutator.
     unsafe { tlab_state_at(owner_state) }.start_bits.store(
         chunk.mark_bitmap.bits.words_ptr() as usize,
