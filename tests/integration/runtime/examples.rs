@@ -15,7 +15,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "a\n5\n1.5\ntrue\n3\n1\n1\n",
         ),
         ("example/class_private_scope.wi", "true\n"),
-        ("example/closure_chain_stack.wi", "10000\n"),
+        ("example/closure_chain_stack.wi", "1000\n"),
         ("example/constructor_closure_types.wi", "true\n"),
         (
             "example/constructor_type_annotations.wi",

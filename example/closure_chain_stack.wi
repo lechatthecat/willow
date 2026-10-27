@@ -1,7 +1,8 @@
-// A bounded closure-chain example; the audit also exercises depth 100,000.
+// A bounded closure-chain example. Depth 1,000 fits the default 1 MiB Windows
+// main-thread stack; the audit also exercises depth 100,000.
 // See docs/audits/closure-chain-stack/report.md for limits and measurements.
 fn chain(n: i64, k: closure(i64) -> i64) -> i64 {
     if n == 0 { return k(0); }
     return chain(n - 1, |x| k(x + 1));
 }
-fn main() { println(chain(10000, |x| x)); }
+fn main() { println(chain(1000, |x| x)); }
