@@ -40,8 +40,6 @@ AGENTS.md
 !/docs/
 /docs/*
 !/docs/gc_telemetry.md
-!/docs/function-closure-diagnostics-audit.md
-!/docs/block-arm-helper-help-audit.md
 
 # Publish the compiler harness and reconstructed async-safepoint workloads.
 /benches/*
@@ -109,16 +107,6 @@ AGENTS.md
 # Reviewed M3 measurement sources and evidence.
 
 # Public mark-worker configuration audit and focused measurements.
-
-# Reviewed public growing-allocation regression evidence.
-!/docs/growing-allocation/
-/docs/growing-allocation/*
-!/docs/growing-allocation/audit.md
-!/docs/growing-allocation/measure.py
-!/docs/growing-allocation/before.json
-!/docs/growing-allocation/after.json
-!/docs/growing-allocation/scaling.txt
-!/docs/growing-allocation/retry-progress.txt
 
 # Public constructor-inference audit and source-only reproducer.
 
