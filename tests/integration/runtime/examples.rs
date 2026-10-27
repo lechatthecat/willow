@@ -1203,7 +1203,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "example/block_arm_control_tails.wi",
-            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n",
         ),
         ("example/channel_effect_witnesses.wi", "7\n7\n2\n"),
         ("example/channel_option_pattern.wi", "30\n"),
