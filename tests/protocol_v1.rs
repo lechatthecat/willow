@@ -265,12 +265,7 @@ fn unknown_indirect_effects_and_virtual_interface_dispatch() {
     let source = "interface I { fn run(self) -> i64; } class A implements I { pub fn run(self) -> i64 { return 1; } } fn call(x: I) -> i64 { return x.run(); } fn main() {}";
     f.write("main.wi", source);
     let snapshot = f.facts();
-    let method = snapshot["functions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|v| v["name"].as_str().unwrap().contains("A") && !v["synthetic"].as_bool().unwrap())
-        .unwrap();
+    let method = named(&snapshot, "A::run");
     let result = f.result(&[
         "impact",
         "main.wi",
