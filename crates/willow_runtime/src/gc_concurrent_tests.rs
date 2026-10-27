@@ -3266,6 +3266,9 @@ fn marker_pool_drains_each_claim_in_one_batch() {
         // A zero collector budget leaves every object to the single worker.
         pool.run(&cycle, 0);
         let drains = mark_workers::BACKGROUND_DRAINS.load(Ordering::Relaxed);
+        // A minor request or an empty sample on a loaded host ends the worker
+        // job early; closure then drains what the worker left.
+        cycle.drain(usize::MAX);
         assert_eq!(BUDGET_RETRY_CALLS.load(Ordering::Relaxed), objects);
         assert_eq!(cycle.objects.marked_count(), objects);
         // One drain per 32-object claim plus the final empty probe, not one
