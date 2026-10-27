@@ -113,7 +113,7 @@ fn native_sync_stack_panic_in_cancellation_defer_is_fatal() {
 fn helper() { defer { panic("cancel-cleanup-panic"); } while true {} }
 async fn worker() { helper(); }
 async fn main() {
-    let task = worker(); await sleep(20); task.cancel(); await sleep(30);
+    let task = worker(); await sleep(20); task.cancel(); let _ = await task.result();
 }
 "#,
         &[("WILLOW_TASK_BUDGET", "3")],
@@ -138,7 +138,7 @@ fn cleanup() {
 fn helper() { defer { cleanup(); } while true {} }
 async fn worker() { helper(); println("must not resume"); }
 async fn main() {
-    let task = worker(); await sleep(20); task.cancel(); await sleep(30); println(9);
+    let task = worker(); await sleep(20); task.cancel(); let _ = await task.result(); println(9);
 }
 "#,
         &[("WILLOW_TASK_BUDGET", "3")],
@@ -200,7 +200,7 @@ async fn worker() {
     println("must not resume");
 }
 async fn main() {
-    let task = worker(); await sleep(20); task.cancel(); await sleep(30); println(9);
+    let task = worker(); await sleep(20); task.cancel(); let _ = await task.result(); println(9);
 }
 "#,
         &[("WILLOW_TASK_BUDGET", "1")],
@@ -353,7 +353,7 @@ async fn worker() {
     defer { println("cleanup start"); busy(); println("must not resume"); }
 }
 async fn main() {
-    let task = worker(); await sleep(20); task.cancel(); await sleep(30); println(9);
+    let task = worker(); await sleep(20); task.cancel(); let _ = await task.result(); println(9);
 }
 "#,
         &[("WILLOW_TASK_BUDGET", "1")],
@@ -436,7 +436,7 @@ fn native_sync_stack_option_callback_is_cancellable() {
 fn busy(n: i64) -> i64 { while true {} return n; }
 async fn worker() { let value: Option<i64> = Some(1); value.map(busy); }
 async fn main() {
-    let task = worker(); await sleep(20); task.cancel(); await sleep(30); println(42);
+    let task = worker(); await sleep(20); task.cancel(); let _ = await task.result(); println(42);
 }
 "#,
         &[("WILLOW_TASK_BUDGET", "1")],
@@ -461,7 +461,7 @@ async fn worker() -> Result<i64, Converted> {
     return Ok(number);
 }
 async fn main() {
-    let task = worker(); await sleep(20); task.cancel(); await sleep(30); println(42);
+    let task = worker(); await sleep(20); task.cancel(); let _ = await task.result(); println(42);
 }
 "#,
         &[("WILLOW_TASK_BUDGET", "1")],
@@ -480,7 +480,7 @@ async fn worker() {
     defer { println("cleanup start"); while true {} }
 }
 async fn main() {
-    let task = worker(); await sleep(20); task.cancel(); await sleep(30); println(42);
+    let task = worker(); await sleep(20); task.cancel(); let _ = await task.result(); println(42);
 }
 "#,
         &[("WILLOW_TASK_BUDGET", "1")],

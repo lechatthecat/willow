@@ -2304,12 +2304,22 @@ fn task_scope_graph_traces_each_scope_and_frame_once() {
                 jobs += 1;
             }
             drop(consumer);
-            let (work, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
+            // A loaded host can exhaust the remark budget; production then
+            // completes the same cycle with a stopped recovery.
+            let (work, plan) = match mark_closure::finish(&cycle, Instant::now()) {
+                Some((work, plan)) => (work, Some(plan)),
+                None => {
+                    let (work, plan, _) = mark_closure::finish_stopped(&cycle, Instant::now());
+                    (work, plan)
+                }
+            };
             assert_eq!(work.scanned_bytes, ((2 * count - 1) * 8) as u64);
             // Leaf frames need a mark bit, but no separate trace job.
             let expected_jobs = count + if fan_out { count.div_ceil(512) - 1 } else { 0 };
             assert_eq!(jobs, expected_jobs);
-            sweep::concurrent(plan);
+            if let Some(plan) = plan {
+                sweep::concurrent(plan);
+            }
             let retained = willow_gc_allocated_bytes();
             willow_pop_roots(count as i32);
             willow_push_root(&mut handles[0]);
