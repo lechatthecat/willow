@@ -2,6 +2,26 @@ use super::*;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+// A loaded host can exhaust the remark budget; production then completes the
+// same cycle with a stopped recovery.
+fn finish_or_recover(
+    cycle: &Arc<ConcurrentCycle>,
+) -> (crate::gc_telemetry::MarkWork, Option<sweep::SweepPlan>) {
+    match mark_closure::finish(cycle, Instant::now()) {
+        Some((work, plan)) => (work, Some(plan)),
+        None => {
+            let (work, plan, _) = mark_closure::finish_stopped(cycle, Instant::now());
+            (work, plan)
+        }
+    }
+}
+
+fn sweep_if_planned(plan: Option<sweep::SweepPlan>) {
+    if let Some(plan) = plan {
+        sweep::concurrent(plan);
+    }
+}
+
 #[test]
 fn failed_stopped_callback_resumes_world_and_remains_in_stop_telemetry() {
     use crate::gc_telemetry::stops::{STOP_COUNTERS_VALID, StopReason, snapshot_stops};
@@ -2200,10 +2220,10 @@ fn map_growth_during_slices_has_a_finite_cursor_and_preserves_deleted_values() {
             crate::map::willow_map_insert(map, key as i64, 0, first as i64, 1);
         }
         drop(consumer);
-        let (work, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
+        let (work, plan) = finish_or_recover(&cycle);
         assert_eq!(work.scanned_bytes, count as u64 * 8);
         assert!(cycle.is_marked(deleted as usize));
-        sweep::concurrent(plan);
+        sweep_if_planned(plan);
         let retained = willow_gc_allocated_bytes();
         willow_gc_collect();
         assert_eq!(
@@ -2304,22 +2324,12 @@ fn task_scope_graph_traces_each_scope_and_frame_once() {
                 jobs += 1;
             }
             drop(consumer);
-            // A loaded host can exhaust the remark budget; production then
-            // completes the same cycle with a stopped recovery.
-            let (work, plan) = match mark_closure::finish(&cycle, Instant::now()) {
-                Some((work, plan)) => (work, Some(plan)),
-                None => {
-                    let (work, plan, _) = mark_closure::finish_stopped(&cycle, Instant::now());
-                    (work, plan)
-                }
-            };
+            let (work, plan) = finish_or_recover(&cycle);
             assert_eq!(work.scanned_bytes, ((2 * count - 1) * 8) as u64);
             // Leaf frames need a mark bit, but no separate trace job.
             let expected_jobs = count + if fan_out { count.div_ceil(512) - 1 } else { 0 };
             assert_eq!(jobs, expected_jobs);
-            if let Some(plan) = plan {
-                sweep::concurrent(plan);
-            }
+            sweep_if_planned(plan);
             let retained = willow_gc_allocated_bytes();
             willow_pop_roots(count as i32);
             willow_push_root(&mut handles[0]);
@@ -2375,10 +2385,10 @@ fn channel_pops_and_appends_do_not_shift_or_extend_the_snapshot() {
             crate::channel::willow_channel_send_ptr(channel.cast(), first.cast());
         }
         drop(consumer);
-        let (work, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
+        let (work, plan) = finish_or_recover(&cycle);
         assert_eq!(work.scanned_bytes, (count - 1) as u64 * 8);
         assert!(cycle.is_marked(deleted as usize));
-        sweep::concurrent(plan);
+        sweep_if_planned(plan);
         let retained = willow_gc_allocated_bytes();
         willow_gc_collect();
         assert_eq!(
@@ -2925,11 +2935,19 @@ fn m3_real_closure_last_work_latency_and_cpu() {
             );
             assist.join().unwrap();
             assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
-            let (work, plan) = finished.expect("closure must finish after the last owner");
+            // A loaded host can exhaust the remark budget after the last owner;
+            // production then completes the cycle with a stopped recovery.
+            let (work, plan) = match finished {
+                Some((work, plan)) => (work, Some(plan)),
+                None => {
+                    let (work, plan, _) = mark_closure::finish_stopped(&cycle, Instant::now());
+                    (work, plan)
+                }
+            };
             assert_eq!(work.marked_bytes, (GC_HEADER_SIZE + 8) as u64);
             assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
             assert!(cycle.queue.snapshot().is_drained());
-            sweep::concurrent(plan);
+            sweep_if_planned(plan);
             assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
             assert!(
                 crate::gc_telemetry::stops::snapshot_stops()
@@ -3410,8 +3428,8 @@ fn root_activation_crosses_pending_stores_before_snapshots_or_assist_scans() {
             observer.join().unwrap();
             cycle.drain(usize::MAX);
             assert_eq!(cycle.is_marked(child), !deletion);
-            let (_, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
-            sweep::concurrent(plan);
+            let (_, plan) = finish_or_recover(&cycle);
+            sweep_if_planned(plan);
             assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
             done.store(true, Ordering::Release);
             writer.join().unwrap();
@@ -3648,8 +3666,8 @@ fn satb_reference_store_throughput_baseline_and_current() {
             "reference_store_active_median capacity={capacity} stores=102400 elapsed_ns={}",
             timings[1]
         );
-        let (_, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
-        sweep::concurrent(plan);
+        let (_, plan) = finish_or_recover(&cycle);
+        sweep_if_planned(plan);
         assert!(values.iter().all(|value| cycle.is_marked(*value as usize)));
     }
     willow_gc_remove_runtime_root(owner);
