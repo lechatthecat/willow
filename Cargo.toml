@@ -1,7 +1,7 @@
 [package]
 name = "willow"
 default-run = "willow"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.96"
 # Only explicitly registered benchmark sources are public.
