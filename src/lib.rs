@@ -367,7 +367,7 @@ impl<'a> CompilerSession<'a> {
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
-        self.analysis_with_policy(emitter, false, false, false)
+        self.analysis_with_policy(emitter, false, false, false, false)
     }
 
     /// Edit preflight covers all project sources and must not rewrite project inputs.
@@ -375,7 +375,7 @@ impl<'a> CompilerSession<'a> {
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
-        self.analysis_with_policy(emitter, false, true, false)
+        self.analysis_with_policy(emitter, false, true, false, false)
     }
     /// Analyze all project sources without importing additional roots into the entry scope
     /// or publishing lock/edit metadata.
@@ -383,7 +383,16 @@ impl<'a> CompilerSession<'a> {
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
-        self.analysis_with_policy(emitter, false, true, true)
+        self.analysis_with_policy(emitter, false, true, true, false)
+    }
+
+    /// Capture semantic evidence even when the final checker reports errors.
+    /// This never authorizes code generation or edit application.
+    pub(crate) fn analysis_for_verification(
+        self,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    ) -> Result<ai::Snapshot> {
+        self.analysis_with_policy(emitter, false, true, false, true)
     }
 
     fn analysis_with_policy(
@@ -392,14 +401,15 @@ impl<'a> CompilerSession<'a> {
         publish_lock: bool,
         discover: bool,
         overview_aliases: bool,
+        verification: bool,
     ) -> Result<ai::Snapshot> {
         let _symbols = self.symbols.enter();
         let _query_stats = query_stats::Session::enter();
         let _node_ids = parser::ast::NodeIdSession::enter();
         let path = std::fs::canonicalize(self.src)?;
-        let source = std::fs::read_to_string(&path)?;
+        let source = compiler_db::captured::FileInput::read(path.clone())?.source;
         let root = path.parent().context("source has no parent")?;
-        let edit_context = if publish_lock {
+        let mut edit_context = if publish_lock {
             None
         } else {
             Some(ai::edit::AnalysisInputs::capture(
@@ -416,14 +426,32 @@ impl<'a> CompilerSession<'a> {
         }
         if discover && let Some(project) = &self.project_root {
             let (project, source_root) = discovery_roots(&inputs, project, root);
-            inputs.check_modules = if overview_aliases {
+            inputs.check_modules = if let Some(modules) = compiler_db::captured::overlay_modules() {
+                modules
+            } else if overview_aliases {
                 package::discover_sources_for_overview(&project, &source_root)?
             } else {
                 package::discover_sources(&project, &source_root)?
             };
         }
+        if let Some(context) = &mut edit_context {
+            context.check_modules.clone_from(&inputs.check_modules);
+        }
         inputs.capture_analysis = true;
-        let frontend = run_frontend_with_inputs(&source, root, &map, inputs, emitter)?;
+        inputs.verification = verification;
+        let frontend = if let Some(context) = &mut edit_context
+            && !verification
+        {
+            let mut recording = ai::verify::RecordingDiagnostics {
+                downstream: emitter,
+                captured: ai::verify::Diagnostics::default(),
+            };
+            let frontend = run_frontend_with_inputs(&source, root, &map, inputs, &mut recording)?;
+            context.diagnostics = recording.captured.facts;
+            frontend
+        } else {
+            run_frontend_with_inputs(&source, root, &map, inputs, emitter)?
+        };
         let mut snapshot = ai::snapshot(&frontend, &path, &source, self.project_root.as_deref())?;
         if let Some(context) = &edit_context {
             context.verify_files()?;
@@ -1021,7 +1049,7 @@ fn run_frontend_revision_cached(
             emit_frontend_diagnostics(&diagnostics, map, &graph, &diagnostic_modules, emitter)?;
             errors += diagnostic_error_count(&diagnostics);
         }
-        if errors > 0 {
+        if errors > 0 && !inputs.verification {
             return Err(frontend_abort(&mut graph, errors));
         }
         let mut storage = graph.artifacts.take().expect("generic source artifacts");
@@ -1298,7 +1326,7 @@ fn run_frontend_revision_cached(
     let entry = validate_entry_point(&program);
     error_count += diagnostic_error_count(&entry);
     emit_frontend_diagnostics(&entry, map, &graph, &diagnostic_modules, emitter)?;
-    if error_count > 0 {
+    if error_count > 0 && !db.inputs().verification {
         return Err(frontend_abort(&mut graph, error_count));
     }
     Ok(Frontend {

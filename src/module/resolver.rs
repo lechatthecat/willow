@@ -761,7 +761,9 @@ fn resolve_one(
 fn find_module_file(src_root: &Path, path: &str) -> Option<PathBuf> {
     candidate_module_paths(src_root, path)
         .into_iter()
-        .find(|candidate| candidate.exists())
+        .find(|candidate| {
+            crate::compiler_db::captured::source_is_visible(candidate) && candidate.exists()
+        })
 }
 
 fn candidate_module_paths(src_root: &Path, path: &str) -> Vec<PathBuf> {

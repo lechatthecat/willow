@@ -31,6 +31,7 @@ impl TargetCapabilities {
 #[derive(Debug, Clone)]
 pub struct CompilerInputs {
     pub(crate) capture_analysis: bool,
+    pub(crate) verification: bool,
     pub(crate) check_modules: std::collections::BTreeMap<String, PathBuf>,
     pub options: crate::CompilerOptions,
     pub project_root: PathBuf,
@@ -79,6 +80,7 @@ impl CompilerInputs {
     pub fn native(options: crate::CompilerOptions, project_root: PathBuf) -> Self {
         Self {
             capture_analysis: false,
+            verification: false,
             check_modules: Default::default(),
             options,
             project_root,

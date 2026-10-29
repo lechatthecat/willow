@@ -238,3 +238,51 @@ fn persistent_cache_concurrent_publication_is_complete() {
     crate::project::init::atomic_replace(&path, &valid).unwrap();
     assert!(load(&path, &fixture.key()).is_ok());
 }
+
+#[test]
+fn semantic_verify_persistent_cache_readonly_reuse_counts() {
+    for count in [8, 32, 128] {
+        let fixture = Fixture::new();
+        let mut source = String::from(SOURCE);
+        for i in 0..count {
+            source.push_str(&format!(" fn unrelated{i}() -> i64 {{ return {i}; }}"));
+        }
+        let entry = fixture.0.join("main.wi");
+        std::fs::write(&entry, &source).unwrap();
+        let map = SourceMap::new(entry.to_str().unwrap(), &source);
+        run(
+            &source,
+            &fixture.0,
+            &map,
+            fixture.inputs(),
+            &mut Diagnostics::default(),
+        )
+        .unwrap();
+        let path = cache_path(&fixture.0, &entry);
+        let cache_before = std::fs::read(&path).unwrap();
+        let edited = source.replacen("return 1;", "return 9;", 1);
+        std::fs::write(&entry, &edited).unwrap();
+        let map = SourceMap::new(entry.to_str().unwrap(), &edited);
+        let mut inputs = fixture.inputs();
+        inputs.capture_analysis = true;
+        inputs.verification = true;
+        let warm = run(
+            &edited,
+            &fixture.0,
+            &map,
+            inputs,
+            &mut Diagnostics::default(),
+        )
+        .unwrap();
+        println!(
+            "semantic_verify_cache unrelated={count} typechecks={} reused={}",
+            warm.db.typed_bodies.typechecks(),
+            warm.db.typed_bodies.reused()
+        );
+        assert_eq!(warm.db.typed_bodies.typechecks(), 1);
+        assert!(warm.db.typed_bodies.reused() >= count + 2);
+        assert_eq!(std::fs::read(&path).unwrap(), cache_before);
+        let snapshot = crate::ai::snapshot(&warm, &entry, &edited, None).unwrap();
+        assert!(snapshot.functions.iter().any(|f| f.name == "first"));
+    }
+}

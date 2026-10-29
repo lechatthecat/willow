@@ -160,6 +160,11 @@ impl<'a> PackageImports<'a> {
     ) -> Result<Option<PathBuf>, PackageImportError> {
         let relative: PathBuf = logical.split("::").collect();
         for candidate in [relative.with_extension("wi"), relative.join("mod.wi")] {
+            if !crate::compiler_db::captured::source_is_visible(
+                &package.source_root().join(&candidate),
+            ) {
+                continue;
+            }
             #[cfg(test)]
             self.file_probes.set(self.file_probes.get() + 1);
             match package.source_file(&candidate) {

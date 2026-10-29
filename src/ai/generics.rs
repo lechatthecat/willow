@@ -330,6 +330,8 @@ pub(super) fn restore(
                 .iter_mut()
                 .chain(&mut details.implements)
                 .chain(&mut details.payload)
+                .chain(&mut details.parameters)
+                .chain(&mut details.constraint_alternatives)
             {
                 *ty = normalize(ty);
             }
@@ -666,6 +668,8 @@ pub(super) fn present_types(snapshot: &mut Snapshot) {
             .iter_mut()
             .chain(&mut symbol.details.implements)
             .chain(&mut symbol.details.payload)
+            .chain(&mut symbol.details.parameters)
+            .chain(&mut symbol.details.constraint_alternatives)
         {
             *ty = present(ty, module);
         }

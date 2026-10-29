@@ -30,6 +30,18 @@ pub struct Symbol {
 /// It does not alter persisted symbol facts or selector identities.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeclarationDetails {
+    pub public_api: bool,
+    pub is_public: bool,
+    pub is_protected: bool,
+    pub is_static: bool,
+    pub is_mut: bool,
+    pub is_open: bool,
+    pub is_override: bool,
+    pub parameters: Vec<Type>,
+    pub parameter_modes: Vec<String>,
+    pub constraint_parameter: Option<String>,
+    pub constraint_alternatives: Vec<Type>,
+    pub constant_value: Option<ConstValue>,
     pub is_async: bool,
     pub is_const: bool,
     pub type_params: Vec<String>,
@@ -104,15 +116,30 @@ pub(super) fn details_of<'a>(
     items: impl Iterator<Item = &'a Item>,
     checked: &crate::semantic::symbols::SymbolTable,
 ) -> HashMap<Span, DeclarationDetails> {
+    let modes = |params: &[Param]| {
+        params
+            .iter()
+            .map(|p| {
+                match p.mode {
+                    ParamMode::Value => "value",
+                    ParamMode::Reference { mutable: false, .. } => "reference",
+                    ParamMode::Reference { mutable: true, .. } => "mutable-reference",
+                }
+                .to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
     let mut result = HashMap::new();
     for item in items {
         match item {
-            Item::Function(f)
-                if f.is_async || f.constant.is_some() || !f.type_params.is_empty() =>
-            {
+            Item::Function(f) => {
                 result.insert(
                     f.span,
                     DeclarationDetails {
+                        public_api: f.public,
+                        is_public: f.public,
+                        parameter_modes: modes(&f.params),
+                        constant_value: f.constant.clone(),
                         type_params: f.type_params.clone(),
                         is_async: f.is_async,
                         is_const: f.constant.is_some(),
@@ -124,6 +151,9 @@ pub(super) fn details_of<'a>(
                 result.insert(
                     c.span,
                     DeclarationDetails {
+                        public_api: c.public,
+                        is_public: c.public,
+                        is_open: c.is_open,
                         type_params: c.type_params.clone(),
                         extends: c
                             .base_class
@@ -147,11 +177,55 @@ pub(super) fn details_of<'a>(
                     },
                 );
                 let owner_params: std::sync::Arc<[String]> = c.type_params.clone().into();
+                for f in &c.fields {
+                    result.insert(
+                        f.span,
+                        DeclarationDetails {
+                            public_api: c.public && (f.public || f.protected),
+                            is_public: f.public,
+                            is_protected: f.protected,
+                            is_static: f.is_static,
+                            is_mut: f.is_mut,
+                            owner_type_params: owner_params.clone(),
+                            ..Default::default()
+                        },
+                    );
+                }
+                for constructor in &c.constructors {
+                    result.insert(
+                        constructor.span,
+                        DeclarationDetails {
+                            public_api: c.public && (constructor.public || constructor.protected),
+                            is_public: constructor.public,
+                            is_protected: constructor.protected,
+                            parameters: constructor.params.iter().map(|p| p.ty.clone()).collect(),
+                            parameter_modes: modes(&constructor.params),
+                            owner_type_params: owner_params.clone(),
+                            ..Default::default()
+                        },
+                    );
+                }
                 for m in &c.methods {
-                    if (m.is_async || !c.type_params.is_empty()) && c.span.contains(m.span) {
+                    if c.span.contains(m.span) {
                         result.insert(
                             m.span,
                             DeclarationDetails {
+                                public_api: c.public && (m.public || m.protected),
+                                is_public: m.public,
+                                is_protected: m.protected,
+                                is_static: m.is_static,
+                                is_open: m.is_open,
+                                is_override: m.is_override,
+                                parameter_modes: modes(&m.params),
+                                constraint_parameter: m
+                                    .constraint
+                                    .as_ref()
+                                    .map(|c| c.parameter.clone()),
+                                constraint_alternatives: m
+                                    .constraint
+                                    .as_ref()
+                                    .map(|c| c.alternatives.clone())
+                                    .unwrap_or_default(),
                                 is_async: m.is_async,
                                 owner_type_params: owner_params.clone(),
                                 ..Default::default()
@@ -164,28 +238,41 @@ pub(super) fn details_of<'a>(
                 result.insert(
                     i.span,
                     DeclarationDetails {
+                        public_api: i.public,
+                        is_public: i.public,
                         type_params: i.type_params.clone(),
                         extends: i.extends.iter().cloned().map(Type::Named).collect(),
                         ..Default::default()
                     },
                 );
-            }
-            Item::Enum(e) => {
-                if !e.type_params.is_empty() {
+                let owner_params: std::sync::Arc<[String]> = i.type_params.clone().into();
+                for method in &i.methods {
                     result.insert(
-                        e.span,
+                        method.span,
                         DeclarationDetails {
-                            type_params: e.type_params.clone(),
+                            public_api: i.public,
+                            is_public: true,
+                            is_static: method.is_static,
+                            parameter_modes: modes(&method.params),
+                            owner_type_params: owner_params.clone(),
                             ..Default::default()
                         },
                     );
                 }
+            }
+            Item::Enum(e) => {
+                result.insert(
+                    e.span,
+                    DeclarationDetails {
+                        public_api: e.public,
+                        is_public: e.public,
+                        type_params: e.type_params.clone(),
+                        ..Default::default()
+                    },
+                );
                 // Checked variants keep declaration order; pair them by index.
                 let info = checked.lookup_enum(&e.name);
                 for (i, v) in e.variants.iter().enumerate() {
-                    if v.payload.is_empty() {
-                        continue;
-                    }
                     let payload = info
                         .and_then(|info| info.variants.get(i))
                         .filter(|c| c.name == v.name && c.payload_types.len() == v.payload.len())
@@ -193,13 +280,14 @@ pub(super) fn details_of<'a>(
                     result.insert(
                         v.span,
                         DeclarationDetails {
+                            public_api: e.public,
+                            is_public: true,
                             payload,
                             ..Default::default()
                         },
                     );
                 }
             }
-            _ => {}
         }
     }
     result
@@ -646,7 +734,15 @@ pub(super) fn finish(
             // clone the whole generic parameter list onto each parameter.
             details: if matches!(
                 d.kind.as_str(),
-                "function" | "method" | "class" | "interface" | "enum" | "variant"
+                "function"
+                    | "method"
+                    | "constructor"
+                    | "class"
+                    | "interface"
+                    | "enum"
+                    | "variant"
+                    | "field"
+                    | "static-field"
             ) {
                 captures
                     .get(&crate::module::ModuleId(d.span.file_id.0))

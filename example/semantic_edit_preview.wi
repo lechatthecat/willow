@@ -1,0 +1,9 @@
+// Capture a semantic baseline, change the return value, then verify the edit.
+// The function signature stays unchanged; main is an affected caller.
+fn answer() -> i64 {
+    return 42;
+}
+
+fn main() {
+    println(answer());
+}

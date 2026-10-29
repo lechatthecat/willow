@@ -6,6 +6,67 @@ use super::{
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+thread_local! {
+    static SOURCE_OVERLAY: std::cell::RefCell<OverlayInputs> = const { std::cell::RefCell::new(OverlayInputs { sources: std::collections::BTreeMap::new(), inventory: None }) };
+}
+
+#[derive(Default)]
+struct OverlayInputs {
+    sources: std::collections::BTreeMap<PathBuf, String>,
+    inventory: Option<OverlayInventory>,
+}
+pub(crate) struct OverlayInventory {
+    pub root: PathBuf,
+    pub files: std::collections::HashSet<PathBuf>,
+    pub modules: std::collections::BTreeMap<String, PathBuf>,
+}
+pub(crate) fn source_is_visible(path: &Path) -> bool {
+    SOURCE_OVERLAY.with(|current| {
+        current.borrow().inventory.as_ref().is_none_or(|inventory| {
+            !path.starts_with(&inventory.root) || inventory.files.contains(path)
+        })
+    })
+}
+pub(crate) fn overlay_modules() -> Option<std::collections::BTreeMap<String, PathBuf>> {
+    SOURCE_OVERLAY.with(|current| {
+        current
+            .borrow()
+            .inventory
+            .as_ref()
+            .map(|inventory| inventory.modules.clone())
+    })
+}
+
+/// Candidate source bytes retain their original compiler input identities.
+/// The guard is intentionally thread-bound and restores a surrounding session.
+pub(crate) struct SourceOverlay {
+    previous: OverlayInputs,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl SourceOverlay {
+    #[cfg(test)]
+    pub(crate) fn enter(sources: std::collections::BTreeMap<PathBuf, String>) -> Self {
+        Self::with_inventory(sources, None)
+    }
+    pub(crate) fn with_inventory(
+        sources: std::collections::BTreeMap<PathBuf, String>,
+        inventory: Option<OverlayInventory>,
+    ) -> Self {
+        Self {
+            previous: SOURCE_OVERLAY
+                .with(|current| current.replace(OverlayInputs { sources, inventory })),
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+impl Drop for SourceOverlay {
+    fn drop(&mut self) {
+        SOURCE_OVERLAY.with(|current| {
+            current.replace(std::mem::take(&mut self.previous));
+        });
+    }
+}
+
 pub(crate) struct FileInput {
     pub path: PathBuf,
     pub source: String,
@@ -20,7 +81,23 @@ impl FileInput {
     /// the resolver spools this exact value for later semantic reads.
     pub(crate) fn read(path: PathBuf) -> std::io::Result<Self> {
         super::tracked::assert_frozen_read();
-        let source = std::fs::read_to_string(&path)?;
+        let overlaid = SOURCE_OVERLAY.with(|current| {
+            let current = current.borrow();
+            if let Some(inventory) = &current.inventory
+                && path.starts_with(&inventory.root)
+                && !inventory.files.contains(&path)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "source absent from candidate inventory",
+                ));
+            }
+            Ok(current.sources.get(&path).cloned())
+        })?;
+        let source = match overlaid {
+            Some(source) => source,
+            None => std::fs::read_to_string(&path)?,
+        };
         Ok(Self { path, source })
     }
 }

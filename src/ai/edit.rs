@@ -51,6 +51,10 @@ struct Plan {
     changes: Vec<Change>,
     state: String,
     candidate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification_baseline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification_modules: Option<BTreeMap<String, String>>,
     absent: Vec<String>,
     work: EditWork,
 }
@@ -118,6 +122,8 @@ pub(crate) struct AnalysisInputs {
     manifest_entry: Option<PathBuf>,
     configuration: String,
     files: BTreeMap<String, Option<String>>,
+    pub(crate) diagnostics: Vec<super::verify::DiagnosticFact>,
+    pub(crate) check_modules: BTreeMap<String, PathBuf>,
 }
 impl AnalysisInputs {
     pub(crate) fn capture(
@@ -152,6 +158,8 @@ impl AnalysisInputs {
             manifest_entry,
             configuration: hash(format!("{options:?}|{}", target_lexicon::HOST)),
             files,
+            diagnostics: Vec::new(),
+            check_modules: BTreeMap::new(),
         })
     }
     pub(crate) fn verify_files(&self) -> Result<()> {
@@ -419,6 +427,8 @@ impl Workspace {
         let (changes, work) =
             structured_changes(&snapshot, &self.root, &sources, request.operations)?;
         ensure!(!changes.is_empty(), "transaction makes no changes");
+        let baseline =
+            super::verify::Baseline::from_snapshot(&snapshot, context.diagnostics.clone())?;
         let mut plan = Plan {
             version: 1,
             compiler: super::storage::compiler_stamp(),
@@ -430,6 +440,22 @@ impl Workspace {
             changes,
             state: "prepared".into(),
             candidate: String::new(),
+            verification_baseline: Some(baseline.revision().to_owned()),
+            verification_modules: Some(
+                context
+                    .check_modules
+                    .iter()
+                    .map(|(name, path)| {
+                        Ok((
+                            name.clone(),
+                            path.strip_prefix(&self.root)?
+                                .to_str()
+                                .context("non UTF-8 module path")?
+                                .to_owned(),
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+            ),
             absent,
             work,
         };
@@ -451,6 +477,7 @@ impl Workspace {
         for change in &plan.changes {
             fs::write(sandbox.join(&change.path), &change.after)?;
         }
+        baseline.save(&self.directory.join(format!("{id}.baseline.json")))?;
         self.store(&id, &plan)?;
         self.preview(&id, format)
     }
@@ -538,6 +565,83 @@ impl Workspace {
         }
         Ok(())
     }
+    /// Read-only semantic verification of a prepared edit, including rejected
+    /// candidates. Does not validate or apply the transaction.
+    pub fn verify(&self, id: &str) -> Result<super::verify::Report> {
+        self.ensure_recovered()?;
+        let plan = self.load(id)?;
+        ensure!(
+            matches!(plan.state.as_str(), "prepared" | "validated"),
+            "transaction is not pending"
+        );
+        ensure!(
+            plan.compiler == super::storage::compiler_stamp(),
+            "compiler changed"
+        );
+        ensure!(
+            plan.configuration == configuration(),
+            "compiler options/environment changed"
+        );
+        self.current(&plan)?;
+        self.check_candidate(id, &plan)?;
+        let expected = plan
+            .verification_baseline
+            .as_deref()
+            .context("transaction predates retained verification baselines; prepare it again")?;
+        let before =
+            super::verify::Baseline::load(&self.directory.join(format!("{id}.baseline.json")))?;
+        ensure!(
+            before.revision() == expected,
+            "transaction baseline mismatch"
+        );
+        let manifest = super::verify::EditManifest {
+            schema_version: 1,
+            baseline_revision: expected.into(),
+            complete: true,
+            changes: plan
+                .changes
+                .iter()
+                .map(|change| super::verify::InputChange {
+                    path: change.path.replace(std::path::MAIN_SEPARATOR, "/"),
+                    before: Some(hash(&change.before)),
+                    after: Some(hash(&change.after)),
+                })
+                .collect(),
+        };
+        let candidate_root = self.directory.join(id);
+        manifest.check(&before, &candidate_root)?;
+        // Keep original physical identities for compiler cache keys. Only the
+        // manifest's changed source bytes are overlaid; the checked candidate
+        // inventory above proves all other inputs equal the retained baseline.
+        let modules = plan
+            .verification_modules
+            .as_ref()
+            .context("transaction predates retained source inventory; prepare it again")?;
+        let after = super::verify::Baseline::capture_overlay(
+            &self.root.join(&plan.entry),
+            plan.project.then_some(self.root.as_path()),
+            plan.changes
+                .iter()
+                .map(|change| (self.root.join(&change.path), change.after.clone()))
+                .collect(),
+            Some(crate::compiler_db::captured::OverlayInventory {
+                root: self.root.clone(),
+                files: plan
+                    .inputs
+                    .keys()
+                    .map(|path| self.root.join(path))
+                    .collect(),
+                modules: modules
+                    .iter()
+                    .map(|(name, path)| (name.clone(), self.root.join(path)))
+                    .collect(),
+            }),
+        )?;
+        self.current(&plan)?;
+        self.check_candidate(id, &plan)?;
+        before.compare(&after)
+    }
+
     pub fn validate(
         &self,
         id: &str,
@@ -838,7 +942,7 @@ fn configuration() -> String {
     ))
 }
 fn candidate(plan: &Plan) -> Result<String> {
-    Ok(hash(serde_json::to_vec(&(
+    let base = hash(serde_json::to_vec(&(
         plan.version,
         &plan.compiler,
         &plan.configuration,
@@ -848,8 +952,16 @@ fn candidate(plan: &Plan) -> Result<String> {
         &plan.inputs,
         &plan.changes,
         &plan.absent,
-    ))?))
+    ))?);
+    match &plan.verification_baseline {
+        Some(baseline) => match &plan.verification_modules {
+            Some(modules) => Ok(hash(serde_json::to_vec(&(base, baseline, modules))?)),
+            None => Ok(hash(serde_json::to_vec(&(base, baseline))?)),
+        },
+        None => Ok(base),
+    }
 }
+
 use crate::workspace_transaction::{durable_write, durable_write_observed, sync_directory};
 
 #[derive(Default, Serialize, Deserialize)]

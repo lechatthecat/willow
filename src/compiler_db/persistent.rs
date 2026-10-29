@@ -214,9 +214,12 @@ pub(crate) fn run(
     emitter: &mut dyn DiagnosticEmitter,
 ) -> Result<Frontend> {
     // Read-only AI/edit sessions must not add cache files to isolated inputs.
-    if inputs.capture_analysis || std::env::var_os("WILLOW_QUERY_CACHE").is_some_and(|v| v == "0") {
+    if (inputs.capture_analysis && !inputs.verification)
+        || std::env::var_os("WILLOW_QUERY_CACHE").is_some_and(|v| v == "0")
+    {
         return crate::run_frontend_revision(source, root, map, inputs, emitter, None, None);
     }
+    let read_only = inputs.verification;
     let entry = Path::new(&map.path);
     let Ok(key) = CacheKey::new(&inputs, entry) else {
         return crate::run_frontend_revision(source, root, map, inputs, emitter, None, None);
@@ -248,7 +251,7 @@ pub(crate) fn run(
         serde_json::json!({"loaded": hit, "typechecks": frontend.db.typed_bodies.typechecks(), "reused_bodies": frontend.db.typed_bodies.reused(), "queries_recomputed": stats.recomputed, "queries_validated": stats.validated, "dependency_edges_visited": stats.dependency_edges_visited}).to_string()
     });
     // Cache failures never change successful compilation into a failure.
-    if let Err(error) = save(&path, key, &frontend, &syntax.borrow()) {
+    if !read_only && let Err(error) = save(&path, key, &frontend, &syntax.borrow()) {
         crate::query_stats::query_cache(|| format!("write skipped: {error}"));
     }
     Ok(frontend)

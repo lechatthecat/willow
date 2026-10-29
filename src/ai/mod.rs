@@ -12,6 +12,7 @@ pub mod interop;
 pub mod overview;
 mod packages;
 mod rename;
+pub mod verify;
 pub use packages::{ModuleEvidence, ModuleIdentity, SymbolIdentity, UpdateDelta};
 mod semantic;
 mod storage;
