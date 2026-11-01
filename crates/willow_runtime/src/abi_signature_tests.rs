@@ -112,6 +112,8 @@ fn collection_handles_are_pointers_and_payload_words_remain_i64() {
     let _: extern "C" fn(*mut u8, i64, i64, i64, i64) = map::willow_map_insert;
     let _: extern "C" fn(*mut u8, i64, i64, i64) -> *mut u8 = map::willow_map_get;
     let _: extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_get_into;
+    let _: extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_remove_into;
+    let _: extern "C" fn(*mut u8, i64, i64) -> *mut u8 = map::willow_map_snapshot;
 }
 
 #[test]
@@ -165,6 +167,7 @@ const WORD_PINS: &[(&str, &[AbiTy], Option<AbiTy>)] = &[
     // (map, key_word, key_is_ref, use_niche) and (map, key_word, key_is_ref).
     ("willow_map_get", &[Ptr, Word, I64, I64], Some(Ptr)),
     ("willow_map_get_into", &[Ptr, Word, I64, Ptr], Some(I64)),
+    ("willow_map_remove_into", &[Ptr, Word, I64, Ptr], Some(I64)),
     ("willow_map_contains", &[Ptr, Word, I64], Some(I64)),
     // Cells: new(value_word, is_ref); get/read(handle) -> word;
     // set/write(handle, word).
@@ -200,6 +203,8 @@ fn word_carrying_rows_keep_i64_payload_types_in_rust() {
     let _: extern "C" fn(*mut u8, i64, i64, i64, i64) = map::willow_map_insert;
     let _: extern "C" fn(*mut u8, i64, i64, i64) -> *mut u8 = map::willow_map_get;
     let _: extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_get_into;
+    let _: extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_remove_into;
+    let _: extern "C" fn(*mut u8, i64, i64) -> *mut u8 = map::willow_map_snapshot;
     let _: extern "C" fn(*mut u8, i64, i64) -> i64 = map::willow_map_contains;
     let _: extern "C" fn(i64, i64) -> *mut c_void = lock::willow_blocking_cell_new;
     let _: extern "C" fn(*mut c_void) -> i64 = lock::willow_blocking_cell_get;
@@ -260,6 +265,7 @@ fn payload_free_collection_and_lock_rows_stay_i64() {
     assert_schema("willow_array_len", &[Ptr], Some(I64));
     assert_schema("willow_array_element_addr", &[Ptr, I64], Some(Ptr));
     assert_schema("willow_map_new", &[I64, I64, I64], Some(Ptr));
+    assert_schema("willow_map_snapshot", &[Ptr, I64, I64], Some(Ptr));
     for lock in ["mutex", "rwlock"] {
         assert_schema(&format!("willow_async_{lock}_poll"), &[Ptr, I64], Some(I32));
         assert_schema(

@@ -229,6 +229,8 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // word is followed by its own is-reference flag (willow-9tls.7).
     PANIC_ALLOC; "willow_map_insert" => ([Ptr, Word, I64, Word, I64] -> None);
     PANIC_ALLOC; "willow_map_get" => ([Ptr, Word, I64, I64] -> Some(Ptr));
+    PANIC_ALLOC; "willow_map_snapshot" => ([Ptr, I64, I64] -> Some(Ptr));
+    PANIC_ALLOC; "willow_map_remove_into" => ([Ptr, Word, I64, Ptr] -> Some(I64));
     PANIC_ALLOC; "willow_map_get_into" => ([Ptr, Word, I64, Ptr] -> Some(I64));
     NONE; "willow_map_len" => ([Ptr] -> Some(I64));
     PANIC_ALLOC; "willow_map_contains" => ([Ptr, Word, I64] -> Some(I64));

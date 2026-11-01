@@ -185,6 +185,8 @@ impl Drop for WordGuard<'_> {
 #[cfg(test)]
 thread_local! {
     static STRING_HASH_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SNAPSHOT_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COMPACT_MOVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WORD_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WORD_SHARED_ACQUIRES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -227,8 +229,10 @@ impl WordMap {
         let bytes = crate::native_memory::hash_bytes::<i64, i64>(self.entries.capacity());
         if bytes > self.charged {
             crate::gc::charge_external(bytes - self.charged);
-            self.charged = bytes;
+        } else if bytes < self.charged {
+            crate::gc::release_external(self.charged - bytes);
         }
+        self.charged = bytes;
     }
 }
 impl Drop for WordMap {
@@ -262,12 +266,13 @@ fn word_key(word: i64, kind: i64) -> Option<i64> {
 struct MapData {
     /// Fixed at construction from Map<K, V>; inserts never change GC metadata.
     layout: MapLayout,
-    /// Hash buckets may move on growth; dense value indices never do. This
-    /// permits bounded GC slices without restarting/skipping a hash iterator.
+    /// Hash growth preserves value indices, permitting bounded GC slices.
+    /// Deletion compaction republishes moved values through the GC barrier.
     // Randomized non-cryptographic foldhash; this is not a cryptographic or
     // adaptive HashDoS defense. Owned and borrowed keys use the same encoder.
     entries: hashbrown::HashMap<MapKey, usize>,
     values: Vec<i64>,
+    free: Vec<usize>,
     /// Major cycles are serialized. Appends after the first slice are covered
     /// by insertion barriers and must not extend this epoch's finite scan.
     scan_limit: usize,
@@ -283,12 +288,42 @@ impl crate::native_memory::Footprint for MapData {
                 crate::native_memory::hash_bytes::<MapKey, usize>(self.entries.capacity()),
             ),
             self.values.capacity() * size_of::<i64>(),
+            self.free.capacity() * size_of::<usize>(),
             self.key_bytes,
         ])
     }
 }
 
 impl MapData {
+    /// Geometric compaction bounds scanning by live entries, rather than the
+    /// lifetime insertion count. Relocated references are republished through
+    /// the insertion barrier because a concurrent slice may have passed them.
+    fn compact_after_remove(&mut self, owner: *mut u8) {
+        if self.entries.len().saturating_mul(4) >= self.values.len() {
+            return;
+        }
+        let mut values = Vec::with_capacity(self.entries.len());
+        for index in self.entries.values_mut() {
+            #[cfg(test)]
+            COMPACT_MOVES.with(|count| count.set(count.get() + 1));
+            let value = self.values[*index];
+            if self.layout.value_is_ref {
+                write_barrier_object_owner(
+                    owner,
+                    std::ptr::null_mut(),
+                    value as *mut u8,
+                    GcStoreDestination::MapValue as i64,
+                );
+            }
+            *index = values.len();
+            values.push(value);
+        }
+        self.values = values;
+        self.free = Vec::new();
+        self.entries.shrink_to_fit();
+        self.scan_limit = self.scan_limit.min(self.values.len());
+    }
+
     #[inline]
     fn get(&self, key: &KeyRef<'_>) -> Option<i64> {
         self.entries.get(key).map(|&index| self.values[index])
@@ -544,6 +579,7 @@ fn map_new(key_kind: i64, value_kind: i64, value_is_ref: i64, confined: bool) ->
             layout,
             entries: hashbrown::HashMap::default(),
             values: Vec::new(),
+            free: Vec::new(),
             scan_limit: 0,
             key_bytes: 0,
             native_table_bytes: 0,
@@ -603,6 +639,7 @@ pub extern "C" fn willow_map_insert(
     let MapData {
         entries,
         values,
+        free,
         key_bytes,
         ..
     } = &mut *data;
@@ -638,8 +675,14 @@ pub extern "C" fn willow_map_insert(
                     GcStoreDestination::MapValue as i64,
                 );
             }
-            let index = values.len();
-            values.push(val_word);
+            let index = if let Some(index) = free.pop() {
+                values[index] = val_word;
+                index
+            } else {
+                let index = values.len();
+                values.push(val_word);
+                index
+            };
             slot.insert_with_key(owned_key, index);
         }
     }
@@ -748,6 +791,175 @@ pub extern "C" fn willow_map_get_into(
     }
 }
 
+/// Remove a key, returning the Option tag and storage word without GC allocation.
+/// Deleted reference slots are cleared with the collector's deletion barrier.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_map_remove_into(
+    map: *mut u8,
+    key_word: i64,
+    key_is_ref: i64,
+    out_payload: *mut i64,
+) -> i64 {
+    unsafe { out_payload.write(0) };
+    if map.is_null() {
+        return 1;
+    }
+    let storage = unsafe { storage(map) };
+    let value = if let MapState::Words(words) = &storage.state {
+        let Some(key) = word_key(key_word, storage.layout.key_kind) else {
+            raise_nan_key();
+            return 1;
+        };
+        let mut words = words.access();
+        let value = words.entries.remove(&key);
+        if words.entries.len().saturating_mul(4) < words.entries.capacity() {
+            words.entries.shrink_to_fit();
+            words.reconcile();
+        }
+        value
+    } else {
+        let mut data = unsafe { map_data(map) };
+        debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
+        let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
+            drop(data);
+            raise_nan_key();
+            return 1;
+        };
+        data.entries.remove_entry(&key).map(|(key, index)| {
+            if let MapKey::Str(text) = key {
+                data.key_bytes -= text.capacity();
+            }
+            let value = data.values[index];
+            if data.layout.value_is_ref {
+                write_barrier_object_owner(
+                    map,
+                    value as *mut u8,
+                    std::ptr::null_mut(),
+                    GcStoreDestination::MapValue as i64,
+                );
+            }
+            data.values[index] = 0;
+            data.free.push(index);
+            data.compact_after_remove(map);
+            value
+        })
+    };
+    match value {
+        Some(value) => {
+            unsafe { out_payload.write(value) };
+            0
+        }
+        None => 1,
+    }
+}
+
+/// Produce an independent snapshot in ascending key order: numeric order for
+/// scalars (false before true), UTF-8 byte order for strings. Mode 0 yields
+/// keys, 1 values, and 2 `(key, value)` tuples. Later mutations are invisible.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_map_snapshot(map: *mut u8, mode: i64, value_pair: i64) -> *mut u8 {
+    use crate::array::{willow_array_new, willow_array_set};
+    use crate::gc::GcRootHandle;
+    if map.is_null() {
+        crate::panic_context::raise_language_message("cannot iterate a null Map");
+        return std::ptr::null_mut();
+    }
+    let layout = unsafe { storage(map) }.layout;
+    // Root copied reference values before the first GC allocation. Native key
+    // copies are independent of the source; no map borrow survives allocation.
+    let mut entries: Vec<(MapKey, i64, Option<GcRootHandle>)> =
+        if let MapState::Words(words) = &unsafe { storage(map) }.state {
+            words
+                .access()
+                .entries
+                .iter()
+                .map(|(&key, &value)| (MapKey::Word(key), value, None))
+                .collect()
+        } else {
+            let data = unsafe { map_data(map) };
+            data.entries
+                .iter()
+                .map(|(key, &index)| {
+                    let value = data.values[index];
+                    (
+                        key.clone(),
+                        value,
+                        (mode != 0 && data.layout.value_is_ref)
+                            .then(|| GcRootHandle::new(value as *mut u8)),
+                    )
+                })
+                .collect()
+        };
+    entries.sort_unstable_by(|a, b| {
+        #[cfg(test)]
+        SNAPSHOT_COMPARISONS.with(|count| count.set(count.get() + 1));
+        match (&a.0, &b.0) {
+            (MapKey::Str(a), MapKey::Str(b)) => a.cmp(b),
+            (MapKey::Word(a), MapKey::Word(b)) if layout.key_kind == 1 => {
+                f64::from_bits(*a as u64).total_cmp(&f64::from_bits(*b as u64))
+            }
+            (MapKey::Word(a), MapKey::Word(b)) => a.cmp(b),
+            _ => unreachable!(),
+        }
+    });
+    let is_ref = match mode {
+        0 => layout.key_kind == 3,
+        1 => layout.value_is_ref,
+        _ => true,
+    };
+    let array = GcRootHandle::new(willow_array_new(entries.len() as i64, i64::from(is_ref)));
+    for (index, (key, value, root)) in entries.into_iter().enumerate() {
+        let key = if mode == 1 {
+            0
+        } else {
+            match key {
+                MapKey::Word(word) => word,
+                MapKey::Str(text) => crate::string::willow_string_from_str(&text) as i64,
+            }
+        };
+        let value = root.as_ref().map_or(value, |root| root.load() as i64);
+        let word = match mode {
+            0 => key,
+            1 if value_pair != 0 => {
+                (unsafe { crate::array::copy_scalar_pair(value as *const i64) }) as i64
+            }
+            1 => value,
+            _ => {
+                use willow_abi::SlotKind::{GcRef, InterfacePair, ScalarPair, Word};
+                let slots = [
+                    if layout.key_kind == 3 { GcRef } else { Word },
+                    match value_pair {
+                        1 => ScalarPair,
+                        2 => InterfacePair,
+                        _ if layout.value_is_ref => GcRef,
+                        _ => Word,
+                    },
+                ];
+                let mut words = [key, value, 0];
+                let width = if value_pair == 0 {
+                    2
+                } else {
+                    let pair = value as *const i64;
+                    unsafe {
+                        words[1] = pair.read();
+                        words[2] = pair.add(1).read();
+                    }
+                    3
+                };
+                crate::gc::willow_alloc_enum_variant(
+                    0,
+                    willow_abi::EnumVariantLayout::new(0, &slots),
+                    &words[..width],
+                ) as i64
+            }
+        };
+        willow_array_set(array.load(), index as i64, word);
+    }
+    array.load()
+}
+
 /// Allocate an independent copy of `map` (same entries + value ref-ness). Backs
 /// `Map<K,V>::freeze()` -> `FrozenMap<K,V>` (willow-dgwo.10): the copy shares no
 /// `MapData` with the original, so it is safe to treat as immutable / Sync.
@@ -789,6 +1001,7 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     let mut dst = unsafe { map_data(copy) };
     dst.entries.reserve(src.entries.len());
     dst.values.reserve(src.values.len());
+    dst.free.clone_from(&src.free);
     for &v in &src.values {
         if layout.value_is_ref {
             write_barrier_object_owner(
@@ -1991,5 +2204,150 @@ mod native_accounting_tests {
         assert!(crate::gc_telemetry::external_bytes() > baseline);
         willow_gc_init();
         assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+    }
+}
+
+#[cfg(test)]
+mod iteration_tests {
+    use super::*;
+    use crate::gc::*;
+
+    #[test]
+    fn remove_reuses_slots_and_snapshots_sort_all_storage_paths() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        for confined in [false, true] {
+            for string_key in [false, true] {
+                let map =
+                    GcRootHandle::new(map_new(if string_key { 3 } else { 0 }, 0, 0, confined));
+                for count in [8, 32, 128, 512] {
+                    for round in 0..4 {
+                        for key in (0..count).rev() {
+                            let word = if string_key {
+                                crate::string::willow_string_from_str(&format!("{key:04}")) as i64
+                            } else {
+                                key
+                            };
+                            willow_map_insert(map.load(), word, i64::from(string_key), key, 0);
+                        }
+                        let snapshot = GcRootHandle::new(willow_map_snapshot(map.load(), 1, 0));
+                        for key in 0..count {
+                            assert_eq!(crate::array::willow_array_get(snapshot.load(), key), key);
+                            let word = if string_key {
+                                crate::string::willow_string_from_str(&format!("{key:04}")) as i64
+                            } else {
+                                key
+                            };
+                            let mut out = -1;
+                            assert_eq!(
+                                willow_map_remove_into(
+                                    map.load(),
+                                    word,
+                                    i64::from(string_key),
+                                    &mut out
+                                ),
+                                0
+                            );
+                            assert_eq!(out, key);
+                            assert_eq!(
+                                willow_map_remove_into(
+                                    map.load(),
+                                    word,
+                                    i64::from(string_key),
+                                    &mut out
+                                ),
+                                1
+                            );
+                            assert_eq!(out, 0);
+                        }
+                        assert_eq!(willow_map_len(map.load()), 0);
+                        if string_key {
+                            let data = unsafe { map_data(map.load()) };
+                            assert!(data.values.is_empty(), "round {round}");
+                            assert_eq!(data.key_bytes, 0);
+                            assert!(data.values.iter().all(|v| *v == 0));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn removed_holes_copy_and_reinsert_are_independent() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let map = GcRootHandle::new(willow_map_new(3, 0, 0));
+        for text in ["a", "b", "c"] {
+            let key = crate::string::willow_string_from_str(text);
+            willow_map_insert(map.load(), key as i64, 1, 7, 0);
+        }
+        let key = GcRootHandle::new(crate::string::willow_string_from_str("b"));
+        let mut out = 0;
+        willow_map_remove_into(map.load(), key.load() as i64, 1, &mut out);
+        let copy = GcRootHandle::new(willow_map_copy(map.load()));
+        willow_map_insert(copy.load(), key.load() as i64, 1, 9, 0);
+        assert_eq!(willow_map_contains(map.load(), key.load() as i64, 1), 0);
+        assert_eq!(
+            willow_map_get_into(copy.load(), key.load() as i64, 1, &mut out),
+            0
+        );
+        assert_eq!(out, 9);
+    }
+
+    #[test]
+    fn snapshot_comparison_and_compaction_counts_scale() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        for count in [64_i64, 256, 1024, 4096] {
+            let map = GcRootHandle::new(willow_map_new(0, 3, 1));
+            let value = GcRootHandle::new(crate::string::willow_string_from_str("live"));
+            for key in 0..count {
+                willow_map_insert(map.load(), key, 0, value.load() as i64, 1);
+            }
+            SNAPSHOT_COMPARISONS.with(|n| n.set(0));
+            let snapshot = GcRootHandle::new(willow_map_snapshot(map.load(), 0, 0));
+            assert_eq!(crate::array::willow_array_len(snapshot.load()), count);
+            let comparisons = SNAPSHOT_COMPARISONS.with(|n| n.get());
+            assert!(comparisons < 4 * count as usize * count.ilog2() as usize);
+            COMPACT_MOVES.with(|n| n.set(0));
+            for key in 0..count {
+                let mut out = 0;
+                willow_map_remove_into(map.load(), key, 0, &mut out);
+            }
+            let moved = COMPACT_MOVES.with(|n| n.get());
+            assert!(moved < count as usize);
+            assert!(unsafe { map_data(map.load()) }.values.is_empty());
+            println!("entries={count} comparisons={comparisons} compact_moves={moved}");
+        }
+    }
+
+    #[test]
+    fn remove_barrier_clears_reference_slots_and_snapshot_roots_survive_gc() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let map = GcRootHandle::new(willow_map_new(0, 3, 1));
+        for key in 0..128 {
+            let value = crate::string::willow_string_from_str(&format!("value-{key}"));
+            willow_map_insert(map.load(), key, 0, value as i64, 1);
+        }
+        let array = GcRootHandle::new(willow_map_snapshot(map.load(), 1, 0));
+        for key in 0..128 {
+            let mut out = 0;
+            assert_eq!(willow_map_remove_into(map.load(), key, 0, &mut out), 0);
+        }
+        let mut children = Vec::new();
+        unsafe {
+            snapshot_map(map.load(), &mut children);
+        }
+        assert!(children.iter().all(|child| child.is_null()));
+        willow_gc_collect();
+        for key in 0..128 {
+            let value = crate::array::willow_array_get(array.load(), key);
+            assert_eq!(
+                unsafe { willow_string_as_bytes(value as *const u8) },
+                format!("value-{key}").as_bytes()
+            );
+        }
     }
 }

@@ -1949,6 +1949,10 @@ impl TypeChecker {
                 let elem_ty = match &iterable_ty {
                     ty if Self::contains_error_type(ty) => Self::error_type(),
                     Type::Array(elem) | Type::FixedArray(elem, _) => (**elem).clone(),
+                    ty if builtin_types::binary_args(ty, B::Map).is_some() => {
+                        let (key, value) = builtin_types::binary_args(ty, B::Map).unwrap();
+                        Type::Generic("$Tuple2".into(), vec![key.clone(), value.clone()])
+                    }
                     ty if builtin_types::unary_arg(ty, B::FrozenArray).is_some() => {
                         builtin_types::unary_arg(ty, B::FrozenArray)
                             .unwrap()
@@ -1966,11 +1970,11 @@ impl TypeChecker {
                             _ => None,
                         };
                         let help = match builtin_types::resolve(other).map(|ty| ty.id) {
-                            Some(B::Map | B::FrozenMap) => {
+                            Some(B::FrozenMap) => {
                                 if let Some(name) = iterable_name {
-                                    format!("`Map` and `FrozenMap` have no iterator; keep keys in an array and retrieve entries with `{name}.get(key)`")
+                                    format!("`FrozenMap` has no iterator; keep keys in an array and retrieve entries with `{name}.get(key)`")
                                 } else {
-                                    "`Map` and `FrozenMap` have no iterator; keep keys in an array and retrieve entries with `.get(key)`".into()
+                                    "`FrozenMap` has no iterator; keep keys in an array and retrieve entries with `.get(key)`".into()
                                 }
                             }
                             _ => {
@@ -1985,7 +1989,7 @@ impl TypeChecker {
                             )
                             .with_label(Label::primary(
                                 s.iterable.span(),
-                                "for-in requires an array or i64 range",
+                                "for-in requires an array, Map, or i64 range",
                             ))
                             .with_help(help),
                         );

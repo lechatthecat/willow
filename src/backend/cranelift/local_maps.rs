@@ -90,6 +90,10 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
                                             | "len"
                                             | "toString"
                                             | "freeze"
+                                            | "remove"
+                                            | "keys"
+                                            | "values"
+                                            | "entries"
                                     )
                             }
                             LirRvalue::IntrinsicCall {
@@ -103,6 +107,10 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
                                         intrinsic,
                                         Intrinsic::MapInsert
                                             | Intrinsic::MapGet
+                                            | Intrinsic::MapRemove
+                                            | Intrinsic::MapKeys
+                                            | Intrinsic::MapValues
+                                            | Intrinsic::MapEntries
                                             | Intrinsic::MapContains
                                             | Intrinsic::MapLen
                                             | Intrinsic::MapToString

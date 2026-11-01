@@ -7485,7 +7485,8 @@ fn flat_intrinsic_supported(
             args.len() == 1 && ctx.storable(element, &args[0])
         }
         StringDebug => *receiver == Type::String && args.is_empty(),
-        MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapInsert | MapToString => {
+        MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapRemove | MapInsert
+        | MapToString => {
             let Some((_, types)) = lir_collection(receiver) else {
                 return false;
             };
@@ -7880,7 +7881,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             MapLen | FrozenMapLen => self.emit_value_runtime_call("willow_map_len", &[receiver]),
             MapToString => self.emit_value_runtime_call("willow_map_to_string", &[receiver]),
             MapFreeze => self.emit_value_runtime_call("willow_map_copy", &[receiver]),
-            MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapInsert => {
+            MapKeys | MapValues | MapEntries => {
+                let mode = self.builder.ins().iconst(
+                    types::I64,
+                    match intrinsic {
+                        MapKeys => 0,
+                        MapValues => 1,
+                        _ => 2,
+                    },
+                );
+                let (_, parameters) = lir_collection(receiver_ty).expect("validated map intrinsic");
+                let pair_kind = if self.is_interface_pair(&parameters[1]) {
+                    2
+                } else {
+                    i64::from(self.is_inline_pair(&parameters[1]))
+                };
+                let pair = self.builder.ins().iconst(types::I64, pair_kind);
+                self.emit_value_runtime_call("willow_map_snapshot", &[receiver, mode, pair])
+            }
+            MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapRemove | MapInsert => {
                 let (_, parameters) = lir_collection(receiver_ty).expect("validated map intrinsic");
                 let (key_ty, value_ty) = (&parameters[0], &parameters[1]);
                 // Boxing a pair key or value allocates, so every operand
@@ -7898,9 +7917,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         );
                         self.builder.ins().ireduce(types::I8, value)
                     }
-                    MapGet | FrozenMapGet => {
-                        self.emit_map_get_value(receiver, key, key_ref, value_ty)
-                    }
+                    MapGet | FrozenMapGet | MapRemove => self.emit_map_get_value(
+                        receiver,
+                        key,
+                        key_ref,
+                        value_ty,
+                        intrinsic == MapRemove,
+                    ),
                     MapInsert => {
                         // Only boxing an inline-pair value allocates; the
                         // coercion and a non-pair storage word do not.

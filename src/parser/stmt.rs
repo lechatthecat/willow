@@ -659,6 +659,8 @@ impl Parser {
     }
 
     pub(super) fn parse_for(&mut self) -> Result<Stmt, Diagnostic> {
+        // Map iteration yields a pair even when the body discards the entry.
+        self.tuple_arities.insert(2);
         let span = self.current_span();
         self.expect(TokenKind::For)?;
         let name_span = self.current_span();

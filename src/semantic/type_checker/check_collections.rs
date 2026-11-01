@@ -462,15 +462,40 @@ impl TypeChecker {
                 }
                 Some(Type::Void)
             }
-            "get" => {
+            "keys" | "values" | "entries" => {
+                if !m.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("`Map::{}` takes no arguments", m.method),
+                        )
+                        .with_label(Label::primary(m.span, "unexpected arguments")),
+                    );
+                }
+                let element = match m.method.as_str() {
+                    "keys" => key_ty,
+                    "values" => val_ty,
+                    _ => Type::Generic("$Tuple2".into(), vec![key_ty, val_ty]),
+                };
+                Some(Type::Array(Box::new(element)))
+            }
+            "get" | "remove" => {
                 if m.args.len() != 1 {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0201,
-                            format!("`Map::get` expects 1 argument, got {}", m.args.len()),
+                            format!(
+                                "`Map::{}` expects 1 argument, got {}",
+                                m.method,
+                                m.args.len()
+                            ),
                         )
-                        .with_label(Label::primary(m.span, "expected `get(key)`")),
+                        .with_label(Label::primary(
+                            m.span,
+                            format!("expected `{}(key)`", m.method),
+                        )),
                     );
                 } else {
                     check_key(self, &m.args[0]).await;
@@ -562,7 +587,7 @@ impl TypeChecker {
                     )
                     .with_label(Label::primary(m.span, "unknown map method"))
                     .with_help(
-                        "maps support `.insert(k, v)`, `.get(k)`, `.contains(k)`, `.len()`, `.freeze()`, `.toString()`",
+                        "maps support `.insert(k, v)`, `.get(k)`, `.remove(k)`, `.keys()`, `.values()`, `.entries()`, `.contains(k)`, `.len()`, `.freeze()`, `.toString()`",
                     );
                 Self::label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
                 self.push(diagnostic);

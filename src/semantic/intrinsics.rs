@@ -168,6 +168,10 @@ pub enum Intrinsic {
     MapInsert,
     /// `Map<K, V>::get(k)` → `Option<V>`.
     MapGet,
+    MapRemove,
+    MapKeys,
+    MapValues,
+    MapEntries,
     /// `Map<K, V>::contains(k)`.
     MapContains,
     /// `Map<K, V>::len()`.
@@ -296,6 +300,10 @@ impl Intrinsic {
         Intrinsic::FrozenArrayLen,
         Intrinsic::MapInsert,
         Intrinsic::MapGet,
+        Intrinsic::MapRemove,
+        Intrinsic::MapKeys,
+        Intrinsic::MapValues,
+        Intrinsic::MapEntries,
         Intrinsic::MapContains,
         Intrinsic::MapLen,
         Intrinsic::MapToString,
@@ -387,6 +395,8 @@ impl Intrinsic {
             ArrayResize => &["willow_array_resize"],
             StringDebug => &["willow_string_debug"],
             ArrayCopy => &["willow_array_copy", "willow_array_copy_scalar_pairs"],
+            MapRemove => &["willow_map_remove_into"],
+            MapKeys | MapValues | MapEntries => &["willow_map_snapshot"],
             MapInsert => &["willow_map_insert"],
             MapGet | FrozenMapGet => &["willow_map_get", "willow_map_get_into"],
             MapContains | FrozenMapContains => &["willow_map_contains"],
@@ -799,6 +809,22 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
         },
         (B::Map, 2) => match (method, arity) {
             ("insert", 2) => Some(ResolvedMethod::fixed(Intrinsic::MapInsert, Type::Void)),
+            ("remove", 1) => Some(ResolvedMethod::fixed(
+                Intrinsic::MapRemove,
+                B::Option.apply(vec![args[1].clone()]),
+            )),
+            ("keys", 0) => Some(ResolvedMethod::fixed(
+                Intrinsic::MapKeys,
+                Type::Array(Box::new(args[0].clone())),
+            )),
+            ("values", 0) => Some(ResolvedMethod::fixed(
+                Intrinsic::MapValues,
+                Type::Array(Box::new(args[1].clone())),
+            )),
+            ("entries", 0) => Some(ResolvedMethod::fixed(
+                Intrinsic::MapEntries,
+                Type::Array(Box::new(Type::Generic("$Tuple2".into(), args.to_vec()))),
+            )),
             ("get", 1) => Some(ResolvedMethod::fixed(
                 Intrinsic::MapGet,
                 B::Option.apply(vec![args[1].clone()]),

@@ -418,3 +418,18 @@ fn iface_pair_owned_growth_example() {
         assert_eq!(out, "7\n7\n99\n7\n");
     }
 }
+
+perspective!(
+    test_map_iteration_interface_values,
+    r#"fn main() {
+        let m: Map<String, Value> = Map::new();
+        let v: Value = new Number(67); m.insert("one", v);
+        let values = m.values(); let entries = m.entries();
+        values[0] = new Number(99);
+        println(m.get("one").unwrap().get());
+        println(m.remove("one").unwrap().get()); gc_collect();
+        for e in entries { let (k, v) = e; println(k); println(v.get()); }
+        println(values[0].get());
+    }"#,
+    "67\n67\none\n67\n99\n"
+);

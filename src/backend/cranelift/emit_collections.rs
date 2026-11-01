@@ -9,6 +9,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         key: cranelift_codegen::ir::Value,
         key_ref: cranelift_codegen::ir::Value,
         value_ty: &Type,
+        remove: bool,
     ) -> cranelift_codegen::ir::Value {
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
@@ -17,8 +18,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ));
         let ptr_ty = reference_type(self.module.target_config());
         let address = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-        let tag =
-            self.emit_value_runtime_call("willow_map_get_into", &[receiver, key, key_ref, address]);
+        let tag = self.emit_value_runtime_call(
+            if remove {
+                "willow_map_remove_into"
+            } else {
+                "willow_map_get_into"
+            },
+            &[receiver, key, key_ref, address],
+        );
         let payload = self.stack_load(types::I64, slot);
         self.emit_option_from_tag_payload(tag, payload, value_ty)
     }

@@ -515,6 +515,8 @@ mod alloc_effects_tests {
         "willow_map_copy",
         "willow_map_get",
         "willow_map_get_into",
+        "willow_map_remove_into",
+        "willow_map_snapshot",
         "willow_map_insert",
         "willow_atomic_i64_new",
         "willow_atomic_bool_new",
@@ -728,7 +730,13 @@ mod alloc_effects_tests {
 
     #[test]
     fn map_key_operations_include_nan_fault_effects() {
-        for name in ["willow_map_insert", "willow_map_get", "willow_map_contains"] {
+        for name in [
+            "willow_map_insert",
+            "willow_map_get",
+            "willow_map_contains",
+            "willow_map_remove_into",
+            "willow_map_snapshot",
+        ] {
             assert!(
                 effects(name)
                     .contains(RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_ALLOCATE))

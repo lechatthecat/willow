@@ -1614,6 +1614,24 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         }
         Stmt::For(s) => {
             let iterable = lower_expr(&s.iterable, ctx)?;
+            let iterable =
+                if let Some((key, value)) = builtin_types::binary_args(&iterable.ty, B::Map) {
+                    HirExpr {
+                        ty: Type::Array(Box::new(Type::Generic(
+                            "$Tuple2".into(),
+                            vec![key.clone(), value.clone()],
+                        ))),
+                        span: iterable.span,
+                        kind: HirExprKind::MethodCall {
+                            object: Box::new(iterable),
+                            method: "entries".into(),
+                            args: vec![],
+                            super_class: None,
+                        },
+                    }
+                } else {
+                    iterable
+                };
             let element_ty = match &iterable.ty {
                 Type::Array(inner) => (**inner).clone(),
                 ty if builtin_types::unary_arg(ty, B::FrozenArray).is_some() => {
@@ -4751,6 +4769,28 @@ mod tests {
             s,
             HirStmt::For { iterable, .. } if iterable.ty == Type::Array(Box::new(Type::I64))
         )));
+    }
+
+    #[test]
+    fn map_iteration_lowers_one_snapshot_per_loop() {
+        for count in [1, 8, 32, 128] {
+            let source = format!(
+                "import std::collections::Map; fn f(m: Map<i64, i64>) {{ {} }}",
+                "for _ in m {}".repeat(count)
+            );
+            let (hir, diagnostics) = lower_src(&source);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let mut snapshots = 0;
+            for statement in &hir.functions[0].body {
+                if let HirStmt::For { iterable, .. } = statement {
+                    assert!(
+                        matches!(&iterable.kind, HirExprKind::MethodCall { method, args, .. } if method == "entries" && args.is_empty())
+                    );
+                    snapshots += 1;
+                }
+            }
+            assert_eq!(snapshots, count);
+        }
     }
 
     // 51. an object literal has the class type

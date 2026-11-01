@@ -469,6 +469,9 @@ impl Parser {
                 let member = self.expect_ident()?;
                 if self.eat(TokenKind::LParen) {
                     let args = self.parse_call_args_after_lparen()?;
+                    if member == "entries" {
+                        self.tuple_arities.insert(2);
+                    }
                     lhs = Expr::MethodCall(Box::new(MethodCallExpr {
                         object: lhs,
                         method: member,

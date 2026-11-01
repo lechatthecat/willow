@@ -1,0 +1,21 @@
+// Iteration snapshots use ascending keys (numeric or UTF-8 string order).
+// Later mutations do not change an existing snapshot; values are shallow copies.
+import std::collections::Map;
+fn main() {
+    let m: Map<String, i64> = Map::new();
+    m.insert("b", 2);
+    m.insert("a", 1);
+    for entry in m {
+        let (key, value) = entry;
+        println(key);
+        println(value);
+        m.remove(key);
+        m.insert("c", 3);
+    }
+    println(m.len());
+    for key in m.keys() { println(key); }
+    for value in m.values() { println(value); }
+    for entry in m.entries() { let (key, value) = entry; println(value); }
+    println(match m.remove("c") { Some(v) => v, None => -1 });
+    println(match m.remove("c") { Some(v) => v, None => -1 });
+}

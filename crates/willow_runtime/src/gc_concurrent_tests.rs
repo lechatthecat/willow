@@ -5259,3 +5259,46 @@ fn inline_satb_roots_survive_minor_overlap_and_unregister_without_runtime_calls(
         reset_internal_for_test();
     }
 }
+
+#[test]
+fn map_remove_compaction_during_slices_preserves_satb_and_live_values() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let mut map = crate::map::willow_map_new(0, 0, 1);
+    willow_push_root(&mut map);
+    let mut live = willow_alloc(8);
+    willow_push_root(&mut live);
+    let mut deleted = willow_alloc(8);
+    willow_push_root(&mut deleted);
+    for key in 0..4096 {
+        crate::map::willow_map_insert(
+            map,
+            key,
+            0,
+            if key == 4000 { live } else { deleted } as i64,
+            1,
+        );
+    }
+    willow_pop_roots(2);
+    let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
+    let mut consumer = cycle.queue.register_assist();
+    cycle.drain_worker(1, &mut Vec::new(), &mut consumer);
+    for key in 0..4096 {
+        if key != 4000 {
+            let mut out = 0;
+            assert_eq!(crate::map::willow_map_remove_into(map, key, 0, &mut out), 0);
+        }
+    }
+    drop(consumer);
+    let (_, plan) = finish_or_recover(&cycle);
+    assert!(cycle.is_marked(live as usize));
+    assert!(cycle.is_marked(deleted as usize));
+    sweep_if_planned(plan);
+    assert_eq!(crate::map::willow_map_get(map, 4000, 0, 1), live);
+    assert_eq!(crate::map::willow_map_len(map), 1);
+    willow_gc_collect();
+    assert_eq!(crate::map::willow_map_get(map, 4000, 0, 1), live);
+    willow_pop_root();
+    willow_gc_collect();
+    reset_internal_for_test();
+}

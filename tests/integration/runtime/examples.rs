@@ -379,6 +379,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/lambda_shadowing.wi", "101\n201\n102\n"),
         ("example/for_loops.wi", "6\n1\n2\n3\n5050\n9\n"),
         ("example/frozen_array.wi", "5\n4\n10\n"),
+        (
+            "example/map_iteration.wi",
+            "a\n1\nb\n2\n1\nc\n3\n3\n3\n-1\n",
+        ),
         ("example/frozen_map.wi", "3\n2\ntrue\n150\n"),
         ("example/frozen_map_gc.wi", "449\ntwo!\n?\n1536\n2\n"),
         (

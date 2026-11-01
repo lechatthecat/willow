@@ -419,7 +419,7 @@ unsafe fn store_pair(pair: *mut i64, first: i64, second: i64, mask: u64) {
 /// Copy both words and preserve whether word zero is traced. Root an interface
 /// object across allocation so a moving collection updates the copied pointer.
 /// The caller must publish or root the returned box before another safepoint.
-unsafe fn copy_scalar_pair(source: *const i64) -> *mut u8 {
+pub(crate) unsafe fn copy_scalar_pair(source: *const i64) -> *mut u8 {
     let mask = unsafe { pair_ref_mask(source) };
     let (first, second) = unsafe { (source.read(), source.add(1).read()) };
     // A successful bump allocation cannot collect: both source words remain
