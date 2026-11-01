@@ -468,6 +468,7 @@ mod alloc_effects_tests {
         "willow_i64_to_string",
         "willow_bool_to_string",
         "willow_f64_parse",
+        "willow_i64_parse",
         "willow_format_f64_17g",
         "willow_format_f64_16f",
         "willow_format_f64_6f",
@@ -814,6 +815,16 @@ mod alloc_effects_tests {
         ] {
             assert_eq!(effects(name), RuntimeEffects::NONE, "{name}");
         }
+    }
+
+    #[test]
+    fn i64_parse_signature_and_allocation_effect() {
+        assert!(allocates("willow_i64_parse"));
+        let symbol = runtime_symbol("willow_i64_parse").unwrap();
+        assert_eq!(
+            (symbol.params, symbol.ret),
+            (&[AbiTy::Ptr][..], Some(AbiTy::Ptr))
+        );
     }
 
     #[test]

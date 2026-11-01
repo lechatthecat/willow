@@ -3588,7 +3588,7 @@ fn lower_resolution_partial(
         is_async,
     };
     let mut out = HirResolution::default();
-    for namespace in ["time", "env", "fs", "net", "parallel", "f64"] {
+    for namespace in ["time", "env", "fs", "net", "parallel", "f64", "i64"] {
         out.namespaces
             .insert(TypeId::local(namespace), namespace.to_owned());
     }
@@ -3609,7 +3609,7 @@ fn lower_resolution_partial(
                 .alias
                 .as_deref()
                 .unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path));
-            if access != "f64" {
+            if !matches!(access, "f64" | "i64") {
                 out.namespaces.remove(&TypeId::local(access));
             }
         }

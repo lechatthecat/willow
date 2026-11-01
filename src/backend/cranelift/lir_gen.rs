@@ -192,7 +192,7 @@ fn namespace_builtin_call(
     class: &str,
     method: &str,
 ) -> Option<crate::semantic::intrinsics::NamespaceBuiltin> {
-    if class == "f64" {
+    if matches!(class, "f64" | "i64") {
         return crate::semantic::intrinsics::namespace_builtin(class, method);
     }
     if known_modules.contains_key(class) {

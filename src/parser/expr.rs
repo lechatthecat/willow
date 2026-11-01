@@ -647,11 +647,16 @@ impl Parser {
             TokenKind::Select => self.parse_select(),
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
-            TokenKind::F64 => {
+            TokenKind::F64 | TokenKind::I64 => {
+                let name = if matches!(self.peek_kind(), TokenKind::I64) {
+                    "i64"
+                } else {
+                    "f64"
+                };
                 let span = self.current_span();
                 self.advance();
                 if self.eat(TokenKind::ColonColon) {
-                    self.parse_static_call("f64".to_string(), span)
+                    self.parse_static_call(name.to_string(), span)
                 } else {
                     Err(self.err(
                         ErrorCode::E0102,

@@ -388,6 +388,8 @@ impl Parser {
                         | TokenKind::Select
                         | TokenKind::Print
                         | TokenKind::Println
+                        | TokenKind::I64
+                        | TokenKind::F64
                 )
             ),
         }
@@ -1837,7 +1839,9 @@ class ProtectedCtor { prot init(self) {} }
             | TokenKind::Await
             | TokenKind::Select
             | TokenKind::Print
-            | TokenKind::Println => AfterQuestion::Ternary,
+            | TokenKind::Println
+            | TokenKind::I64
+            | TokenKind::F64 => AfterQuestion::Ternary,
 
             // `r? - 1` (binary minus on the try result) vs `c ? -1 : 2`
             // (negative then-branch); `r? || b` vs `c ? || 1 : || 2` (lambda).
@@ -1915,9 +1919,7 @@ class ProtectedCtor { prot init(self) {} }
             | TokenKind::Async
             | TokenKind::Enum
             | TokenKind::Const
-            | TokenKind::I64
-            | TokenKind::Bool
-            | TokenKind::F64 => AfterQuestion::Try,
+            | TokenKind::Bool => AfterQuestion::Try,
         }
     }
 

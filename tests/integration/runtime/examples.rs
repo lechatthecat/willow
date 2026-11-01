@@ -364,6 +364,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/example.wi", "50\ntrue\n"),
         ("example/fib.wi", "6765\n"),
         ("example/fib_bench.wi", "6765\n"),
+        (
+            "example/i64_parse.wi",
+            "42\n-9223372036854775808\nparse failed\n",
+        ),
         ("example/f64_parse.wi", "3.5\ntrue\nNaN\nparse failed\n"),
         (
             "example/f64_integral_display.wi",

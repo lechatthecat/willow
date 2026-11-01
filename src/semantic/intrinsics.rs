@@ -2198,6 +2198,17 @@ pub(crate) struct NamespaceBuiltin {
 pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBuiltin> {
     use crate::semantic::ids::SemanticType as Type;
     use crate::stdlib_schema::{self, StdItemKind};
+    if class == "i64" && method == "parse" {
+        return Some(NamespaceBuiltin {
+            runtime: "willow_i64_parse",
+            params: vec![Type::String],
+            ret: Type::Generic(
+                "Result".to_string().into(),
+                vec![Type::I64, Type::Named("ParseIntError".to_string().into())],
+            ),
+            narrow_to_bool: false,
+        });
+    }
     if class == "f64" {
         return match method {
             "from_i64" => Some(NamespaceBuiltin {

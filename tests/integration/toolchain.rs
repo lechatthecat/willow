@@ -1553,3 +1553,142 @@ fn test_import_recursive_types_shared_model_runs() {
     assert!(ok, "shared recursive model failed to compile or run");
     assert_eq!(output, "0\n0\n");
 }
+
+#[test]
+fn test_i64_parse_rules_and_composition() {
+    // Signed boundaries, zeros and leading zeros; then every rejected syntax
+    // family. All paths go through compiled Willow and typed Result matching.
+    let valid = [
+        ("0", "0"),
+        ("-0", "0"),
+        ("+0", "0"),
+        ("42", "42"),
+        ("+42", "42"),
+        ("-42", "-42"),
+        ("00042", "42"),
+        ("-00042", "-42"),
+        ("9223372036854775807", "9223372036854775807"),
+        ("+9223372036854775807", "9223372036854775807"),
+        ("-9223372036854775808", "-9223372036854775808"),
+    ];
+    let invalid = [
+        "",
+        "+",
+        "-",
+        " 1",
+        "1 ",
+        "1 2",
+        "++1",
+        "--1",
+        "+-1",
+        "-+1",
+        "1_000",
+        "0xff",
+        "0b10",
+        "1.0",
+        "1e2",
+        "NaN",
+        "１２",
+        "−1",
+        "9223372036854775808",
+        "-9223372036854775809",
+        "999999999999999999999999999",
+    ];
+    let mut source = String::from(
+        r#"
+fn parse(text: String) -> Result<i64, ParseIntError> {
+    let value = i64::parse(text)?;
+    return Result::Ok(value);
+}
+fn display(text: String) -> String {
+    let result: Result<i64, ParseIntError> = parse(text);
+    return match result {
+        Result::Ok(value) => value.toString(),
+        Result::Err(error) => match error { ParseIntError::Invalid(message) => "invalid", },
+    };
+}
+fn main() {
+"#,
+    );
+    let mut expected = String::new();
+    for (input, output) in valid {
+        source.push_str(&format!("println(display(\"{input}\"));\n"));
+        expected.push_str(output);
+        expected.push('\n');
+    }
+    for input in invalid {
+        source.push_str(&format!("println(display(\"{input}\"));\n"));
+        expected.push_str("invalid\n");
+    }
+    source.push_str(
+        r#"
+    println(true ? i64::parse("7").unwrap() : 0);
+    println(false ? 0 : i64::parse("8").unwrap());
+    println(i64::parse((-42).toString()).unwrap() + 43);
+    println(true ? f64::parse("2.5").unwrap() : 0.0);
+}
+"#,
+    );
+    expected.push_str("7\n8\n1\n2.5\n");
+    let (out, ok) = compile_and_run(&source);
+    assert!(ok, "{out}");
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn test_i64_parse_diagnostics() {
+    for (call, message) in [
+        (
+            "i64::parse(1)",
+            "mismatched types: expected `String`, found `i64`",
+        ),
+        (
+            "i64::parse()",
+            "function `i64::parse` expects 1 argument, got 0",
+        ),
+        (
+            "i64::parse(\"1\", \"2\")",
+            "function `i64::parse` expects 1 argument, got 2",
+        ),
+    ] {
+        assert_compile_error_contains(
+            &format!("fn main() {{ {call}; }}"),
+            &["error[E0201]", message],
+        );
+    }
+}
+
+#[test]
+fn test_i64_parse_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress_all(
+        r#"
+fn main() {
+    let mut sum = 0;
+    for i in 0..100 {
+        let text = i.toString();
+        let result = i64::parse(text);
+        let error = i64::parse(text + "x");
+        sum += result.unwrap();
+        let message = match error {
+            Result::Ok(value) => "unexpected",
+            Result::Err(error) => match error { ParseIntError::Invalid(message) => message, },
+        };
+        if i == 99 { println(message); }
+    }
+    println(sum);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "invalid integer: invalid digit found in string\n4950\n"
+    );
+}
+
+#[test]
+fn test_i64_parse_example() {
+    let (out, ok) = compile_and_run(include_str!("../../example/i64_parse.wi"));
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n-9223372036854775808\nparse failed\n");
+}

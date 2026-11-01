@@ -5,7 +5,7 @@ use crate::string::{willow_string_as_str, willow_string_from_str};
 
 const RESULT_OK_TAG: i64 = 0;
 const RESULT_ERR_TAG: i64 = 1;
-const PARSE_FLOAT_INVALID_TAG: i64 = 0;
+const PARSE_INVALID_TAG: i64 = 0;
 
 /// Default f64 display omits `.0` for every integral value, including signed
 /// zeros (`0` and `-0`). Parsing preserves the sign bit. Explicit precision
@@ -131,20 +131,43 @@ pub extern "C" fn willow_bool_to_string(value: u8) -> *mut u8 {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_f64_parse(text: *const u8) -> *mut u8 {
     let text = unsafe { willow_string_as_str(text) };
-    match text.parse::<f64>() {
+    alloc_parse_result(
+        text.parse::<f64>()
+            .map(|value| value.to_bits() as i64)
+            .map_err(|err| format!("invalid float: {err}")),
+    )
+}
+
+/// Parses signed decimal ASCII digits, with an optional leading `+` or `-`.
+/// Whitespace, separators, radix prefixes and values outside i64 are rejected.
+/// Returns `Result<i64, ParseIntError>`; no input-sized copy is allocated.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_i64_parse(text: *const u8) -> *mut u8 {
+    let text = unsafe { willow_string_as_str(text) };
+    alloc_parse_result(
+        text.parse::<i64>()
+            .map_err(|err| format!("invalid integer: {err}")),
+    )
+}
+
+// Both parse errors have one Invalid(String) variant, and both Ok payloads
+// occupy a non-reference word. Keep their allocation and rooting identical.
+fn alloc_parse_result(parsed: Result<i64, String>) -> *mut u8 {
+    match parsed {
         Ok(value) => willow_alloc_enum_variant(
             0,
             willow_abi::EnumVariantLayout::new(RESULT_OK_TAG as u32, &[willow_abi::SlotKind::Word]),
-            &[value.to_bits() as i64],
+            &[value],
         ),
         Err(err) => {
-            let mut message = willow_string_from_str(&format!("invalid float: {err}"));
+            let mut message = willow_string_from_str(&err);
             willow_push_root(&mut message as *mut *mut u8);
 
             let mut parse_error = willow_alloc_enum_variant(
                 0,
                 willow_abi::EnumVariantLayout::new(
-                    PARSE_FLOAT_INVALID_TAG as u32,
+                    PARSE_INVALID_TAG as u32,
                     &[willow_abi::SlotKind::GcRef],
                 ),
                 &[message as i64],
@@ -312,9 +335,49 @@ mod tests {
         unsafe {
             assert_eq!(*(result as *const i64), RESULT_ERR_TAG);
             let parse_error = *((result as *const i64).add(1)) as *mut u8;
-            assert_eq!(*(parse_error as *const i64), PARSE_FLOAT_INVALID_TAG);
+            assert_eq!(*(parse_error as *const i64), PARSE_INVALID_TAG);
             let message = *((parse_error as *const i64).add(1)) as *mut u8;
             assert_eq!(ws_text(message), "invalid float: invalid float literal");
+        }
+    }
+    #[test]
+    fn i64_parse_runtime_whitespace_and_payloads() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        for input in ["\t1", "1\n", "\r1", "1\0", "1\t2", "\u{a0}1"] {
+            let result = willow_i64_parse(willow_string_from_str(input));
+            unsafe {
+                assert_eq!(*(result as *const i64), RESULT_ERR_TAG, "{input:?}");
+                let error = *((result as *const i64).add(1)) as *mut u8;
+                assert_eq!(*(error as *const i64), PARSE_INVALID_TAG);
+                let message = *((error as *const i64).add(1)) as *mut u8;
+                assert!(ws_text(message).starts_with("invalid integer:"));
+            }
+        }
+        for (input, expected) in [
+            ("-9223372036854775808", i64::MIN),
+            ("9223372036854775807", i64::MAX),
+        ] {
+            let result = willow_i64_parse(willow_string_from_str(input));
+            unsafe {
+                assert_eq!(*(result as *const i64), RESULT_OK_TAG);
+                assert_eq!(*((result as *const i64).add(1)), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn i64_parse_long_leading_zeros() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        // Increasing lengths exercise full scans without overflowing early.
+        for n in [32, 256, 2048, 16384] {
+            let input = format!("{}42", "0".repeat(n));
+            let result = willow_i64_parse(willow_string_from_str(&input));
+            unsafe {
+                assert_eq!(*(result as *const i64), RESULT_OK_TAG);
+                assert_eq!(*((result as *const i64).add(1)), 42);
+            }
         }
     }
 }

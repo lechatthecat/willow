@@ -1,0 +1,13 @@
+// Signed decimal digits with an optional leading + or -; no whitespace.
+// Overflow and malformed input return Err instead of wrapping or panicking.
+fn main() {
+    println(i64::parse("+42").unwrap());
+    println(i64::parse("-9223372036854775808").unwrap());
+    let message = match i64::parse("9223372036854775808") {
+        Result::Ok(value) => value.toString(),
+        Result::Err(error) => match error {
+            ParseIntError::Invalid(message) => "parse failed",
+        },
+    };
+    println(message);
+}

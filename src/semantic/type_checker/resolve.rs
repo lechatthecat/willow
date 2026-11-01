@@ -2555,14 +2555,14 @@ impl TypeChecker {
             return Type::String;
         }
 
-        if class_name == "f64" && method_name == "parse" {
+        if matches!(class_name, "f64" | "i64") && method_name == "parse" {
             if args.len() != 1 {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
                         format!(
-                            "function `f64::parse` expects 1 argument, got {}",
+                            "function `{class_name}::parse` expects 1 argument, got {}",
                             args.len()
                         ),
                     )
@@ -2573,7 +2573,11 @@ impl TypeChecker {
             self.check_value_call_args(&params, args);
             return Type::Generic(
                 "Result".to_string(),
-                vec![Type::F64, Type::Named("ParseFloatError".to_string())],
+                if class_name == "i64" {
+                    vec![Type::I64, Type::Named("ParseIntError".to_string())]
+                } else {
+                    vec![Type::F64, Type::Named("ParseFloatError".to_string())]
+                },
             );
         }
 

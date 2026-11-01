@@ -323,3 +323,13 @@ they do not establish that regex resolves from crates.io.
 
 `monotonic_clock.wi` measures elapsed nanoseconds across a sleep using
 `std::time::now_ns`. See [clock semantics](../docs/monotonic-clock.md).
+
+### Integer parsing
+
+`i64_parse.wi` demonstrates `i64::parse(String) -> Result<i64, ParseIntError>`.
+It accepts ASCII decimal digits with an optional leading `+` or `-`, including
+leading zeros and the full signed 64-bit range. Empty input, whitespace (including
+leading/trailing whitespace), separators, radix prefixes, non-ASCII digits and
+overflow return `ParseIntError::Invalid(String)`. Trim input explicitly if desired.
+The error string describes the failure; callers should match the variant rather
+than depend on its exact wording.

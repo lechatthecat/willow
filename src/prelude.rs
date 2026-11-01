@@ -17,6 +17,10 @@ pub enum Result<T, E> {
     Err(E),
 }
 
+pub enum ParseIntError {
+    Invalid(String),
+}
+
 pub enum ParseFloatError {
     Invalid(String),
 }

@@ -119,6 +119,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     ALLOC; "willow_f64_to_string" => ([F64] -> Some(Ptr));
     ALLOC; "willow_i64_to_string" => ([I64] -> Some(Ptr));
     ALLOC; "willow_bool_to_string" => ([I8] -> Some(Ptr));
+    ALLOC; "willow_i64_parse" => ([Ptr] -> Some(Ptr));
     ALLOC; "willow_f64_parse" => ([Ptr] -> Some(Ptr));
     ALLOC; "willow_format_f64_17g" => ([F64] -> Some(Ptr));
     ALLOC; "willow_format_f64_16f" => ([F64] -> Some(Ptr));
