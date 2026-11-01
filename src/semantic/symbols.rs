@@ -374,6 +374,8 @@ impl Default for DeclarationSymbols {
 /// registration uses copy-on-write only when a declaration actually mutates.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct SymbolTable {
+    #[serde(skip)]
+    precheck_values: Rc<std::cell::RefCell<HashMap<SymbolRead, serde_json::Value>>>,
     scopes: super::scopes::Scopes<VarInfo>,
     #[serde(skip)]
     method_owners: Rc<std::cell::RefCell<method_owners::MethodOwners>>,
@@ -394,6 +396,7 @@ impl std::ops::Deref for SymbolTable {
 
 impl std::ops::DerefMut for SymbolTable {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.precheck_values = Default::default();
         self.bare_enum_names = Default::default();
         self.method_owners = Default::default();
         self.task_dispatch = Default::default();
@@ -538,6 +541,7 @@ impl SymbolTable {
     pub(crate) fn fork_body_scope(&self) -> Self {
         Self {
             scopes: Default::default(),
+            precheck_values: Rc::clone(&self.precheck_values),
             bare_enum_names: Rc::clone(&self.bare_enum_names),
             method_owners: Rc::clone(&self.method_owners),
             task_dispatch: Rc::clone(&self.task_dispatch),
@@ -550,6 +554,7 @@ impl SymbolTable {
     pub(crate) fn declaration_shell(&self, shared: &[ModuleId]) -> Self {
         Self {
             scopes: Default::default(),
+            precheck_values: Default::default(),
             bare_enum_names: Default::default(),
             method_owners: Default::default(),
             task_dispatch: Default::default(),
@@ -593,20 +598,40 @@ impl SymbolTable {
     }
 
     pub fn define_func(&mut self, name: String, info: FuncInfo) {
+        let read = SymbolRead::Function(name.clone());
+        self.precheck_symbol_write(read.clone());
+        let mut fingerprints = Rc::clone(&self.precheck_values);
         self.functions
             .insert(FunctionId::free_from_source_name(&name), info);
+        Rc::make_mut(&mut fingerprints).get_mut().remove(&read);
+        self.precheck_values = fingerprints;
     }
 
     pub fn lookup_func(&self, name: &str) -> Option<&FuncInfo> {
+        let result = self.lookup_func_raw(name);
+        self.precheck_symbol_read(SymbolRead::Function(name.to_owned()), result);
+        result
+    }
+    fn lookup_func_raw(&self, name: &str) -> Option<&FuncInfo> {
         record_read(|| SymbolRead::Function(name.to_owned()));
         self.functions.get(&FunctionId::free_from_source_name(name))
     }
 
     pub fn define_class(&mut self, name: String, info: ClassInfo) {
+        let read = SymbolRead::Class(name.clone());
+        self.precheck_symbol_write(read.clone());
+        let mut fingerprints = Rc::clone(&self.precheck_values);
         self.classes.insert(TypeId::from_source_name(&name), info);
+        Rc::make_mut(&mut fingerprints).get_mut().remove(&read);
+        self.precheck_values = fingerprints;
     }
 
     pub fn lookup_class(&self, name: &str) -> Option<&ClassInfo> {
+        let result = self.lookup_class_raw(name);
+        self.precheck_symbol_read(SymbolRead::Class(name.to_owned()), result);
+        result
+    }
+    fn lookup_class_raw(&self, name: &str) -> Option<&ClassInfo> {
         record_read(|| SymbolRead::Class(name.to_owned()));
         self.classes.get(&TypeId::from_source_name(name))
     }
@@ -637,11 +662,24 @@ impl SymbolTable {
     }
 
     pub fn lookup_module(&self, name: &str) -> Option<&ModuleInfo> {
+        let result = self.lookup_module_raw(name);
+        self.precheck_symbol_read(SymbolRead::Module(name.to_owned()), result.is_some());
+        result
+    }
+    fn lookup_module_raw(&self, name: &str) -> Option<&ModuleInfo> {
         record_read(|| SymbolRead::Module(name.to_owned()));
         self.modules.get(self.module_names.get(name)?)
     }
 
     pub(crate) fn lookup_module_func(&self, module: &str, name: &str) -> Option<&FuncInfo> {
+        let result = self.lookup_module_func_raw(module, name);
+        self.precheck_symbol_read(
+            SymbolRead::ModuleFunction(module.to_owned(), name.to_owned()),
+            result,
+        );
+        result
+    }
+    fn lookup_module_func_raw(&self, module: &str, name: &str) -> Option<&FuncInfo> {
         record_read(|| SymbolRead::ModuleFunction(module.to_owned(), name.to_owned()));
         self.modules
             .get(self.module_names.get(module)?)?
@@ -650,15 +688,30 @@ impl SymbolTable {
     }
 
     pub fn define_enum(&mut self, name: String, info: EnumInfo) {
+        let read = SymbolRead::Enum(name.clone());
+        self.precheck_symbol_write(read.clone());
+        let mut fingerprints = Rc::clone(&self.precheck_values);
         self.enums.insert(TypeId::from_source_name(&name), info);
+        Rc::make_mut(&mut fingerprints).get_mut().remove(&read);
+        self.precheck_values = fingerprints;
     }
 
     pub fn lookup_enum(&self, name: &str) -> Option<&EnumInfo> {
+        let result = self.lookup_enum_raw(name);
+        self.precheck_symbol_read(SymbolRead::Enum(name.to_owned()), result);
+        result
+    }
+    fn lookup_enum_raw(&self, name: &str) -> Option<&EnumInfo> {
         record_read(|| SymbolRead::Enum(name.to_owned()));
         self.enums.get(&TypeId::from_source_name(name))
     }
 
     pub(crate) fn enum_nameable_bare(&self, identity: &str) -> bool {
+        let result = self.enum_nameable_bare_raw(identity);
+        self.precheck_symbol_read(SymbolRead::EnumBare(identity.to_owned()), result);
+        result
+    }
+    fn enum_nameable_bare_raw(&self, identity: &str) -> bool {
         record_read(|| SymbolRead::EnumBare(identity.to_owned()));
         self.bare_enum_names
             .borrow_mut()
@@ -678,11 +731,21 @@ impl SymbolTable {
     }
 
     pub fn define_interface(&mut self, name: String, info: InterfaceInfo) {
+        let read = SymbolRead::Interface(name.clone());
+        self.precheck_symbol_write(read.clone());
+        let mut fingerprints = Rc::clone(&self.precheck_values);
         self.interfaces
             .insert(TypeId::from_source_name(&name), info);
+        Rc::make_mut(&mut fingerprints).get_mut().remove(&read);
+        self.precheck_values = fingerprints;
     }
 
     pub fn lookup_interface(&self, name: &str) -> Option<&InterfaceInfo> {
+        let result = self.lookup_interface_raw(name);
+        self.precheck_symbol_read(SymbolRead::Interface(name.to_owned()), result);
+        result
+    }
+    fn lookup_interface_raw(&self, name: &str) -> Option<&InterfaceInfo> {
         record_read(|| SymbolRead::Interface(name.to_owned()));
         self.interfaces.get(&TypeId::from_source_name(name))
     }
@@ -752,9 +815,142 @@ impl InterfaceInfo {
     }
 }
 
+impl SymbolTable {
+    fn precheck_fingerprint(
+        &self,
+        read: &SymbolRead,
+        value: impl FnOnce() -> serde_json::Value,
+    ) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let cached = matches!(
+            read,
+            SymbolRead::Function(_)
+                | SymbolRead::Class(_)
+                | SymbolRead::Enum(_)
+                | SymbolRead::Interface(_)
+                | SymbolRead::ModuleFunction(..)
+        );
+        if cached && let Some(value) = self.precheck_values.borrow().get(read) {
+            return value.clone();
+        }
+        let digest = Sha256::digest(
+            serde_json::to_vec(&crate::compiler_db::syntax::semantic(&value()))
+                .expect("symbol fingerprint"),
+        );
+        let value = serde_json::json!(format!("{:x}", crate::hex::Hex(&digest)));
+        if cached {
+            self.precheck_values
+                .borrow_mut()
+                .insert(read.clone(), value.clone());
+        }
+        value
+    }
+    pub(crate) fn precheck_value(&self, read: &SymbolRead) -> serde_json::Value {
+        self.precheck_fingerprint(read, || self.symbol_value(read))
+    }
+    fn precheck_symbol_read(&self, read: SymbolRead, value: impl serde::Serialize) {
+        use crate::semantic::type_checker::precheck_journal as journal;
+        if journal::is_active() {
+            let value = self.precheck_fingerprint(&read, || {
+                serde_json::to_value(value).expect("symbol fingerprint")
+            });
+            journal::read(
+                journal::Key::new("symbols", Some(serde_json::to_value(read).unwrap())),
+                value,
+            );
+        }
+    }
+    fn precheck_dispatch_read(&self, read: SymbolRead, value: bool) {
+        use crate::semantic::type_checker::precheck_journal as journal;
+        if !journal::is_active() {
+            return;
+        }
+        let writes = journal::take_dirty_symbols()
+            .into_iter()
+            .filter_map(|key| {
+                let read: SymbolRead = serde_json::from_value(key.key.clone()?).ok()?;
+                matches!(read, SymbolRead::Class(_) | SymbolRead::Interface(_)).then(|| {
+                    let output = self.precheck_output(&read);
+                    (key, output)
+                })
+            })
+            .collect();
+        journal::record_dispatch(journal::DispatchEvent {
+            writes,
+            read: serde_json::to_value(read).unwrap(),
+            result: value,
+        });
+    }
+    fn precheck_symbol_write(&self, read: SymbolRead) {
+        use crate::semantic::type_checker::precheck_journal as journal;
+        if journal::is_active() {
+            let key = journal::Key::new("symbols", Some(serde_json::to_value(&read).unwrap()));
+            let value = self.precheck_value(&read);
+            journal::write(key, value);
+        }
+    }
+    pub(crate) fn precheck_output(&self, read: &SymbolRead) -> serde_json::Value {
+        match read {
+            SymbolRead::Function(name) => serde_json::to_value(self.lookup_func(name)),
+            SymbolRead::Class(name) => serde_json::to_value(self.lookup_class(name)),
+            SymbolRead::Enum(name) => serde_json::to_value(self.lookup_enum(name)),
+            SymbolRead::Interface(name) => serde_json::to_value(self.lookup_interface(name)),
+            _ => return serde_json::Value::Null,
+        }
+        .unwrap()
+    }
+    pub(crate) fn restore_precheck(
+        &mut self,
+        read: SymbolRead,
+        value: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        match read {
+            SymbolRead::Function(name) => self.define_func(name, serde_json::from_value(value)?),
+            SymbolRead::Class(name) => self.define_class(name, serde_json::from_value(value)?),
+            SymbolRead::Enum(name) => self.define_enum(name, serde_json::from_value(value)?),
+            SymbolRead::Interface(name) => {
+                self.define_interface(name, serde_json::from_value(value)?)
+            }
+            _ => anyhow::bail!("invalid precheck symbol output"),
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precheck_symbol_fingerprints_are_shared_and_invalidated_per_name() {
+        for size in [8, 32, 128] {
+            let mut symbols = SymbolTable::default();
+            symbols.define_func("f".into(), function_info(Type::I64));
+            let read = SymbolRead::Function("f".into());
+            let encoded = std::cell::Cell::new(0);
+            let fingerprint = |symbols: &SymbolTable| {
+                symbols.precheck_fingerprint(&read, || {
+                    encoded.set(encoded.get() + 1);
+                    serde_json::json!(vec![0; size])
+                })
+            };
+            let before = fingerprint(&symbols);
+            for n in 0..size {
+                symbols.define_func(format!("unrelated{n}"), function_info(Type::I64));
+                assert_eq!(fingerprint(&symbols), before);
+            }
+            assert_eq!(encoded.get(), 1);
+            let mut fork = symbols.fork_body_scope();
+            fork.define_func("f".into(), function_info(Type::Bool));
+            fingerprint(&fork);
+            assert_eq!(encoded.get(), 2);
+            assert_eq!(fingerprint(&symbols), before);
+            assert_eq!(encoded.get(), 2);
+            symbols.functions.clear();
+            fingerprint(&symbols);
+            assert_eq!(encoded.get(), 3);
+        }
+    }
 
     #[test]
     fn body_reads_include_missing_symbols_and_select_only_module_member() {

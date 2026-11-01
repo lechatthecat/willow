@@ -11,6 +11,9 @@ mod check_concurrency;
 mod check_decls;
 mod check_lambda_match;
 pub(crate) mod generics;
+pub(crate) mod precheck;
+pub(crate) mod precheck_journal;
+mod signature;
 pub use check_lambda_match::LambdaCapture;
 mod async_retention;
 #[cfg(test)]
@@ -56,18 +59,19 @@ use crate::semantic::call_graph::ClassHierarchy;
 use crate::semantic::concurrency::NonpreemptibleReason;
 use crate::semantic::ids::{FunctionId, TypeId};
 use crate::stdlib_schema;
+use precheck_journal::{Map as ObservedMap, Set as ObservedSet};
 use std::collections::{HashMap, HashSet};
 
 /// Unit-level declaration and name-resolution inputs. Body evaluators share
 /// this allocation; declaration registration is the only mutating phase.
 #[derive(Clone)]
 pub struct ResolutionContext {
-    pub(crate) array_classes: HashMap<Type, String>,
-    pub(crate) array_abi_files: HashSet<crate::diagnostics::FileId>,
+    pub(crate) array_classes: ObservedMap<Type, String>,
+    pub(crate) array_abi_files: ObservedSet<crate::diagnostics::FileId>,
     /// Files of imported modules whose generic templates this unit
     /// instantiates. Their spellings follow the provider's imports, which the
     /// provider's own check validates.
-    provider_template_files: HashSet<crate::diagnostics::FileId>,
+    provider_template_files: ObservedSet<crate::diagnostics::FileId>,
     /// Whether the items being checked belong to the ENTRY program rather than
     /// an imported module. Only [`ReturnSite::EntryMain`] reads it, and only to
     /// decide whether a `main` is the real entry point — a module's `main` is
@@ -87,25 +91,26 @@ pub struct ResolutionContext {
     /// Names introduced by imports (module access names and item-import locals),
     /// used to reject local declarations that collide with an import. The span
     /// is the item-import's location, or `None` for module access names.
-    imported_names: HashMap<String, Option<Span>>,
+    imported_names: ObservedMap<String, Option<Span>>,
     /// Canonical declaration routes retained for direct registration APIs.
     /// Driver registrations additionally borrow package-aware per-unit paths.
-    module_access_names: HashMap<String, String>,
+    module_access_names: ObservedMap<String, String>,
     /// Shared source-import routes built once with the dependency index.
     registration_import_paths: std::rc::Rc<HashMap<String, String>>,
     /// Dependency metadata needed by imported signatures, without a source
     /// import in this unit. Lookups on inferred types still use the metadata;
     /// explicitly written type names must pass `check_source_type_name` first.
-    signature_only_modules: HashSet<String>,
+    signature_only_modules: ObservedSet<String>,
     /// Collection type names made available by `std::collections` imports.
-    imported_collection_types: HashSet<String>,
+    imported_collection_types: ObservedSet<String>,
+    imported_collection_targets: ObservedSet<String>,
     /// Local aliases for collection types imported from `std::collections`.
-    imported_collection_aliases: HashMap<String, String>,
+    imported_collection_aliases: ObservedMap<String, String>,
     /// Imported std module namespaces, keyed by their local access name.
-    imported_std_modules: HashMap<String, ImportedStdModule>,
+    imported_std_modules: ObservedMap<String, ImportedStdModule>,
     /// Directly imported synchronous std::fs functions, keyed by their local
     /// alias. These block a native worker and therefore participate in E2604.
-    imported_blocking_std_functions: HashMap<String, &'static str>,
+    imported_blocking_std_functions: ObservedMap<String, &'static str>,
     /// Enforce the Send/Sync async checks (E2402-E2405). Compiler entry points
     /// always enable these; direct checker tests can isolate individual rules.
     enforce_send_sync: bool,
@@ -134,12 +139,17 @@ pub struct ResolutionContext {
 pub struct TypeChecker {
     pub(crate) generics: generics::Generics,
     // Declaration-epoch caches: cleared before registering each program.
-    marker_contracts: HashMap<String, Option<send_sync::Marker>>,
-    marker_contract_proven: HashSet<(Type, send_sync::Marker)>,
+    marker_contracts: ObservedMap<String, Option<send_sync::Marker>>,
+    marker_contract_proven: ObservedSet<(Type, send_sync::Marker)>,
 
     /// Injected signatures carry provider metadata, not names written in this unit.
     signature_metadata: bool,
     resolution: std::rc::Rc<ResolutionContext>,
+    pub(crate) prechecks: Option<std::rc::Rc<precheck::Cache>>,
+    pub(crate) declaration_cache: Option<std::rc::Rc<precheck::Cache>>,
+    precheck_bodies: HashMap<BodyId, serde_json::Value>,
+    precheck_context: serde_json::Value,
+    precheck_occurrences: HashMap<String, usize>,
     body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
     body_query_error: Option<anyhow::Error>,
     effect_queries: Option<(
@@ -193,6 +203,12 @@ pub struct TypeChecker {
     /// which is the one place a written spelling could still reach the back end
     /// and be turned down as an unknown type.
     pub normalized_types: HashMap<Type, Type>,
+    signature_qualified: HashSet<String>,
+    signature_array_before: Option<(bool, bool)>,
+    signature_normalized: HashMap<Type, Type>,
+    signature_values:
+        std::cell::RefCell<HashMap<crate::compiler_db::checks::CheckInput, serde_json::Value>>,
+    signature_reads: Option<HashMap<crate::compiler_db::checks::CheckInput, serde_json::Value>>,
     /// Resolved class/module identity for every static call and field, including
     /// unchanged spellings. Interned identities avoid per-site name allocation.
     pub static_call_classes: HashMap<ExprId, crate::semantic::ids::TypeId>,
@@ -205,13 +221,13 @@ pub struct TypeChecker {
     /// `extends` cycle diagnostic. Each member of a cycle discovers the same
     /// cycle from its own declaration; the first one in declaration order
     /// reports it and the rest stay silent (willow-jlky).
-    reported_class_cycles: HashSet<String>,
-    invalid_type_names: std::rc::Rc<std::cell::RefCell<HashSet<String>>>,
+    reported_class_cycles: ObservedSet<String>,
+    invalid_type_names: std::rc::Rc<std::cell::RefCell<ObservedSet<String>>>,
     import_type_hints: std::rc::Rc<std::cell::OnceCell<HashMap<String, Vec<String>>>>,
     /// Collection type names referenced through fully-qualified `std` paths.
-    fully_qualified_collection_types: HashSet<String>,
+    fully_qualified_collection_types: ObservedSet<String>,
     /// Suppress duplicate missing-import diagnostics per type name.
-    missing_collection_imports_reported: HashSet<String>,
+    missing_collection_imports_reported: ObservedSet<String>,
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
     static_reads: HashMap<FunctionId, HashSet<FunctionId>>,
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
@@ -249,7 +265,7 @@ fn interface_default_effect_id(interface: &str, method: &str) -> FunctionId {
     )
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ImportedStdModule {
     module: String,
     span: Span,
@@ -319,17 +335,20 @@ impl TypeChecker {
             class_module_path: None,
             task_sync_preemption: crate::compiler_db::inputs::TargetCapabilities::native()
                 .sync_stack_preemption,
-            imported_names: HashMap::new(),
-            module_access_names: HashMap::new(),
+            imported_names: ObservedMap::new("resolution.imported_names"),
+            module_access_names: ObservedMap::new("resolution.module_access_names"),
             registration_import_paths: std::rc::Rc::new(HashMap::new()),
-            signature_only_modules: HashSet::new(),
-            imported_collection_types: HashSet::new(),
-            array_classes: HashMap::new(),
-            array_abi_files: HashSet::new(),
-            provider_template_files: HashSet::new(),
-            imported_collection_aliases: HashMap::new(),
-            imported_std_modules: HashMap::new(),
-            imported_blocking_std_functions: HashMap::new(),
+            signature_only_modules: ObservedSet::new("resolution.signature_only_modules"),
+            imported_collection_types: ObservedSet::new("resolution.imported_collection_types"),
+            imported_collection_targets: ObservedSet::new("resolution.imported_collection_targets"),
+            array_classes: ObservedMap::new("resolution.array_classes"),
+            array_abi_files: ObservedSet::new("resolution.array_abi_files"),
+            provider_template_files: ObservedSet::new("resolution.provider_template_files"),
+            imported_collection_aliases: ObservedMap::new("resolution.imported_collection_aliases"),
+            imported_std_modules: ObservedMap::new("resolution.imported_std_modules"),
+            imported_blocking_std_functions: ObservedMap::new(
+                "resolution.imported_blocking_std_functions",
+            ),
             enforce_send_sync: false,
             field_writes: None,
             nonpreemptible_methods: Default::default(),
@@ -346,11 +365,16 @@ impl TypeChecker {
     fn empty(resolution: std::rc::Rc<ResolutionContext>, symbols: SymbolTable) -> Self {
         Self {
             generics: generics::Generics::default(),
-            marker_contracts: HashMap::new(),
-            marker_contract_proven: HashSet::new(),
+            marker_contracts: ObservedMap::new("resolution.marker_contracts"),
+            marker_contract_proven: ObservedSet::new("resolution.marker_contract_proven"),
             resolution,
             signature_metadata: false,
             body_queries: None,
+            prechecks: None,
+            declaration_cache: None,
+            precheck_bodies: Default::default(),
+            precheck_context: serde_json::Value::Null,
+            precheck_occurrences: Default::default(),
             body_query_error: None,
             effect_queries: None,
             declaration_queries: None,
@@ -369,13 +393,24 @@ impl TypeChecker {
             expr_types: HashMap::new(),
             reference_arg_modes: HashMap::new(),
             normalized_types: HashMap::new(),
+            signature_reads: None,
+            signature_qualified: HashSet::new(),
+            signature_array_before: None,
+            signature_normalized: HashMap::new(),
+            signature_values: Default::default(),
             static_call_classes: HashMap::new(),
             lambda_captures: HashMap::new(),
-            reported_class_cycles: HashSet::new(),
-            invalid_type_names: Default::default(),
+            reported_class_cycles: ObservedSet::new("resolution.reported_class_cycles"),
+            invalid_type_names: std::rc::Rc::new(std::cell::RefCell::new(ObservedSet::new(
+                "resolution.invalid_type_names",
+            ))),
             import_type_hints: Default::default(),
-            fully_qualified_collection_types: HashSet::new(),
-            missing_collection_imports_reported: HashSet::new(),
+            fully_qualified_collection_types: ObservedSet::new(
+                "resolution.fully_qualified_collection_types",
+            ),
+            missing_collection_imports_reported: ObservedSet::new(
+                "resolution.missing_collection_imports_reported",
+            ),
             resolved_calls: HashMap::new(),
             static_reads: HashMap::new(),
             analysis_calls: HashMap::new(),
@@ -424,9 +459,20 @@ impl TypeChecker {
 
     /// Whether an instance field may be written after construction.
     fn field_reassigned(&self, field: &FieldDecl) -> bool {
-        self.field_writes
+        let value = self
+            .field_writes
             .as_ref()
-            .is_some_and(|writes| writes.is_reassigned(&field.name, field.span))
+            .is_some_and(|writes| writes.is_reassigned(&field.name, field.span));
+        if precheck_journal::is_active() {
+            precheck_journal::read(
+                precheck_journal::Key::new(
+                    "field_write",
+                    Some(serde_json::json!([field.name, field.span])),
+                ),
+                value.into(),
+            );
+        }
+        value
     }
 
     /// Seed the non-preemptible methods of imported classes (keyed by receiver
@@ -522,6 +568,7 @@ impl TypeChecker {
     }
 
     fn normalize_type(&mut self, ty: &Type, span: Span) -> Type {
+        self.record_signature_type(ty, span);
         if let Type::Generic(name, args) = ty
             && let Some(template) = self.generics.classes.get(name).cloned()
             && let Some(storage) = &template.abi_storage
@@ -532,7 +579,7 @@ impl TypeChecker {
             if let Some((module, item)) = self.resolve_fully_qualified_std_item(name, span)
                 && module == "collections"
             {
-                self.fully_qualified_collection_types.insert(item);
+                self.record_signature_collection(item);
             }
             if args.len() != template.type_params.len() {
                 self.generic_error(
@@ -552,13 +599,13 @@ impl TypeChecker {
                 .zip(normalized)
                 .collect();
             let concrete = crate::semantic::generic_inference::substitute(storage, &bindings);
-            self.normalized_types.insert(ty.clone(), concrete.clone());
+            self.record_signature_normalized(ty, &concrete);
             return concrete;
         }
         if let Type::Generic(name, args) = ty
             && let Some(concrete) = self.instantiate_class(name, args, span)
         {
-            self.normalized_types.insert(ty.clone(), concrete.clone());
+            self.record_signature_normalized(ty, &concrete);
             return concrete;
         }
         if let Type::Named(name) = ty
@@ -588,7 +635,7 @@ impl TypeChecker {
         // builtin generic); recording that would hand lowering a type the
         // program never wrote. Everything else is the annotation's meaning.
         if normalized != *ty && !(normalized == Type::Void && *ty != Type::Void) {
-            self.normalized_types.insert(ty.clone(), normalized.clone());
+            self.record_signature_normalized(ty, &normalized);
         }
         normalized
     }
@@ -622,7 +669,7 @@ impl TypeChecker {
                 }
                 if let Some((module, item)) = self.resolve_fully_qualified_std_item(name, span) {
                     if module == "collections" {
-                        self.fully_qualified_collection_types.insert(item.clone());
+                        self.record_signature_collection(item.clone());
                     }
                     return self.normalize_std_type_item(name, &module, &item, args, span);
                 }
@@ -1353,6 +1400,16 @@ impl TypeChecker {
     }
 
     fn unknown_type_help(&self, name: &str) -> String {
+        let value = self.unknown_type_help_value(name);
+        if precheck_journal::is_active() {
+            precheck_journal::read(
+                precheck_journal::Key::new("type_help", Some(name.into())),
+                value.clone().into(),
+            );
+        }
+        value
+    }
+    fn unknown_type_help_value(&self, name: &str) -> String {
         let hints = self.import_type_hints.get_or_init(|| {
             let mut hints: HashMap<String, Vec<String>> = HashMap::new();
             for (name, public) in self

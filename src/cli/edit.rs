@@ -90,7 +90,9 @@ impl EditCommand {
             return Ok(command);
         }
         anyhow::ensure!(
-            command.baseline.is_none() && command.output.is_none() && command.manifest.is_none(),
+            command.baseline.is_none()
+                && command.output.is_none()
+                && (command.manifest.is_none() || command.operation == "verify"),
             "baseline/output/manifest option not valid for operation"
         );
         if command.operation == "prepare" {
@@ -155,7 +157,16 @@ impl EditCommand {
             }
             "preview" => workspace.preview(id, self.changes),
             "validate" => workspace.validate(id, emitter),
-            "verify" => Ok(serde_json::to_value(workspace.verify(id)?)?),
+            "verify" => {
+                let report = match self.manifest {
+                    Some(path) => workspace.verify_manifest(
+                        id,
+                        &willow_compiler::ai::verify::EditManifest::load(&path)?,
+                    )?,
+                    None => workspace.verify(id)?,
+                };
+                Ok(serde_json::to_value(report)?)
+            }
             "apply" => workspace.apply(id, emitter),
             "recover" => workspace.recover(id),
             _ => unreachable!(),
@@ -222,13 +233,16 @@ mod semantic_verify_tests {
             "baseline --entry main.wi --output baseline.json",
             "verify --entry main.wi --baseline baseline.json --manifest edits.json",
             "verify --transaction abc",
+            "verify --transaction abc --manifest edits.json",
         ] {
             assert!(parse(command).is_ok(), "{command}");
         }
         for command in [
             "verify --entry main.wi --baseline b",
             "baseline --entry main.wi --output b --manifest m",
-            "verify --transaction t --manifest m",
+            "apply --transaction t --manifest m",
+            "validate --transaction t --manifest m",
+            "preview --transaction t --manifest m",
             "baseline --entry main.wi",
             "baseline --output b",
             "verify --entry main.wi",

@@ -207,7 +207,7 @@ pub(crate) struct TypedBody {
 }
 
 impl TypedBody {
-    fn new(
+    pub(super) fn new(
         id: BodyId,
         outputs: BodyOutputs,
         collection_names: HashSet<String>,
@@ -290,8 +290,8 @@ impl BodyChecker {
         TypedBody::new(
             self.id,
             outputs,
-            state.fully_qualified_collection_types,
-            state.missing_collection_imports_reported,
+            state.fully_qualified_collection_types.into_raw(),
+            state.missing_collection_imports_reported.into_raw(),
         )
     }
 }
@@ -348,11 +348,35 @@ impl TypeChecker {
 
     /// Evaluate one body against shared declarations, then aggregate its owned
     /// outputs in source order. Repeated requests replay the immutable artifact.
-    pub(super) fn query_body(&mut self, id: BodyId, check: impl FnOnce(&mut TypeChecker)) {
+    pub(super) fn query_body(
+        &mut self,
+        id: BodyId,
+        syntax: &impl serde::Serialize,
+        check: impl FnOnce(&mut TypeChecker),
+    ) {
+        if self.prechecks.is_some() {
+            if !super::precheck_journal::is_active()
+                && let Some(syntax) = self.precheck_bodies.get(&id).cloned()
+            {
+                self.precheck_operation(format!("body:{id:?}"), id, syntax, |checker| {
+                    checker
+                        .prechecks
+                        .as_ref()
+                        .unwrap()
+                        .bodies
+                        .set(checker.prechecks.as_ref().unwrap().bodies.get() + 1);
+                    check(checker);
+                });
+                return;
+            }
+            let cache = self.prechecks.as_ref().unwrap();
+            cache.bodies.set(cache.bodies.get() + 1);
+        }
         let Some(queries) = self.body_queries.clone() else {
             check(self);
             return;
         };
+        queries.capture_expanded(id, syntax);
         if self.body_query_error.is_some() {
             return;
         }
@@ -382,7 +406,7 @@ impl TypeChecker {
             return;
         }
         self.checked_bodies.push(id);
-        if let Err(error) = self.absorb_body(body, &queries) {
+        if let Err(error) = self.absorb_body(body, Some(&queries)) {
             self.body_query_error = Some(error);
         }
     }
@@ -390,10 +414,10 @@ impl TypeChecker {
     /// Merge one evaluated body into this checker: its own tables first, then
     /// each lambda in preorder, with diagnostics and task-method sites
     /// interleaved exactly as inline checking produced them.
-    fn absorb_body(
+    pub(super) fn absorb_body(
         &mut self,
         body: TypedBody,
-        queries: &crate::compiler_db::body::BodyQueries,
+        queries: Option<&crate::compiler_db::body::BodyQueries>,
     ) -> anyhow::Result<()> {
         for (caller, reads) in body.static_reads {
             self.static_reads.entry(caller).or_default().extend(reads);
@@ -413,8 +437,10 @@ impl TypeChecker {
         }
         self.expr_types.extend(body.expr_types);
         self.analysis_calls.extend(body.analysis_calls);
-        self.analysis_symbols
-            .extend(queries.resolved_references(body.id, &body.analysis_symbols)?);
+        self.analysis_symbols.extend(match queries {
+            Some(queries) => queries.resolved_references(body.id, &body.analysis_symbols)?,
+            None => body.analysis_symbols,
+        });
         self.reference_arg_modes.extend(body.reference_arg_modes);
         self.enum_variant_resolutions
             .extend(body.enum_variant_resolutions);
@@ -456,7 +482,9 @@ impl TypeChecker {
             ordered.absorb_until(self, splice.errors, splice.task_sites);
             let child = match resident.next() {
                 Some(child) => child,
-                None => queries.read(splice.body)?,
+                None => queries
+                    .ok_or_else(|| anyhow::anyhow!("missing precheck lambda output"))?
+                    .read(splice.body)?,
             };
             self.absorb_body(child, queries)?;
         }
@@ -464,7 +492,7 @@ impl TypeChecker {
         Ok(())
     }
 
-    fn swap_body_outputs(&mut self, outputs: &mut BodyOutputs) {
+    pub(super) fn swap_body_outputs(&mut self, outputs: &mut BodyOutputs) {
         use std::mem::swap;
         swap(&mut self.errors, &mut outputs.errors);
         swap(&mut self.expr_types, &mut outputs.expr_types);

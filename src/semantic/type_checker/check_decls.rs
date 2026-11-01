@@ -19,6 +19,9 @@ impl TypeChecker {
     /// kind of bare name a payload may use without declaring it. Registration
     /// cannot judge this: a payload may name a type declared later in the file.
     pub(super) fn check_enum(&mut self, decl: &EnumDecl) {
+        self.cached_enum_validation(decl);
+    }
+    pub(super) fn check_enum_types(&mut self, decl: &EnumDecl) {
         // The parser creates exactly one bound parameter per tuple position.
         // Revalidating these generated names against a slice would be quadratic.
         if crate::parser::tuples::is_tuple(&decl.name) {
@@ -40,7 +43,7 @@ impl TypeChecker {
     /// Validate an interface's `extends` clause (willow-1js.2 / willow-1js.8):
     /// each super must be a registered interface, with no cycle, and its
     /// method signatures against the registered types (willow-rlq9).
-    pub(super) fn check_interface(&mut self, decl: &InterfaceDecl) {
+    pub(super) fn check_interface_header(&mut self, decl: &InterfaceDecl) {
         // Signature types were normalized at registration and are judged here,
         // once a later declaration can be named and the interface's own
         // parameters are known to be parameters (`fn from(e: E) -> Self` in
@@ -100,6 +103,10 @@ impl TypeChecker {
                 )),
             );
         }
+    }
+
+    pub(super) fn check_interface(&mut self, decl: &InterfaceDecl) {
+        self.cached_interface_validation(decl);
         // Type-check default method bodies even when no class implements the
         // interface (willow-1js.7). `self` is the opaque `Self`; the body is the
         // canonical default (the injected class copies of non-generic defaults are
@@ -123,7 +130,7 @@ impl TypeChecker {
         decl: &InterfaceDecl,
     ) {
         if let Some(body) = &m.default_body {
-            self.query_body(body.id, |checker| checker.check_default_body(m, decl));
+            self.query_body(body.id, m, |checker| checker.check_default_body(m, decl));
         }
     }
 
@@ -200,10 +207,7 @@ impl TypeChecker {
             || self.provider_template_files.contains(&span.file_id)
             || self.imported_collection_types.contains(name)
             || self.fully_qualified_collection_types.contains(name)
-            || self
-                .imported_collection_aliases
-                .values()
-                .any(|item| item == name)
+            || self.imported_collection_targets.contains(name)
         {
             return;
         }
@@ -229,7 +233,7 @@ impl TypeChecker {
         );
     }
 
-    pub(super) fn check_class(&mut self, c: &ClassDecl) {
+    pub(super) fn check_class_header(&mut self, c: &ClassDecl) -> Type {
         let receiver_ty = self.normalize_type(&c.receiver_type(), c.span);
         self.check_class_inheritance(c);
         // A class on, or extending into, an `extends` cycle has no usable base
@@ -247,8 +251,13 @@ impl TypeChecker {
             let ty = self.normalize_type(&field.ty, field.span);
             self.validate_type(&ty, field.span);
         }
+        receiver_ty
+    }
+
+    pub(super) fn check_class(&mut self, c: &ClassDecl) {
+        let receiver_ty = self.cached_class_validation(c);
         self.check_static_property_initializers(c);
-        let instantiated = self.instantiate_foreign_defaults(c);
+        let instantiated = self.cached_class_defaults(c);
         for m in &c.methods {
             if self.generics.abstract_check && m.constraint.is_some() {
                 self.check_constrained_method(m, c);
@@ -285,7 +294,7 @@ impl TypeChecker {
         c: &ClassDecl,
         receiver_ty: &Type,
     ) {
-        self.query_body(ctor.body.id, |checker| {
+        self.query_body(ctor.body.id, ctor, |checker| {
             checker.check_constructor_body(ctor, c, receiver_ty)
         });
     }
@@ -1005,16 +1014,21 @@ impl TypeChecker {
                 .as_ref()
                 .and_then(|queries| queries.initializer(init.id()));
             if let Some(id) = id {
-                self.query_body(id, |checker| {
+                self.query_body(id, field, |checker| {
                     checker.check_static_initializer(field, init, c)
                 });
             } else {
-                self.check_static_initializer(field, init, c);
+                self.cached_static_initializer(field, init, c);
             }
         }
     }
 
-    fn check_static_initializer(&mut self, field: &FieldDecl, init: &Expr, c: &ClassDecl) {
+    pub(super) fn check_static_initializer(
+        &mut self,
+        field: &FieldDecl,
+        init: &Expr,
+        c: &ClassDecl,
+    ) {
         let previous_class = self.local.current_class.replace(c.name.clone());
         let declared = self.normalize_type(&field.ty, field.span);
 
@@ -1648,7 +1662,7 @@ impl TypeChecker {
     }
 
     pub(super) fn check_method(&mut self, m: &MethodDecl, class: &ClassDecl, receiver_ty: &Type) {
-        self.query_body(m.body.id, |checker| {
+        self.query_body(m.body.id, m, |checker| {
             checker.check_method_body(m, class, receiver_ty)
         });
     }
@@ -1764,7 +1778,7 @@ impl TypeChecker {
     }
 
     pub(super) fn check_function(&mut self, f: &FunctionDecl) {
-        self.query_body(f.body.id, |checker| checker.check_function_body(f));
+        self.query_body(f.body.id, f, |checker| checker.check_function_body(f));
     }
 
     fn check_function_body(&mut self, f: &FunctionDecl) {

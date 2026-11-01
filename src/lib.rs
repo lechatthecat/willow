@@ -483,7 +483,10 @@ impl<'a> CompilerSession<'a> {
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
         discover: bool,
     ) -> Result<(Frontend, String, diagnostics::SourceMap)> {
-        let src_path = PathBuf::from(self.src);
+        // Match analysis/verification identity before deriving roots and query
+        // keys, so relative CLI checks populate the same persistent cache.
+        let src_path =
+            std::fs::canonicalize(self.src).with_context(|| format!("cannot read {}", self.src))?;
         let source = std::fs::read_to_string(&src_path)
             .with_context(|| format!("cannot read {}", src_path.display()))?;
 
@@ -493,7 +496,8 @@ impl<'a> CompilerSession<'a> {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let map = diagnostics::SourceMap::new(self.src, &source);
+        let map =
+            diagnostics::SourceMap::new(src_path.to_str().context("non UTF-8 path")?, &source);
 
         let mut inputs =
             compiler_db::inputs::CompilerInputs::native(self.opts.clone(), root.clone())
@@ -694,6 +698,12 @@ fn run_frontend_revision_cached(
             .artifacts
             .as_ref()
             .expect("revision artifacts");
+        artifacts.previous_modules = previous
+            .module_graph
+            .files
+            .iter()
+            .map(|m| (m.id, m.path.clone()))
+            .collect();
         artifacts.previous_parsed = Some((std::rc::Rc::clone(&old.store), old.parsed.clone()));
         artifacts.previous_expanded = Some((std::rc::Rc::clone(&old.store), old.expanded.clone()));
         artifacts
@@ -701,6 +711,11 @@ fn run_frontend_revision_cached(
             .begin_revision(std::rc::Rc::clone(&old.bodies));
     }
     if let Some(disk) = disk {
+        artifacts.previous_modules = disk
+            .modules
+            .iter()
+            .map(|(id, path, _)| (*id, path.clone()))
+            .collect();
         artifacts.previous_parsed = Some((std::rc::Rc::clone(&disk.store), disk.parsed.clone()));
         artifacts.previous_expanded =
             Some((std::rc::Rc::clone(&disk.store), disk.expanded.clone()));
@@ -855,6 +870,16 @@ fn run_frontend_revision_cached(
     let source_imports_checked = std::iter::once(&program)
         .chain(graph.files.iter().map(|m| &m.program))
         .any(|p| has_generics(p) || has_foreign_generic_default(p));
+    let prechecks = std::rc::Rc::new(semantic::type_checker::precheck::Cache::revision(
+        previous
+            .map(|old| old.db.prechecks.as_ref())
+            .or_else(|| disk.map(|old| &old.prechecks)),
+        &graph
+            .artifacts
+            .as_ref()
+            .expect("source artifacts")
+            .correspondence,
+    ));
     if source_imports_checked {
         let mut storage = graph.artifacts.take().expect("spooled imports");
         let registry = std::rc::Rc::new(std::cell::RefCell::new(
@@ -934,6 +959,7 @@ fn run_frontend_revision_cached(
                 }
                 let mut checker = semantic::TypeChecker::new();
                 checker.template_precheck = true;
+                checker.prechecks = Some(std::rc::Rc::clone(&prechecks));
                 checker.generics.registry = std::rc::Rc::clone(&registry);
                 checker.capture_generic_call_targets();
                 checker.set_field_writes(std::rc::Rc::clone(&field_writes));
@@ -984,6 +1010,7 @@ fn run_frontend_revision_cached(
                 &inputs.options,
                 None,
                 Some(TemplatePrecheck {
+                    prechecks: std::rc::Rc::clone(&prechecks),
                     dependencies: &dependencies,
                     registry: std::rc::Rc::clone(&registry),
                     field_writes: std::rc::Rc::clone(&field_writes),
@@ -1138,6 +1165,7 @@ fn run_frontend_revision_cached(
     );
     db.generic_sources = generic_sources;
     db.runtime_names = runtime_names;
+    db.prechecks = prechecks;
     db.source_imports_checked = source_imports_checked;
     db.field_writes = std::rc::Rc::new(
         artifacts.field_writes(
@@ -1208,6 +1236,17 @@ fn run_frontend_revision_cached(
     }
     if let Some(previous) = previous {
         db.effects.reuse_from(&previous.db.effects);
+        db.effects
+            .retain_units(&compiler_db::revision::compatible_units(
+                previous
+                    .module_graph
+                    .files
+                    .iter()
+                    .map(|m| (m.id, &m.path, m.symbol_module)),
+                &graph.files,
+            ));
+        db.typed_bodies
+            .reuse_checks(&previous.db.typed_bodies, &artifacts.correspondence);
         let candidates =
             compiler_db::revision::candidate_bodies(previous, &graph.files, &artifacts, &db);
         db.typed_bodies.reuse_body_candidates(
@@ -1217,38 +1256,44 @@ fn run_frontend_revision_cached(
         )?;
     }
     if let Some(disk) = disk {
-        let current: Vec<_> = graph
-            .files
-            .iter()
-            .map(|m| (m.id, m.path.clone(), m.symbol_module))
-            .collect();
-        if current == disk.modules {
-            let mut candidates = compiler_db::revision::candidate_body_ids(
-                &disk.parsed,
+        db.typed_bodies
+            .reuse_checks(&disk.bodies, &artifacts.correspondence);
+        let compatible = compiler_db::revision::compatible_units(
+            disk.modules
+                .iter()
+                .map(|(id, path, symbol)| (*id, path, *symbol)),
+            &graph.files,
+        );
+        db.effects.reuse_solutions(&disk.effects);
+        db.effects.retain_units(&compatible);
+        let mut candidates =
+            compiler_db::revision::candidate_body_ids(&disk.parsed, &graph.files, &artifacts, &db);
+        candidates.retain(|id| {
+            artifacts
+                .bodies
+                .owner(*id)
+                .is_some_and(|(unit, _)| compatible.contains(&unit))
+        });
+        if let Some(queries) = &syntax_queries {
+            let definitions = compiler_db::stable_path::inventory(
+                std::path::Path::new(&map.path),
                 &graph.files,
                 &artifacts,
-                &db,
-            );
-            if let Some(queries) = &syntax_queries {
-                let definitions = compiler_db::stable_path::inventory(
-                    std::path::Path::new(&map.path),
-                    &graph.files,
-                    &artifacts,
-                    &queries.borrow(),
-                )?;
-                candidates.retain(|id| {
-                    definitions
-                        .get(id)
-                        .is_some_and(|key| disk.definitions.get(key) == Some(id))
-                });
-            }
-            db.typed_bodies.reuse_body_candidates(
-                &disk.bodies,
-                &candidates,
-                &artifacts.correspondence,
+                &queries.borrow(),
             )?;
+            candidates.retain(|id| {
+                definitions
+                    .get(id)
+                    .is_some_and(|key| disk.definitions.get(key) == Some(id))
+            });
         }
+        db.typed_bodies.reuse_body_candidates(
+            &disk.bodies,
+            &candidates,
+            &artifacts.correspondence,
+        )?;
     }
+    db.effects.relocate_solutions(&artifacts.correspondence);
     if db.inputs().capture_analysis {
         *db.effects.analysis.borrow_mut() = Some(Default::default());
     }
@@ -1265,6 +1310,7 @@ fn run_frontend_revision_cached(
                 db.dependencies(),
                 &db.effects,
                 Some((&local_helpers, db.inputs().target)),
+                Some(&db.typed_bodies),
             );
             concurrency.extend(db.typed_bodies.check_async_borrows(
                 &body,
@@ -1286,6 +1332,7 @@ fn run_frontend_revision_cached(
             db.dependencies(),
             &db.effects,
             Some((&local_helpers, db.inputs().target)),
+            Some(&db.typed_bodies),
         );
         concurrency.extend(db.typed_bodies.check_async_borrows(
             &body,
@@ -1329,6 +1376,8 @@ fn run_frontend_revision_cached(
     if error_count > 0 && !db.inputs().verification {
         return Err(frontend_abort(&mut graph, error_count));
     }
+    db.typed_bodies.finish_checks();
+    db.prechecks.finish();
     Ok(Frontend {
         program,
         module_graph: graph,
@@ -1394,7 +1443,7 @@ fn expand_prechecked_unit(
     if let Some(sources) = generic_sources {
         let mut metadata = ai::generics::Source::capture(&source);
         metadata.class_templates = checker.generics.class_template_spans();
-        metadata.logical_types = checker.generics.logical_types.clone();
+        metadata.logical_types = checker.generics.logical_types.raw().clone();
         metadata.nominal_aliases = std::mem::take(&mut checker.generics.nominal_aliases);
         metadata.symbols = std::mem::take(&mut checker.generics.source_symbols);
         sources.insert(unit, metadata);
@@ -1430,6 +1479,7 @@ fn typecheck_phase(
 
 /// State the template pre-check shares across the units it checks.
 struct TemplatePrecheck<'a> {
+    prechecks: std::rc::Rc<semantic::type_checker::precheck::Cache>,
     /// The pre-check has no session yet, but still resolves package aliases
     /// through the build's dependency index.
     dependencies: &'a ModuleDependencies,
@@ -1450,6 +1500,7 @@ fn typecheck_phase_with_generics(
     checker.template_precheck = precheck.is_some();
     let template_dependencies = precheck.map(|precheck| {
         checker.set_field_writes(precheck.field_writes);
+        checker.prechecks = Some(precheck.prechecks);
         checker.generics.registry = precheck.registry;
         checker.capture_generic_call_targets();
         precheck.dependencies
@@ -1460,6 +1511,7 @@ fn typecheck_phase_with_generics(
         checker = checker.with_sync_stack_preemption(db.inputs().target.sync_stack_preemption);
         checker.set_effect_queries(std::rc::Rc::clone(&db.effects), module::UnitId::ENTRY);
         checker.set_body_queries(std::rc::Rc::clone(&db.typed_bodies));
+        checker.declaration_cache = Some(std::rc::Rc::clone(&db.prechecks));
         checker
             .set_declaration_queries(std::rc::Rc::clone(&db.declarations), module::UnitId::ENTRY);
     }
@@ -1548,6 +1600,7 @@ fn check_module(
     checker.set_field_writes(std::rc::Rc::clone(&db.field_writes));
     checker.set_effect_queries(std::rc::Rc::clone(&db.effects), module.id);
     checker.set_body_queries(std::rc::Rc::clone(&db.typed_bodies));
+    checker.declaration_cache = Some(std::rc::Rc::clone(&db.prechecks));
     checker.set_declaration_queries(std::rc::Rc::clone(&db.declarations), module.id);
     checker.set_enforce_send_sync(options.enforce_send_sync);
     register_prelude(&mut checker)?;
@@ -1831,6 +1884,7 @@ fn check_unit_concurrency(
         &compiler_db::HelperSummary,
         compiler_db::inputs::TargetCapabilities,
     )>,
+    body_queries: Option<&compiler_db::body::BodyQueries>,
 ) -> Vec<diagnostics::Diagnostic> {
     let by_path = dependencies.paths_for(program);
     let bindings = ModuleImportBindings::new(program, dependencies);
@@ -1890,7 +1944,11 @@ fn check_unit_concurrency(
         };
     }
     match local_helpers {
-        Some((helpers, _)) => analyzer.check_program_with_helpers(program, helpers).errors,
+        Some((helpers, _)) => {
+            analyzer
+                .check_program_cached(program, helpers, body_queries)
+                .errors
+        }
         None => analyzer.check_program(program).errors,
     }
 }
@@ -3855,6 +3913,7 @@ mod frontend_phase_tests {
             &[],
             &ModuleDependencies::new(&[]),
             &compiler_db::effects::EffectQueries::default(),
+            None,
             None,
         );
         assert!(diagnostic_error_count(&phase) > 0);

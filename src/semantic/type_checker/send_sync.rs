@@ -683,7 +683,7 @@ struct MarkerWalk {
     proven: HashSet<(Type, Marker)>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) enum Marker {
     Send,
     Sync,

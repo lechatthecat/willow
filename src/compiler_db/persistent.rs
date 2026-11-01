@@ -64,6 +64,7 @@ impl CacheKey {
 
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
+    prechecks: Vec<(String, crate::semantic::type_checker::precheck::Record)>,
     key: CacheKey,
     id_ends: [u64; 2],
     modules: Vec<ModuleIdentity>,
@@ -72,6 +73,7 @@ struct Snapshot {
     index: Rc<BodyIndex>,
     bodies: BodySnapshot,
     syntax: SyntaxSnapshot,
+    effects: super::effects::EffectSnapshot,
     definitions: Vec<(
         super::stable_path::StableDefPath,
         crate::parser::ast::BodyId,
@@ -79,11 +81,13 @@ struct Snapshot {
 }
 
 pub(crate) struct DiskRevision {
+    pub prechecks: crate::semantic::type_checker::precheck::Cache,
     pub store: Rc<ArtifactStore>,
     pub parsed: ParsedRecords,
     pub expanded: std::collections::HashMap<FileId, usize>,
     pub index: Rc<BodyIndex>,
     pub bodies: BodyQueries,
+    pub effects: super::effects::EffectQueries,
     pub modules: Vec<ModuleIdentity>,
     pub definitions:
         std::collections::HashMap<super::stable_path::StableDefPath, crate::parser::ast::BodyId>,
@@ -119,6 +123,14 @@ fn load(path: &Path, key: &CacheKey) -> Result<(DiskRevision, SyntaxQueries)> {
     );
     let snapshot: Snapshot = serde_json::from_slice(payload)?;
     anyhow::ensure!(snapshot.key == *key, "incompatible compiler cache");
+    let mut units = std::collections::HashSet::new();
+    for (unit, _, _) in &snapshot.modules {
+        // Leave headroom for newly discovered imports, as for syntax IDs below.
+        anyhow::ensure!(
+            unit.0 > 0 && unit.0 <= u32::MAX - (1 << 20) && units.insert(*unit),
+            "invalid cached module identity"
+        );
+    }
     // Reserving ranges also covers IDs belonging only to synthesized bodies.
     crate::parser::ast::reserve_cached_ids(snapshot.id_ends)?;
     let syntax = SyntaxQueries::from_disk(snapshot.syntax)?;
@@ -143,8 +155,12 @@ fn load(path: &Path, key: &CacheKey) -> Result<(DiskRevision, SyntaxQueries)> {
         Rc::clone(&store),
         Rc::clone(&snapshot.index),
     )?;
+    let effects = super::effects::EffectQueries::default();
+    effects.restore_solutions(snapshot.effects)?;
     Ok((
         DiskRevision {
+            prechecks: crate::semantic::type_checker::precheck::Cache::restore(snapshot.prechecks)?,
+            effects,
             store,
             parsed,
             expanded,
@@ -175,6 +191,7 @@ fn save(path: &Path, key: CacheKey, frontend: &Frontend, syntax: &SyntaxQueries)
             .map(|(id, key)| (key, id))
             .collect();
     let snapshot = Snapshot {
+        prechecks: frontend.db.prechecks.snapshot(),
         key,
         id_ends: crate::parser::ast::cached_id_ends(),
         modules: frontend
@@ -192,6 +209,7 @@ fn save(path: &Path, key: CacheKey, frontend: &Frontend, syntax: &SyntaxQueries)
         index: Rc::clone(&artifacts.bodies),
         bodies: frontend.db.typed_bodies.disk_snapshot()?,
         syntax: syntax.disk_snapshot()?,
+        effects: frontend.db.effects.disk_snapshot(),
         definitions,
     };
     let payload = serde_json::to_vec(&snapshot)?;
@@ -225,6 +243,7 @@ pub(crate) fn run(
         return crate::run_frontend_revision(source, root, map, inputs, emitter, None, None);
     };
     let path = cache_path(root, entry);
+    let restore_start = std::time::Instant::now();
     let loaded = load(&path, &key).ok();
     let hit = loaded.is_some();
     let (previous, syntax) = match loaded {
@@ -235,6 +254,8 @@ pub(crate) fn run(
     syntax
         .borrow_mut()
         .configure_sources(inputs.package_graph.as_deref());
+    let restore_us = restore_start.elapsed().as_micros();
+    let frontend_start = std::time::Instant::now();
     let frontend = crate::run_frontend_revision_cached(
         source,
         root,
@@ -246,9 +267,10 @@ pub(crate) fn run(
         previous.as_ref(),
     )?;
     syntax.borrow_mut().finish()?;
+    let frontend_us = frontend_start.elapsed().as_micros();
     let stats = syntax.borrow().stats();
     crate::query_stats::query_cache(|| {
-        serde_json::json!({"loaded": hit, "typechecks": frontend.db.typed_bodies.typechecks(), "reused_bodies": frontend.db.typed_bodies.reused(), "queries_recomputed": stats.recomputed, "queries_validated": stats.validated, "dependency_edges_visited": stats.dependency_edges_visited}).to_string()
+        serde_json::json!({"loaded": hit, "cache_restore_us": restore_us, "frontend_us": frontend_us, "effects_scanned": frontend.db.effects.work().0, "effects_recomputed": frontend.db.effects.work().1, "precheck_replay_us": frontend.db.prechecks.replay_us.get(), "precheck_semantic_us": frontend.db.prechecks.semantic_us.get(), "declaration_validations": frontend.db.prechecks.validations.get(), "precheck_declarations": frontend.db.prechecks.declarations.get(), "precheck_bodies": frontend.db.prechecks.bodies.get(), "precheck_signatures": frontend.db.prechecks.signatures.get(), "precheck_instances": frontend.db.prechecks.instances.get(), "precheck_templates": frontend.db.prechecks.templates.get(), "signature_checks": frontend.db.typed_bodies.signature_checks.get(), "concurrency_checks": frontend.db.typed_bodies.concurrency_checks.get(), "async_borrow_checks": frontend.db.typed_bodies.async_borrow_checks.get(), "typechecks": frontend.db.typed_bodies.typechecks(), "reused_bodies": frontend.db.typed_bodies.reused(), "queries_recomputed": stats.recomputed, "queries_validated": stats.validated, "dependency_edges_visited": stats.dependency_edges_visited}).to_string()
     });
     // Cache failures never change successful compilation into a failure.
     if !read_only && let Err(error) = save(&path, key, &frontend, &syntax.borrow()) {

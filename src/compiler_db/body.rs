@@ -12,6 +12,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use super::checks::{CheckInput, CheckKind, CheckRecord, CheckValue};
 type SignatureKey = (crate::module::UnitId, SymbolRead);
 struct ReuseCandidate {
     record: usize,
@@ -105,6 +106,7 @@ struct BodyTracking {
 /// existing name-based serializers.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct BodySnapshot {
+    checks: Vec<((BodyId, CheckKind), CheckRecord)>,
     records: Vec<TypedBody>,
     typed: Vec<(BodyId, usize)>,
     dependencies: Vec<(BodyId, Vec<SymbolRead>)>,
@@ -112,6 +114,12 @@ pub(crate) struct BodySnapshot {
 }
 
 pub(crate) struct BodyQueries {
+    expanded: std::cell::RefCell<HashMap<BodyId, Rc<serde_json::Value>>>,
+    checks: std::cell::RefCell<HashMap<(BodyId, CheckKind), Rc<CheckRecord>>>,
+    active_checks: std::cell::RefCell<HashSet<(BodyId, CheckKind)>>,
+    pub(crate) signature_checks: std::cell::Cell<usize>,
+    pub(crate) concurrency_checks: std::cell::Cell<usize>,
+    pub(crate) async_borrow_checks: std::cell::Cell<usize>,
     store: Rc<ArtifactStore>,
     index: Rc<BodyIndex>,
     typed: QueryTable<BodyId, usize>,
@@ -135,6 +143,65 @@ pub(crate) struct BodyQueries {
 }
 
 impl BodyQueries {
+    pub(crate) fn reuse_checks(
+        &self,
+        previous: &Self,
+        correspondence: &super::syntax::Correspondence,
+    ) {
+        self.checks
+            .borrow_mut()
+            .clone_from(&previous.checks.borrow());
+        self.correspondence.borrow_mut().spans = correspondence.spans.clone();
+    }
+    pub(crate) fn cached_check(
+        &self,
+        body: BodyId,
+        kind: CheckKind,
+        syntax: &serde_json::Value,
+        input: impl Fn(&CheckInput) -> serde_json::Value,
+    ) -> Result<Option<CheckValue>> {
+        let checks = self.checks.borrow();
+        let Some(record) = checks.get(&(body, kind)) else {
+            return Ok(None);
+        };
+        if record.syntax.as_ref() != syntax
+            || record
+                .inputs
+                .iter()
+                .any(|(key, value)| input(key) != *value)
+        {
+            return Ok(None);
+        }
+        let value = self.remap_cached(&record.value)?;
+        let updated = CheckRecord {
+            syntax: record.syntax.clone(),
+            inputs: record.inputs.clone(),
+            value: value.clone(),
+        };
+        drop(checks);
+        self.checks
+            .borrow_mut()
+            .insert((body, kind), Rc::new(updated));
+        self.active_checks.borrow_mut().insert((body, kind));
+        Ok(Some(value))
+    }
+    pub(crate) fn store_check(&self, body: BodyId, kind: CheckKind, record: CheckRecord) {
+        self.checks
+            .borrow_mut()
+            .insert((body, kind), Rc::new(record));
+        self.active_checks.borrow_mut().insert((body, kind));
+    }
+
+    pub(crate) fn finish_checks(&self) {
+        let active = self.active_checks.borrow();
+        self.checks
+            .borrow_mut()
+            .retain(|key, _| active.contains(key));
+    }
+    pub(crate) fn semantic_check_entries(&self) -> usize {
+        self.checks.borrow().len()
+    }
+
     pub(crate) fn disk_snapshot(&self) -> Result<BodySnapshot> {
         let mut records = Vec::new();
         let mut typed = Vec::new();
@@ -154,6 +221,12 @@ impl BodyQueries {
             typed.push((id, slot));
         }
         Ok(BodySnapshot {
+            checks: self
+                .active_checks
+                .borrow()
+                .iter()
+                .filter_map(|key| self.checks.borrow().get(key).map(|r| (*key, (**r).clone())))
+                .collect(),
             records,
             typed,
             dependencies: self
@@ -183,6 +256,45 @@ impl BodyQueries {
             anyhow::ensure!(seen.insert(body), "duplicate cached body identity");
         }
         let queries = Self::new(store, index);
+        for (key, record) in snapshot.checks {
+            let mut input_keys = HashSet::new();
+            anyhow::ensure!(
+                record.inputs.iter().all(|(input, _)| {
+                    input_keys.insert(input)
+                        && !matches!(input, CheckInput::SignatureSymbol(SymbolRead::Dispatch(..)))
+                }),
+                "invalid or duplicate cached check dependency"
+            );
+            anyhow::ensure!(
+                record.inputs.iter().all(|(input, _)| matches!(
+                    (key.1, input),
+                    (
+                        CheckKind::Signature,
+                        CheckInput::SignatureType(..) | CheckInput::SignatureSymbol(..)
+                    ) | (
+                        CheckKind::Concurrency,
+                        CheckInput::Helper(..) | CheckInput::Class(..) | CheckInput::Target
+                    )
+                )),
+                "invalid signature check inputs"
+            );
+            anyhow::ensure!(
+                matches!(
+                    (key.1, &record.value),
+                    (CheckKind::Signature, CheckValue::Signature(..))
+                        | (CheckKind::Concurrency, CheckValue::Concurrency(..))
+                ),
+                "invalid cached check kind"
+            );
+            anyhow::ensure!(
+                queries
+                    .checks
+                    .borrow_mut()
+                    .insert(key, Rc::new(record))
+                    .is_none(),
+                "duplicate cached check"
+            );
+        }
         let records = snapshot
             .records
             .iter()
@@ -402,7 +514,8 @@ impl BodyQueries {
         let Some((unit, _)) = self.index.owner(id) else {
             return Vec::new();
         };
-        self.dependencies(id)
+        let mut reads: Vec<_> = self
+            .dependencies(id)
             .unwrap_or_default()
             .iter()
             .map(|read| {
@@ -411,7 +524,31 @@ impl BodyQueries {
                     self.signature(unit, read, symbols),
                 )
             })
-            .collect()
+            .collect();
+        if let Some(value) = self.expanded.borrow().get(&id) {
+            reads.push((format!("expanded_body:{id:?}"), Rc::clone(value)));
+        }
+        reads
+    }
+
+    pub(crate) fn capture_expanded(&self, id: BodyId, syntax: &impl serde::Serialize) {
+        use sha2::{Digest, Sha256};
+        if self.tracking.borrow().is_none() {
+            return;
+        }
+        let value =
+            super::syntax::semantic(&serde_json::to_value(syntax).expect("expanded syntax"));
+        let digest = Sha256::digest(serde_json::to_vec(&value).expect("expanded syntax"));
+        let value = Rc::new(serde_json::json!(format!("{:x}", crate::hex::Hex(&digest))));
+        let mut expanded = self.expanded.borrow_mut();
+        expanded.insert(id, Rc::clone(&value));
+        let mut pending = vec![id];
+        while let Some(parent) = pending.pop() {
+            for (_, child) in self.index.child_lambdas(parent) {
+                expanded.insert(child, Rc::clone(&value));
+                pending.push(child);
+            }
+        }
     }
 
     /// Copy syntax-stable candidate records, but do not publish a typed memo
@@ -682,6 +819,12 @@ impl BodyQueries {
 
     pub(crate) fn new(store: Rc<ArtifactStore>, index: Rc<BodyIndex>) -> Self {
         Self {
+            expanded: Default::default(),
+            checks: Default::default(),
+            active_checks: Default::default(),
+            signature_checks: Default::default(),
+            concurrency_checks: Default::default(),
+            async_borrow_checks: Default::default(),
             store,
             index,
             typed: QueryTable::named("typed_body"),
@@ -726,7 +869,18 @@ impl BodyQueries {
             } else {
                 self.index.source_body(id)
             };
-            vec![QueryNode::TypedBody(typed), QueryNode::SyntaxImports(path)]
+            let mut deps = vec![QueryNode::TypedBody(typed)];
+            // Direct effects and borrow reports inspect checked body syntax,
+            // expression types and reference modes, not import lists. Resolution
+            // changes invalidate those facts through the typed body's reads;
+            // its syntax revision also covers nested bodies and syntax-only edits.
+            if !matches!(
+                node,
+                QueryNode::DirectEffects(_) | QueryNode::AsyncBorrowReport(_)
+            ) {
+                deps.push(QueryNode::SyntaxImports(path));
+            }
+            deps
         });
         let cached = syntax
             .borrow_mut()
@@ -829,7 +983,12 @@ impl BodyQueries {
                 id,
                 super::tracked::QueryNode::AsyncBorrowReport(id),
                 None,
-                || Ok(compute()),
+                || {
+                    // Count actual checker execution, not cache validation/restoration.
+                    self.async_borrow_checks
+                        .set(self.async_borrow_checks.get() + 1);
+                    Ok(compute())
+                },
             )?;
             let record = self.store.write(&report)?;
             fresh = Some(report);

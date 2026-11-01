@@ -68,7 +68,7 @@ impl TypeChecker {
 
     /// Report E2003 if `name` (a local declaration) collides with an imported
     /// name (a module access name or a directly imported item).
-    pub(super) fn check_local_decl_collision(&mut self, name: &str, span: Span) {
+    pub(super) fn check_local_decl_collision_uncached(&mut self, name: &str, span: Span) {
         if let Some(import_span) = self.imported_names.get(name).copied() {
             let mut diag = Diagnostic::new(
                 Severity::Error,
@@ -87,7 +87,7 @@ impl TypeChecker {
     /// namespace. Codegen reports the clash only once checking succeeds, and
     /// registration here is last-wins, so a use would be checked against the
     /// wrong declaration first. Keep the first one and report the second.
-    fn reject_constant_redeclaration(&mut self, f: &FunctionDecl) -> bool {
+    pub(super) fn reject_constant_redeclaration_uncached(&mut self, f: &FunctionDecl) -> bool {
         let Some(first) = self.symbols.lookup_func(&f.name) else {
             return false;
         };
@@ -175,6 +175,7 @@ impl TypeChecker {
             ));
         }
         self.register_instantiation_types(&program.instantiation_types);
+        self.prepare_precheck(program);
         // Generic declarations are templates and never enter the ordinary
         // signature-registration pass. Index all declarations first so a
         // template cannot silently replace another template or share a name
@@ -197,18 +198,11 @@ impl TypeChecker {
                 Item::Interface(i) => (&i.name, i.span, "interface", !i.type_params.is_empty()),
             };
             if let Some(&(first_span, first_kind, first_generic)) = declarations.get(name) {
-                if generic || first_generic {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0706,
-                            format!("{kind} `{name}` is already declared as a {first_kind}"),
-                        )
-                        .with_label(Label::primary(span, "second declaration"))
-                        .with_label(Label::secondary(first_span, "first declared here"))
-                        .with_help("rename one of them"),
-                    );
-                }
+                self.cached_duplicate_declaration(
+                    name,
+                    (span, kind, generic),
+                    (first_span, first_kind, first_generic),
+                );
             } else {
                 declarations.insert(name, (span, kind, generic));
             }
@@ -274,7 +268,7 @@ impl TypeChecker {
                     if !c.type_params.is_empty() {
                         continue;
                     }
-                    self.register_class(c);
+                    self.precheck_declaration(item);
                 }
                 Item::Enum(e) => {
                     self.check_local_decl_collision(&e.name, e.span);
@@ -289,7 +283,7 @@ impl TypeChecker {
                         );
                         continue;
                     }
-                    self.register_enum(e);
+                    self.precheck_declaration(item);
                 }
                 Item::Interface(i) => {
                     self.check_local_decl_collision(&i.name, i.span);
@@ -304,12 +298,13 @@ impl TypeChecker {
                         );
                         continue;
                     }
-                    self.register_interface(i, None);
+                    self.precheck_declaration(item);
                 }
                 _ => {}
             }
         }
 
+        self.signature_values.borrow_mut().clear();
         // Pass 2: register all top-level function signatures
         for item in &program.items {
             if let Item::Function(f) = item {
@@ -325,32 +320,14 @@ impl TypeChecker {
                     );
                     continue;
                 }
-                if self.reject_constant_redeclaration(f) {
+                if self.cached_constant_collision(f) {
                     continue;
                 }
                 if !f.type_params.is_empty() {
                     continue;
                 }
-                let params = self.normalize_param_types(&f.params);
-                let param_infos = self.normalize_param_infos(&f.params);
-                let return_type = self.normalize_type(
-                    &f.return_type,
-                    f.return_type_span.as_deref().copied().unwrap_or(f.span),
-                );
-                self.symbols.define_func(
-                    f.name.clone(),
-                    FuncInfo {
-                        foreign: f.rust_bridge.is_some(),
-                        param_infos,
-                        params,
-                        return_type,
-                        public: f.public,
-                        is_async: f.is_async,
-                        declaration_span: f.span,
-                        module_path: None,
-                        constant: f.constant.clone(),
-                    },
-                );
+                let info = self.normalized_signature(f);
+                self.symbols.define_func(f.name.clone(), info);
             }
         }
 

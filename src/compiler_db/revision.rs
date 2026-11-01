@@ -37,7 +37,27 @@ impl AnalysisRevision {
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
         artifact_limit: u64,
     ) -> Result<ai::Snapshot> {
+        self.analyze_policy(session, emitter, artifact_limit, false)
+    }
+
+    /// Read-only verification policy with retained compiler state.
+    pub fn analyze_verification(
+        &mut self,
+        session: CompilerSession<'_>,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    ) -> Result<ai::Snapshot> {
+        self.analyze_policy(session, emitter, 128 * 1024 * 1024, true)
+    }
+
+    fn analyze_policy(
+        &mut self,
+        session: CompilerSession<'_>,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+        artifact_limit: u64,
+        verification: bool,
+    ) -> Result<ai::Snapshot> {
         use anyhow::Context;
+        let prepare_start = std::time::Instant::now();
         let _symbols = self.symbols.enter();
         let verify = std::env::var_os("WILLOW_INCREMENTAL_VERIFY").is_some_and(|v| v == "1");
         let cold_session = verify.then(|| {
@@ -59,9 +79,22 @@ impl AnalysisRevision {
             captured::FileInput::capture(std::path::Path::new(session.src))?;
         let root = path.parent().context("source has no parent")?;
         let map = diagnostics::SourceMap::new(path.to_str().context("non UTF-8 path")?, &source);
-        let mut inputs = inputs::CompilerInputs::native(session.opts, root.to_path_buf())
-            .resolve_project(session.project_root.as_deref())?;
+        let inputs = inputs::CompilerInputs::native(session.opts, root.to_path_buf());
+        let mut inputs = if verification {
+            inputs.resolve_project_analysis(session.project_root.as_deref(), false)?
+        } else {
+            inputs.resolve_project(session.project_root.as_deref())?
+        };
         inputs.capture_analysis = true;
+        inputs.verification = verification;
+        if verification && let Some(project) = &session.project_root {
+            let (project, source_root) = crate::discovery_roots(&inputs, project, root);
+            inputs.check_modules = if let Some(modules) = captured::overlay_modules() {
+                modules
+            } else {
+                crate::package::discover_sources(&project, &source_root)?
+            };
+        }
         let mut accepted =
             captured::configuration(&inputs, &path, session.project_root.as_deref())?;
         let previous = self
@@ -78,6 +111,8 @@ impl AnalysisRevision {
         syntax
             .borrow_mut()
             .configure_sources(inputs.package_graph.as_deref());
+        let prepare_us = prepare_start.elapsed().as_micros();
+        let frontend_start = std::time::Instant::now();
         let frontend = crate::run_frontend_revision(
             &source,
             root,
@@ -87,6 +122,7 @@ impl AnalysisRevision {
             previous,
             Some(std::rc::Rc::clone(&syntax)),
         )?;
+        let frontend_us = frontend_start.elapsed().as_micros();
         let retained = frontend
             .module_graph
             .artifacts
@@ -98,15 +134,18 @@ impl AnalysisRevision {
             retained <= artifact_limit,
             "revision artifacts exceed {artifact_limit} bytes"
         );
+        let snapshot_start = std::time::Instant::now();
         let snapshot = ai::snapshot(&frontend, &path, &source, session.project_root.as_deref())?;
         ai::check_size(&snapshot)?;
+        let snapshot_us = snapshot_start.elapsed().as_micros();
         if let Some(cold_session) = cold_session {
             let mut cold_diagnostics = Vec::new();
-            let cold = cold_session
-                .analysis_with_emitter(&mut VerificationEmitter {
-                    downstream: None,
-                    observed: Some(&mut cold_diagnostics),
-                })
+            let mut cold_emitter = VerificationEmitter {
+                downstream: None,
+                observed: Some(&mut cold_diagnostics),
+            };
+            let cold = (if verification { cold_session.analysis_for_verification(&mut cold_emitter) }
+                else { cold_session.analysis_with_emitter(&mut cold_emitter) })
                 .with_context(|| format!(
                     "E0800: incremental verification mismatch: warm analysis succeeded but cold analysis failed; query graph={}",
                     syntax.borrow().verification_dump()
@@ -144,6 +183,15 @@ impl AnalysisRevision {
         );
         let stats = syntax.borrow().stats();
         let incremental_stats = serde_json::json!({
+            "state_prepare_us": prepare_us,
+            "typechecks": frontend.db.typed_bodies.typechecks(),
+            "effects_scanned": frontend.db.effects.work().0,
+            "effects_recomputed": frontend.db.effects.work().1,
+            "frontend_us": frontend_us,
+            "snapshot_us": snapshot_us,
+            "semantic_check_entries": frontend.db.typed_bodies.semantic_check_entries(),
+            "precheck_replay_us": frontend.db.prechecks.replay_us.get(), "precheck_semantic_us": frontend.db.prechecks.semantic_us.get(), "declaration_validations": frontend.db.prechecks.validations.get(), "precheck_declarations": frontend.db.prechecks.declarations.get(), "precheck_bodies": frontend.db.prechecks.bodies.get(), "precheck_signatures": frontend.db.prechecks.signatures.get(), "precheck_instances": frontend.db.prechecks.instances.get(), "precheck_templates": frontend.db.prechecks.templates.get(), "signature_checks": frontend.db.typed_bodies.signature_checks.get(),
+            "concurrency_checks": frontend.db.typed_bodies.concurrency_checks.get(), "async_borrow_checks": frontend.db.typed_bodies.async_borrow_checks.get(),
             "inputs_changed": stats.inputs_changed,
             "queries_validated": stats.validated,
             "queries_recomputed": stats.recomputed,
@@ -199,15 +247,6 @@ pub(crate) fn candidate_bodies(
     artifacts: &UnitArtifacts,
     db: &CompilerDb,
 ) -> HashSet<crate::parser::ast::BodyId> {
-    let old = &previous.module_graph.files;
-    if old.len() != modules.len()
-        || old
-            .iter()
-            .zip(modules)
-            .any(|(a, b)| a.id != b.id || a.path != b.path || a.symbol_module != b.symbol_module)
-    {
-        return HashSet::new();
-    }
     // Source identity discovers possible artifacts; only tracked query
     // validation decides whether a discovered body is reusable. No reverse
     // dependency walk is needed for an input mutation.
@@ -216,7 +255,43 @@ pub(crate) fn candidate_bodies(
         .artifacts
         .as_ref()
         .expect("revision artifacts");
-    candidate_body_ids(&old_artifacts.parsed, modules, artifacts, db)
+    let compatible = compatible_units(
+        previous
+            .module_graph
+            .files
+            .iter()
+            .map(|m| (m.id, &m.path, m.symbol_module)),
+        modules,
+    );
+    let mut candidates = candidate_body_ids(&old_artifacts.parsed, modules, artifacts, db);
+    candidates.retain(|id| {
+        artifacts
+            .bodies
+            .owner(*id)
+            .is_some_and(|(unit, _)| compatible.contains(&unit))
+    });
+    candidates
+}
+
+/// Numeric unit IDs alone are not identity: resolver traversal can change.
+/// Entry identity is bound by the enclosing revision/cache configuration.
+pub(crate) fn compatible_units<'a>(
+    old: impl Iterator<
+        Item = (
+            UnitId,
+            &'a std::path::PathBuf,
+            Option<crate::semantic::ids::SymbolModule>,
+        ),
+    >,
+    modules: &[module::ResolvedModule],
+) -> HashSet<UnitId> {
+    let old: HashMap<_, _> = old.map(|(id, path, symbol)| (id, (path, symbol))).collect();
+    modules
+        .iter()
+        .filter(|m| old.get(&m.id) == Some(&(&m.path, m.symbol_module)))
+        .map(|m| m.id)
+        .chain(std::iter::once(UnitId::ENTRY))
+        .collect()
 }
 
 pub(crate) fn candidate_body_ids(
@@ -1577,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn revision_rejects_failed_inputs_and_restarts_on_configuration_and_topology() {
+    fn revision_rejects_failed_inputs_restarts_configuration_and_retains_topology() {
         let f = Fixture::new();
         f.write("main.wi", "fn main() {}");
         let mut warm = AnalysisRevision::default();
@@ -1608,7 +1683,7 @@ mod tests {
         assert_eq!((warm.typechecks, warm.reused_bodies), (2, 0));
         f.write("main.wi", "fn main() {}");
         assert!(f.compare(&mut warm));
-        assert_eq!((warm.typechecks, warm.reused_bodies), (1, 0));
+        assert_eq!((warm.typechecks, warm.reused_bodies), (0, 1));
     }
     #[test]
     fn revision_configuration_manifest_and_entry_boundaries_match_cold() {
@@ -1760,6 +1835,10 @@ mod tests {
                 .unwrap()
                 - base_bytes;
             peak_query_bytes = peak_query_bytes.max(query_bytes);
+            assert_eq!(
+                warm.incremental_stats["semantic_check_entries"], 4,
+                "edit {step}"
+            );
             assert!(nodes < 100, "edit {step}: {nodes} nodes");
             assert!(edges < 300, "edit {step}: {edges} edges");
             assert!(warm.retained_artifact_bytes < 100_000);

@@ -32,6 +32,32 @@ fn span(value: &Value) -> Option<Span> {
     })
 }
 
+/// Presentation coordinates in structural order, including signature-only items.
+pub(crate) fn spans(value: &Value) -> Vec<Span> {
+    fn visit(value: &Value, out: &mut Vec<Span>) {
+        if let Some(value) = span(value) {
+            out.push(value);
+            return;
+        }
+        match value {
+            Value::Object(values) => {
+                for value in values.values() {
+                    visit(value, out);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    visit(value, &mut out);
+    out
+}
+
 /// The flat AST wire has named IDs and tuple-expression IDs immediately after
 /// a Span. Child indices and numeric literals are semantic and stay intact.
 fn tuple_id(values: &[Value], index: usize) -> bool {
@@ -254,21 +280,29 @@ impl Correspondence {
         &self,
         value: &T,
     ) -> Result<T> {
-        fn walk(value: &mut Value, spans: &HashMap<Span, Span>) {
+        self.remap_with_spans(value, &HashMap::new())
+    }
+
+    pub(crate) fn remap_with_spans<T: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        value: &T,
+        local: &HashMap<Span, Span>,
+    ) -> Result<T> {
+        fn walk(value: &mut Value, spans: &HashMap<Span, Span>, local: &HashMap<Span, Span>) {
             if let Some(old) = span(value) {
-                if let Some(new) = spans.get(&old) {
+                if let Some(new) = local.get(&old).or_else(|| spans.get(&old)) {
                     *value = serde_json::to_value(new).expect("span");
                 }
                 return;
             }
             match value {
-                Value::Object(object) => object.values_mut().for_each(|v| walk(v, spans)),
-                Value::Array(array) => array.iter_mut().for_each(|v| walk(v, spans)),
+                Value::Object(object) => object.values_mut().for_each(|v| walk(v, spans, local)),
+                Value::Array(array) => array.iter_mut().for_each(|v| walk(v, spans, local)),
                 _ => {}
             }
         }
         let mut value = serde_json::to_value(value)?;
-        walk(&mut value, &self.spans);
+        walk(&mut value, &self.spans, local);
         Ok(serde_json::from_value(value)?)
     }
 }

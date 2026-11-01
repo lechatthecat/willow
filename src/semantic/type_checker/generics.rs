@@ -1,5 +1,6 @@
 //! Concrete instantiations discovered by semantic checking, before persistent
 //! body queries are registered. The final pipeline checks the expanded program.
+use super::precheck_journal::{Map, Set};
 use super::*;
 use crate::parser::ownership::NodeMut;
 use crate::semantic::symbols::{EnumInfo, FuncInfo, InstantiationType, InterfaceInfo};
@@ -9,29 +10,29 @@ use std::rc::Rc;
 
 type InstantiationKey = (u8, String, Vec<Type>);
 type ImportedTypes = Vec<(String, Rc<InstantiationType>)>;
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct InstantiatedClass {
     info: ClassInfo,
     types: ImportedTypes,
 }
 
 /// One owned template per source declaration across every checker in a build.
-#[derive(Default)]
 pub(crate) struct TemplateRegistry {
     pub capture_source_references: bool,
-    pub module_paths: Rc<HashMap<crate::diagnostics::FileId, String>>,
-    requested: HashSet<InstantiationKey>,
-    nominal_types: HashMap<String, Rc<InstantiationType>>,
-    instantiated_classes: HashMap<InstantiationKey, Rc<InstantiatedClass>>,
-    functions: HashMap<(crate::diagnostics::FileId, String), Rc<FunctionDecl>>,
+    pub module_paths: Rc<Map<crate::diagnostics::FileId, String>>,
+    requested: Map<InstantiationKey, ()>,
+    nominal_types: Map<String, Rc<InstantiationType>>,
+    instantiated_classes: Map<InstantiationKey, Rc<InstantiatedClass>>,
+    functions: Map<(crate::diagnostics::FileId, String), Rc<FunctionDecl>>,
     // Read-only declaration identities are shared with abstract checking; its
     // speculative instances still use a separate registry.
-    classes: Rc<HashMap<(crate::diagnostics::FileId, String), Rc<ClassDecl>>>,
+    classes: Rc<Map<(crate::diagnostics::FileId, String), Rc<ClassDecl>>>,
     /// Generic interfaces with default bodies, by declaring file and name: a
     /// class in another unit receives their defaults (willow-s71l).
-    interfaces: HashMap<(crate::diagnostics::FileId, String), Rc<InterfaceDecl>>,
+    interfaces: Map<(crate::diagnostics::FileId, String), Rc<InterfaceDecl>>,
     /// Each concrete instantiation of such an interface, checked once in its
     /// declaring unit and shared by every receiving class.
-    interface_instances: HashMap<InstantiationKey, Rc<InterfaceDecl>>,
+    interface_instances: Map<InstantiationKey, Rc<InterfaceDecl>>,
     #[cfg(test)]
     interface_specializations: usize,
     #[cfg(test)]
@@ -50,24 +51,61 @@ pub(crate) struct TemplateRegistry {
     pub origins: GeneratedOrigins,
     /// Instance segment -> source spelling with concrete type arguments.
     /// Shared across units; keys keep linker identity out of runtime reports.
-    pub runtime_names: HashMap<String, String>,
+    pub runtime_names: Map<String, String>,
+}
+impl Default for TemplateRegistry {
+    fn default() -> Self {
+        Self {
+            capture_source_references: Default::default(),
+            module_paths: Rc::new(Map::new("registry.module_paths")),
+            requested: Map::new("registry.requested"),
+            nominal_types: Map::new("registry.nominal_types"),
+            instantiated_classes: Map::new("registry.instantiated_classes"),
+            functions: Map::new("registry.functions"),
+            classes: Rc::new(Map::new("registry.classes")),
+            interfaces: Map::new("registry.interfaces"),
+            interface_instances: Map::new("registry.interface_instances"),
+            #[cfg(test)]
+            interface_specializations: Default::default(),
+            #[cfg(test)]
+            function_specializations: Default::default(),
+            #[cfg(test)]
+            class_specializations: Default::default(),
+            #[cfg(test)]
+            class_requests: Default::default(),
+            #[cfg(test)]
+            function_copies: Default::default(),
+            #[cfg(test)]
+            class_copies: Default::default(),
+            origins: Default::default(),
+            runtime_names: Map::new("registry.runtime_names"),
+        }
+    }
 }
 
-#[derive(Default)]
 pub(crate) struct GeneratedOrigins {
-    pub bodies: HashMap<BodyId, BodyId>,
-    pub initializers: HashMap<ExprId, ExprId>,
+    pub bodies: Map<BodyId, BodyId>,
+    pub initializers: Map<ExprId, ExprId>,
+}
+impl Default for GeneratedOrigins {
+    fn default() -> Self {
+        Self {
+            bodies: Map::new("origins.bodies"),
+            initializers: Map::new("origins.initializers"),
+        }
+    }
 }
 
 impl TemplateRegistry {
     fn reserve(&mut self, key: &InstantiationKey) -> Result<bool, ()> {
-        if self.requested.contains(key) {
+        if self.requested.contains_key(key) {
             return Ok(false);
         }
-        if self.requested.len() >= 4096 {
+        if self.requested.raw().len() >= 4096 {
+            let _ = self.requested.len();
             return Err(());
         }
-        self.requested.insert(key.clone());
+        self.requested.insert(key.clone(), ());
         Ok(true)
     }
 
@@ -109,7 +147,6 @@ impl TemplateRegistry {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct Generics {
     pub registry: Rc<RefCell<TemplateRegistry>>,
     pub abstract_check: bool,
@@ -117,28 +154,53 @@ pub(crate) struct Generics {
     pub parameter_names: HashSet<String>,
     /// Source calls rejected on an opaque declaration parameter. Concrete
     /// checking reuses the rejection instead of exposing specialization types.
-    pub rejected_parameter_methods: HashSet<Span>,
+    pub rejected_parameter_methods: Set<Span>,
     pub source_symbols: crate::semantic::analysis_symbols::Facts,
-    pub functions: HashMap<String, std::rc::Rc<FunctionDecl>>,
-    pub classes: HashMap<String, std::rc::Rc<ClassDecl>>,
-    pub instances: HashMap<InstantiationKey, String>,
+    pub functions: Map<String, std::rc::Rc<FunctionDecl>>,
+    pub classes: Map<String, std::rc::Rc<ClassDecl>>,
+    pub instances: Map<InstantiationKey, String>,
     pub pending: std::collections::VecDeque<Instantiation>,
-    pub imported_types: HashMap<String, Rc<InstantiationType>>,
+    pub imported_types: Map<String, Rc<InstantiationType>>,
     pub emitted: Vec<Item>,
-    pub logical_types: HashMap<String, Type>,
+    pub logical_types: Map<String, Type>,
     /// Instantiation nominal aliases (`$type$mono$...`) to the module-qualified
     /// identity they hash, so analysis can spell an instance's types.
-    pub nominal_aliases: HashMap<String, String>,
+    pub nominal_aliases: Map<String, String>,
     pub active_class_depth: usize,
-    pub calls: HashMap<ExprId, String>,
-    pub function_paths: HashMap<String, String>,
-    pub class_paths: HashMap<String, String>,
-    pub objects: HashMap<ExprId, String>,
+    pub calls: Map<ExprId, String>,
+    pub function_paths: Map<String, String>,
+    pub class_paths: Map<String, String>,
+    pub objects: Map<ExprId, String>,
     /// Interface defaults this checker's classes received from a generic
     /// interface another unit declares, by (class, method): each is replaced
     /// by the default at that method index of the instance checked in that
     /// unit (willow-s71l).
-    pub default_copies: HashMap<String, HashMap<String, (Rc<InterfaceDecl>, usize)>>,
+    pub default_copies: Map<String, HashMap<String, (Rc<InterfaceDecl>, usize)>>,
+}
+impl Default for Generics {
+    fn default() -> Self {
+        Self {
+            registry: Default::default(),
+            abstract_check: Default::default(),
+            parameter_names: Default::default(),
+            rejected_parameter_methods: Set::new("generic.rejected_parameter_methods"),
+            source_symbols: Default::default(),
+            functions: Map::new("generic.functions"),
+            classes: Map::new("generic.classes"),
+            instances: Map::new("generic.instances"),
+            pending: Default::default(),
+            imported_types: Map::new("generic.imported_types"),
+            emitted: Default::default(),
+            logical_types: Map::new("generic.logical_types"),
+            nominal_aliases: Map::new("generic.nominal_aliases"),
+            active_class_depth: Default::default(),
+            calls: Map::new("generic.calls"),
+            function_paths: Map::new("generic.function_paths"),
+            class_paths: Map::new("generic.class_paths"),
+            objects: Map::new("generic.objects"),
+            default_copies: Map::new("generic.default_copies"),
+        }
+    }
 }
 
 impl Generics {
@@ -305,7 +367,7 @@ mod template_registry_tests {
         assert_eq!(source.class_copies, 1);
         abstract_registry
             .requested
-            .insert((1, "speculative".into(), vec![Type::I64]));
+            .insert((1, "speculative".into(), vec![Type::I64]), ());
         assert!(source.requested.is_empty());
         abstract_registry.intern_class(other);
         assert_eq!(source.classes.len(), 1);
@@ -817,6 +879,7 @@ mod template_registry_tests {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Instantiation {
     pub item: Item,
     pub classes: ImportedTypes,
@@ -856,7 +919,7 @@ impl FreshIds {
 }
 
 /// Abstract class use needs field/method signatures, never executable bodies.
-fn class_signature(class: &ClassDecl) -> ClassDecl {
+pub(super) fn class_signature(class: &ClassDecl) -> ClassDecl {
     let empty = |body: &Block| Block {
         id: body.id,
         stmts: Vec::new(),
@@ -1079,18 +1142,21 @@ impl TypeChecker {
                     let alias = symbol("$type", &[Type::Named(canonical.clone())]);
                     // The alias hashes `canonical`, so every unit records the
                     // same module-qualified value for it.
-                    self.generics
-                        .nominal_aliases
-                        .entry(alias.clone())
-                        .or_insert(canonical);
-                    classes.entry(alias.clone()).or_insert_with(|| {
+                    if !self.generics.nominal_aliases.contains_key(&alias) {
                         self.generics
-                            .registry
-                            .borrow_mut()
+                            .nominal_aliases
+                            .insert(alias.clone(), canonical);
+                    }
+                    classes.entry(alias.clone()).or_insert_with(|| {
+                        let mut registry = self.generics.registry.borrow_mut();
+                        if let Some(existing) = registry.nominal_types.get(&alias) {
+                            return Rc::clone(existing);
+                        }
+                        let value = Rc::new(info.into_owned());
+                        registry
                             .nominal_types
-                            .entry(alias.clone())
-                            .or_insert_with(|| Rc::new(info.into_owned()))
-                            .clone()
+                            .insert(alias.clone(), Rc::clone(&value));
+                        value
                     });
                     alias
                 });
@@ -2586,53 +2652,75 @@ impl TypeChecker {
         checker.generics.registry.borrow_mut().classes =
             Rc::clone(&self.generics.registry.borrow().classes);
         checker.generics.abstract_check = true;
+        checker.prechecks = self.prechecks.clone();
+        checker.precheck_context = self.precheck_context.clone();
         let functions: Vec<_> = self.generics.functions.values().cloned().collect();
         let classes: Vec<_> = self.generics.classes.values().cloned().collect();
         for f in functions {
             if f.span.file_id != file {
                 continue;
             }
-            for name in &f.type_params {
-                if name == &f.name
-                    || checker.symbols.lookup_class(name).is_some()
-                    || checker.symbols.lookup_enum(name).is_some()
-                    || checker.symbols.lookup_interface(name).is_some()
-                    || checker.generics.classes.contains_key(name)
-                {
-                    checker.generic_error(
+            checker.generics.parameter_names = f.type_params.iter().cloned().collect();
+            checker.local.declared_type_params = f.type_params.clone();
+            checker.precheck_operation(
+                format!("abstract_function:{}:{}", file.0, f.name),
+                f.body.id,
+                serde_json::to_value(&f).unwrap(),
+                |state| {
+                    if let Some(cache) = &state.prechecks {
+                        cache.templates.set(cache.templates.get() + 1);
+                    }
+                    for name in &f.type_params {
+                        if name == &f.name
+                            || state.symbols.lookup_class(name).is_some()
+                            || state.symbols.lookup_enum(name).is_some()
+                            || state.symbols.lookup_interface(name).is_some()
+                            || state.generics.classes.contains_key(name)
+                        {
+                            state.generic_error(
                         f.span,
                         format!("type parameter `{name}` shadows an existing type or declaration"),
                     );
-                }
-            }
-            checker.generics.parameter_names = f.type_params.iter().cloned().collect();
-            checker.local.declared_type_params = f.type_params.clone();
-            checker.check_function(&f);
-            checker.generics.pending.clear();
+                        }
+                    }
+                    state.check_function(&f);
+                    state.generics.pending.clear();
+                },
+            );
         }
         let mut checked_classes = HashSet::new();
         for c in classes {
             if c.span.file_id != file || !checked_classes.insert(c.span) {
                 continue;
             }
-            for name in &c.type_params {
-                if name == &c.name
-                    || checker.symbols.lookup_class(name).is_some()
-                    || checker.symbols.lookup_enum(name).is_some()
-                    || checker.symbols.lookup_interface(name).is_some()
-                    || checker.generics.classes.contains_key(name)
-                {
-                    checker.generic_error(
+            checker.generics.parameter_names = c.type_params.iter().cloned().collect();
+            checker.local.declared_type_params = c.type_params.clone();
+            checker.precheck_operation(
+                format!("abstract_class:{}:{}", file.0, c.name),
+                BodyId::fresh(),
+                serde_json::to_value(&c).unwrap(),
+                |state| {
+                    if let Some(cache) = &state.prechecks {
+                        cache.templates.set(cache.templates.get() + 1);
+                    }
+                    for name in &c.type_params {
+                        if name == &c.name
+                            || state.symbols.lookup_class(name).is_some()
+                            || state.symbols.lookup_enum(name).is_some()
+                            || state.symbols.lookup_interface(name).is_some()
+                            || state.generics.classes.contains_key(name)
+                        {
+                            state.generic_error(
                         c.span,
                         format!("type parameter `{name}` shadows an existing type or declaration"),
                     );
-                }
-            }
-            checker.generics.parameter_names = c.type_params.iter().cloned().collect();
-            checker.local.declared_type_params = c.type_params.clone();
-            checker.register_class(&c);
-            checker.check_class(&c);
-            checker.generics.pending.clear();
+                        }
+                    }
+                    state.register_class(&c);
+                    state.check_class(&c);
+                    state.generics.pending.clear();
+                },
+            );
         }
         self.analysis_symbols
             .used_imports
@@ -2649,6 +2737,32 @@ impl TypeChecker {
     }
 
     pub(crate) fn check_generic_instance(&mut self, instance: Instantiation) {
+        if let Some(cache) = self.prechecks.clone()
+            && !super::precheck_journal::is_active()
+        {
+            let (name, file, id) = match &instance.item {
+                Item::Function(f) => (f.name.clone(), f.span.file_id, f.body.id),
+                Item::Class(c) => (
+                    c.name.clone(),
+                    c.span.file_id,
+                    c.methods.first().map_or_else(BodyId::fresh, |m| m.body.id),
+                ),
+                Item::Interface(i) => (i.name.clone(), i.span.file_id, BodyId::fresh()),
+                Item::Enum(_) => unreachable!(),
+            };
+            let syntax = serde_json::to_value(&instance).unwrap();
+            self.precheck_operation(
+                format!("instance:{}:{name}", file.0),
+                id,
+                syntax,
+                |checker| {
+                    cache.instances.set(cache.instances.get() + 1);
+                    checker.check_generic_instance(instance);
+                },
+            );
+            return;
+        }
+
         self.register_shared_instantiation_types(&instance.classes);
         let item = instance.item;
         match &item {
@@ -3119,5 +3233,275 @@ mod semantic_fact_identity_tests {
             patterns.extend(new_patterns);
             bodies.extend(new_bodies);
         }
+    }
+}
+
+impl Generics {
+    pub(super) fn journal_value(
+        &self,
+        key: &super::precheck_journal::Key,
+        raw: bool,
+    ) -> serde_json::Value {
+        let registry = self.registry.borrow();
+        match key.field.as_str() {
+            "generic.rejected_parameter_methods" => {
+                if raw {
+                    self.rejected_parameter_methods.output_value(key)
+                } else {
+                    self.rejected_parameter_methods.read_value(key)
+                }
+            }
+            "registry.module_paths" => {
+                if raw {
+                    registry.module_paths.output_value(key)
+                } else {
+                    registry.module_paths.read_value(key)
+                }
+            }
+            "registry.requested" => {
+                if raw {
+                    registry.requested.output_value(key)
+                } else {
+                    registry.requested.read_value(key)
+                }
+            }
+            "registry.nominal_types" => {
+                if raw {
+                    registry.nominal_types.output_value(key)
+                } else {
+                    registry.nominal_types.read_value(key)
+                }
+            }
+            "registry.instantiated_classes" => {
+                if raw {
+                    registry.instantiated_classes.output_value(key)
+                } else {
+                    registry.instantiated_classes.read_value(key)
+                }
+            }
+            "registry.functions" => {
+                if raw {
+                    registry.functions.output_value(key)
+                } else {
+                    registry.functions.read_value(key)
+                }
+            }
+            "registry.classes" => {
+                if raw {
+                    registry.classes.output_value(key)
+                } else {
+                    registry.classes.read_value(key)
+                }
+            }
+            "registry.interfaces" => {
+                if raw {
+                    registry.interfaces.output_value(key)
+                } else {
+                    registry.interfaces.read_value(key)
+                }
+            }
+            "registry.interface_instances" => {
+                if raw {
+                    registry.interface_instances.output_value(key)
+                } else {
+                    registry.interface_instances.read_value(key)
+                }
+            }
+            "registry.runtime_names" => {
+                if raw {
+                    registry.runtime_names.output_value(key)
+                } else {
+                    registry.runtime_names.read_value(key)
+                }
+            }
+            "origins.bodies" => {
+                if raw {
+                    registry.origins.bodies.output_value(key)
+                } else {
+                    registry.origins.bodies.read_value(key)
+                }
+            }
+            "origins.initializers" => {
+                if raw {
+                    registry.origins.initializers.output_value(key)
+                } else {
+                    registry.origins.initializers.read_value(key)
+                }
+            }
+            "generic.functions" => {
+                if raw {
+                    self.functions.output_value(key)
+                } else {
+                    self.functions.read_value(key)
+                }
+            }
+            "generic.classes" => {
+                if raw {
+                    self.classes.output_value(key)
+                } else {
+                    self.classes.read_value(key)
+                }
+            }
+            "generic.instances" => {
+                if raw {
+                    self.instances.output_value(key)
+                } else {
+                    self.instances.read_value(key)
+                }
+            }
+            "generic.imported_types" => {
+                if raw {
+                    self.imported_types.output_value(key)
+                } else {
+                    self.imported_types.read_value(key)
+                }
+            }
+            "generic.logical_types" => {
+                if raw {
+                    self.logical_types.output_value(key)
+                } else {
+                    self.logical_types.read_value(key)
+                }
+            }
+            "generic.nominal_aliases" => {
+                if raw {
+                    self.nominal_aliases.output_value(key)
+                } else {
+                    self.nominal_aliases.read_value(key)
+                }
+            }
+            "generic.calls" => {
+                if raw {
+                    self.calls.output_value(key)
+                } else {
+                    self.calls.read_value(key)
+                }
+            }
+            "generic.function_paths" => {
+                if raw {
+                    self.function_paths.output_value(key)
+                } else {
+                    self.function_paths.read_value(key)
+                }
+            }
+            "generic.class_paths" => {
+                if raw {
+                    self.class_paths.output_value(key)
+                } else {
+                    self.class_paths.read_value(key)
+                }
+            }
+            "generic.objects" => {
+                if raw {
+                    self.objects.output_value(key)
+                } else {
+                    self.objects.read_value(key)
+                }
+            }
+            "generic.default_copies" => {
+                if raw {
+                    self.default_copies.output_value(key)
+                } else {
+                    self.default_copies.read_value(key)
+                }
+            }
+            _ => serde_json::Value::Null,
+        }
+    }
+    pub(super) fn validate_journal_key(
+        &self,
+        key: &super::precheck_journal::Key,
+    ) -> anyhow::Result<()> {
+        let registry = self.registry.borrow();
+        match key.field.as_str() {
+            "generic.rejected_parameter_methods" => {
+                self.rejected_parameter_methods.validate_key(key)
+            }
+            "registry.module_paths" => registry.module_paths.validate_key(key),
+            "registry.requested" => registry.requested.validate_key(key),
+            "registry.nominal_types" => registry.nominal_types.validate_key(key),
+            "registry.instantiated_classes" => registry.instantiated_classes.validate_key(key),
+            "registry.functions" => registry.functions.validate_key(key),
+            "registry.classes" => registry.classes.validate_key(key),
+            "registry.interfaces" => registry.interfaces.validate_key(key),
+            "registry.interface_instances" => registry.interface_instances.validate_key(key),
+            "registry.runtime_names" => registry.runtime_names.validate_key(key),
+            "origins.bodies" => registry.origins.bodies.validate_key(key),
+            "origins.initializers" => registry.origins.initializers.validate_key(key),
+            "generic.functions" => self.functions.validate_key(key),
+            "generic.classes" => self.classes.validate_key(key),
+            "generic.instances" => self.instances.validate_key(key),
+            "generic.imported_types" => self.imported_types.validate_key(key),
+            "generic.logical_types" => self.logical_types.validate_key(key),
+            "generic.nominal_aliases" => self.nominal_aliases.validate_key(key),
+            "generic.calls" => self.calls.validate_key(key),
+            "generic.function_paths" => self.function_paths.validate_key(key),
+            "generic.class_paths" => self.class_paths.validate_key(key),
+            "generic.objects" => self.objects.validate_key(key),
+            "generic.default_copies" => self.default_copies.validate_key(key),
+            _ => anyhow::bail!("unknown generic dependency field"),
+        }
+    }
+    pub(super) fn replay_budget_allows(
+        &self,
+        writes: &[(super::precheck_journal::Key, serde_json::Value)],
+    ) -> bool {
+        let registry = self.registry.borrow();
+        let extra = writes
+            .iter()
+            .filter(|(key, value)| {
+                key.field == "registry.requested"
+                    && value.get(0) == Some(&serde_json::Value::Bool(true))
+            })
+            .filter(|(key, _)| {
+                key.key
+                    .as_ref()
+                    .and_then(|k| serde_json::from_value::<InstantiationKey>(k.clone()).ok())
+                    .is_some_and(|key| !registry.requested.raw().contains_key(&key))
+            })
+            .count();
+        registry.requested.raw().len() + extra <= 4096
+    }
+    pub(super) fn restore_journal(
+        &mut self,
+        key: &super::precheck_journal::Key,
+        value: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let mut registry = self.registry.borrow_mut();
+        match key.field.as_str() {
+            "generic.rejected_parameter_methods" => {
+                self.rejected_parameter_methods.restore_value(key, value)?
+            }
+            "registry.module_paths" => {
+                Rc::make_mut(&mut registry.module_paths).restore_value(key, value)?
+            }
+            "registry.requested" => registry.requested.restore_value(key, value)?,
+            "registry.nominal_types" => registry.nominal_types.restore_value(key, value)?,
+            "registry.instantiated_classes" => {
+                registry.instantiated_classes.restore_value(key, value)?
+            }
+            "registry.functions" => registry.functions.restore_value(key, value)?,
+            "registry.classes" => Rc::make_mut(&mut registry.classes).restore_value(key, value)?,
+            "registry.interfaces" => registry.interfaces.restore_value(key, value)?,
+            "registry.interface_instances" => {
+                registry.interface_instances.restore_value(key, value)?
+            }
+            "registry.runtime_names" => registry.runtime_names.restore_value(key, value)?,
+            "origins.bodies" => registry.origins.bodies.restore_value(key, value)?,
+            "origins.initializers" => registry.origins.initializers.restore_value(key, value)?,
+            "generic.functions" => self.functions.restore_value(key, value)?,
+            "generic.classes" => self.classes.restore_value(key, value)?,
+            "generic.instances" => self.instances.restore_value(key, value)?,
+            "generic.imported_types" => self.imported_types.restore_value(key, value)?,
+            "generic.logical_types" => self.logical_types.restore_value(key, value)?,
+            "generic.nominal_aliases" => self.nominal_aliases.restore_value(key, value)?,
+            "generic.calls" => self.calls.restore_value(key, value)?,
+            "generic.function_paths" => self.function_paths.restore_value(key, value)?,
+            "generic.class_paths" => self.class_paths.restore_value(key, value)?,
+            "generic.objects" => self.objects.restore_value(key, value)?,
+            "generic.default_copies" => self.default_copies.restore_value(key, value)?,
+            _ => anyhow::bail!("unknown generic replay field"),
+        }
+        Ok(())
     }
 }

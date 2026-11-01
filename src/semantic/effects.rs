@@ -423,6 +423,134 @@ pub(crate) struct EffectSolution<W> {
     pub(crate) recomputed: usize,
 }
 
+/// Version-bound persistence for solved equations. Structured function IDs are
+/// stored as entries, not JSON object keys.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredEffectSolution<W> {
+    facts: Vec<(FunctionId, StoredEffectSummary<W>)>,
+    equations: Vec<StoredEffectEquation<W>>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredEffectEquation<W> {
+    id: FunctionId,
+    seed: StoredEffectSummary<W>,
+    edges: Vec<(FunctionId, u8)>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredEffectSummary<W> {
+    effects: u8,
+    witnesses: BTreeMap<u32, W>,
+}
+impl<W: Clone> EffectSolution<W> {
+    /// Relocate evidence without solving unchanged semantic equations again.
+    pub(crate) fn map_witnesses(&mut self, mut map: impl FnMut(&mut W)) {
+        for summary in self.facts.summaries.values_mut() {
+            for witness in summary.witnesses.values_mut() {
+                map(witness);
+            }
+        }
+        for equation in self.equations.values_mut() {
+            for witness in equation.seed.witnesses.values_mut() {
+                map(witness);
+            }
+        }
+    }
+
+    pub(crate) fn store(&self) -> StoredEffectSolution<W> {
+        let summary = |s: &EffectSummary<W>| StoredEffectSummary {
+            effects: s.effects.bits(),
+            witnesses: s.witnesses.clone(),
+        };
+        StoredEffectSolution {
+            facts: self
+                .facts
+                .summaries
+                .iter()
+                .map(|(&id, s)| (id, summary(s)))
+                .collect(),
+            equations: self
+                .equations
+                .iter()
+                .map(|(&id, e)| StoredEffectEquation {
+                    id,
+                    seed: summary(&e.seed),
+                    edges: e
+                        .edges
+                        .iter()
+                        .map(|&(id, effects)| (id, effects.bits()))
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+impl<W> StoredEffectSolution<W> {
+    pub(crate) fn restore(self) -> anyhow::Result<EffectSolution<W>> {
+        fn effects(bits: u8) -> anyhow::Result<RuntimeEffects> {
+            let mut value = RuntimeEffects::NONE;
+            for bit in 0..RuntimeEffects::BIT_COUNT {
+                if bits & (1 << bit) != 0 {
+                    value = value.union(RuntimeEffects::from_bit(bit));
+                }
+            }
+            if bits & RuntimeEffects::MAY_CHECKED_PANIC.bits() != 0 {
+                value = value.union(RuntimeEffects::MAY_CHECKED_PANIC);
+            }
+            anyhow::ensure!(value.bits() == bits, "invalid stored effects");
+            Ok(value)
+        }
+        fn summary<W>(s: StoredEffectSummary<W>) -> anyhow::Result<EffectSummary<W>> {
+            let value = effects(s.effects)?;
+            anyhow::ensure!(
+                s.witnesses
+                    .keys()
+                    .all(|&bit| bit < RuntimeEffects::BIT_COUNT
+                        && value.intersects(RuntimeEffects::from_bit(bit))),
+                "invalid effect witness bit"
+            );
+            Ok(EffectSummary {
+                effects: value,
+                witnesses: s.witnesses,
+            })
+        }
+        let mut facts = BTreeMap::new();
+        for (id, value) in self.facts {
+            anyhow::ensure!(
+                facts.insert(id, summary(value)?).is_none(),
+                "duplicate effect fact"
+            );
+        }
+        let mut equations = BTreeMap::new();
+        for StoredEffectEquation { id, seed, edges } in self.equations {
+            let edges = edges
+                .into_iter()
+                .map(|(id, bits)| Ok((id, effects(bits)?)))
+                .collect::<anyhow::Result<_>>()?;
+            anyhow::ensure!(
+                equations
+                    .insert(
+                        id,
+                        EffectEquation {
+                            seed: summary(seed)?,
+                            edges
+                        }
+                    )
+                    .is_none(),
+                "duplicate effect equation"
+            );
+        }
+        anyhow::ensure!(
+            facts.keys().eq(equations.keys()),
+            "effect solution inventory mismatch"
+        );
+        Ok(EffectSolution {
+            facts: EffectFacts { summaries: facts },
+            equations,
+            recomputed: 0,
+        })
+    }
+}
+
 /// The solved summaries, keyed by [`FunctionId`].
 #[derive(Debug, Clone)]
 pub struct EffectFacts<W> {
@@ -669,6 +797,54 @@ mod tests {
             .get(&id(name))
             .map(EffectSummary::effects)
             .unwrap_or(NONE)
+    }
+
+    #[test]
+    fn persistent_effect_solution_roundtrip_and_invalidation() {
+        for count in [8, 32, 128] {
+            for shape in ["chain", "fanout", "cycle"] {
+                let mut graph = CallGraph::default();
+                for i in 0..count {
+                    let next = match shape {
+                        "fanout" if i > 0 => Some(0),
+                        "chain" if i + 1 < count => Some(i + 1),
+                        "cycle" => Some((i + 1) % count),
+                        _ => None,
+                    };
+                    let next = next.map(|i| format!("node_{i}"));
+                    calls(
+                        &mut graph,
+                        &format!("node_{i}"),
+                        &next.as_deref().into_iter().collect::<Vec<_>>(),
+                    );
+                }
+                calls(&mut graph, "isolated", &[]);
+                let make = |effect| permissive::<u8>().seed(id("node_0"), effect, Some(1));
+                let initial = make(PANIC.union(RuntimeEffects::MAY_CHECKED_PANIC))
+                    .solve_incremental(&graph, None);
+                let bytes = serde_json::to_vec(&initial.store()).unwrap();
+                let restored: StoredEffectSolution<u8> = serde_json::from_slice(&bytes).unwrap();
+                let restored = restored.restore().unwrap();
+                assert_eq!(restored.facts.summaries, initial.facts.summaries);
+                let same = make(PANIC.union(RuntimeEffects::MAY_CHECKED_PANIC))
+                    .solve_incremental(&graph, Some(&restored));
+                assert_eq!(same.recomputed, 0);
+                let removed = make(NONE).solve_incremental(&graph, Some(&restored));
+                assert_eq!(removed.facts.summaries, make(NONE).solve(&graph).summaries);
+                let added = make(PANIC.union(RuntimeEffects::MAY_CHECKED_PANIC))
+                    .seed(id("isolated"), BLOCK, Some(2))
+                    .solve_incremental(&graph, Some(&restored));
+                assert_eq!(added.recomputed, 1);
+                let mut corrupt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                corrupt["facts"].as_array_mut().unwrap().pop();
+                assert!(
+                    serde_json::from_value::<StoredEffectSolution<u8>>(corrupt)
+                        .unwrap()
+                        .restore()
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]

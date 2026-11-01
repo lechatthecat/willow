@@ -16,6 +16,57 @@ impl SymbolTable {
     /// Cache every traversed (class spelling, method) pair, including misses.
     /// Body forks share this cache; declaration mutation detaches it in DerefMut.
     pub(crate) fn resolved_method_class(&self, class: &str, method: &str) -> Option<String> {
+        let result = self.resolved_method_class_raw(class, method);
+        self.record_precheck_method_owner(class, method, &result);
+        result
+    }
+
+    /// A class introduced by this operation is replayed with its result. Its
+    /// own method table is therefore not an external dependency, but inherited
+    /// methods still depend on the first ancestor the operation did not write.
+    /// Keep the usual aggregate query for that external suffix of the chain.
+    fn record_precheck_method_owner(&self, class: &str, method: &str, result: &Option<String>) {
+        use crate::semantic::type_checker::precheck_journal as journal;
+        if !journal::is_active() {
+            return;
+        }
+        let mut current = class;
+        let mut visited = HashSet::new();
+        loop {
+            let key = journal::Key::new(
+                "symbols",
+                Some(serde_json::to_value(SymbolRead::Class(current.to_owned())).unwrap()),
+            );
+            if !journal::has_written(&key) {
+                let external;
+                let value = if current == class {
+                    result
+                } else {
+                    external = self.resolved_method_class_raw(current, method);
+                    &external
+                };
+                self.precheck_symbol_read(
+                    SymbolRead::MethodOwner(current.to_owned(), method.to_owned()),
+                    value,
+                );
+                return;
+            }
+            if !visited.insert(current) {
+                return;
+            }
+            let Some(info) = self.classes.get(&TypeId::from_source_name(current)) else {
+                return;
+            };
+            if info.methods.contains_key(method) {
+                return;
+            }
+            let Some(base) = info.base_class.as_deref() else {
+                return;
+            };
+            current = base;
+        }
+    }
+    fn resolved_method_class_raw(&self, class: &str, method: &str) -> Option<String> {
         // Record the query even on a cache hit. Replaying all ancestor Class
         // reads would reintroduce depth-proportional work in every body.
         record_read(|| SymbolRead::MethodOwner(class.to_owned(), method.to_owned()));
@@ -287,5 +338,61 @@ mod tests {
         let before = symbols.symbol_value(&miss);
         symbols.define_class("Base".into(), class("Base", None, &["m", "new"]));
         assert_ne!(symbols.symbol_value(&miss), before);
+    }
+    #[test]
+    fn method_owner_precheck_own_class_preserves_external_ancestor_dependency() {
+        use crate::semantic::type_checker::precheck_journal as journal;
+        let mut symbols = SymbolTable::default();
+        symbols.define_class("Base".into(), class("Base", None, &[]));
+        let capture = journal::begin();
+        symbols.define_class("Middle".into(), class("Middle", Some("Base"), &[]));
+        symbols.define_class("Child".into(), class("Child", Some("Middle"), &[]));
+        for _ in 0..2 {
+            assert_eq!(symbols.resolved_method_class("Child", "m"), None);
+        }
+        let captured = capture.finish();
+        let read = SymbolRead::MethodOwner("Base".into(), "m".into());
+        let key = journal::Key::new("symbols", Some(serde_json::to_value(&read).unwrap()));
+        assert_eq!(
+            captured.reads.get(&key),
+            Some(&symbols.precheck_value(&read))
+        );
+        for own in ["Child", "Middle"] {
+            let key = journal::Key::new(
+                "symbols",
+                Some(
+                    serde_json::to_value(SymbolRead::MethodOwner(own.into(), "m".into())).unwrap(),
+                ),
+            );
+            assert!(!captured.reads.contains_key(&key));
+        }
+        symbols.define_class("Base".into(), class("Base", None, &["m"]));
+        assert_ne!(symbols.precheck_value(&read), captured.reads[&key]);
+        assert_eq!(
+            symbols.resolved_method_class("Child", "m"),
+            Some("Base".into())
+        );
+    }
+
+    #[test]
+    fn method_owner_precheck_own_hits_and_cycles_need_no_external_query() {
+        use crate::semantic::type_checker::precheck_journal as journal;
+        let mut symbols = SymbolTable::default();
+        let capture = journal::begin();
+        symbols.define_class("A".into(), class("A", Some("B"), &["direct"]));
+        symbols.define_class("B".into(), class("B", Some("A"), &[]));
+        assert_eq!(
+            symbols.resolved_method_class("A", "direct"),
+            Some("A".into())
+        );
+        assert_eq!(symbols.resolved_method_class("A", "missing"), None);
+        assert!(capture.finish().reads.keys().all(|key| {
+            !matches!(
+                key.key
+                    .clone()
+                    .and_then(|key| serde_json::from_value::<SymbolRead>(key).ok()),
+                Some(SymbolRead::MethodOwner(..))
+            )
+        }));
     }
 }

@@ -838,11 +838,11 @@ impl SyntaxQueries {
     }
 }
 
-// A process-private derived wire; bump when its payload contract changes.
+// A compiler-version-bound derived wire; bump when its payload contract changes.
 // Semantic static targets are now total for checked static expressions.
 const DERIVED_WIRE_VERSION: u8 = 2;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct DerivedValue {
     // Preparation and the memo share immutable buffers; publication is O(1)
     // beyond the single encoding/canonicalization pass.
@@ -2172,12 +2172,19 @@ enum DiskKind {
     Typed,
     Dispatch,
     Children,
+    Derived,
+    Dependencies,
 }
 impl DiskValue {
     fn query_kind(node: &QueryNode) -> Result<DiskKind> {
         Ok(match node {
             QueryNode::Parse(_) => DiskKind::Parsed,
             QueryNode::TypedBody(_) => DiskKind::Typed,
+            QueryNode::NormalizedBody(_)
+            | QueryNode::DirectEffects(_)
+            | QueryNode::DefiniteAssignment(_)
+            | QueryNode::AsyncBorrowReport(_)
+            | QueryNode::ResolvedReferences(_) => DiskKind::Derived,
             QueryNode::CompilerEnvironment
             | QueryNode::SyntaxDeclarations(_)
             | QueryNode::SyntaxImports(_)
@@ -2191,6 +2198,7 @@ impl DiskValue {
     fn input_kind(node: &InputNode) -> Result<DiskKind> {
         Ok(match node {
             InputNode::Source(_) => DiskKind::Source,
+            InputNode::DerivedDependencies(_) => DiskKind::Dependencies,
             InputNode::SemanticSymbol(..)
             | InputNode::CompilerStamp
             | InputNode::StdlibStamp
@@ -2214,6 +2222,8 @@ impl DiskValue {
             DiskKind::Typed => encode_as::<TypedBodyValue>(value)?,
             DiskKind::Dispatch => encode_as::<super::dispatch::DispatchDeclaration>(value)?,
             DiskKind::Children => encode_as::<Vec<String>>(value)?,
+            DiskKind::Derived => encode_as::<DerivedValue>(value)?,
+            DiskKind::Dependencies => encode_as::<Vec<QueryNode>>(value)?,
         };
         Ok(Self { kind, payload })
     }
@@ -2264,6 +2274,8 @@ impl DiskValue {
                 decode_as::<super::dispatch::DispatchDeclaration>(self.payload, fingerprint)
             }
             DiskKind::Children => decode_as::<Vec<String>>(self.payload, fingerprint),
+            DiskKind::Derived => decode_as::<DerivedValue>(self.payload, fingerprint),
+            DiskKind::Dependencies => decode_as::<Vec<QueryNode>>(self.payload, fingerprint),
         }
     }
 }
@@ -2304,6 +2316,46 @@ mod disk_snapshot_tests {
                     .unwrap(),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn disk_snapshot_retains_body_analysis_and_invalidates_changed_dependencies() {
+        let (mut queries, body) = fixture();
+        let nodes = [
+            QueryNode::NormalizedBody(body),
+            QueryNode::DirectEffects(body),
+            QueryNode::DefiniteAssignment(body),
+            QueryNode::AsyncBorrowReport(body),
+            QueryNode::ResolvedReferences(body),
+        ];
+        let dependencies = vec![QueryNode::BodySyntax(
+            PathBuf::from("disk-entry.wi"),
+            "Function:f".into(),
+        )];
+        for node in &nodes {
+            queries
+                .publish_derived(node.clone(), serde_json::json!([42]), dependencies.clone())
+                .unwrap();
+        }
+        let bytes = serde_json::to_vec(&queries.disk_snapshot().unwrap()).unwrap();
+        for (source, retained) in [
+            ("fn f() -> i64 { return 1; }", true),
+            ("fn f() -> i64 { return 2; }", false),
+            ("fn other() -> i64 { return 1; }", false),
+        ] {
+            let mut next = SyntaxQueries::from_disk(serde_json::from_slice(&bytes).unwrap())
+                .unwrap()
+                .candidate()
+                .unwrap();
+            next.parse(Path::new("disk-entry.wi"), FileId::ENTRY, source)
+                .unwrap();
+            for node in &nodes {
+                let result = next
+                    .validate_derived_typed::<Vec<i32>>(node.clone(), dependencies.clone())
+                    .unwrap();
+                assert_eq!(result, retained.then_some(vec![42]), "{node:?}: {source}");
+            }
         }
     }
 

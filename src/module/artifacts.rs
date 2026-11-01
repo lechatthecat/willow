@@ -89,6 +89,7 @@ pub(crate) struct UnitArtifacts {
     pub(crate) previous_parsed: Option<(Rc<ArtifactStore>, ParsedRecords)>,
     pub(crate) correspondence: crate::compiler_db::syntax::Correspondence,
     pub(crate) syntax_queries: Option<Rc<RefCell<crate::compiler_db::incremental::SyntaxQueries>>>,
+    pub(crate) previous_modules: Vec<(super::UnitId, PathBuf)>,
     pub(crate) syntax_owners: HashMap<BodyId, (FileId, String)>,
     pub(crate) initializer_owners: HashMap<crate::parser::ast::ExprId, (FileId, String)>,
 }
@@ -375,6 +376,7 @@ impl UnitArtifacts {
                         previous_parsed: None,
                         correspondence: Default::default(),
                         syntax_queries: None,
+                        previous_modules: Vec::new(),
                         syntax_owners: Default::default(),
                         initializer_owners: Default::default(),
                     };

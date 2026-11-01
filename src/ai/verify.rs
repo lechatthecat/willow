@@ -54,7 +54,7 @@ impl EditManifest {
         manifest.validate()?;
         Ok(manifest)
     }
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         ensure!(
             self.schema_version == 1 && self.complete,
             "complete version-1 edit manifest required"
@@ -427,6 +427,27 @@ impl Baseline {
         manifest.check(self, &root)?;
         self.compare(&after)
     }
+    /// Verify while retaining compiler analysis between calls. Cache files remain read-only.
+    pub fn verify_manifest_retained(
+        &self,
+        entry: &Path,
+        project: Option<&Path>,
+        manifest: &EditManifest,
+        revision: &mut crate::compiler_db::revision::AnalysisRevision,
+    ) -> Result<Report> {
+        let entry = std::fs::canonicalize(entry)?;
+        let root =
+            std::fs::canonicalize(project.unwrap_or(entry.parent().context("entry parent")?))?;
+        manifest.check(self, &root)?;
+        let after = Self::capture_retained(&entry, project, revision)?;
+        manifest.check(self, &root)?;
+        let started = std::time::Instant::now();
+        let result = self.compare(&after);
+        revision.incremental_stats["report_compare_us"] =
+            serde_json::json!(started.elapsed().as_micros());
+        result
+    }
+
     pub fn revision(&self) -> &str {
         &self.revision
     }
@@ -436,6 +457,7 @@ impl Baseline {
     pub fn diagnostics(&self) -> &[DiagnosticFact] {
         &self.diagnostics
     }
+    #[cfg(test)]
     pub(crate) fn capture_overlay(
         entry: &Path,
         project: Option<&Path>,
@@ -447,19 +469,45 @@ impl Baseline {
         Self::capture(entry, project)
     }
     pub fn capture(entry: &Path, project: Option<&Path>) -> Result<Self> {
+        Self::capture_with_revision(entry, project, None)
+    }
+    /// Capture a baseline using caller-owned, read-only retained compiler state.
+    pub fn capture_retained(
+        entry: &Path,
+        project: Option<&Path>,
+        revision: &mut crate::compiler_db::revision::AnalysisRevision,
+    ) -> Result<Self> {
+        Self::capture_with_revision(entry, project, Some(revision))
+    }
+    pub(crate) fn capture_with_revision(
+        entry: &Path,
+        project: Option<&Path>,
+        mut revision: Option<&mut crate::compiler_db::revision::AnalysisRevision>,
+    ) -> Result<Self> {
         let entry = std::fs::canonicalize(entry)?;
         let root =
             std::fs::canonicalize(project.unwrap_or(entry.parent().context("entry parent")?))?;
         let mut diagnostics = Diagnostics::default();
-        let checked = crate::CompilerSession::new(
+        let session = crate::CompilerSession::new(
             entry.to_str().context("non UTF-8 entry")?,
             "",
             &crate::CompilerOptions::debug(),
             project.map(Path::to_owned),
-        )
-        .analysis_for_verification(&mut diagnostics);
+        );
+        let checked = match revision.as_deref_mut() {
+            Some(revision) => revision.analyze_verification(session, &mut diagnostics),
+            None => session.analysis_for_verification(&mut diagnostics),
+        };
         match checked {
-            Ok(snapshot) => Self::from_snapshot(&snapshot, diagnostics.facts),
+            Ok(snapshot) => {
+                let start = std::time::Instant::now();
+                let result = Self::from_snapshot(&snapshot, diagnostics.facts);
+                if let Some(revision) = revision {
+                    revision.incremental_stats["baseline_report_us"] =
+                        serde_json::json!(start.elapsed().as_micros());
+                }
+                result
+            }
             Err(error) => {
                 // Infrastructure failures are not semantic edit results.
                 ensure!(
@@ -511,6 +559,12 @@ impl Baseline {
         snapshot: &Snapshot,
         diagnostics: Vec<DiagnosticFact>,
     ) -> Result<Self> {
+        let started = std::time::Instant::now();
+        let result = Self::from_snapshot_impl(snapshot, diagnostics);
+        crate::query_stats::verification_phase("baseline_report", started);
+        result
+    }
+    fn from_snapshot_impl(snapshot: &Snapshot, diagnostics: Vec<DiagnosticFact>) -> Result<Self> {
         let names = display::TypeNames::new(snapshot);
         let mut facts = BTreeMap::new();
         let mut ids = HashMap::new();
@@ -911,6 +965,12 @@ impl Baseline {
         Ok(result)
     }
     pub fn compare(&self, after: &Self) -> Result<Report> {
+        let started = std::time::Instant::now();
+        let result = self.compare_impl(after);
+        crate::query_stats::verification_phase("report_compare", started);
+        result
+    }
+    fn compare_impl(&self, after: &Self) -> Result<Report> {
         ensure!(
             self.compiler == after.compiler,
             "incompatible verification compiler"

@@ -22,6 +22,14 @@ impl SymbolTable {
     /// or changing an implementation invalidates callers during body reuse.
     /// Declaration mutations detach the cache; body forks share immutable results.
     pub(crate) fn dispatch_may_start_task(&self, class: &str, method: &str) -> bool {
+        let result = self.dispatch_may_start_task_raw(class, method);
+        self.precheck_dispatch_read(
+            SymbolRead::TaskDispatch(class.to_owned(), method.to_owned()),
+            result,
+        );
+        result
+    }
+    fn dispatch_may_start_task_raw(&self, class: &str, method: &str) -> bool {
         record_read(|| SymbolRead::TaskDispatch(class.to_owned(), method.to_owned()));
         let canonical = |name: &str| {
             let id = TypeId::from_source_name(name);

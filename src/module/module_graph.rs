@@ -85,6 +85,7 @@ pub struct ModuleGraph {
     by_key: HashMap<ModuleKey, ModuleId>,
     resolved: HashSet<ModuleKey>,
     next_module_id: u32,
+    previous_source_ids: HashMap<PathBuf, ModuleId>,
     dependencies: HashMap<ModuleKey, Dependencies>,
     visiting: Vec<ModuleKey>,
     visiting_positions: HashMap<ModuleKey, usize>,
@@ -126,6 +127,30 @@ impl ModuleGraph {
 
     pub fn file(&self, id: ModuleId) -> Option<&SourceFile> {
         self.files.iter().find(|file| file.id == id)
+    }
+
+    /// Reserve only identities, never resolved modules or old file contents.
+    /// New imports allocate above the prior range so removals cannot alias them.
+    pub(crate) fn retain_source_ids(&mut self, modules: Vec<(ModuleId, PathBuf)>) {
+        for (id, path) in modules {
+            self.next_module_id = self.next_module_id.max(id.0);
+            self.previous_source_ids.insert(path, id);
+        }
+    }
+
+    pub(crate) fn reserve_source_key(
+        &mut self,
+        key: ModuleKey,
+        path: &std::path::Path,
+    ) -> ModuleId {
+        if let Some(id) = self.by_key.get(&key) {
+            return *id;
+        }
+        if let Some(id) = self.previous_source_ids.remove(path) {
+            self.by_key.insert(key, id);
+            return id;
+        }
+        self.reserve_key(key)
     }
 
     pub fn reserve_module_id(&mut self, path: &str) -> ModuleId {

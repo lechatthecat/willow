@@ -309,19 +309,31 @@ pub(super) fn restore(
                 .flatten()
                 .map(|(s, _)| *s)
                 .collect();
+            // Invalid duplicate templates still share a callable identity. Pick
+            // their first source declaration deterministically rather than let
+            // HashMap iteration choose the owner of unknown-effect evidence.
+            let mut templates: HashMap<FunctionId, (Span, Span)> = HashMap::new();
             for (&span, (name, body)) in &source.callables {
                 if !instantiated.contains(&span) {
                     let id = callable(name);
-                    capture.templates.insert(id);
-                    capture.declarations.insert(id, vec![(span, *body)]);
-                    capture.graph.merge(
-                        id,
-                        crate::semantic::call_graph::CallSites {
-                            has_unknown: true,
-                            ..Default::default()
-                        },
-                    );
+                    let first = templates.entry(id).or_insert((span, *body));
+                    if (span.file_id.0, span.start, span.end)
+                        < (first.0.file_id.0, first.0.start, first.0.end)
+                    {
+                        *first = (span, *body);
+                    }
                 }
+            }
+            for (id, (span, body)) in templates {
+                capture.templates.insert(id);
+                capture.declarations.insert(id, vec![(span, body)]);
+                capture.graph.merge(
+                    id,
+                    crate::semantic::call_graph::CallSites {
+                        has_unknown: true,
+                        ..Default::default()
+                    },
+                );
             }
         }
         for details in capture.symbol_details.values_mut() {

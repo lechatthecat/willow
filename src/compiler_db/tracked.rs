@@ -1646,8 +1646,16 @@ impl TrackedQueryTable {
         let mut pending: Vec<_> = states
             .iter()
             .filter_map(|(node, state)| {
-                (matches!(node, QueryNode::TypedBody(_) | QueryNode::Parse(_))
-                    && matches!(state, State::Ready(Memo { result: Ok(_), .. })))
+                (matches!(
+                    node,
+                    QueryNode::TypedBody(_)
+                        | QueryNode::Parse(_)
+                        | QueryNode::NormalizedBody(_)
+                        | QueryNode::DirectEffects(_)
+                        | QueryNode::DefiniteAssignment(_)
+                        | QueryNode::AsyncBorrowReport(_)
+                        | QueryNode::ResolvedReferences(_)
+                ) && matches!(state, State::Ready(Memo { result: Ok(_), .. })))
                 .then_some(node.clone())
             })
             .collect();

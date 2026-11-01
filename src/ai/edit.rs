@@ -59,6 +59,25 @@ struct Plan {
     work: EditWork,
 }
 
+impl Plan {
+    fn verification_manifest(&self) -> Option<super::verify::EditManifest> {
+        Some(super::verify::EditManifest {
+            schema_version: 1,
+            baseline_revision: self.verification_baseline.clone()?,
+            complete: true,
+            changes: self
+                .changes
+                .iter()
+                .map(|change| super::verify::InputChange {
+                    path: change.path.replace(std::path::MAIN_SEPARATOR, "/"),
+                    before: Some(hash(&change.before)),
+                    after: Some(hash(&change.after)),
+                })
+                .collect(),
+        })
+    }
+}
+
 /// How `edit.preview` reports changed files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChangeFormat {
@@ -511,7 +530,8 @@ impl Workspace {
         };
         Ok(
             serde_json::json!({"kind":"edit.preview", "transaction":id, "revision":plan.revision,
-            "candidate":plan.candidate, "state":plan.state, "changes":changes, "work":plan.work}),
+            "candidate":plan.candidate, "state":plan.state, "changes":changes, "work":plan.work,
+            "verification_manifest":plan.verification_manifest()}),
         )
     }
     fn check_candidate(&self, id: &str, plan: &Plan) -> Result<()> {
@@ -568,6 +588,49 @@ impl Workspace {
     /// Read-only semantic verification of a prepared edit, including rejected
     /// candidates. Does not validate or apply the transaction.
     pub fn verify(&self, id: &str) -> Result<super::verify::Report> {
+        self.verify_with_manifest(id, None, None)
+    }
+
+    /// Verify exactly the prepared changes using a fresh caller attestation.
+    /// Unlisted original and candidate inputs being unchanged is the caller's
+    /// guarantee. Validation and application retain exhaustive integrity checks.
+    pub fn verify_manifest(
+        &self,
+        id: &str,
+        manifest: &super::verify::EditManifest,
+    ) -> Result<super::verify::Report> {
+        manifest.validate()?;
+        self.verify_with_manifest(id, Some(manifest), None)
+    }
+
+    /// Verify a transaction using caller-owned retained analysis.
+    pub fn verify_manifest_retained(
+        &self,
+        id: &str,
+        manifest: &super::verify::EditManifest,
+        revision: &mut crate::compiler_db::revision::AnalysisRevision,
+    ) -> Result<super::verify::Report> {
+        manifest.validate()?;
+        self.verify_with_manifest(id, Some(manifest), Some(revision))
+    }
+
+    fn current_declared(&self, manifest: &super::verify::EditManifest) -> Result<()> {
+        for change in &manifest.changes {
+            ensure!(
+                Some(hash(fs::read(self.file(&change.path)?)?)) == change.before,
+                "stale transaction: {}",
+                change.path
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_with_manifest(
+        &self,
+        id: &str,
+        supplied: Option<&super::verify::EditManifest>,
+        mut revision: Option<&mut crate::compiler_db::revision::AnalysisRevision>,
+    ) -> Result<super::verify::Report> {
         self.ensure_recovered()?;
         let plan = self.load(id)?;
         ensure!(
@@ -582,8 +645,10 @@ impl Workspace {
             plan.configuration == configuration(),
             "compiler options/environment changed"
         );
-        self.current(&plan)?;
-        self.check_candidate(id, &plan)?;
+        if supplied.is_none() {
+            self.current(&plan)?;
+            self.check_candidate(id, &plan)?;
+        }
         let expected = plan
             .verification_baseline
             .as_deref()
@@ -594,32 +659,46 @@ impl Workspace {
             before.revision() == expected,
             "transaction baseline mismatch"
         );
-        let manifest = super::verify::EditManifest {
-            schema_version: 1,
-            baseline_revision: expected.into(),
-            complete: true,
-            changes: plan
+        let prepared = plan
+            .verification_manifest()
+            .context("missing verification baseline")?;
+        let manifest = supplied.unwrap_or(&prepared);
+        if supplied.is_some() {
+            ensure!(
+                manifest.baseline_revision == expected,
+                "transaction manifest baseline mismatch"
+            );
+            ensure!(
+                manifest.changes.len() == prepared.changes.len(),
+                "manifest must contain all prepared changes"
+            );
+            let changes: BTreeMap<_, _> = prepared
                 .changes
                 .iter()
-                .map(|change| super::verify::InputChange {
-                    path: change.path.replace(std::path::MAIN_SEPARATOR, "/"),
-                    before: Some(hash(&change.before)),
-                    after: Some(hash(&change.after)),
-                })
-                .collect(),
-        };
+                .map(|change| (&change.path, change))
+                .collect();
+            for change in &manifest.changes {
+                let expected = changes
+                    .get(&change.path)
+                    .context("manifest contains an unprepared change")?;
+                ensure!(
+                    change.before == expected.before && change.after == expected.after,
+                    "manifest differs from prepared change: {}",
+                    change.path
+                );
+            }
+            self.current_declared(manifest)?;
+        }
         let candidate_root = self.directory.join(id);
         manifest.check(&before, &candidate_root)?;
         // Keep original physical identities for compiler cache keys. Only the
-        // manifest's changed source bytes are overlaid; the checked candidate
-        // inventory above proves all other inputs equal the retained baseline.
+        // manifest's changed source bytes are overlaid. A supplied manifest
+        // attests to unlisted inputs; the legacy path checks the full inventory.
         let modules = plan
             .verification_modules
             .as_ref()
             .context("transaction predates retained source inventory; prepare it again")?;
-        let after = super::verify::Baseline::capture_overlay(
-            &self.root.join(&plan.entry),
-            plan.project.then_some(self.root.as_path()),
+        let overlay = crate::compiler_db::captured::SourceOverlay::with_inventory(
             plan.changes
                 .iter()
                 .map(|change| (self.root.join(&change.path), change.after.clone()))
@@ -636,10 +715,28 @@ impl Workspace {
                     .map(|(name, path)| (name.clone(), self.root.join(path)))
                     .collect(),
             }),
+        );
+        let after = super::verify::Baseline::capture_with_revision(
+            &self.root.join(&plan.entry),
+            plan.project.then_some(self.root.as_path()),
+            revision.as_deref_mut(),
         )?;
-        self.current(&plan)?;
-        self.check_candidate(id, &plan)?;
-        before.compare(&after)
+        drop(overlay);
+        if supplied.is_none() {
+            self.current(&plan)?;
+            self.check_candidate(id, &plan)?;
+        }
+        if supplied.is_some() {
+            self.current_declared(manifest)?;
+            manifest.check(&before, &candidate_root)?;
+        }
+        let started = std::time::Instant::now();
+        let result = before.compare(&after);
+        if let Some(revision) = revision {
+            revision.incremental_stats["report_compare_us"] =
+                serde_json::json!(started.elapsed().as_micros());
+        }
+        result
     }
 
     pub fn validate(

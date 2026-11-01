@@ -29,7 +29,7 @@ pub(crate) const ANY_PANIC: RuntimeEffects = PANIC.union(CHECKED_PANIC);
 use crate::semantic::concurrency::{NonpreemptibleHelper, NonpreemptibleReason};
 const NO_PREEMPT: RuntimeEffects = RuntimeEffects::NO_PREEMPT_REGION;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub(crate) enum EffectWitness {
     Lock(LockEffectWitness),
     Helper {
@@ -175,8 +175,110 @@ impl Default for EffectQueries {
         }
     }
 }
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct EffectSnapshot {
+    solutions: Vec<(
+        UnitId,
+        crate::semantic::effects::StoredEffectSolution<EffectWitness>,
+    )>,
+    io: Vec<(UnitId, crate::semantic::effects::StoredEffectSolution<u8>)>,
+}
+
 impl EffectQueries {
-    #[cfg(test)]
+    pub(crate) fn disk_snapshot(&self) -> EffectSnapshot {
+        EffectSnapshot {
+            solutions: self
+                .solutions
+                .borrow()
+                .iter()
+                .map(|(&unit, s)| (unit, s.store()))
+                .collect(),
+            io: self
+                .io_solutions
+                .borrow()
+                .iter()
+                .map(|(&unit, s)| (unit, s.store()))
+                .collect(),
+        }
+    }
+    pub(crate) fn reuse_solutions(&self, previous: &Self) {
+        self.solutions
+            .borrow_mut()
+            .clone_from(&previous.solutions.borrow());
+        self.io_solutions
+            .borrow_mut()
+            .clone_from(&previous.io_solutions.borrow());
+    }
+    pub(crate) fn retain_units(&self, units: &HashSet<UnitId>) {
+        self.previous
+            .borrow_mut()
+            .retain(|unit, _| units.contains(unit));
+        self.solutions
+            .borrow_mut()
+            .retain(|unit, _| units.contains(unit));
+        self.io_solutions
+            .borrow_mut()
+            .retain(|unit, _| units.contains(unit));
+    }
+
+    pub(crate) fn relocate_solutions(&self, correspondence: &super::syntax::Correspondence) {
+        if !correspondence.spans.iter().any(|(old, new)| old != new) {
+            return;
+        }
+        let locations: HashMap<_, _> = correspondence
+            .spans
+            .iter()
+            .map(|(old, new)| {
+                (
+                    (old.file_id.0, old.start, old.end),
+                    (new.file_id.0, new.start, new.end),
+                )
+            })
+            .collect();
+        for solution in self.solutions.borrow_mut().values_mut() {
+            Arc::make_mut(solution).map_witnesses(|witness| match witness {
+                EffectWitness::Lock(lock) => {
+                    if let Some(span) = correspondence.spans.get(&lock.cause.span) {
+                        lock.cause.span = *span;
+                    }
+                    if let Some(target) = &mut lock.cause.lock
+                        && let Some(span) = correspondence.spans.get(&target.target)
+                    {
+                        target.target = *span;
+                    }
+                }
+                EffectWitness::Helper { source, .. } | EffectWitness::Panic { source, .. } => {
+                    if let Some(location) = locations.get(source) {
+                        *source = *location;
+                    }
+                }
+                EffectWitness::External(_) => {}
+            });
+        }
+    }
+
+    pub(crate) fn restore_solutions(&self, snapshot: EffectSnapshot) -> anyhow::Result<()> {
+        let mut solutions = HashMap::new();
+        for (unit, stored) in snapshot.solutions {
+            anyhow::ensure!(
+                solutions
+                    .insert(unit, Arc::new(stored.restore()?))
+                    .is_none(),
+                "duplicate effect unit"
+            );
+        }
+        let mut io = HashMap::new();
+        for (unit, stored) in snapshot.io {
+            anyhow::ensure!(
+                io.insert(unit, Arc::new(stored.restore()?)).is_none(),
+                "duplicate IO effect unit"
+            );
+        }
+        *self.solutions.borrow_mut() = solutions;
+        *self.io_solutions.borrow_mut() = io;
+        Ok(())
+    }
+
     pub(crate) fn work(&self) -> (usize, usize) {
         (self.scanned.get(), self.recomputed.get())
     }
@@ -1284,6 +1386,14 @@ fn same_seed(a: &EffectSummary<EffectWitness>, b: &EffectSummary<EffectWitness>)
                         && a.cause.span == b.cause.span
                         && a.cause.kind == b.cause.kind
                         && a.cause.operation == b.cause.operation
+                        && a.cause.is_conservative == b.cause.is_conservative
+                        && match (&a.cause.lock, &b.cause.lock) {
+                            (Some(a), Some(b)) => {
+                                a.mode == b.mode && a.target == b.target && a.r#type == b.r#type
+                            }
+                            (None, None) => true,
+                            _ => false,
+                        }
                 }
                 (a, b) => a == b,
             }
@@ -1575,7 +1685,7 @@ pub(crate) const LOCK_EFFECT_WAIT: RuntimeEffects =
 /// `Eq` is deliberately owner-only too, keeping `Ord` consistent with it. That
 /// preserves the first seeded cause per effect and owner. Acquisition seeds
 /// precede other direct waits, making their precise lock location canonical.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LockEffectWitness {
     pub(crate) owner: FunctionId,
     pub(crate) cause: LockEffectCause,
@@ -1623,6 +1733,72 @@ pub(crate) struct LockEffectCallsite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effect_solution_relocation_preserves_lock_target_and_invalidates_changed_evidence() {
+        let owner = FunctionId::free("work");
+        let old = Span::new(10, 20, 1, 11);
+        let new = Span::new(30, 40, 2, 11);
+        let target = Span::new(15, 16, 1, 16);
+        let new_target = Span::new(35, 36, 2, 16);
+        let witness = EffectWitness::Lock(LockEffectWitness {
+            owner,
+            cause: LockEffectCause {
+                is_conservative: false,
+                span: old,
+                operation: "lock".into(),
+                kind: LockEffectKind::Suspend,
+                lock: Some(Box::new(LockTarget {
+                    mode: "lock".into(),
+                    target,
+                    r#type: Some(Type::I64),
+                })),
+            },
+        });
+        let solution = EffectProblem::new()
+            .seed(owner, RuntimeEffects::MAY_SUSPEND, Some(witness))
+            .solve_incremental(&CallGraph::default(), None);
+        let queries = EffectQueries::default();
+        queries
+            .solutions
+            .borrow_mut()
+            .insert(UnitId::ENTRY, Arc::new(solution));
+        let mut correspondence = super::super::syntax::Correspondence::default();
+        correspondence
+            .spans
+            .extend([(old, new), (target, new_target)]);
+        queries.relocate_solutions(&correspondence);
+        let solutions = queries.solutions.borrow();
+        let fact = solutions[&UnitId::ENTRY].facts.get(&owner).unwrap();
+        let EffectWitness::Lock(lock) = fact.witness(RuntimeEffects::MAY_SUSPEND).unwrap() else {
+            panic!("lock evidence");
+        };
+        assert_eq!(lock.cause.span, new);
+        assert_eq!(lock.cause.lock.as_ref().unwrap().target, new_target);
+        for change in ["type", "mode", "target", "conservative", "removed"] {
+            let mut changed = lock.clone();
+            match change {
+                "type" => changed.cause.lock.as_mut().unwrap().r#type = Some(Type::Bool),
+                "mode" => changed.cause.lock.as_mut().unwrap().mode = "lock read".into(),
+                "target" => changed.cause.lock.as_mut().unwrap().target = target,
+                "conservative" => changed.cause.is_conservative = true,
+                "removed" => changed.cause.lock = None,
+                _ => unreachable!(),
+            }
+            let changed = EffectProblem::new()
+                .seed(
+                    owner,
+                    RuntimeEffects::MAY_SUSPEND,
+                    Some(EffectWitness::Lock(changed)),
+                )
+                .solve_incremental_by(
+                    &CallGraph::default(),
+                    Some(&solutions[&UnitId::ENTRY]),
+                    same_seed,
+                );
+            assert_eq!(changed.recomputed, 1, "{change}");
+        }
+    }
 
     #[test]
     fn memberwise_constructor_facts_scale_without_local_uses() {

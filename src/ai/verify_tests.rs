@@ -420,6 +420,55 @@ fn semantic_verify_transaction_dryrun_and_rejection() {
         .unwrap();
     let id = preview["transaction"].as_str().unwrap();
     let report = workspace.verify(id).unwrap();
+    let manifest: EditManifest =
+        serde_json::from_value(preview["verification_manifest"].clone()).unwrap();
+    let attested = workspace.verify_manifest(id, &manifest).unwrap();
+    let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+    Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+    for _ in 0..3 {
+        let warm = workspace
+            .verify_manifest_retained(id, &manifest, &mut retained)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::to_value(warm).unwrap()
+        );
+    }
+    assert_eq!(retained.incremental_stats["concurrency_checks"], 0);
+    assert_eq!(retained.incremental_stats["signature_checks"], 0);
+    assert_eq!(
+        serde_json::to_value(&report).unwrap(),
+        serde_json::to_value(attested).unwrap()
+    );
+    for case in 0..11 {
+        let mut invalid = manifest.clone();
+        match case {
+            0 => invalid.complete = false,
+            1 => invalid.schema_version = 2,
+            2 => invalid.baseline_revision = "0".repeat(64),
+            3 => invalid.changes.clear(),
+            4 => invalid.changes.push(invalid.changes[0].clone()),
+            5 => invalid.changes[0].path = "../main.wi".into(),
+            6 => invalid.changes[0].path = "other.wi".into(),
+            7 => invalid.changes[0].before = Some("0".repeat(64)),
+            8 => invalid.changes[0].after = Some("0".repeat(64)),
+            9 => invalid.changes[0].before = None,
+            10 => invalid.changes[0].after = None,
+            _ => unreachable!(),
+        }
+        assert!(
+            workspace.verify_manifest(id, &invalid).is_err(),
+            "case {case}"
+        );
+    }
+    let candidate = f.0.join(".willow-edits").join(id).join("main.wi");
+    let candidate_bytes = fs::read(&candidate).unwrap();
+    fs::write(&candidate, "fn main() {}").unwrap();
+    assert!(workspace.verify_manifest(id, &manifest).is_err());
+    fs::write(&candidate, &candidate_bytes).unwrap();
+    fs::write(&entry, "fn main() {}").unwrap();
+    assert!(workspace.verify_manifest(id, &manifest).is_err());
+    fs::write(&entry, &source).unwrap();
     assert!(report.complete, "{report:?}");
     assert!(report.diagnostics.added.is_empty(), "{report:?}");
     assert!(report.diagnostics.removed.is_empty(), "{report:?}");
@@ -902,6 +951,23 @@ fn semantic_verify_transaction_keeps_prepared_project_inventory() {
         .unwrap();
     let id = prepared["transaction"].as_str().unwrap();
     let before = serde_json::to_value(workspace.verify(id).unwrap()).unwrap();
+    let manifest: EditManifest =
+        serde_json::from_value(prepared["verification_manifest"].clone()).unwrap();
+    assert_eq!(
+        before,
+        serde_json::to_value(workspace.verify_manifest(id, &manifest).unwrap()).unwrap()
+    );
+    // Unlisted candidate additions are covered by caller attestation. The
+    // legacy integrity path still rejects them, and verification preserves them.
+    let unlisted = f.0.join(".willow-edits").join(id).join("src/unlisted.wi");
+    fs::write(&unlisted, "fn extra() {}").unwrap();
+    assert!(workspace.verify(id).is_err());
+    assert_eq!(
+        before,
+        serde_json::to_value(workspace.verify_manifest(id, &manifest).unwrap()).unwrap()
+    );
+    assert_eq!(fs::read_to_string(&unlisted).unwrap(), "fn extra() {}");
+    fs::remove_file(unlisted).unwrap();
     let extra = f.0.join("src/extra.wi");
     fs::write(&extra, "pub fn extra() -> i64 { return 3; }").unwrap();
     let after = serde_json::to_value(workspace.verify(id).unwrap()).unwrap();
@@ -994,5 +1060,1470 @@ fn semantic_verify_overlay_preserves_module_precedence() {
         fs::write(source_root.join("lib.wi"), "invalid !!!").unwrap();
         let after = serde_json::to_value(workspace.verify(id).unwrap()).unwrap();
         assert_eq!(before, after, "project={project}");
+    }
+}
+
+#[test]
+fn semantic_verify_retained_matches_clean_across_edits_and_topology() {
+    for count in [8, 32, 128] {
+        let f = Fixture::new();
+        let unrelated = (0..count)
+            .map(|i| format!("fn unrelated{i}() -> i64 {{ return {i}; }}\n"))
+            .collect::<String>();
+        let source = format!(
+            "pub fn value() -> i64 {{ return 1; }} fn main() {{ println(value()); }}\n{unrelated}"
+        );
+        let entry = f.0.join("main.wi");
+        fs::write(&entry, &source).unwrap();
+        let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+        let baseline = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+        for (case, candidate) in [
+            ("body", source.replacen("return 1;", "return 2;", 1)),
+            (
+                "signature",
+                source.replacen("-> i64 { return 1; }", "-> bool { return true; }", 1),
+            ),
+            (
+                "effect",
+                source.replacen("return 1;", "println(1); return 1;", 1),
+            ),
+            ("add_file", format!("import extra;\n{source}")),
+            ("remove_file", source.clone()),
+            (
+                "remove_declaration",
+                source
+                    .replace("pub fn value() -> i64 { return 1; }", "")
+                    .replace("println(value());", ""),
+            ),
+        ] {
+            let extra = f.0.join("extra.wi");
+            if case == "add_file" {
+                fs::write(&extra, "pub fn extra() -> i64 { return 42; }").unwrap();
+            }
+            if case == "remove_file" {
+                fs::remove_file(&extra).unwrap();
+            }
+            fs::write(&entry, &candidate).unwrap();
+            let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            let clean = Baseline::capture(&entry, None).unwrap();
+            assert_eq!(
+                serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+                serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+                "{case} {count}"
+            );
+            let repeat = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            assert_eq!(
+                serde_json::to_value(baseline.compare(&repeat).unwrap()).unwrap(),
+                serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap()
+            );
+            assert_eq!(
+                retained.incremental_stats["concurrency_checks"], 0,
+                "{case}"
+            );
+            assert_eq!(retained.incremental_stats["signature_checks"], 0, "{case}");
+            assert_eq!(fs::read_to_string(&entry).unwrap(), candidate);
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_retained_concurrency_diagnostic_relocation_matches_clean() {
+    let f = Fixture::new();
+    let entry = f.0.join("main.wi");
+    let source = "async fn borrow(x: &mut fn(i64) -> i64) {} fn main() {}";
+    let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+    fs::write(&entry, source).unwrap();
+    let before = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+    assert!(!before.diagnostics().is_empty());
+    for prefix in ["\n", "\n\n\n", ""] {
+        fs::write(&entry, format!("{prefix}{source}")).unwrap();
+        let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+        let clean = Baseline::capture(&entry, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(before.compare(&warm).unwrap()).unwrap(),
+            serde_json::to_value(before.compare(&clean).unwrap()).unwrap()
+        );
+        assert_eq!(retained.incremental_stats["concurrency_checks"], 0);
+        assert_eq!(retained.incremental_stats["signature_checks"], 0);
+    }
+}
+
+#[test]
+fn semantic_verify_retained_named_and_generic_signatures_both_workflows() {
+    for count in [8, 32, 128] {
+        for (declaration, ty) in [
+            ("class Box {}", "Box"),
+            ("class Box<T> { value: T; }", "Box<i64>"),
+            ("enum Box<T> { Value(T) }", "Box<i64>"),
+            ("enum Box<T> { Value(T) }", "fn(Box<i64>) -> Box<i64>"),
+        ] {
+            let f = Fixture::new();
+            let entry = f.0.join("main.wi");
+            let unrelated = (0..count)
+                .map(|i| format!("fn unrelated{i}(v: {ty}) -> {ty} {{ return v; }}\n"))
+                .collect::<String>();
+            let source = format!("{} {declaration}\n{unrelated}", basic());
+            fs::write(&entry, &source).unwrap();
+            let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+            let baseline = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            let snapshot = crate::CompilerSession::new(
+                entry.to_str().unwrap(),
+                "",
+                &crate::CompilerOptions::debug(),
+                None,
+            )
+            .analysis_for_edit_with_emitter(&mut Diagnostics::default())
+            .unwrap();
+            let function = snapshot
+                .functions
+                .iter()
+                .find(|f| f.name == "value")
+                .unwrap()
+                .id
+                .clone();
+            let workspace = edit::Workspace::open(&f.0).unwrap();
+            let preview = workspace
+                .prepare(
+                    &entry,
+                    false,
+                    edit::Request {
+                        revision: snapshot.revision,
+                        operations: vec![edit::Operation::ReplaceBody {
+                            function,
+                            body: "{ return 7; }".into(),
+                        }],
+                    },
+                    edit::ChangeFormat::Diff,
+                    &mut Diagnostics::default(),
+                )
+                .unwrap();
+            let id = preview["transaction"].as_str().unwrap();
+            let manifest =
+                serde_json::from_value(preview["verification_manifest"].clone()).unwrap();
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let clean = workspace
+                .verify_manifest_retained(id, &manifest, &mut clean_state)
+                .unwrap();
+            for _ in 0..3 {
+                let warm = workspace
+                    .verify_manifest_retained(id, &manifest, &mut retained)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(warm).unwrap(),
+                    serde_json::to_value(&clean).unwrap()
+                );
+                assert_eq!(
+                    retained.incremental_stats["signature_checks"], 0,
+                    "transaction {ty} {count}"
+                );
+                assert_eq!(fs::read_to_string(&entry).unwrap(), source);
+            }
+            // A signature edit invalidates one signature, then moving every
+            // declaration must remap the cached results without rechecking them.
+            for (expected, changed) in [
+                (0, source.replacen("return 1;", "return 2;", 1)),
+                (
+                    1,
+                    source.replacen("-> i64 { return 1; }", "-> bool { return true; }", 1),
+                ),
+                (1, format!("\n\n{source}")),
+                (0, format!("\n\n\n{source}")),
+            ] {
+                fs::write(&entry, &changed).unwrap();
+                let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+                let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+                let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+                assert_eq!(
+                    serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+                    serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+                    "tree {ty} {count}"
+                );
+                assert_eq!(
+                    retained.incremental_stats["signature_checks"], expected,
+                    "tree {ty} {count}"
+                );
+                assert_eq!(fs::read_to_string(&entry).unwrap(), changed);
+            }
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_signature_resolution_dependencies_and_collection_replay() {
+    for (declarations, annotation) in [
+        ("class Box {}", "Box"),
+        ("enum Box<T> { Value(T) }", "Box<i64>"),
+        ("", "std::collections::Map<i64, i64>"),
+        ("", "std::collections::Array<i64>"),
+    ] {
+        let fixture = Fixture::new();
+        let entry = fixture.0.join("main.wi");
+        let first = format!("fn first(v: {annotation}) -> {annotation} {{ return v; }}\n");
+        let second = first.replace("first", "second");
+        let tail = "fn uses_array(v: Array<i64>) -> Array<i64> { return v; } fn main() {}";
+        let source = format!("{declarations}\n{first}{second}{tail}");
+        let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+        fs::write(&entry, &source).unwrap();
+        let before = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+        for candidate in [
+            source.replace(&first, ""),
+            format!("{declarations}\n{second}{first}{tail}"),
+            source
+                .replace("class Box {}", "enum Box { Value }")
+                .replace(
+                    "enum Box<T> { Value(T) }",
+                    "enum Box<T> { Value(T), Empty }",
+                ),
+            source.clone(),
+        ] {
+            fs::write(&entry, &candidate).unwrap();
+            let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+            assert_eq!(
+                serde_json::to_value(before.compare(&warm).unwrap()).unwrap(),
+                serde_json::to_value(before.compare(&clean).unwrap()).unwrap(),
+                "{annotation} {candidate}"
+            );
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_signature_import_invalidation_is_affected_only() {
+    for count in [8, 32, 128] {
+        let f = Fixture::new();
+        let entry = f.0.join("main.wi");
+        let lib = f.0.join("lib.wi");
+        let unrelated = (0..count)
+            .map(|i| format!("fn unrelated{i}(v: Stable) -> Stable {{ return v; }}\n"))
+            .collect::<String>();
+        let source = format!(
+            "import lib::Box as Alias; class Stable {{}} fn dependent(v: Alias<i64>) -> Alias<i64> {{ return v; }} fn main() {{}}\n{unrelated}"
+        );
+        let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+        fs::write(&entry, &source).unwrap();
+        fs::write(&lib, "pub enum Box<T> { Value(T) }").unwrap();
+        let before = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+        for library in [
+            "pub enum Box<T> { Value(T), Empty }",
+            "pub enum Box<T> { Value(T) } pub enum Unused { Empty }",
+            "pub enum Box<T> { Value(T) } pub enum Unused { Empty, Other }",
+        ] {
+            fs::write(&lib, library).unwrap();
+            let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            let expected = usize::from(!library.contains("Other"));
+            assert_eq!(
+                retained.incremental_stats["signature_checks"], expected,
+                "{count} {library}"
+            );
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+            assert_eq!(
+                serde_json::to_value(before.compare(&warm).unwrap()).unwrap(),
+                serde_json::to_value(before.compare(&clean).unwrap()).unwrap()
+            );
+            assert_eq!(fs::read_to_string(&lib).unwrap(), library);
+            assert_eq!(fs::read_to_string(&entry).unwrap(), source);
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_signature_mixed_collection_spelling_uses_entry_state() {
+    for params in [
+        "a: std::collections::Array<i64>, b: Array<i64>",
+        "a: Array<i64>, b: std::collections::Array<i64>",
+        "a: Array<i64>, b: Array<i64>",
+    ] {
+        let f = Fixture::new();
+        let entry = f.0.join("main.wi");
+        let source = format!("fn mixed({params}) {{}} fn main() {{}}");
+        fs::write(&entry, &source).unwrap();
+        let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+        let before = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+        for offset in 1..=3 {
+            fs::write(&entry, format!("{}{source}", "\n".repeat(offset))).unwrap();
+            let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            assert_eq!(
+                retained.incremental_stats["signature_checks"], 0,
+                "{params}"
+            );
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+            assert_eq!(
+                serde_json::to_value(before.compare(&warm).unwrap()).unwrap(),
+                serde_json::to_value(before.compare(&clean).unwrap()).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_precheck_skips_unrelated_functions() {
+    for count in [8, 32, 128] {
+        for imported in [false, true] {
+            let f = Fixture::new();
+            let entry = f.0.join("main.wi");
+            let edited = if imported {
+                f.0.join("lib.wi")
+            } else {
+                entry.clone()
+            };
+            let source = format!("class Box<T> {{ value: T; }} {}", basic())
+                + &(0..count)
+                    .map(|i| format!("fn unrelated{i}() -> i64 {{ return {i}; }}\n"))
+                    .collect::<String>();
+            let entry_source = if imported {
+                "import lib; fn main() { let n = lib::value(); }".to_owned()
+            } else {
+                source.clone()
+            };
+            fs::write(&entry, &entry_source).unwrap();
+            fs::write(&edited, &source).unwrap();
+            let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+            let before = Baseline::capture_retained(&entry, None, &mut revision).unwrap();
+            let snapshot = crate::CompilerSession::new(
+                entry.to_str().unwrap(),
+                "",
+                &crate::CompilerOptions::debug(),
+                None,
+            )
+            .analysis_for_edit_with_emitter(&mut Diagnostics::default())
+            .unwrap();
+            let function = snapshot
+                .functions
+                .iter()
+                .find(|f| f.name == "value")
+                .unwrap()
+                .id
+                .clone();
+            let workspace = edit::Workspace::open(&f.0).unwrap();
+            let preview = workspace
+                .prepare(
+                    &entry,
+                    false,
+                    edit::Request {
+                        revision: snapshot.revision,
+                        operations: vec![edit::Operation::ReplaceBody {
+                            function,
+                            body: "{ return 7; }".into(),
+                        }],
+                    },
+                    edit::ChangeFormat::Diff,
+                    &mut Diagnostics::default(),
+                )
+                .unwrap();
+            let id = preview["transaction"].as_str().unwrap();
+            let manifest =
+                serde_json::from_value(preview["verification_manifest"].clone()).unwrap();
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let clean = workspace
+                .verify_manifest_retained(id, &manifest, &mut clean_state)
+                .unwrap();
+            for repeat in 0..3 {
+                let warm = workspace
+                    .verify_manifest_retained(id, &manifest, &mut revision)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(warm).unwrap(),
+                    serde_json::to_value(&clean).unwrap(),
+                    "transaction imported={imported} count={count} repeat={repeat}"
+                );
+                // Repeated verification reuses the retained candidate state.
+                assert_eq!(
+                    revision.incremental_stats["precheck_bodies"],
+                    usize::from(repeat == 0),
+                    "transaction imported={imported} count={count} repeat={repeat}: {}",
+                    revision.incremental_stats
+                );
+                assert_eq!(revision.incremental_stats["precheck_signatures"], 0);
+                assert_eq!(revision.incremental_stats["precheck_templates"], 0);
+                assert_eq!(fs::read_to_string(&entry).unwrap(), entry_source);
+                assert_eq!(fs::read_to_string(&edited).unwrap(), source);
+            }
+            let changed = source.replacen("return 1;", "return 2;", 1);
+            fs::write(&edited, &changed).unwrap();
+            for repeat in 0..3 {
+                let warm = Baseline::capture_retained(&entry, None, &mut revision).unwrap();
+                assert_eq!(
+                    revision.incremental_stats["precheck_bodies"],
+                    usize::from(repeat == 0),
+                    "tree imported={imported} count={count} repeat={repeat}: {}",
+                    revision.incremental_stats
+                );
+                assert_eq!(revision.incremental_stats["precheck_signatures"], 0);
+                assert_eq!(revision.incremental_stats["precheck_templates"], 0);
+                let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+                let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+                assert_eq!(
+                    serde_json::to_value(before.compare(&warm).unwrap()).unwrap(),
+                    serde_json::to_value(before.compare(&clean).unwrap()).unwrap()
+                );
+                assert_eq!(fs::read_to_string(&edited).unwrap(), changed);
+                if imported {
+                    assert_eq!(fs::read_to_string(&entry).unwrap(), entry_source);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_precheck_generic_dependencies_match_clean() {
+    let f = Fixture::new();
+    let entry = f.0.join("main.wi");
+    let template = "fn identity<T>(x: T) -> T { return x; }";
+    let first = "fn first() -> i64 { return identity(1); }";
+    let second = "fn second() -> i64 { return identity(2); }";
+    let stable = "fn stable() -> i64 { return 3; } fn main() {}";
+    let source = format!("{template} {first} {second} {stable}");
+    fs::write(&entry, &source).unwrap();
+    let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+    let baseline = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+    for (case, candidate) in [
+        ("body", source.replacen("return 3;", "return 4;", 1)),
+        (
+            "remove_first_requester",
+            format!("{template} {second} {stable}"),
+        ),
+        (
+            "template_body",
+            format!(
+                "{} {second} {stable}",
+                template.replace("return x;", "let copy = x; return copy;")
+            ),
+        ),
+        (
+            "negative_lookup",
+            format!(
+                "{} {second} {stable}",
+                template.replace("return x;", "missing(); return x;")
+            ),
+        ),
+        (
+            "add_dependency",
+            format!(
+                "{} {second} {stable} fn missing() {{}}",
+                template.replace("return x;", "missing(); return x;")
+            ),
+        ),
+        (
+            "dependency_effect",
+            format!(
+                "{} {second} {stable} fn missing() {{ println(1); }}",
+                template.replace("return x;", "missing(); return x;")
+            ),
+        ),
+        (
+            "remove_dependency",
+            format!(
+                "{} {second} {stable}",
+                template.replace("return x;", "missing(); return x;")
+            ),
+        ),
+        ("remove_template", format!("{second} {stable}")),
+        ("restore", source.clone()),
+    ] {
+        fs::write(&entry, &candidate).unwrap();
+        let warm = Baseline::capture_retained(&entry, None, &mut retained)
+            .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+        let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+        let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+        assert_eq!(
+            serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+            serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+            "{case}"
+        );
+        if case == "body" {
+            assert_eq!(
+                retained.incremental_stats["precheck_bodies"], 1,
+                "{}",
+                retained.incremental_stats
+            );
+            assert_eq!(retained.incremental_stats["precheck_signatures"], 0);
+            assert_eq!(retained.incremental_stats["precheck_templates"], 0);
+            assert_eq!(retained.incremental_stats["precheck_instances"], 0);
+        }
+        assert_eq!(fs::read_to_string(&entry).unwrap(), candidate);
+    }
+}
+
+#[test]
+fn semantic_verify_precheck_imported_template_changes_match_clean() {
+    let f = Fixture::new();
+    let entry = f.0.join("main.wi");
+    let library = f.0.join("lib.wi");
+    let entry_source = "import lib; fn one() -> i64 { return lib::identity(1); } fn main() {}";
+    let source = "pub fn identity<T>(x: T) -> T { return x; } fn unrelated() -> i64 { return 7; }";
+    fs::write(&entry, entry_source).unwrap();
+    fs::write(&library, source).unwrap();
+    let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+    let baseline = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+    for (case, candidate) in [
+        ("relocation", format!("\n\n{source}")),
+        (
+            "template_body",
+            source.replace("return x;", "let copy = x; return copy;"),
+        ),
+        (
+            "negative_lookup",
+            source.replace("return x;", "missing(); return x;"),
+        ),
+        (
+            "add_dependency",
+            format!(
+                "{} fn missing() {{}}",
+                source.replace("return x;", "missing(); return x;")
+            ),
+        ),
+        (
+            "change_dependency",
+            format!(
+                "{} fn missing() {{ println(1); }}",
+                source.replace("return x;", "missing(); return x;")
+            ),
+        ),
+        (
+            "remove_template",
+            "fn unrelated() -> i64 { return 7; }".to_owned(),
+        ),
+        ("restore", source.to_owned()),
+        ("relocate_restored", format!("\n\n\n{source}")),
+    ] {
+        fs::write(&library, &candidate).unwrap();
+        let warm = Baseline::capture_retained(&entry, None, &mut retained)
+            .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+        let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+        let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+        assert_eq!(
+            serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+            serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+            "{case}"
+        );
+        if case == "relocation" || case == "relocate_restored" {
+            for counter in [
+                "precheck_bodies",
+                "precheck_signatures",
+                "precheck_templates",
+                "precheck_instances",
+            ] {
+                assert_eq!(
+                    retained.incremental_stats[counter], 0,
+                    "{case}: {counter}: {}",
+                    retained.incremental_stats
+                );
+            }
+        }
+        assert_eq!(fs::read_to_string(&library).unwrap(), candidate);
+        assert_eq!(fs::read_to_string(&entry).unwrap(), entry_source);
+    }
+}
+
+#[test]
+fn semantic_verify_precheck_unrelated_import_changes_skip_semantics() {
+    verify_unrelated_import_changes_skip_semantics(false);
+}
+
+#[test]
+fn semantic_verify_precheck_declaration_scaling_both_workflows() {
+    for count in [8, 32, 128] {
+        let f = Fixture::new();
+        let entry = f.0.join("main.wi");
+        let source = format!("class Box<T> {{ value: T; }} {}\n", basic())
+            + &(0..count).map(|i| format!("class C{i} {{ value: i64; }} enum E{i} {{ Value(i64) }} interface I{i} {{ fn get(self) -> i64; }}\n")).collect::<String>();
+        fs::write(&entry, &source).unwrap();
+        let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+        let baseline = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+        let snapshot = crate::CompilerSession::new(
+            entry.to_str().unwrap(),
+            "",
+            &crate::CompilerOptions::debug(),
+            None,
+        )
+        .analysis_for_edit_with_emitter(&mut Diagnostics::default())
+        .unwrap();
+        let function = snapshot
+            .functions
+            .iter()
+            .find(|f| f.name == "value")
+            .unwrap()
+            .id
+            .clone();
+        let workspace = edit::Workspace::open(&f.0).unwrap();
+        let preview = workspace
+            .prepare(
+                &entry,
+                false,
+                edit::Request {
+                    revision: snapshot.revision,
+                    operations: vec![edit::Operation::ReplaceBody {
+                        function,
+                        body: "{ return 7; }".into(),
+                    }],
+                },
+                edit::ChangeFormat::Diff,
+                &mut Diagnostics::default(),
+            )
+            .unwrap();
+        let id = preview["transaction"].as_str().unwrap();
+        let manifest = serde_json::from_value(preview["verification_manifest"].clone()).unwrap();
+        let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+        let clean = workspace
+            .verify_manifest_retained(id, &manifest, &mut clean_state)
+            .unwrap();
+        for repeat in 0..2 {
+            let warm = workspace
+                .verify_manifest_retained(id, &manifest, &mut retained)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(warm).unwrap(),
+                serde_json::to_value(&clean).unwrap()
+            );
+            assert_eq!(
+                retained.incremental_stats["precheck_declarations"], 0,
+                "transaction count={count} repeat={repeat}: {}",
+                retained.incremental_stats
+            );
+            assert_eq!(
+                retained.incremental_stats["declaration_validations"], 0,
+                "count={count} repeat={repeat}: {}",
+                retained.incremental_stats
+            );
+            assert_eq!(
+                retained.incremental_stats["precheck_bodies"],
+                usize::from(repeat == 0)
+            );
+            assert_eq!(fs::read_to_string(&entry).unwrap(), source);
+        }
+        let changed = source.replacen("return 1;", "return 2;", 1);
+        fs::write(&entry, &changed).unwrap();
+        for repeat in 0..2 {
+            let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+            assert_eq!(
+                serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+                serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap()
+            );
+            assert_eq!(
+                retained.incremental_stats["precheck_declarations"], 0,
+                "tree count={count} repeat={repeat}: {}",
+                retained.incremental_stats
+            );
+            assert_eq!(
+                retained.incremental_stats["declaration_validations"], 0,
+                "count={count} repeat={repeat}: {}",
+                retained.incremental_stats
+            );
+            assert_eq!(
+                retained.incremental_stats["precheck_bodies"],
+                usize::from(repeat == 0)
+            );
+            assert_eq!(fs::read_to_string(&entry).unwrap(), changed);
+        }
+        let mut candidate = changed;
+        for (case, before, after) in [
+            (
+                "class",
+                "class C0 { value: i64; }",
+                "class C0 { value: bool; }",
+            ),
+            ("enum", "enum E0 { Value(i64) }", "enum E0 { Value(bool) }"),
+            (
+                "interface",
+                "interface I0 { fn get(self) -> i64; }",
+                "interface I0 { fn get(self) -> bool; }",
+            ),
+            (
+                "diagnostic",
+                "interface I0 { fn get(self) -> bool; }",
+                "interface I0 { fn get(self) -> bool; fn get(self) -> i64; }",
+            ),
+            ("diagnostic_replay", "", "\n"),
+            (
+                "repair",
+                "interface I0 { fn get(self) -> bool; fn get(self) -> i64; }",
+                "interface I0 { fn get(self) -> bool; }",
+            ),
+        ] {
+            candidate = candidate.replacen(before, after, 1);
+            fs::write(&entry, &candidate).unwrap();
+            let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+            assert_eq!(
+                serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+                serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+                "{case} count={count}"
+            );
+            assert_eq!(
+                retained.incremental_stats["precheck_declarations"],
+                if case == "diagnostic_replay" { 0 } else { 2 },
+                "{case} count={count}: {}",
+                retained.incremental_stats
+            );
+            if case.starts_with("diagnostic") {
+                assert!(warm.diagnostics.iter().any(|d| d.severity == "error"));
+            }
+            assert_eq!(fs::read_to_string(&entry).unwrap(), candidate);
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_precheck_import_resolution_matches_clean() {
+    #[derive(Default)]
+    struct RawDiagnostics {
+        raw: Vec<serde_json::Value>,
+        facts: Diagnostics,
+    }
+    impl crate::diagnostics::DiagnosticEmitter for RawDiagnostics {
+        fn emit(
+            &mut self,
+            diagnostic: &crate::diagnostics::Diagnostic,
+            sources: &dyn crate::diagnostics::source_map::SourceLookup,
+        ) -> std::io::Result<()> {
+            self.raw.push(serde_json::to_value(diagnostic).unwrap());
+            self.facts.emit(diagnostic, sources)
+        }
+    }
+    fn capture(
+        entry: &std::path::Path,
+        retained: &mut crate::compiler_db::revision::AnalysisRevision,
+    ) -> (Baseline, Vec<serde_json::Value>) {
+        let mut diagnostics = RawDiagnostics::default();
+        let snapshot = retained
+            .analyze_verification(
+                crate::CompilerSession::new(
+                    entry.to_str().unwrap(),
+                    "",
+                    &crate::CompilerOptions::debug(),
+                    None,
+                ),
+                &mut diagnostics,
+            )
+            .unwrap();
+        (
+            Baseline::from_snapshot(&snapshot, diagnostics.facts.facts).unwrap(),
+            diagnostics.raw,
+        )
+    }
+    let unrelated = (0..16)
+        .map(|i| format!("fn unrelated{i}() -> i64 {{ return {i}; }}\n"))
+        .collect::<String>();
+    for (shape, annotation, initial, changes) in [
+        (
+            "alias",
+            "Alias",
+            "",
+            vec![
+                ("add", "import types::Payload as Alias;", Some((1, 0))),
+                ("retarget", "import types::Choice as Alias;", Some((1, 1))),
+                ("remove", "", Some((1, 1))),
+                ("restore", "import types::Payload as Alias;", Some((1, 0))),
+            ],
+        ),
+        (
+            "collections",
+            "Items<i64>",
+            "import std::collections::Array as Items;",
+            vec![
+                (
+                    "unrelated",
+                    "import std::collections::Array as Items; import std::time;",
+                    Some((0, 0)),
+                ),
+                (
+                    "retarget",
+                    "import std::collections::Map as Items;",
+                    Some((1, 1)),
+                ),
+                (
+                    "restore",
+                    "import std::collections::Array as Items;",
+                    Some((1, 1)),
+                ),
+            ],
+        ),
+        (
+            "hint",
+            "Paylod",
+            "import types;",
+            vec![
+                ("nearby", "import types::Payload;", None),
+                ("different", "import types::Choice;", None),
+                ("restore", "import types::Payload;", None),
+            ],
+        ),
+    ] {
+        let f = Fixture::new();
+        let entry = f.0.join("main.wi");
+        let library = f.0.join("types.wi");
+        let library_source = "pub class Payload { pub value: i64; } pub enum Choice { Value(i64) }";
+        fs::write(&library, library_source).unwrap();
+        let body = format!(
+            "class Gate<T> {{ value: T; }} fn dependent(v: {annotation}) -> {annotation} {{ return v; }} fn main() {{}}\n{unrelated}"
+        );
+        fs::write(&entry, format!("{initial}\n{body}")).unwrap();
+        let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+        let (baseline, _) = capture(&entry, &mut retained);
+        for (case, imports, expected) in changes {
+            let candidate = format!("{imports}\n{body}");
+            fs::write(&entry, &candidate).unwrap();
+            let (warm, warm_diagnostics) = capture(&entry, &mut retained);
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let (clean, clean_diagnostics) = capture(&entry, &mut clean_state);
+            assert_eq!(
+                serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+                serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+                "{shape} {case}"
+            );
+            assert_eq!(
+                warm_diagnostics, clean_diagnostics,
+                "full diagnostics {shape} {case}"
+            );
+            for counter in ["precheck_bodies", "precheck_signatures"] {
+                let count = retained.incremental_stats[counter].as_u64().unwrap();
+                if let Some((bodies, signatures)) = expected {
+                    let expected = if counter == "precheck_bodies" {
+                        bodies
+                    } else {
+                        signatures
+                    };
+                    assert_eq!(
+                        count, expected,
+                        "{shape} {case} {counter}: {}",
+                        retained.incremental_stats
+                    );
+                } else {
+                    // Only the invalid dependent signature/body can observe a
+                    // change in available type-name suggestions.
+                    assert!(
+                        count <= 1,
+                        "{shape} {case} {counter}: {}",
+                        retained.incremental_stats
+                    );
+                }
+            }
+            assert_eq!(
+                retained.incremental_stats["precheck_templates"], 0,
+                "{shape} {case}"
+            );
+            assert_eq!(fs::read_to_string(&entry).unwrap(), candidate);
+            assert_eq!(fs::read_to_string(&library).unwrap(), library_source);
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_precheck_inheritance_validation_skips_unrelated() {
+    for count in [8, 32, 128] {
+        for chain in [false, true] {
+            let f = Fixture::new();
+            let entry = f.0.join("main.wi");
+            let mut source = format!(
+                "class Gate<T> {{ value: T; }} {} open class C0 {{}}\n",
+                basic()
+            );
+            for i in 1..=count {
+                let parent = if chain { i - 1 } else { 0 };
+                source.push_str(&format!("open class C{i} extends C{parent} {{}}\n"));
+            }
+            fs::write(&entry, &source).unwrap();
+            let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+            let baseline = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            let candidate = source.replacen("return 1;", "return 2;", 1);
+            fs::write(&entry, &candidate).unwrap();
+            let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+            assert_eq!(
+                serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+                serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap()
+            );
+            for counter in [
+                "declaration_validations",
+                "precheck_declarations",
+                "precheck_signatures",
+                "precheck_templates",
+            ] {
+                assert_eq!(
+                    retained.incremental_stats[counter], 0,
+                    "chain={chain} count={count} {counter}: {}",
+                    retained.incremental_stats
+                );
+            }
+            assert_eq!(retained.incremental_stats["precheck_bodies"], 1);
+            assert_eq!(fs::read_to_string(&entry).unwrap(), candidate);
+            // The ancestor becomes sealed, invalidating the children that read
+            // its inheritance contract; diagnostic replay must match clean.
+            let invalid = candidate.replacen("open class C0", "class C0", 1);
+            for candidate in [invalid.clone(), format!("\n{invalid}"), source.clone()] {
+                fs::write(&entry, &candidate).unwrap();
+                let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+                let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+                let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+                assert_eq!(
+                    serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+                    serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+                    "chain={chain} count={count}"
+                );
+                assert_eq!(fs::read_to_string(&entry).unwrap(), candidate);
+            }
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_precheck_class_state_matches_clean() {
+    for (shape, declaration, needle, change) in [
+        (
+            "marker",
+            "interface Send {} interface Sync extends Send {} interface Contract extends Sync {} class Shared implements Contract { pub value: i64; }",
+            "pub value: i64;",
+            "pub mut value: i64;",
+        ),
+        (
+            "default",
+            "interface Named { fn get(self) -> i64 { return 3; } } class Shared implements Named {}",
+            "return 3;",
+            "return true;",
+        ),
+        (
+            "static",
+            "class Shared { pub static value: i64 = 3; }",
+            "= 3;",
+            "= true;",
+        ),
+    ] {
+        let f = Fixture::new();
+        let entry = f.0.join("main.wi");
+        let source = format!("class Gate<T> {{ value: T; }} {} {declaration}", basic());
+        fs::write(&entry, &source).unwrap();
+        let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+        let baseline = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+        assert!(
+            !baseline.diagnostics.iter().any(|d| d.severity == "error"),
+            "{shape}: {:?}",
+            baseline.diagnostics
+        );
+        for (case, candidate) in [
+            ("unrelated", source.replacen("return 1;", "return 2;", 1)),
+            ("invalid", source.replacen(needle, change, 1)),
+            (
+                "relocate",
+                format!("\n{}", source.replacen(needle, change, 1)),
+            ),
+            ("repair", source.clone()),
+        ] {
+            fs::write(&entry, &candidate).unwrap();
+            let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+            assert_eq!(
+                serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+                serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+                "{shape} {case}"
+            );
+            if case == "unrelated" {
+                assert_eq!(
+                    retained.incremental_stats["declaration_validations"], 0,
+                    "{shape}: {}",
+                    retained.incremental_stats
+                );
+                assert_eq!(
+                    retained.incremental_stats["precheck_bodies"], 1,
+                    "{shape}: {}",
+                    retained.incremental_stats
+                );
+            } else if case != "repair" {
+                assert!(
+                    warm.diagnostics.iter().any(|d| d.severity == "error"),
+                    "{shape} {case}"
+                );
+            }
+            assert_eq!(fs::read_to_string(&entry).unwrap(), candidate);
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_precheck_collision_diagnostics_match_clean() {
+    #[derive(Default)]
+    struct CompleteDiagnostics {
+        raw: Vec<serde_json::Value>,
+        facts: Diagnostics,
+    }
+    impl crate::diagnostics::DiagnosticEmitter for CompleteDiagnostics {
+        fn emit(
+            &mut self,
+            diagnostic: &crate::diagnostics::Diagnostic,
+            sources: &dyn crate::diagnostics::source_map::SourceLookup,
+        ) -> std::io::Result<()> {
+            self.raw.push(serde_json::to_value(diagnostic).unwrap());
+            self.facts.emit(diagnostic, sources)
+        }
+    }
+    fn capture(
+        entry: &std::path::Path,
+        state: &mut crate::compiler_db::revision::AnalysisRevision,
+    ) -> (Baseline, Vec<serde_json::Value>) {
+        let mut diagnostics = CompleteDiagnostics::default();
+        let snapshot = state
+            .analyze_verification(
+                crate::CompilerSession::new(
+                    entry.to_str().unwrap(),
+                    "",
+                    &crate::CompilerOptions::debug(),
+                    None,
+                ),
+                &mut diagnostics,
+            )
+            .unwrap();
+        (
+            Baseline::from_snapshot(&snapshot, diagnostics.facts.facts).unwrap(),
+            diagnostics.raw,
+        )
+    }
+    let f = Fixture::new();
+    let entry = f.0.join("main.wi");
+    let provider = f.0.join("provider.wi");
+    fs::write(&provider, "pub fn other() -> i64 { return 4; }").unwrap();
+    fs::write(f.0.join("value.wi"), "").unwrap();
+    fs::write(f.0.join("extra.wi"), "").unwrap();
+    let base = "class Gate<T> { value: T; } fn value() -> i64 { return 1; } fn main() {}";
+    let duplicate = "fn pick<T>(x: T) -> T { return x; } fn pick<T>(x: T) -> T { return x; }";
+    fs::write(&entry, base).unwrap();
+    let mut state = crate::compiler_db::revision::AnalysisRevision::default();
+    let (baseline, _) = capture(&entry, &mut state);
+    for (case, candidate, invalid) in [
+        ("module_add", format!("import value; {base}"), true),
+        ("module_remove", base.to_owned(), false),
+        (
+            "alias_add",
+            format!("import provider as value; import extra; {base}"),
+            true,
+        ),
+        (
+            "alias_reorder",
+            format!("import extra; import provider as value; {base}"),
+            true,
+        ),
+        (
+            "alias_relocate",
+            format!("\n\nimport extra; import provider as value; {base}"),
+            true,
+        ),
+        (
+            "item_alias",
+            format!("import provider::other as value; {base}"),
+            true,
+        ),
+        ("alias_remove", base.to_owned(), false),
+        (
+            "constant_first",
+            format!("const value: i64 = 9; {base}"),
+            true,
+        ),
+        (
+            "constant_last",
+            format!("{base} const value: i64 = 9;"),
+            true,
+        ),
+        (
+            "constant_relocate",
+            format!("\n{base} const value: i64 = 9;"),
+            true,
+        ),
+        ("constant_remove", base.to_owned(), false),
+        ("duplicate_generic", format!("{base} {duplicate}"), true),
+        ("duplicate_relocate", format!("\n{base} {duplicate}"), true),
+        ("duplicate_remove", base.to_owned(), false),
+    ] {
+        fs::write(&entry, &candidate).unwrap();
+        for repeat in 0..2 {
+            let (warm, warm_diagnostics) = capture(&entry, &mut state);
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let (clean, clean_diagnostics) = capture(&entry, &mut clean_state);
+            assert_eq!(
+                serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+                serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+                "{case} repeat={repeat}"
+            );
+            assert_eq!(
+                warm_diagnostics, clean_diagnostics,
+                "full diagnostics {case} repeat={repeat}"
+            );
+            assert_eq!(
+                warm.diagnostics.iter().any(|d| d.severity == "error"),
+                invalid,
+                "{case}"
+            );
+            if repeat == 1 {
+                assert_eq!(
+                    state.incremental_stats["declaration_validations"], 0,
+                    "stable {case}: {}",
+                    state.incremental_stats
+                );
+            }
+            assert_eq!(fs::read_to_string(&entry).unwrap(), candidate);
+            assert_eq!(
+                fs::read_to_string(&provider).unwrap(),
+                "pub fn other() -> i64 { return 4; }"
+            );
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_import_topology_retains_unrelated_modules() {
+    for count in [8, 32, 128] {
+        let f = Fixture::new();
+        let entry = f.0.join("main.wi");
+        let library = f.0.join("stable.wi");
+        let extra = f.0.join("extra.wi");
+        let unchanged = (0..count)
+            .map(|i| format!("pub fn unrelated{i}() -> i64 {{ return {i}; }}\n"))
+            .collect::<String>();
+        fs::write(&library, &unchanged).unwrap();
+        let source = format!("import stable;\n{}", basic());
+        fs::write(&entry, &source).unwrap();
+        let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+        let baseline = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+        for (case, candidate) in [
+            ("add", format!("import extra;\n{source}")),
+            (
+                "reorder",
+                format!("import stable; import extra;\n{}", basic()),
+            ),
+            ("remove", source.clone()),
+        ] {
+            if case == "add" {
+                fs::write(&extra, "pub fn added() -> i64 { return 42; }").unwrap();
+            }
+            if case == "remove" {
+                fs::remove_file(&extra).unwrap();
+            }
+            fs::write(&entry, &candidate).unwrap();
+            let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+            let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+            assert_eq!(
+                serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+                serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+                "{case} {count}"
+            );
+            assert_eq!(
+                retained.typechecks,
+                usize::from(case == "add"),
+                "{case} {count}: {}",
+                retained.incremental_stats
+            );
+            assert_eq!(
+                retained.incremental_stats["effects_recomputed"],
+                // New module: its function plus inherited Into, in two effect lattices.
+                if case == "add" { 4 } else { 0 },
+                "{case} {count}: {}",
+                retained.incremental_stats
+            );
+            assert_eq!(
+                retained.incremental_stats["effects_scanned"],
+                usize::from(case == "add"),
+                "{case} {count}: {}",
+                retained.incremental_stats
+            );
+            assert_eq!(
+                retained.incremental_stats["precheck_bodies"],
+                usize::from(case == "add"),
+                "{case} {count}: {}",
+                retained.incremental_stats
+            );
+            assert_eq!(fs::read_to_string(&library).unwrap(), unchanged);
+            assert_eq!(fs::read_to_string(&entry).unwrap(), candidate);
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_import_topology_invalidates_dependents_and_relocated_evidence() {
+    let f = Fixture::new();
+    let entry = f.0.join("main.wi");
+    let library = f.0.join("library.wi");
+    let extra = f.0.join("extra.wi");
+    fs::write(&library, "pub fn value(x: i64) -> i64 { return x + 1; }").unwrap();
+    let body =
+        "fn dependent() -> i64 { return library::value(1); } fn main() { println(dependent()); }";
+    let source = format!("import library; {body}");
+    fs::write(&entry, &source).unwrap();
+    let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+    let baseline = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+    for (case, imports, lib) in [
+        (
+            "insert_before",
+            "import extra; import library;",
+            Some("pub fn value(x: i64) -> i64 { return x + 1; }"),
+        ),
+        (
+            "changed_effect",
+            "import extra; import library;",
+            Some("pub fn value(x: i64) -> i64 { println(x); return x; }"),
+        ),
+        (
+            "changed_signature",
+            "import extra; import library;",
+            Some("pub fn value(x: bool) -> bool { return x; }"),
+        ),
+        ("remove", "import extra;", None),
+        (
+            "restore",
+            "import library; import extra;",
+            Some("pub fn value(x: i64) -> i64 { return x + 2; }"),
+        ),
+        (
+            "relocate",
+            "\n\nimport library; import extra;",
+            Some("\n\npub fn value(x: i64) -> i64 { return x + 2; }"),
+        ),
+    ] {
+        fs::write(&extra, "pub fn spare() {}").unwrap();
+        match lib {
+            Some(text) => fs::write(&library, text).unwrap(),
+            None => fs::remove_file(&library).unwrap(),
+        }
+        let candidate = format!("{imports} {body}");
+        fs::write(&entry, &candidate).unwrap();
+        let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+        let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+        let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+        assert_eq!(
+            serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+            serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+            "{case}"
+        );
+        if case == "insert_before" {
+            assert_eq!(retained.typechecks, 1);
+        }
+        if case == "relocate" {
+            assert_eq!(retained.typechecks, 0);
+            assert_eq!(
+                retained.incremental_stats["effects_recomputed"], 0,
+                "{}",
+                retained.incremental_stats
+            );
+        }
+        assert_eq!(fs::read_to_string(&entry).unwrap(), candidate);
+    }
+}
+
+#[test]
+fn semantic_verify_async_borrow_unrelated_import_changes_skip_checks() {
+    verify_unrelated_import_changes_skip_semantics(true);
+}
+
+fn verify_unrelated_import_changes_skip_semantics(with_borrows: bool) {
+    for count in [8, 32, 128] {
+        for transaction in [false, true] {
+            let f = Fixture::new();
+            let entry = f.0.join("main.wi");
+            let extra = f.0.join("extra.wi");
+            fs::write(&extra, "").unwrap();
+            let source = format!(
+                "class Box<T> {{ value: T; }} {} {}",
+                basic(),
+                if with_borrows {
+                    "async fn borrow(x: &i64) -> i64 { return x; } async fn consumer() { let x = 1; let t = borrow(&x); await t; }"
+                } else {
+                    ""
+                }
+            ) + &(0..count)
+                .map(|i| format!("fn unrelated{i}() -> i64 {{ return {i}; }}\n"))
+                .collect::<String>();
+            fs::write(&entry, &source).unwrap();
+            let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+            let baseline = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+            if with_borrows {
+                assert!(
+                    retained.incremental_stats["async_borrow_checks"]
+                        .as_u64()
+                        .unwrap()
+                        >= count
+                );
+            }
+            for (case, candidate) in [
+                ("add", format!("import extra;\n{source}")),
+                ("remove", source.clone()),
+            ] {
+                fs::write(&entry, &candidate).unwrap();
+                if transaction {
+                    // A retained compiler revision may predate the current
+                    // prepared transaction. Import edits must not invalidate
+                    // bodies that do not read the changed import bindings.
+                    let snapshot = crate::CompilerSession::new(
+                        entry.to_str().unwrap(),
+                        "",
+                        &crate::CompilerOptions::debug(),
+                        None,
+                    )
+                    .analysis_for_edit_with_emitter(&mut Diagnostics::default())
+                    .unwrap();
+                    let function = snapshot
+                        .functions
+                        .iter()
+                        .find(|f| f.name == "value")
+                        .unwrap()
+                        .id
+                        .clone();
+                    let workspace = edit::Workspace::open(&f.0).unwrap();
+                    let preview = workspace
+                        .prepare(
+                            &entry,
+                            false,
+                            edit::Request {
+                                revision: snapshot.revision,
+                                operations: vec![edit::Operation::ReplaceBody {
+                                    function,
+                                    body: "{ return 7; }".into(),
+                                }],
+                            },
+                            edit::ChangeFormat::Diff,
+                            &mut Diagnostics::default(),
+                        )
+                        .unwrap();
+                    let id = preview["transaction"].as_str().unwrap();
+                    let manifest =
+                        serde_json::from_value(preview["verification_manifest"].clone()).unwrap();
+                    let warm = workspace
+                        .verify_manifest_retained(id, &manifest, &mut retained)
+                        .unwrap();
+                    let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+                    let clean = workspace
+                        .verify_manifest_retained(id, &manifest, &mut clean_state)
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(warm).unwrap(),
+                        serde_json::to_value(clean).unwrap(),
+                        "{case} transaction count={count}"
+                    );
+                } else {
+                    let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+                    let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+                    let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+                    assert_eq!(
+                        serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+                        serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+                        "{case} tree count={count}"
+                    );
+                }
+                assert_eq!(
+                    retained.incremental_stats["precheck_bodies"],
+                    usize::from(transaction && case == "add"),
+                    "{case} transaction={transaction} count={count}: {}",
+                    retained.incremental_stats
+                );
+                for counter in [
+                    "precheck_signatures",
+                    "precheck_templates",
+                    "precheck_declarations",
+                    "declaration_validations",
+                ] {
+                    assert_eq!(
+                        retained.incremental_stats[counter], 0,
+                        "{case} transaction={transaction} count={count} {counter}: {}",
+                        retained.incremental_stats
+                    );
+                }
+                assert_eq!(
+                    retained.typechecks,
+                    usize::from(transaction && case == "add"),
+                    "{case} count={count}"
+                );
+                assert_eq!(
+                    retained.incremental_stats["effects_recomputed"], 0,
+                    "{case} count={count}: {}",
+                    retained.incremental_stats
+                );
+                assert_eq!(
+                    retained.incremental_stats["async_borrow_checks"],
+                    usize::from(with_borrows && transaction && case == "add"),
+                    "{case} transaction={transaction} count={count}: {}",
+                    retained.incremental_stats
+                );
+                assert_eq!(fs::read_to_string(&entry).unwrap(), candidate);
+                assert_eq!(fs::read_to_string(&extra).unwrap(), "");
+            }
+        }
+    }
+}
+
+#[test]
+fn semantic_verify_async_borrow_actual_dependencies_match_clean() {
+    let f = Fixture::new();
+    let entry = f.0.join("main.wi");
+    let provider = f.0.join("provider.wi");
+    let asynchronous = "pub async fn borrow(x: &i64) -> i64 { return x; }";
+    let synchronous = "async fn other() -> i64 { return 1; } pub fn borrow(x: &i64) -> Task<i64> { return other(); }";
+    let source = "import provider; async fn local(x: &i64) -> i64 { return x; } async fn active() { let x = 1; await local(&x); } async fn dependent() { let x = 1; let t = provider::borrow(&x); } fn main() {}";
+    fs::write(&entry, source).unwrap();
+    fs::write(&provider, asynchronous).unwrap();
+    let mut retained = crate::compiler_db::revision::AnalysisRevision::default();
+    let baseline = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+    assert!(baseline.diagnostics.iter().any(|d| d.code == "E1708"));
+    for (case, library, candidate, escaping, checks) in [
+        ("sync", synchronous, source.to_owned(), false, 1),
+        ("async", asynchronous, source.to_owned(), true, 1),
+        (
+            "await",
+            asynchronous,
+            source.replace(
+                "let t = provider::borrow(&x);",
+                "let t = provider::borrow(&x); await t;",
+            ),
+            false,
+            1,
+        ),
+        (
+            "nested",
+            asynchronous,
+            source.replace(
+                "let t = provider::borrow(&x);",
+                "let f = || { let t = provider::borrow(&x); };",
+            ),
+            true,
+            1,
+        ),
+        ("restore", asynchronous, source.to_owned(), true, 1),
+        ("relocate", asynchronous, format!("\n\n{source}"), true, 0),
+    ] {
+        fs::write(&provider, library).unwrap();
+        fs::write(&entry, &candidate).unwrap();
+        let warm = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+        let mut clean_state = crate::compiler_db::revision::AnalysisRevision::default();
+        let clean = Baseline::capture_retained(&entry, None, &mut clean_state).unwrap();
+        assert_eq!(
+            serde_json::to_value(baseline.compare(&warm).unwrap()).unwrap(),
+            serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+            "{case}"
+        );
+        assert_eq!(
+            warm.diagnostics.iter().any(|d| d.code == "E1708"),
+            escaping,
+            "{case}"
+        );
+        assert_eq!(
+            retained.incremental_stats["async_borrow_checks"], checks,
+            "{case}: {}",
+            retained.incremental_stats
+        );
+        let repeat = Baseline::capture_retained(&entry, None, &mut retained).unwrap();
+        assert_eq!(
+            serde_json::to_value(baseline.compare(&repeat).unwrap()).unwrap(),
+            serde_json::to_value(baseline.compare(&clean).unwrap()).unwrap(),
+            "repeat {case}"
+        );
+        assert_eq!(
+            retained.incremental_stats["async_borrow_checks"], 0,
+            "repeat {case}"
+        );
     }
 }

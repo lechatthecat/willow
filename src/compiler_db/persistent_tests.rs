@@ -164,6 +164,23 @@ fn persistent_cache_corrupt_records_are_misses_and_can_be_replaced() {
         assert!(load(&path, &fixture.key()).is_err(), "accepted {name}");
     }
     let original: serde_json::Value = serde_json::from_slice(&valid[65..]).unwrap();
+    for id in [0, u32::MAX] {
+        let mut malformed = original.clone();
+        malformed["modules"][0][0] = serde_json::json!(id);
+        std::fs::write(&path, envelope(&serde_json::to_vec(&malformed).unwrap())).unwrap();
+        assert!(
+            load(&path, &fixture.key()).is_err(),
+            "accepted invalid module ID"
+        );
+    }
+    let mut duplicate = original.clone();
+    let module = duplicate["modules"][0].clone();
+    duplicate["modules"].as_array_mut().unwrap().push(module);
+    std::fs::write(&path, envelope(&serde_json::to_vec(&duplicate).unwrap())).unwrap();
+    assert!(
+        load(&path, &fixture.key()).is_err(),
+        "accepted duplicate module ID"
+    );
     for field in ["id_ends", "parsed", "index", "bodies", "syntax"] {
         let mut malformed = original.clone();
         malformed[field] = serde_json::Value::Null;
@@ -171,6 +188,23 @@ fn persistent_cache_corrupt_records_are_misses_and_can_be_replaced() {
         assert!(
             load(&path, &fixture.key()).is_err(),
             "accepted invalid {field}"
+        );
+    }
+    for input in [
+        serde_json::json!({"SignatureSymbol": {"Dispatch": [0, "method"]}}),
+        serde_json::json!("Target"),
+    ] {
+        let mut malformed = original.clone();
+        let checks = malformed["bodies"]["checks"].as_array_mut().unwrap();
+        let signature = checks
+            .iter_mut()
+            .find(|check| check[0][1] == "Signature")
+            .unwrap();
+        signature[1]["inputs"] = serde_json::json!([[input, null]]);
+        std::fs::write(&path, envelope(&serde_json::to_vec(&malformed).unwrap())).unwrap();
+        assert!(
+            load(&path, &fixture.key()).is_err(),
+            "accepted foreign signature dependency"
         );
     }
     let mut exhausted = original.clone();
@@ -280,9 +314,116 @@ fn semantic_verify_persistent_cache_readonly_reuse_counts() {
             warm.db.typed_bodies.reused()
         );
         assert_eq!(warm.db.typed_bodies.typechecks(), 1);
+        assert_eq!(warm.db.typed_bodies.signature_checks.get(), 0);
+        assert_eq!(warm.db.typed_bodies.concurrency_checks.get(), 1);
+        assert_eq!(
+            warm.db.effects.work().1,
+            0,
+            "value-only edit must reuse solved effects"
+        );
         assert!(warm.db.typed_bodies.reused() >= count + 2);
         assert_eq!(std::fs::read(&path).unwrap(), cache_before);
         let snapshot = crate::ai::snapshot(&warm, &entry, &edited, None).unwrap();
         assert!(snapshot.functions.iter().any(|f| f.name == "first"));
     }
+}
+
+#[test]
+fn semantic_verify_disk_named_and_generic_signatures_reuse_and_clean_parity() {
+    for count in [8, 32, 128] {
+        for (declaration, ty) in [
+            ("class Box {}", "Box"),
+            ("class Box<T> { value: T; }", "Box<i64>"),
+            ("enum Box<T> { Value(T) }", "Box<i64>"),
+            ("enum Box<T> { Value(T) }", "fn(Box<i64>) -> Box<i64>"),
+        ] {
+            let fixture = Fixture::new();
+            let compile = |text: &str, old: Option<&DiskRevision>, syntax: SyntaxQueries| {
+                let entry = fixture.0.join("main.wi");
+                std::fs::write(&entry, text).unwrap();
+                let map = SourceMap::new(entry.to_str().unwrap(), text);
+                let syntax = Rc::new(RefCell::new(syntax.candidate().unwrap()));
+                let mut inputs = fixture.inputs();
+                inputs.capture_analysis = true;
+                inputs.verification = true;
+                let frontend = crate::run_frontend_revision_cached(
+                    text,
+                    &fixture.0,
+                    &map,
+                    inputs,
+                    &mut Diagnostics::default(),
+                    None,
+                    Some(Rc::clone(&syntax)),
+                    old,
+                )
+                .unwrap();
+                (frontend, syntax)
+            };
+            let mut source = format!("{SOURCE} {declaration}");
+            for i in 0..count {
+                source.push_str(&format!(
+                    " fn unrelated{i}(v: {ty}) -> {ty} {{ return v; }}"
+                ));
+            }
+            let (before, syntax) = compile(&source, None, SyntaxQueries::default());
+            let path = fixture.0.join("analysis.cache");
+            save(&path, fixture.key(), &before, &syntax.borrow()).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let (disk, syntax) = load(&path, &fixture.key()).unwrap();
+            let edited = source.replacen("return 1;", "return 9;", 1);
+            let (warm, _) = compile(&edited, Some(&disk), syntax);
+            assert_eq!(
+                warm.db.typed_bodies.signature_checks.get(),
+                0,
+                "{ty} {count}"
+            );
+            let (clean, _) = compile(&edited, None, SyntaxQueries::default());
+            let entry = fixture.0.join("main.wi");
+            let baseline = |frontend, text: &str| {
+                let snapshot = crate::ai::snapshot(frontend, &entry, text, None).unwrap();
+                crate::ai::verify::Baseline::from_snapshot(&snapshot, vec![]).unwrap()
+            };
+            let base = baseline(&before, &source);
+            assert_eq!(
+                serde_json::to_value(base.compare(&baseline(&warm, &edited)).unwrap()).unwrap(),
+                serde_json::to_value(base.compare(&baseline(&clean, &edited)).unwrap()).unwrap(),
+                "{ty} {count}",
+            );
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert_eq!(std::fs::read_to_string(entry).unwrap(), edited);
+        }
+    }
+}
+
+#[test]
+fn persistent_precheck_malformed_keys_and_outputs_are_cache_misses() {
+    let fixture = Fixture::new();
+    let (frontend, syntax) = fixture.compile(
+        "class Box<T> { value: T; } fn use_box(v: Box<i64>) -> Box<i64> { return v; } fn main() {}",
+        None,
+        SyntaxQueries::default(),
+    );
+    let path = fixture.0.join("analysis.cache");
+    save(&path, fixture.key(), &frontend, &syntax.borrow()).unwrap();
+    let valid = std::fs::read(&path).unwrap();
+    let original: serde_json::Value = serde_json::from_slice(&valid[65..]).unwrap();
+    assert!(!original["prechecks"].as_array().unwrap().is_empty());
+    for dependency in [
+        serde_json::json!({"field":"symbols","key":null}),
+        serde_json::json!({"field":"symbols","key":{"Dispatch":[0,"m"]}}),
+        serde_json::json!({"field":"unknown","key":"bad"}),
+        serde_json::json!({"field":"generic.instances","key":"bad"}),
+    ] {
+        let mut candidate = original.clone();
+        candidate["prechecks"][0][1]["reads"] = serde_json::json!([[dependency, null]]);
+        std::fs::write(&path, envelope(&serde_json::to_vec(&candidate).unwrap())).unwrap();
+        assert!(load(&path, &fixture.key()).is_err());
+    }
+    let mut candidate = original;
+    candidate["prechecks"][0][1]["writes"] =
+        serde_json::json!([[{"field":"symbols","key":{"Class":"Box"}},"bad"]]);
+    std::fs::write(&path, envelope(&serde_json::to_vec(&candidate).unwrap())).unwrap();
+    assert!(load(&path, &fixture.key()).is_err());
+    std::fs::write(&path, valid).unwrap();
+    assert!(load(&path, &fixture.key()).is_ok());
 }

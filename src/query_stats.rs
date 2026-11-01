@@ -267,6 +267,16 @@ fn trace(message: std::fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr().lock(), "[query-log] {message}");
 }
 
+/// Separate verification reporting work from compiler cache/front-end work.
+pub(crate) fn verification_phase(phase: &str, start: std::time::Instant) {
+    if std::env::var_os("WILLOW_QUERY_CACHE_STATS").is_some_and(|v| v == "1") {
+        eprintln!(
+            "willow-verification-phase {}",
+            serde_json::json!({"phase": phase, "elapsed_us": start.elapsed().as_micros()})
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -408,6 +408,12 @@ impl TypeChecker {
     }
 
     fn registration_module_path(&self, path: &str) -> Option<&String> {
+        if super::precheck_journal::is_active() {
+            super::precheck_journal::read(
+                super::precheck_journal::Key::new("registration_path", Some(path.into())),
+                serde_json::to_value(self.registration_import_paths.get(path)).unwrap(),
+            );
+        }
         self.registration_import_paths
             .get(path)
             .or_else(|| self.module_access_names.get(path))
@@ -1006,6 +1012,7 @@ impl TypeChecker {
                         .insert(local.to_string(), Some(import.span));
                     self.imported_collection_aliases
                         .insert(local.to_string(), (*item).to_string());
+                    self.imported_collection_targets.insert((*item).to_string());
                     if import.alias.is_none() {
                         self.imported_collection_types.insert((*item).to_string());
                     }

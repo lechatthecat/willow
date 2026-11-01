@@ -3,6 +3,7 @@
 pub(crate) mod body;
 pub(crate) mod captured;
 mod checked;
+pub(crate) mod checks;
 pub(crate) mod declarations;
 pub(crate) mod dependencies;
 pub(crate) mod dispatch;
@@ -49,6 +50,7 @@ struct CheckedUnitRecord {
 
 pub struct CompilerDb {
     pub(crate) source_imports_checked: bool,
+    pub(crate) prechecks: std::rc::Rc<crate::semantic::type_checker::precheck::Cache>,
     /// Whole-program field writes, shared by every unit's checker.
     pub(crate) field_writes: std::rc::Rc<crate::semantic::field_writes::FieldWrites>,
     /// Monomorph diagnostic spellings, moved into code generation once.
@@ -85,6 +87,7 @@ impl CompilerDb {
         let overflow_checks = inputs.options.target.build_mode == crate::BuildMode::Debug;
         Self {
             source_imports_checked: false,
+            prechecks: Default::default(),
             field_writes: Default::default(),
             generic_sources: Default::default(),
             runtime_names: Default::default(),

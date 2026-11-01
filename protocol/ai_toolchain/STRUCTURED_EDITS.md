@@ -55,6 +55,27 @@ stops before modifying any file in its preflight pass. Restore/resolve the
 reported conflicting file explicitly before retrying recovery; no automatic
 conflict resolution is attempted.
 
+## Semantic verification with a complete change manifest
+
+`prepare` and `preview` return `verification_manifest`, a version-1 object
+binding all prepared changes to their semantic baseline. Save it as JSON and run:
+
+```sh
+willow edit verify --root . --transaction <transaction> --manifest manifest.json
+```
+
+Submitting this manifest is a fresh caller guarantee that every unlisted original
+and prepared input is unchanged. Verification requires exactly the prepared
+changes and checks their original and candidate bytes before and after analysis.
+It rejects missing, extra, malformed, or mismatched changes and baseline bindings.
+Unreported tampering, including same-size/same-mtime changes, is outside this
+contract. Omitting `--manifest` retains exhaustive transaction integrity checks.
+
+Verification preserves source, cache and transaction bytes and does not validate
+or apply the edit. `validate` and `apply` retain their exhaustive checks. The
+independent semantic-difference report remains version 1. Manifest attestation
+alone makes no claim about the amount of semantic reanalysis or cache work.
+
 ## Visibility, concurrency, and recovery contract
 
 `Workspace` holds the exclusive advisory OS lock at `.willow-edits/lock`

@@ -152,13 +152,14 @@ pub(crate) fn resolve_imports_spooled(
 pub(crate) fn resolve_imports_spooled_entry(
     entry_program: &Program,
     src_root: &Path,
-    artifacts: super::artifacts::UnitArtifacts,
+    mut artifacts: super::artifacts::UnitArtifacts,
     entry_path: Option<PathBuf>,
     package_graph: Option<std::sync::Arc<crate::package::PackageGraph>>,
     project_mode: bool,
     check_modules: &std::collections::BTreeMap<String, PathBuf>,
 ) -> ImportResolution {
     let mut graph = ModuleGraph::new(src_root.to_path_buf());
+    graph.retain_source_ids(std::mem::take(&mut artifacts.previous_modules));
     graph.entry_path = entry_path;
     graph.project_mode = project_mode;
     graph.package_graph = package_graph;
@@ -186,9 +187,9 @@ pub(crate) fn resolve_imports_in_graph(
         .iter()
         .any(|unit| unit.canonical_path == bundled_path)
     {
-        let id = graph.reserve_module_id(bundled_path);
-        let mut source = include_str!("../../std/collections.wi").to_owned();
         let path = Path::new("<std>/collections.wi");
+        let id = graph.reserve_source_key(ModuleKey::new(PackageId(0), bundled_path), path);
+        let mut source = include_str!("../../std/collections.wi").to_owned();
         let parsed = if let Some(queries) = graph
             .artifacts
             .as_ref()
@@ -571,7 +572,7 @@ fn resolve_one(
         }
     };
 
-    let module_id = graph.reserve_key(key.clone());
+    let module_id = graph.reserve_source_key(key.clone(), &module_path);
     let tracked = graph
         .artifacts
         .as_ref()
