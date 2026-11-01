@@ -12,6 +12,7 @@ mod overview;
 mod package;
 mod protocol;
 mod rust;
+mod semantic_diff;
 
 #[derive(Debug)]
 enum CliCommand {
@@ -599,6 +600,13 @@ fn child_exit_code(status: ExitStatus) -> i32 {
 }
 
 pub(super) fn run(args: Vec<String>) -> Result<()> {
+    if args.first().is_some_and(|arg| arg == "verify-edit") {
+        let code = semantic_diff::run(&args[1..])?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     if let Some(text) = help(&args) {
         println!("{text}");
         return Ok(());

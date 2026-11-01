@@ -157,3 +157,43 @@ fail without changing source files. A rejection tied to one occurrence adds
 `line`/`column`) to the `request.finished` event. Local candidates and journals remain under
 `.willow-edits/`; retain interrupted journals until recovery. Completed candidate
 history may be removed manually while no edit operation is active.
+
+## Git revision verification
+
+Run `willow verify-edit --base HEAD --root . --format json` to compare a local
+Git revision with the working tree, including uncommitted source edits. Use
+`--entry path/to/main.wi` to select an entry. A root containing `project.toml`
+uses project analysis and discovers its modules; otherwise the default entry
+is `main.wi`. `--explain` adds witness paths to the text presentation.
+Analysis mode is determined from each captured tree. Adding or deleting the root
+manifest returns `incomplete`, retaining known baseline diagnostics. Evidence
+paths remain relative to `--root`, including when the entry is in a subdirectory.
+Default entries are resolved independently from the captured manifests. A change
+in the effective entry also returns `incomplete`; an explicit `--entry` selects
+the same entry in both trees, subject to configuration compatibility checks.
+
+The command reads local Git objects and captured source/configuration bytes.
+It does not check out a revision, fetch dependencies, compile executable code,
+run tests, or modify the working tree or index. Analysis uses temporary input
+files, offline dependency resolution, and an existing lockfile when present.
+Dependencies outside the captured root, non-regular source inputs, missing
+sources, ambiguous declarations, and input-limit failures produce an incomplete
+result. Inputs are limited to 64 MiB per tree. Working input digests are checked
+again after analysis. A cold baseline is analyzed first; the target reuses its
+compiler revision and rechecks affected bodies. There is no persistent cache
+publication by this command.
+
+JSON uses `schema: "willow.semantic-diff.v1"` with `status`, `base`, `target`,
+`changes`, and `summary`. Each change identifies its symbol and match result,
+added/removed effects, witness causes and certainty, impacted callers, contracts,
+public API changes, and call-target changes. Symbol matching uses module-relative
+declaration names and kinds, compares signatures, and rejects ambiguous duplicate
+names instead of guessing renames. Paths use workspace-relative `/` separators.
+The legacy `edit verify` and effects JSON formats remain unchanged.
+
+Exit codes are 0 for a complete result without violations, 1 for a contract
+violation or explicitly selected policy violation, 2 for invalid arguments or
+a revision that cannot be resolved, and 3 for incomplete analysis or inconsistent
+inputs. Existing baseline contract violations remain visible and return 1.
+Effect growth alone is informational; opt into rejecting it with
+`--fail-on effect-growth`. Incomplete evidence takes precedence over violations.

@@ -30,6 +30,7 @@ pub struct Symbol {
 /// It does not alter persisted symbol facts or selector identities.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeclarationDetails {
+    pub effect_contracts: Vec<String>,
     pub public_api: bool,
     pub is_public: bool,
     pub is_protected: bool,
@@ -136,6 +137,11 @@ pub(super) fn details_of<'a>(
                 result.insert(
                     f.span,
                     DeclarationDetails {
+                        effect_contracts: f
+                            .effect_contracts
+                            .iter()
+                            .map(|c| c.kind.name().to_owned())
+                            .collect(),
                         public_api: f.public,
                         is_public: f.public,
                         parameter_modes: modes(&f.params),
@@ -210,6 +216,11 @@ pub(super) fn details_of<'a>(
                         result.insert(
                             m.span,
                             DeclarationDetails {
+                                effect_contracts: m
+                                    .effect_contracts
+                                    .iter()
+                                    .map(|c| c.kind.name().to_owned())
+                                    .collect(),
                                 public_api: c.public && (m.public || m.protected),
                                 is_public: m.public,
                                 is_protected: m.protected,
@@ -250,6 +261,11 @@ pub(super) fn details_of<'a>(
                     result.insert(
                         method.span,
                         DeclarationDetails {
+                            effect_contracts: method
+                                .effect_contracts
+                                .iter()
+                                .map(|c| c.kind.name().to_owned())
+                                .collect(),
                             public_api: i.public,
                             is_public: true,
                             is_static: method.is_static,

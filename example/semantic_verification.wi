@@ -1,0 +1,10 @@
+// In a Git project, compare edits with:
+// willow verify-edit --base HEAD --format json --explain
+// Adding a waiting operation to a helper also changes its callers' effects.
+@effects(no_wait)
+fn double(value: i64) -> i64 { return value + value; }
+
+@effects(no_wait)
+fn answer() -> i64 { return double(21); }
+
+fn main() { println(answer()); }

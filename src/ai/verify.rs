@@ -1119,3 +1119,6 @@ impl Baseline {
 #[cfg(test)]
 #[path = "verify_tests.rs"]
 mod tests;
+
+#[path = "semantic_diff.rs"]
+pub mod semantic_diff;
