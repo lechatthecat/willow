@@ -197,6 +197,7 @@ pub(crate) fn module_lambda_symbol(module_prefix: &str, index: usize) -> String 
 /// non-static instance method with a hidden `self` receiver and void return.
 pub(crate) fn constructor_to_method(ctor: &ConstructorDecl) -> MethodDecl {
     MethodDecl {
+        effect_contracts: Vec::new(),
         array_body_optimization: crate::parser::ast::ArrayBodyOptimization::None,
         constraint: None,
         name: "init".to_string(),

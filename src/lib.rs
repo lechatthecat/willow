@@ -2644,6 +2644,7 @@ impl ForeignBatch {
                 defaults.insert(
                     body.id,
                     parser::ast::MethodDecl {
+                        effect_contracts: method.effect_contracts.clone(),
                         array_body_optimization: crate::parser::ast::ArrayBodyOptimization::None,
                         constraint: None,
                         name: method.name.clone(),

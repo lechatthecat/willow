@@ -724,7 +724,7 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
     types: &HashMap<ExprId, Type<N>>,
     origins: Option<(&super::ids::BodyIndex, &EffectQueries)>,
     callables: &HashMap<FunctionId, bool>,
-    direct: &HashMap<FunctionId, LockEffectCause>,
+    direct: &HashMap<FunctionId, DirectLockEffects>,
     external: impl Fn(&FunctionId) -> RuntimeEffects,
 ) -> UnitEffects {
     crate::query_stats::add(crate::query_stats::Counter::NonpreemptibleHelpers, 1);
@@ -775,21 +775,19 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
                     value_constructors.push(FunctionId::method(owner, &variant.name));
                 }
             }
-            Item::Interface(i) if i.type_params.is_empty() => {
+            Item::Interface(i) => {
                 for m in &i.methods {
-                    if let Some(body) = &m.default_body {
-                        pending.push((
-                            FunctionId::method(
-                                TypeId::local(&i.name),
-                                format!("$default${}", m.name),
-                            ),
-                            body.id,
-                            body,
-                        ));
+                    let id =
+                        FunctionId::method(TypeId::local(&i.name), format!("$default${}", m.name));
+                    if let Some(body) = &m.default_body
+                        && (i.type_params.is_empty() || callables.contains_key(&id))
+                    {
+                        // Generic default bodies are included only when the abstract
+                        // checker explicitly registered their typed evidence.
+                        pending.push((id, body.id, body));
                     }
                 }
             }
-            _ => {}
         }
     }
     let canonical_bodies: HashSet<_> = pending.iter().map(|(_, body, _)| *body).collect();
@@ -1065,19 +1063,20 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
             );
         }
     }
-    for (&id, cause) in direct {
-        // Keep fail-closed capabilities for lock safety, but do not promote
-        // an unavailable imported body into a source-level compiler witness.
-        problem = problem.seed(
-            id,
-            cause.kind.effects(),
-            (!cause.is_conservative).then(|| {
-                EffectWitness::Lock(LockEffectWitness {
-                    owner: id,
-                    cause: cause.clone(),
-                })
-            }),
-        );
+    for (&id, causes) in direct {
+        for cause in &causes.causes {
+            // Each wait bit retains its first deterministic source witness.
+            problem = problem.seed(
+                id,
+                cause.kind.effects(),
+                (!cause.is_conservative).then(|| {
+                    EffectWitness::Lock(LockEffectWitness {
+                        owner: id,
+                        cause: cause.clone(),
+                    })
+                }),
+            );
+        }
     }
     for id in graph.ids().chain(callables.keys()).chain(helpers.keys()) {
         let mut mask = ANY_PANIC
@@ -1647,6 +1646,36 @@ pub(crate) struct LockEffectCause {
     pub(crate) lock: Option<Box<LockTarget>>,
 }
 
+/// Bounded direct waiting evidence: retain the first cause for each newly
+/// discovered wait bit, in source traversal order. At most two causes survive.
+/// Keeping the first entry preserves the existing E2604 witness preference.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DirectLockEffects {
+    causes: Vec<LockEffectCause>,
+}
+
+impl DirectLockEffects {
+    pub(crate) fn insert(&mut self, cause: LockEffectCause) {
+        let known = self
+            .causes
+            .iter()
+            .fold(RuntimeEffects::NONE, |bits, c| bits.union(c.kind.effects()));
+        if !known.contains(cause.kind.effects()) {
+            self.causes.push(cause);
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        for cause in other.causes {
+            self.insert(cause);
+        }
+    }
+
+    pub(crate) fn first(&self) -> Option<&LockEffectCause> {
+        self.causes.first()
+    }
+}
+
 /// The locked operand of a `lock` statement: its source spelling of the mode
 /// (`lock`, `lock read`, `lock write`), operand span and checked type, so
 /// effect evidence can name what is acquired.
@@ -2084,12 +2113,14 @@ mod tests {
                 );
                 let direct = HashMap::from([(
                     acquire,
-                    LockEffectCause {
-                        is_conservative: false,
-                        span: Span::dummy(),
-                        operation: "earlier wait".into(),
-                        kind: LockEffectKind::SuspendOrBlock,
-                        lock: None,
+                    DirectLockEffects {
+                        causes: vec![LockEffectCause {
+                            is_conservative: false,
+                            span: Span::dummy(),
+                            operation: "earlier wait".into(),
+                            kind: LockEffectKind::SuspendOrBlock,
+                            lock: None,
+                        }],
                     },
                 )]);
                 let lock_only = solve_unit(
@@ -2341,12 +2372,14 @@ mod tests {
         }
         let direct = HashMap::from([(
             leaf,
-            LockEffectCause {
-                is_conservative: false,
-                span: Span::dummy(),
-                operation: "wait".into(),
-                kind: LockEffectKind::Block,
-                lock: None,
+            DirectLockEffects {
+                causes: vec![LockEffectCause {
+                    is_conservative: false,
+                    span: Span::dummy(),
+                    operation: "wait".into(),
+                    kind: LockEffectKind::Block,
+                    lock: None,
+                }],
             },
         )]);
         let effects = solve_unit(
@@ -3013,7 +3046,7 @@ impl CallableIndex {
 #[derive(Default)]
 pub(crate) struct EffectInputs {
     pub(crate) edges: HashMap<FunctionId, HashSet<FunctionId>>,
-    pub(crate) direct: HashMap<FunctionId, LockEffectCause>,
+    pub(crate) direct: HashMap<FunctionId, DirectLockEffects>,
     pub(crate) direct_sites: Vec<LockEffectCause>,
     pub(crate) sites: Vec<LockEffectCallsite>,
 }
@@ -3076,6 +3109,52 @@ mod local_callable_identity_tests {
                 "declarations={count} index_entries={} lookup_invocations={lookups}",
                 index.local_methods.len()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_wait_tests {
+    use super::*;
+
+    #[test]
+    fn direct_wait_evidence_is_bounded_and_merges_both_bits() {
+        for count in [32, 128, 512, 2048] {
+            for reversed in [false, true] {
+                let mut effects = DirectLockEffects::default();
+                for index in 0..count {
+                    let kind = if (index % 2 == 0) != reversed {
+                        LockEffectKind::Block
+                    } else {
+                        LockEffectKind::Suspend
+                    };
+                    let mut fragment = DirectLockEffects::default();
+                    fragment.insert(LockEffectCause {
+                        is_conservative: false,
+                        span: Span::new(index, index + 1, 1, index + 1),
+                        operation: "wait".into(),
+                        kind,
+                        lock: None,
+                    });
+                    effects.merge(fragment);
+                }
+                assert_eq!(effects.causes.len(), 2);
+                assert_eq!(effects.causes[0].span.start, 0);
+                assert_eq!(effects.causes[1].span.start, 1);
+                let encoded = serde_json::to_vec(&effects).unwrap();
+                let restored: DirectLockEffects = serde_json::from_slice(&encoded).unwrap();
+                let bits = restored
+                    .causes
+                    .iter()
+                    .fold(RuntimeEffects::NONE, |bits, cause| {
+                        bits.union(cause.kind.effects())
+                    });
+                assert_eq!(bits, LOCK_EFFECT_WAIT);
+                println!(
+                    "direct-wait-evidence operations={count} reversed={reversed} retained={}",
+                    restored.causes.len()
+                );
+            }
         }
     }
 }

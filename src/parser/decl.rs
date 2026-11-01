@@ -134,14 +134,63 @@ impl Parser {
         }
     }
 
+    /// Resolve the closed set of built-in contract names at declaration time.
+    fn parse_effect_contracts(&mut self) -> Result<Vec<EffectContract>, Diagnostic> {
+        let mut contracts = Vec::new();
+        while self.eat(TokenKind::At) {
+            let start = self.previous_span();
+            if self.expect_ident()? != "effects" {
+                return Err(self.err(
+                    ErrorCode::E0102,
+                    "unknown declaration attribute; expected `effects`",
+                ));
+            }
+            self.expect(TokenKind::LParen)?;
+            loop {
+                let name = self.expect_ident()?;
+                let kind = match name.as_str() {
+                    "no_wait" => EffectContractKind::NoWait,
+                    "no_block" => EffectContractKind::NoBlock,
+                    "no_suspend" => EffectContractKind::NoSuspend,
+                    _ => {
+                        return Err(self.err(
+                            ErrorCode::E0102,
+                            format!("unknown effect contract `{name}`"),
+                        ));
+                    }
+                };
+                contracts.push(EffectContract {
+                    kind,
+                    span: start.to(self.previous_span()),
+                });
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RParen)?;
+        }
+        Ok(contracts)
+    }
+
     /// `Ok(None)`: the item was consumed but rejected, with its diagnostic
     /// already recorded in `recovered_errors` (see [`Self::parse_const`]).
     pub(super) fn parse_item(&mut self) -> Result<Option<Item>, Diagnostic> {
+        let contracts = self.parse_effect_contracts()?;
         let public = self.eat(TokenKind::Pub);
         let is_open = self.eat(TokenKind::Open);
         let is_async = self.eat(TokenKind::Async);
+        if !contracts.is_empty() && !self.check(TokenKind::Fn) {
+            return Err(self.err(
+                ErrorCode::E0105,
+                "effect contracts require a function or method",
+            ));
+        }
         match self.peek_kind() {
-            TokenKind::Fn => Ok(Some(Item::Function(self.parse_fn(public, is_async)?))),
+            TokenKind::Fn => {
+                let mut function = self.parse_fn(public, is_async)?;
+                function.effect_contracts = contracts;
+                Ok(Some(Item::Function(function)))
+            }
             TokenKind::Class => Ok(Some(Item::Class(self.parse_class(public, is_open)?))),
             TokenKind::Enum => Ok(Some(Item::Enum(self.parse_enum_decl(public)?))),
             TokenKind::Const if is_open => Err(self.err(
@@ -297,6 +346,7 @@ impl Parser {
         let mut constructors = Vec::new();
 
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
+            let contracts = self.parse_effect_contracts()?;
             let member_public = self.eat(TokenKind::Pub);
             let member_prot = if !member_public {
                 self.eat(TokenKind::Prot)
@@ -308,6 +358,9 @@ impl Parser {
             // (willow-scq2). It carries visibility but no other modifiers.
             let is_init = self.is_constructor_init_ahead();
             if is_init {
+                if !contracts.is_empty() {
+                    return Err(self.err(ErrorCode::E0105, "effect contracts require a method"));
+                }
                 constructors.push(self.parse_constructor(member_public, member_prot)?);
                 continue;
             }
@@ -350,15 +403,20 @@ impl Parser {
             let member_async = self.eat(TokenKind::Async);
 
             if self.check(TokenKind::Fn) {
-                methods.push(self.parse_method(
+                let mut method = self.parse_method(
                     member_public,
                     member_prot,
                     member_async,
                     member_open,
                     member_override,
                     member_static,
-                )?);
+                )?;
+                method.effect_contracts = contracts;
+                methods.push(method);
             } else {
+                if !contracts.is_empty() {
+                    return Err(self.err(ErrorCode::E0105, "effect contracts require a method"));
+                }
                 if member_open || member_override || member_async {
                     return Err(self.err(
                         ErrorCode::E0105,
@@ -450,6 +508,7 @@ impl Parser {
         self.default_import_usage.type_parameters(&type_params);
         let mut methods = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
+            let contracts = self.parse_effect_contracts()?;
             // Interface members carry no visibility/modifier keywords: methods are
             // public by contract. A leading `pub`/`prot`/`open`/etc. is not allowed.
             // Static interface members are out of scope (willow-qsqf §17 → E0836).
@@ -481,7 +540,9 @@ impl Parser {
                     "expected an interface method (`fn name(...) -> Type;`)",
                 ));
             }
-            methods.push(self.parse_interface_method()?);
+            let mut method = self.parse_interface_method()?;
+            method.effect_contracts = contracts;
+            methods.push(method);
         }
 
         let end = self.current_span();
@@ -584,6 +645,7 @@ impl Parser {
         let span = start.to(end);
 
         Ok(InterfaceMethodDecl {
+            effect_contracts: Vec::new(),
             name,
             params,
             is_static: !has_self,
@@ -747,6 +809,7 @@ impl Parser {
         let span = start.to(body.span);
 
         Ok(MethodDecl {
+            effect_contracts: Vec::new(),
             array_body_optimization: crate::parser::ast::ArrayBodyOptimization::None,
             constraint,
             name,
@@ -863,6 +926,7 @@ impl Parser {
         let body = self.parse_block()?;
         let span = start.to(body.span);
         Ok(FunctionDecl {
+            effect_contracts: Vec::new(),
             type_params,
             name,
             public,
@@ -915,6 +979,7 @@ impl Parser {
             span,
         };
         Ok(Some(FunctionDecl {
+            effect_contracts: Vec::new(),
             type_params: Vec::new(),
             name,
             public,

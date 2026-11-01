@@ -157,7 +157,7 @@ pub(super) struct BodyOutputs {
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
     analysis_symbols: crate::semantic::analysis_symbols::Facts,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
-    lock_direct: HashMap<FunctionId, LockEffectCause>,
+    lock_direct: HashMap<FunctionId, DirectLockEffects>,
     lock_direct_sites: Vec<LockEffectCause>,
     lock_sites: Vec<LockEffectCallsite>,
     indirect_lock: crate::semantic::indirect_lock::IndirectInputs,
@@ -191,7 +191,7 @@ pub(crate) struct TypedBody {
     analysis_symbols: crate::semantic::analysis_symbols::Facts,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
     #[serde(with = "crate::compiler_db::map_entries")]
-    lock_direct: HashMap<FunctionId, LockEffectCause>,
+    lock_direct: HashMap<FunctionId, DirectLockEffects>,
     lock_direct_sites: Vec<LockEffectCause>,
     lock_sites: Vec<LockEffectCallsite>,
     indirect_lock: crate::semantic::indirect_lock::IndirectInputs,
@@ -457,7 +457,11 @@ impl TypeChecker {
                 .extend(targets);
         }
         for (caller, cause) in body.lock_direct {
-            self.effect_inputs.direct.entry(caller).or_insert(cause);
+            self.effect_inputs
+                .direct
+                .entry(caller)
+                .or_default()
+                .merge(cause);
         }
         self.effect_inputs
             .direct_sites
@@ -1284,6 +1288,30 @@ mod tests {
                 .expect("missing collection import");
             let span = error.primary_span().expect("primary type label");
             assert_eq!(&source[span.start..span.end], expected);
+        }
+    }
+
+    #[test]
+    fn typed_body_mixed_wait_contract_evidence_replays() {
+        for body in ["c.get(); await sleep(1);", "await sleep(1); c.get();"] {
+            for (contract, root) in [("no_suspend", "await"), ("no_block", "BlockingCell.get")] {
+                let source =
+                    format!("@effects({contract}) async fn f(c: BlockingCell<i64>) {{ {body} }}");
+                let (checker, queries, _) = compare(&source);
+                let error = checker
+                    .errors
+                    .iter()
+                    .find(|d| d.code == ErrorCode::E2610)
+                    .expect("mixed waits must survive stored body replay");
+                assert!(
+                    error
+                        .labels
+                        .iter()
+                        .any(|l| l.message == format!("root operation `{root}`")),
+                    "{error:?}"
+                );
+                assert!(queries.stats().hits > 0);
+            }
         }
     }
 

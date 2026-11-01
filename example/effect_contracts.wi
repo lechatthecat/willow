@@ -1,0 +1,28 @@
+// Waiting is excluded from these synchronous helpers, including allocation.
+@effects(no_wait)
+fn twice<T>(value: T, combine: fn(T, T) -> T) -> T {
+    return combine(value, value);
+}
+
+@effects(no_wait)
+fn add(a: i64, b: i64) -> i64 { return a + b; }
+
+class Numbers {
+    @effects(no_wait)
+    pub static fn answer() -> i64 {
+        let values = [20, 1];
+        return add(values[0], values[1]);
+    }
+}
+
+@effects(no_block)
+async fn pause() { await sleep(1); }
+
+@effects(no_wait)
+fn make_task() -> Task<void> { return pause(); }
+
+async fn main() {
+    let task = make_task();
+    await task;
+    println(twice(Numbers::answer(), add));
+}

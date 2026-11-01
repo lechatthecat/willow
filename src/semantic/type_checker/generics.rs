@@ -953,6 +953,7 @@ pub(super) fn class_signature(class: &ClassDecl) -> ClassDecl {
             .methods
             .iter()
             .map(|m| MethodDecl {
+                effect_contracts: m.effect_contracts.clone(),
                 array_body_optimization: m.array_body_optimization,
                 constraint: m.constraint.clone(),
                 name: m.name.clone(),
@@ -2636,7 +2637,11 @@ impl TypeChecker {
         }
     }
 
-    pub(crate) fn validate_generic_templates(&mut self, file: crate::diagnostics::FileId) {
+    pub(crate) fn validate_generic_templates(
+        &mut self,
+        file: crate::diagnostics::FileId,
+        program: &Program,
+    ) {
         // Abstract checking has a separate symbol/output epoch: no symbolic
         // type or speculative body can escape into the concrete artifact set.
         let mut checker = TypeChecker::new();
@@ -2654,6 +2659,30 @@ impl TypeChecker {
         checker.generics.abstract_check = true;
         checker.prechecks = self.prechecks.clone();
         checker.precheck_context = self.precheck_context.clone();
+        let contracts = program.items.iter().any(|item| match item {
+            Item::Function(f) => !f.type_params.is_empty() && !f.effect_contracts.is_empty(),
+            Item::Class(c) => {
+                !c.type_params.is_empty()
+                    && c.methods.iter().any(|m| !m.effect_contracts.is_empty())
+            }
+            Item::Interface(i) => {
+                !i.type_params.is_empty()
+                    && i.methods
+                        .iter()
+                        .any(|m| m.default_body.is_some() && !m.effect_contracts.is_empty())
+            }
+            _ => false,
+        });
+        if contracts {
+            // Abstract effect evidence must be collected, not replayed from the
+            // diagnostic-only template cache. It stays in this isolated checker.
+            checker.prechecks = None;
+            checker.effect_index = self.effect_index.clone();
+            checker.expr_types = self.expr_types.clone();
+            checker.resolved_calls = self.resolved_calls.clone();
+            checker.effect_inputs.direct = self.effect_inputs.direct.clone();
+            checker.effect_inputs.edges = self.effect_inputs.edges.clone();
+        }
         let functions: Vec<_> = self.generics.functions.values().cloned().collect();
         let classes: Vec<_> = self.generics.classes.values().cloned().collect();
         for f in functions {
@@ -2721,6 +2750,83 @@ impl TypeChecker {
                     state.generics.pending.clear();
                 },
             );
+        }
+        // Annotated generic defaults need checking even without an instance.
+        // Check their sibling defaults too, so self-helper edges retain evidence.
+        for interface in program.items.iter().filter_map(|item| match item {
+            Item::Interface(i)
+                if !i.type_params.is_empty()
+                    && i.span.file_id == file
+                    && i.methods
+                        .iter()
+                        .any(|m| m.default_body.is_some() && !m.effect_contracts.is_empty()) =>
+            {
+                Some(i)
+            }
+            _ => None,
+        }) {
+            checker.generics.parameter_names = interface.type_params.iter().cloned().collect();
+            checker.local.declared_type_params = interface.type_params.clone();
+            for method in &interface.methods {
+                if method.default_body.is_some() {
+                    let id = interface_default_effect_id(&interface.name, &method.name);
+                    checker.effect_index.callables.insert(id, false);
+                    checker
+                        .effect_inputs
+                        .edges
+                        .entry(FunctionId::method(
+                            TypeId::from_source_name(&interface.name),
+                            &method.name,
+                        ))
+                        .or_default()
+                        .insert(id);
+                }
+            }
+            for method in &interface.methods {
+                if method.default_body.is_some() {
+                    checker.check_interface_default_body(method, interface);
+                    checker.generics.pending.clear();
+                }
+            }
+        }
+        if contracts {
+            use crate::semantic::call_graph::{CallGraph, CallSites};
+            let mut graph = CallGraph::default();
+            for &id in checker.effect_index.callables.keys() {
+                graph.merge(id, CallSites::default());
+            }
+            for (&id, sites) in &checker.resolved_calls {
+                graph.merge(id, sites.clone());
+            }
+            for (&id, targets) in &checker.effect_inputs.edges {
+                graph.merge(
+                    id,
+                    CallSites {
+                        targets: targets.iter().copied().collect(),
+                        ..Default::default()
+                    },
+                );
+            }
+            let effects = crate::compiler_db::effects::solve_unit(
+                program,
+                &graph,
+                &checker.expr_types,
+                None,
+                &checker.effect_index.callables,
+                &checker.effect_inputs.direct,
+                |target| {
+                    self.effect_queries.as_ref().map_or_else(
+                        || {
+                            crate::compiler_db::effects::intrinsic_effects(target)
+                                .unwrap_or(crate::semantic::effects::RuntimeEffects::MAY_PANIC)
+                        },
+                        |(queries, unit)| {
+                            queries.external(*unit, target, &self.effect_index.imports)
+                        },
+                    )
+                },
+            );
+            checker.report_effect_contracts(program, &graph, &effects.facts, true);
         }
         self.analysis_symbols
             .used_imports

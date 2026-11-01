@@ -1,3 +1,4 @@
+mod effect_contracts;
 // Conditional advice also covers stored results without tracking value provenance.
 const STRING_FIND_SENTINEL_HELP: &str = "if this i64 came from String.find(needle), it is a byte offset, not an Option: -1 means not found; test `index >= 0` before using it, or use `contains(needle)` for a bool";
 
@@ -49,7 +50,7 @@ pub(crate) use types::*;
 
 use super::symbols::{ClassInfo, FieldInfo, MethodInfo, ParamInfo, StaticPropInfo, SymbolTable};
 use crate::compiler_db::effects::{
-    LOCK_EFFECT_WAIT, LockEffectCallsite, LockEffectCause, LockEffectKind,
+    DirectLockEffects, LOCK_EFFECT_WAIT, LockEffectCallsite, LockEffectCause, LockEffectKind,
 };
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::module::std_registry;

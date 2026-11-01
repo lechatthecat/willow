@@ -548,7 +548,8 @@ impl Parser {
     fn at_item_start(&self) -> bool {
         matches!(
             self.peek_kind(),
-            TokenKind::Fn
+            TokenKind::At
+                | TokenKind::Fn
                 | TokenKind::Async
                 | TokenKind::Class
                 | TokenKind::Open
@@ -1886,7 +1887,8 @@ class ProtectedCtor { prot init(self) {} }
             | TokenKind::Eof => AfterQuestion::Try,
 
             // Keywords that cannot start an expression → try-propagate.
-            TokenKind::Fn
+            TokenKind::At
+            | TokenKind::Fn
             | TokenKind::Let
             | TokenKind::Mut
             | TokenKind::If
@@ -1923,6 +1925,7 @@ class ProtectedCtor { prot init(self) {} }
     /// `classify_after_question`: extend BOTH when adding a token.
     fn all_token_kinds() -> Vec<TokenKind> {
         vec![
+            TokenKind::At,
             TokenKind::Fn,
             TokenKind::Let,
             TokenKind::Mut,

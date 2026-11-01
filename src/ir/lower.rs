@@ -4146,6 +4146,7 @@ mod tests {
                         module: None,
                         imports: vec![],
                         items: vec![Item::Function(FunctionDecl {
+                            effect_contracts: Vec::new(),
                             return_type_span: None,
                             type_params: Vec::new(),
                             name: "main".into(),

@@ -289,10 +289,45 @@ pub struct InterfaceDecl {
     pub span: Span,
 }
 
+/// A built-in negative effect contract on a callable declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EffectContractKind {
+    NoWait,
+    NoBlock,
+    NoSuspend,
+}
+
+impl EffectContractKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NoWait => "no_wait",
+            Self::NoBlock => "no_block",
+            Self::NoSuspend => "no_suspend",
+        }
+    }
+
+    pub fn forbidden(self) -> willow_abi::RuntimeEffects {
+        use willow_abi::RuntimeEffects as E;
+        match self {
+            Self::NoWait => E::MAY_BLOCK.union(E::MAY_SUSPEND),
+            Self::NoBlock => E::MAY_BLOCK,
+            Self::NoSuspend => E::MAY_SUSPEND,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EffectContract {
+    pub kind: EffectContractKind,
+    pub span: Span,
+}
+
 /// A required method signature inside an interface (no body).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)] // fields consumed by the interface type checker (willow-t8b)
 pub struct InterfaceMethodDecl {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_contracts: Vec<EffectContract>,
     pub name: String,
     pub params: Vec<Param>,
     pub is_static: bool,
@@ -411,6 +446,8 @@ pub enum ArrayBodyOptimization {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MethodDecl {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_contracts: Vec<EffectContract>,
     #[serde(default)]
     pub array_body_optimization: ArrayBodyOptimization,
     /// A finite, declaration-checked domain for this method.
@@ -446,6 +483,8 @@ pub struct MethodDecl {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionDecl {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_contracts: Vec<EffectContract>,
     #[serde(default)]
     pub type_params: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

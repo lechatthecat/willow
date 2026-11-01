@@ -196,6 +196,10 @@ impl<'a> Lexer<'a> {
                 }
             }
             b'"' => return self.lex_string().map(Some),
+            b'@' => {
+                self.advance();
+                TokenKind::At
+            }
             b';' => {
                 self.advance();
                 TokenKind::Semicolon

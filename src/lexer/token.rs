@@ -92,6 +92,7 @@ pub enum TokenKind {
     Question,
 
     // Delimiters
+    At,
     Semicolon,
     Colon,
     Comma,

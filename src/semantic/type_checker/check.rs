@@ -366,9 +366,17 @@ impl TypeChecker {
         if let Some(file) = program.items.iter().find_map(|item| match item {
             Item::Function(f) if !f.type_params.is_empty() => Some(f.span.file_id),
             Item::Class(c) if !c.type_params.is_empty() => Some(c.span.file_id),
+            Item::Interface(i)
+                if !i.type_params.is_empty()
+                    && i.methods
+                        .iter()
+                        .any(|m| m.default_body.is_some() && !m.effect_contracts.is_empty()) =>
+            {
+                Some(i.span.file_id)
+            }
             _ => None,
         }) {
-            self.validate_generic_templates(file);
+            self.validate_generic_templates(file, program);
         }
         self.finish_effect_analysis(program);
         self.warn_unused_imports(program);
@@ -755,7 +763,8 @@ impl TypeChecker {
                             self.effect_inputs
                                 .direct
                                 .entry(implementation_id)
-                                .or_insert(cause);
+                                .or_default()
+                                .insert(cause);
                         }
                     }
                 }
@@ -851,8 +860,7 @@ impl TypeChecker {
     }
 
     /// Record one direct wait operation in the callable currently being
-    /// checked. The first witness is sufficient: callers only need to know
-    /// that some path can wait before the helper returns.
+    /// checked. Block and suspend must both survive for bit-specific contracts.
     pub(super) fn record_direct_lock_effect(
         &mut self,
         span: Span,
@@ -865,7 +873,8 @@ impl TypeChecker {
             self.effect_inputs
                 .direct
                 .entry(caller)
-                .or_insert(LockEffectCause {
+                .or_default()
+                .insert(LockEffectCause {
                     is_conservative: false,
                     span,
                     operation: operation.into(),
@@ -1126,6 +1135,7 @@ impl TypeChecker {
                 &self.indirect_lock,
             );
         }
+        self.report_effect_contracts(program, &graph, &effects.facts, false);
         self.report_transitive_lock_effects(&effects.facts);
         self.report_indirect_lock_effects(&graph, &effects.facts);
     }
@@ -1191,7 +1201,12 @@ impl TypeChecker {
         span: Span,
         facts: &crate::semantic::effects::EffectFacts<crate::compiler_db::effects::EffectWitness>,
     ) -> Option<LockEffectCause> {
-        if let Some(cause) = self.effect_inputs.direct.get(callee) {
+        if let Some(cause) = self
+            .effect_inputs
+            .direct
+            .get(callee)
+            .and_then(DirectLockEffects::first)
+        {
             return Some(cause.clone());
         }
         // Lambdas are never imported; any other callable outside this unit's

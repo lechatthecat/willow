@@ -1222,6 +1222,7 @@ fn inject_default_interface_methods(
                 chosen.push((
                     iface_name.to_string(),
                     MethodDecl {
+                        effect_contracts: dm.effect_contracts.clone(),
                         array_body_optimization: crate::parser::ast::ArrayBodyOptimization::None,
                         constraint: None,
                         name: dm.name.clone(),
@@ -1491,6 +1492,7 @@ mod tests {
                     };
                     let methods = if depth == 7_999 {
                         vec![parser::ast::InterfaceMethodDecl {
+                            effect_contracts: Vec::new(),
                             name: "answer".into(),
                             params: vec![],
                             is_static: false,

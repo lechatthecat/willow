@@ -966,6 +966,7 @@ impl UnitCodegenContext<'_> {
         self.output.module.clear_context(&mut ctx);
 
         let poll_decl = FunctionDecl {
+            effect_contracts: Vec::new(),
             return_type_span: None,
             type_params: Vec::new(),
             name: format!(
