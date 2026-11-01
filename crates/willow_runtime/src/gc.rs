@@ -206,6 +206,66 @@ pub(crate) fn willow_alloc_enum_variant(
     value
 }
 
+/// [`willow_alloc_enum_variant`] for runtime entries called directly by
+/// generated code. A type-id-0 variant with exactly one payload word
+/// bump-allocates young from the runtime TLAB, with no GC point,
+/// root registration or old-region work; only a TLAB miss reaches the
+/// collecting slow path, rooting a traced word in a shadow-stack slot. Other
+/// shapes, and threads without a runtime TLAB, use the general helper.
+pub(crate) fn alloc_enum_variant_from_generated(
+    type_id: u32,
+    layout: willow_abi::EnumVariantLayout<'_>,
+    payload_words: &[i64],
+) -> *mut u8 {
+    let pointer_bytes = std::mem::size_of::<usize>() as u32;
+    let mask = layout.gc_ref_mask();
+    let young = (type_id == 0
+        && payload_words.len() == 1
+        && layout.payload.word_count() == 1
+        && layout.payload_bytes(pointer_bytes) == 16)
+        .then(|| enum_pair_layout(mask))
+        .flatten();
+    let Some(young) = young else {
+        return willow_alloc_enum_variant(type_id, layout, payload_words);
+    };
+    let mut word = payload_words[0] as *mut u8;
+    let value = match try_alloc_young([young]) {
+        Some([value]) => value,
+        None => {
+            let traced = mask != 0;
+            if traced {
+                willow_push_root(&mut word);
+            }
+            let value = alloc_young_layout_slow(young);
+            if traced {
+                willow_pop_roots(1);
+            }
+            value
+        }
+    };
+    if value.is_null() {
+        return value;
+    }
+    // SAFETY: the object holds the tag word and one payload word; the
+    // payload is fresh zeroed storage, so the barrier sees no deleted edge.
+    unsafe {
+        *value.cast::<i64>() = i64::from(layout.tag);
+        let destination = value.cast::<i64>().add(1);
+        if mask != 0 {
+            willow_gc_write_barrier(
+                value,
+                std::ptr::null_mut(),
+                word,
+                GcStoreDestination::EnumPayload as i64,
+            );
+            store_gc_reference(destination.cast(), word);
+        } else {
+            destination.write(word as i64);
+        }
+    }
+    value
+}
+
 #[repr(C)]
 pub struct GcHeader {
     /// Mark bit used during mark phase.
@@ -269,6 +329,7 @@ pub const GC_TLAB_MAX_OBJECT_SIZE: usize = 4 * 1024;
 mod layouts;
 #[path = "gc/runtime_tlab.rs"]
 mod runtime_tlab;
+use runtime_tlab::enum_pair_layout;
 pub use runtime_tlab::willow_gc_current_tlab;
 pub(crate) use runtime_tlab::{
     RuntimeTlabOwner, YoungLayout, alloc_string_payload_slow, alloc_young_layout_slow,
@@ -1777,7 +1838,18 @@ fn account_old_region_allocation(
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Old-generation allocations this thread requested (test evidence for
+    /// which allocation path runtime entries take).
+    pub(crate) static OLD_ALLOCATIONS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Runtime-root slot registrations made by this thread.
+    pub(crate) static RUNTIME_ROOT_SLOT_ADDS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
+    #[cfg(test)]
+    OLD_ALLOCATIONS_FOR_TEST.set(OLD_ALLOCATIONS_FOR_TEST.get() + 1);
     if payload_size < 0 {
         crate::failure::fatal_invariant("negative managed allocation size");
     }

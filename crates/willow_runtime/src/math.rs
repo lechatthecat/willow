@@ -1,7 +1,7 @@
 use std::ffi::{CStr, c_char};
 
-use crate::gc::{willow_alloc_enum_variant, willow_pop_roots, willow_push_root};
-use crate::string::{willow_string_as_str, willow_string_from_str};
+use crate::gc::alloc_enum_variant_from_generated;
+use crate::string::willow_string_as_str;
 
 const RESULT_OK_TAG: i64 = 0;
 const RESULT_ERR_TAG: i64 = 1;
@@ -108,7 +108,7 @@ pub extern "C" fn willow_f64_trunc_to_i64(value: f64) -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_f64_to_string(value: f64) -> *mut u8 {
-    willow_string_from_str(&format_f64_shortest(value))
+    crate::string::alloc_native_string(&format_f64_shortest(value))
 }
 
 /// `i64.toString()` — GC-managed WillowString of the decimal representation.
@@ -123,7 +123,7 @@ pub extern "C" fn willow_i64_to_string(value: i64) -> *mut u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_bool_to_string(value: u8) -> *mut u8 {
-    willow_string_from_str(if value != 0 { "true" } else { "false" })
+    crate::string::alloc_native_string(if value != 0 { "true" } else { "false" })
 }
 
 /// Returns `Result<f64, ParseFloatError>`.
@@ -153,18 +153,19 @@ pub extern "C" fn willow_i64_parse(text: *const u8) -> *mut u8 {
 
 // Both parse errors have one Invalid(String) variant, and both Ok payloads
 // occupy a non-reference word. Keep their allocation and rooting identical.
+// Called directly by generated code: every object is a short-lived young TLAB
+// allocation when the runtime TLAB hits, and each miss roots the previously
+// built object in a shadow-stack slot.
 fn alloc_parse_result(parsed: Result<i64, String>) -> *mut u8 {
     match parsed {
-        Ok(value) => willow_alloc_enum_variant(
+        Ok(value) => alloc_enum_variant_from_generated(
             0,
             willow_abi::EnumVariantLayout::new(RESULT_OK_TAG as u32, &[willow_abi::SlotKind::Word]),
             &[value],
         ),
         Err(err) => {
-            let mut message = willow_string_from_str(&err);
-            willow_push_root(&mut message as *mut *mut u8);
-
-            let mut parse_error = willow_alloc_enum_variant(
+            let message = crate::string::alloc_native_string(&err);
+            let parse_error = alloc_enum_variant_from_generated(
                 0,
                 willow_abi::EnumVariantLayout::new(
                     PARSE_INVALID_TAG as u32,
@@ -172,19 +173,14 @@ fn alloc_parse_result(parsed: Result<i64, String>) -> *mut u8 {
                 ),
                 &[message as i64],
             );
-            willow_pop_roots(1);
-
-            willow_push_root(&mut parse_error as *mut *mut u8);
-            let result = willow_alloc_enum_variant(
+            alloc_enum_variant_from_generated(
                 0,
                 willow_abi::EnumVariantLayout::new(
                     RESULT_ERR_TAG as u32,
                     &[willow_abi::SlotKind::GcRef],
                 ),
                 &[parse_error as i64],
-            );
-            willow_pop_roots(1);
-            result
+            )
         }
     }
 }
@@ -193,28 +189,28 @@ fn alloc_parse_result(parsed: Result<i64, String>) -> *mut u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_format_f64_17g(value: f64) -> *mut u8 {
-    willow_string_from_str(&format_f64_17g(value))
+    crate::string::alloc_native_string(&format_f64_17g(value))
 }
 
 /// Returns a GC-managed WillowString formatted with 16 decimal places.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_format_f64_16f(value: f64) -> *mut u8 {
-    willow_string_from_str(&format_f64_16f(value))
+    crate::string::alloc_native_string(&format_f64_16f(value))
 }
 
 /// Returns a GC-managed WillowString formatted with 6 decimal places.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_format_f64_6f(value: f64) -> *mut u8 {
-    willow_string_from_str(&format_f64_6f(value))
+    crate::string::alloc_native_string(&format_f64_6f(value))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gc::{runtime_test_guard, willow_gc_init};
-    use crate::string::willow_string_as_str;
+    use crate::string::{willow_string_as_str, willow_string_from_str};
 
     fn ws_text(ptr: *mut u8) -> String {
         unsafe { willow_string_as_str(ptr) }.to_string()

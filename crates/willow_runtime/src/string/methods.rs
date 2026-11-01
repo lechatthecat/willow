@@ -1,6 +1,5 @@
 //! Core String operations. All positions are UTF-8 byte offsets.
-use super::{string_payload_size, ws_as_bytes};
-use crate::gc::{GcObjectKind, GcRootHandle, willow_alloc_with_layout};
+use super::{SlotRoots, alloc_string_payload_rooted, string_payload_size, ws_as_bytes};
 use willow_abi::string_layout::{DATA_OFFSET, LEN_OFFSET};
 
 // String creation validates UTF-8. These operations preserve that invariant;
@@ -28,26 +27,43 @@ unsafe fn copy_bytes(source: *const u8, destination: *mut u8, len: usize) {
     unsafe { std::ptr::copy_nonoverlapping(source, destination, len) };
 }
 
-// The caller supplies a checked range on UTF-8 boundaries.
+// The caller supplies a checked range on UTF-8 boundaries. Called only from
+// runtime entries invoked directly by generated code: a TLAB hit reaches no
+// GC point; a miss roots `value` in a shadow-stack slot and reloads it.
 fn copy_range(value: *mut u8, start: usize, end: usize) -> *mut u8 {
-    let len = end - start;
-    let size = string_payload_size(len).expect("range fits an existing String");
-    let value = GcRootHandle::new(value);
-    let result = willow_alloc_with_layout(GcObjectKind::String, 0, size, 0);
-    if !result.is_null() {
-        unsafe {
-            *(result.add(LEN_OFFSET as usize) as *mut i64) = len as i64;
-            if len != 0 {
-                copy_bytes(
-                    value.load().add(DATA_OFFSET + start),
-                    result.add(DATA_OFFSET),
-                    len,
-                );
-            }
-            *result.add(DATA_OFFSET + len) = 0;
-        }
-    }
+    let size = range_payload_size(start, end);
+    let mut roots = [value];
+    let result = alloc_string_payload_rooted(size, &mut roots);
+    unsafe { fill_range(result, roots[0], start, end) };
     result
+}
+
+fn range_payload_size(start: usize, end: usize) -> usize {
+    string_payload_size(end - start).expect("range fits an existing String") as usize
+}
+
+/// Write the length, bytes [start, end) of `source` and the NUL into the fresh
+/// String payload `result` (null after a failed allocation is ignored).
+///
+/// # Safety
+/// `result` is null or holds `end - start` bytes plus header and NUL; `source`
+/// is the current address of a String covering the range.
+unsafe fn fill_range(result: *mut u8, source: *mut u8, start: usize, end: usize) {
+    if result.is_null() {
+        return;
+    }
+    let len = end - start;
+    unsafe {
+        *(result.add(LEN_OFFSET as usize) as *mut i64) = len as i64;
+        if len != 0 {
+            copy_bytes(
+                source.add(DATA_OFFSET + start),
+                result.add(DATA_OFFSET),
+                len,
+            );
+        }
+        *result.add(DATA_OFFSET + len) = 0;
+    }
 }
 
 /// Copy [start, end); invalid ranges/boundaries raise a recoverable language panic.
@@ -116,15 +132,15 @@ pub extern "C" fn willow_string_repeat(value: *mut u8, count: i64) -> *mut u8 {
     else {
         return fail("String.repeat size overflow");
     };
-    let value = GcRootHandle::new(value);
-    let result = willow_alloc_with_layout(GcObjectKind::String, 0, size, 0);
+    let mut roots = [value];
+    let result = alloc_string_payload_rooted(size as usize, &mut roots);
     if !result.is_null() {
         unsafe {
             *(result.add(LEN_OFFSET as usize) as *mut i64) = total as i64;
             // Doubling copies avoid count-dependent work for empty inputs and
             // use O(log(count)) copy operations for nonempty inputs, O(total) bytes.
             if total != 0 {
-                copy_bytes(value.load().add(DATA_OFFSET), result.add(DATA_OFFSET), len);
+                copy_bytes(roots[0].add(DATA_OFFSET), result.add(DATA_OFFSET), len);
                 let mut filled = len;
                 while filled < total {
                     let copied = filled.min(total - filled);
@@ -155,7 +171,7 @@ pub extern "C" fn willow_string_concat_array(array: *mut u8) -> *mut u8 {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_debug(value: *mut u8) -> *mut u8 {
     let text = unsafe { crate::string::willow_string_as_str(value) };
-    crate::string::willow_string_from_str(&format!("{text:?}"))
+    crate::string::alloc_native_string(&format!("{text:?}"))
 }
 
 #[unsafe(no_mangle)]
@@ -179,9 +195,9 @@ pub extern "C" fn willow_array_join(array: *mut u8, separator: *mut u8) -> *mut 
     let Some(size) = string_payload_size(total) else {
         return fail("Array.join size overflow");
     };
-    let array = GcRootHandle::new(array);
-    let separator = GcRootHandle::new(separator);
-    let result = willow_alloc_with_layout(GcObjectKind::String, 0, size, 0);
+    let mut roots = [array, separator];
+    let result = alloc_string_payload_rooted(size as usize, &mut roots);
+    let [array, separator] = roots;
     if !result.is_null() {
         unsafe {
             *(result.add(LEN_OFFSET as usize) as *mut i64) = total as i64;
@@ -189,13 +205,13 @@ pub extern "C" fn willow_array_join(array: *mut u8, separator: *mut u8) -> *mut 
             for index in 0..count {
                 if index != 0 && separator_len != 0 {
                     copy_bytes(
-                        separator.load().add(DATA_OFFSET),
+                        separator.add(DATA_OFFSET),
                         result.add(DATA_OFFSET + offset),
                         separator_len,
                     );
                     offset += separator_len;
                 }
-                let (bytes, len) = ws_as_bytes(join_element(array.load(), index));
+                let (bytes, len) = ws_as_bytes(join_element(array, index));
                 if len != 0 {
                     copy_bytes(bytes, result.add(DATA_OFFSET + offset), len);
                     offset += len;
@@ -230,22 +246,26 @@ pub extern "C" fn willow_string_split(value: *mut u8, separator: *const u8) -> *
             })
             .collect()
     };
-    let value = GcRootHandle::new(value);
+    // Root the receiver and result array in shadow-stack slots for the whole
+    // call: TLAB hits reach no GC point, and a miss may move both referents.
+    let mut roots = [value, std::ptr::null_mut()];
+    let _roots = SlotRoots::push(&mut roots);
     let result = crate::array::willow_array_new(ranges.len() as i64, 1);
     if result.is_null() {
         return result;
     }
-    let result = GcRootHandle::new(result);
+    roots[1] = result;
     for (index, (start, end)) in ranges.into_iter().enumerate() {
-        let part = copy_range(value.load(), start, end);
+        let part = alloc_string_payload_rooted(range_payload_size(start, end), &mut []);
         if part.is_null() {
             return part;
         }
+        unsafe { fill_range(part, roots[0], start, end) };
         // A valid in-bounds store has no allocation/safepoint; array_set applies
         // the GC write barrier, and the rooted array retains every earlier part.
-        crate::array::willow_array_set(result.load(), index as i64, part as i64);
+        crate::array::willow_array_set(roots[1], index as i64, part as i64);
     }
-    result.load()
+    roots[1]
 }
 
 #[cfg(test)]
@@ -257,7 +277,7 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::{willow_pop_roots, willow_push_root};
+    use crate::gc::{GcRootHandle, willow_pop_roots, willow_push_root};
     use crate::string::{willow_string_as_str, willow_string_from_str};
 
     #[test]

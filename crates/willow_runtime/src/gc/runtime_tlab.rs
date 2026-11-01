@@ -115,25 +115,35 @@ pub(crate) struct YoungLayout {
     kind: GcObjectKind,
 }
 
+/// Two-word enum objects (type id 0) indexed by inline reference mask:
+/// array pair copies and runtime-built `tag + one word` enum variants.
+static ENUM_PAIR_DESCRIPTORS: [willow_abi::GcLayoutDescriptor; 4] = {
+    let mut table = [willow_abi::GcLayoutDescriptor {
+        type_id: 0,
+        layout_id: 0,
+        gc_ref_mask: 0,
+        size: GC_HEADER_SIZE as u64 + 16,
+    }; 4];
+    let mut mask = 0;
+    while mask < 4 {
+        table[mask].layout_id = willow_abi::gc_layout_id(GcObjectKind::Enum, 16, 0, mask as u64);
+        table[mask].gc_ref_mask = mask as u64;
+        mask += 1;
+    }
+    table
+};
+
 /// Pair copies keep the same enum layout and independent storage. Only the
 /// first word can be a managed reference; the second is scalar/vtable data.
 pub(crate) fn array_pair_layout(mask: u64) -> Option<YoungLayout> {
-    static DESCRIPTORS: [willow_abi::GcLayoutDescriptor; 2] = [
-        willow_abi::GcLayoutDescriptor {
-            type_id: 0,
-            layout_id: willow_abi::gc_layout_id(GcObjectKind::Enum, 16, 0, 0),
-            gc_ref_mask: 0,
-            size: GC_HEADER_SIZE as u64 + 16,
-        },
-        willow_abi::GcLayoutDescriptor {
-            type_id: 0,
-            layout_id: willow_abi::gc_layout_id(GcObjectKind::Enum, 16, 0, 1),
-            gc_ref_mask: 1,
-            size: GC_HEADER_SIZE as u64 + 16,
-        },
-    ];
+    (mask < 2).then_some(())?;
+    enum_pair_layout(mask)
+}
+
+/// Two-word type-id-0 enum object with inline reference `mask` (bits 0..2).
+pub(crate) fn enum_pair_layout(mask: u64) -> Option<YoungLayout> {
     Some(YoungLayout {
-        descriptor: DESCRIPTORS.get(usize::try_from(mask).ok()?)?,
+        descriptor: ENUM_PAIR_DESCRIPTORS.get(usize::try_from(mask).ok()?)?,
         kind: GcObjectKind::Enum,
     })
 }
@@ -698,6 +708,191 @@ mod tests {
             assert_eq!(willow_array_get(arr, i), i * 3);
         }
         willow_pop_roots(1);
+        reset_internal();
+    }
+
+    // -- runtime-created method results and parse Results ------------------
+
+    fn ws(text: &str) -> *mut u8 {
+        crate::string::willow_string_from_str(text)
+    }
+
+    fn word(ptr: *mut u8, index: usize) -> i64 {
+        unsafe { *(ptr as *const i64).add(index) }
+    }
+
+    /// `(old allocations, runtime-root slot registrations)` made by this thread.
+    fn path_counts() -> (usize, usize) {
+        (
+            super::OLD_ALLOCATIONS_FOR_TEST.get(),
+            super::RUNTIME_ROOT_SLOT_ADDS_FOR_TEST.get(),
+        )
+    }
+
+    fn young(ptr: *mut u8) -> bool {
+        generation(ptr) == Some(GC_GENERATION_YOUNG)
+    }
+
+    /// Text of a `Result<_, ParseError>::Err(Invalid(message))`.
+    fn parse_error_message(result: *mut u8) -> String {
+        assert_eq!(word(result, 0), 1, "Err tag");
+        let parse_error = word(result, 1) as *mut u8;
+        assert_eq!(word(parse_error, 0), 0, "Invalid tag");
+        text(word(parse_error, 1) as *mut u8)
+    }
+
+    #[test]
+    fn runtime_method_results_bump_allocate_young_without_root_traffic() {
+        use crate::string::*;
+        let _guard = runtime_test_guard();
+        reset_internal();
+        let _owner = RuntimeTlabOwner::enter();
+        let (source, space, comma, bad) = (ws("  lend 123456 45 6 "), ws(" "), ws(","), ws("12x"));
+        let float = ws("2.5");
+        prime_runtime_tlab();
+        let (old_before, roots_before) = path_counts();
+        let fast_before = willow_gc_tlab_fast_allocations();
+
+        let trimmed = willow_string_trim(source);
+        assert_eq!(text(trimmed), "lend 123456 45 6");
+        let digits = willow_string_substring(trimmed, 5, 11);
+        assert_eq!(text(digits), "123456");
+        let parts = willow_string_split(trimmed, space);
+        assert_eq!(willow_array_len(parts), 4);
+        let fields: Vec<_> = (0..4)
+            .map(|i| willow_array_get(parts, i) as *mut u8)
+            .collect();
+        assert_eq!(
+            fields.iter().map(|&part| text(part)).collect::<Vec<_>>(),
+            ["lend", "123456", "45", "6"]
+        );
+        let repeated = willow_string_repeat(digits, 3);
+        assert_eq!(text(repeated), "123456123456123456");
+        let joined = willow_array_join(parts, comma);
+        assert_eq!(text(joined), "lend,123456,45,6");
+        let ok = crate::math::willow_i64_parse(digits);
+        assert_eq!([word(ok, 0), word(ok, 1)], [0, 123456]);
+        let err = crate::math::willow_i64_parse(bad);
+        assert!(parse_error_message(err).starts_with("invalid integer"));
+        let float_ok = crate::math::willow_f64_parse(float);
+        assert_eq!(
+            [word(float_ok, 0), word(float_ok, 1)],
+            [0, 2.5f64.to_bits() as i64]
+        );
+        let float_text = crate::math::willow_f64_to_string(2.5);
+        assert_eq!(text(float_text), "2.5");
+        let bool_text = crate::math::willow_bool_to_string(1);
+        assert_eq!(text(bool_text), "true");
+        let debug = willow_string_debug(digits);
+        assert_eq!(text(debug), "\"123456\"");
+
+        let mut results = vec![
+            trimmed, digits, parts, repeated, joined, ok, err, float_ok, float_text, bool_text,
+            debug,
+        ];
+        results.extend(&fields);
+        results.push(word(err, 1) as *mut u8);
+        results.push(word(word(err, 1) as *mut u8, 1) as *mut u8);
+        for result in results {
+            assert!(young(result), "runtime result {result:p} is young");
+        }
+        // trim, substring, split (handle + buffer + 4 parts), repeat, join,
+        // Ok, Err (message + ParseError + Result), f64 Ok, two toStrings, debug.
+        assert_eq!(willow_gc_tlab_fast_allocations() - fast_before, 18);
+        assert_eq!(
+            path_counts(),
+            (old_before, roots_before),
+            "no old allocation or runtime-root registration"
+        );
+        reset_internal();
+    }
+
+    #[test]
+    fn runtime_method_results_survive_relocating_misses() {
+        use crate::string::*;
+        let _guard = runtime_test_guard();
+        reset_internal();
+        let _owner = RuntimeTlabOwner::enter();
+        // One object per TLAB: every allocation below misses and collects.
+        let _stress = StressModes::set("relocate");
+        let mut slots = [std::ptr::null_mut::<u8>(); 3];
+        for slot in &mut slots {
+            willow_push_root(slot);
+        }
+        slots[1] = willow_string_trim(ws(", "));
+        slots[2] = willow_string_trim(ws("4x"));
+        // Earlier collections are all high-survival evidence. Forget it so the
+        // receiver survives its first collections young and must move.
+        runtime().heap.lock().unwrap().tenuring = Default::default();
+        slots[0] = concat(&mut [
+            willow_abi::string_concat::PART_STRING,
+            ws(" é水 ") as u64,
+            willow_abi::string_concat::PART_I64,
+            42,
+            willow_abi::string_concat::PART_STRING,
+            ws(" b ") as u64,
+        ]);
+        assert!(young(slots[0]));
+        let minor_before = runtime().heap.lock().unwrap().minor_collections;
+        let roots_before = path_counts().1;
+        let mut source = slots[0];
+
+        let trimmed = willow_string_trim(slots[0]);
+        assert_ne!(slots[0], source, "the receiver moved during its own result");
+        assert_eq!(text(trimmed), "é水 42 b");
+        source = slots[0];
+        assert_eq!(text(willow_string_substring(slots[0], 1, 6)), "é水");
+        assert_ne!(slots[0], source);
+        let parts = willow_string_split(slots[0], ws(" "));
+        let fields: Vec<_> = (0..willow_array_len(parts))
+            .map(|i| text(willow_array_get(parts, i) as *mut u8))
+            .collect();
+        assert_eq!(fields, ["", "é水", "42", "b", ""]);
+        let mut parts = parts;
+        willow_push_root(&mut parts);
+        assert_eq!(text(willow_array_join(parts, slots[1])), ",é水,42,b,");
+        willow_pop_roots(1);
+        assert_eq!(text(willow_string_repeat(slots[1], 3)), ",,,");
+        let ok = crate::math::willow_i64_parse(willow_string_trim(ws(" -17 ")));
+        assert_eq!([word(ok, 0), word(ok, 1)], [0, -17]);
+        let err = crate::math::willow_i64_parse(slots[2]);
+        assert!(parse_error_message(err).starts_with("invalid integer"));
+        assert_eq!(text(willow_string_debug(slots[2])), "\"4x\"");
+
+        assert!(runtime().heap.lock().unwrap().minor_collections > minor_before);
+        assert_eq!(
+            path_counts().1,
+            roots_before,
+            "misses root only shadow-stack slots"
+        );
+        willow_pop_roots(3);
+        reset_internal();
+    }
+
+    #[test]
+    fn unregistered_threads_build_runtime_method_results_old() {
+        use crate::string::*;
+        let _guard = runtime_test_guard();
+        reset_internal();
+        assert!(!runtime_tlab_enabled());
+        let source = ws(" a b ");
+        let (old_before, _) = path_counts();
+        let parts = willow_string_split(willow_string_trim(source), ws(" "));
+        assert_eq!(willow_array_len(parts), 2);
+        assert_eq!(text(willow_array_get(parts, 1) as *mut u8), "b");
+        let ok = crate::math::willow_i64_parse(ws("9"));
+        assert_eq!([word(ok, 0), word(ok, 1)], [0, 9]);
+        let err = crate::math::willow_i64_parse(ws(""));
+        assert!(parse_error_message(err).starts_with("invalid integer"));
+        for result in [parts, ok, err, willow_array_get(parts, 0) as *mut u8] {
+            assert_eq!(
+                generation(result),
+                None,
+                "an unregistered thread allocates old"
+            );
+        }
+        // trim, two strings, split (handle, buffer, two parts), Ok, Err (3).
+        assert!(path_counts().0 - old_before >= 11);
         reset_internal();
     }
 }

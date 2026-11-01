@@ -259,6 +259,8 @@ pub extern "C" fn willow_gc_add_runtime_root_slot(slot: *mut *mut u8) {
         // SAFETY: the caller guarantees a valid slot.
         cycle.enqueue(unsafe { *slot });
     }
+    #[cfg(test)]
+    RUNTIME_ROOT_SLOT_ADDS_FOR_TEST.set(RUNTIME_ROOT_SLOT_ADDS_FOR_TEST.get() + 1);
     runtime().runtime_root_slots.add(slot.cast());
 }
 

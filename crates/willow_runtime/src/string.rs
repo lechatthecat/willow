@@ -305,6 +305,63 @@ impl Drop for PartRoots {
     }
 }
 
+/// Shadow-stack root slots held by a runtime entry called directly by
+/// generated code, popped on drop. Pushing and popping touch only this
+/// thread's root stack: no runtime-root map entry or heap allocation.
+/// The slots must stay at their addresses until the guard drops; reload
+/// every managed pointer from its slot after each GC point.
+pub(crate) struct SlotRoots(i32);
+
+impl SlotRoots {
+    pub(crate) fn push(slots: &mut [*mut u8]) -> Self {
+        for slot in slots.iter_mut() {
+            crate::gc::willow_push_root(slot);
+        }
+        Self(slots.len() as i32)
+    }
+}
+
+impl Drop for SlotRoots {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            crate::gc::willow_pop_roots(self.0);
+        }
+    }
+}
+
+/// Allocate a String payload of `payload_size` bytes for a runtime entry
+/// called directly by generated code: a young TLAB bump that reaches no GC
+/// point, else the collecting slow path with `roots` pushed as relocatable
+/// root slots. The caller reloads managed pointers from `roots` afterwards.
+/// The length word, bytes and NUL terminator are the caller's to write.
+pub(crate) fn alloc_string_payload_rooted(payload_size: usize, roots: &mut [*mut u8]) -> *mut u8 {
+    if let Some(ptr) = crate::gc::try_alloc_young_string_payload(payload_size) {
+        return ptr;
+    }
+    let _roots = SlotRoots::push(roots);
+    crate::gc::alloc_string_payload_slow(payload_size)
+}
+
+/// Allocate a String holding the native (non-managed) UTF-8 `text` for a
+/// runtime entry called directly by generated code; young when the runtime
+/// TLAB hits. No managed input needs rooting.
+pub(crate) fn alloc_native_string(text: &str) -> *mut u8 {
+    let Some(payload_size) = string_payload_size(text.len()) else {
+        return std::ptr::null_mut();
+    };
+    let ptr = alloc_string_payload_rooted(payload_size as usize, &mut []);
+    if !ptr.is_null() {
+        // SAFETY: the payload holds the length word, `text.len()` bytes and a
+        // NUL; `text` is native memory, unaffected by any collection above.
+        unsafe {
+            *(ptr.add(LEN_OFFSET as usize) as *mut i64) = text.len() as i64;
+            std::ptr::copy_nonoverlapping(text.as_ptr(), ptr.add(DATA_OFFSET), text.len());
+            *ptr.add(DATA_OFFSET + text.len()) = 0;
+        }
+    }
+    ptr
+}
+
 /// Byte length of `value` in decimal, including a leading `-`.
 pub(crate) fn decimal_len(value: i64) -> usize {
     let digits = value
