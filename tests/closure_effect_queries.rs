@@ -43,7 +43,7 @@ fn closure_effects_comparator_and_route_are_known() {
         let result = effects(snapshot.clone(), name);
         assert_eq!(result["status"], "ok", "{name}: {result}");
         assert_eq!(
-            result["runtime_effects"].as_u64().unwrap() & 6,
+            result["bounds"]["runtime"].as_u64().unwrap() & 6,
             0,
             "{result}"
         );
@@ -58,7 +58,7 @@ fn closure_effects_blocking_body_is_preserved() {
     );
     assert_eq!(result["status"], "ok", "{result}");
     assert_ne!(
-        result["runtime_effects"].as_u64().unwrap() & 2,
+        result["bounds"]["runtime"].as_u64().unwrap() & 2,
         0,
         "{result}"
     );
@@ -183,7 +183,7 @@ fn closure_effects_body_inference_perspectives() {
         let source = format!("{declarations}\nfn main() {{ {body} }}");
         let result = effects(snapshot(&source, label), "main");
         assert_eq!(result["status"], "ok", "{label}: {result}");
-        let bits = result["runtime_effects"].as_u64().unwrap();
+        let bits = result["bounds"]["runtime"].as_u64().unwrap();
         assert_eq!(bits & 4, 0, "{label}: {result}");
         assert_eq!(bits & 2 != 0, blocking, "{label}: {result}");
     }
@@ -199,7 +199,7 @@ fn closure_effects_missing_candidates_remain_unknown() {
         "apply",
     );
     assert_eq!(result["status"], "unknown", "{result}");
-    assert_eq!(result["runtime_effects"], 63);
+    assert_eq!(result["bounds"]["runtime"], 63);
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn closure_effects_imported_heap_and_dijkstra_route() {
         let result = effects(snapshot.clone(), name);
         assert_eq!(result["status"], "ok", "{name}: {result}");
         assert_eq!(
-            result["runtime_effects"].as_u64().unwrap() & 6,
+            result["bounds"]["runtime"].as_u64().unwrap() & 6,
             0,
             "{name}: {result}"
         );
@@ -235,7 +235,7 @@ fn closure_effects_imported_heap_and_dijkstra_route() {
             .unwrap();
         assert_eq!(result["status"], "ok", "{selector}: {result}");
         assert_eq!(
-            result["runtime_effects"].as_u64().unwrap() & 6,
+            result["bounds"]["runtime"].as_u64().unwrap() & 6,
             0,
             "{result}"
         );
@@ -294,7 +294,11 @@ fn closure_effects_chains_cycles_and_serialization() {
             serde_json::from_slice::<Snapshot>(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
         let first = effects(snapshot, "main");
         assert_eq!(first["status"], "ok", "{first}");
-        assert_eq!(first["runtime_effects"].as_u64().unwrap() & 6, 0, "{first}");
+        assert_eq!(
+            first["bounds"]["runtime"].as_u64().unwrap() & 6,
+            0,
+            "{first}"
+        );
         assert_eq!(first, effects(restored, "main"));
         println!("indirect chain depth={n} recursive_body=1 serialization=stable");
     }
@@ -307,13 +311,13 @@ fn closure_effects_distinct_arities_do_not_share_blocking_bounds() {
     let compare = effects(snapshot.clone(), "compare");
     assert_eq!(compare["status"], "ok", "{compare}");
     assert_eq!(
-        compare["runtime_effects"].as_u64().unwrap() & 6,
+        compare["bounds"]["runtime"].as_u64().unwrap() & 6,
         0,
         "{compare}"
     );
     let main = effects(snapshot, "main");
     assert_eq!(main["status"], "ok", "{main}");
-    assert_ne!(main["runtime_effects"].as_u64().unwrap() & 2, 0, "{main}");
+    assert_ne!(main["bounds"]["runtime"].as_u64().unwrap() & 2, 0, "{main}");
 }
 
 #[test]
@@ -323,7 +327,7 @@ fn closure_effects_opaque_value_does_not_disappear_beside_known_candidate() {
     let source = "fn apply(f: fn(f64, f64) -> f64) -> f64 { return f(1.0, 2.0); } fn main() { apply(pow); apply(|a: f64, b: f64| a + b); }";
     let result = effects(snapshot(source, "opaque"), "apply");
     assert_eq!(result["status"], "unknown", "{result}");
-    assert_eq!(result["runtime_effects"], 63);
+    assert_eq!(result["bounds"]["runtime"], 63);
 }
 
 #[test]
@@ -358,7 +362,7 @@ fn closure_effects_known_method_and_indirect_call_compose() {
     let result = effects(snapshot(source, "method-and-indirect"), "Heap::before");
     assert_eq!(result["status"], "ok", "{result}");
     assert_eq!(
-        result["runtime_effects"].as_u64().unwrap() & 6,
+        result["bounds"]["runtime"].as_u64().unwrap() & 6,
         0,
         "{result}"
     );
@@ -369,7 +373,7 @@ fn closure_effects_unresolved_virtual_call_is_not_hidden_by_known_lambda() {
     let source = "interface Run { fn run(self) -> i64; } fn apply(f: closure() -> i64, r: Run) -> i64 { return f() + r.run(); } fn main() { let k = 1; let f = || k; f(); }";
     let result = effects(snapshot(source, "unresolved-virtual"), "apply");
     assert_eq!(result["status"], "unknown", "{result}");
-    assert_eq!(result["runtime_effects"], 63);
+    assert_eq!(result["bounds"]["runtime"], 63);
 }
 
 fn evidence_operation(result: &serde_json::Value, effect: u64) -> String {
@@ -393,11 +397,21 @@ fn closure_effects_cite_indirect_site_not_caller_lambda_body() {
     for name in ["apply", "relay"] {
         let result = effects(snapshot.clone(), name);
         assert_ne!(
-            result["runtime_effects"].as_u64().unwrap() & 2,
+            result["bounds"]["runtime"].as_u64().unwrap() & 2,
             0,
             "{result}"
         );
         assert_eq!(evidence_operation(&result, 2), "indirect-call", "{name}");
+        let state = &result["effects"][1];
+        assert_eq!(state["state"], "unknown", "{name}: {result}");
+        assert!(state["witness"].is_null());
+        assert!(
+            state["unknown_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["code"] == "indirect-call")
+        );
         let blocking = result["effect_evidence"]
             .as_array()
             .unwrap()
@@ -420,10 +434,18 @@ fn closure_effects_direct_callee_keeps_evidence_beside_foreign_lambda() {
     let snapshot = snapshot(source, "direct-and-foreign");
     let apply = effects(snapshot.clone(), "apply");
     assert_eq!(evidence_operation(&apply, 2), "BlockingCell.get", "{apply}");
+    assert_eq!(apply["effects"][1]["state"], "may", "{apply}");
+    assert!(apply["effects"][1]["witness"]["location"].is_object());
+    assert!(
+        !apply["effects"][1]["unknown_reasons"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     // A lambda nested in the queried generic body is its own code; the value
     // it forwards to is still caller-supplied.
     let own = effects(snapshot, "own");
-    assert_ne!(own["runtime_effects"].as_u64().unwrap() & 2, 0, "{own}");
+    assert_ne!(own["bounds"]["runtime"].as_u64().unwrap() & 2, 0, "{own}");
     assert_eq!(evidence_operation(&own, 2), "indirect-call", "{own}");
 }
 

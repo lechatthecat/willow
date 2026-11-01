@@ -1,0 +1,12 @@
+// Inspect with: willow effects --source example/effect_states.wi effect_states::mixed
+// The callback is uncertain; the local division supplies a panic witness.
+fn pure(value: i64) -> i64 { return value; }
+fn opaque(callback: fn(i64) -> i64, value: i64) -> i64 {
+    return callback(value);
+}
+fn mixed(callback: fn(i64) -> i64, value: i64) -> i64 {
+    return opaque(callback, value) + 10 / value;
+}
+fn main() {
+    println(mixed(pure, 2));
+}

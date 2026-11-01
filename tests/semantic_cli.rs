@@ -590,7 +590,7 @@ fn effects_human_decodes_masks_and_retains_source_evidence() {
     assert!(
         String::from_utf8(empty.stdout)
             .unwrap()
-            .contains("Runtime effects: none")
+            .contains("may-allocate: none")
     );
     for extra in [vec![], vec!["--all"], vec!["--explain"]] {
         let mut args = vec!["effects", "main::main"];
@@ -616,7 +616,7 @@ fn effects_human_decodes_masks_and_retains_source_evidence() {
     }
     let out = f.run(&["effects", "main::main", "--format=json"]);
     let value: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(value["result"]["runtime_effects"], 63);
+    assert_eq!(value["result"]["bounds"]["runtime"], 63);
     assert!(value["result"]["effect_evidence"].is_array());
     assert!(value["result"].get("compiler_witnesses").is_none());
 }
@@ -636,16 +636,16 @@ fn power_effects_follow_lowered_guards_and_cite_the_integer_power() {
     .unwrap();
     for name in ["big", "neg", "gen"] {
         let value = f.json(&["effects", &format!("main::{name}")], 0);
-        assert_eq!(value["result"]["runtime_effects"], 0, "{name}: {value}");
+        assert_eq!(value["result"]["bounds"]["runtime"], 0, "{name}: {value}");
         let text = String::from_utf8(f.run(&["effects", &format!("main::{name}")]).stdout).unwrap();
-        assert!(text.contains("Runtime effects: none"), "{name}: {text}");
+        assert!(text.contains("may-allocate: none"), "{name}: {text}");
         assert!(!text.contains("panic-guard"), "{name}: {text}");
     }
     // Debug analysis: the dynamic exponent's sign guard and the literal
     // exponent's checked multiplications both cite the `**` expression.
     for (name, at) in [("ivar", "src/main.wi:4:43"), ("ilit", "src/main.wi:5:35")] {
         let value = f.json(&["effects", &format!("main::{name}")], 0);
-        assert_eq!(value["result"]["runtime_effects"], 32, "{name}: {value}");
+        assert_eq!(value["result"]["bounds"]["runtime"], 32, "{name}: {value}");
         let text = String::from_utf8(f.run(&["effects", &format!("main::{name}")]).stdout).unwrap();
         assert!(text.contains("operation=panic-guard"), "{name}: {text}");
         assert!(text.contains(&format!("at {at}")), "{name}: {text}");
@@ -682,7 +682,7 @@ fn imported_interface_effects_use_completed_implementation_summaries() {
             )
             .unwrap();
             let result = f.json(&["effects", "main::round"], 0);
-            let effects = result["result"]["runtime_effects"].as_u64().unwrap();
+            let effects = result["result"]["bounds"]["runtime"].as_u64().unwrap();
             let waits = RuntimeEffects::MAY_BLOCK
                 .union(RuntimeEffects::MAY_SUSPEND)
                 .bits() as u64;
@@ -716,7 +716,7 @@ fn imported_interface_all_pure_implementations_have_no_waiting_evidence() {
         .union(RuntimeEffects::MAY_SUSPEND)
         .bits() as u64;
     assert_eq!(
-        result["runtime_effects"].as_u64().unwrap() & waits,
+        result["bounds"]["runtime"].as_u64().unwrap() & waits,
         0,
         "{result}"
     );
@@ -891,6 +891,9 @@ fn impact_groups_definitions_direct_and_indirect_callers() {
             .skip(1)
             .take_while(|line| !line.starts_with("total="))
         {
+            if line.starts_with("    ") {
+                continue;
+            }
             match line.strip_prefix("  ") {
                 Some(name) => groups.last_mut().unwrap().1.push(name.into()),
                 None => groups.push((line.into(), vec![])),
@@ -1457,7 +1460,7 @@ fn await_block_bounds_explain_lowering_without_blaming_locks() {
                         "{result}"
                     );
                     assert_eq!(
-                        result["result"]["runtime_effects"].as_u64().unwrap()
+                        result["result"]["bounds"]["runtime"].as_u64().unwrap()
                             & u64::from(
                                 RuntimeEffects::MAY_BLOCK.bits()
                                     | RuntimeEffects::NO_PREEMPT_REGION.bits()
@@ -1492,7 +1495,7 @@ fn await_block_bounds_explain_lowering_without_blaming_locks() {
             }
             let fees = f.json(&["effects", "main::fees"], 0);
             assert_eq!(
-                fees["result"]["runtime_effects"].as_u64().unwrap()
+                fees["result"]["bounds"]["runtime"].as_u64().unwrap()
                     & u64::from(RuntimeEffects::MAY_BLOCK.bits()),
                 0,
                 "{fees}"
@@ -1580,7 +1583,7 @@ fn async_task_await_parks_instead_of_blocking() {
     ] {
         let selector = format!("main::{name}");
         let value = f.json(&["effects", &selector, "--explain"], 0);
-        let runtime = value["result"]["runtime_effects"].as_u64().unwrap();
+        let runtime = value["result"]["bounds"]["runtime"].as_u64().unwrap();
         assert_eq!(runtime & u64::from(excluded), 0, "{name}: {value}");
         assert_eq!(
             runtime & u64::from(parks),
@@ -1603,7 +1606,13 @@ fn async_task_await_parks_instead_of_blocking() {
         let output = f.run(&["effects", &selector]);
         assert!(output.status.success());
         let text = String::from_utf8(output.stdout).unwrap();
-        assert!(!text.contains("may-block"), "{name}: {text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("may-block:"))
+                .collect::<Vec<_>>(),
+            ["may-block: none"],
+            "{name}: {text}"
+        );
         for line in text.lines().filter(|l| l.contains("operation=await")) {
             assert_eq!(line.matches("status=").count(), 1, "{name}: {text}");
             assert_eq!(line.matches("kind=").count(), 1, "{name}: {text}");
@@ -1612,7 +1621,7 @@ fn async_task_await_parks_instead_of_blocking() {
     // Creating a task in a synchronous caller does not run the await.
     let relay = f.json(&["effects", "main::relay"], 0);
     assert_eq!(
-        relay["result"]["runtime_effects"].as_u64().unwrap() & u64::from(excluded),
+        relay["result"]["bounds"]["runtime"].as_u64().unwrap() & u64::from(excluded),
         0,
         "{relay}"
     );
@@ -1620,7 +1629,7 @@ fn async_task_await_parks_instead_of_blocking() {
     // is still not blamed for blocking.
     let printed = f.json(&["effects", "main::printed", "--explain"], 0);
     assert_ne!(
-        printed["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
+        printed["result"]["bounds"]["runtime"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
         0,
         "{printed}"
     );
@@ -2141,8 +2150,13 @@ fn main() {}
         let output = f.run(&["impact", &selector]);
         assert!(String::from_utf8(output.stdout).unwrap().contains(reason));
         for node in value["result"]["impact"]["nodes"].as_array().unwrap() {
-            if node["unknown"] == true {
-                assert!(node["reason"].is_string(), "{node}");
+            for effect in node["effects"].as_array().unwrap() {
+                if effect["state"] == "unknown" {
+                    assert!(
+                        !effect["unknown_reasons"].as_array().unwrap().is_empty(),
+                        "{node}"
+                    );
+                }
             }
         }
     }
@@ -2198,7 +2212,7 @@ fn length_queries_attribute_only_panic_allocation_and_resolved_dispatch_stays_kn
             );
         } else {
             assert_eq!(
-                result["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_ALLOCATE.bits()),
+                result["bounds"]["runtime"].as_u64().unwrap() & u64::from(E::MAY_ALLOCATE.bits()),
                 0,
                 "{value}"
             );
@@ -2588,7 +2602,7 @@ fn effect_precision_arithmetic_select_concat_and_allocation() {
     ] {
         let value = f.json(&["effects", &format!("main::{name}")], 0);
         assert_eq!(
-            value["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_PANIC.bits()),
+            value["result"]["bounds"]["runtime"].as_u64().unwrap() & u64::from(E::MAY_PANIC.bits()),
             0,
             "{name}: {value}"
         );
@@ -2602,14 +2616,14 @@ fn effect_precision_arithmetic_select_concat_and_allocation() {
     ] {
         let value = f.json(&["effects", &format!("main::{name}")], 0);
         assert_ne!(
-            value["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_PANIC.bits()),
+            value["result"]["bounds"]["runtime"].as_u64().unwrap() & u64::from(E::MAY_PANIC.bits()),
             0,
             "{name}: {value}"
         );
     }
     for name in ["concat", "concat_relay", "async_select", "Selector::wait"] {
         let value = f.json(&["effects", &format!("main::{name}")], 0);
-        let bits = value["result"]["runtime_effects"].as_u64().unwrap();
+        let bits = value["result"]["bounds"]["runtime"].as_u64().unwrap();
         assert_eq!(bits & u64::from(E::MAY_BLOCK.bits()), 0, "{name}: {value}");
         assert_eq!(
             bits & u64::from(E::NO_PREEMPT_REGION.bits()),
@@ -2626,7 +2640,7 @@ fn effect_precision_arithmetic_select_concat_and_allocation() {
     for name in ["sync_select", "select_with_io"] {
         let value = f.json(&["effects", &format!("main::{name}")], 0);
         assert_ne!(
-            value["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
+            value["result"]["bounds"]["runtime"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
             0,
             "{name}: {value}"
         );
@@ -3023,7 +3037,7 @@ fn effect_witness_precision_literals_scheduler_and_unknown_origins() {
     for name in ["literal", "literal_relay"] {
         let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 1);
         assert_ne!(
-            value["result"]["runtime_effects"].as_u64().unwrap()
+            value["result"]["bounds"]["runtime"].as_u64().unwrap()
                 & u64::from(E::MAY_ALLOCATE.bits()),
             0,
             "{value}"
@@ -3079,7 +3093,7 @@ fn effect_witness_precision_literals_scheduler_and_unknown_origins() {
         "timer_relay",
     ] {
         let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
-        let bits = value["result"]["runtime_effects"].as_u64().unwrap();
+        let bits = value["result"]["bounds"]["runtime"].as_u64().unwrap();
         assert_eq!(
             bits & u64::from(E::MAY_BLOCK.bits() | E::NO_PREEMPT_REGION.bits()),
             0,
@@ -3213,7 +3227,7 @@ fn generic_closure_value_calls_keep_queries_available() {
         let text = value.to_string();
         assert_eq!(value["result"]["status"], "ok", "{text}");
         assert_eq!(
-            value["result"]["runtime_effects"].as_u64().unwrap() & 6,
+            value["result"]["bounds"]["runtime"].as_u64().unwrap() & 6,
             0,
             "{text}"
         );
@@ -3760,7 +3774,7 @@ fn main() {}
     for name in ["res", "opt", "some", "ok", "parse_only", "conv"] {
         let v = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
         assert_eq!(v["result"]["status"], "ok", "{v}");
-        let bits = v["result"]["runtime_effects"].as_u64().unwrap();
+        let bits = v["result"]["bounds"]["runtime"].as_u64().unwrap();
         assert_eq!(
             bits & !u64::from(E::MAY_PANIC.union(E::MAY_ALLOCATE).bits()),
             0,
@@ -3864,7 +3878,7 @@ fn channel_effect_sites_and_unresolved_callee_locations() {
                 .is_empty()
         );
         assert_eq!(
-            value["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
+            value["result"]["bounds"]["runtime"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
             0
         );
         let sites: Vec<_> = value["result"]["effect_evidence"]
@@ -4005,7 +4019,7 @@ fn main() {}
             "{value}"
         );
         assert_eq!(
-            value["result"]["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
+            value["result"]["bounds"]["runtime"].as_u64().unwrap() & u64::from(E::MAY_BLOCK.bits()),
             0,
             "{value}"
         );
@@ -4332,7 +4346,7 @@ fn imported_constructor_effects_match_local_field_initialization() {
     )
     .unwrap();
     let local = f.json(&["effects", "main::local", "--explain"], 0);
-    assert_eq!(local["result"]["compiler_effects"], 0);
+    assert_eq!(local["result"]["bounds"]["compiler"], 0);
     for name in [
         "memberwise",
         "explicit",
@@ -4348,19 +4362,19 @@ fn imported_constructor_effects_match_local_field_initialization() {
     ] {
         let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
         assert_eq!(
-            value["result"]["compiler_effects"], local["result"]["compiler_effects"],
+            value["result"]["bounds"]["compiler"], local["result"]["bounds"]["compiler"],
             "{value}"
         );
         if name.starts_with("enum_") {
             assert_eq!(
-                value["result"]["runtime_effects"].as_u64().unwrap()
+                value["result"]["bounds"]["runtime"].as_u64().unwrap()
                     & u64::from(E::MAY_BLOCK.bits() | E::MAY_SUSPEND.bits()),
                 0,
                 "{value}"
             );
         } else {
             assert_eq!(
-                value["result"]["runtime_effects"], local["result"]["runtime_effects"],
+                value["result"]["bounds"]["runtime"], local["result"]["bounds"]["runtime"],
                 "{value}"
             );
         }
@@ -4384,19 +4398,19 @@ fn imported_constructor_effects_match_local_field_initialization() {
     }
     let risky = f.json(&["effects", "main::risky", "--explain"], 0);
     assert_ne!(
-        risky["result"]["compiler_effects"].as_u64().unwrap() & u64::from(E::MAY_PANIC.bits()),
+        risky["result"]["bounds"]["compiler"].as_u64().unwrap() & u64::from(E::MAY_PANIC.bits()),
         0,
         "{risky}"
     );
     assert_eq!(
-        risky["result"]["compiler_effects"].as_u64().unwrap()
+        risky["result"]["bounds"]["compiler"].as_u64().unwrap()
             & u64::from(E::MAY_BLOCK.bits() | E::MAY_SUSPEND.bits()),
         0,
         "{risky}"
     );
     let waiting = f.json(&["effects", "main::waiting", "--explain"], 0);
     assert_ne!(
-        waiting["result"]["compiler_effects"].as_u64().unwrap()
+        waiting["result"]["bounds"]["compiler"].as_u64().unwrap()
             & u64::from(E::MAY_BLOCK.bits() | E::MAY_SUSPEND.bits()),
         0,
         "{waiting}"
@@ -4597,6 +4611,7 @@ fn rename_conflicts_name_owner_and_impact_labels_lambdas_in_order() {
         .lines()
         .skip_while(|line| !line.starts_with("Affected functions:"))
         .take_while(|line| !line.starts_with("total="))
+        .filter(|line| !line.starts_with("    "))
         .filter_map(|line| line.strip_prefix("  "))
         .collect();
     assert_eq!(
@@ -4768,7 +4783,7 @@ fn module_qualified_calls_and_unit_variants_resolve_in_effects_impact_and_refs()
         )
         .unwrap();
         let effects = f.json(&["effects", "main::both"], 0);
-        assert_eq!(effects["result"]["runtime_effects"], 1, "{effects}");
+        assert_eq!(effects["result"]["bounds"]["runtime"], 1, "{effects}");
         let effects = String::from_utf8(f.run(&["effects", "main::both"]).stdout).unwrap();
         assert!(effects.starts_with("effects main::both: ok"), "{effects}");
         assert!(!effects.contains("Unresolved call"), "{effects}");
@@ -4780,7 +4795,11 @@ fn module_qualified_calls_and_unit_variants_resolve_in_effects_impact_and_refs()
                 (
                     n["selector"].as_str().unwrap(),
                     n["relation"].as_str().unwrap(),
-                    n["unknown"].as_bool().unwrap(),
+                    n["effects"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|e| e["state"] == "unknown"),
                 )
             })
             .collect();
@@ -5635,7 +5654,7 @@ fn main() {}
     .unwrap();
     for name in ["empty", "scalar", "constructor", "risky"] {
         let result = f.json(&["effects", &format!("main::{name}")], 0);
-        let bits = result["result"]["runtime_effects"].as_u64().unwrap();
+        let bits = result["result"]["bounds"]["runtime"].as_u64().unwrap();
         assert_ne!(
             bits & u64::from(RuntimeEffects::MAY_ALLOCATE.bits()),
             0,
@@ -6048,4 +6067,51 @@ fn direct_kind_rejects_effect_names_and_unknown_values() {
             }
         }
     }
+}
+
+#[test]
+fn effect_states_versioned_schema_matches_impact_and_preserves_witnesses() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/effect_states.wi"),
+    )
+    .unwrap();
+    let value = f.json(&["effects", "main::mixed"], 0);
+    let result = &value["result"];
+    assert_eq!(result["schema"], "willow.effects.v2");
+    assert!(result.get("runtime_effects").is_none());
+    let effects = result["effects"].as_array().unwrap();
+    assert_eq!(effects.len(), 6);
+    let panic = effects.iter().find(|e| e["effect"] == 32).unwrap();
+    assert_eq!(panic["state"], "may", "{value}");
+    assert!(panic["witness"]["location"].is_object(), "{value}");
+    let impact = f.json(&["impact", "main::mixed"], 0);
+    assert_eq!(impact["result"]["impact"]["schema"], "willow.effects.v2");
+    let node = impact["result"]["impact"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["distance"] == 0)
+        .unwrap();
+    assert_eq!(node["effects"], result["effects"]);
+    assert!(node.get("runtime_effects").is_none());
+    assert!(node.get("unknown").is_none());
+    let missing = f.json(&["effects", "main::absent"], 1);
+    assert_eq!(missing["result"]["schema"], "willow.effects.v2");
+    assert!(
+        missing["result"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["state"] == "unknown")
+    );
+    let pure = f.json(&["effects", "main::pure"], 0);
+    assert!(
+        pure["result"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["state"] == "none")
+    );
 }

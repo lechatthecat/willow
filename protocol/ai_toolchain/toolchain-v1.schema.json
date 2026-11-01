@@ -158,8 +158,7 @@
         "level",
         "distance",
         "graph_distance",
-        "runtime_effects",
-        "unknown"
+        "effects"
       ],
       "properties": {
         "id": {
@@ -180,16 +179,11 @@
           "type": "integer",
           "minimum": 0
         },
-        "runtime_effects": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 63
-        },
-        "unknown": {
-          "type": "boolean"
-        },
         "identity": {
           "$ref": "#/$defs/symbolIdentity"
+        },
+        "effects": {
+          "$ref": "#/$defs/effectStates"
         }
       }
     },
@@ -200,7 +194,8 @@
         "nodes",
         "truncated",
         "unknown",
-        "edge_visits"
+        "edge_visits",
+        "schema"
       ],
       "properties": {
         "revision": {
@@ -243,6 +238,9 @@
               }
             }
           }
+        },
+        "schema": {
+          "const": "willow.effects.v2"
         }
       }
     },
@@ -342,6 +340,111 @@
         },
         "symbol": {
           "type": "string"
+        }
+      }
+    },
+    "effectStates": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "required": [
+          "effect",
+          "state",
+          "witness",
+          "unknown_reasons"
+        ],
+        "properties": {
+          "effect": {
+            "enum": [
+              1,
+              2,
+              4,
+              8,
+              16,
+              32
+            ]
+          },
+          "state": {
+            "enum": [
+              "may",
+              "unknown",
+              "none"
+            ]
+          },
+          "witness": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "unknown_reasons": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "code",
+                "location"
+              ],
+              "properties": {
+                "code": {
+                  "enum": [
+                    "indirect-call",
+                    "unresolved-callee",
+                    "incomplete-flow",
+                    "missing-body",
+                    "external-interop",
+                    "missing-witness",
+                    "missing-source"
+                  ]
+                },
+                "location": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "effectResponse": {
+      "type": "object",
+      "required": [
+        "schema",
+        "effects"
+      ],
+      "properties": {
+        "schema": {
+          "const": "willow.effects.v2"
+        },
+        "effects": {
+          "$ref": "#/$defs/effectStates"
+        },
+        "bounds": {
+          "type": "object",
+          "required": [
+            "runtime",
+            "compiler"
+          ],
+          "properties": {
+            "runtime": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 63
+            },
+            "compiler": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 63
+            }
+          }
         }
       }
     }

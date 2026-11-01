@@ -888,8 +888,12 @@ impl DirectSession {
             }
             return Ok(result);
         }
-        let resolved = self.resolve(selector, filter)?;
+        let mut resolved = self.resolve(selector, filter)?;
         if resolved["status"] != "ok" {
+            if command == "effects" {
+                resolved["schema"] = json!(super::effect_states::SCHEMA);
+                resolved["effects"] = super::effect_states::Analysis::unavailable();
+            }
             return Ok(resolved);
         }
         let declaration = resolved["symbol"]["id"]

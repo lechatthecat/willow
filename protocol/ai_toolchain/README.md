@@ -143,11 +143,36 @@ Successful query envelopes carry `revision` and `result`; an invalid revision
 returns top-level `status: stale` before lookup. Unknown positions/identities,
 ambiguous source positions and incomplete evidence remain distinct.
 
-`effects` preserves compiler capability bits and supplies `effect_evidence`
-for each set bit, with a source witness or explicit missing evidence. Compiler
-facts, runtime capability bounds and external boundaries are distinguished.
-A missing witness produces `incomplete`; unknown callees produce `unknown`.
-These are capability facts, not proof of external business writes.
+Effect responses and impact objects carry `schema: "willow.effects.v2"`.
+Effect responses have `effects`; each impact node has the same `effects` array.
+Every array contains all six runtime capability bits, including absent effects:
+
+```json
+{"effect":32,"state":"may","witness":{"function":"...","location":{"path":"main.wi","start":12,"end":17},"operation":"division"},"unknown_reasons":[{"code":"indirect-call","location":null}]}
+```
+
+`may` means an operation witness exists, not that execution is inevitable.
+`unknown` means only an uncertain bound is available. `none` means neither a
+witness nor uncertainty remains in the analyzed graph. Evidence wins over
+uncertainty for `state`, but `unknown_reasons` remains populated. Indirect-call
+candidate bodies alone cannot establish `may` for the indirect caller.
+Reasons include `indirect-call`, `unresolved-callee`, `incomplete-flow`,
+`missing-body`, `external-interop`, `missing-witness` and `missing-source`.
+One representative location per reason category is retained; null means no
+source location is available. This bounded summary does not enumerate every
+transitive cause or every possible execution path.
+
+This replaces the old effect/impact node schema: effect response bit masks move
+to `bounds.runtime` and `bounds.compiler`; impact nodes no longer expose
+`runtime_effects`, `unknown` or `reason`. Bounds remain conservative inputs to
+safety decisions; **unknown must be treated as possibly present**. `status`
+describes query/evidence availability, not any individual effect's state.
+Detailed `effect_evidence`, local `compiler_witnesses` (`--explain`), and
+`unknown_causes` supplement the summary with operation and task relationships.
+Impact's outer `unknown`/`truncated` describe graph discovery coverage, not the
+per-effect states, which use the full analyzed graph even when output is limited.
+Snapshot storage and toolchain event envelope versions are unchanged. These
+capability facts do not prove external business writes or predicate feasibility.
 
 Package-aware analysis adds `identity: {package, module, symbol}` to callable,
 source-symbol, reference and impact-node results. `package` contains `name`,

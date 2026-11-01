@@ -317,7 +317,9 @@ fn concise(value: &mut Value) {
                 "witness",
                 "compiler_witnesses",
             ] {
-                fields.remove(key);
+                if key != "witness" || !fields.contains_key("state") {
+                    fields.remove(key);
+                }
             }
             if fields.contains_key("type_display") {
                 fields.remove("type");
@@ -511,7 +513,7 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
             _ => {}
         }
     }
-    if result["runtime_effects"].is_number() {
+    if result["effects"].is_array() {
         effect_lines(result, options.all, options.explain, &mut lines);
     }
     if let Some(nodes) = result["impact"]["nodes"].as_array() {
@@ -565,6 +567,11 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
                     _ => String::new(),
                 }
             ));
+            let start = lines.len();
+            effect_state_lines(&node["effects"], &mut lines);
+            for line in &mut lines[start..] {
+                line.insert_str(0, "    ");
+            }
         }
         lines.push(format!(
             "total={} shown={} truncated={} unknown={}",
@@ -612,7 +619,34 @@ fn effect_names(bits: &Value) -> String {
     }
 }
 
+fn effect_state_lines(effects: &Value, lines: &mut Vec<String>) {
+    if let Some(effects) = effects.as_array() {
+        for effect in effects {
+            lines.push(format!(
+                "{}: {}",
+                effect_names(&effect["effect"]),
+                effect["state"].as_str().unwrap_or("unknown")
+            ));
+            if effect["witness"].is_object() {
+                lines.push(format!(
+                    "  Witness: {}",
+                    location(&effect["witness"]["location"])
+                ));
+            }
+            if let Some(reasons) = effect["unknown_reasons"].as_array() {
+                for reason in reasons {
+                    lines.push(format!(
+                        "  Unknown: {}",
+                        reason["code"].as_str().unwrap_or("missing-witness")
+                    ));
+                }
+            }
+        }
+    }
+}
+
 fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String>) {
+    effect_state_lines(&result["effects"], lines);
     if let Some(causes) = result["unknown_causes"].as_array() {
         for cause in causes.iter().take(if all { usize::MAX } else { 50 }) {
             lines.push(format!(
@@ -650,17 +684,19 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
             ));
         }
     }
-    lines.push(format!(
-        "Runtime effects: {}",
-        effect_names(&result["runtime_effects"])
-    ));
-    lines.push(format!(
-        "Compiler effects: {}",
-        effect_names(&result["compiler_effects"])
-    ));
+    if explain {
+        lines.push(format!(
+            "Conservative runtime bounds: {}",
+            effect_names(&result["bounds"]["runtime"])
+        ));
+        lines.push(format!(
+            "Compiler bounds: {}",
+            effect_names(&result["bounds"]["compiler"])
+        ));
+    }
     if explain
-        && ["runtime_effects", "compiler_effects"].iter().any(|key| {
-            result[key].as_u64().is_some_and(|bits| {
+        && ["runtime", "compiler"].iter().any(|key| {
+            result["bounds"][key].as_u64().is_some_and(|bits| {
                 bits & u64::from(willow_abi::RuntimeEffects::NO_PREEMPT_REGION.bits()) != 0
             })
         })
@@ -1391,7 +1427,7 @@ mod tests {
             let fact = json!({"effect":4,"status":"compiler-fact",
                 "witness":{"kind":"wait","owner":"arena::play","cause":cause}});
             let value = json!({"effect_evidence":[fact],"compiler_witnesses":[fact],
-                "runtime_effects":4,"compiler_effects":4,"meaning":""});
+                "bounds":{"runtime":4,"compiler":4},"meaning":""});
             let mut lines = Vec::new();
             compact_effect_evidence(&value, "arena::play", false, &mut lines);
             let line = &lines[1];
@@ -1554,8 +1590,7 @@ mod tests {
     fn effect_evidence_output_is_bounded_and_all_is_linear() {
         for count in [0, 1, 16, 64, 256, 1024] {
             let facts: Vec<_> = (0..count).map(|i| json!({"effect":1,"witness":{"kind":"runtime-capability","cause":{"operation":format!("op-{i}"),"location":{"path":"main.wi","line":i+1,"column":1}}}})).collect();
-            let value =
-                json!({"runtime_effects":1,"compiler_effects":0,"compiler_witnesses":facts});
+            let value = json!({"bounds":{"runtime":1,"compiler":0},"compiler_witnesses":facts});
             for all in [false, true] {
                 let mut lines = Vec::new();
                 effect_lines(&value, all, false, &mut lines);
@@ -1571,14 +1606,14 @@ mod tests {
                     lines.iter().any(|l| l.contains("omitted; use --all")),
                     !all && count > 50
                 );
-                assert_eq!(lines.len(), 3 + shown + usize::from(!all && count > 50));
+                assert_eq!(lines.len(), 1 + shown + usize::from(!all && count > 50));
             }
         }
         let bits = willow_abi::RuntimeEffects::NO_PREEMPT_REGION.bits();
         assert_eq!(effect_names(&json!(bits)), "may-run-without-preemption");
         let mut lines = Vec::new();
         effect_lines(
-            &json!({"runtime_effects":bits,"compiler_effects":0}),
+            &json!({"bounds":{"runtime":bits,"compiler":0}}),
             false,
             true,
             &mut lines,

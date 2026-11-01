@@ -428,7 +428,7 @@ pub(super) fn finish(
 
 /// Disjoint sorted declaration ranges support local-site membership without
 /// multiplying the number of witnesses by the number of declaration ranges.
-fn local_ranges(locations: &[Location]) -> Vec<(&str, usize, usize)> {
+pub(super) fn local_ranges(locations: &[Location]) -> Vec<(&str, usize, usize)> {
     let mut ranges: Vec<_> = locations
         .iter()
         .map(|l| (l.path.as_str(), l.start, l.end))
@@ -530,6 +530,7 @@ pub enum QueryRequest {
 }
 /// Own one immutable revision and its indexes. Query calls do no frontend work.
 pub struct QuerySession {
+    effect_states: Option<effect_states::Analysis>,
     packages: packages::PackageIndex,
     pub(super) names: display::TypeNames,
     pub(crate) snapshot: Snapshot,
@@ -754,6 +755,7 @@ impl QuerySession {
             .filter_map(|id| functions.get(id).copied())
             .collect();
         Ok(Self {
+            effect_states: None,
             packages,
             names,
             snapshot,
@@ -1156,12 +1158,16 @@ impl QuerySession {
             }
             QueryRequest::Effects { function, .. } => match self.functions.get(&function) {
                 None => {
-                    json!({"status":if self.symbols.contains_key(&function) {"unanalyzed"} else {"unknown"},
+                    json!({"schema":effect_states::SCHEMA,"effects":effect_states::Analysis::unavailable(),"status":if self.symbols.contains_key(&function) {"unanalyzed"} else {"unknown"},
                         "reason":if self.symbols.get(&function).is_some_and(|&i| self.snapshot.semantic.symbols[i].kind == "method") {
                             "This interface contract has no executable body. Query an implementing method for its effects; dispatch effects depend on the implementation."
                         } else { "No executable body is available for this symbol in the selected source graph." }})
                 }
                 Some(&i) => {
+                    let states = self
+                        .effect_states
+                        .get_or_insert_with(|| effect_states::Analysis::new(&self.snapshot))
+                        .output(i);
                     let f = &self.snapshot.functions[i];
                     let mut seen = std::collections::HashSet::from([i]);
                     let mut queue = std::collections::VecDeque::from([(i, None)]);
@@ -1464,8 +1470,9 @@ impl QuerySession {
                             }
                         }
                     }
-                    json!({"status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
-                        "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence,
+                    json!({"schema":effect_states::SCHEMA,"effects":states,
+                        "status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
+                        "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "bounds":{"runtime":f.runtime_effects,"compiler":self.snapshot.semantic.compiler_effects.get(&f.id)},"effect_evidence":evidence,
                         "witness":witness, "compiler_witnesses":compiler_witnesses,
                         "meaning":"compiler facts and conservative runtime capability bounds; indirect-call bounds cover checked function values in this workspace, not arbitrary values supplied by future callers; external business effects and predicate feasibility are not implied"})
                 }
@@ -1769,6 +1776,9 @@ impl Snapshot {
             unresolved_retry_calls,
         } = RiskPaths::new(self, true);
         let functions: HashMap<_, _> = self.functions.iter().map(|f| (f.id.as_str(), f)).collect();
+        // This is the fail-closed edit-safety projection, not the public
+        // effect certainty analysis. Both evidence and uncertainty prohibit
+        // treating a call as pure. Public queries use effect_states::Analysis.
         // A single backwards propagation computes absence of observable operations.
         // Do not turn a new call to an effect-free body into a new side effect.
         // Missing bodies, incomplete flow and runtime capabilities stay conservative.

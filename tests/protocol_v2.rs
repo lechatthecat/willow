@@ -288,7 +288,7 @@ fn queries_share_revision_and_match_compiler_facts() {
         serde_json::to_value(willow_compiler::parser::ast::Type::<String>::I64).unwrap()
     );
     assert_eq!(
-        results[3]["result"]["runtime_effects"],
+        results[3]["result"]["bounds"]["runtime"],
         named(&snapshot, "main")["runtime_effects"]
     );
     assert!(results[3]["result"]["witness"].as_array().unwrap().len() >= 2);
@@ -728,7 +728,7 @@ fn effects_have_per_bit_roots_and_distinguish_unknown_evidence() {
             .unwrap()
             .iter()
             .fold(0, |bits, e| bits | e["effect"].as_u64().unwrap());
-        assert_eq!(bits, result["runtime_effects"].as_u64().unwrap());
+        assert_eq!(bits, result["bounds"]["runtime"].as_u64().unwrap());
     }
     assert_eq!(values[2]["result"]["status"], "unknown");
     assert!(

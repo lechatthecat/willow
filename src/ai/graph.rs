@@ -26,12 +26,11 @@ pub struct ImpactNode {
     pub level: usize,
     pub distance: usize,
     pub graph_distance: usize,
-    pub runtime_effects: u8,
-    pub unknown: bool,
-    pub reason: Option<&'static str>,
+    pub effects: serde_json::Value,
 }
 #[derive(Debug, Serialize)]
 pub struct Impact {
+    pub schema: &'static str,
     pub rust_dependencies: Vec<interop::RustCrateIdentity>,
     pub dependency_boundary: Vec<serde_json::Value>,
     pub external_dependencies: Vec<serde_json::Value>,
@@ -304,6 +303,7 @@ impl Snapshot {
             truncated,
             edge_visits,
         } = walk;
+        let states = effect_states::Analysis::new(self);
         let mut nodes = Vec::new();
         // An unresolved caller outside the discovered component could still
         // call a seed through a function value. Do not present a closed reverse
@@ -324,9 +324,7 @@ impl Snapshot {
                         level: (distance[i] + 1).min(3),
                         distance: distance[i],
                         graph_distance: graph_distance[i],
-                        runtime_effects: f.runtime_effects,
-                        unknown: f.unknown,
-                        reason: f.unknown_reason(),
+                        effects: states.output(i),
                     });
                 }
             }
@@ -343,6 +341,7 @@ impl Snapshot {
             self.semantic.interop.crates.clone()
         };
         Ok(Impact {
+            schema: effect_states::SCHEMA,
             rust_dependencies,
             dependency_boundary,
             external_dependencies,
@@ -536,7 +535,13 @@ mod tests {
                 assert_eq!(result.edge_visits, expected, "{shape} {n}");
                 assert!(!result.truncated);
                 assert!(result.unknown && result.reason.is_some());
-                assert!(result.nodes.iter().all(|f| f.unknown && f.reason.is_some()));
+                assert!(result.nodes.iter().all(|f| {
+                    f.effects
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|e| e["state"] == "unknown")
+                }));
                 let mut snapshot = snapshot;
                 snapshot.compiler = storage::compiler_stamp();
                 snapshot.revision = snapshot.digest().unwrap();
