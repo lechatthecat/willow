@@ -128,7 +128,6 @@ pub(crate) struct BodyQueries {
         HashMap<crate::module::UnitId, std::sync::Arc<crate::semantic::call_graph::ClassHierarchy>>,
     >,
     correspondence: std::cell::RefCell<super::syntax::Correspondence>,
-    coordinates_changed: std::cell::Cell<bool>,
     candidates: std::cell::RefCell<HashMap<BodyId, ReuseCandidate>>,
     signatures: std::cell::RefCell<HashMap<SignatureKey, Rc<serde_json::Value>>>,
     dependencies: std::cell::RefCell<
@@ -469,10 +468,6 @@ impl BodyQueries {
         });
     }
 
-    pub(crate) fn cached_coordinates_changed(&self) -> bool {
-        self.coordinates_changed.get()
-    }
-
     pub(crate) fn remap_cached<V: serde::Serialize + serde::de::DeserializeOwned>(
         &self,
         value: &V,
@@ -561,7 +556,9 @@ impl BodyQueries {
     ) -> Result<()> {
         self.correspondence.borrow_mut().spans = correspondence.spans.clone();
         let coordinates_changed = correspondence.spans.iter().any(|(old, new)| old != new);
-        self.coordinates_changed.set(coordinates_changed);
+        if coordinates_changed && let Some(tracking) = self.tracking.borrow().as_ref() {
+            tracking.syntax.borrow_mut().shift_coordinates();
+        }
         let mut copied = HashMap::new();
         for &id in bodies {
             if self.typed.is_ready(&id) {
@@ -803,6 +800,51 @@ impl BodyQueries {
             self.reused.set(self.reused.get() + 1);
         }
     }
+    pub(crate) fn source_body_changes(&self, unit: crate::module::UnitId) -> Vec<String> {
+        self.tracking
+            .borrow()
+            .as_ref()
+            .map(|tracking| tracking.syntax.borrow().source_body_changes(unit))
+            .unwrap_or_default()
+    }
+    pub(crate) fn source_owner_span(
+        &self,
+        unit: crate::module::UnitId,
+        owner: &str,
+    ) -> Option<crate::diagnostics::Span> {
+        self.tracking
+            .borrow()
+            .as_ref()
+            .and_then(|tracking| tracking.syntax.borrow().source_owner_span(unit, owner))
+    }
+    pub(crate) fn effect_source_changes(
+        &self,
+        unit: crate::module::UnitId,
+    ) -> Option<Vec<(String, bool)>> {
+        self.tracking
+            .borrow()
+            .as_ref()
+            .and_then(|tracking| tracking.syntax.borrow().effect_source_changes(unit))
+    }
+    pub(crate) fn declarations_changed(&self, unit: crate::module::UnitId) -> bool {
+        self.tracking
+            .borrow()
+            .as_ref()
+            .is_some_and(|tracking| tracking.syntax.borrow().declarations_changed(unit))
+    }
+    pub(crate) fn changed_bodies_in(&self, unit: crate::module::UnitId) -> HashSet<BodyId> {
+        self.tracking
+            .borrow()
+            .as_ref()
+            .map(|tracking| tracking.syntax.borrow().changed_bodies_in(unit))
+            .unwrap_or_default()
+    }
+    pub(crate) fn indirect_inputs(
+        &self,
+        id: BodyId,
+    ) -> Result<crate::semantic::indirect_lock::IndirectInputs> {
+        Ok(self.read(id)?.indirect_inputs())
+    }
     pub(crate) fn typechecks(&self) -> usize {
         self.typechecks.get()
     }
@@ -831,7 +873,6 @@ impl BodyQueries {
             tracking: Default::default(),
             dispatch: Default::default(),
             correspondence: Default::default(),
-            coordinates_changed: Default::default(),
             candidates: Default::default(),
             signatures: Default::default(),
             dependencies: Default::default(),
@@ -850,6 +891,21 @@ impl BodyQueries {
         node: super::tracked::QueryNode,
         extra: Option<Vec<super::tracked::QueryNode>>,
         compute: impl FnOnce() -> Result<V>,
+    ) -> Result<V> {
+        self.derived_with(id, node, extra, compute, false)
+    }
+
+    /// `projection` marks a value cheaply copied from the current checked body,
+    /// whose spans reused-body relocation already updated. A valid memo then
+    /// only records the dependency; its wire is never presented, so shifted
+    /// unchanged bodies need no presentation refresh.
+    fn derived_with<V: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        id: BodyId,
+        node: super::tracked::QueryNode,
+        extra: Option<Vec<super::tracked::QueryNode>>,
+        compute: impl FnOnce() -> Result<V>,
+        projection: bool,
     ) -> Result<V> {
         use super::tracked::QueryNode;
         let tracking = self.tracking.borrow().as_ref().and_then(|tracking| {
@@ -886,11 +942,15 @@ impl BodyQueries {
             .borrow_mut()
             .validate_derived_typed::<V>(node.clone(), deps.clone())?;
         if let Some(value) = cached {
-            let result = value;
-            if !self.coordinates_changed.get() {
-                return Ok(result);
+            if projection {
+                return compute();
             }
-            let result = self.correspondence.borrow().remap(&result)?;
+            use super::incremental::DerivedCoordinates;
+            let result = match syntax.borrow().derived_coordinates(&node) {
+                DerivedCoordinates::Current => return Ok(value),
+                DerivedCoordinates::Previous => self.correspondence.borrow().remap(&value)?,
+                DerivedCoordinates::Stale => compute()?,
+            };
             syntax
                 .borrow_mut()
                 .refresh_derived(node, serde_json::to_value(&result)?)?;
@@ -907,11 +967,12 @@ impl BodyQueries {
         id: BodyId,
         facts: &crate::semantic::analysis_symbols::Facts,
     ) -> Result<crate::semantic::analysis_symbols::Facts> {
-        self.derived(
+        self.derived_with(
             id,
             super::tracked::QueryNode::ResolvedReferences(id),
             None,
             || Ok(facts.clone()),
+            true,
         )
     }
 

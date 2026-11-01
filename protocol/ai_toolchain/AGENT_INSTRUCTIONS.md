@@ -46,3 +46,26 @@ Golden files in tests/fixtures/agent cover check/build and direct-command instru
 wrappers. The bootstrap integration test executes the direct references, type,
 effects, impact and rename workflow, then checks the modified program. Sync tests
 verify schema upgrades, preservation of user text and malformed-block rejection.
+
+## Semantic edit loop
+
+Choose the Git base before editing. Use `willow overview .`, refs, type, effects
+and impact to answer the relevant structure and dependency questions. After the
+edit, run `willow check . --format ndjson`, then
+`willow verify-edit --base BASE --format json`. Fix problems, repeat verification,
+run focused tests, and review the source diff. Verification complements tests.
+
+`verify-edit` emits one `willow.semantic-diff.v1` JSON document, not NDJSON
+protocol events. Exit codes: 0 complete without policy violations; 1 contract or
+requested policy violation; 2 command failure; 3 incomplete evidence. Reject
+incomplete evidence even when the change list is empty. Add
+`--fail-on effect-growth` to reject new effects; use `--explain` for human output.
+
+Within a verification invocation, the target analysis reuses the base compiler
+revision. Changed bodies and affected reverse dependencies invalidate compiler
+queries. Source and dependency captures and compiler configuration delimit reuse;
+no verification cache survives a process/compiler replacement. Report comparison
+skips equal semantic-index subtrees while retaining existing contract violations.
+Input capture, fresh declaration discovery, snapshot construction and output
+serialization still depend on total input/output size; query reuse does not make
+these phases proportional to the edit alone.

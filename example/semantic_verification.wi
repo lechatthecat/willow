@@ -1,5 +1,7 @@
 // In a Git project, compare edits with:
-// willow verify-edit --base HEAD --format json --explain
+// willow check . --format ndjson
+// willow verify-edit --base HEAD --format json
+// Fix findings, rerun verification, test, then review the diff.
 // Adding a waiting operation to a helper also changes its callers' effects.
 @effects(no_wait)
 fn double(value: i64) -> i64 { return value + value; }

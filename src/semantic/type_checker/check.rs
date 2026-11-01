@@ -430,9 +430,23 @@ impl TypeChecker {
         self.effect_inputs.sites.clear();
         self.indirect_lock.clear();
 
-        for item in &program.items {
+        let root_queries = self.effect_queries.clone();
+        let register_root = |body, location| {
+            if let Some((queries, unit)) = &root_queries {
+                queries.register_root(*unit, body, location);
+            }
+        };
+        use crate::compiler_db::effects::EffectRootLocation;
+        for (item_index, item) in program.items.iter().enumerate() {
+            if let Some((_, unit)) = &root_queries {
+                crate::ai::incremental_snapshot::record_declaration(*unit, item);
+            }
             match item {
                 Item::Function(function) => {
+                    if let Some((_, unit)) = &root_queries {
+                        crate::ai::incremental_snapshot::record_root(*unit, item_index, function);
+                    }
+                    register_root(function.body.id, EffectRootLocation::Function(item_index));
                     self.effect_index.callables.insert(
                         FunctionId::free_from_source_name(function.name.as_str()),
                         function.is_async,
@@ -444,7 +458,19 @@ impl TypeChecker {
                         .symbols
                         .lookup_class(&class.name)
                         .map_or(owner, |info| TypeId::from_source_name(&info.name));
-                    for method in &class.methods {
+                    for (member, method) in class.methods.iter().enumerate() {
+                        if let Some((_, unit)) = &root_queries {
+                            crate::ai::incremental_snapshot::record_method(
+                                *unit, item_index, member, class, method,
+                            );
+                        }
+                        register_root(
+                            method.body.id,
+                            EffectRootLocation::Method {
+                                item: item_index,
+                                member,
+                            },
+                        );
                         self.effect_index.local_methods.insert(
                             FunctionId::method(canonical, &method.name),
                             FunctionId::method(owner, &method.name),
@@ -452,6 +478,24 @@ impl TypeChecker {
                         self.effect_index.callables.insert(
                             FunctionId::method(owner, method.name.as_str()),
                             method.is_async,
+                        );
+                    }
+                    for (member, constructor) in class.constructors.iter().enumerate() {
+                        if let Some((_, unit)) = &root_queries {
+                            crate::ai::incremental_snapshot::record_constructor(
+                                *unit,
+                                item_index,
+                                member,
+                                class,
+                                constructor,
+                            );
+                        }
+                        register_root(
+                            constructor.body.id,
+                            EffectRootLocation::Constructor {
+                                item: item_index,
+                                member,
+                            },
                         );
                     }
                     if !class.constructors.is_empty() {
@@ -464,7 +508,25 @@ impl TypeChecker {
                             .insert(FunctionId::method(owner, "init"), false);
                     }
                 }
-                Item::Enum(_) | Item::Interface(_) => {}
+                Item::Interface(interface) => {
+                    for (member, method) in interface.methods.iter().enumerate() {
+                        if let Some(body) = &method.default_body {
+                            if let Some((_, unit)) = &root_queries {
+                                crate::ai::incremental_snapshot::record_default(
+                                    *unit, item_index, member, interface, method,
+                                );
+                            }
+                            register_root(
+                                body.id,
+                                EffectRootLocation::InterfaceDefault {
+                                    item: item_index,
+                                    member,
+                                },
+                            );
+                        }
+                    }
+                }
+                Item::Enum(_) => {}
             }
         }
 
@@ -1092,7 +1154,10 @@ impl TypeChecker {
         {
             captured.insert(
                 *unit,
-                crate::ai::capture(
+                crate::ai::capture_incremental(
+                    *unit,
+                    self.body_queries.as_deref(),
+                    queries,
                     program,
                     &graph,
                     crate::ai::CaptureInputs {

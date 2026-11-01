@@ -15,8 +15,16 @@ mod packages;
 mod rename;
 pub mod verify;
 pub use packages::{ModuleEvidence, ModuleIdentity, SymbolIdentity, UpdateDelta};
+mod incremental_dispatch;
+mod incremental_indirect;
+pub(crate) mod incremental_snapshot;
 mod semantic;
 mod storage;
+pub(crate) use incremental_snapshot::{
+    VerificationRelocation, VerificationSnapshotColdFallback, VerificationSnapshotFallback,
+    VerificationSnapshotState, VerificationSnapshotUpdate, capture_incremental,
+    incremental_snapshot,
+};
 pub(crate) mod symbols;
 pub use graph::{Direction, Impact, ImpactNode, Limits};
 pub use semantic::{QueryRequest, QuerySession, SemanticFacts};
@@ -159,6 +167,7 @@ pub(crate) struct CapturedUnit {
     lambda_names: HashMap<FunctionId, String>,
     rename_calls: Vec<(Span, FunctionId)>,
     direct: HashMap<FunctionId, u8>,
+    own_effects: HashMap<FunctionId, u8>,
     dispatches: HashMap<FunctionId, BTreeSet<FunctionId>>,
     dispatch_sites: HashMap<Span, FunctionId>,
     interfaces: interfaces::Captured,
@@ -223,6 +232,7 @@ pub(crate) fn capture(
         lambda_names: HashMap::new(),
         rename_calls: Vec::new(),
         direct: HashMap::new(),
+        own_effects: HashMap::new(),
         dispatches: HashMap::new(),
         dispatch_sites: HashMap::new(),
         interfaces: Default::default(),
@@ -350,7 +360,7 @@ pub(crate) fn capture(
             }).collect();
             result.semantic.witnesses.insert(id, witnesses);
         }
-        let mut bits = facts.get(&id).map_or_else(
+        let compiler_bits = facts.get(&id).map_or_else(
             || {
                 if matches!(body, AstEvent::Expr(_)) {
                     RuntimeEffects::ALL.bits()
@@ -360,6 +370,7 @@ pub(crate) fn capture(
             },
             |f| f.effects().intersection(RuntimeEffects::ALL).bits(),
         );
+        let mut bits = 0;
         if let Some(sites) = graph.get(&id) {
             for &span in sites.indirect_spans.values() {
                 result.semantic.capability(
@@ -667,7 +678,8 @@ pub(crate) fn capture(
         if initializer {
             result.graph.merge(id, initializer_calls);
         }
-        *result.direct.entry(id).or_default() |= bits;
+        *result.own_effects.entry(id).or_default() |= bits;
+        *result.direct.entry(id).or_default() |= bits | compiler_bits;
     }
     result
 }
@@ -693,6 +705,55 @@ pub(crate) fn snapshot(
     source: &str,
     project: Option<&Path>,
 ) -> Result<Snapshot> {
+    snapshot_with_boundary(
+        frontend,
+        entry,
+        source,
+        project,
+        SnapshotBoundary::default(),
+    )
+}
+
+type DispatchDependents<'a> = &'a dyn Fn(&[Function], &[String], usize) -> Vec<Function>;
+type InstanceCapture = Vec<(String, String, Vec<String>)>;
+type RetainedFunction<'a> = &'a dyn Fn(&str) -> Option<Function>;
+#[derive(Default)]
+struct SnapshotBoundary<'a> {
+    instances: Option<&'a std::cell::RefCell<InstanceCapture>>,
+    functions: HashMap<(UnitId, FunctionId), Function>,
+    synthetic: Vec<Function>,
+    dispatch: Option<&'a std::cell::RefCell<Option<incremental_dispatch::State>>>,
+    dispatch_retired: Option<&'a std::collections::HashSet<String>>,
+    dispatch_dependents: Option<DispatchDependents<'a>>,
+    retained_id: Option<RetainedFunction<'a>>,
+    fixed_ids: Option<&'a std::cell::RefCell<std::collections::HashSet<String>>>,
+    retained: Option<&'a dyn Fn(UnitId, FunctionId) -> Option<Function>>,
+    bodyless: Option<&'a dyn Fn(UnitId, FunctionId) -> Option<RuntimeEffects>>,
+    indirect: Option<&'a HashMap<UnitId, indirect::Inputs>>,
+    generics: Option<&'a HashMap<UnitId, generics::Source>>,
+}
+fn snapshot_with_boundary(
+    frontend: &crate::Frontend,
+    entry: &Path,
+    source: &str,
+    project: Option<&Path>,
+    context: SnapshotBoundary<'_>,
+) -> Result<Snapshot> {
+    let SnapshotBoundary {
+        instances: retained_instances,
+        functions: boundary,
+        synthetic: mut retained_synthetic,
+        dispatch: retained_dispatch,
+        dispatch_retired,
+        dispatch_dependents,
+        retained_id,
+        fixed_ids,
+        retained,
+        bodyless: retained_bodyless,
+        indirect: retained_indirect,
+        generics: selected_generic_sources,
+    } = context;
+    let generic_sources = selected_generic_sources.unwrap_or(&frontend.db.generic_sources);
     let workspace =
         std::fs::canonicalize(project.unwrap_or(entry.parent().context("entry parent")?))?;
     let workspace = workspace
@@ -706,7 +767,9 @@ pub(crate) fn snapshot(
         .borrow_mut()
         .take()
         .context("analysis capture disabled")?;
-    generics::restore(&frontend.db.generic_sources, &mut captured);
+    if retained.is_none() || selected_generic_sources.is_some() {
+        generics::restore(generic_sources, &mut captured);
+    }
     let mut paths = HashMap::from([(UnitId::ENTRY, entry.to_string_lossy().into_owned())]);
     let mut namespaces = HashMap::new();
     let mut programs = HashMap::from([(UnitId::ENTRY, &frontend.program)]);
@@ -747,6 +810,9 @@ pub(crate) fn snapshot(
             .iter()
             .map(|m| (m.id, &m.program)),
     ) {
+        if retained.is_some() {
+            continue;
+        }
         for item in &program.items {
             if let Item::Function(f) = item
                 && f.rust_bridge.is_some()
@@ -823,7 +889,8 @@ pub(crate) fn snapshot(
             if let Some(target) = frontend.db.dependencies().unit_for_path(unit, &import.path) {
                 map.insert(local.to_string(), (target, None));
                 map.insert(import.path.clone(), (target, None));
-                if let Some(module) = programs.get(&target).and_then(|p| p.module.as_ref())
+                if retained.is_none()
+                    && let Some(module) = programs.get(&target).and_then(|p| p.module.as_ref())
                     && let Some(capture) = captured.get_mut(&unit)
                 {
                     capture.symbols.reference(
@@ -843,12 +910,15 @@ pub(crate) fn snapshot(
                 && let Some(target) = frontend.db.dependencies().unit_for_path(unit, module)
             {
                 map.insert(local.to_string(), (target, Some(item.to_string())));
-                item_imports.push((unit, target, item, import.span));
-                if let Some(declaration) = frontend
-                    .db
-                    .generic_sources
-                    .get(&target)
-                    .and_then(|s| s.items.get(item))
+                if retained.is_none() {
+                    item_imports.push((unit, target, item, import.span));
+                }
+                if retained.is_none()
+                    && let Some(declaration) = frontend
+                        .db
+                        .generic_sources
+                        .get(&target)
+                        .and_then(|s| s.items.get(item))
                     && let Some(capture) = captured.get_mut(&unit)
                 {
                     capture.symbols.reference(
@@ -867,6 +937,11 @@ pub(crate) fn snapshot(
         Some(owner) => FunctionId::method(TypeId::local(owner), id.name()),
         None => FunctionId::free(id.name()),
     };
+    if let Some(inputs) = retained_indirect {
+        for (&unit, capture) in &mut captured {
+            capture.indirect = inputs.get(&unit).cloned().unwrap_or_default();
+        }
+    }
     let resolve_uncached = |unit: UnitId, id: FunctionId| -> (UnitId, FunctionId) {
         if let (Some(ns), Some(owner)) = (id.namespace(), id.owner()) {
             // A qualified module function is represented as a static call:
@@ -925,7 +1000,7 @@ pub(crate) fn snapshot(
         resolutions.borrow_mut().insert(key, target);
         target
     };
-    let mut nodes: HashMap<(UnitId, FunctionId), Function> = HashMap::new();
+    let mut nodes: HashMap<(UnitId, FunctionId), Function> = boundary;
     for (&unit, capture) in &captured {
         for id in capture.graph.ids().chain(capture.declarations.keys()) {
             let (owner, local) = resolve(unit, *id);
@@ -958,6 +1033,20 @@ pub(crate) fn snapshot(
             });
         }
     }
+    if let Some(retained) = retained {
+        for (&unit, capture) in &captured {
+            for (_, sites) in capture.graph.iter() {
+                for target in &sites.targets {
+                    let key = resolve(unit, *target);
+                    if let std::collections::hash_map::Entry::Vacant(entry) = nodes.entry(key)
+                        && let Some(node) = retained(key.0, key.1)
+                    {
+                        entry.insert(node);
+                    }
+                }
+            }
+        }
+    }
     for (&unit, capture) in &captured {
         for &(span, target) in &capture.rename_calls {
             if let Some(node) = nodes.get_mut(&resolve(unit, target))
@@ -982,6 +1071,9 @@ pub(crate) fn snapshot(
             unit,
             crate::compiler_db::normalize::builtin_module_aliases(program),
         );
+        if retained.is_some() {
+            continue;
+        }
         for item in &program.items {
             match item {
                 Item::Class(class) if class.constructors.is_empty() => {
@@ -995,6 +1087,9 @@ pub(crate) fn snapshot(
         }
     }
     let bodyless_effects = |(unit, target): &(UnitId, FunctionId)| {
+        if let Some(retained) = retained_bodyless {
+            return retained(*unit, *target);
+        }
         let is_enum = *bodyless.get(&(*unit, target.owner()?.as_ref()))?;
         match (is_enum, target.name().as_ref()) {
             (false, "init") => Some(RuntimeEffects::NONE),
@@ -1011,6 +1106,20 @@ pub(crate) fn snapshot(
                 crate::semantic::intrinsics::builtin_static_effects(target, &module_aliases[&unit])
             })
     };
+    if let Some(retained) = retained {
+        for (&unit, capture) in &captured {
+            for (target, _, _) in &capture.indirect.values {
+                if let Some(target) = target {
+                    let key = resolve(unit, *target);
+                    if !nodes.contains_key(&key)
+                        && let Some(function) = retained(key.0, key.1)
+                    {
+                        nodes.insert(key, function);
+                    }
+                }
+            }
+        }
+    }
     let (indirect_functions, indirect_calls) = indirect::infer(&captured, &nodes, &resolve);
     let incomplete_indirect: std::collections::HashSet<_> = indirect_functions
         .iter()
@@ -1127,6 +1236,9 @@ pub(crate) fn snapshot(
     let class_key = |unit: UnitId, owner: &str| format!("$unit{}::{owner}", unit.0);
     let mut classes = Vec::new();
     for (&unit, program) in &programs {
+        if retained.is_some() {
+            continue;
+        }
         for item in &program.items {
             if let Item::Class(class) = item {
                 let key = class_key(unit, &class.name);
@@ -1179,7 +1291,80 @@ pub(crate) fn snapshot(
             }
         }
     }
-    let dispatch = dispatch::complete(&classes, &dispatches.keys().cloned().collect());
+    let mut dispatch_changed_ids = std::collections::HashSet::new();
+    let dispatch = if let Some(retained_dispatch) = retained_dispatch {
+        let mut owners = HashMap::<String, std::collections::HashSet<(String, String)>>::new();
+        if let Some(retired) = dispatch_retired {
+            for id in retired {
+                owners.entry(id.clone()).or_default();
+            }
+        }
+        for (&unit, capture) in &captured {
+            for id in capture.declarations.keys() {
+                if let Some(function) = nodes.get(&resolve(unit, *id)) {
+                    owners.entry(function.id.clone()).or_default();
+                }
+            }
+        }
+        for (query, callers) in &dispatches {
+            for caller in callers {
+                if let Some(function) = nodes.get(caller) {
+                    owners
+                        .entry(function.id.clone())
+                        .or_default()
+                        .insert(query.clone());
+                }
+            }
+        }
+        let mut state = retained_dispatch.borrow_mut();
+        let mut functions;
+        if let Some(state) = state.as_mut() {
+            let delta = state.update(owners.into_iter().collect());
+            dispatch_changed_ids.extend(delta.functions.iter().map(|function| function.id.clone()));
+            if let Some(dependents) = dispatch_dependents {
+                retained_synthetic.extend(dependents(
+                    &delta.functions,
+                    &delta.removed,
+                    delta.visits,
+                ));
+            }
+            functions = delta.functions;
+        } else {
+            let fresh = incremental_dispatch::State::new(&classes, owners);
+            functions = if fresh.supported() {
+                fresh.functions().cloned().collect()
+            } else {
+                dispatch::complete(&classes, &dispatches.keys().cloned().collect()).functions
+            };
+            *state = Some(fresh);
+        }
+        let state = state.as_ref().unwrap();
+        let queries: HashMap<_, _> = dispatches
+            .keys()
+            .filter_map(|query| Some((query.clone(), state.query(&query.0, &query.1)?.to_owned())))
+            .collect();
+        let produced: std::collections::HashSet<_> = functions
+            .iter()
+            .map(|function| function.id.clone())
+            .collect();
+        for id in queries.values() {
+            if !produced.contains(id)
+                && let Some(function) = retained_id
+                    .and_then(|lookup| lookup(id))
+                    .or_else(|| state.function(id).cloned())
+            {
+                functions.push(function);
+            }
+        }
+        dispatch::Dispatch {
+            functions,
+            queries,
+            #[cfg(test)]
+            visits: 0,
+        }
+    } else {
+        dispatch::complete(&classes, &dispatches.keys().cloned().collect())
+    };
     for (key, callers) in dispatches {
         if let Some(id) = dispatch.queries.get(&key) {
             for caller in callers {
@@ -1257,14 +1442,49 @@ pub(crate) fn snapshot(
     for (key, targets) in edges {
         nodes.get_mut(&key).unwrap().callees = targets.into_iter().collect();
     }
+    let mut captured_ids = std::collections::HashSet::new();
+    for (&unit, capture) in &captured {
+        for id in capture.declarations.keys() {
+            if let Some(function) = nodes.get(&resolve(unit, *id)) {
+                captured_ids.insert(function.id.clone());
+            }
+        }
+    }
+    let indirect_ids: std::collections::HashSet<_> = indirect_functions
+        .iter()
+        .map(|function| function.id.clone())
+        .collect();
     let mut functions: Vec<_> = nodes
         .into_values()
         .chain(dispatch.functions)
         .chain(indirect_functions)
         .chain(interface_routing.functions)
         .collect();
+    let overrides: std::collections::HashSet<_> = retained_synthetic
+        .iter()
+        .filter(|function| {
+            !captured_ids.contains(&function.id)
+                && !dispatch_changed_ids.contains(&function.id)
+                && !indirect_ids.contains(&function.id)
+                && fixed_ids.is_none_or(|fixed| !fixed.borrow().contains(&function.id))
+        })
+        .map(|function| function.id.clone())
+        .collect();
+    functions.retain(|function| !overrides.contains(&function.id));
+    let produced: std::collections::HashSet<_> = functions
+        .iter()
+        .map(|function| function.id.clone())
+        .collect();
+    functions.extend(
+        retained_synthetic
+            .into_iter()
+            .filter(|function| !produced.contains(&function.id)),
+    );
     for node in &mut functions {
-        if node.synthetic && node.callees.is_empty() {
+        if node.synthetic
+            && node.callees.is_empty()
+            && fixed_ids.is_none_or(|fixed| !fixed.borrow().contains(&node.id))
+        {
             node.unknown = true;
             node.runtime_effects = RuntimeEffects::ALL.bits();
         }
@@ -1273,12 +1493,31 @@ pub(crate) fn snapshot(
     functions.sort_by(|a, b| a.id.cmp(&b.id));
     let instance_ids: Vec<String> = functions.iter().map(|f| f.id.clone()).collect();
     let instance_callees: Vec<Vec<String>> = functions.iter().map(|f| f.callees.clone()).collect();
-    let merged = generics::aggregate(
-        &frontend.db.generic_sources,
-        &paths,
-        &mut functions,
-        &mut semantic,
-    );
+    let merged = if retained.is_none() || selected_generic_sources.is_some() {
+        generics::aggregate(generic_sources, &paths, &mut functions, &mut semantic)
+    } else {
+        HashMap::new()
+    };
+    if let Some(output) = retained_instances {
+        output.borrow_mut().extend(
+            instance_ids
+                .iter()
+                .zip(&instance_callees)
+                .filter(|(id, _)| {
+                    retained.is_none()
+                        || captured_ids.contains(*id)
+                        || dispatch_changed_ids.contains(*id)
+                        || indirect_ids.contains(*id)
+                })
+                .map(|(id, callees)| {
+                    (
+                        id.clone(),
+                        merged.get(id).unwrap_or(id).clone(),
+                        callees.clone(),
+                    )
+                }),
+        );
+    }
     let by_source: HashMap<_, _> = functions
         .iter()
         .enumerate()
@@ -1338,46 +1577,54 @@ pub(crate) fn snapshot(
         &functions,
         &semantic.symbols,
     );
-    let ranges: Vec<_> = captured
-        .values()
-        .flat_map(|unit| &unit.symbol_owners)
-        .filter_map(|(span, owner)| {
-            Some((
-                Location {
-                    path: paths.get(&crate::module::ModuleId(span.file_id.0))?.clone(),
-                    start: span.start,
-                    end: span.end,
-                },
-                owner.clone(),
-            ))
-        })
-        .collect();
-    semantic.references = frontend.db.references.capture(symbol_references, &ranges)?;
-    generics::source_edges(
-        &frontend.db.generic_sources,
-        &paths,
-        &mut functions,
-        &semantic.references,
-    );
+    semantic.references = if retained.is_some() {
+        frontend.db.references.patch(symbol_references)
+    } else {
+        let ranges: Vec<_> = captured
+            .values()
+            .flat_map(|unit| &unit.symbol_owners)
+            .filter_map(|(span, owner)| {
+                Some((
+                    Location {
+                        path: paths.get(&crate::module::ModuleId(span.file_id.0))?.clone(),
+                        start: span.start,
+                        end: span.end,
+                    },
+                    owner.clone(),
+                ))
+            })
+            .collect();
+        frontend.db.references.capture(symbol_references, &ranges)?
+    };
+    if retained.is_none() || selected_generic_sources.is_some() {
+        generics::source_edges(
+            generic_sources,
+            &paths,
+            &mut functions,
+            &semantic.references,
+        );
+    }
     semantic.instances =
         graph::Instances::new(&instance_ids, &instance_callees, &merged, &functions);
     graph::propagate(&mut functions);
     packages::attach(frontend, &paths, &captured, &mut functions, &mut semantic)?;
-    semantic.rust_bridges = frontend
-        .db
-        .rust_bridge_symbols
-        .iter()
-        .map(|(_, symbol)| symbol.clone())
-        .collect();
-    interop::attach(
-        frontend,
-        &paths,
-        &functions,
-        bridge_declarations,
-        &mut semantic,
-    )?;
-    if let Some(root) = project {
-        semantic.interop.load_project(root)?;
+    if retained.is_none() {
+        semantic.rust_bridges = frontend
+            .db
+            .rust_bridge_symbols
+            .iter()
+            .map(|(_, symbol)| symbol.clone())
+            .collect();
+        interop::attach(
+            frontend,
+            &paths,
+            &functions,
+            bridge_declarations,
+            &mut semantic,
+        )?;
+        if let Some(root) = project {
+            semantic.interop.load_project(root)?;
+        }
     }
     captured.clear();
     let mut snapshot = Snapshot {
@@ -1401,11 +1648,10 @@ pub(crate) fn snapshot(
         .filter(|file| file.is_bundled())
         .map(|file| file.id)
         .collect();
-    if frontend
-        .db
-        .generic_sources
-        .iter()
-        .any(|(unit, source)| !bundled.contains(unit) && source.has_workspace_generics())
+    if (retained.is_none() || selected_generic_sources.is_some())
+        && generic_sources
+            .iter()
+            .any(|(unit, source)| !bundled.contains(unit) && source.has_workspace_generics())
     {
         generics::present_types(&mut snapshot);
     }

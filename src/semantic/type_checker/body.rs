@@ -243,6 +243,24 @@ impl TypedBody {
         }
     }
 
+    pub(crate) fn indirect_inputs(&self) -> crate::semantic::indirect_lock::IndirectInputs {
+        self.indirect_lock.clone()
+    }
+    pub(crate) fn analysis_symbols(&self) -> crate::semantic::analysis_symbols::Facts {
+        self.analysis_symbols.clone()
+    }
+
+    pub(crate) fn snapshot_tables(
+        self,
+        types: &mut HashMap<ExprId, Type>,
+        calls: &mut HashMap<ExprId, Option<FunctionId>>,
+        patterns: &mut HashMap<PatternId, Pattern>,
+    ) {
+        types.extend(self.expr_types);
+        calls.extend(self.analysis_calls);
+        patterns.extend(self.pattern_resolutions);
+    }
+
     /// Merge this body's tables and then its lambdas' in preorder, the order
     /// in which inline checking last wrote each key.
     pub(crate) fn merge_tables(

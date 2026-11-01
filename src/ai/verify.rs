@@ -5,6 +5,7 @@ use super::*;
 use crate::diagnostics::{Diagnostic, DiagnosticEmitter, source_map::SourceLookup};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 const BASELINE_SIZE_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -217,7 +218,7 @@ struct Node {
     prefix: String,
     digest: String,
     key: Option<String>,
-    children: BTreeMap<char, Node>,
+    children: BTreeMap<char, Arc<Node>>,
 }
 impl Node {
     fn build(entries: &[(String, String, String)]) -> Option<Self> {
@@ -244,7 +245,10 @@ impl Node {
         while start < entries.len() {
             let digit = entries[start].0.as_bytes()[common];
             let end = start + entries[start..].partition_point(|e| e.0.as_bytes()[common] == digit);
-            children.insert(digit as char, Self::build(&entries[start..end]).unwrap());
+            children.insert(
+                digit as char,
+                Arc::new(Self::build(&entries[start..end]).unwrap()),
+            );
             start = end;
         }
         let digest = hash_serialized(
@@ -261,6 +265,132 @@ impl Node {
             children,
         })
     }
+    fn rehash(&mut self) {
+        self.digest = hash_serialized(
+            &self
+                .children
+                .iter()
+                .map(|(digit, child)| (digit, &child.digest))
+                .collect::<Vec<_>>(),
+        )
+        .expect("radix digest");
+    }
+
+    /// Replace one leaf by copying only its radix path. Unchanged child nodes
+    /// remain shared with earlier revisions. Returns visited node count, including
+    /// the newly occupied slot for an insertion into an empty tree or branch.
+    fn insert(root: &mut Option<Self>, identity: &str, key: &str, digest: String) -> usize {
+        assert!(
+            identity.len() == 64 && identity.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid semantic identity hash"
+        );
+        match root {
+            Some(node) => node.insert_leaf(identity, key, digest),
+            None => {
+                *root = Some(Self::leaf(identity, key, digest));
+                1
+            }
+        }
+    }
+
+    fn leaf(identity: &str, key: &str, digest: String) -> Self {
+        Self {
+            prefix: identity.into(),
+            digest,
+            key: Some(key.into()),
+            children: BTreeMap::new(),
+        }
+    }
+
+    fn insert_leaf(&mut self, identity: &str, key: &str, digest: String) -> usize {
+        let common = self
+            .prefix
+            .bytes()
+            .zip(identity.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common < self.prefix.len() {
+            let old_digit = self.prefix.as_bytes()[common] as char;
+            let new_digit = identity.as_bytes()[common] as char;
+            let old = std::mem::replace(
+                self,
+                Self {
+                    prefix: identity[..common].into(),
+                    digest: String::new(),
+                    key: None,
+                    children: BTreeMap::new(),
+                },
+            );
+            self.children.insert(old_digit, Arc::new(old));
+            self.children
+                .insert(new_digit, Arc::new(Self::leaf(identity, key, digest)));
+            self.rehash();
+            return 1;
+        }
+        if let Some(existing) = &self.key {
+            assert_eq!(existing, key, "semantic identity hash collision");
+            self.digest = digest;
+            return 1;
+        }
+        let digit = identity.as_bytes()[self.prefix.len()] as char;
+        let visits = match self.children.get_mut(&digit) {
+            Some(child) => Arc::make_mut(child).insert_leaf(identity, key, digest),
+            None => {
+                self.children
+                    .insert(digit, Arc::new(Self::leaf(identity, key, digest)));
+                1
+            }
+        };
+        self.rehash();
+        visits + 1
+    }
+
+    /// Delete one leaf and collapse a resulting single-child branch. A missing
+    /// identity leaves the tree unchanged; an identity collision fails closed.
+    fn remove(root: &mut Option<Self>, identity: &str, key: &str) -> usize {
+        let Some(node) = root else {
+            return 1;
+        };
+        let (empty, visits) = node.remove_leaf(identity, key);
+        if empty {
+            *root = None;
+        }
+        visits
+    }
+
+    fn remove_leaf(&mut self, identity: &str, key: &str) -> (bool, usize) {
+        if !identity.starts_with(&self.prefix) {
+            return (false, 1);
+        }
+        if let Some(existing) = &self.key {
+            if self.prefix != identity {
+                return (false, 1);
+            }
+            assert_eq!(existing, key, "semantic identity hash collision");
+            return (true, 1);
+        }
+        let Some(&digit) = identity.as_bytes().get(self.prefix.len()) else {
+            return (false, 1);
+        };
+        let digit = digit as char;
+        let Some(child) = self.children.get_mut(&digit) else {
+            return (false, 1);
+        };
+        let (empty, visits) = Arc::make_mut(child).remove_leaf(identity, key);
+        if empty {
+            self.children.remove(&digit);
+        }
+        match self.children.len() {
+            0 => return (true, visits + 1),
+            1 => {
+                let (_, child) = self.children.pop_first().expect("one radix child");
+                *self = Arc::try_unwrap(child).unwrap_or_else(|child| (*child).clone());
+            }
+            _ => self.rehash(),
+        }
+        (false, visits + 1)
+    }
+
     fn collect(&self, keys: &mut BTreeSet<String>, work: &mut Work) {
         work.index_nodes += 1;
         if let Some(key) = &self.key {
@@ -296,7 +426,12 @@ impl Node {
                 .copied()
                 .collect::<BTreeSet<_>>()
             {
-                Self::difference(a.children.get(&digit), b.children.get(&digit), keys, work);
+                Self::difference(
+                    a.children.get(&digit).map(Arc::as_ref),
+                    b.children.get(&digit).map(Arc::as_ref),
+                    keys,
+                    work,
+                );
             }
         } else if b.prefix.starts_with(&a.prefix) && a.key.is_none() {
             let digit = b.prefix.as_bytes()[a.prefix.len()] as char;
@@ -315,6 +450,24 @@ impl Node {
     }
 }
 
+fn declaration_signature(s: &symbols::Symbol, names: &display::TypeNames) -> Value {
+    let module = s.identity.as_ref().map(|i| i.module.as_str());
+    let types = |ts: &[Type]| {
+        ts.iter()
+            .map(|t| names.render(t, module))
+            .collect::<Vec<_>>()
+    };
+    let signature = json!({"kind":s.kind,"type":s.ty.as_ref().map(|ty| names.render(ty,module)),
+                "exported":s.details.public_api,"public":s.details.is_public,"protected":s.details.is_protected,
+                "static":s.details.is_static,"mutable":s.details.is_mut,"open":s.details.is_open,"override":s.details.is_override,
+                "parameters":types(&s.details.parameters),"parameter_modes":s.details.parameter_modes,
+                "constraint_parameter":s.details.constraint_parameter,"constraint_alternatives":types(&s.details.constraint_alternatives),
+                "constant_value":s.details.constant_value,"async":s.details.is_async,"const":s.details.is_const,"type_parameters":s.details.type_params,
+                "extends":types(&s.details.extends),
+                "implements":types(&s.details.implements),"payload":types(&s.details.payload)});
+    signature
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Baseline {
@@ -324,10 +477,10 @@ pub struct Baseline {
     revision: String,
     complete: bool,
     diagnostics: Vec<DiagnosticFact>,
-    facts: BTreeMap<String, Fact>,
-    inputs: BTreeMap<String, String>,
+    facts: im::OrdMap<String, Arc<Fact>>,
+    inputs: im::OrdMap<String, String>,
     #[serde(skip)]
-    callers: BTreeMap<String, BTreeSet<String>>,
+    callers: im::OrdMap<String, im::OrdSet<String>>,
     #[serde(skip)]
     index: Option<Node>,
     #[serde(skip)]
@@ -337,6 +490,16 @@ pub struct Baseline {
     #[serde(skip)]
     public_count: usize,
 }
+/// Identity metadata produced while constructing baseline declaration facts.
+/// Report adapters reuse it rather than enumerating declarations again.
+#[derive(Clone)]
+struct SnapshotNames {
+    type_names: Arc<display::TypeNames>,
+    ids: im::OrdMap<String, String>,
+    ambiguous: im::OrdSet<String>,
+    contracts: im::OrdMap<String, BTreeSet<String>>,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Work {
     pub index_nodes: usize,
@@ -400,7 +563,7 @@ pub struct Report {
 fn public_signature(value: Option<&Value>) -> bool {
     value.is_some_and(|v| v["exported"] == true)
 }
-fn configuration_inputs(root: &Path, inputs: &mut BTreeMap<String, String>) -> Result<()> {
+fn configuration_inputs(root: &Path, inputs: &mut im::OrdMap<String, String>) -> Result<()> {
     for name in ["project.toml", "project.lock"] {
         match std::fs::read(root.join(name)) {
             Ok(bytes) => {
@@ -523,9 +686,9 @@ impl Baseline {
                     ),
                     complete: false,
                     diagnostics: diagnostics.facts,
-                    facts: BTreeMap::new(),
-                    inputs: BTreeMap::new(),
-                    callers: BTreeMap::new(),
+                    facts: im::OrdMap::new(),
+                    inputs: im::OrdMap::new(),
+                    callers: im::OrdMap::new(),
                     index: None,
                     diagnostic_index: None,
                     diagnostic_lookup: BTreeMap::new(),
@@ -559,16 +722,27 @@ impl Baseline {
         snapshot: &Snapshot,
         diagnostics: Vec<DiagnosticFact>,
     ) -> Result<Self> {
+        Self::from_snapshot_with_names(snapshot, diagnostics).map(|(baseline, _)| baseline)
+    }
+    fn from_snapshot_with_names(
+        snapshot: &Snapshot,
+        diagnostics: Vec<DiagnosticFact>,
+    ) -> Result<(Self, SnapshotNames)> {
         let started = std::time::Instant::now();
         let result = Self::from_snapshot_impl(snapshot, diagnostics);
         crate::query_stats::verification_phase("baseline_report", started);
         result
     }
-    fn from_snapshot_impl(snapshot: &Snapshot, diagnostics: Vec<DiagnosticFact>) -> Result<Self> {
-        let names = display::TypeNames::new(snapshot);
+    fn from_snapshot_impl(
+        snapshot: &Snapshot,
+        diagnostics: Vec<DiagnosticFact>,
+    ) -> Result<(Self, SnapshotNames)> {
+        let names = Arc::new(display::TypeNames::new(snapshot));
         let mut facts = BTreeMap::new();
-        let mut ids = HashMap::new();
+        let mut ids = im::OrdMap::new();
         let mut ordinals = BTreeMap::new();
+        let mut ambiguous = im::OrdSet::new();
+        let mut contracts = im::OrdMap::new();
         let mut declarations: Vec<_> = snapshot
             .semantic
             .symbols
@@ -606,21 +780,17 @@ impl Baseline {
             let ordinal = ordinals.entry(stem.clone()).or_insert(0usize);
             let key = format!("{stem}#{ordinal}");
             *ordinal += 1;
+            if *ordinal == 2 {
+                ambiguous.insert(stem);
+            }
             ids.insert(s.id.clone(), key.clone());
-            let module = s.identity.as_ref().map(|i| i.module.as_str());
-            let types = |ts: &[Type]| {
-                ts.iter()
-                    .map(|t| names.render(t, module))
-                    .collect::<Vec<_>>()
-            };
-            let signature = json!({"kind":s.kind,"type":s.ty.as_ref().map(|ty| names.render(ty,module)),
-                "exported":s.details.public_api,"public":s.details.is_public,"protected":s.details.is_protected,
-                "static":s.details.is_static,"mutable":s.details.is_mut,"open":s.details.is_open,"override":s.details.is_override,
-                "parameters":types(&s.details.parameters),"parameter_modes":s.details.parameter_modes,
-                "constraint_parameter":s.details.constraint_parameter,"constraint_alternatives":types(&s.details.constraint_alternatives),
-                "constant_value":s.details.constant_value,"async":s.details.is_async,"const":s.details.is_const,"type_parameters":s.details.type_params,
-                "extends":types(&s.details.extends),
-                "implements":types(&s.details.implements),"payload":types(&s.details.payload)});
+            if !s.details.effect_contracts.is_empty() {
+                contracts.insert(
+                    key.clone(),
+                    s.details.effect_contracts.iter().cloned().collect(),
+                );
+            }
+            let signature = declaration_signature(s, &names);
             facts.insert(
                 key,
                 Fact {
@@ -811,7 +981,10 @@ impl Baseline {
             revision: snapshot.revision.clone(),
             complete: true,
             diagnostics,
-            facts,
+            facts: facts
+                .into_iter()
+                .map(|(key, fact)| (key, Arc::new(fact)))
+                .collect(),
             inputs: snapshot
                 .sources
                 .iter()
@@ -823,7 +996,10 @@ impl Baseline {
                         .map(|path| (path.replace(std::path::MAIN_SEPARATOR, "/"), digest.clone()))
                 })
                 .collect(),
-            callers,
+            callers: callers
+                .into_iter()
+                .map(|(key, values)| (key, values.into_iter().collect::<im::OrdSet<_>>()))
+                .collect(),
             index: None,
             diagnostic_index: None,
             diagnostic_lookup: BTreeMap::new(),
@@ -833,7 +1009,15 @@ impl Baseline {
         result.normalize_diagnostics(&snapshot.workspace);
         result.reindex()?;
         result.revision = result.digest()?;
-        Ok(result)
+        Ok((
+            result,
+            SnapshotNames {
+                type_names: names,
+                ids,
+                ambiguous,
+                contracts,
+            },
+        ))
     }
     fn digest(&self) -> Result<String> {
         hash_serialized(&(
@@ -845,6 +1029,22 @@ impl Baseline {
             &self.inputs,
         ))
     }
+    /// Refresh one fact's index leaf after an effects-only correction. A missing
+    /// fact removes its leaf. This does not adjust declaration visibility,
+    /// diagnostic indexes or caller edges: their owners apply those deltas.
+    fn refresh_effect_fact_index(&mut self, key: &str) -> Result<usize> {
+        let identity = hash(key);
+        Ok(match self.facts.get(key) {
+            Some(fact) => Node::insert(
+                &mut self.index,
+                &identity,
+                key,
+                hash_serialized(&(key, fact))?,
+            ),
+            None => Node::remove(&mut self.index, &identity, key),
+        })
+    }
+
     fn reindex(&mut self) -> Result<()> {
         let mut entries = self
             .facts
@@ -858,6 +1058,9 @@ impl Baseline {
             .values()
             .filter(|f| public_signature(f.signature.as_ref()))
             .count();
+        self.reindex_diagnostics()
+    }
+    fn reindex_diagnostics(&mut self) -> Result<()> {
         self.diagnostic_lookup.clear();
         let mut diagnostics = Vec::new();
         let mut occurrences = BTreeMap::<String, usize>::new();
@@ -1113,6 +1316,132 @@ impl Baseline {
             diagnostics: Delta { added, removed },
             work,
         })
+    }
+}
+
+#[cfg(test)]
+mod radix_delta_tests {
+    use super::*;
+
+    fn cold(entries: &BTreeMap<String, (String, String)>) -> Option<Node> {
+        let values: Vec<_> = entries
+            .iter()
+            .map(|(identity, (key, digest))| (identity.clone(), key.clone(), digest.clone()))
+            .collect();
+        Node::build(&values)
+    }
+
+    fn same(actual: &Option<Node>, expected: &Option<Node>) {
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn radix_delta_insert_update_delete_matches_cold_build() {
+        for count in [8, 32, 128] {
+            let mut entries = BTreeMap::new();
+            let mut tree = None;
+            for i in 0..count {
+                let key = format!("declaration_{i}");
+                let identity = hash(&key);
+                let digest = hash(format!("fact_{i}"));
+                assert!(Node::insert(&mut tree, &identity, &key, digest.clone()) <= 65);
+                entries.insert(identity, (key, digest));
+                same(&tree, &cold(&entries));
+            }
+            let saved = tree.clone();
+            for i in (0..count).rev() {
+                let key = format!("declaration_{i}");
+                let identity = hash(&key);
+                let digest = hash(format!("changed_{i}"));
+                assert!(Node::insert(&mut tree, &identity, &key, digest.clone()) <= 65);
+                entries.insert(identity, (key, digest));
+                same(&tree, &cold(&entries));
+            }
+            assert_ne!(
+                saved.as_ref().unwrap().digest,
+                tree.as_ref().unwrap().digest
+            );
+            for i in (0..count).rev() {
+                let key = format!("declaration_{i}");
+                let identity = hash(&key);
+                assert!(Node::remove(&mut tree, &identity, &key) <= 65);
+                entries.remove(&identity);
+                same(&tree, &cold(&entries));
+            }
+            assert!(tree.is_none());
+            assert_eq!(Node::remove(&mut tree, &hash("missing"), "missing"), 1);
+        }
+    }
+
+    #[test]
+    fn radix_delta_shares_unrelated_subtrees_and_bounds_fixed_edit_work() {
+        let target = format!("a{}", "0".repeat(63));
+        for count in [8, 32, 128] {
+            let mut entries: BTreeMap<_, _> = (0..count)
+                .map(|i| {
+                    (
+                        format!("b{i:063x}"),
+                        (format!("other_{i}"), hash(format!("fact_{i}"))),
+                    )
+                })
+                .collect();
+            entries.insert(target.clone(), ("target".into(), hash("old")));
+            let original = cold(&entries);
+            let mut changed = original.clone();
+            let untouched = &original.as_ref().unwrap().children[&'b'];
+            assert_eq!(
+                Node::insert(&mut changed, &target, "target", hash("new")),
+                2
+            );
+            assert!(Arc::ptr_eq(
+                untouched,
+                &changed.as_ref().unwrap().children[&'b']
+            ));
+            entries.insert(target.clone(), ("target".into(), hash("new")));
+            same(&changed, &cold(&entries));
+            assert_eq!(Node::remove(&mut changed, &target, "target"), 2);
+            entries.remove(&target);
+            same(&changed, &cold(&entries));
+            assert_eq!(changed.as_ref().unwrap().prefix, untouched.prefix);
+            for (digit, child) in &changed.as_ref().unwrap().children {
+                assert!(Arc::ptr_eq(child, &untouched.children[digit]));
+            }
+            let wire = serde_json::to_vec(&changed).unwrap();
+            let restored: Option<Node> = serde_json::from_slice(&wire).unwrap();
+            same(&restored, &changed);
+            println!("radix_delta unrelated={count} updated_nodes=2 removed_nodes=2");
+        }
+    }
+
+    #[test]
+    fn radix_delta_splits_and_collapses_compressed_branches() {
+        let identities = [
+            format!("aa{}", "0".repeat(62)),
+            format!("ab{}", "0".repeat(62)),
+            format!("b{}", "0".repeat(63)),
+        ];
+        for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2]] {
+            let mut tree = None;
+            let mut entries = BTreeMap::new();
+            for i in order {
+                let key = format!("key_{i}");
+                let digest = hash(&key);
+                Node::insert(&mut tree, &identities[i], &key, digest.clone());
+                entries.insert(identities[i].clone(), (key, digest));
+                same(&tree, &cold(&entries));
+            }
+            let before_missing = serde_json::to_value(&tree).unwrap();
+            Node::remove(&mut tree, &format!("c{}", "0".repeat(63)), "missing");
+            assert_eq!(serde_json::to_value(&tree).unwrap(), before_missing);
+            for i in order {
+                Node::remove(&mut tree, &identities[i], &format!("key_{i}"));
+                entries.remove(&identities[i]);
+                same(&tree, &cold(&entries));
+            }
+        }
     }
 }
 

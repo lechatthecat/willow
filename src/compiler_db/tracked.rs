@@ -107,6 +107,8 @@ pub(crate) enum InputNode {
     RuntimeAbiRevision,
     ManifestMode,
     Entry,
+    SyntaxSignature(PathBuf, String),
+    BodySyntax(PathBuf, String),
 }
 
 impl InputNode {
@@ -221,6 +223,7 @@ struct Memo {
     changed_at: Revision,
     dependencies: Arc<[Dependency]>,
     durability: Durability,
+    retained_bytes: usize,
 }
 #[derive(Clone)]
 enum State {
@@ -279,6 +282,15 @@ pub(crate) struct TrackedStats {
     pub green_after_recompute: usize,
     pub changed: usize,
     pub dependency_edges_visited: usize,
+    pub candidate_entries_cloned: usize,
+    pub reclamation_nodes_visited: usize,
+    pub reclamation_edges_visited: usize,
+    pub accounting_entries_visited: usize,
+    pub accounting_edges_visited: usize,
+    pub reclamation_credit_added: usize,
+    pub validation_metadata_entries: usize,
+    pub auxiliary_accounting_entries: usize,
+    pub memo_entries_written: usize,
 }
 
 /// Dispatcher implementations may only read captured inputs and other queries.
@@ -304,9 +316,21 @@ struct QueryCycle(Arc<str>);
 pub(crate) struct TrackedQueryTable {
     revision: Revision,
     last_changed: [Revision; 3],
-    inputs: HashMap<InputNode, Input>,
-    states: RefCell<HashMap<QueryNode, State>>,
+    inputs: im::HashMap<InputNode, Input>,
+    states: RefCell<im::HashMap<QueryNode, State>>,
+    source_inputs: im::HashSet<PathBuf>,
+    input_bytes: usize,
+    memo_bytes: Cell<usize>,
+    dependency_edges: Cell<usize>,
+    journal_bytes: Cell<usize>,
+    validation_bytes: Cell<usize>,
+    demanded_bytes: Cell<usize>,
+    reclamation_credit: Cell<usize>,
+    last_sweep_work: usize,
     demanded: RefCell<HashSet<QueryNode>>,
+    inflight: RefCell<HashSet<QueryNode>>,
+    green: RefCell<HashMap<QueryNode, Durability>>,
+    changed_queries: RefCell<HashSet<QueryNode>>,
     stack: RefCell<Vec<EvalFrame>>,
     stats: Cell<TrackedStats>,
     #[cfg(test)]
@@ -330,6 +354,12 @@ impl TrackedQueryTable {
             last_changed: self.last_changed,
             inputs: self.inputs.clone(),
             states: RefCell::new(self.states.borrow().clone()),
+            source_inputs: self.source_inputs.clone(),
+            input_bytes: self.input_bytes,
+            memo_bytes: Cell::new(self.memo_bytes.get()),
+            dependency_edges: Cell::new(self.dependency_edges.get()),
+            reclamation_credit: Cell::new(self.reclamation_credit.get()),
+            last_sweep_work: self.last_sweep_work,
             ..Default::default()
         })
     }
@@ -341,11 +371,22 @@ impl TrackedQueryTable {
                 .checked_add(1)
                 .context("revision overflow")?,
         );
+        *self.changed_queries.get_mut() = HashSet::new();
+        self.journal_bytes.set(0);
+        self.green.get_mut().clear();
+        self.validation_bytes.set(0);
         Ok(())
     }
     pub(crate) fn retain_sources(&mut self, paths: &HashSet<PathBuf>) {
-        self.inputs
-            .retain(|node, _| !matches!(node, InputNode::Source(path) if !paths.contains(path)));
+        let removed: Vec<_> = self
+            .source_inputs
+            .iter()
+            .filter(|path| !paths.contains(*path))
+            .cloned()
+            .collect();
+        for path in removed {
+            self.remove_input(&InputNode::Source(path));
+        }
     }
 
     /// Capture each source once before evaluating its queries in a candidate.
@@ -371,7 +412,7 @@ impl TrackedQueryTable {
                 .get(&node)
                 .map_or(durability, |old| old.durability.max(durability));
             self.changed(invalidates, self.revision);
-            self.inputs.insert(
+            self.insert_input(
                 node,
                 Input {
                     value,
@@ -382,9 +423,69 @@ impl TrackedQueryTable {
         }
     }
 
-    /// Retain the transitive closure of this candidate's demands. Visiting
-    /// each live node and edge once also preserves dependencies of green memos
-    /// whose providers never ran in this revision.
+    fn credit(&self, work: usize) {
+        self.reclamation_credit
+            .set(self.reclamation_credit.get().saturating_add(work));
+        self.bump(|stats| stats.reclamation_credit_added += work);
+    }
+    fn input_size(node: &InputNode, input: &Input) -> usize {
+        node.heap_bytes() + input.value.retained_bytes
+    }
+    fn insert_input(&mut self, node: InputNode, input: Input) {
+        self.bump(|stats| stats.accounting_entries_visited += 1);
+        self.credit(2);
+        if let InputNode::Source(path) = &node {
+            self.source_inputs.insert(path.clone());
+        }
+        self.input_bytes += Self::input_size(&node, &input);
+        if let Some(old) = self.inputs.insert(node.clone(), input) {
+            self.input_bytes -= Self::input_size(&node, &old);
+        }
+    }
+    fn remove_input(&mut self, node: &InputNode) {
+        if let Some(old) = self.inputs.remove(node) {
+            self.input_bytes -= Self::input_size(node, &old);
+            if let InputNode::Source(path) = node {
+                self.source_inputs.remove(path);
+            }
+        }
+    }
+    fn dependency_bytes(edges: &[Dependency]) -> usize {
+        edges
+            .iter()
+            .map(|edge| {
+                std::mem::size_of::<Dependency>()
+                    + match &edge.node {
+                        DependencyNode::Input(node) => node.heap_bytes(),
+                        DependencyNode::Query(node) => node.heap_bytes(),
+                    }
+            })
+            .sum()
+    }
+    fn memo_size(node: &QueryNode, memo: &Memo) -> usize {
+        node.heap_bytes() + memo.retained_bytes
+    }
+    pub(crate) fn needs_compaction(&self) -> bool {
+        self.last_sweep_work == 0 || self.reclamation_credit.get() >= self.last_sweep_work.max(128)
+    }
+    pub(crate) fn graph_size(&self) -> (usize, usize) {
+        (self.states.borrow().len(), self.dependency_edges.get())
+    }
+    /// Reclamation is amortized against changed inputs and rebuilt dependencies,
+    /// not revisions or validation reads. Persistent candidates share untouched
+    /// graph storage. A cold sweep establishes the initial accounting baseline.
+    pub(crate) fn compact_amortized(
+        &mut self,
+        inventory: impl FnMut(&QueryNode) -> bool,
+    ) -> (usize, usize) {
+        if self.needs_compaction() {
+            self.compact(inventory)
+        } else {
+            self.graph_size()
+        }
+    }
+    /// Explicit full collection, also used at serialization boundaries. Each
+    /// actual node/edge visit is recorded; no graph scan determines the trigger.
     pub(crate) fn compact(
         &mut self,
         mut inventory: impl FnMut(&QueryNode) -> bool,
@@ -392,18 +493,16 @@ impl TrackedQueryTable {
         assert_frozen_read();
         assert!(self.stack.get_mut().is_empty());
         let mut live = std::mem::take(self.demanded.get_mut());
-        live.extend(
-            self.states
-                .get_mut()
-                .keys()
-                .filter(|node| inventory(node))
-                .cloned(),
-        );
+        self.demanded_bytes.set(0);
+        let states = self.states.get_mut();
+        let mut node_visits = states.len();
+        live.extend(states.keys().filter(|node| inventory(node)).cloned());
+        node_visits += live.len();
         let mut pending: Vec<_> = live.iter().cloned().collect();
         let mut inputs = HashSet::new();
-        let states = self.states.get_mut();
         let mut edges = 0;
         while let Some(node) = pending.pop() {
+            node_visits += 1;
             if let Some(State::Ready(memo)) = states.get(&node) {
                 edges += memo.dependencies.len();
                 for dependency in memo.dependencies.iter() {
@@ -420,20 +519,64 @@ impl TrackedQueryTable {
                 }
             }
         }
-        states.retain(|node, _| live.contains(node));
-        self.inputs.retain(|node, _| inputs.contains(node));
-        if states.capacity() > 4 * states.len().max(16) {
-            states.shrink_to_fit();
+        let dead: Vec<_> = states
+            .keys()
+            .filter(|node| !live.contains(*node))
+            .cloned()
+            .collect();
+        node_visits += states.len();
+        node_visits += dead.len();
+        for node in dead {
+            if let Some(State::Ready(memo)) = states.remove(&node) {
+                edges += memo.dependencies.len();
+                self.memo_bytes
+                    .set(self.memo_bytes.get() - Self::memo_size(&node, &memo));
+                self.dependency_edges
+                    .set(self.dependency_edges.get() - memo.dependencies.len());
+            }
         }
-        if self.inputs.capacity() > 4 * self.inputs.len().max(16) {
-            self.inputs.shrink_to_fit();
+        let dead: Vec<_> = self
+            .inputs
+            .keys()
+            .filter(|node| !inputs.contains(*node))
+            .cloned()
+            .collect();
+        node_visits += self.inputs.len();
+        node_visits += dead.len();
+        for node in dead {
+            self.remove_input(&node);
         }
-        (states.len(), edges)
+        self.last_sweep_work = self.states.get_mut().len() * 5
+            + self.inputs.len() * 2
+            + self.dependency_edges.get() * 2;
+        self.reclamation_credit.set(0);
+        self.bump(|stats| {
+            stats.reclamation_nodes_visited += node_visits;
+            stats.reclamation_edges_visited += edges;
+        });
+        self.graph_size()
     }
 
+    pub(crate) fn account_reclamation_indexes(&mut self, entries: usize) {
+        self.last_sweep_work += entries;
+        self.bump(|stats| stats.reclamation_nodes_visited += entries);
+    }
     pub(crate) fn revision(&self) -> Revision {
         self.revision
     }
+    /// Results first published or semantically changed in this candidate/revision.
+    /// Green validation, recomputation with an equal result, and presentation-only
+    /// refreshes are excluded. This is a sparse journal, not an inventory scan.
+    /// It records successful memo publication, including changed cached errors;
+    /// deferred or cyclic evaluations are not published and are excluded.
+    ///
+    /// Compaction only evicts cache entries, so it does not report semantic
+    /// deletion. Consumers must obtain removed owners from their source inventory.
+    /// New candidates, advanced revisions, and disk restoration start empty.
+    pub(crate) fn changed_queries(&self) -> std::cell::Ref<'_, HashSet<QueryNode>> {
+        self.changed_queries.borrow()
+    }
+
     /// Refresh presentation data only; semantic equality and clocks must stay intact.
     pub(crate) fn refresh_value(&self, node: &QueryNode, value: QueryValue) -> Result<()> {
         assert_frozen_read();
@@ -445,7 +588,18 @@ impl TrackedQueryTable {
             memo.result.as_ref().is_ok_and(|old| old.equivalent(&value)),
             "semantic result changed during presentation refresh: {node:?}"
         );
+        let old_bytes = memo
+            .result
+            .as_ref()
+            .map_or_else(|error| error.len(), |value| value.retained_bytes);
+        self.memo_bytes
+            .set(self.memo_bytes.get() - old_bytes + value.retained_bytes);
+        memo.retained_bytes = memo.retained_bytes - old_bytes + value.retained_bytes;
         memo.result = Ok(value);
+        self.bump(|stats| {
+            stats.accounting_entries_visited += 1;
+            stats.memo_entries_written += 1;
+        });
         Ok(())
     }
     pub(crate) fn peek(&self, node: &QueryNode) -> Option<QueryValue> {
@@ -474,41 +628,14 @@ impl TrackedQueryTable {
         }
     }
     pub(crate) fn retained_bytes(&self) -> usize {
-        let states = self.states.borrow();
-        let inputs = self
-            .inputs
-            .iter()
-            .map(|(node, input)| node.heap_bytes() + input.value.retained_bytes)
-            .sum::<usize>();
-        let buckets = self.inputs.capacity() * (std::mem::size_of::<(InputNode, Input)>() + 16) * 2
-            + states.capacity() * (std::mem::size_of::<(QueryNode, State)>() + 16) * 2;
-        inputs
-            + buckets
-            + states
-                .iter()
-                .map(|(node, state)| {
-                    node.heap_bytes()
-                        + match state {
-                            State::Ready(memo) => {
-                                memo.dependencies
-                                    .iter()
-                                    .map(|edge| {
-                                        std::mem::size_of::<Dependency>()
-                                            + match &edge.node {
-                                                DependencyNode::Input(node) => node.heap_bytes(),
-                                                DependencyNode::Query(node) => node.heap_bytes(),
-                                            }
-                                    })
-                                    .sum::<usize>()
-                                    + memo
-                                        .result
-                                        .as_ref()
-                                        .map_or_else(|e| e.len(), |v| v.retained_bytes)
-                            }
-                            State::Computing { .. } => 0,
-                        }
-                })
-                .sum::<usize>()
+        // HAMT paths and occupied leaf storage: a conservative per-entry bound.
+        self.input_bytes
+            + self.memo_bytes.get()
+            + self.journal_bytes.get()
+            + self.validation_bytes.get()
+            + self.demanded_bytes.get()
+            + self.inputs.len() * (std::mem::size_of::<(InputNode, Input)>() + 128) * 2
+            + self.states.borrow().len() * (std::mem::size_of::<(QueryNode, State)>() + 128) * 2
     }
     #[cfg(test)]
     pub(crate) fn retention_profile(&self) -> std::collections::BTreeMap<String, usize> {
@@ -610,7 +737,7 @@ impl TrackedQueryTable {
         for (node, value) in changes {
             let durability = node.durability();
             self.changed(durability, next);
-            self.inputs.insert(
+            self.insert_input(
                 node,
                 Input {
                     value,
@@ -630,9 +757,21 @@ impl TrackedQueryTable {
             self.changed(removed_durability, next);
         }
         if replace {
-            self.inputs.retain(|node, _| unique.contains(node));
+            let dead: Vec<_> = self
+                .inputs
+                .keys()
+                .filter(|node| !unique.contains(*node))
+                .cloned()
+                .collect();
+            for node in dead {
+                self.remove_input(&node);
+            }
         }
         self.revision = next;
+        *self.changed_queries.get_mut() = HashSet::new();
+        self.journal_bytes.set(0);
+        self.green.get_mut().clear();
+        self.validation_bytes.set(0);
         Ok(true)
     }
 
@@ -641,6 +780,13 @@ impl TrackedQueryTable {
             *clock = revision;
         }
         self.bump(|s| s.inputs_changed += 1);
+    }
+
+    /// Providers may probe an optional captured input only when their missing
+    /// branch records another dependency that observes its future appearance.
+    pub(crate) fn contains_input(&self, node: &InputNode) -> bool {
+        self.assert_active_owner();
+        self.inputs.contains_key(node)
     }
 
     pub(crate) fn input(&self, node: &InputNode) -> Result<QueryValue> {
@@ -679,7 +825,13 @@ impl TrackedQueryTable {
         provider: &impl QueryProvider,
         node: QueryNode,
     ) -> Result<(QueryValue, Revision)> {
-        self.demanded.borrow_mut().insert(node.clone());
+        if self.demanded.borrow_mut().insert(node.clone()) {
+            self.demanded_bytes.set(
+                self.demanded_bytes.get()
+                    + node.heap_bytes()
+                    + (std::mem::size_of::<QueryNode>() + 32) * 2,
+            );
+        }
         let memo = self.validate(provider, &node)?;
         self.record(DependencyNode::Query(node), memo.changed_at);
         memo.result
@@ -771,23 +923,33 @@ impl TrackedQueryTable {
                 self.revision
             );
         }
+        if self.inflight.borrow().contains(node) {
+            let revision = self.revision;
+            let error: Arc<str> = format!(
+                "E0800: compiler query cycle: {} -> {node:?} (revision {})",
+                self.stack
+                    .borrow()
+                    .iter()
+                    .map(|f| format!("{:?}", f.node))
+                    .collect::<Vec<_>>()
+                    .join(" -> "),
+                revision.0
+            )
+            .into();
+            *self.cycle_error.borrow_mut() = Some(Arc::clone(&error));
+            return Err(QueryCycle(error).into());
+        }
         let previous = match self.states.borrow().get(node) {
-            Some(State::Computing { revision }) => {
-                let error: Arc<str> = format!(
-                    "E0800: compiler query cycle: {} -> {node:?} (revision {})",
-                    self.stack
-                        .borrow()
-                        .iter()
-                        .map(|f| format!("{:?}", f.node))
-                        .collect::<Vec<_>>()
-                        .join(" -> "),
-                    revision.0
-                )
-                .into();
-                *self.cycle_error.borrow_mut() = Some(Arc::clone(&error));
-                return Err(QueryCycle(error).into());
+            Some(State::Computing { .. }) => {
+                unreachable!("active evaluations live in the candidate overlay")
             }
             Some(State::Ready(memo)) => {
+                if let Some(&durability) = self.green.borrow().get(node) {
+                    let mut memo = memo.clone();
+                    memo.verified_at = self.revision;
+                    memo.durability = durability;
+                    return Ok(Begin::Done(memo));
+                }
                 debug_assert!(
                     memo.changed_at <= memo.verified_at,
                     "invalid revision in {node:?}"
@@ -799,12 +961,7 @@ impl TrackedQueryTable {
             }
             None => None,
         };
-        self.states.borrow_mut().insert(
-            node.clone(),
-            State::Computing {
-                revision: self.revision,
-            },
-        );
+        self.inflight.borrow_mut().insert(node.clone());
         let depth = self.stack.borrow().len();
         self.stack.borrow_mut().push(EvalFrame {
             node: node.clone(),
@@ -816,7 +973,6 @@ impl TrackedQueryTable {
             table: self,
             node: node.clone(),
             depth,
-            previous: previous.clone(),
         };
         let Some(old) = &previous else {
             return self
@@ -876,9 +1032,13 @@ impl TrackedQueryTable {
         // Semantic backdating does not backdate durability. A child
         // can return the same value while gaining a less stable input.
         memo.durability = durability;
-        self.states
-            .borrow_mut()
-            .insert(node.clone(), State::Ready(memo.clone()));
+        self.green.borrow_mut().insert(node.clone(), durability);
+        self.validation_bytes.set(
+            self.validation_bytes.get()
+                + node.heap_bytes()
+                + (std::mem::size_of::<(QueryNode, Durability)>() + 32) * 2,
+        );
+        self.bump(|stats| stats.validation_metadata_entries += 1);
         memo
     }
     fn recompute(&self, provider: &impl QueryProvider, frame: Frame<'_>) -> Result<Memo> {
@@ -932,13 +1092,23 @@ impl TrackedQueryTable {
             .map(|edge| match &edge.node {
                 DependencyNode::Input(node) => self.inputs[node].durability,
                 DependencyNode::Query(node) => match &self.states.borrow()[node] {
-                    State::Ready(memo) => memo.durability,
+                    State::Ready(memo) => self
+                        .green
+                        .borrow()
+                        .get(node)
+                        .copied()
+                        .unwrap_or(memo.durability),
                     State::Computing { .. } => unreachable!("cycle checked before publication"),
                 },
             })
             .min()
             .unwrap_or(Durability::High);
-        let memo = Memo {
+        let dependency_bytes = Self::dependency_bytes(&dependencies);
+        let previous_accounting = previous
+            .as_ref()
+            .map(|memo| (Self::memo_size(node, memo), memo.dependencies.len()));
+        let mut memo = Memo {
+            retained_bytes: dependency_bytes,
             durability,
             changed_at: if equal {
                 previous.as_ref().unwrap().changed_at
@@ -954,9 +1124,34 @@ impl TrackedQueryTable {
             },
             dependencies: dependencies.into(),
         };
+        memo.retained_bytes += memo
+            .result
+            .as_ref()
+            .map_or_else(|error| error.len(), |value| value.retained_bytes);
+        self.memo_bytes.set(
+            self.memo_bytes.get() - previous_accounting.map_or(0, |v| v.0)
+                + Self::memo_size(node, &memo),
+        );
+        self.dependency_edges.set(
+            self.dependency_edges.get() - previous_accounting.map_or(0, |v| v.1)
+                + memo.dependencies.len(),
+        );
+        self.bump(|stats| {
+            stats.memo_entries_written += 1;
+            stats.accounting_entries_visited += 1;
+            stats.accounting_edges_visited += memo.dependencies.len();
+        });
+        self.credit(6 + 2 * previous_accounting.map_or(0, |v| v.1) + 2 * memo.dependencies.len());
         self.states
             .borrow_mut()
             .insert(node.clone(), State::Ready(memo.clone()));
+        if !equal && self.changed_queries.borrow_mut().insert(node.clone()) {
+            self.journal_bytes.set(
+                self.journal_bytes.get()
+                    + node.heap_bytes()
+                    + (std::mem::size_of::<QueryNode>() + 32) * 2,
+            );
+        }
         Ok(memo)
     }
     fn bump(&self, f: impl FnOnce(&mut TrackedStats)) {
@@ -1009,7 +1204,6 @@ struct Guard<'a> {
     table: &'a TrackedQueryTable,
     node: QueryNode,
     depth: usize,
-    previous: Option<Memo>,
 }
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
@@ -1026,14 +1220,25 @@ impl Drop for Guard<'_> {
             let (depth, owner) = n.get();
             n.set((depth - 1, if depth == 1 { std::ptr::null() } else { owner }));
         });
-        let mut states = self.table.states.borrow_mut();
-        if matches!(states.get(&self.node), Some(State::Computing { .. })) {
-            if let Some(previous) = self.previous.take().filter(|_| deferred) {
-                states.insert(self.node.clone(), State::Ready(previous));
-            } else {
-                states.remove(&self.node);
-            }
+        let published = self.table.green.borrow().contains_key(&self.node)
+            || matches!(self.table.states.borrow().get(&self.node),Some(State::Ready(memo)) if memo.verified_at == self.table.revision);
+        if !published
+            && !deferred
+            && let Some(State::Ready(memo)) = self.table.states.borrow_mut().remove(&self.node)
+        {
+            self.table
+                .memo_bytes
+                .set(self.table.memo_bytes.get() - TrackedQueryTable::memo_size(&self.node, &memo));
+            self.table
+                .dependency_edges
+                .set(self.table.dependency_edges.get() - memo.dependencies.len());
+            self.table.bump(|stats| {
+                stats.memo_entries_written += 1;
+                stats.accounting_entries_visited += 1;
+            });
+            self.table.credit(6 + 2 * memo.dependencies.len());
         }
+        self.table.inflight.borrow_mut().remove(&self.node);
     }
 }
 
@@ -1046,6 +1251,196 @@ mod tests {
             table.input(&self.0)
         }
     }
+    #[test]
+    fn candidate_reclamation_and_accounting_are_amortized() {
+        let mut first_work = None;
+        for size in [8, 32, 128] {
+            let mut accepted = TrackedQueryTable::default();
+            accepted
+                .accept((0..size).map(|id| (input(id), value(0))).collect())
+                .unwrap();
+            for id in 0..size {
+                accepted.read(&InputReader(input(id)), query(id)).unwrap();
+            }
+            accepted.compact(|_| true);
+            let mut credit = 0;
+            let mut work = 0;
+            let mut collections = 0;
+            for revision in 1..=1024 {
+                let mut next = accepted.candidate().unwrap();
+                next.advance_candidate().unwrap();
+                next.capture_candidate(input(0), value(revision));
+                next.read(&InputReader(input(0)), query(0)).unwrap();
+                next.compact_amortized(|_| true);
+                let stats = next.stats();
+                credit += stats.reclamation_credit_added;
+                work += stats.reclamation_nodes_visited + stats.reclamation_edges_visited;
+                collections += usize::from(stats.reclamation_nodes_visited > 0);
+                assert!(
+                    work <= 4 * credit,
+                    "size={size} revision={revision} work={work} credit={credit}"
+                );
+                assert_eq!(stats.candidate_entries_cloned, 0);
+                assert_eq!(stats.memo_entries_written, 1);
+                if revision == 1 {
+                    let accounting = (
+                        stats.accounting_entries_visited,
+                        stats.accounting_edges_visited,
+                    );
+                    assert_eq!(*first_work.get_or_insert(accounting), accounting);
+                }
+                accepted = next;
+            }
+            assert!(collections > 0);
+            for _ in 0..8 {
+                let mut next = accepted.candidate().unwrap();
+                next.read(&InputReader(input(0)), query(0)).unwrap();
+                next.compact_amortized(|_| true);
+                assert_eq!(next.stats().reclamation_credit_added, 0);
+                assert_eq!(next.stats().reclamation_nodes_visited, 0);
+                assert_eq!(next.stats().memo_entries_written, 0);
+                accepted = next;
+            }
+        }
+    }
+
+    #[test]
+    fn green_validation_does_not_rewrite_persistent_memos() {
+        for size in [8, 32, 128] {
+            let mut accepted = TrackedQueryTable::default();
+            accepted
+                .accept(vec![(input(0), value(0)), (input(1), value(0))])
+                .unwrap();
+            for id in 0..size {
+                accepted.read(&InputReader(input(0)), query(id)).unwrap();
+            }
+            let mut next = accepted.candidate().unwrap();
+            next.advance_candidate().unwrap();
+            next.capture_candidate(input(1), value(1));
+            for id in 0..size {
+                next.read(&InputReader(input(0)), query(id)).unwrap();
+            }
+            assert_eq!(next.stats().memo_entries_written, 0);
+            assert_eq!(next.stats().validation_metadata_entries, size);
+            for id in 0..size {
+                let states = next.states.borrow();
+                let Some(State::Ready(memo)) = states.get(&query(id)) else {
+                    panic!("missing memo")
+                };
+                assert_eq!(memo.verified_at, accepted.revision());
+            }
+        }
+    }
+
+    #[test]
+    fn changed_query_journal_excludes_equal_recomputation_and_presentation() {
+        struct Parity;
+        impl QueryProvider for Parity {
+            fn compute(&self, table: &TrackedQueryTable, _: &QueryNode) -> Result<QueryValue> {
+                Ok(value(*table.input(&input(0))?.get::<i64>() % 2))
+            }
+        }
+        let mut table = TrackedQueryTable::default();
+        table.accept(vec![(input(0), value(0))]).unwrap();
+        table.read(&Parity, query(0)).unwrap();
+        assert_eq!(*table.changed_queries(), HashSet::from([query(0)]));
+        table.accept(vec![(input(0), value(2))]).unwrap();
+        assert!(table.changed_queries().is_empty());
+        table.read(&Parity, query(0)).unwrap();
+        assert_eq!(table.stats().green_after_recompute, 1);
+        assert!(table.changed_queries().is_empty());
+        table.refresh_value(&query(0), value(0)).unwrap();
+        assert!(table.changed_queries().is_empty());
+        table.accept(vec![(input(0), value(3))]).unwrap();
+        table.read(&Parity, query(0)).unwrap();
+        table.read(&Parity, query(0)).unwrap();
+        assert_eq!(*table.changed_queries(), HashSet::from([query(0)]));
+    }
+
+    #[test]
+    fn changed_query_journal_is_candidate_local_and_revision_scoped() {
+        let reader = InputReader(input(0));
+        let mut accepted = TrackedQueryTable::default();
+        accepted.accept(vec![(input(0), value(1))]).unwrap();
+        accepted.read(&reader, query(0)).unwrap();
+        let mut candidate = accepted.candidate().unwrap();
+        assert!(candidate.changed_queries().is_empty());
+        candidate.read(&reader, query(0)).unwrap();
+        assert!(candidate.changed_queries().is_empty());
+        candidate.advance_candidate().unwrap();
+        candidate.capture_candidate(input(0), value(2));
+        candidate.read(&reader, query(0)).unwrap();
+        assert_eq!(*candidate.changed_queries(), HashSet::from([query(0)]));
+        assert_eq!(*accepted.peek(&query(0)).unwrap().get::<i64>(), 1);
+        assert_eq!(*accepted.changed_queries(), HashSet::from([query(0)]));
+        assert!(!candidate.accept(vec![(input(0), value(2))]).unwrap());
+        assert_eq!(candidate.changed_queries().len(), 1);
+        candidate.advance_candidate().unwrap();
+        assert!(candidate.changed_queries().is_empty());
+        // Cache eviction is not evidence that the source owner was deleted.
+        candidate.compact(|_| false);
+        assert!(candidate.changed_queries().is_empty());
+        let restored =
+            TrackedQueryTable::from_disk(TrackedQueryTable::default().disk_snapshot().unwrap())
+                .unwrap();
+        assert!(restored.changed_queries().is_empty());
+    }
+
+    #[test]
+    fn changed_query_journal_excludes_unpublished_deferred_and_cyclic_results() {
+        struct Deferred;
+        impl QueryProvider for Deferred {
+            fn compute(&self, _: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
+                Err(DeferredQuery(node.clone()).into())
+            }
+        }
+        struct Cycle;
+        impl QueryProvider for Cycle {
+            fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
+                table.read(self, node.clone())
+            }
+        }
+        let table = TrackedQueryTable::default();
+        assert!(table.read(&Deferred, query(0)).is_err());
+        assert!(table.changed_queries().is_empty());
+        assert!(table.read(&Cycle, query(0)).is_err());
+        assert!(table.changed_queries().is_empty());
+    }
+
+    #[test]
+    fn changed_query_journal_tracks_only_demanded_results_and_cached_errors() {
+        struct Fallible;
+        impl QueryProvider for Fallible {
+            fn compute(&self, table: &TrackedQueryTable, _: &QueryNode) -> Result<QueryValue> {
+                let n = *table.input(&input(0))?.get::<i64>();
+                anyhow::bail!("failure {n}")
+            }
+        }
+        for count in [8, 32, 128] {
+            let reader = InputReader(input(0));
+            let mut table = TrackedQueryTable::default();
+            table.accept(vec![(input(0), value(0))]).unwrap();
+            for i in 0..count {
+                table.read(&reader, query(i)).unwrap();
+            }
+            table.accept(vec![(input(0), value(1))]).unwrap();
+            table.read(&reader, query(0)).unwrap();
+            assert_eq!(*table.changed_queries(), HashSet::from([query(0)]));
+            assert!(table.read(&Fallible, query(count)).is_err());
+            assert_eq!(
+                *table.changed_queries(),
+                HashSet::from([query(0), query(count)])
+            );
+            table.advance_candidate().unwrap();
+            assert!(table.read(&Fallible, query(count)).is_err());
+            assert!(table.changed_queries().is_empty());
+            table.advance_candidate().unwrap();
+            table.capture_candidate(input(0), value(2));
+            assert!(table.read(&Fallible, query(count)).is_err());
+            assert_eq!(*table.changed_queries(), HashSet::from([query(count)]));
+        }
+    }
+
     #[test]
     fn durability_shortcuts_skip_edges_and_respect_intervening_revisions() {
         for high in [
@@ -1641,21 +2036,29 @@ struct DiskMemo {
 }
 impl TrackedQueryTable {
     pub(crate) fn disk_snapshot(&self) -> Result<DiskTable> {
+        self.disk_snapshot_filtered(|_| true)
+    }
+    pub(crate) fn disk_snapshot_filtered(
+        &self,
+        mut root: impl FnMut(&QueryNode) -> bool,
+    ) -> Result<DiskTable> {
         anyhow::ensure!(self.stack.borrow().is_empty(), "snapshot during evaluation");
         let states = self.states.borrow();
         let mut pending: Vec<_> = states
             .iter()
             .filter_map(|(node, state)| {
-                (matches!(
-                    node,
-                    QueryNode::TypedBody(_)
-                        | QueryNode::Parse(_)
-                        | QueryNode::NormalizedBody(_)
-                        | QueryNode::DirectEffects(_)
-                        | QueryNode::DefiniteAssignment(_)
-                        | QueryNode::AsyncBorrowReport(_)
-                        | QueryNode::ResolvedReferences(_)
-                ) && matches!(state, State::Ready(Memo { result: Ok(_), .. })))
+                (root(node)
+                    && matches!(
+                        node,
+                        QueryNode::TypedBody(_)
+                            | QueryNode::Parse(_)
+                            | QueryNode::NormalizedBody(_)
+                            | QueryNode::DirectEffects(_)
+                            | QueryNode::DefiniteAssignment(_)
+                            | QueryNode::AsyncBorrowReport(_)
+                            | QueryNode::ResolvedReferences(_)
+                    )
+                    && matches!(state, State::Ready(Memo { result: Ok(_), .. })))
                 .then_some(node.clone())
             })
             .collect();
@@ -1684,11 +2087,20 @@ impl TrackedQueryTable {
             memos.push(DiskMemo {
                 value: super::incremental::DiskValue::query(&node, value)?,
                 fingerprint: value.fingerprint,
+                verified_at: if self.green.borrow().contains_key(&node) {
+                    self.revision
+                } else {
+                    memo.verified_at
+                },
+                durability: self
+                    .green
+                    .borrow()
+                    .get(&node)
+                    .copied()
+                    .unwrap_or(memo.durability),
                 node,
-                verified_at: memo.verified_at,
                 changed_at: memo.changed_at,
                 dependencies: memo.dependencies.to_vec(),
-                durability: memo.durability,
             });
         }
         let mut inputs = Vec::new();
@@ -1759,6 +2171,8 @@ impl TrackedQueryTable {
             let previous = states.insert(
                 memo.node,
                 State::Ready(Memo {
+                    retained_bytes: Self::dependency_bytes(&memo.dependencies)
+                        + value.retained_bytes,
                     result: Ok(value),
                     verified_at: memo.verified_at,
                     changed_at: memo.changed_at,
@@ -1828,6 +2242,42 @@ impl TrackedQueryTable {
             }
         }
         anyhow::ensure!(visited == states.len(), "cyclic snapshot dependencies");
+        result.input_bytes = result
+            .inputs
+            .iter()
+            .map(|(node, input)| Self::input_size(node, input))
+            .sum();
+        result.source_inputs = result
+            .inputs
+            .keys()
+            .filter_map(|node| {
+                if let InputNode::Source(path) = node {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        result.memo_bytes.set(
+            states
+                .iter()
+                .map(|(node, state)| match state {
+                    State::Ready(memo) => Self::memo_size(node, memo),
+                    State::Computing { .. } => 0,
+                })
+                .sum(),
+        );
+        result.dependency_edges.set(
+            states
+                .values()
+                .map(|state| match state {
+                    State::Ready(memo) => memo.dependencies.len(),
+                    State::Computing { .. } => 0,
+                })
+                .sum(),
+        );
+        result.last_sweep_work =
+            states.len() * 3 + result.inputs.len() + result.dependency_edges.get();
         Ok(result)
     }
 }

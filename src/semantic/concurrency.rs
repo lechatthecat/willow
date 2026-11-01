@@ -160,7 +160,7 @@ impl ConcurrencyAnalyzer {
     pub fn with_module_helper_index(
         mut self,
         module_name: &str,
-        index: &HashMap<FunctionId, NonpreemptibleHelper>,
+        index: &crate::compiler_db::HelperSummary,
     ) -> Self {
         for (name, helper) in index {
             self.nonpreemptible_sync_helpers.insert(
@@ -202,7 +202,7 @@ impl ConcurrencyAnalyzer {
         local: &str,
         item: &str,
         module_display: &str,
-        index: &HashMap<FunctionId, NonpreemptibleHelper>,
+        index: &crate::compiler_db::HelperSummary,
     ) -> Self {
         for (name, helper) in index {
             let rekeyed = name.remap_imported_item(item, local);
@@ -556,7 +556,7 @@ impl ConcurrencyAnalyzer {
 /// compilation session. Session callers borrow the already-computed projection.
 pub(crate) fn compute_nonpreemptible_helpers(
     program: &Program,
-) -> HashMap<FunctionId, NonpreemptibleHelper> {
+) -> crate::compiler_db::HelperSummary {
     let graph = crate::semantic::TypeChecker::resolved_effect_graph(program);
     let effects = crate::compiler_db::effects::solve_unit(
         program,
@@ -661,7 +661,7 @@ mod tests {
             (false, true, true, 6),
         ] {
             let helpers = if helper {
-                HashMap::from([(
+                crate::compiler_db::HelperSummary::from(vec![(
                     FunctionId::free("helper"),
                     NonpreemptibleHelper {
                         span,
@@ -669,7 +669,7 @@ mod tests {
                     },
                 )])
             } else {
-                HashMap::new()
+                crate::compiler_db::HelperSummary::new()
             };
             let analyzer = || {
                 let analyzer = ConcurrencyAnalyzer::new().with_sync_stack_preemption(target);

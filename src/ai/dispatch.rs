@@ -3,6 +3,7 @@
 //! A query follows shared union edges; it never enumerates all descendants.
 use super::*;
 
+#[derive(Clone)]
 pub(super) struct Class {
     pub key: String,
     pub base: Option<String>,
@@ -11,6 +12,7 @@ pub(super) struct Class {
     pub methods: Vec<(String, String)>,
 }
 
+#[derive(Clone)]
 pub(super) struct Dispatch {
     pub functions: Vec<Function>,
     pub queries: HashMap<(String, String), String>,

@@ -840,3 +840,1325 @@ fn semantic_diff_review_entry_defaults_and_validation() {
     inputs.insert("project.toml".into(), b"invalid [".to_vec());
     assert!(resolve_entry(&opts, &inputs).is_err());
 }
+
+// Keep a full enumeration and independently cold target as the oracle. This
+// checks both compiler revision reuse and the report's sparse candidate index.
+fn incremental_oracle(sources: &[&str]) {
+    let scratch = tree::Scratch::new().unwrap();
+    let opts = Options {
+        root: scratch.0.clone(),
+        entry: Some("main.wi".into()),
+        project: false,
+        base: String::new(),
+        fail_on_growth: false,
+    };
+    let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+    let mut previous: Option<Capture> = None;
+    for source in sources {
+        fs::write(scratch.0.join("main.wi"), source).unwrap();
+        let warm = analyze(&opts, &scratch, &mut revision, Path::new("main.wi")).unwrap();
+        let cold = analyze(
+            &opts,
+            &scratch,
+            &mut crate::compiler_db::revision::AnalysisRevision::default(),
+            Path::new("main.wi"),
+        )
+        .unwrap();
+        if let Some(base) = &previous {
+            let keys: BTreeSet<String> = base
+                .baseline
+                .facts
+                .keys()
+                .chain(cold.baseline.facts.keys())
+                .cloned()
+                .collect();
+            for policy in [false, true] {
+                let expected =
+                    serde_json::to_value(compare_keys(base, &cold, policy, keys.clone()).unwrap())
+                        .unwrap();
+                let actual = serde_json::to_value(compare(base, &warm, policy).unwrap()).unwrap();
+                assert_eq!(actual, expected, "{source}");
+                assert_eq!(
+                    actual,
+                    serde_json::to_value(compare(base, &warm, policy).unwrap()).unwrap()
+                );
+            }
+        }
+        previous = Some(cold);
+    }
+}
+
+#[test]
+fn semantic_diff_incremental_cold_oracle_edit_shapes() {
+    // Addition, deletion, rename, signature, visibility, contracts, existing
+    // violations, growth, shrink, offsets, async masks, dispatch, cycles,
+    // closures, generic bodies, branches, exits, call targets and repeated edits.
+    incremental_oracle(&[
+        "fn main() {}",
+        "pub fn f() {} fn main() {}",
+        "pub fn g() {} fn main() {}",
+        "pub fn g() -> i64 { return 1; } fn main() {}",
+        "fn g() -> i64 { return 1; } fn main() {}",
+        "fn g() -> i64 { return 2; } fn main() {}",
+        "fn main() {}",
+    ]);
+    incremental_oracle(&[
+        "fn leaf(c: BlockingCell<i64>) {} fn caller(c: BlockingCell<i64>) { leaf(c); } fn main() {}",
+        "fn leaf(c: BlockingCell<i64>) { c.get(); } fn caller(c: BlockingCell<i64>) { leaf(c); } fn main() {}",
+        "\n\nfn leaf(c: BlockingCell<i64>) { c.get(); } fn caller(c: BlockingCell<i64>) { leaf(c); } fn main() {}",
+        "@effects(no_wait) fn leaf(c: BlockingCell<i64>) { c.get(); } fn caller(c: BlockingCell<i64>) { leaf(c); } fn main() {}",
+        "@effects(no_wait) fn leaf(c: BlockingCell<i64>) { c.get(); } fn caller(c: BlockingCell<i64>) { leaf(c); } fn main() {}",
+        "@effects(no_block) fn leaf(c: BlockingCell<i64>) { c.get(); } fn caller(c: BlockingCell<i64>) { leaf(c); } fn main() {}",
+        "@effects(no_suspend) fn leaf(c: BlockingCell<i64>) { c.get(); } fn caller(c: BlockingCell<i64>) { leaf(c); } fn main() {}",
+        "async fn leaf(c: BlockingCell<i64>) { c.get(); } fn caller(c: BlockingCell<i64>) { leaf(c); } fn main() {}",
+        "async fn leaf(c: BlockingCell<i64>) {} fn caller(c: BlockingCell<i64>) { leaf(c); } fn main() {}",
+    ]);
+    for (before, after) in [
+        (
+            "fn a() { b(); } fn b() { a(); } fn main() {}",
+            "fn a() { b(); } fn b() { println(1); a(); } fn main() {}",
+        ),
+        (
+            "fn f() { let g = |x: i64| x; g(1); } fn main() {}",
+            "fn f() { let g = |x: i64| { println(x); return x; }; g(1); } fn main() {}",
+        ),
+        (
+            "fn f<T>(x: T) -> T { return x; } fn main() { f(1); }",
+            "fn f<T>(x: T) -> T { println(1); return x; } fn main() { f(1); }",
+        ),
+        (
+            "fn a() {} fn b() { println(1); } fn f() { a(); } fn main() {}",
+            "fn a() {} fn b() { println(1); } fn f() { b(); } fn main() {}",
+        ),
+        (
+            "fn f(x: bool, c: BlockingCell<i64>) { if x { return; } } fn main() {}",
+            "fn f(x: bool, c: BlockingCell<i64>) { if x { c.get(); return; } c.get(); } fn main() {}",
+        ),
+        (
+            "interface I { fn f(self); } class C implements I { pub fn f(self) {} } fn call(x: I) { x.f(); } fn main() {}",
+            "interface I { fn f(self); } class C implements I { pub fn f(self) { println(1); } } fn call(x: I) { x.f(); } fn main() {}",
+        ),
+    ] {
+        incremental_oracle(&[before, after, before]);
+    }
+}
+
+#[test]
+fn semantic_diff_incremental_query_scaling() {
+    let mut independent_work = None;
+    for shape in ["independent", "chain", "fanout", "exits"] {
+        for size in [8, 32, 128] {
+            let scratch = tree::Scratch::new().unwrap();
+            let opts = Options {
+                root: scratch.0.clone(),
+                entry: Some("main.wi".into()),
+                project: false,
+                base: String::new(),
+                fail_on_growth: false,
+            };
+            let mut source = "fn leaf(c: BlockingCell<i64>) {}\n".to_owned();
+            for i in 0..size {
+                let body = match shape {
+                    "chain" if i > 0 => format!("node_{}(c);", i - 1),
+                    "chain" | "fanout" => "leaf(c);".into(),
+                    _ => String::new(),
+                };
+                source.push_str(&format!("fn node_{i}(c: BlockingCell<i64>) {{ {body} }}\n"));
+            }
+            source.push_str("fn main() {}\n");
+            let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+            fs::write(scratch.0.join("main.wi"), &source).unwrap();
+            let base = analyze(&opts, &scratch, &mut revision, Path::new("main.wi")).unwrap();
+            let replacement = if shape == "exits" {
+                let exits = "if c.get() == 0 { return; } ".repeat(size);
+                format!("fn leaf(c: BlockingCell<i64>) {{ {exits} }}")
+            } else {
+                "fn leaf(c: BlockingCell<i64>) { c.get(); }".into()
+            };
+            fs::write(
+                scratch.0.join("main.wi"),
+                source.replacen("fn leaf(c: BlockingCell<i64>) {}", &replacement, 1),
+            )
+            .unwrap();
+            crate::semantic::effects::REACHABLE_EDGE_VISITS.with(|v| v.set(0));
+            let target = analyze(&opts, &scratch, &mut revision, Path::new("main.wi")).unwrap();
+            let solver_edge_visits =
+                crate::semantic::effects::REACHABLE_EDGE_VISITS.with(|v| v.get());
+            assert_eq!(revision.changed_bodies.len(), 1);
+            assert_eq!(revision.incremental_stats["changed_typed_bodies"], 1);
+            let cold = analyze(
+                &opts,
+                &scratch,
+                &mut crate::compiler_db::revision::AnalysisRevision::default(),
+                Path::new("main.wi"),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(compare(&base, &target, false).unwrap()).unwrap(),
+                serde_json::to_value(compare(&base, &cold, false).unwrap()).unwrap(),
+                "cold scaling oracle {shape}/{size}"
+            );
+            let mut work = Work::default();
+            let keys = comparison_keys(&base, &target, &mut work);
+            let affected = if matches!(shape, "chain" | "fanout") {
+                size + 1
+            } else {
+                1
+            };
+            assert_eq!(keys.len(), affected);
+            assert_eq!(revision.incremental_stats["effects_scanned"], 1);
+            assert_eq!(revision.typechecks, 1);
+            // Include every tracked query recomputation, not only body checks.
+            // Extra exits add two expression-level queries each. This bound is
+            // not a total-analysis bound: equation comparisons and snapshot
+            // reconstruction are measured separately below.
+            // Complete signature/builtin references and the retained effect inventory
+            // add a fixed set of projection queries. Unrelated-size equality
+            // below is the strict scaling assertion.
+            let query_budget = if shape == "exits" { 14 + 2 * size } else { 16 };
+            assert!(
+                revision.incremental_stats["queries_recomputed"]
+                    .as_u64()
+                    .unwrap()
+                    <= query_budget as u64,
+                "{shape}/{size}: {}",
+                revision.incremental_stats
+            );
+            let equations = revision.incremental_stats["effects_recomputed"]
+                .as_u64()
+                .unwrap();
+            assert!(
+                equations <= 2 * affected as u64 + 2,
+                "{shape} {size}: {equations}"
+            );
+            for (counter, budget) in [
+                ("snapshot_functions_rebuilt", affected),
+                ("snapshot_symbols_rebuilt", 5 * affected),
+                ("report_facts_rebuilt", affected),
+                ("report_witness_owners_visited", 6 * affected),
+                ("report_witness_edges_visited", 12 * affected),
+                ("report_witness_queue_operations", 4 * affected),
+                ("report_dependency_edges_visited", 10 * affected),
+            ] {
+                assert!(
+                    revision.incremental_stats[counter].as_u64().unwrap() <= budget as u64,
+                    "{shape}/{size} {counter}: {}",
+                    revision.incremental_stats
+                );
+            }
+            if shape == "independent" {
+                let counts: Vec<_> = [
+                    "candidate_entries_cloned",
+                    "memo_entries_written",
+                    "accounting_entries_visited",
+                    "accounting_edges_visited",
+                    "queries_recomputed",
+                    "effect_equations_compared",
+                    "effect_inventory_owners",
+                    "effect_dependency_reads",
+                    "snapshot_owner_checks",
+                    "snapshot_dispatch_visits",
+                    "snapshot_projection_items_cloned",
+                    "snapshot_boundary_functions",
+                    "snapshot_functions_rebuilt",
+                    "snapshot_symbols_rebuilt",
+                    "report_facts_rebuilt",
+                    "report_witness_owners_visited",
+                    "report_witness_edges_visited",
+                    "report_witness_queue_operations",
+                    "report_dependency_edges_visited",
+                ]
+                .map(|key| revision.incremental_stats[key].as_u64().unwrap())
+                .into_iter()
+                .chain(std::iter::once(solver_edge_visits as u64))
+                .collect();
+                if let Some(previous) = &independent_work {
+                    assert_eq!(
+                        previous, &counts,
+                        "unrelated input increased work at {size}"
+                    );
+                } else {
+                    independent_work = Some(counts);
+                }
+            }
+            assert!(
+                solver_edge_visits <= 40 * (affected + 1),
+                "{shape}/{size} solver edges {solver_edge_visits}"
+            );
+            assert!(work.index_nodes <= 1 + 1024 * affected);
+            let all = base
+                .baseline
+                .facts
+                .keys()
+                .chain(target.baseline.facts.keys())
+                .cloned()
+                .collect();
+            assert_eq!(
+                serde_json::to_value(compare(&base, &target, false).unwrap()).unwrap(),
+                serde_json::to_value(compare_keys(&base, &target, false, all).unwrap()).unwrap()
+            );
+            println!(
+                "incremental shape={shape} size={size} scans=1 equations={equations} compared={} index_nodes={} typechecks={} queries_recomputed={} equation_comparisons={} snapshot_functions={} snapshot_symbols={} snapshot_owner_checks={} coordinate_owners={} changed_typed_bodies={} report_facts={} report_witness_owners={} report_witness_edges={} report_witness_queue={} report_dependency_edges={} effect_inventory_owners={} coordinate_leaves={} effect_dependency_reads={} dispatch_visits={} dispatch_nodes={} projection_items={} boundary_functions={} solver_edges={solver_edge_visits} candidate_clones={} accounting_entries={} accounting_edges={} gc_nodes={} gc_edges={} gc_credit={} memo_writes={} validation_metadata={} auxiliary_accounting={}",
+                work.compared_symbols,
+                work.index_nodes,
+                revision.typechecks,
+                revision.incremental_stats["queries_recomputed"],
+                revision.incremental_stats["effect_equations_compared"],
+                revision.incremental_stats["snapshot_functions_rebuilt"],
+                revision.incremental_stats["snapshot_symbols_rebuilt"],
+                revision.incremental_stats["snapshot_owner_checks"],
+                revision.incremental_stats["snapshot_coordinate_owners"],
+                revision.incremental_stats["changed_typed_bodies"],
+                revision.incremental_stats["report_facts_rebuilt"],
+                revision.incremental_stats["report_witness_owners_visited"],
+                revision.incremental_stats["report_witness_edges_visited"],
+                revision.incremental_stats["report_witness_queue_operations"],
+                revision.incremental_stats["report_dependency_edges_visited"],
+                revision.incremental_stats["effect_inventory_owners"],
+                revision.incremental_stats["report_coordinate_leaves_visited"],
+                revision.incremental_stats["effect_dependency_reads"],
+                revision.incremental_stats["snapshot_dispatch_visits"],
+                revision.incremental_stats["snapshot_dispatch_nodes"],
+                revision.incremental_stats["snapshot_projection_items_cloned"],
+                revision.incremental_stats["snapshot_boundary_functions"],
+                revision.incremental_stats["candidate_entries_cloned"],
+                revision.incremental_stats["accounting_entries_visited"],
+                revision.incremental_stats["accounting_edges_visited"],
+                revision.incremental_stats["reclamation_nodes_visited"],
+                revision.incremental_stats["reclamation_edges_visited"],
+                revision.incremental_stats["reclamation_credit_added"],
+                revision.incremental_stats["memo_entries_written"],
+                revision.incremental_stats["validation_metadata_entries"],
+                revision.incremental_stats["auxiliary_accounting_entries"]
+            );
+        }
+    }
+}
+
+#[test]
+fn semantic_diff_incremental_dependency_edits_match_cold() {
+    let scratch = tree::Scratch::new().unwrap();
+    let opts = Options {
+        root: scratch.0.clone(),
+        entry: Some("main.wi".into()),
+        project: false,
+        base: String::new(),
+        fail_on_growth: false,
+    };
+    fs::write(scratch.0.join("main.wi"), "import dep; @effects(no_wait) fn call(c: BlockingCell<i64>) { dep::leaf(c); } fn main() {}").unwrap();
+    let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+    let mut previous: Option<Capture> = None;
+    for source in [
+        "pub fn leaf(c: BlockingCell<i64>) {}",
+        "pub fn leaf(c: BlockingCell<i64>) { c.get(); }",
+        "\n\npub fn leaf(c: BlockingCell<i64>) { c.get(); }",
+        "pub fn leaf(c: BlockingCell<i64>) {}",
+    ] {
+        fs::write(scratch.0.join("dep.wi"), source).unwrap();
+        let warm = analyze(&opts, &scratch, &mut revision, Path::new("main.wi")).unwrap();
+        let cold = analyze(
+            &opts,
+            &scratch,
+            &mut crate::compiler_db::revision::AnalysisRevision::default(),
+            Path::new("main.wi"),
+        )
+        .unwrap();
+        if let Some(base) = &previous {
+            let keys = base
+                .baseline
+                .facts
+                .keys()
+                .chain(cold.baseline.facts.keys())
+                .cloned()
+                .collect();
+            assert_eq!(
+                serde_json::to_value(compare(base, &warm, false).unwrap()).unwrap(),
+                serde_json::to_value(compare_keys(base, &cold, false, keys).unwrap()).unwrap()
+            );
+        }
+        previous = Some(cold);
+    }
+}
+
+#[test]
+fn semantic_diff_retained_duplicate_diagnostics_keep_distinct_owners() {
+    let warnings = "fn warning_a(n:i64)->i64 { return match n { _ => 1, x if x > 0 => 2 }; }\nfn warning_b(n:i64)->i64 { return match n { _ => 1, x if x > 0 => 2 }; }\nfn main() {}";
+    let before = format!("fn leaf() {{}}\n{warnings}");
+    let after = format!("fn leaf() {{ println(42); }}\n{warnings}");
+    let moved = format!("\n\n{after}");
+    incremental_oracle(&[&before, &after, &moved]);
+}
+
+#[test]
+fn semantic_diff_report_failure_invalidates_retained_snapshot() {
+    let scratch = tree::Scratch::new().unwrap();
+    let opts = Options {
+        root: scratch.0.clone(),
+        entry: Some("main.wi".into()),
+        project: false,
+        base: String::new(),
+        fail_on_growth: false,
+    };
+    let entry = Path::new("main.wi");
+    let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+    fs::write(scratch.0.join(entry), "fn leaf() {} fn main() {}").unwrap();
+    let base = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+    // Simulate rejection/loss of the report after accepting a compiler state.
+    revision.verification_capture = None;
+    fs::write(
+        scratch.0.join(entry),
+        "fn leaf() { println(42); } fn main() {}",
+    )
+    .unwrap();
+    assert!(analyze(&opts, &scratch, &mut revision, entry).is_err());
+    let recovered = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+    let cold = analyze(
+        &opts,
+        &scratch,
+        &mut crate::compiler_db::revision::AnalysisRevision::default(),
+        entry,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(compare(&base, &recovered, false).unwrap()).unwrap(),
+        serde_json::to_value(compare(&base, &cold, false).unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn semantic_diff_retained_free_declaration_deltas_scale() {
+    for size in [8, 32, 128] {
+        let scratch = tree::Scratch::new().unwrap();
+        let opts = Options {
+            root: scratch.0.clone(),
+            entry: Some("main.wi".into()),
+            project: false,
+            base: String::new(),
+            fail_on_growth: false,
+        };
+        let mut source = String::new();
+        for i in 0..size {
+            source.push_str(&format!("fn unrelated_{i}() {{}}\n"));
+        }
+        source.push_str("fn main() {}\n");
+        let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+        let entry = Path::new("main.wi");
+        fs::write(scratch.0.join(entry), &source).unwrap();
+        let mut before = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        for prefix in [
+            "pub fn added() { println(42); }\n",
+            "pub fn added(n:i64) { println(n); }\n",
+            "",
+        ] {
+            fs::write(scratch.0.join(entry), format!("{prefix}{source}")).unwrap();
+            let after = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+            let cold = analyze(
+                &opts,
+                &scratch,
+                &mut crate::compiler_db::revision::AnalysisRevision::default(),
+                entry,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(compare(&before, &after, false).unwrap()).unwrap(),
+                serde_json::to_value(compare(&before, &cold, false).unwrap()).unwrap(),
+                "size={size} edit={prefix}"
+            );
+            assert!(
+                revision.incremental_stats["snapshot_functions_rebuilt"]
+                    .as_u64()
+                    .unwrap()
+                    <= 2,
+                "{}",
+                revision.incremental_stats
+            );
+            assert!(
+                revision.incremental_stats["snapshot_symbols_rebuilt"]
+                    .as_u64()
+                    .unwrap()
+                    <= 4,
+                "{}",
+                revision.incremental_stats
+            );
+            assert!(
+                revision.incremental_stats["report_facts_rebuilt"]
+                    .as_u64()
+                    .unwrap()
+                    <= 2,
+                "{}",
+                revision.incremental_stats
+            );
+            before = after;
+        }
+    }
+}
+
+#[test]
+fn semantic_diff_retained_nominal_coordinates_match_cold() {
+    let suffix = "class C { pub fn value(self) -> i64 { return 1; } }\nfn use_it(c:C)->i64 { return c.value(); }\nfn main() {}";
+    let before = format!("fn leaf() {{}}\n{suffix}");
+    let after = format!("fn leaf() {{ println(42); }}\n{suffix}");
+    let moved = format!("\n\n{after}");
+    incremental_oracle(&[&before, &after, &moved, &before]);
+}
+
+#[test]
+fn semantic_diff_retained_duplicate_declarations_match_cold() {
+    incremental_oracle(&[
+        "fn same() {} fn main() {}",
+        "fn same() {} fn same() { println(42); } fn main() {}",
+        "fn same() {} fn same() {} fn main() {}",
+        "fn same() {} fn main() {}",
+    ]);
+}
+
+#[test]
+fn semantic_diff_retained_witness_coordinates_do_not_accumulate() {
+    let scratch = tree::Scratch::new().unwrap();
+    let opts = Options {
+        root: scratch.0.clone(),
+        entry: Some("main.wi".into()),
+        project: false,
+        base: String::new(),
+        fail_on_growth: false,
+    };
+    let entry = Path::new("main.wi");
+    let source =
+        "fn leaf(c:BlockingCell<i64>) { c.get(); } fn caller(c:BlockingCell<i64>) {} fn main() {}";
+    let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+    fs::write(scratch.0.join(entry), source).unwrap();
+    let base = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+    let leaves = base.causes.leaves.len();
+    let locations = base.causes.locations.len();
+    for edit in 1..=128 {
+        fs::write(
+            scratch.0.join(entry),
+            format!("{}{source}", "\n".repeat(edit % 2)),
+        )
+        .unwrap();
+        let current = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        assert_eq!(current.causes.leaves.len(), leaves);
+        assert_eq!(current.causes.locations.len(), locations);
+        if [8, 32, 128].contains(&edit) {
+            let changed = source.replace(
+                "fn caller(c:BlockingCell<i64>) {}",
+                "fn caller(c:BlockingCell<i64>) { leaf(c); }",
+            );
+            fs::write(scratch.0.join(entry), &changed).unwrap();
+            let target = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+            let cold = analyze(
+                &opts,
+                &scratch,
+                &mut crate::compiler_db::revision::AnalysisRevision::default(),
+                entry,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(compare(&base, &target, false).unwrap()).unwrap(),
+                serde_json::to_value(compare(&base, &cold, false).unwrap()).unwrap()
+            );
+            fs::write(scratch.0.join(entry), source).unwrap();
+            analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        }
+    }
+}
+
+#[test]
+fn semantic_diff_retained_unrelated_generic_does_not_rebuild() {
+    let mut measured = None;
+    for size in [8, 32, 128] {
+        let scratch = tree::Scratch::new().unwrap();
+        let opts = Options {
+            root: scratch.0.clone(),
+            entry: Some("main.wi".into()),
+            project: false,
+            base: String::new(),
+            fail_on_growth: false,
+        };
+        let entry = Path::new("main.wi");
+        let mut source = String::from(
+            "fn leaf(c:BlockingCell<i64>) {}\nfn identity<T>(x:T)->T { return x; }\nfn main() { identity(1); }\n",
+        );
+        for i in 0..size {
+            source.push_str(&format!("fn unrelated_{i}() {{}}\n"));
+        }
+        let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+        fs::write(scratch.0.join(entry), &source).unwrap();
+        let before = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        fs::write(
+            scratch.0.join(entry),
+            source.replace(
+                "fn leaf(c:BlockingCell<i64>) {}",
+                "fn leaf(c:BlockingCell<i64>) { c.get(); }",
+            ),
+        )
+        .unwrap();
+        let after = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        let counts = [
+            "effect_equations_compared",
+            "snapshot_functions_rebuilt",
+            "snapshot_symbols_rebuilt",
+            "report_facts_rebuilt",
+        ]
+        .map(|key| revision.incremental_stats[key].as_u64().unwrap());
+        if let Some(old) = measured {
+            assert_eq!(
+                old, counts,
+                "unrelated generics caused full rebuild at {size}"
+            );
+        }
+        measured = Some(counts);
+        assert_eq!(counts[1], 1);
+        let cold = analyze(
+            &opts,
+            &scratch,
+            &mut crate::compiler_db::revision::AnalysisRevision::default(),
+            entry,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(compare(&before, &after, false).unwrap()).unwrap(),
+            serde_json::to_value(compare(&before, &cold, false).unwrap()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn semantic_diff_retained_unrelated_modules_scale() {
+    let mut measured = None;
+    for size in [8, 32, 128] {
+        let scratch = tree::Scratch::new().unwrap();
+        let opts = Options {
+            root: scratch.0.clone(),
+            entry: Some("main.wi".into()),
+            project: false,
+            base: String::new(),
+            fail_on_growth: false,
+        };
+        let entry = Path::new("main.wi");
+        let mut source = String::from("import dep;\n");
+        for i in 0..size {
+            source.push_str(&format!("import unrelated_{i};\n"));
+            fs::write(
+                scratch.0.join(format!("unrelated_{i}.wi")),
+                "pub fn idle() {}",
+            )
+            .unwrap();
+        }
+        source.push_str("fn main() {}\n");
+        fs::write(scratch.0.join(entry), source).unwrap();
+        fs::write(
+            scratch.0.join("dep.wi"),
+            "pub fn leaf(c:BlockingCell<i64>) {}",
+        )
+        .unwrap();
+        let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+        let before = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        fs::write(
+            scratch.0.join("dep.wi"),
+            "pub fn leaf(c:BlockingCell<i64>) { c.get(); }",
+        )
+        .unwrap();
+        let after = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        let counts = [
+            "queries_recomputed",
+            "effect_equations_compared",
+            "effect_inventory_owners",
+            "snapshot_owner_checks",
+            "snapshot_functions_rebuilt",
+            "snapshot_symbols_rebuilt",
+            "report_facts_rebuilt",
+        ]
+        .map(|key| revision.incremental_stats[key].as_u64().unwrap());
+        if let Some(old) = measured {
+            assert_eq!(
+                old, counts,
+                "unrelated modules increased semantic work at {size}"
+            );
+        }
+        measured = Some(counts);
+        let cold = analyze(
+            &opts,
+            &scratch,
+            &mut crate::compiler_db::revision::AnalysisRevision::default(),
+            entry,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(compare(&before, &after, false).unwrap()).unwrap(),
+            serde_json::to_value(compare(&before, &cold, false).unwrap()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn semantic_diff_retained_method_and_effectful_neighbors_scale() {
+    for method in [false, true] {
+        let mut measured = None;
+        for size in [8, 32, 128] {
+            let scratch = tree::Scratch::new().unwrap();
+            let opts = Options {
+                root: scratch.0.clone(),
+                entry: Some("main.wi".into()),
+                project: false,
+                base: String::new(),
+                fail_on_growth: false,
+            };
+            let entry = Path::new("main.wi");
+            let signature = if method {
+                "class C { fn leaf(self,c:BlockingCell<i64>)"
+            } else {
+                "fn leaf(c:BlockingCell<i64>)"
+            };
+            let suffix = if method { " }\n" } else { "\n" };
+            // Equal byte lengths exclude coordinate repair from semantic work.
+            let before_body = "{          }";
+            let after_body = "{ c.get(); }";
+            assert_eq!(before_body.len(), after_body.len());
+            let mut source = format!("{signature} {before_body}{suffix}");
+            for i in 0..size {
+                source.push_str(&format!("fn unrelated_{i}() {{ println(1); }}\n"));
+            }
+            source.push_str("fn main() {}\n");
+            fs::write(scratch.0.join(entry), &source).unwrap();
+            let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+            let before = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+            fs::write(
+                scratch.0.join(entry),
+                source.replacen(before_body, after_body, 1),
+            )
+            .unwrap();
+            let after = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+            let counts = [
+                "queries_recomputed",
+                "effect_equations_compared",
+                "effect_inventory_owners",
+                "snapshot_owner_checks",
+                "snapshot_functions_rebuilt",
+                "snapshot_symbols_rebuilt",
+                "report_facts_rebuilt",
+            ]
+            .map(|key| revision.incremental_stats[key].as_u64().unwrap());
+            if let Some(old) = measured {
+                assert_eq!(
+                    old, counts,
+                    "method={method} unrelated effectful functions increased work at {size}"
+                );
+            }
+            measured = Some(counts);
+            assert_eq!(
+                counts[4], 1,
+                "method={method}: {}",
+                revision.incremental_stats
+            );
+            let cold = analyze(
+                &opts,
+                &scratch,
+                &mut crate::compiler_db::revision::AnalysisRevision::default(),
+                entry,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(compare(&before, &after, false).unwrap()).unwrap(),
+                serde_json::to_value(compare(&before, &cold, false).unwrap()).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn semantic_diff_retained_lambda_edits_scale() {
+    retained_specialized_edit_scaling("lambda");
+}
+#[test]
+fn semantic_diff_retained_generic_edits_scale() {
+    retained_specialized_edit_scaling("generic");
+}
+#[test]
+fn semantic_diff_retained_virtual_edits_scale() {
+    retained_specialized_edit_scaling("virtual");
+}
+#[test]
+fn semantic_diff_retained_constructor_edits_scale() {
+    retained_specialized_edit_scaling("constructor");
+}
+#[test]
+fn semantic_diff_retained_default_edits_scale() {
+    retained_specialized_edit_scaling("default");
+}
+#[test]
+fn semantic_diff_retained_generic_class_edits_scale() {
+    retained_specialized_edit_scaling("generic_class");
+}
+#[test]
+fn semantic_diff_retained_constructor_group_edits_scale() {
+    retained_specialized_edit_scaling("constructor_group");
+}
+fn retained_specialized_edit_scaling(selected: &str) {
+    for (shape, before_root, after_root, main) in [
+        (
+            "lambda",
+            "fn leaf() { let g = |x:i64| x; g(1); }",
+            "fn leaf() { let g = |x:i64| { println(x); return x; }; g(1); }",
+            "fn main() {}",
+        ),
+        (
+            "generic",
+            "fn leaf<T>(x:T)->T { return x; }",
+            "fn leaf<T>(x:T)->T { println(1); return x; }",
+            "fn main() { leaf(1); leaf(true); }",
+        ),
+        (
+            "virtual",
+            "interface I { fn leaf(self); } class C implements I { pub fn leaf(self) {} } fn call(x:I) { x.leaf(); }",
+            "interface I { fn leaf(self); } class C implements I { pub fn leaf(self) { println(1); } } fn call(x:I) { x.leaf(); }",
+            "fn main() {}",
+        ),
+        (
+            "constructor",
+            "class C { pub init(self) {} }",
+            "class C { pub init(self) { println(1); } }",
+            "fn main() { let c = new C(); }",
+        ),
+        (
+            "default",
+            "interface I { fn leaf(self) {} } class C implements I {}",
+            "interface I { fn leaf(self) { println(1); } } class C implements I {}",
+            "fn main() {}",
+        ),
+        (
+            "generic_class",
+            "class C<T> { pub fn leaf(self,x:T)->T { return x; } }",
+            "class C<T> { pub fn leaf(self,x:T)->T { println(1); return x; } }",
+            "fn main() { let c = new C<i64>(); c.leaf(1); }",
+        ),
+        (
+            "constructor_group",
+            "class C { pub init(self) {} pub init(self,x:i64) {} }",
+            "class C { pub init(self) {} pub init(self,x:i64) { println(x); } }",
+            "fn main() { let c = new C(); }",
+        ),
+    ] {
+        if shape != selected {
+            continue;
+        }
+        let mut measured = None;
+        for size in [8, 32, 128] {
+            let scratch = tree::Scratch::new().unwrap();
+            let opts = Options {
+                root: scratch.0.clone(),
+                entry: Some("main.wi".into()),
+                project: false,
+                base: String::new(),
+                fail_on_growth: false,
+            };
+            let entry = Path::new("main.wi");
+            let mut suffix = format!("\n{main}\n");
+            for i in 0..size {
+                if shape == "virtual" {
+                    suffix.push_str(&format!("class Unrelated_{i} {{ fn idle(self) {{}} }}\n"));
+                } else {
+                    suffix.push_str(&format!("fn unrelated_{i}() {{}}\n"));
+                }
+            }
+            fs::write(scratch.0.join(entry), format!("{before_root}{suffix}")).unwrap();
+            let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+            let before = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+            fs::write(scratch.0.join(entry), format!("{after_root}{suffix}")).unwrap();
+            let after = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+            let counts = [
+                "effect_equations_compared",
+                "effect_inventory_owners",
+                "snapshot_functions_rebuilt",
+                "snapshot_symbols_rebuilt",
+                "report_facts_rebuilt",
+                "snapshot_dispatch_visits",
+            ]
+            .map(|key| revision.incremental_stats[key].as_u64().unwrap());
+            println!(
+                "specialized shape={shape} size={size} equation_comparisons={} effect_inventory_owners={} snapshot_functions={} snapshot_symbols={} report_facts={} queries_recomputed={} report_witness_owners={} report_witness_edges={} report_witness_queue={} dispatch_visits={}",
+                counts[0],
+                counts[1],
+                counts[2],
+                counts[3],
+                counts[4],
+                revision.incremental_stats["queries_recomputed"],
+                revision.incremental_stats["report_witness_owners_visited"],
+                revision.incremental_stats["report_witness_edges_visited"],
+                revision.incremental_stats["report_witness_queue_operations"],
+                revision.incremental_stats["snapshot_dispatch_visits"]
+            );
+            if let Some(old) = measured {
+                assert_eq!(
+                    old, counts,
+                    "{shape} unrelated functions increased work at {size}"
+                );
+            }
+            measured = Some(counts);
+            assert!(counts[2] <= 4, "{shape}: {}", revision.incremental_stats);
+            let cold = analyze(
+                &opts,
+                &scratch,
+                &mut crate::compiler_db::revision::AnalysisRevision::default(),
+                entry,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(compare(&before, &after, false).unwrap()).unwrap(),
+                serde_json::to_value(compare(&before, &cold, false).unwrap()).unwrap(),
+                "{shape}/{size}"
+            );
+            fs::write(scratch.0.join(entry), format!("{before_root}{suffix}")).unwrap();
+            let reverted = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+            assert_eq!(
+                serde_json::to_value(compare(&after, &reverted, false).unwrap()).unwrap(),
+                serde_json::to_value(compare(&after, &before, false).unwrap()).unwrap(),
+                "reverted {shape}/{size}"
+            );
+        }
+    }
+}
+
+#[test]
+fn semantic_diff_retained_imported_default_edits_scale() {
+    retained_imported_edit_scaling("imported_default");
+}
+#[test]
+fn semantic_diff_retained_imported_generic_edits_scale() {
+    retained_imported_edit_scaling("imported_generic");
+}
+fn retained_imported_edit_scaling(shape: &str) {
+    let mut measured = None;
+    for size in [8, 32, 128] {
+        let scratch = tree::Scratch::new().unwrap();
+        let opts = Options {
+            root: scratch.0.clone(),
+            entry: Some("main.wi".into()),
+            project: false,
+            base: String::new(),
+            fail_on_growth: false,
+        };
+        let entry = Path::new("main.wi");
+        let mut source = String::from(if shape == "imported_default" {
+            "import dep; class C implements dep::I {} fn main() {}\n"
+        } else {
+            "import dep; fn main() { dep::leaf(1); }\n"
+        });
+        for i in 0..size {
+            source.push_str(&format!("fn unrelated_{i}() {{}}\n"));
+        }
+        fs::write(scratch.0.join(entry), source).unwrap();
+        fs::write(
+            scratch.0.join("dep.wi"),
+            if shape == "imported_default" {
+                "pub interface I { fn leaf(self) {} }"
+            } else {
+                "pub fn leaf<T>(x:T)->T { return x; }"
+            },
+        )
+        .unwrap();
+        let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+        let before = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        fs::write(
+            scratch.0.join("dep.wi"),
+            if shape == "imported_default" {
+                "pub interface I { fn leaf(self) { println(1); } }"
+            } else {
+                "pub fn leaf<T>(x:T)->T { println(1); return x; }"
+            },
+        )
+        .unwrap();
+        let after = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        let counts = [
+            "effect_equations_compared",
+            "effect_inventory_owners",
+            "snapshot_functions_rebuilt",
+            "snapshot_symbols_rebuilt",
+            "report_facts_rebuilt",
+            "snapshot_dispatch_visits",
+        ]
+        .map(|key| revision.incremental_stats[key].as_u64().unwrap());
+        println!(
+            "specialized shape={shape} size={size} equation_comparisons={} effect_inventory_owners={} snapshot_functions={} snapshot_symbols={} report_facts={} queries_recomputed={} report_witness_owners={} report_witness_edges={} report_witness_queue={} dispatch_visits={}",
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+            revision.incremental_stats["queries_recomputed"],
+            revision.incremental_stats["report_witness_owners_visited"],
+            revision.incremental_stats["report_witness_edges_visited"],
+            revision.incremental_stats["report_witness_queue_operations"],
+            revision.incremental_stats["snapshot_dispatch_visits"]
+        );
+        if let Some(old) = measured {
+            assert_eq!(old, counts, "{shape} at {size}");
+        }
+        measured = Some(counts);
+        assert!(counts[2] <= 4, "{}", revision.incremental_stats);
+        let cold = analyze(
+            &opts,
+            &scratch,
+            &mut crate::compiler_db::revision::AnalysisRevision::default(),
+            entry,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(compare(&before, &after, false).unwrap()).unwrap(),
+            serde_json::to_value(compare(&before, &cold, false).unwrap()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn semantic_diff_retained_generic_instantiation_lifecycle() {
+    incremental_oracle(&[
+        "fn identity<T>(x:T)->T { println(1); return x; } fn main() {}",
+        "fn identity<T>(x:T)->T { println(1); return x; } fn main() { identity(1); }",
+        "fn identity<T>(x:T)->T { println(1); return x; } fn main() { identity(1); identity(true); }",
+        "fn identity<T>(x:T)->T { println(1); return x; } fn main() { identity(true); }",
+        "fn identity<T>(x:T)->T { println(1); return x; } fn main() {}",
+        "fn identity<T>(x:T)->T { return x; } fn main() {}",
+    ]);
+    let scratch = tree::Scratch::new().unwrap();
+    let opts = Options {
+        root: scratch.0.clone(),
+        entry: Some("main.wi".into()),
+        project: false,
+        base: String::new(),
+        fail_on_growth: false,
+    };
+    let entry = Path::new("main.wi");
+    fs::write(
+        scratch.0.join("dep.wi"),
+        "pub fn identity<T>(x:T)->T { println(1); return x; }",
+    )
+    .unwrap();
+    let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+    let mut previous = None;
+    for body in [
+        "",
+        "dep::identity(1);",
+        "dep::identity(1); dep::identity(true);",
+        "dep::identity(true);",
+        "",
+    ] {
+        fs::write(
+            scratch.0.join(entry),
+            format!("import dep; fn main() {{ {body} }}"),
+        )
+        .unwrap();
+        let warm = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        let cold = analyze(
+            &opts,
+            &scratch,
+            &mut crate::compiler_db::revision::AnalysisRevision::default(),
+            entry,
+        )
+        .unwrap();
+        if let Some(base) = &previous {
+            assert_eq!(
+                serde_json::to_value(compare(base, &warm, false).unwrap()).unwrap(),
+                serde_json::to_value(compare(base, &cold, false).unwrap()).unwrap()
+            );
+        }
+        previous = Some(cold);
+    }
+}
+
+#[test]
+fn semantic_diff_retained_call_target_lifecycle() {
+    let prefix = "fn a() { println(1); } fn b() {} ";
+    let before = format!("{prefix} fn call() {{ let f=a; f(); }} fn main() {{}}");
+    let after = format!("{prefix} fn call() {{ let f=b; f(); }} fn main() {{}}");
+    let removed = format!("{prefix} fn call() {{}} fn main() {{}}");
+    incremental_oracle(&[&before, &after, &removed, &before]);
+    let classes = "open class Base { pub open fn run(self) {} } class C extends Base { pub override fn run(self) { println(1); } } ";
+    let before = format!("{classes} fn call(x:Base) {{}} fn main() {{}}");
+    let after = format!("{classes} fn call(x:Base) {{ x.run(); }} fn main() {{}}");
+    incremental_oracle(&[&before, &after, &before, &after]);
+}
+
+#[test]
+fn semantic_diff_retained_new_callees_preserve_direct_witnesses() {
+    for _ in 0..3 {
+        incremental_oracle(&[
+            "fn old() {} fn caller() { old(); } fn main() {}",
+            "fn old() {} fn caller() { added(); } fn added() { println(1); } fn main() {}",
+            "fn old() {} fn caller() { old(); } fn main() {}",
+        ]);
+    }
+}
+
+#[test]
+fn semantic_diff_retained_generic_unused_imports_scale() {
+    let mut measured = None;
+    for size in [8, 32, 128] {
+        let scratch = tree::Scratch::new().unwrap();
+        let opts = Options {
+            root: scratch.0.clone(),
+            entry: Some("main.wi".into()),
+            project: false,
+            base: String::new(),
+            fail_on_growth: false,
+        };
+        let entry = Path::new("main.wi");
+        fs::write(
+            scratch.0.join(entry),
+            "import dep; import types; fn main() { dep::leaf(1, new types::C()); }",
+        )
+        .unwrap();
+        fs::write(scratch.0.join("types.wi"), "pub class C {}").unwrap();
+        let mut imports = String::from("import types;\n");
+        for i in 0..size {
+            imports.push_str(&format!("import unused_{i};\n"));
+            fs::write(scratch.0.join(format!("unused_{i}.wi")), "pub fn idle() {}").unwrap();
+        }
+        fs::write(
+            scratch.0.join("dep.wi"),
+            format!("{imports}pub fn leaf<T>(x:T,c:types::C)->T {{ return x; }}"),
+        )
+        .unwrap();
+        let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+        let before = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        fs::write(
+            scratch.0.join("dep.wi"),
+            format!("{imports}pub fn leaf<T>(x:T,c:types::C)->T {{ println(1); return x; }}"),
+        )
+        .unwrap();
+        let after = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        let counts = [
+            "effect_equations_compared",
+            "snapshot_functions_rebuilt",
+            "snapshot_symbols_rebuilt",
+            "report_facts_rebuilt",
+        ]
+        .map(|key| revision.incremental_stats[key].as_u64().unwrap());
+        if let Some(old) = measured {
+            assert_eq!(old, counts, "unused imports at {size}");
+        }
+        measured = Some(counts);
+        let cold = analyze(
+            &opts,
+            &scratch,
+            &mut crate::compiler_db::revision::AnalysisRevision::default(),
+            entry,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(compare(&before, &after, false).unwrap()).unwrap(),
+            serde_json::to_value(compare(&before, &cold, false).unwrap()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn semantic_diff_retained_large_unchanged_boundary_scale() {
+    let mut measured = None;
+    for size in [8, 32, 128] {
+        let scratch = tree::Scratch::new().unwrap();
+        let opts = Options {
+            root: scratch.0.clone(),
+            entry: Some("main.wi".into()),
+            project: false,
+            base: String::new(),
+            fail_on_growth: false,
+        };
+        let entry = Path::new("main.wi");
+        let mut source = String::from("fn leaf(c:BlockingCell<i64>) {          }\nfn large() {\n");
+        for i in 0..size {
+            source.push_str(&format!("let local_{i} = {i};\n"));
+        }
+        source.push_str("}\nfn caller(c:BlockingCell<i64>) { large(); leaf(c); } fn main() {}\n");
+        fs::write(scratch.0.join(entry), &source).unwrap();
+        let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+        let before = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        fs::write(
+            scratch.0.join(entry),
+            source.replacen("{          }", "{ c.get(); }", 1),
+        )
+        .unwrap();
+        let after = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        let counts = [
+            "effect_equations_compared",
+            "snapshot_functions_rebuilt",
+            "snapshot_symbols_rebuilt",
+            "report_facts_rebuilt",
+            "snapshot_projection_items_cloned",
+            "snapshot_boundary_functions",
+        ]
+        .map(|key| revision.incremental_stats[key].as_u64().unwrap());
+        if let Some(old) = measured {
+            assert_eq!(old, counts, "unchanged callee body at {size}");
+        }
+        measured = Some(counts);
+        let cold = analyze(
+            &opts,
+            &scratch,
+            &mut crate::compiler_db::revision::AnalysisRevision::default(),
+            entry,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(compare(&before, &after, false).unwrap()).unwrap(),
+            serde_json::to_value(compare(&before, &cold, false).unwrap()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn semantic_diff_competing_witness_chain_scales() {
+    for size in [8usize, 32, 128] {
+        let scratch = tree::Scratch::new().unwrap();
+        let opts = Options {
+            root: scratch.0.clone(),
+            entry: Some("main.wi".into()),
+            project: false,
+            base: String::new(),
+            fail_on_growth: false,
+        };
+        let entry = Path::new("main.wi");
+        let mut source = String::from("fn noop() {} fn main() {}\n");
+        for i in 0..size {
+            source.push_str(&format!(
+                "fn witness_{:04}(c:BlockingCell<i64>) {{ c.get(); }}\n",
+                size - i
+            ));
+            let next = if i + 1 < size {
+                format!("caller_{:04}(c);", i + 1)
+            } else {
+                String::new()
+            };
+            source.push_str(&format!(
+                "fn caller_{i:04}(c:BlockingCell<i64>) {{ witness_{:04}(c); {next} }}\n",
+                size - i
+            ));
+        }
+        fs::write(scratch.0.join(entry), &source).unwrap();
+        let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+        let base = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        let changed = source.replace("witness_0001(c);  }", "witness_0001(c); noop(); }");
+        assert_ne!(changed, source);
+        for (phase, text) in [("add", &changed), ("remove", &source)] {
+            fs::write(scratch.0.join(entry), text).unwrap();
+            crate::semantic::effects::DELTA_QUEUE_POPS.with(|v| v.set(0));
+            crate::semantic::effects::REACHABLE_EDGE_VISITS.with(|v| v.set(0));
+            let target = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+            let pops = crate::semantic::effects::DELTA_QUEUE_POPS.with(|v| v.get());
+            let edges = crate::semantic::effects::REACHABLE_EDGE_VISITS.with(|v| v.get());
+            assert!(
+                pops <= 48 * (size + 2),
+                "size={size} phase={phase} pops={pops}"
+            );
+            assert!(
+                edges <= 96 * (size + 2),
+                "size={size} phase={phase} edges={edges}"
+            );
+            let cold = analyze(
+                &opts,
+                &scratch,
+                &mut crate::compiler_db::revision::AnalysisRevision::default(),
+                entry,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(compare(&base, &target, false).unwrap()).unwrap(),
+                serde_json::to_value(compare(&base, &cold, false).unwrap()).unwrap()
+            );
+            println!(
+                "competing-production size={size} phase={phase} queue_pops={pops} edges={edges}"
+            );
+        }
+    }
+}
+
+#[test]
+fn semantic_diff_candidate_reclamation_is_amortized() {
+    let mut independent_accounting = None;
+    for size in [8usize, 32, 128] {
+        let scratch = tree::Scratch::new().unwrap();
+        let opts = Options {
+            root: scratch.0.clone(),
+            entry: Some("main.wi".into()),
+            project: false,
+            base: String::new(),
+            fail_on_growth: false,
+        };
+        let entry = Path::new("main.wi");
+        let mut source = String::from("fn leaf(c:BlockingCell<i64>) {}\nfn main() {}\n");
+        for i in 0..size {
+            source.push_str(&format!("fn unrelated_{i}() {{}}\n"));
+        }
+        let edited = source.replacen(
+            "fn leaf(c:BlockingCell<i64>) {}",
+            "fn leaf(c:BlockingCell<i64>) { c.get(); }",
+            1,
+        );
+        fs::write(scratch.0.join(entry), &source).unwrap();
+        let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+        let base = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+        let mut work = 0u64;
+        let mut credit = 0u64;
+        let mut collections = 0;
+        for step in 0..128 {
+            let text = if step % 2 == 0 { &edited } else { &source };
+            fs::write(scratch.0.join(entry), text).unwrap();
+            let target = analyze(&opts, &scratch, &mut revision, entry).unwrap();
+            let stats = &revision.incremental_stats;
+            assert_eq!(stats["candidate_entries_cloned"], 0);
+            let visited = stats["reclamation_nodes_visited"].as_u64().unwrap()
+                + stats["reclamation_edges_visited"].as_u64().unwrap();
+            work += visited;
+            credit += stats["reclamation_credit_added"].as_u64().unwrap();
+            collections += usize::from(visited > 0);
+            assert!(
+                work <= 4 * credit,
+                "size={size} step={step} gc_work={work} mutation_credit={credit}"
+            );
+            if step == 0 {
+                let accounting = (
+                    stats["accounting_entries_visited"].as_u64().unwrap(),
+                    stats["accounting_edges_visited"].as_u64().unwrap(),
+                );
+                if let Some(previous) = independent_accounting {
+                    assert_eq!(accounting, previous, "size={size}");
+                }
+                independent_accounting = Some(accounting);
+            }
+            if step == 127 {
+                let cold = analyze(
+                    &opts,
+                    &scratch,
+                    &mut crate::compiler_db::revision::AnalysisRevision::default(),
+                    entry,
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(compare(&base, &target, false).unwrap()).unwrap(),
+                    serde_json::to_value(compare(&base, &cold, false).unwrap()).unwrap()
+                );
+            }
+        }
+        assert!(
+            collections > 0,
+            "fixture must exercise actual reclamation: size={size}"
+        );
+        for _ in 0..8 {
+            analyze(&opts, &scratch, &mut revision, entry).unwrap();
+            for key in [
+                "candidate_entries_cloned",
+                "reclamation_nodes_visited",
+                "reclamation_edges_visited",
+                "reclamation_credit_added",
+            ] {
+                assert_eq!(
+                    revision.incremental_stats[key], 0,
+                    "unchanged size={size} {key}"
+                );
+            }
+        }
+        println!(
+            "candidate-amortized size={size} revisions=128 gc_work={work} mutation_credit={credit} collections={collections}"
+        );
+    }
+}

@@ -13,17 +13,135 @@ pub(crate) struct Source {
     pub logical_types: HashMap<String, Type>,
     pub nominal_aliases: HashMap<String, String>,
     pub symbols: Facts,
-    written: HashMap<(u32, usize), String>,
+    written: BTreeMap<(u32, usize), String>,
     pub(super) declarations: Vec<Declaration>,
     owners: Vec<(Span, String)>,
     details: HashMap<Span, symbols::DeclarationDetails>,
     callables: HashMap<Span, (String, Span)>,
+    callable_names: HashMap<String, Span>,
     pub(super) items: HashMap<String, Declaration>,
 }
 impl Source {
     /// Whether this unit declares a template or names an instance.
     pub(super) fn has_workspace_generics(&self) -> bool {
         !self.items.is_empty() || !self.logical_types.is_empty() || !self.nominal_aliases.is_empty()
+    }
+
+    pub(crate) fn index_symbols(&mut self) {
+        self.callable_names = self
+            .callables
+            .iter()
+            .map(|(span, (name, _))| (name.clone(), *span))
+            .collect();
+        self.declarations.sort_by_key(|d| d.span.start);
+        self.owners.sort_by_key(|(span, _)| span.start);
+        self.symbols.declarations.sort_by_key(|d| d.span.start);
+        self.symbols.references.sort_by_key(|r| r.span.start);
+        self.symbols.members.sort_by_key(|(_, d)| d.span.start);
+        self.symbols.member_references.sort_by_key(|r| r.span.start);
+    }
+    pub(super) fn selected_functions(
+        &self,
+        names: &std::collections::HashSet<String>,
+    ) -> Option<Self> {
+        fn slice<T: Clone>(items: &[T], span: Span, location: impl Fn(&T) -> Span) -> Vec<T> {
+            let start = items.partition_point(|item| location(item).start < span.start);
+            let end = items.partition_point(|item| location(item).start < span.end);
+            items[start..end]
+                .iter()
+                .filter(|item| location(item).end <= span.end)
+                .cloned()
+                .collect()
+        }
+        let mut selected = Self::default();
+        for name in names {
+            if let Some(ty) = self.logical_types.get(name) {
+                selected.logical_types.insert(name.clone(), ty.clone());
+            }
+            if let Some(alias) = self.nominal_aliases.get(name) {
+                selected.nominal_aliases.insert(name.clone(), alias.clone());
+            }
+            let (item, span) = if let Some(item) = self.items.get(name) {
+                if item.kind != "function" {
+                    continue;
+                }
+                (item, item.span)
+            } else if let Some((owner, _)) = name.rsplit_once("::") {
+                let Some(class) = self.items.get(owner) else {
+                    continue;
+                };
+                let Some(span) = self.callable_names.get(name) else {
+                    continue;
+                };
+                selected.declarations.push(class.clone());
+                selected.owners.push((class.span, owner.to_owned()));
+                if let Some(template) = self.class_templates.get(owner) {
+                    selected.class_templates.insert(owner.to_owned(), *template);
+                }
+                (class, *span)
+            } else {
+                continue;
+            };
+            selected.items.insert(item.name.clone(), item.clone());
+            selected
+                .declarations
+                .extend(slice(&self.declarations, span, |d| d.span));
+            selected
+                .owners
+                .extend(slice(&self.owners, span, |(s, _)| *s));
+            selected
+                .symbols
+                .declarations
+                .extend(slice(&self.symbols.declarations, span, |d| d.span));
+            selected
+                .symbols
+                .references
+                .extend(slice(&self.symbols.references, span, |r| r.span));
+            selected
+                .symbols
+                .members
+                .extend(slice(&self.symbols.members, span, |(_, d)| d.span));
+            selected.symbols.member_references.extend(slice(
+                &self.symbols.member_references,
+                span,
+                |r| r.span,
+            ));
+            if let Some(callable) = self.callables.get(&span) {
+                selected.callables.insert(span, callable.clone());
+            }
+            for (key, value) in self
+                .written
+                .range((span.file_id.0, span.start)..(span.file_id.0, span.end))
+            {
+                selected.written.insert(*key, value.clone());
+            }
+        }
+        for declaration in &selected.declarations {
+            if let Some(details) = self.details.get(&declaration.span) {
+                selected.details.insert(declaration.span, details.clone());
+            }
+        }
+        let target_spans: std::collections::HashSet<_> = selected
+            .symbols
+            .references
+            .iter()
+            .map(|reference| reference.target.span)
+            .collect();
+        for span in target_spans {
+            let start = self
+                .declarations
+                .partition_point(|declaration| declaration.span.start < span.start);
+            for declaration in self.declarations[start..]
+                .iter()
+                .take_while(|declaration| declaration.span.start == span.start)
+            {
+                if declaration.span == span {
+                    selected.declarations.push(declaration.clone());
+                }
+            }
+        }
+        selected.index_symbols();
+        Some(selected)
     }
 
     pub fn capture(program: &Program) -> Self {
@@ -57,7 +175,7 @@ impl Source {
                 _ => {}
             }
         }
-        let mut written = HashMap::new();
+        let mut written = BTreeMap::new();
         for event in roots.into_iter().flat_map(AstWalk::new) {
             match event {
                 AstEvent::Expr(Expr::Call(c)) => {
@@ -102,6 +220,7 @@ impl Source {
                 .collect(),
             declarations: facts.declarations,
             callables,
+            callable_names: HashMap::new(),
         }
     }
 }
@@ -362,7 +481,7 @@ fn callable(name: &str) -> FunctionId {
 }
 /// Compiler generated spelling consists of qualified segments; erase only the
 /// specialization suffix, retaining method/module segments.
-fn source_spelling(name: &str) -> String {
+pub(super) fn source_spelling(name: &str) -> String {
     if let Some(lambda) = name.strip_prefix("<lambda ")
         && let Some((owner, location)) = lambda.rsplit_once('@')
     {

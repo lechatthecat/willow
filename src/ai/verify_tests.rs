@@ -183,12 +183,12 @@ fn synthetic(n: usize) -> Baseline {
         .map(|i| {
             (
                 format!("f{i}"),
-                Fact {
+                Arc::new(Fact {
                     signature: Some(json!({"type":"fn() -> i64","exported":true})),
                     effects: Some(EffectState { may: 0, unknown: 0 }),
                     body: "one".into(),
                     callees: vec![],
-                },
+                }),
             )
         })
         .collect();
@@ -200,8 +200,8 @@ fn synthetic(n: usize) -> Baseline {
         complete: true,
         diagnostics: vec![],
         facts,
-        inputs: BTreeMap::new(),
-        callers: BTreeMap::new(),
+        inputs: im::OrdMap::new(),
+        callers: im::OrdMap::new(),
         index: None,
         diagnostic_index: None,
         diagnostic_lookup: BTreeMap::new(),
@@ -211,11 +211,89 @@ fn synthetic(n: usize) -> Baseline {
     b
 }
 #[test]
+fn semantic_verify_sparse_effect_index_matches_full_reindex() {
+    for count in [8, 32, 128] {
+        let original = synthetic(count);
+        let original_wire = serde_json::to_value(&original).unwrap();
+        let mut sparse = original.clone();
+        let identity = hash("f0");
+        let root = original.index.as_ref().unwrap();
+        let changed_digit = identity.as_bytes()[root.prefix.len()] as char;
+        let (&sibling_digit, sibling) = root
+            .children
+            .iter()
+            .find(|(digit, _)| **digit != changed_digit)
+            .unwrap();
+
+        sparse
+            .facts
+            .get_mut("f0")
+            .map(Arc::make_mut)
+            .unwrap()
+            .effects = Some(EffectState {
+            may: crate::semantic::effects::RuntimeEffects::MAY_BLOCK.bits(),
+            unknown: 0,
+        });
+        let visits = sparse.refresh_effect_fact_index("f0").unwrap();
+        assert!(visits <= 65);
+        assert!(Arc::ptr_eq(
+            sibling,
+            &sparse.index.as_ref().unwrap().children[&sibling_digit]
+        ));
+        let mut cold = sparse.clone();
+        cold.reindex().unwrap();
+        assert_eq!(
+            serde_json::to_value(&sparse.index).unwrap(),
+            serde_json::to_value(&cold.index).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&sparse).unwrap(),
+            serde_json::to_value(&cold).unwrap()
+        );
+        assert_eq!(original.facts["f0"].effects.as_ref().unwrap().may, 0);
+        assert_eq!(serde_json::to_value(&original).unwrap(), original_wire);
+
+        // The index operation owns only the leaf. Visibility/caller bookkeeping
+        // is deliberately untouched here so this tests the deletion projection.
+        sparse.facts.remove("f0");
+        assert!(sparse.refresh_effect_fact_index("f0").unwrap() <= 65);
+        assert!(Arc::ptr_eq(
+            sibling,
+            &sparse.index.as_ref().unwrap().children[&sibling_digit]
+        ));
+        cold = sparse.clone();
+        cold.reindex().unwrap();
+        assert_eq!(
+            serde_json::to_value(&sparse.index).unwrap(),
+            serde_json::to_value(&cold.index).unwrap()
+        );
+        let sparse_wire = serde_json::to_value(&sparse).unwrap();
+        assert_eq!(sparse_wire, serde_json::to_value(&cold).unwrap());
+        assert_eq!(
+            sparse_wire.as_object().unwrap().keys().collect::<Vec<_>>(),
+            original_wire
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>()
+        );
+        let mut restored: Baseline = serde_json::from_value(sparse_wire.clone()).unwrap();
+        assert!(restored.index.is_none());
+        restored.reindex().unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.index).unwrap(),
+            serde_json::to_value(&sparse.index).unwrap()
+        );
+        assert_eq!(serde_json::to_value(&restored).unwrap(), sparse_wire);
+    }
+}
+
+#[test]
 fn semantic_verify_radix_scaling_counts() {
     for n in [16, 64, 256, 1024, 4096] {
         let a = synthetic(n);
         let mut b = a.clone();
-        b.facts.get_mut("f0").unwrap().body = "two".into();
+        b.facts.get_mut("f0").map(Arc::make_mut).unwrap().body = "two".into();
         b.reindex().unwrap();
         let r = a.compare(&b).unwrap();
         println!(
@@ -254,8 +332,11 @@ fn semantic_verify_radix_matches_full_oracle() {
     for offset in 0..16 {
         let mut b = a.clone();
         for i in (offset..200).step_by(17) {
-            b.facts.get_mut(&format!("f{i}")).unwrap().signature =
-                Some(json!({"type":"fn() -> bool","exported":true}));
+            b.facts
+                .get_mut(&format!("f{i}"))
+                .map(Arc::make_mut)
+                .unwrap()
+                .signature = Some(json!({"type":"fn() -> bool","exported":true}));
         }
         b.reindex().unwrap();
         let expected: Vec<_> = a
@@ -279,7 +360,8 @@ fn semantic_verify_radix_matches_full_oracle() {
 fn semantic_verify_effect_unknown_transition() {
     let a = synthetic(2);
     let mut b = a.clone();
-    b.facts.get_mut("f0").unwrap().effects = Some(EffectState { may: 1, unknown: 2 });
+    b.facts.get_mut("f0").map(Arc::make_mut).unwrap().effects =
+        Some(EffectState { may: 1, unknown: 2 });
     b.reindex().unwrap();
     let r = a.compare(&b).unwrap();
     assert_eq!(r.effects.changed.len(), 1);
@@ -307,6 +389,7 @@ fn semantic_verify_deep_chain_and_cycle_callers() {
         let callee = format!("f{}", (i + 1) % 1024);
         a.facts
             .get_mut(&format!("f{i}"))
+            .map(Arc::make_mut)
             .unwrap()
             .callees
             .push(callee.clone());
@@ -314,7 +397,7 @@ fn semantic_verify_deep_chain_and_cycle_callers() {
     }
     a.reindex().unwrap();
     let mut b = a.clone();
-    b.facts.get_mut("f0").unwrap().body = "two".into();
+    b.facts.get_mut("f0").map(Arc::make_mut).unwrap().body = "two".into();
     b.reindex().unwrap();
     let r = a.compare(&b).unwrap();
     assert_eq!(r.affected_callers.len(), 1023);
@@ -326,6 +409,7 @@ fn semantic_verify_fanout_and_shared_caller() {
     for i in 1..512 {
         a.facts
             .get_mut(&format!("f{i}"))
+            .map(Arc::make_mut)
             .unwrap()
             .callees
             .push("f0".into());
@@ -336,7 +420,7 @@ fn semantic_verify_fanout_and_shared_caller() {
     }
     a.reindex().unwrap();
     let mut b = a.clone();
-    b.facts.get_mut("f0").unwrap().body = "two".into();
+    b.facts.get_mut("f0").map(Arc::make_mut).unwrap().body = "two".into();
     b.reindex().unwrap();
     let r = a.compare(&b).unwrap();
     assert_eq!(r.affected_callers.len(), 511);

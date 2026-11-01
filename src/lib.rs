@@ -1446,6 +1446,7 @@ fn expand_prechecked_unit(
         metadata.logical_types = checker.generics.logical_types.raw().clone();
         metadata.nominal_aliases = std::mem::take(&mut checker.generics.nominal_aliases);
         metadata.symbols = std::mem::take(&mut checker.generics.source_symbols);
+        metadata.index_symbols();
         sources.insert(unit, metadata);
     }
     checker.expand_generics(&mut source, fresh_ids);

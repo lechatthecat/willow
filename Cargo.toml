@@ -47,6 +47,7 @@ serde_json = "1.0.152"
 willow_abi = { path = "crates/willow_abi" }
 willow_continuations = { path = "crates/willow_continuations" }
 toml_edit = "0.25.17"
+im = { version = "15.1.0", features = ["serde"] }
 
 # The runtime's hot FFI entry points (willow_sync_poll_counter, safepoint and
 # barrier fast paths) are called from every generated function. With the

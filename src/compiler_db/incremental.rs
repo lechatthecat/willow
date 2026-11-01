@@ -18,6 +18,241 @@ use std::{
     rc::Rc,
 };
 
+/// Persistent source/index inventories with cached payload accounting. Mutating
+/// one key copies only that key's value; candidate clones share all map roots.
+pub(crate) trait InventoryMeasure: Clone + Retained {
+    fn inventory_measure(&self) -> (usize, usize);
+}
+macro_rules! constant_inventory_measure { ($($ty:ty),*) => { $(impl InventoryMeasure for $ty {
+    fn inventory_measure(&self)->(usize,usize) {(self.heap_bytes(),1)}
+})* }; }
+constant_inventory_measure!(
+    String,
+    bool,
+    u64,
+    FunctionId,
+    Span,
+    PathBuf,
+    super::tracked::Durability,
+    Source,
+    BodyBinding,
+    CompactJson,
+    im::OrdSet<FunctionId>,
+    im::HashSet<BodyId>
+);
+impl<T: InventoryMeasure> InventoryMeasure for Vec<T> {
+    fn inventory_measure(&self) -> (usize, usize) {
+        self.iter().fold(
+            (self.capacity() * std::mem::size_of::<T>(), 1),
+            |(bytes, work), item| {
+                let (b, w) = item.inventory_measure();
+                (bytes + b, work + w)
+            },
+        )
+    }
+}
+impl<A: InventoryMeasure, B: InventoryMeasure> InventoryMeasure for (A, B) {
+    fn inventory_measure(&self) -> (usize, usize) {
+        let (a, aw) = self.0.inventory_measure();
+        let (b, bw) = self.1.inventory_measure();
+        (a + b, aw + bw)
+    }
+}
+impl<T: InventoryMeasure> InventoryMeasure for std::collections::BTreeSet<T> {
+    fn inventory_measure(&self) -> (usize, usize) {
+        self.iter().fold(
+            (self.len() * (std::mem::size_of::<T>() + 64) * 2, 1),
+            |(bytes, work), item| {
+                let (b, w) = item.inventory_measure();
+                (bytes + b, work + w)
+            },
+        )
+    }
+}
+#[derive(Clone)]
+struct InventoryEntry<V> {
+    value: V,
+    bytes: usize,
+}
+pub(crate) struct InventoryMap<K, V> {
+    values: im::HashMap<K, std::sync::Arc<InventoryEntry<V>>>,
+    bytes: usize,
+    accounting: usize,
+}
+impl<K: Clone + Eq + std::hash::Hash, V> Clone for InventoryMap<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            bytes: self.bytes,
+            accounting: 0,
+        }
+    }
+}
+impl<K, V> Default for InventoryMap<K, V> {
+    fn default() -> Self {
+        Self {
+            values: im::HashMap::new(),
+            bytes: 0,
+            accounting: 0,
+        }
+    }
+}
+impl<K: Clone + Eq + std::hash::Hash + Retained, V: InventoryMeasure> InventoryMap<K, V> {
+    pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let (value_bytes, work) = value.inventory_measure();
+        self.accounting += 1 + work;
+        let bytes = key.heap_bytes() + value_bytes;
+        let old = self
+            .values
+            .insert(key, std::sync::Arc::new(InventoryEntry { value, bytes }));
+        self.bytes += bytes;
+        if let Some(old) = &old {
+            self.bytes -= old.bytes;
+        }
+        old.map(|old| std::sync::Arc::unwrap_or_clone(old).value)
+    }
+    fn replace(&mut self, key: K, value: V) {
+        let (value_bytes, work) = value.inventory_measure();
+        self.accounting += 1 + work;
+        let bytes = key.heap_bytes() + value_bytes;
+        let old = self
+            .values
+            .insert(key, std::sync::Arc::new(InventoryEntry { value, bytes }));
+        self.bytes += bytes;
+        if let Some(old) = old {
+            self.bytes -= old.bytes;
+        }
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+    fn get<Q: ?Sized + Eq + std::hash::Hash>(&self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        self.values.get(key).map(|entry| &entry.value)
+    }
+    fn contains_key<Q: ?Sized + Eq + std::hash::Hash>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        self.values.contains_key(key)
+    }
+    fn remove<Q: ?Sized + Eq + std::hash::Hash>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        let old = self.values.remove(key)?;
+        self.accounting += 1;
+        self.bytes -= old.bytes;
+        Some(std::sync::Arc::unwrap_or_clone(old).value)
+    }
+    fn discard<Q: ?Sized + Eq + std::hash::Hash>(&mut self, key: &Q)
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        if let Some(old) = self.values.remove(key) {
+            self.accounting += 1;
+            self.bytes -= old.bytes;
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.values.iter().map(|(key, entry)| (key, &entry.value))
+    }
+    fn keys(&self) -> impl Iterator<Item = &K> {
+        self.values.keys()
+    }
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.values.values().map(|entry| &entry.value)
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.values.len()
+    }
+    fn clear(&mut self) {
+        let accounting = self.accounting;
+        *self = Self::default();
+        self.accounting = accounting;
+    }
+    fn update<R>(&mut self, key: K, apply: impl FnOnce(&mut V) -> R) -> R
+    where
+        V: Default,
+    {
+        if !self.values.contains_key(&key) {
+            self.replace(key.clone(), V::default());
+        }
+        let entry = std::sync::Arc::make_mut(self.values.get_mut(&key).unwrap());
+        let result = apply(&mut entry.value);
+        let (value_bytes, work) = entry.value.inventory_measure();
+        self.accounting += 1 + work;
+        let bytes = key.heap_bytes() + value_bytes;
+        self.bytes = self.bytes - entry.bytes + bytes;
+        entry.bytes = bytes;
+        result
+    }
+}
+impl<K: Clone + Eq + std::hash::Hash + Retained, V: InventoryMeasure> Retained
+    for InventoryMap<K, V>
+{
+    fn heap_bytes(&self) -> usize {
+        self.bytes + self.values.len() * (std::mem::size_of::<(K, V)>() + 128) * 2
+    }
+}
+impl Retained for im::OrdSet<FunctionId> {
+    fn heap_bytes(&self) -> usize {
+        self.len() * (std::mem::size_of::<FunctionId>() + 64) * 2
+    }
+}
+impl Retained for im::HashSet<BodyId> {
+    fn heap_bytes(&self) -> usize {
+        self.len() * (std::mem::size_of::<BodyId>() + 64) * 2
+    }
+}
+struct InventorySet<K> {
+    values: InventoryMap<K, u64>,
+}
+impl<K: Clone + Eq + std::hash::Hash> Clone for InventorySet<K> {
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+        }
+    }
+}
+impl<K> Default for InventorySet<K> {
+    fn default() -> Self {
+        Self {
+            values: InventoryMap::default(),
+        }
+    }
+}
+impl<K: Clone + Eq + std::hash::Hash + Retained> InventorySet<K> {
+    fn insert(&mut self, key: K) -> bool {
+        self.values.insert(key, 0).is_none()
+    }
+    fn iter(&self) -> impl Iterator<Item = &K> {
+        self.values.keys()
+    }
+}
+impl<K: Clone + Eq + std::hash::Hash + Retained> FromIterator<K> for InventorySet<K> {
+    fn from_iter<T: IntoIterator<Item = K>>(values: T) -> Self {
+        let mut result = Self::default();
+        for value in values {
+            result.insert(value);
+        }
+        result
+    }
+}
+impl<K: Clone + Eq + std::hash::Hash + Retained> Retained for InventorySet<K> {
+    fn heap_bytes(&self) -> usize {
+        self.values.heap_bytes()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Source {
     file: FileId,
@@ -30,24 +265,38 @@ pub(crate) type TokenPairs = (TokenInventory, TokenInventory);
 #[derive(Default)]
 pub(crate) struct SyntaxQueries {
     table: TrackedQueryTable,
-    source_roots: HashMap<PathBuf, super::tracked::Durability>,
-    interface_dispatch: HashMap<UnitId, Vec<FunctionId>>,
-    pub(crate) dispatch_classes: HashMap<UnitId, std::collections::BTreeSet<String>>,
-    captured: HashMap<PathBuf, Source>,
-    source_paths: HashMap<UnitId, PathBuf>,
+    source_roots: InventoryMap<PathBuf, super::tracked::Durability>,
+    interface_dispatch: InventoryMap<UnitId, Vec<FunctionId>>,
+    pub(crate) dispatch_classes: InventoryMap<UnitId, std::collections::BTreeSet<String>>,
+    captured: InventoryMap<PathBuf, Source>,
+    source_paths: InventoryMap<UnitId, PathBuf>,
+    owner_changes: InventoryMap<PathBuf, Vec<(String, bool)>>,
+    source_body_changes: InventoryMap<PathBuf, Vec<String>>,
     advanced: bool,
-    bodies: HashMap<BodyId, BodyBinding>,
+    bodies: InventoryMap<BodyId, BodyBinding>,
     prepared: HashMap<BodyId, PreparedBody>,
     symbols: HashMap<(UnitId, String), Rc<Value>>,
-    effect_functions: HashMap<UnitId, Vec<FunctionId>>,
-    reference_wires: HashMap<super::references::SymbolUseId, CompactJson>,
-    reference_symbols: std::collections::BTreeSet<super::references::SymbolId>,
-    reference_uses: std::collections::BTreeSet<super::references::SymbolUseId>,
+    effect_functions: InventoryMap<UnitId, im::OrdSet<FunctionId>>,
+    effect_inventory_owners: usize,
+    effect_dependency_reads: std::cell::Cell<usize>,
+    effect_epochs: InventoryMap<UnitId, u64>,
+    reference_wires: InventoryMap<super::references::SymbolUseId, CompactJson>,
+    reference_symbols: InventorySet<super::references::SymbolId>,
+    reference_uses: InventorySet<super::references::SymbolUseId>,
     effects: HashMap<UnitId, PreparedEffects>,
     derived: HashMap<QueryNode, DerivedValue>,
     checked_roots: std::collections::HashSet<BodyId>,
-    token_pairs: HashMap<PathBuf, TokenPairs>,
+    changed_body_units: InventoryMap<UnitId, im::HashSet<BodyId>>,
+    token_pairs: InventoryMap<PathBuf, TokenPairs>,
     captured_nodes: std::collections::HashSet<InputNode>,
+    captured_node_bytes: usize,
+    pending_dispatch: InventoryMap<UnitId, std::collections::BTreeSet<String>>,
+    pending_interface: InventoryMap<UnitId, Vec<FunctionId>>,
+    pending_effect: InventoryMap<UnitId, im::OrdSet<FunctionId>>,
+    // Advanced once per revision whose source edits move retained coordinates.
+    // A derived memo records the epoch its presentation spans belong to.
+    coordinate_epoch: u64,
+    coordinates_shifted: bool,
 }
 impl std::fmt::Debug for SyntaxQueries {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -72,7 +321,7 @@ impl SyntaxQueries {
             }
         }
         self.interface_dispatch
-            .insert(unit, inputs.keys().copied().collect());
+            .replace(unit, inputs.keys().copied().collect());
         for (&id, targets) in inputs {
             self.capture_input(
                 InputNode::InterfaceDispatch(unit, id),
@@ -118,20 +367,21 @@ impl SyntaxQueries {
             uses.iter().map(|(id, _)| id.clone()).collect();
         let removed: Vec<_> = self
             .reference_uses
-            .difference(&current_uses)
+            .iter()
+            .filter(|id| !current_uses.contains(*id))
             .cloned()
             .collect();
         for id in removed {
             self.capture_input(InputNode::ResolvedReference(id), value(Value::Null)?)?;
         }
-        self.reference_uses = current_uses;
+        self.reference_uses = current_uses.into_iter().collect();
         for (id, reference) in uses {
             let mut canonical = reference.clone();
             if let Some(object) = canonical.as_object_mut() {
                 object.remove("location");
             }
             self.reference_wires
-                .insert(id.clone(), CompactJson::new(&reference)?);
+                .replace(id.clone(), CompactJson::new(&reference)?);
             self.capture_input(InputNode::ResolvedReference(id.clone()), value(canonical)?)?;
             self.resolved_reference(id)?;
         }
@@ -227,21 +477,33 @@ impl SyntaxQueries {
             source_roots: self.source_roots.clone(),
             dispatch_classes: self.dispatch_classes.clone(),
             interface_dispatch: self.interface_dispatch.clone(),
-            captured: HashMap::new(),
-            source_paths: HashMap::new(),
+            captured: InventoryMap::default(),
+            source_paths: InventoryMap::default(),
+            owner_changes: InventoryMap::default(),
+            source_body_changes: InventoryMap::default(),
             advanced: false,
-            bodies: HashMap::new(),
+            bodies: InventoryMap::default(),
             prepared: HashMap::new(),
             symbols: HashMap::new(),
             effect_functions: self.effect_functions.clone(),
-            reference_wires: HashMap::new(),
+            effect_inventory_owners: 0,
+            effect_dependency_reads: Default::default(),
+            effect_epochs: self.effect_epochs.clone(),
+            reference_wires: InventoryMap::default(),
             reference_symbols: self.reference_symbols.clone(),
             reference_uses: self.reference_uses.clone(),
             effects: HashMap::new(),
             derived: HashMap::new(),
             checked_roots: Default::default(),
-            token_pairs: HashMap::new(),
+            changed_body_units: Default::default(),
+            token_pairs: InventoryMap::default(),
             captured_nodes: Default::default(),
+            captured_node_bytes: 0,
+            pending_dispatch: self.dispatch_classes.clone(),
+            pending_interface: self.interface_dispatch.clone(),
+            pending_effect: self.effect_functions.clone(),
+            coordinate_epoch: self.coordinate_epoch,
+            coordinates_shifted: false,
         };
         for (node, payload) in [
             (
@@ -271,7 +533,7 @@ impl SyntaxQueries {
                 PackageSourceIdentity::Git { .. } | PackageSourceIdentity::GitSubdirectory { .. }
             ) && package.identity.revision.is_some()
                 && package.checksum.is_some();
-            self.source_roots.insert(
+            self.source_roots.replace(
                 package.root.clone(),
                 if immutable {
                     Durability::High
@@ -294,6 +556,19 @@ impl SyntaxQueries {
                 "input changed after capture in one candidate: {node:?}"
             );
             return Ok(());
+        }
+        self.captured_node_bytes += node.heap_bytes();
+        match &node {
+            InputNode::DispatchDeclaration(unit, _) => {
+                self.pending_dispatch.discard(unit);
+            }
+            InputNode::InterfaceDispatch(unit, _) => {
+                self.pending_interface.discard(unit);
+            }
+            InputNode::EffectRoots(unit) => {
+                self.pending_effect.discard(unit);
+            }
+            _ => {}
         }
         if !self.advanced
             && !self
@@ -320,8 +595,8 @@ impl SyntaxQueries {
             bodies: &self.bodies,
             prepared: &self.prepared,
             effects: &self.effects,
+            effect_dependency_reads: &self.effect_dependency_reads,
             derived: &self.derived,
-            checked_roots: &self.checked_roots,
         }
     }
     pub(crate) fn capture_semantic(
@@ -353,7 +628,7 @@ impl SyntaxQueries {
         Ok(())
     }
     pub(crate) fn register_body(&mut self, unit: UnitId, body: BodyId, path: &Path, owner: &str) {
-        self.bodies.insert(
+        self.bodies.replace(
             body,
             BodyBinding {
                 unit,
@@ -388,6 +663,60 @@ impl SyntaxQueries {
             Err(error) => Err(error),
         }
     }
+    /// Typed owners whose semantic result changed in this candidate. Source
+    /// removals must be supplied separately by the source inventory owner.
+    pub(crate) fn changed_bodies(&self) -> std::collections::HashSet<BodyId> {
+        self.table
+            .changed_queries()
+            .iter()
+            .filter_map(|node| match node {
+                QueryNode::TypedBody(body) => Some(*body),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn changed_bodies_in(&self, unit: UnitId) -> std::collections::HashSet<BodyId> {
+        self.changed_body_units
+            .get(&unit)
+            .map(|bodies| bodies.iter().copied().collect())
+            .unwrap_or_default()
+    }
+    pub(crate) fn declarations_changed(&self, unit: UnitId) -> bool {
+        self.source_paths.get(&unit).is_some_and(|path| {
+            self.table
+                .changed_queries()
+                .contains(&QueryNode::SyntaxDeclarations(path.clone()))
+        })
+    }
+    /// Source body deltas include unchecked templates, which have no TypedBody memo.
+    pub(crate) fn source_body_changes(&self, unit: UnitId) -> Vec<String> {
+        self.source_paths
+            .get(&unit)
+            .and_then(|path| self.source_body_changes.get(path))
+            .cloned()
+            .unwrap_or_default()
+    }
+    pub(crate) fn source_owner_span(&self, unit: UnitId, owner: &str) -> Option<Span> {
+        let path = self.source_paths.get(&unit)?;
+        let parsed = self.table.peek(&QueryNode::Parse(path.clone()))?;
+        parsed.get::<ParsedValue>().owner_spans.get(owner).copied()
+    }
+    pub(crate) fn effect_source_changes(&self, unit: UnitId) -> Option<Vec<(String, bool)>> {
+        let path = self.source_paths.get(&unit)?;
+        if self
+            .table
+            .changed_queries()
+            .contains(&QueryNode::SyntaxImports(path.clone()))
+        {
+            return None;
+        }
+        Some(self.owner_changes.get(path).cloned().unwrap_or_default())
+    }
+    pub(crate) fn body_source_owner(&self, body: BodyId) -> Option<String> {
+        Some(self.bodies.get(&body)?.owner.clone())
+    }
+
     pub(crate) fn has_typed_body(&self, body: BodyId) -> bool {
         self.table.peek(&QueryNode::TypedBody(body)).is_some()
     }
@@ -411,6 +740,14 @@ impl SyntaxQueries {
         );
         self.table
             .read(&self.provider(), QueryNode::TypedBody(body))?;
+        if self
+            .table
+            .changed_queries()
+            .contains(&QueryNode::TypedBody(body))
+        {
+            self.changed_body_units
+                .update(unit, |bodies| bodies.insert(body));
+        }
         Ok(())
     }
     #[cfg(test)]
@@ -456,18 +793,48 @@ impl SyntaxQueries {
             Err(error) => Err(error),
         }
     }
+    /// Record that this revision's correspondence moves retained coordinates.
+    pub(crate) fn shift_coordinates(&mut self) {
+        if !self.coordinates_shifted {
+            self.coordinates_shifted = true;
+            self.coordinate_epoch += 1;
+        }
+    }
+    /// How a validated derived memo's presentation spans relate to the
+    /// current source. Memos are relocated only when read, so one skipped in
+    /// a shifted revision is more than one correspondence behind.
+    pub(crate) fn derived_coordinates(&self, node: &QueryNode) -> DerivedCoordinates {
+        let epoch = self
+            .table
+            .peek(node)
+            .map_or(0, |memo| memo.get::<DerivedValue>().epoch);
+        if epoch == self.coordinate_epoch {
+            DerivedCoordinates::Current
+        } else if self.coordinates_shifted && epoch + 1 == self.coordinate_epoch {
+            DerivedCoordinates::Previous
+        } else {
+            DerivedCoordinates::Stale
+        }
+    }
     pub(crate) fn refresh_derived(&self, node: QueryNode, wire: Value) -> Result<()> {
         let canonical = serde_json::to_vec(&super::syntax::without_spans(&wire))?;
         let fingerprint = ResultFingerprint::bytes(&canonical);
         let mut encoded = vec![DERIVED_WIRE_VERSION];
         serde_json::to_writer(&mut encoded, &wire)?;
         let wire = encoded;
+        if self.table.peek(&node).is_some_and(|old| {
+            let old = old.get::<DerivedValue>();
+            old.epoch == self.coordinate_epoch && old.wire.as_ref() == wire.as_slice()
+        }) {
+            return Ok(());
+        }
         self.table.refresh_value(
             &node,
             QueryValue::new(
                 DerivedValue {
                     wire: wire.into(),
                     canonical: canonical.into(),
+                    epoch: self.coordinate_epoch,
                 },
                 fingerprint,
             ),
@@ -494,6 +861,7 @@ impl SyntaxQueries {
         let value = DerivedValue {
             wire: wire.into(),
             canonical: canonical.into(),
+            epoch: self.coordinate_epoch,
         };
         self.derived.insert(node.clone(), value.clone());
         self.table.read(&self.provider(), node.clone())?;
@@ -501,36 +869,33 @@ impl SyntaxQueries {
         self.table
             .refresh_value(&node, QueryValue::new(value, fingerprint))
     }
-    pub(crate) fn validate_effects(&mut self, unit: UnitId, roots: Vec<BodyId>) -> Result<bool> {
+    fn capture_effect_epoch(&mut self, unit: UnitId) -> Result<()> {
+        let node = InputNode::EffectRoots(unit);
+        if self.captured_nodes.contains(&node) {
+            return Ok(());
+        }
+        let changed = self
+            .changed_body_units
+            .get(&unit)
+            .is_some_and(|ids| !ids.is_empty());
+        let value = self.effect_epochs.update(unit, |epoch| {
+            if changed {
+                *epoch = epoch.checked_add(1).expect("effect input epoch exhausted");
+            }
+            *epoch
+        });
         self.capture_input(
-            InputNode::EffectRoots(unit),
-            QueryValue::new(
-                roots
-                    .iter()
-                    .map(|body| (*body, self.checked_roots.contains(body)))
-                    .collect::<Vec<_>>(),
-                ResultFingerprint::bytes(b"effect-roots-v1"),
-            ),
-        )?;
+            node,
+            QueryValue::new(value, ResultFingerprint::bytes(b"effect-unit-epoch-v1")),
+        )
+    }
+    pub(crate) fn validate_effects(&mut self, unit: UnitId, _roots: Vec<BodyId>) -> Result<bool> {
+        self.capture_effect_epoch(unit)?;
         match self
             .table
             .read(&self.provider(), QueryNode::EffectInventory(unit))
         {
-            Ok(inventory) => {
-                // A green inventory can outlive per-function inputs pruned at
-                // finish when nobody queried that function. A new caller in
-                // this revision must still be able to ask for its effects.
-                for (&function, effect) in &inventory.get::<EffectInventoryValue>().functions {
-                    self.capture_input(
-                        InputNode::ComputedEffect(unit, function),
-                        QueryValue::new(
-                            Some(effect.clone()),
-                            ResultFingerprint::bytes(b"computed-effect"),
-                        ),
-                    )?;
-                }
-                Ok(true)
-            }
+            Ok(_) => Ok(true),
             Err(error)
                 if error
                     .downcast_ref::<super::tracked::DeferredQuery>()
@@ -541,59 +906,117 @@ impl SyntaxQueries {
             Err(error) => Err(error),
         }
     }
+    #[cfg(test)]
     pub(crate) fn publish_effects(
         &mut self,
         unit: UnitId,
         roots: Vec<BodyId>,
         imported: Vec<(UnitId, FunctionId)>,
         inventory: HashMap<FunctionId, super::effects::CapturedEffect>,
-        source_units: Vec<UnitId>,
-        metadata: Value,
+        mut source_units: Vec<UnitId>,
+        _metadata: Value,
     ) -> Result<()> {
-        self.capture_input(
-            InputNode::EffectRoots(unit),
-            QueryValue::new(
-                roots
-                    .iter()
-                    .map(|body| (*body, self.checked_roots.contains(body)))
-                    .collect::<Vec<_>>(),
-                ResultFingerprint::bytes(b"effect-roots-v1"),
-            ),
-        )?;
-        for function in self.effect_functions.remove(&unit).unwrap_or_default() {
-            if !inventory.contains_key(&function) {
-                self.capture_input(
-                    InputNode::ComputedEffect(unit, function),
-                    QueryValue::new(
-                        None::<super::effects::CapturedEffect>,
-                        ResultFingerprint::bytes(b"computed-effect"),
-                    ),
-                )?;
+        source_units.extend(imported.iter().map(|(unit, _)| *unit));
+        source_units.sort();
+        source_units.dedup();
+        let mut updates: HashMap<_, _> = inventory
+            .into_iter()
+            .map(|(id, effect)| (id, Some(effect)))
+            .collect();
+        if let Some(old) = self.effect_functions.get(&unit) {
+            for &id in old {
+                updates.entry(id).or_insert(None);
             }
         }
+        self.publish_effect_delta(unit, roots, imported, updates, source_units)
+    }
+    pub(crate) fn effect_dependency_reads(&self) -> usize {
+        self.effect_dependency_reads.get()
+    }
+    pub(crate) fn effect_inventory_owners(&self) -> usize {
+        self.effect_inventory_owners
+    }
+    pub(crate) fn has_effect_inventory(&self, unit: UnitId) -> bool {
+        self.table
+            .peek(&QueryNode::EffectInventory(unit))
+            .is_some_and(|value| value.downcast::<EffectInventoryValue>().is_some())
+    }
+    pub(crate) fn effect_inventory_ids(&self, unit: UnitId) -> Vec<FunctionId> {
         self.effect_functions
-            .insert(unit, inventory.keys().copied().collect());
-        for (&function, effect) in &inventory {
+            .get(&unit)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
+    }
+    pub(crate) fn publish_effect_delta(
+        &mut self,
+        unit: UnitId,
+        _roots: Vec<BodyId>,
+        _imported: Vec<(UnitId, FunctionId)>,
+        updates: HashMap<FunctionId, Option<super::effects::CapturedEffect>>,
+        source_units: Vec<UnitId>,
+    ) -> Result<()> {
+        self.capture_effect_epoch(unit)?;
+        let mut inventory = self
+            .table
+            .peek(&QueryNode::EffectInventory(unit))
+            .and_then(|value| value.downcast::<EffectInventoryValue>().cloned())
+            .unwrap_or_default();
+        let mut changed = false;
+        let mut added = Vec::new();
+        for (function, effect) in updates {
+            self.effect_inventory_owners += 1;
+            let previous = inventory.functions.get(&function);
+            if previous.map(|value| value.as_ref()) == effect.as_ref() {
+                continue;
+            }
+            changed = true;
+            if let Some(previous) = previous {
+                inventory.bytes -= previous.as_ref().retained_bytes();
+            }
+            match &effect {
+                Some(effect) => {
+                    let stored = std::sync::Arc::new(effect.clone());
+                    inventory.bytes += stored.as_ref().retained_bytes();
+                    if inventory.functions.insert(function, stored).is_none() {
+                        added.push(function);
+                    }
+                    self.effect_functions
+                        .update(unit, |functions| functions.insert(function));
+                }
+                None => {
+                    inventory.functions.remove(&function);
+                    self.effect_functions
+                        .update(unit, |functions| functions.remove(&function));
+                }
+            }
             self.capture_input(
                 InputNode::ComputedEffect(unit, function),
-                QueryValue::new(
-                    Some(effect.clone()),
-                    ResultFingerprint::bytes(b"computed-effect"),
-                ),
+                QueryValue::new(effect, ResultFingerprint::bytes(b"computed-effect")),
             )?;
+        }
+        if changed {
+            inventory.stamp = inventory
+                .stamp
+                .checked_add(1)
+                .expect("effect stamp exhausted");
         }
         self.effects.insert(
             unit,
             PreparedEffects {
-                roots,
-                imported,
                 inventory,
                 source_units,
-                metadata: CompactJson::new(&metadata)?,
             },
         );
         self.table
             .read(&self.provider(), QueryNode::EffectInventory(unit))?;
+        // Root capability memos keep their captured input alive during graph
+        // compaction. Existing owners retain these nodes without being reread.
+        for function in added {
+            self.table.read(
+                &self.provider(),
+                QueryNode::EffectCapabilities(unit, function),
+            )?;
+        }
         Ok(())
     }
     pub(crate) fn effect_capabilities(
@@ -621,74 +1044,65 @@ impl SyntaxQueries {
         // Candidate metadata starts from the accepted inventories so capture
         // can publish removals. Units not captured in this revision must not
         // keep deleted classes/functions rooted during graph compaction.
-        let mut dispatch_units = std::collections::HashSet::new();
-        let mut interface_units = std::collections::HashSet::new();
-        let mut effect_units = std::collections::HashSet::new();
-        for input in &self.captured_nodes {
-            match input {
-                InputNode::DispatchDeclaration(unit, _) => {
-                    dispatch_units.insert(*unit);
+        for unit in self.pending_dispatch.keys() {
+            self.dispatch_classes.discard(unit);
+        }
+        for unit in self.pending_interface.keys() {
+            self.interface_dispatch.discard(unit);
+        }
+        for unit in self.pending_effect.keys() {
+            self.effect_functions.discard(unit);
+            self.effect_epochs.discard(unit);
+        }
+        self.pending_dispatch.clear();
+        self.pending_interface.clear();
+        self.pending_effect.clear();
+        let (nodes, edges) = if self.table.needs_compaction() {
+            let mut index_work =
+                self.dispatch_classes.values.len() + self.interface_dispatch.values.len();
+            let captured = &self.captured_nodes;
+            let bodies = &self.bodies;
+            let classes: std::collections::HashSet<_> = self
+                .dispatch_classes
+                .values()
+                .flatten()
+                .inspect(|_| index_work += 1)
+                .map(|name| crate::semantic::ids::TypeId::from_source_name(name))
+                .collect();
+            let interfaces: std::collections::HashSet<_> = self
+                .interface_dispatch
+                .values()
+                .flatten()
+                .inspect(|_| index_work += 1)
+                .filter_map(FunctionId::owner_type)
+                .collect();
+            let effects = &self.effect_functions;
+            let size = self.table.compact(|node| match node {
+                QueryNode::EffectCapabilities(unit, id) => {
+                    effects.get(unit).is_some_and(|ids| ids.contains(id))
                 }
-                InputNode::InterfaceDispatch(unit, _) => {
-                    interface_units.insert(*unit);
+                QueryNode::ClassLayout(id) | QueryNode::GcLayout(id) => {
+                    classes.contains(id) || captured.contains(&InputNode::LayoutDeclaration(*id))
                 }
-                InputNode::EffectRoots(unit) => {
-                    effect_units.insert(*unit);
+                QueryNode::InterfaceLayout(id) => {
+                    interfaces.contains(id)
+                        || captured.contains(&InputNode::InterfaceDeclaration(*id))
                 }
-                _ => {}
-            }
-        }
-        let old_lengths = (
-            self.dispatch_classes.len(),
-            self.interface_dispatch.len(),
-            self.effect_functions.len(),
-        );
-        self.dispatch_classes
-            .retain(|unit, _| dispatch_units.contains(unit));
-        self.interface_dispatch
-            .retain(|unit, _| interface_units.contains(unit));
-        self.effect_functions
-            .retain(|unit, _| effect_units.contains(unit));
-        if self.dispatch_classes.len() != old_lengths.0 {
-            self.dispatch_classes.shrink_to_fit();
-        }
-        if self.interface_dispatch.len() != old_lengths.1 {
-            self.interface_dispatch.shrink_to_fit();
-        }
-        if self.effect_functions.len() != old_lengths.2 {
-            self.effect_functions.shrink_to_fit();
-        }
-        let captured = &self.captured_nodes;
-        let bodies = &self.bodies;
-        let classes: std::collections::HashSet<_> = self
-            .dispatch_classes
-            .values()
-            .flatten()
-            .map(|name| crate::semantic::ids::TypeId::from_source_name(name))
-            .collect();
-        let interfaces: std::collections::HashSet<_> = self
-            .interface_dispatch
-            .values()
-            .flatten()
-            .filter_map(FunctionId::owner_type)
-            .collect();
-        let (nodes, edges) = self.table.compact(|node| match node {
-            QueryNode::ClassLayout(id) | QueryNode::GcLayout(id) => {
-                classes.contains(id) || captured.contains(&InputNode::LayoutDeclaration(*id))
-            }
-            QueryNode::InterfaceLayout(id) => {
-                interfaces.contains(id) || captured.contains(&InputNode::InterfaceDeclaration(*id))
-            }
-            QueryNode::TypedBody(id)
-            | QueryNode::NormalizedBody(id)
-            | QueryNode::DefiniteAssignment(id)
-            | QueryNode::AsyncBorrowReport(id)
-            | QueryNode::ResolvedReferences(id)
-            | QueryNode::DirectEffects(id)
-            | QueryNode::LirBody(id)
-            | QueryNode::AsyncFrameLayout(id) => bodies.contains_key(id),
-            _ => false,
-        });
+                QueryNode::TypedBody(id)
+                | QueryNode::NormalizedBody(id)
+                | QueryNode::DefiniteAssignment(id)
+                | QueryNode::AsyncBorrowReport(id)
+                | QueryNode::ResolvedReferences(id)
+                | QueryNode::DirectEffects(id)
+                | QueryNode::LirBody(id)
+                | QueryNode::AsyncFrameLayout(id) => bodies.contains_key(id),
+                _ => false,
+            });
+            self.table.account_reclamation_indexes(index_work);
+            size
+        } else {
+            self.table.graph_size()
+        };
         anyhow::ensure!(nodes <= 1_000_000, "revision query node limit exceeded");
         anyhow::ensure!(
             edges <= 8_000_000,
@@ -759,6 +1173,9 @@ impl SyntaxQueries {
         }
         self.table.retained_bytes()
             + self.source_roots.heap_bytes()
+            + self.owner_changes.heap_bytes()
+            + self.source_body_changes.heap_bytes()
+            + self.effect_epochs.heap_bytes()
             + self.interface_dispatch.heap_bytes()
             + self.dispatch_classes.heap_bytes()
             + self.captured.heap_bytes()
@@ -772,15 +1189,37 @@ impl SyntaxQueries {
             + self.reference_uses.heap_bytes()
             + self.effects.heap_bytes()
             + self.derived.heap_bytes()
-            + self.checked_roots.heap_bytes()
+            + self.checked_roots.capacity() * std::mem::size_of::<BodyId>() * 2
+            + self.changed_body_units.heap_bytes()
             + self.token_pairs.heap_bytes()
-            + self.captured_nodes.heap_bytes()
+            + self.captured_node_bytes
+            + self.captured_nodes.capacity() * std::mem::size_of::<InputNode>() * 2
     }
     pub(crate) fn verification_dump(&self) -> String {
         self.table.verification_dump()
     }
     pub(crate) fn stats(&self) -> TrackedStats {
-        self.table.stats()
+        let mut stats = self.table.stats();
+        stats.auxiliary_accounting_entries = self.source_roots.accounting
+            + self.interface_dispatch.accounting
+            + self.dispatch_classes.accounting
+            + self.captured.accounting
+            + self.source_paths.accounting
+            + self.owner_changes.accounting
+            + self.source_body_changes.accounting
+            + self.bodies.accounting
+            + self.effect_functions.accounting
+            + self.effect_epochs.accounting
+            + self.reference_wires.accounting
+            + self.reference_symbols.values.accounting
+            + self.reference_uses.values.accounting
+            + self.changed_body_units.accounting
+            + self.token_pairs.accounting
+            + self.pending_dispatch.accounting
+            + self.pending_interface.accounting
+            + self.pending_effect.accounting
+            + self.captured_nodes.len();
+        stats
     }
     pub(crate) fn take_token_pairs(&mut self, path: &Path) -> Option<TokenPairs> {
         self.token_pairs.remove(path)
@@ -815,8 +1254,8 @@ impl SyntaxQueries {
             self.table
                 .capture_candidate_with_durability(node, value, self.source_durability(path));
             self.source_paths
-                .insert(crate::module::ModuleId(file.0), path.to_owned());
-            self.captured.insert(path.to_owned(), captured);
+                .replace(crate::module::ModuleId(file.0), path.to_owned());
+            self.captured.replace(path.to_owned(), captured);
         }
         let result = self
             .table
@@ -828,11 +1267,65 @@ impl SyntaxQueries {
         self.table
             .read(&self.provider(), QueryNode::SyntaxImports(path.to_owned()))?;
         let parsed = result.get::<ParsedValue>();
+        let mut owner_changes = Vec::new();
+        let mut source_body_changes = Vec::new();
+        if let Some(previous) = &previous {
+            let old = &previous.get::<ParsedValue>().owners;
+            for (owner, (signature, body)) in &parsed.owners {
+                if old.get(owner).is_none_or(|(_, before)| before != body) {
+                    source_body_changes.push(owner.clone());
+                }
+                if old.get(owner).is_none_or(|(before, _)| before != signature) {
+                    owner_changes.push((owner.clone(), true));
+                }
+            }
+            for owner in old.keys() {
+                if !parsed.owners.contains_key(owner) {
+                    owner_changes.push((owner.clone(), false));
+                    source_body_changes.push(owner.clone());
+                }
+            }
+        }
+        if previous.is_none() {
+            source_body_changes.extend(parsed.owners.keys().cloned());
+        }
+        if !self.source_body_changes.contains_key(path) {
+            self.source_body_changes
+                .replace(path.to_owned(), source_body_changes);
+        }
+        self.owner_changes.replace(path.to_owned(), owner_changes);
+        // Parsing is the capture boundary. Publish owner projections as
+        // independent inputs: a changed file must not recompute every body's
+        // otherwise-equal syntax/signature query through one Parse dependency.
+        for (owner, (signature, body)) in &parsed.owners {
+            self.capture_input(
+                InputNode::SyntaxSignature(path.to_owned(), owner.clone()),
+                signature.clone().into_query(),
+            )?;
+            self.capture_input(
+                InputNode::BodySyntax(path.to_owned(), owner.clone()),
+                body.clone().into_query(),
+            )?;
+        }
+        if let Some(previous) = &previous {
+            for owner in previous.get::<ParsedValue>().owners.keys() {
+                if !parsed.owners.contains_key(owner) {
+                    self.capture_input(
+                        InputNode::SyntaxSignature(path.to_owned(), owner.clone()),
+                        value(Value::Null)?,
+                    )?;
+                    self.capture_input(
+                        InputNode::BodySyntax(path.to_owned(), owner.clone()),
+                        value(Value::Null)?,
+                    )?;
+                }
+            }
+        }
         if let Some(previous) = previous {
             let old: TokenInventory =
                 serde_json::from_slice(&previous.get::<ParsedValue>().tokens)?;
             let new: TokenInventory = serde_json::from_slice(&parsed.tokens)?;
-            self.token_pairs.insert(path.to_owned(), (old, new));
+            self.token_pairs.replace(path.to_owned(), (old, new));
         }
         Ok(serde_json::from_slice(&parsed.wire)?)
     }
@@ -848,6 +1341,16 @@ struct DerivedValue {
     // beyond the single encoding/canonicalization pass.
     wire: Rc<Vec<u8>>,
     canonical: Rc<Vec<u8>>,
+    #[serde(default)]
+    epoch: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DerivedCoordinates {
+    Current,
+    /// The current correspondence maps these spans.
+    Previous,
+    /// Recompute: no single correspondence maps these spans.
+    Stale,
 }
 impl PartialEq for DerivedValue {
     fn eq(&self, other: &Self) -> bool {
@@ -865,6 +1368,8 @@ struct ParsedValue {
     imports: CompactJson,
     // Precomputed per-owner projections keep lookups independent of file size.
     owners: HashMap<String, (CompactJson, CompactJson)>,
+    #[serde(default)]
+    owner_spans: HashMap<String, Span>,
 }
 impl PartialEq for ParsedValue {
     fn eq(&self, other: &Self) -> bool {
@@ -901,25 +1406,30 @@ impl Retained for TypedBodyValue {
 }
 
 struct PreparedEffects {
-    roots: Vec<BodyId>,
-    imported: Vec<(UnitId, FunctionId)>,
-    inventory: HashMap<FunctionId, super::effects::CapturedEffect>,
+    inventory: EffectInventoryValue,
     source_units: Vec<UnitId>,
-    metadata: CompactJson,
 }
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Default)]
 struct EffectInventoryValue {
-    functions: HashMap<FunctionId, super::effects::CapturedEffect>,
-    metadata: CompactJson,
+    functions: im::OrdMap<FunctionId, std::sync::Arc<super::effects::CapturedEffect>>,
+    // Advanced only after exact per-owner comparisons find a changed value.
+    stamp: u64,
+    bytes: usize,
 }
+impl PartialEq for EffectInventoryValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.stamp == other.stamp
+    }
+}
+impl Eq for EffectInventoryValue {}
 struct SyntaxProvider<'a> {
-    source_paths: &'a HashMap<UnitId, PathBuf>,
-    interface_dispatch: &'a HashMap<UnitId, Vec<FunctionId>>,
-    bodies: &'a HashMap<BodyId, BodyBinding>,
+    source_paths: &'a InventoryMap<UnitId, PathBuf>,
+    interface_dispatch: &'a InventoryMap<UnitId, Vec<FunctionId>>,
+    bodies: &'a InventoryMap<BodyId, BodyBinding>,
     prepared: &'a HashMap<BodyId, PreparedBody>,
     effects: &'a HashMap<UnitId, PreparedEffects>,
+    effect_dependency_reads: &'a std::cell::Cell<usize>,
     derived: &'a HashMap<QueryNode, DerivedValue>,
-    checked_roots: &'a std::collections::HashSet<BodyId>,
 }
 /// Immutable canonical JSON without the per-field allocation overhead of Value.
 /// Encoding happens once; equality and fingerprints compare the same bytes.
@@ -1003,7 +1513,7 @@ fn index_declarations(items: &Value, prefix: &str, index: &mut serde_json::Map<S
             .or_else(|| declaration.get("initializer"))
             .cloned()
             .unwrap_or(Value::Null);
-        index.insert(owner.clone(), serde_json::json!({"signature": declarations(declaration.clone()), "body": super::syntax::semantic(&body)}));
+        index.insert(owner.clone(), serde_json::json!({"signature": declarations(declaration.clone()), "body": super::syntax::semantic(&body), "span": declaration.get("span")}));
         for field in ["methods", "static_methods", "constructors", "fields"] {
             index_declarations(&declaration[field], &format!("{owner}/{field}"), index);
         }
@@ -1065,6 +1575,14 @@ impl QueryProvider for SyntaxProvider<'_> {
                 let parsed = serde_json::to_value((program, diagnostics, lexer_failed))?;
                 let mut index = serde_json::Map::new();
                 index_declarations(&parsed[0]["items"], "", &mut index);
+                let owner_spans = index
+                    .iter()
+                    .filter_map(|(owner, projection)| {
+                        serde_json::from_value::<Span>(projection["span"].clone())
+                            .ok()
+                            .map(|span| (owner.clone(), span))
+                    })
+                    .collect();
                 let owners = index
                     .into_iter()
                     .map(|(owner, projection)| {
@@ -1090,6 +1608,7 @@ impl QueryProvider for SyntaxProvider<'_> {
                         declarations: CompactJson::new(&declarations(parsed[0]["items"].clone()))?,
                         imports: CompactJson::new(&super::syntax::semantic(&parsed[0]["imports"]))?,
                         owners,
+                        owner_spans,
                     },
                     fingerprint,
                 ))
@@ -1104,6 +1623,16 @@ impl QueryProvider for SyntaxProvider<'_> {
                 }
             }
             QueryNode::SyntaxSignature(path, owner) | QueryNode::BodySyntax(path, owner) => {
+                let input = if matches!(node, QueryNode::BodySyntax(_, _)) {
+                    InputNode::BodySyntax(path.clone(), owner.clone())
+                } else {
+                    InputNode::SyntaxSignature(path.clone(), owner.clone())
+                };
+                if table.contains_input(&input) {
+                    return table.input(&input);
+                }
+                // An owner never observed in this file still has to track its
+                // possible future addition. A captured removal uses Null above.
                 let parsed = table.read(self, QueryNode::Parse(path.clone()))?;
                 match parsed.get::<ParsedValue>().owners.get(owner) {
                     Some((signature, body)) => {
@@ -1140,52 +1669,28 @@ impl QueryProvider for SyntaxProvider<'_> {
                 let Some(prepared) = self.effects.get(unit) else {
                     return Err(super::tracked::DeferredQuery(node.clone()).into());
                 };
+                self.effect_dependency_reads.set(
+                    self.effect_dependency_reads.get()
+                        + 1
+                        + usize::from(self.source_paths.contains_key(unit))
+                        + self.interface_dispatch.get(unit).map_or(0, Vec::len)
+                        + prepared.source_units.len(),
+                );
                 table.input(&InputNode::EffectRoots(*unit))?;
-                // A declaration-only unit still publishes memberwise/variant
-                // constructors. No BodySyntax root can invalidate that inventory
-                // when a class or variant is added, removed, or renamed.
-                if prepared.roots.is_empty()
-                    && let Some(path) = self.source_paths.get(unit)
-                {
-                    table.read(self, QueryNode::SyntaxDeclarations(path.clone()))?;
+                // Source capture establishes the current unit inventory. Body
+                // journals separately force completion after type-only changes;
+                // no per-function dependency inventory is rebuilt here.
+                if let Some(path) = self.source_paths.get(unit) {
+                    table.read(self, QueryNode::Parse(path.clone()))?;
                 }
                 for &id in self.interface_dispatch.get(unit).into_iter().flatten() {
                     table.read(self, QueryNode::InterfaceDispatchTargets(*unit, id))?;
-                }
-                let mut paths = std::collections::HashSet::new();
-                for body in &prepared.roots {
-                    if self.checked_roots.contains(body) {
-                        table.read(self, QueryNode::TypedBody(*body))?;
-                    } else {
-                        let binding = self.bodies.get(body).ok_or_else(|| {
-                            anyhow::anyhow!("missing effect source binding {body:?}")
-                        })?;
-                        table.read(
-                            self,
-                            QueryNode::BodySyntax(binding.path.clone(), binding.owner.clone()),
-                        )?;
-                        table.read(
-                            self,
-                            QueryNode::SyntaxSignature(binding.path.clone(), binding.owner.clone()),
-                        )?;
-                    }
-                    if let Some(binding) = self.bodies.get(body)
-                        && paths.insert(binding.path.clone())
-                    {
-                        table.read(self, QueryNode::Parse(binding.path.clone()))?;
-                    }
-                }
-                for (unit, function) in &prepared.imported {
-                    table.read(self, QueryNode::EffectCapabilities(*unit, *function))?;
                 }
                 for unit in &prepared.source_units {
                     table.read(self, QueryNode::EffectInventory(*unit))?;
                 }
                 Ok(QueryValue::new(
-                    EffectInventoryValue {
-                        functions: prepared.inventory.clone(),
-                        metadata: prepared.metadata.clone(),
-                    },
+                    prepared.inventory.clone(),
                     ResultFingerprint::bytes(b"effect-inventory-v1"),
                 ))
             }
@@ -1302,11 +1807,7 @@ impl Retained for PreparedBody {
 }
 impl Retained for PreparedEffects {
     fn heap_bytes(&self) -> usize {
-        self.roots.heap_bytes()
-            + self.imported.heap_bytes()
-            + self.inventory.heap_bytes()
-            + self.source_units.heap_bytes()
-            + self.metadata.heap_bytes()
+        self.inventory.heap_bytes() + self.source_units.heap_bytes()
     }
 }
 impl Retained for ParsedValue {
@@ -1317,6 +1818,7 @@ impl Retained for ParsedValue {
             + self.declarations.heap_bytes()
             + self.imports.heap_bytes()
             + self.owners.heap_bytes()
+            + self.owner_spans.heap_bytes()
     }
 }
 impl Retained for DerivedValue {
@@ -1326,7 +1828,7 @@ impl Retained for DerivedValue {
 }
 impl Retained for EffectInventoryValue {
     fn heap_bytes(&self) -> usize {
-        self.functions.heap_bytes() + self.metadata.heap_bytes()
+        self.bytes + self.functions.len() * 64
     }
 }
 
@@ -1380,6 +1882,7 @@ mod tests {
                                 DerivedValue {
                                     wire: wire.into(),
                                     canonical: canonical.clone(),
+                                    epoch: 0,
                                 },
                                 ResultFingerprint::bytes(&canonical),
                             ),
@@ -1409,13 +1912,137 @@ mod tests {
     }
 
     #[test]
+    fn effect_publication_delta_retains_unread_inputs_and_scales_by_changed_owner() {
+        use super::super::effects::{CapturedEffect, EffectCapabilities, EffectEvidence};
+        use crate::semantic::effects::{EffectSummary, RuntimeEffects};
+        use std::sync::Arc;
+        let capture = |io| CapturedEffect {
+            capabilities: EffectCapabilities {
+                runtime: RuntimeEffects::NONE,
+                may_io: io,
+            },
+            evidence: EffectEvidence {
+                summary: Arc::new(EffectSummary::default()),
+            },
+            helper: None,
+            loop_bodies: Vec::new(),
+        };
+        for size in [8, 32, 128] {
+            let mut first = SyntaxQueries::default().candidate().unwrap();
+            let ids: Vec<_> = (0..size)
+                .map(|i| FunctionId::free(format!("item_{i}")))
+                .collect();
+            first
+                .publish_effect_delta(
+                    UnitId::ENTRY,
+                    vec![],
+                    vec![],
+                    ids.iter().map(|&id| (id, Some(capture(false)))).collect(),
+                    vec![],
+                )
+                .unwrap();
+            first.finish().unwrap();
+            let before = first
+                .table
+                .peek(&QueryNode::EffectInventory(UnitId::ENTRY))
+                .unwrap();
+            let untouched = before.get::<EffectInventoryValue>().functions[&ids[1]].clone();
+            let mut next = first.candidate().unwrap();
+            next.changed_body_units
+                .update(UnitId::ENTRY, |bodies| bodies.insert(BodyId::fresh()));
+            assert!(!next.validate_effects(UnitId::ENTRY, vec![]).unwrap());
+            next.publish_effect_delta(
+                UnitId::ENTRY,
+                vec![],
+                vec![],
+                [(ids[0], Some(capture(true)))].into(),
+                vec![],
+            )
+            .unwrap();
+            assert_eq!(next.effect_inventory_owners(), 1);
+            assert_eq!(next.effect_dependency_reads(), 1);
+            next.finish().unwrap();
+            assert!(
+                !next
+                    .effect_capabilities(UnitId::ENTRY, ids[size - 1])
+                    .unwrap()
+                    .may_io
+            );
+            assert!(
+                next.effect_capabilities(UnitId::ENTRY, ids[0])
+                    .unwrap()
+                    .may_io
+            );
+            let after = next
+                .table
+                .peek(&QueryNode::EffectInventory(UnitId::ENTRY))
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                &untouched,
+                &after.get::<EffectInventoryValue>().functions[&ids[1]]
+            ));
+            assert_eq!(before.get::<EffectInventoryValue>().functions.len(), size);
+        }
+    }
+
+    #[test]
+    fn effect_inventory_byte_accounting_tracks_stored_vector_capacity() {
+        use super::super::effects::{CapturedEffect, EffectCapabilities, EffectEvidence};
+        use crate::semantic::effects::{EffectSummary, RuntimeEffects};
+        use std::sync::Arc;
+        let id = FunctionId::free("value");
+        let body = BodyId::fresh();
+        let mut accepted = SyntaxQueries::default();
+        for step in 0..9 {
+            let mut next = accepted.candidate().unwrap();
+            next.changed_body_units
+                .update(UnitId::ENTRY, |bodies| bodies.insert(body));
+            let mut loops = Vec::with_capacity(32);
+            loops.push(body);
+            let effect = (step < 8).then(|| CapturedEffect {
+                capabilities: EffectCapabilities {
+                    runtime: RuntimeEffects::NONE,
+                    may_io: step % 2 == 0,
+                },
+                evidence: EffectEvidence {
+                    summary: Arc::new(EffectSummary::default()),
+                },
+                helper: None,
+                loop_bodies: loops,
+            });
+            next.publish_effect_delta(UnitId::ENTRY, vec![], vec![], [(id, effect)].into(), vec![])
+                .unwrap();
+            let value = next
+                .table
+                .peek(&QueryNode::EffectInventory(UnitId::ENTRY))
+                .unwrap();
+            let inventory = value.get::<EffectInventoryValue>();
+            assert_eq!(
+                inventory.bytes,
+                inventory
+                    .functions
+                    .values()
+                    .map(|v| v.as_ref().retained_bytes())
+                    .sum::<usize>()
+            );
+            if step == 8 {
+                assert_eq!(inventory.bytes, 0);
+            }
+            next.finish().unwrap();
+            accepted = next;
+        }
+    }
+
+    #[test]
     fn finish_prunes_inventory_for_units_absent_from_candidate() {
         let mut queries = SyntaxQueries::default();
         queries
             .dispatch_classes
             .insert(UnitId::ENTRY, ["Removed".into()].into());
         queries.interface_dispatch.insert(UnitId::ENTRY, vec![]);
-        queries.effect_functions.insert(UnitId::ENTRY, vec![]);
+        queries
+            .effect_functions
+            .insert(UnitId::ENTRY, Default::default());
         let mut candidate = queries.candidate().unwrap();
         candidate.finish().unwrap();
         assert!(candidate.dispatch_classes.is_empty());
@@ -1521,6 +2148,130 @@ mod tests {
             assert_eq!(encoded.decode::<Value>().unwrap(), *a);
         }
     }
+    #[test]
+    fn unchecked_template_source_body_journal_and_current_span() {
+        let path = Path::new("template.wi");
+        let initial = "fn identity<T>(x:T)->T { return x; } fn main() {}";
+        let edited = "// shifted\nfn identity<T>(x:T)->T { println(1); return x; } fn main() {}";
+        let mut accepted = SyntaxQueries::default().candidate().unwrap();
+        accepted.parse(path, FileId::ENTRY, initial).unwrap();
+        let mut next = accepted.candidate().unwrap();
+        next.parse(path, FileId::ENTRY, edited).unwrap();
+        assert_eq!(
+            next.source_body_changes(UnitId::ENTRY),
+            vec!["Function:identity"]
+        );
+        assert!(next.changed_bodies_in(UnitId::ENTRY).is_empty());
+        assert_eq!(
+            next.source_owner_span(UnitId::ENTRY, "Function:identity")
+                .unwrap()
+                .start,
+            edited.find("fn identity").unwrap()
+        );
+        next.parse(path, FileId::ENTRY, edited).unwrap();
+        assert_eq!(
+            next.source_body_changes(UnitId::ENTRY),
+            vec!["Function:identity"]
+        );
+        let mut moved = next.candidate().unwrap();
+        let moved_source = format!("\n{edited}");
+        moved.parse(path, FileId::ENTRY, &moved_source).unwrap();
+        assert!(moved.source_body_changes(UnitId::ENTRY).is_empty());
+        assert_eq!(
+            moved
+                .source_owner_span(UnitId::ENTRY, "Function:identity")
+                .unwrap()
+                .start,
+            moved_source.find("fn identity").unwrap()
+        );
+        let mut removed = moved.candidate().unwrap();
+        removed.parse(path, FileId::ENTRY, "fn main() {}").unwrap();
+        assert_eq!(
+            removed.source_body_changes(UnitId::ENTRY),
+            vec!["Function:identity"]
+        );
+        assert!(
+            removed
+                .source_owner_span(UnitId::ENTRY, "Function:identity")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn owner_projection_recomputations_ignore_unrelated_functions() {
+        for count in [8, 32, 128] {
+            let path = Path::new("owners.wi");
+            let unrelated: String = (0..count)
+                .map(|i| format!("fn function_{i}() -> i64 {{ return {i}; }}\n"))
+                .collect();
+            let source = format!("fn edited() -> i64 {{ return 1; }} {unrelated}");
+            let mut first = SyntaxQueries::default().candidate().unwrap();
+            first.parse(path, FileId::ENTRY, &source).unwrap();
+            let owners: Vec<_> = std::iter::once("Function:edited".to_owned())
+                .chain((0..count).map(|i| format!("Function:function_{i}")))
+                .collect();
+            for owner in &owners {
+                first.body_syntax(path, owner).unwrap();
+                first.signature(path, owner).unwrap();
+            }
+            first.finish().unwrap();
+            let mut next = first.candidate().unwrap();
+            next.parse(
+                path,
+                FileId::ENTRY,
+                &source.replacen("return 1;", "return 20;", 1),
+            )
+            .unwrap();
+            for owner in &owners {
+                next.body_syntax(path, owner).unwrap();
+                next.signature(path, owner).unwrap();
+            }
+            assert_eq!(next.stats().recomputed, 4, "unrelated={count}");
+            assert_eq!(
+                next.recomputations(&QueryNode::BodySyntax(
+                    path.into(),
+                    "Function:edited".into()
+                )),
+                1
+            );
+            for owner in &owners[1..] {
+                assert_eq!(
+                    next.recomputations(&QueryNode::BodySyntax(path.into(), owner.clone())),
+                    0
+                );
+                assert_eq!(
+                    next.recomputations(&QueryNode::SyntaxSignature(path.into(), owner.clone())),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owner_projection_missing_add_remove_and_disk_roundtrip() {
+        let path = Path::new("missing-owner.wi");
+        let owner = "Function:later";
+        let mut current = SyntaxQueries::default().candidate().unwrap();
+        for source in [
+            "fn main() {}",
+            "fn later() -> i64 { return 1; } fn main() {}",
+            "\nfn later() -> i64 { return 1; } fn main() {}",
+            "fn main() {}",
+            "fn main() {}",
+            "fn later() -> bool { return true; } fn main() {}",
+        ] {
+            let mut next = current.candidate().unwrap();
+            next.parse(path, FileId::ENTRY, source).unwrap();
+            let body = next.body_syntax(path, owner).unwrap();
+            let signature = next.signature(path, owner).unwrap();
+            assert_eq!(body.is_null(), !source.contains("fn later"));
+            assert_eq!(signature.is_null(), !source.contains("fn later"));
+            next.finish().unwrap();
+            let wire = serde_json::to_vec(&next.disk_snapshot().unwrap()).unwrap();
+            current = SyntaxQueries::from_disk(serde_json::from_slice(&wire).unwrap()).unwrap();
+        }
+    }
+
     #[test]
     fn compact_parse_storage_and_projection_work_scale_with_owners() {
         let mut previous = None;
@@ -1860,14 +2611,16 @@ mod tests {
         for count in [8, 32, 128] {
             let path = Path::new("entry.wi");
             let source = (0..count)
-                .map(|i| format!("fn f{i}() -> i64 {{ return {i}; }}\n"))
+                .map(|i| format!("fn function_{i}() -> i64 {{ return {i}; }}\n"))
                 .collect::<String>();
             let mut accepted = SyntaxQueries::default().candidate().unwrap();
             accepted.parse(path, FileId::ENTRY, &source).unwrap();
             for i in 0..count {
-                accepted.signature(path, &format!("Function:f{i}")).unwrap();
                 accepted
-                    .body_syntax(path, &format!("Function:f{i}"))
+                    .signature(path, &format!("Function:function_{i}"))
+                    .unwrap();
+                accepted
+                    .body_syntax(path, &format!("Function:function_{i}"))
                     .unwrap();
             }
             let changed = source.replacen("return 0", "return 999", 1);
@@ -1875,18 +2628,24 @@ mod tests {
             next.parse(path, FileId::ENTRY, &changed).unwrap();
             for i in 0..count {
                 assert_eq!(
-                    accepted.signature(path, &format!("Function:f{i}")).unwrap(),
-                    next.signature(path, &format!("Function:f{i}")).unwrap()
+                    accepted
+                        .signature(path, &format!("Function:function_{i}"))
+                        .unwrap(),
+                    next.signature(path, &format!("Function:function_{i}"))
+                        .unwrap()
                 );
                 let before = accepted
-                    .body_syntax(path, &format!("Function:f{i}"))
+                    .body_syntax(path, &format!("Function:function_{i}"))
                     .unwrap();
-                let after = next.body_syntax(path, &format!("Function:f{i}")).unwrap();
+                let after = next
+                    .body_syntax(path, &format!("Function:function_{i}"))
+                    .unwrap();
                 assert_eq!(before == after, i != 0);
             }
             assert_eq!(next.stats().dependency_edges_visited, 4 + 2 * count);
             assert_eq!(next.stats().changed, 2); // parse and edited body projection
-            assert_eq!(next.stats().green_after_recompute, 1 + 2 * count);
+            assert_eq!(next.stats().green_after_recompute, 2);
+            assert_eq!(next.stats().recomputed, 4);
         }
     }
     #[test]
@@ -2043,7 +2802,8 @@ mod tests {
             for aggregate in [false, true] {
                 let path = Path::new("entry.wi");
                 let source = (0..count)
-                    .map(|i| format!("fn f{i}() -> i64 {{ return {i}; }}\n"))
+                    // `fN` names would collide with builtin types such as `f64`.
+                    .map(|i| format!("fn fun{i}() -> i64 {{ return {i}; }}\n"))
                     .collect::<String>();
                 let mut first = SyntaxQueries::default().candidate().unwrap();
                 first.parse(path, FileId::ENTRY, &source).unwrap();
@@ -2063,7 +2823,7 @@ mod tests {
                                 UnitId::ENTRY,
                                 body,
                                 path,
-                                &format!("Function:f{i}"),
+                                &format!("Function:fun{i}"),
                                 reads.clone()
                             )
                             .unwrap()
@@ -2090,18 +2850,15 @@ mod tests {
                                 UnitId::ENTRY,
                                 body,
                                 path,
-                                &format!("Function:f{i}"),
+                                &format!("Function:fun{i}"),
                                 vec![],
                             )
                             .unwrap(),
                     );
                 }
                 assert_eq!(demands, if aggregate { count } else { 1 });
-                let expected_visits = if aggregate {
-                    5 * count + 3
-                } else {
-                    6 * count + 2
-                };
+                // Per-owner syntax inputs validate without revisiting Parse.
+                let expected_visits = if aggregate { 5 * count + 1 } else { 6 * count };
                 assert_eq!(next.stats().dependency_edges_visited, expected_visits);
                 println!(
                     "signature_strategy={} bodies={count} edge_visits={expected_visits} demanded_typechecks={demands}",
@@ -2130,20 +2887,32 @@ mod tests {
 pub(crate) struct SyntaxSnapshot {
     table: super::tracked::DiskTable,
     dispatch_classes: Vec<(UnitId, std::collections::BTreeSet<String>)>,
+    #[serde(default)]
+    coordinate_epoch: u64,
 }
 impl SyntaxQueries {
     pub(crate) fn disk_snapshot(&self) -> Result<SyntaxSnapshot> {
         Ok(SyntaxSnapshot {
-            table: self.table.disk_snapshot()?,
+            table: self.table.disk_snapshot_filtered(|node| match node {
+                QueryNode::Parse(path) => self.captured.contains_key(path),
+                QueryNode::TypedBody(body)
+                | QueryNode::NormalizedBody(body)
+                | QueryNode::DirectEffects(body)
+                | QueryNode::DefiniteAssignment(body)
+                | QueryNode::AsyncBorrowReport(body)
+                | QueryNode::ResolvedReferences(body) => self.bodies.contains_key(body),
+                _ => true,
+            })?,
             dispatch_classes: self
                 .dispatch_classes
                 .iter()
                 .map(|(unit, classes)| (*unit, classes.clone()))
                 .collect(),
+            coordinate_epoch: self.coordinate_epoch,
         })
     }
     pub(crate) fn from_disk(snapshot: SyntaxSnapshot) -> Result<Self> {
-        let mut dispatch_classes = HashMap::new();
+        let mut dispatch_classes = InventoryMap::default();
         for (unit, classes) in snapshot.dispatch_classes {
             anyhow::ensure!(
                 dispatch_classes.insert(unit, classes).is_none(),
@@ -2153,6 +2922,7 @@ impl SyntaxQueries {
         Ok(Self {
             table: TrackedQueryTable::from_disk(snapshot.table)?,
             dispatch_classes,
+            coordinate_epoch: snapshot.coordinate_epoch,
             ..Self::default()
         })
     }
@@ -2199,7 +2969,9 @@ impl DiskValue {
         Ok(match node {
             InputNode::Source(_) => DiskKind::Source,
             InputNode::DerivedDependencies(_) => DiskKind::Dependencies,
-            InputNode::SemanticSymbol(..)
+            InputNode::SyntaxSignature(..)
+            | InputNode::BodySyntax(..)
+            | InputNode::SemanticSymbol(..)
             | InputNode::CompilerStamp
             | InputNode::StdlibStamp
             | InputNode::RuntimeAbiRevision => DiskKind::Compact,

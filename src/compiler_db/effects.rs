@@ -59,42 +59,22 @@ pub(crate) struct EffectCapabilities {
     pub(crate) may_io: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct EffectEvidence {
-    pub(crate) summary: EffectSummary<EffectWitness>,
-    // LockEffectWitness's in-solve ordering deliberately compares owners only.
-    // Across revisions, evidence equality must also compare locations/causes.
-    pub(crate) canonical: serde_json::Value,
+    pub(crate) summary: Arc<EffectSummary<EffectWitness>>,
 }
+impl PartialEq for EffectEvidence {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.summary, &other.summary) || same_seed(&self.summary, &other.summary)
+    }
+}
+impl Eq for EffectEvidence {}
+#[cfg(test)]
 impl EffectEvidence {
     fn new(summary: EffectSummary<EffectWitness>) -> Self {
-        let witnesses: Vec<_> = (0..RuntimeEffects::BIT_COUNT)
-            .map(|bit| match summary.witness(RuntimeEffects::from_bit(bit)) {
-                Some(EffectWitness::Lock(witness)) => {
-                    serde_json::json!(["lock", witness.owner, witness.cause])
-                }
-                Some(EffectWitness::Helper {
-                    reason,
-                    owner,
-                    source,
-                }) => serde_json::json!([
-                    "helper",
-                    owner,
-                    source,
-                    match reason {
-                        NonpreemptibleReason::Loop => "loop",
-                        NonpreemptibleReason::Recursion => "recursion",
-                    }
-                ]),
-                Some(EffectWitness::Panic { owner, source }) => {
-                    serde_json::json!(["panic", owner, source])
-                }
-                Some(EffectWitness::External(owner)) => serde_json::json!(["external", owner]),
-                None => serde_json::Value::Null,
-            })
-            .collect();
-        let canonical = serde_json::json!([summary.effects().bits(), witnesses]);
-        Self { summary, canonical }
+        Self {
+            summary: Arc::new(summary),
+        }
     }
 }
 
@@ -102,18 +82,164 @@ impl EffectEvidence {
 pub(crate) struct CapturedEffect {
     pub(crate) capabilities: EffectCapabilities,
     pub(crate) evidence: EffectEvidence,
+    pub(crate) helper: Option<(Span, bool)>,
+    pub(crate) loop_bodies: Vec<BodyId>,
 }
+
+type EffectRootInventory = im::HashMap<BodyId, Arc<Vec<FunctionId>>>;
 
 #[derive(Clone)]
 pub(crate) struct UnitEffects {
     pub(crate) facts: EffectFacts<EffectWitness>,
     pub(crate) helpers: Arc<super::HelperSummary>,
-    loop_bodies: HashSet<BodyId>,
-    callables: HashMap<FunctionId, bool>,
-    may_io: HashSet<FunctionId>,
-    pub(crate) preemption_bodies: HashSet<FunctionId>,
-    pub(crate) preemption_loops: HashSet<FunctionId>,
-    pub(crate) preemption_copies: Vec<(FunctionId, UnitId, FunctionId)>,
+    loop_bodies: im::HashSet<BodyId>,
+    callables: im::HashMap<FunctionId, bool>,
+    may_io: im::HashSet<FunctionId>,
+    pub(crate) preemption_bodies: im::HashSet<FunctionId>,
+    pub(crate) preemption_loops: im::HashSet<FunctionId>,
+    pub(crate) preemption_copies: im::OrdSet<(FunctionId, UnitId, FunctionId)>,
+    plan: EffectPlan,
+}
+
+impl UnitEffects {
+    /// Returns the number of retained parts and spans inspected.
+    fn relocate(&mut self, correspondence: &super::syntax::Correspondence) -> usize {
+        let span = |old: Span| correspondence.span(old).filter(|new| *new != old);
+        let plan = &mut self.plan;
+        let mut visits = 0;
+        let mut parts = Vec::new();
+        for (&id, owned) in &plan.direct {
+            for (&root, part) in owned {
+                visits += 1;
+                let moved = |old: Option<Span>| old.and_then(span);
+                let checked = moved(part.checked_span);
+                let panic = moved(part.panic_span);
+                let lock = moved(part.lock_span);
+                let looped = moved(part.loop_span);
+                let target = moved(part.lock_target.as_ref().map(|t| t.target));
+                if checked.is_none()
+                    && panic.is_none()
+                    && lock.is_none()
+                    && looped.is_none()
+                    && target.is_none()
+                {
+                    continue;
+                }
+                let mut relocated = (**part).clone();
+                relocated.checked_span = checked.or(relocated.checked_span);
+                relocated.panic_span = panic.or(relocated.panic_span);
+                relocated.lock_span = lock.or(relocated.lock_span);
+                relocated.loop_span = looped.or(relocated.loop_span);
+                if let (Some(lock_target), Some(new)) = (&mut relocated.lock_target, target) {
+                    lock_target.target = new;
+                }
+                parts.push((id, root, Arc::new(relocated)));
+            }
+        }
+        for (id, root, part) in parts {
+            plan.direct.entry(id).or_default().insert(root, part);
+        }
+        for spans in [&mut plan.helpers, &mut plan.loops] {
+            visits += spans.len();
+            let moved: Vec<_> = spans
+                .iter()
+                .filter_map(|(&id, &old)| Some((id, span(old)?)))
+                .collect();
+            spans.extend(moved);
+        }
+        visits += self.helpers.len();
+        let moved: Vec<_> = self
+            .helpers
+            .iter()
+            .filter_map(|(&id, helper)| Some((id, span(helper.span)?)))
+            .collect();
+        if !moved.is_empty() {
+            let helpers = Arc::make_mut(&mut self.helpers);
+            for (id, new) in moved {
+                if let Some(helper) = helpers.get_mut(&id) {
+                    helper.span = new;
+                }
+            }
+        }
+        visits
+    }
+}
+
+#[derive(Clone, Default)]
+struct EffectPlan {
+    roots: EffectRootInventory,
+    source_roots: im::HashMap<String, im::HashSet<BodyId>>,
+    helpers: im::HashMap<FunctionId, crate::diagnostics::Span>,
+    loops: im::HashMap<FunctionId, crate::diagnostics::Span>,
+    bodies: im::HashMap<FunctionId, BodyId>,
+    direct: im::HashMap<FunctionId, im::HashMap<BodyId, Arc<DirectBodyEffects>>>,
+    external: im::HashMap<(UnitId, FunctionId), im::HashSet<FunctionId>>,
+    providers: im::HashSet<UnitId>,
+    copy_sources: im::HashMap<UnitId, im::HashSet<FunctionId>>,
+    copies: im::HashMap<FunctionId, CopyContribution>,
+    copy_targets: im::HashMap<(UnitId, FunctionId), im::HashSet<FunctionId>>,
+    inherited: im::HashMap<BodyId, CopyContribution>,
+    inherited_targets: im::HashMap<(UnitId, FunctionId), im::HashSet<FunctionId>>,
+    ambiguous: bool,
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct CopyContribution {
+    body: BodyId,
+    source_body: BodyId,
+    provider: UnitId,
+    source: FunctionId,
+}
+
+/// Source inventory locator supplied while declarations are registered.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub(crate) enum EffectRootLocation {
+    Function(usize),
+    Method { item: usize, member: usize },
+    Constructor { item: usize, member: usize },
+    InterfaceDefault { item: usize, member: usize },
+}
+impl EffectRootLocation {
+    fn span(self, program: &Program) -> Option<crate::diagnostics::Span> {
+        match self {
+            Self::Function(item) => match program.items.get(item)? {
+                Item::Function(f) => Some(f.span),
+                _ => None,
+            },
+            Self::Method { item, member } => match program.items.get(item)? {
+                Item::Class(c) => Some(c.methods.get(member)?.span),
+                _ => None,
+            },
+            Self::Constructor { item, member } => match program.items.get(item)? {
+                Item::Class(c) => Some(c.constructors.get(member)?.span),
+                _ => None,
+            },
+            Self::InterfaceDefault { item, member } => match program.items.get(item)? {
+                Item::Interface(i) => Some(i.methods.get(member)?.span),
+                _ => None,
+            },
+        }
+    }
+    fn block(self, program: &Program) -> Option<&Block> {
+        match self {
+            Self::Function(item) => match program.items.get(item)? {
+                Item::Function(f) => Some(&f.body),
+                _ => None,
+            },
+            Self::Method { item, member } => match program.items.get(item)? {
+                Item::Class(c) => Some(&c.methods.get(member)?.body),
+                _ => None,
+            },
+            Self::Constructor { item, member } => match program.items.get(item)? {
+                Item::Class(c) => Some(&c.constructors.get(member)?.body),
+                _ => None,
+            },
+            Self::InterfaceDefault { item, member } => match program.items.get(item)? {
+                Item::Interface(i) => i.methods.get(member)?.default_body.as_ref(),
+                _ => None,
+            },
+        }
+    }
 }
 
 pub(crate) struct EffectQueries {
@@ -121,6 +247,12 @@ pub(crate) struct EffectQueries {
     /// from persistent runtime summaries or copied across source revisions.
     pub(crate) contract_facts: std::cell::RefCell<HashMap<UnitId, Arc<EffectFacts<EffectWitness>>>>,
     pub(crate) static_initializers: super::static_init::StaticInitQueries,
+    root_locations: std::cell::RefCell<HashMap<(UnitId, BodyId), EffectRootLocation>>,
+    unseen_roots: std::cell::RefCell<HashMap<UnitId, EffectRootInventory>>,
+    active_unit: std::cell::Cell<Option<UnitId>>,
+    affected: std::cell::RefCell<HashMap<UnitId, HashSet<FunctionId>>>,
+    relocated: std::cell::RefCell<HashMap<UnitId, HashSet<FunctionId>>>,
+    full_units: std::cell::RefCell<HashSet<UnitId>>,
     solutions: std::cell::RefCell<
         HashMap<UnitId, Arc<crate::semantic::effects::EffectSolution<EffectWitness>>>,
     >,
@@ -128,6 +260,9 @@ pub(crate) struct EffectQueries {
         std::cell::RefCell<HashMap<UnitId, Arc<crate::semantic::effects::EffectSolution<u8>>>>,
     scanned: std::cell::Cell<usize>,
     recomputed: std::cell::Cell<usize>,
+    compared: std::cell::Cell<usize>,
+    /// Retained direct parts and helper/loop spans inspected by relocation.
+    relocation_visits: std::cell::Cell<usize>,
     body_queries: std::cell::RefCell<std::rc::Weak<super::body::BodyQueries>>,
     pub(crate) analysis: std::cell::RefCell<Option<HashMap<UnitId, crate::ai::CapturedUnit>>>,
     // Frozen unit assembly for backend reads. Direct-body queries and callable
@@ -135,8 +270,6 @@ pub(crate) struct EffectQueries {
     units: QueryTable<UnitId, UnitEffects>,
     completed: std::cell::RefCell<HashMap<UnitId, Arc<UnitEffects>>>,
     previous: std::cell::RefCell<HashMap<UnitId, Arc<UnitEffects>>>,
-    capabilities: QueryTable<(UnitId, FunctionId), EffectCapabilities>,
-    evidence: QueryTable<(UnitId, FunctionId), EffectSummary<EffectWitness>>,
     tracking:
         std::cell::RefCell<std::rc::Weak<std::cell::RefCell<super::incremental::SyntaxQueries>>>,
     imported_reads: std::cell::RefCell<HashMap<UnitId, HashSet<(UnitId, FunctionId)>>>,
@@ -157,17 +290,23 @@ impl Default for EffectQueries {
         Self {
             contract_facts: Default::default(),
             static_initializers: Default::default(),
+            root_locations: Default::default(),
+            unseen_roots: Default::default(),
+            active_unit: Default::default(),
+            affected: Default::default(),
+            relocated: Default::default(),
+            full_units: Default::default(),
             solutions: Default::default(),
             io_solutions: Default::default(),
             scanned: Default::default(),
             recomputed: Default::default(),
+            compared: Default::default(),
+            relocation_visits: Default::default(),
             body_queries: Default::default(),
             analysis: Default::default(),
             units: QueryTable::named("unit_effects"),
             completed: Default::default(),
             previous: Default::default(),
-            capabilities: QueryTable::named("effect_capabilities"),
-            evidence: QueryTable::named("effect_evidence"),
             tracking: Default::default(),
             imported_reads: Default::default(),
             source_reads: Default::default(),
@@ -186,11 +325,256 @@ pub(crate) struct EffectSnapshot {
         crate::semantic::effects::StoredEffectSolution<EffectWitness>,
     )>,
     io: Vec<(UnitId, crate::semantic::effects::StoredEffectSolution<u8>)>,
+    #[serde(default)]
+    units: Vec<(UnitId, StoredEffectUnit)>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredEffectUnit {
+    #[serde(default)]
+    copy_contributions: Vec<(FunctionId, CopyContribution)>,
+    #[serde(default)]
+    inherited_contributions: Vec<(FunctionId, CopyContribution)>,
+    #[serde(default)]
+    providers: Vec<UnitId>,
+    #[serde(default)]
+    ambiguous: bool,
+    helpers: Vec<(FunctionId, crate::diagnostics::Span, NonpreemptibleReason)>,
+    loop_bodies: Vec<BodyId>,
+    callables: Vec<(FunctionId, bool)>,
+    may_io: Vec<FunctionId>,
+    own: Vec<FunctionId>,
+    preemption_loops: Vec<FunctionId>,
+    copies: Vec<(FunctionId, UnitId, FunctionId)>,
+    roots: Vec<(BodyId, Vec<FunctionId>)>,
+    source_roots: Vec<(String, Vec<BodyId>)>,
+    helper_spans: Vec<(FunctionId, crate::diagnostics::Span)>,
+    loops: Vec<(FunctionId, crate::diagnostics::Span)>,
+    bodies: Vec<(FunctionId, BodyId)>,
+    direct: Vec<(FunctionId, Vec<(BodyId, DirectBodyEffects)>)>,
+    external: Vec<((UnitId, FunctionId), Vec<FunctionId>)>,
+}
+impl StoredEffectUnit {
+    fn store(unit: &UnitEffects) -> Self {
+        Self {
+            inherited_contributions: unit
+                .plan
+                .inherited
+                .iter()
+                .filter_map(|(root, copy)| {
+                    unit.plan
+                        .roots
+                        .get(root)
+                        .and_then(|ids| ids.first())
+                        .map(|&id| (id, *copy))
+                })
+                .collect(),
+            copy_contributions: unit
+                .plan
+                .copies
+                .iter()
+                .map(|(&id, &copy)| (id, copy))
+                .collect(),
+            providers: unit.plan.providers.iter().copied().collect(),
+            ambiguous: unit.plan.ambiguous,
+            helpers: unit
+                .helpers
+                .iter()
+                .map(|(&id, h)| (id, h.span, h.reason))
+                .collect(),
+            loop_bodies: unit.loop_bodies.iter().copied().collect(),
+            callables: unit.callables.iter().map(|(&id, &a)| (id, a)).collect(),
+            may_io: unit.may_io.iter().copied().collect(),
+            own: unit.preemption_bodies.iter().copied().collect(),
+            preemption_loops: unit.preemption_loops.iter().copied().collect(),
+            copies: unit.preemption_copies.iter().copied().collect(),
+            source_roots: unit
+                .plan
+                .source_roots
+                .iter()
+                .map(|(key, roots)| (key.clone(), roots.iter().copied().collect()))
+                .collect(),
+            roots: unit
+                .plan
+                .roots
+                .iter()
+                .map(|(&id, f)| (id, (**f).clone()))
+                .collect(),
+            helper_spans: unit.plan.helpers.iter().map(|(&id, &s)| (id, s)).collect(),
+            loops: unit.plan.loops.iter().map(|(&id, &s)| (id, s)).collect(),
+            bodies: unit.plan.bodies.iter().map(|(&id, &b)| (id, b)).collect(),
+            direct: unit
+                .plan
+                .direct
+                .iter()
+                .map(|(&id, parts)| {
+                    (
+                        id,
+                        parts
+                            .iter()
+                            .map(|(&root, p)| (root, (**p).clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            external: unit
+                .plan
+                .external
+                .iter()
+                .map(|(&origin, targets)| (origin, targets.iter().copied().collect()))
+                .collect(),
+        }
+    }
+    fn restore(self, facts: EffectFacts<EffectWitness>) -> anyhow::Result<UnitEffects> {
+        let direct: im::HashMap<_, im::HashMap<_, _>> = self
+            .direct
+            .into_iter()
+            .map(|(id, parts)| {
+                (
+                    id,
+                    parts
+                        .into_iter()
+                        .map(|(root, part)| (root, Arc::new(part)))
+                        .collect(),
+                )
+            })
+            .collect();
+        for (&id, parts) in &direct {
+            anyhow::ensure!(
+                facts.get(&id).is_some() && parts.values().all(|p| p.id == id),
+                "invalid direct effect inventory"
+            );
+        }
+        for (_, ids) in &self.roots {
+            anyhow::ensure!(
+                ids.iter().all(|id| facts.get(id).is_some()),
+                "missing direct effect root"
+            );
+        }
+        let mut copy_sources: im::HashMap<UnitId, im::HashSet<FunctionId>> = Default::default();
+        for &(_, provider, source) in &self.copies {
+            copy_sources.entry(provider).or_default().insert(source);
+        }
+        let contribution_ids: HashSet<_> =
+            self.copy_contributions.iter().map(|(id, _)| *id).collect();
+        anyhow::ensure!(
+            self.copies
+                .iter()
+                .all(|(id, _, _)| contribution_ids.contains(id)),
+            "missing canonical copy contribution index"
+        );
+        let mut copy_targets: im::HashMap<_, im::HashSet<FunctionId>> = Default::default();
+        for &(id, copy) in &self.copy_contributions {
+            copy_targets
+                .entry((copy.provider, copy.source))
+                .or_default()
+                .insert(id);
+        }
+        let mut inherited_targets: im::HashMap<_, im::HashSet<FunctionId>> = Default::default();
+        let mut inherited = im::HashMap::new();
+        for (id, copy) in self.inherited_contributions {
+            inherited_targets
+                .entry((copy.provider, copy.source))
+                .or_default()
+                .insert(id);
+            inherited.insert(copy.body, copy);
+        }
+        Ok(UnitEffects {
+            facts,
+            helpers: Arc::new(
+                self.helpers
+                    .into_iter()
+                    .map(|(id, span, reason)| (id, NonpreemptibleHelper { span, reason }))
+                    .collect(),
+            ),
+            loop_bodies: self.loop_bodies.into_iter().collect(),
+            callables: self.callables.into_iter().collect(),
+            may_io: self.may_io.into_iter().collect(),
+            preemption_bodies: self.own.into_iter().collect(),
+            preemption_loops: self.preemption_loops.into_iter().collect(),
+            preemption_copies: self.copies.into_iter().collect(),
+            plan: EffectPlan {
+                copy_sources,
+                copies: self.copy_contributions.into_iter().collect(),
+                copy_targets,
+                inherited,
+                inherited_targets,
+                providers: self.providers.into_iter().collect(),
+                ambiguous: self.ambiguous,
+                roots: self
+                    .roots
+                    .into_iter()
+                    .map(|(root, ids)| (root, Arc::new(ids)))
+                    .collect(),
+                source_roots: self
+                    .source_roots
+                    .into_iter()
+                    .map(|(key, roots)| (key, roots.into_iter().collect()))
+                    .collect(),
+                helpers: self.helper_spans.into_iter().collect(),
+                loops: self.loops.into_iter().collect(),
+                bodies: self.bodies.into_iter().collect(),
+                direct,
+                external: self
+                    .external
+                    .into_iter()
+                    .map(|(origin, targets)| (origin, targets.into_iter().collect()))
+                    .collect(),
+            },
+        })
+    }
 }
 
 impl EffectQueries {
+    pub(crate) fn register_root(&self, unit: UnitId, body: BodyId, location: EffectRootLocation) {
+        self.unseen_roots
+            .borrow_mut()
+            .entry(unit)
+            .or_insert_with(|| {
+                self.previous
+                    .borrow()
+                    .get(&unit)
+                    .map(|state| state.plan.roots.clone())
+                    .unwrap_or_default()
+            })
+            .remove(&body);
+        self.root_locations
+            .borrow_mut()
+            .insert((unit, body), location);
+    }
+    pub(crate) fn removed_roots(&self, unit: UnitId) -> im::HashSet<BodyId> {
+        let remaining = self
+            .unseen_roots
+            .borrow()
+            .get(&unit)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.previous
+                    .borrow()
+                    .get(&unit)
+                    .map(|state| state.plan.roots.clone())
+                    .unwrap_or_default()
+            });
+        remaining.keys().copied().collect()
+    }
+    pub(crate) fn affected_functions(&self, unit: UnitId) -> HashSet<FunctionId> {
+        self.affected
+            .borrow()
+            .get(&unit)
+            .cloned()
+            .unwrap_or_default()
+    }
     pub(crate) fn disk_snapshot(&self) -> EffectSnapshot {
         EffectSnapshot {
+            units: self
+                .completed
+                .borrow()
+                .iter()
+                .filter(|(unit, _)| {
+                    self.solutions.borrow().contains_key(unit)
+                        && self.io_solutions.borrow().contains_key(unit)
+                })
+                .map(|(&unit, state)| (unit, StoredEffectUnit::store(state)))
+                .collect(),
             solutions: self
                 .solutions
                 .borrow()
@@ -206,6 +590,9 @@ impl EffectQueries {
         }
     }
     pub(crate) fn reuse_solutions(&self, previous: &Self) {
+        self.previous
+            .borrow_mut()
+            .clone_from(&previous.previous.borrow());
         self.solutions
             .borrow_mut()
             .clone_from(&previous.solutions.borrow());
@@ -226,9 +613,31 @@ impl EffectQueries {
     }
 
     pub(crate) fn relocate_solutions(&self, correspondence: &super::syntax::Correspondence) {
-        if !correspondence.spans.iter().any(|(old, new)| old != new) {
+        let files = correspondence.moved_files();
+        if files.is_empty() {
             return;
         }
+        // Retained spans belong to their unit's file, or to a provider file for
+        // copied/inherited bodies. Units outside both keep every coordinate.
+        let moved: HashSet<UnitId> = files
+            .iter()
+            .map(|file| crate::module::ModuleId(file.0))
+            .collect();
+        let previous = self.previous.borrow();
+        let affected: HashSet<UnitId> = previous
+            .iter()
+            .filter(|(unit, state)| {
+                moved.contains(unit)
+                    || state
+                        .plan
+                        .providers
+                        .iter()
+                        .any(|provider| moved.contains(provider))
+            })
+            .map(|(&unit, _)| unit)
+            .chain(moved.iter().copied())
+            .collect();
+        drop(previous);
         let locations: HashMap<_, _> = correspondence
             .spans
             .iter()
@@ -239,25 +648,52 @@ impl EffectQueries {
                 )
             })
             .collect();
-        for solution in self.solutions.borrow_mut().values_mut() {
-            Arc::make_mut(solution).map_witnesses(|witness| match witness {
-                EffectWitness::Lock(lock) => {
-                    if let Some(span) = correspondence.spans.get(&lock.cause.span) {
-                        lock.cause.span = *span;
+        for (&unit, solution) in self
+            .solutions
+            .borrow_mut()
+            .iter_mut()
+            .filter(|(unit, _)| affected.contains(unit))
+        {
+            let relocated = Arc::make_mut(solution).map_witnesses(|witness| {
+                let mut changed = false;
+                match witness {
+                    EffectWitness::Lock(lock) => {
+                        if let Some(span) = correspondence.spans.get(&lock.cause.span) {
+                            changed |= lock.cause.span != *span;
+                            lock.cause.span = *span;
+                        }
+                        if let Some(target) = &mut lock.cause.lock
+                            && let Some(span) = correspondence.spans.get(&target.target)
+                        {
+                            changed |= target.target != *span;
+                            target.target = *span;
+                        }
                     }
-                    if let Some(target) = &mut lock.cause.lock
-                        && let Some(span) = correspondence.spans.get(&target.target)
-                    {
-                        target.target = *span;
+                    EffectWitness::Helper { source, .. } | EffectWitness::Panic { source, .. } => {
+                        if let Some(location) = locations.get(source) {
+                            changed |= *source != *location;
+                            *source = *location;
+                        }
                     }
+                    EffectWitness::External(_) => {}
                 }
-                EffectWitness::Helper { source, .. } | EffectWitness::Panic { source, .. } => {
-                    if let Some(location) = locations.get(source) {
-                        *source = *location;
-                    }
-                }
-                EffectWitness::External(_) => {}
+                changed
             });
+            self.relocated
+                .borrow_mut()
+                .entry(unit)
+                .or_default()
+                .extend(relocated);
+        }
+        // Retained direct parts reseed equations after later edits; keep their
+        // coordinates current so a reseed never sees a span several edits old.
+        let mut previous = self.previous.borrow_mut();
+        for unit in &affected {
+            if let Some(state) = previous.get_mut(unit) {
+                let visits = Arc::make_mut(state).relocate(correspondence);
+                self.relocation_visits
+                    .set(self.relocation_visits.get() + visits);
+            }
         }
     }
 
@@ -278,13 +714,36 @@ impl EffectQueries {
                 "duplicate IO effect unit"
             );
         }
+        let mut units = HashMap::new();
+        for (unit, stored) in snapshot.units {
+            let facts = solutions
+                .get(&unit)
+                .ok_or_else(|| anyhow::anyhow!("missing unit effect solution"))?
+                .facts
+                .clone();
+            anyhow::ensure!(io.contains_key(&unit), "missing unit IO solution");
+            anyhow::ensure!(
+                units
+                    .insert(unit, Arc::new(stored.restore(facts)?))
+                    .is_none(),
+                "duplicate retained effect unit"
+            );
+        }
+        *self.previous.borrow_mut() = units;
         *self.solutions.borrow_mut() = solutions;
         *self.io_solutions.borrow_mut() = io;
         Ok(())
     }
 
+    pub(crate) fn equation_comparisons(&self) -> usize {
+        self.compared.get()
+    }
     pub(crate) fn work(&self) -> (usize, usize) {
         (self.scanned.get(), self.recomputed.get())
+    }
+    #[cfg(test)]
+    pub(crate) fn relocation_visits(&self) -> usize {
+        self.relocation_visits.get()
     }
 
     pub(crate) fn new(
@@ -355,95 +814,121 @@ impl EffectQueries {
     ) -> anyhow::Result<Arc<UnitEffects>> {
         let completed = self.units.query(unit, || {
             let tracking = self.tracking.borrow().upgrade();
-            let roots = self.roots.borrow().get(&unit).cloned().unwrap_or_default();
+            let roots = Vec::new();
             let green = match &tracking {
                 Some(tracking) => tracking
                     .borrow_mut()
                     .validate_effects(unit, roots.clone())?,
                 None => false,
             };
-            let previous = self.previous.borrow_mut().remove(&unit).filter(|_| green);
+            let changed_bodies = tracking
+                .as_ref()
+                .is_some_and(|tracking| !tracking.borrow().changed_bodies_in(unit).is_empty());
+            let previous = self
+                .previous
+                .borrow()
+                .get(&unit)
+                .cloned()
+                .filter(|_| green && !changed_bodies);
             let reused = previous.is_some();
-            let result = match previous {
+            let mut result = match previous {
                 Some(previous) => (*previous).clone(),
-                None => compute(),
+                None => {
+                    self.active_unit.set(Some(unit));
+                    let result = compute();
+                    self.active_unit.set(None);
+                    let mut affected = self
+                        .solutions
+                        .borrow()
+                        .get(&unit)
+                        .map(|s| s.affected.clone())
+                        .unwrap_or_default();
+                    if let Some(io) = self.io_solutions.borrow().get(&unit) {
+                        affected.extend(io.affected.iter().copied());
+                    }
+                    self.affected.borrow_mut().insert(unit, affected);
+                    result
+                }
             };
-            if let Some(tracking) = tracking.filter(|_| !reused) {
-                let inventory = result
-                    .facts
-                    .iter()
-                    .map(|(&id, summary)| {
-                        (
-                            id,
+            let relocated = self
+                .relocated
+                .borrow_mut()
+                .remove(&unit)
+                .unwrap_or_default();
+            if let Some(solution) = self.solutions.borrow().get(&unit) {
+                result.facts = solution.facts.clone();
+            }
+            if let Some(tracking) = tracking.filter(|_| !reused || !relocated.is_empty()) {
+                let full = self.full_units.borrow_mut().remove(&unit)
+                    || !self.solutions.borrow().contains_key(&unit)
+                    || !tracking.borrow().has_effect_inventory(unit);
+                let mut owners: HashSet<_> = if full {
+                    result
+                        .facts
+                        .iter()
+                        .map(|(&id, _)| id)
+                        .chain(tracking.borrow().effect_inventory_ids(unit))
+                        .collect()
+                } else {
+                    self.affected
+                        .borrow()
+                        .get(&unit)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                owners.extend(relocated);
+                let inventory = owners
+                    .into_iter()
+                    .map(|id| {
+                        let effect = result.facts.shared(&id).map(|summary| {
+                            let mut loop_bodies: Vec<_> = result
+                                .plan
+                                .direct
+                                .get(&id)
+                                .into_iter()
+                                .flat_map(|parts| parts.values())
+                                .filter(|part| part.loop_span.is_some())
+                                .map(|part| part.body)
+                                .collect();
+                            if let Some(copy) = result.plan.copies.get(&id)
+                                && result.loop_bodies.contains(&copy.body)
+                            {
+                                loop_bodies.push(copy.body);
+                            }
+                            loop_bodies.sort();
+                            loop_bodies.dedup();
                             CapturedEffect {
                                 capabilities: EffectCapabilities {
                                     runtime: summary.effects(),
                                     may_io: result.may_io.contains(&id),
                                 },
-                                evidence: EffectEvidence::new(summary.clone()),
-                            },
-                        )
+                                evidence: EffectEvidence {
+                                    summary: Arc::clone(summary),
+                                },
+                                helper: result.helpers.get(&id).map(|helper| {
+                                    (
+                                        helper.span,
+                                        matches!(helper.reason, NonpreemptibleReason::Loop),
+                                    )
+                                }),
+                                loop_bodies,
+                            }
+                        });
+                        (id, effect)
                     })
                     .collect();
-                let imported = self
-                    .imported_reads
-                    .borrow_mut()
-                    .remove(&unit)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
-                let source_units = self
-                    .source_reads
-                    .borrow_mut()
-                    .remove(&unit)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
-                let mut loop_bodies: Vec<_> = result.loop_bodies.iter().copied().collect();
-                loop_bodies.sort();
-                let mut helpers: Vec<_> = result
-                    .helpers
-                    .iter()
-                    .map(|(id, helper)| {
-                        (
-                            *id,
-                            serde_json::json!([
-                                id,
-                                helper.span,
-                                match helper.reason {
-                                    NonpreemptibleReason::Loop => "loop",
-                                    NonpreemptibleReason::Recursion => "recursion",
-                                }
-                            ]),
-                        )
-                    })
-                    .collect();
-                helpers.sort_by_key(|(id, _)| *id);
-                let metadata = serde_json::json!([
-                    loop_bodies,
-                    helpers
-                        .into_iter()
-                        .map(|(_, value)| value)
-                        .collect::<Vec<_>>()
-                ]);
-                tracking.borrow_mut().publish_effects(
+                self.imported_reads.borrow_mut().remove(&unit);
+                if let Some(reads) = self.source_reads.borrow_mut().remove(&unit) {
+                    result.plan.providers.extend(reads);
+                }
+                let source_units = result.plan.providers.iter().copied().collect();
+                tracking.borrow_mut().publish_effect_delta(
                     unit,
                     roots,
-                    imported,
+                    Vec::new(),
                     inventory,
                     source_units,
-                    metadata,
                 )?;
-            }
-            for (&id, summary) in result.facts.iter() {
-                self.capabilities.seed(
-                    (unit, id),
-                    EffectCapabilities {
-                        runtime: summary.effects(),
-                        may_io: result.may_io.contains(&id),
-                    },
-                );
-                self.evidence.seed((unit, id), summary.clone());
             }
             Ok(result)
         })?;
@@ -476,7 +961,12 @@ impl EffectQueries {
         unit: UnitId,
         id: FunctionId,
     ) -> Option<Arc<EffectCapabilities>> {
-        self.capabilities.ready(&(unit, id))
+        let completed = self.completed.borrow();
+        let result = completed.get(&unit)?;
+        Some(Arc::new(EffectCapabilities {
+            runtime: result.facts.get(&id)?.effects(),
+            may_io: result.may_io.contains(&id),
+        }))
     }
 
     /// Evidence includes locations; capability consumers never read this table.
@@ -485,13 +975,19 @@ impl EffectQueries {
         unit: UnitId,
         id: FunctionId,
     ) -> Option<Arc<EffectSummary<EffectWitness>>> {
-        let frozen = self.evidence.ready(&(unit, id))?;
+        let frozen = self
+            .completed
+            .borrow()
+            .get(&unit)?
+            .facts
+            .shared(&id)?
+            .clone();
         if let Some(tracking) = self.tracking.borrow().upgrade() {
             let evidence = tracking
                 .borrow()
                 .effect_evidence(unit, id)
                 .expect("completed effect evidence query");
-            return Some(Arc::new(evidence.summary));
+            return Some(evidence.summary);
         }
         Some(frozen)
     }
@@ -732,8 +1228,22 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
     external: impl Fn(&FunctionId) -> RuntimeEffects,
 ) -> UnitEffects {
     crate::query_stats::add(crate::query_stats::Counter::NonpreemptibleHelpers, 1);
+    if let Some((index, queries)) = origins
+        && let Some(unit) = queries.active_unit.get()
+        && let Some(result) = solve_unit_delta(
+            program, graph, types, index, queries, unit, callables, direct, &external,
+        )
+    {
+        return result;
+    }
+    if let Some((_, queries)) = origins
+        && let Some(unit) = queries.active_unit.get()
+    {
+        queries.full_units.borrow_mut().insert(unit);
+    }
     let index = origins.map(|(index, _)| index);
     let overflow_checks = origins.is_none_or(|(_, queries)| queries.overflow_checks);
+    let mut plan = EffectPlan::default();
     let mut pending = Vec::new();
     let mut helpers = HashMap::new();
     let mut foreign = Vec::new();
@@ -794,6 +1304,11 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
             }
         }
     }
+    let mut free_names = HashSet::new();
+    plan.ambiguous = program.items.iter().any(|item| match item {
+        Item::Function(function) => !free_names.insert(function.name.as_str()),
+        _ => false,
+    });
     let canonical_bodies: HashSet<_> = pending.iter().map(|(_, body, _)| *body).collect();
     let consumer = index.and_then(|index| {
         pending
@@ -904,7 +1419,23 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
                 }
                 if canonical_bodies.contains(&source) || reused.contains(&body_id) {
                     if let Some((unit, _)) = index.owner(source) {
-                        preemption_copies.push((id, unit, source_callable(index, source)));
+                        let source_id = source_callable(index, source);
+                        preemption_copies.push((id, unit, source_id));
+                        plan.copies.insert(
+                            id,
+                            CopyContribution {
+                                body: body_id,
+                                source_body: source,
+                                provider: unit,
+                                source: source_id,
+                            },
+                        );
+                        plan.copy_targets
+                            .entry((unit, source_id))
+                            .or_default()
+                            .insert(id);
+                        plan.bodies.insert(id, body_id);
+                        plan.roots.insert(body_id, Arc::new(vec![id]));
                     }
                     // Defaults are checked only under the canonical interface
                     // identity, in the declaring unit. Do not repeat their
@@ -918,6 +1449,22 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
                     }
                     copies.push((id, source));
                     continue;
+                }
+                if let Some((provider, _)) = index.owner(source) {
+                    let source_id = source_callable(index, source);
+                    plan.inherited.insert(
+                        body_id,
+                        CopyContribution {
+                            body: body_id,
+                            source_body: source,
+                            provider,
+                            source: source_id,
+                        },
+                    );
+                    plan.inherited_targets
+                        .entry((provider, source_id))
+                        .or_default()
+                        .insert(id);
                 }
                 if known.is_none() {
                     // Generic instantiations have no canonical checked proof.
@@ -945,7 +1492,7 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
         };
         let queries = origins.and_then(|(_, effects)| effects.body_queries.borrow().upgrade());
         let direct_bodies = match queries {
-            Some(queries) => queries
+            Some(queries) if !plan.ambiguous => queries
                 .derived(
                     body_id,
                     super::tracked::QueryNode::DirectEffects(body_id),
@@ -953,9 +1500,30 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
                     scan,
                 )
                 .expect("direct effect dependencies have completed"),
-            None => scan().expect("direct effect scan is infallible"),
+            _ => scan().expect("direct effect scan is infallible"),
         };
+        plan.roots.insert(
+            body_id,
+            Arc::new(
+                direct_bodies
+                    .iter()
+                    .map(|d| d.id)
+                    .chain(graph_lambdas(body_id, body, index))
+                    .collect(),
+            ),
+        );
+        if let Some((_, queries)) = origins
+            && let Some(tracking) = queries.tracking.borrow().upgrade()
+            && let Some(owner) = tracking.borrow().body_source_owner(body_id)
+        {
+            plan.source_roots.entry(owner).or_default().insert(body_id);
+        }
         for direct in direct_bodies {
+            plan.direct
+                .entry(direct.id)
+                .or_default()
+                .insert(body_id, Arc::new(direct.clone()));
+            plan.bodies.insert(direct.id, direct.body);
             if direct.preemption_loop {
                 preemption_loops.insert(direct.id);
             }
@@ -1147,6 +1715,12 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
                 io_callers.entry(*target).or_default().push(caller);
             }
             if !own.contains(target) && classified.insert(*target) {
+                if let (Some((_, queries)), Some(unit)) = (origins, consumer)
+                    && let Some(origin) = queries.external_target(unit, target, &imports)
+                {
+                    plan.external.entry(origin).or_default().insert(*target);
+                    plan.providers.insert(origin.0);
+                }
                 // Every unproved external call is conservatively IO-capable.
                 // Known runtime/stat/math intrinsics are the only pure leaves;
                 // filesystem, networking, printing and foreign calls fail closed.
@@ -1207,6 +1781,9 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
         let solution =
             io_problem.solve_incremental(&io_graph, previous.get(&unit).map(Arc::as_ref));
         queries
+            .compared
+            .set(queries.compared.get() + solution.compared);
+        queries
             .recomputed
             .set(queries.recomputed.get() + solution.recomputed);
         may_io = solution
@@ -1238,14 +1815,36 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
                 same_seed,
             );
             queries
+                .compared
+                .set(queries.compared.get() + solution.compared);
+            queries
                 .recomputed
                 .set(queries.recomputed.get() + solution.recomputed);
             let facts = solution.facts.clone();
             solutions.insert(unit, Arc::new(solution));
             facts
         }
-        _ => problem.solve(&lock_graph),
+        _ => {
+            // A unit without bodies (for example only value constructors) has
+            // no retained fixpoint; drop an earlier one so it cannot override
+            // these facts when the unit completes.
+            if let Some((_, queries)) = origins
+                && let Some(unit) = queries.active_unit.get()
+            {
+                queries.solutions.borrow_mut().remove(&unit);
+                queries.io_solutions.borrow_mut().remove(&unit);
+            }
+            problem.solve(&lock_graph)
+        }
     };
+    for &(_, provider, source) in &preemption_copies {
+        plan.copy_sources
+            .entry(provider)
+            .or_default()
+            .insert(source);
+    }
+    plan.helpers = helpers.iter().map(|(&id, &span)| (id, span)).collect();
+    plan.loops = loop_spans.into_iter().collect();
     let helpers = helpers
         .into_iter()
         .filter_map(|(id, span)| match facts.get(&id)?.witness(NO_PREEMPT)? {
@@ -1262,16 +1861,880 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
     UnitEffects {
         facts,
         helpers: Arc::new(helpers),
-        loop_bodies,
-        callables: callables.clone(),
-        may_io,
-        preemption_bodies: own,
-        preemption_loops,
-        preemption_copies,
+        loop_bodies: loop_bodies.into_iter().collect(),
+        callables: callables.iter().map(|(&id, &a)| (id, a)).collect(),
+        may_io: may_io.into_iter().collect(),
+        preemption_bodies: own.into_iter().collect(),
+        preemption_loops: preemption_loops.into_iter().collect(),
+        preemption_copies: preemption_copies.into_iter().collect(),
+        plan,
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+// A retained unit consumes changed typed owners directly. Structural declaration
+// invalidation still goes through the full producer so synthetic declarations and
+// copied defaults are never inferred from a stale source inventory.
+#[allow(clippy::too_many_arguments)]
+fn solve_unit_delta<N: std::fmt::Display>(
+    program: &Program,
+    graph: &CallGraph,
+    types: &HashMap<ExprId, Type<N>>,
+    index: &super::ids::BodyIndex,
+    queries: &EffectQueries,
+    unit: UnitId,
+    callables: &HashMap<FunctionId, bool>,
+    direct: &HashMap<FunctionId, DirectLockEffects>,
+    external: &impl Fn(&FunctionId) -> RuntimeEffects,
+) -> Option<UnitEffects> {
+    use crate::semantic::effects::EffectEquation;
+    let tracking = queries.tracking.borrow().upgrade()?;
+    let source_changes = tracking.borrow().effect_source_changes(unit)?;
+    // Nominal declaration/dispatch changes rebuild the unit producer inventory.
+    // Individual free callable additions, removals and signatures have complete
+    // owner deltas and do not take that path.
+    if source_changes
+        .iter()
+        .any(|(owner, _)| !owner.starts_with("Function:"))
+    {
+        return None;
+    }
+    let previous = queries.previous.borrow().get(&unit)?.clone();
+    let mut inherited_changed = HashSet::new();
+    for &provider in &previous.plan.providers {
+        if let Some(sources) = queries.affected.borrow().get(&provider) {
+            for source in sources {
+                if let Some(targets) = previous.plan.inherited_targets.get(&(provider, *source)) {
+                    inherited_changed.extend(targets.iter().copied());
+                }
+            }
+        }
+    }
+    let mut changed_copies = HashSet::new();
+    for provider in previous.plan.copy_sources.keys() {
+        if let Some(sources) = queries.affected.borrow().get(provider) {
+            for source in sources {
+                if let Some(targets) = previous.plan.copy_targets.get(&(*provider, *source)) {
+                    changed_copies.extend(targets.iter().copied());
+                }
+            }
+        }
+    }
+    let mut removed_roots: HashSet<_> = source_changes
+        .iter()
+        .filter(|(_, exists)| !exists)
+        .flat_map(|(owner, _)| {
+            previous
+                .plan
+                .source_roots
+                .get(owner)
+                .into_iter()
+                .flatten()
+                .copied()
+        })
+        .collect();
+    removed_roots.extend(queries.removed_roots(unit));
+    let locations = queries.root_locations.borrow();
+    let mut created_copies = Vec::new();
+    let mut roots = HashSet::new();
+    for mut body in tracking.borrow().changed_bodies_in(unit) {
+        let Some((owner_unit, mut owner)) = index.owner(body) else {
+            continue;
+        };
+        if owner_unit != unit {
+            continue;
+        }
+        while let super::ids::BodyOwner::Lambda { parent, .. } = owner {
+            body = parent;
+            owner = index.owner(body)?.1;
+        }
+        let source = index.source_body(body);
+        if source != body
+            && previous
+                .plan
+                .copies
+                .contains_key(&source_callable(index, body))
+        {
+            changed_copies.insert(source_callable(index, body));
+            continue;
+        }
+        let reused_default = match locations.get(&(unit, body)) {
+            Some(EffectRootLocation::Method { item, member }) => match program.items.get(*item) {
+                Some(Item::Class(class)) => class
+                    .methods
+                    .get(*member)
+                    .is_some_and(|method| method.is_default_injected),
+                _ => false,
+            },
+            _ => false,
+        };
+        if source != body && (locations.contains_key(&(unit, source)) || reused_default) {
+            let (provider, _) = index.owner(source)?;
+            let id = source_callable(index, body);
+            created_copies.push((
+                id,
+                CopyContribution {
+                    body,
+                    source_body: source,
+                    provider,
+                    source: source_callable(index, source),
+                },
+            ));
+            changed_copies.insert(id);
+            continue;
+        }
+        roots.insert(body);
+    }
+    // A signature-only owner edit (for example toggling `async`) keeps the body
+    // text but changes its callable kind and helper membership; rescan it.
+    for (owner, _) in source_changes.iter().filter(|(_, exists)| *exists) {
+        roots.extend(
+            previous
+                .plan
+                .source_roots
+                .get(owner)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|body| {
+                    !removed_roots.contains(body)
+                        && locations.contains_key(&(unit, *body))
+                        && index.owner(*body).is_some_and(|(owner, _)| owner == unit)
+                }),
+        );
+    }
+    // All root locations come from the existing declaration inventory pass.
+    for &root in &roots {
+        locations.get(&(unit, root))?.block(program)?;
+    }
+    if previous.plan.ambiguous {
+        return None;
+    }
+    let mut result = (*previous).clone();
+    for (id, copy) in created_copies {
+        result.plan.copies.insert(id, copy);
+        result
+            .plan
+            .copy_targets
+            .entry((copy.provider, copy.source))
+            .or_default()
+            .insert(id);
+        result
+            .plan
+            .copy_sources
+            .entry(copy.provider)
+            .or_default()
+            .insert(copy.source);
+        result.plan.bodies.insert(id, copy.body);
+        result.plan.roots.insert(copy.body, Arc::new(vec![id]));
+        result.preemption_bodies.insert(id);
+        result
+            .preemption_copies
+            .insert((id, copy.provider, copy.source));
+        if let Some(&is_async) = callables.get(&id) {
+            result.callables.insert(id, is_async);
+            if !is_async
+                && let Some(span) = locations
+                    .get(&(unit, copy.body))
+                    .and_then(|location| location.span(program))
+            {
+                result.plan.helpers.insert(id, span);
+            }
+        }
+    }
+
+    let mut solution = (**queries.solutions.borrow().get(&unit)?).clone();
+    let mut io_solution = (**queries.io_solutions.borrow().get(&unit)?).clone();
+    let mut changed = HashSet::new();
+    for root in roots.into_iter().chain(removed_roots.iter().copied()) {
+        for &id in result
+            .plan
+            .roots
+            .get(&root)
+            .map(Arc::as_ref)
+            .into_iter()
+            .flatten()
+        {
+            changed.insert(id);
+            if let Some(parts) = result.plan.direct.get_mut(&id) {
+                if let Some(old) = parts.remove(&root) {
+                    result.loop_bodies.remove(&old.body);
+                }
+                if parts.is_empty() {
+                    result.plan.direct.remove(&id);
+                }
+            }
+        }
+        if removed_roots.contains(&root) {
+            if let Some(copy) = result.plan.inherited.remove(&root)
+                && let Some(targets) = result
+                    .plan
+                    .inherited_targets
+                    .get_mut(&(copy.provider, copy.source))
+            {
+                if let Some(ids) = result.plan.roots.get(&root) {
+                    for id in ids.iter() {
+                        targets.remove(id);
+                    }
+                }
+                if targets.is_empty() {
+                    result
+                        .plan
+                        .inherited_targets
+                        .remove(&(copy.provider, copy.source));
+                }
+            }
+
+            if let Some(ids) = result.plan.roots.remove(&root) {
+                for &id in ids.iter() {
+                    if let Some(copy) = result.plan.copies.remove(&id) {
+                        result
+                            .preemption_copies
+                            .remove(&(id, copy.provider, copy.source));
+                        if let Some(targets) = result
+                            .plan
+                            .copy_targets
+                            .get_mut(&(copy.provider, copy.source))
+                        {
+                            targets.remove(&id);
+                            if targets.is_empty() {
+                                result
+                                    .plan
+                                    .copy_targets
+                                    .remove(&(copy.provider, copy.source));
+                                if let Some(sources) =
+                                    result.plan.copy_sources.get_mut(&copy.provider)
+                                {
+                                    sources.remove(&copy.source);
+                                }
+                            }
+                        }
+                    }
+                    result.plan.helpers.remove(&id);
+                    result.callables.remove(&id);
+                }
+            }
+            continue;
+        }
+        let location = locations[&(unit, root)];
+        let body = location.block(program)?;
+        let id = source_callable(index, root);
+        let source = index.source_body(root);
+        if source != root {
+            let (provider, _) = index.owner(source)?;
+            let source_id = source_callable(index, source);
+            result.plan.inherited.insert(
+                root,
+                CopyContribution {
+                    body: root,
+                    source_body: source,
+                    provider,
+                    source: source_id,
+                },
+            );
+            result
+                .plan
+                .inherited_targets
+                .entry((provider, source_id))
+                .or_default()
+                .insert(id);
+        }
+
+        if let Some(&is_async) = callables.get(&id) {
+            result.callables.insert(id, is_async);
+            if is_async {
+                result.plan.helpers.remove(&id);
+            } else if matches!(
+                location,
+                EffectRootLocation::Function(_) | EffectRootLocation::Method { .. }
+            ) {
+                result.plan.helpers.insert(id, location.span(program)?);
+            }
+        }
+        if let Some(owner) = tracking.borrow().body_source_owner(root) {
+            result
+                .plan
+                .source_roots
+                .entry(owner)
+                .or_default()
+                .insert(root);
+        }
+        let scan = || {
+            queries.scanned.set(queries.scanned.get() + 1);
+            Ok(scan_direct_effects(
+                id,
+                root,
+                body,
+                types,
+                Some(index),
+                queries.overflow_checks,
+            ))
+        };
+        let scan = match queries.body_queries.borrow().upgrade() {
+            Some(bodies) => bodies
+                .derived(
+                    root,
+                    super::tracked::QueryNode::DirectEffects(root),
+                    None,
+                    scan,
+                )
+                .expect("changed direct effect dependencies have completed"),
+            None => scan().expect("direct effect scan is infallible"),
+        };
+        result.plan.roots.insert(
+            root,
+            Arc::new(
+                scan.iter()
+                    .map(|d| d.id)
+                    .chain(graph_lambdas(root, body, Some(index)))
+                    .collect(),
+            ),
+        );
+        changed.extend(result.plan.roots[&root].iter().copied());
+        if result.plan.helpers.contains_key(&id) {
+            result.plan.helpers.insert(id, location.span(program)?);
+        }
+        for part in scan {
+            changed.insert(part.id);
+            result.plan.bodies.insert(part.id, part.body);
+            result
+                .plan
+                .direct
+                .entry(part.id)
+                .or_default()
+                .insert(root, Arc::new(part));
+        }
+    }
+    for (owner, exists) in source_changes {
+        if !exists {
+            result.plan.source_roots.remove(&owner);
+        }
+    }
+    let imports: HashMap<_, _> = program
+        .imports
+        .iter()
+        .map(|import| {
+            (
+                import.alias.clone().unwrap_or_else(|| {
+                    import
+                        .path
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(&import.path)
+                        .to_owned()
+                }),
+                import.path.clone(),
+            )
+        })
+        .collect();
+    let old_external_targets: HashSet<_> = changed
+        .iter()
+        .filter_map(|&id| solution.equation(id))
+        .flat_map(|equation| equation.edges.iter().map(|(target, _)| *target))
+        .filter(|target| !previous.preemption_bodies.contains(target))
+        .collect();
+    changed.extend(inherited_changed);
+    let mut copy_pending: Vec<_> = changed.iter().copied().collect();
+    while let Some(source) = copy_pending.pop() {
+        if let Some(targets) = result.plan.copy_targets.get(&(unit, source)) {
+            for &id in targets {
+                if changed_copies.insert(id) {
+                    copy_pending.push(id);
+                }
+            }
+        }
+    }
+    let mut external_changed = HashSet::new();
+
+    let affected_units = queries.affected.borrow();
+    for &provider in &result.plan.providers {
+        let Some(affected) = affected_units.get(&provider) else {
+            continue;
+        };
+        for &function in affected {
+            if let Some(targets) = result.plan.external.get(&(provider, function)) {
+                external_changed.extend(targets.iter().copied());
+            }
+        }
+    }
+    drop(affected_units);
+    let mut seeds = HashMap::new();
+    let mut io_seeds = HashSet::new();
+    let mut removed = HashSet::new();
+    for &id in &changed {
+        if result.plan.copies.contains_key(&id) {
+            changed_copies.insert(id);
+            continue;
+        }
+        result.plan.loops.remove(&id);
+        result.preemption_loops.remove(&id);
+        let Some(parts) = result.plan.direct.get(&id) else {
+            result.preemption_bodies.remove(&id);
+            // A block lambda can become an expression lambda while retaining
+            // its contextual identity. Its graph vertex still exists even
+            // though it no longer has a scanned block contribution.
+            if let Some(sites) = graph.get(&id) {
+                let mut seed = EffectSummary::default();
+                if sites.has_unknown {
+                    seed.add_effect(PANIC, None);
+                    io_seeds.insert(id);
+                }
+                for &target in &sites.targets {
+                    if !result.preemption_bodies.contains(&target) {
+                        external_changed.insert(target);
+                    }
+                }
+                seeds.insert(id, seed);
+            } else {
+                removed.insert(id);
+            }
+            continue;
+        };
+        result.preemption_bodies.insert(id);
+        let mut seed = EffectSummary::default();
+        // The cold producer pops declaration roots in reverse source order.
+        // Preserve that deterministic witness preference for overloaded owners.
+        let mut ordered_parts: Vec<_> = parts.iter().collect();
+        ordered_parts.sort_by_key(|(root, _)| {
+            std::cmp::Reverse(match locations.get(&(unit, **root)) {
+                Some(EffectRootLocation::Function(item)) => (*item, 0),
+                Some(
+                    EffectRootLocation::Method { item, member }
+                    | EffectRootLocation::Constructor { item, member }
+                    | EffectRootLocation::InterfaceDefault { item, member },
+                ) => (*item, *member),
+                None => (0, 0),
+            })
+        });
+        for (&root, part) in ordered_parts {
+            if part.body == root
+                && let Some(copy) = result.plan.inherited.get(&root)
+            {
+                let known =
+                    queries.source_effects(unit, copy.provider, copy.source_body, copy.source);
+                if let Some((summary, has_loop, may_io)) = known {
+                    seed.add_effect(summary.effects().intersection(ANY_PANIC), None);
+                    seed.add_effect(
+                        summary.effects().intersection(LOCK_EFFECT_WAIT),
+                        summary.witness(LOCK_EFFECT_WAIT),
+                    );
+                    if may_io {
+                        io_seeds.insert(id);
+                    }
+                    if has_loop {
+                        result.loop_bodies.insert(root);
+                        if let Some(&span) = result.plan.helpers.get(&id) {
+                            result.plan.loops.insert(id, span);
+                        }
+                    } else if part.loop_span.is_none() {
+                        result.loop_bodies.remove(&root);
+                    }
+                } else {
+                    seed.add_effect(PANIC, None);
+                }
+            }
+            if part.preemption_loop {
+                result.preemption_loops.insert(id);
+            }
+            if let Some(span) = part.loop_span {
+                result.loop_bodies.insert(part.body);
+                result.plan.loops.insert(id, span);
+            }
+            if part.may_io {
+                io_seeds.insert(id);
+            }
+            if let Some(span) = part.lock_span {
+                seed.add_effect(
+                    RuntimeEffects::MAY_SUSPEND,
+                    Some(&EffectWitness::Lock(LockEffectWitness {
+                        owner: id,
+                        cause: LockEffectCause {
+                            is_conservative: false,
+                            span,
+                            operation: "lock".into(),
+                            kind: LockEffectKind::Suspend,
+                            lock: part.lock_target.clone().map(Box::new),
+                        },
+                    })),
+                );
+            }
+            let panic = if part.panics {
+                Some((PANIC, part.panic_span))
+            } else if part.checked_panics {
+                Some((CHECKED_PANIC, part.checked_span))
+            } else {
+                None
+            };
+            if let Some((bits, span)) = panic {
+                let witness = span.map(|span| EffectWitness::Panic {
+                    owner: id,
+                    source: (span.file_id.0, span.start, span.end),
+                });
+                seed.add_effect(bits, witness.as_ref());
+            }
+        }
+        for cause in direct.get(&id).into_iter().flat_map(|d| &d.causes) {
+            let witness = (!cause.is_conservative).then(|| {
+                EffectWitness::Lock(LockEffectWitness {
+                    owner: id,
+                    cause: cause.clone(),
+                })
+            });
+            seed.add_effect(cause.kind.effects(), witness.as_ref());
+        }
+        if let Some(sites) = graph.get(&id) {
+            if sites.has_unknown {
+                seed.add_effect(PANIC, None);
+                io_seeds.insert(id);
+            }
+            for &target in &sites.targets {
+                if !result.preemption_bodies.contains(&target) {
+                    external_changed.insert(target);
+                }
+            }
+        } else {
+            seed.add_effect(PANIC, None);
+        }
+        seeds.insert(id, seed);
+    }
+    // Canonical copies have no destination body scan. Refresh only aliases
+    // reached from changed source owners, preserving the full producer's masks.
+    for &id in &changed_copies {
+        let copy = result.plan.copies[&id];
+        if result.plan.helpers.contains_key(&id)
+            && let Some(span) = locations
+                .get(&(unit, copy.body))
+                .and_then(|location| location.span(program))
+        {
+            result.plan.helpers.insert(id, span);
+        }
+        result.plan.loops.remove(&id);
+        result.loop_bodies.remove(&copy.body);
+        let mut seed = EffectSummary::default();
+        if copy.provider == unit {
+            if let Some(&span) = result.plan.loops.get(&copy.source) {
+                result.plan.loops.insert(id, span);
+            }
+        } else {
+            let known = queries.source_effects(unit, copy.provider, copy.source_body, copy.source);
+            if let Some((summary, has_loop, may_io)) = known {
+                seed.add_effect(summary.effects().intersection(ANY_PANIC), None);
+                seed.add_effect(
+                    summary.effects().intersection(LOCK_EFFECT_WAIT),
+                    summary.witness(LOCK_EFFECT_WAIT),
+                );
+                if may_io {
+                    io_seeds.insert(id);
+                }
+                if has_loop {
+                    result.loop_bodies.insert(copy.body);
+                    if let Some(&span) = result.plan.helpers.get(&id) {
+                        result.plan.loops.insert(id, span);
+                    }
+                }
+            } else {
+                seed.add_effect(PANIC.union(LOCK_EFFECT_WAIT), None);
+                io_seeds.insert(id);
+                if let Some(&span) = result.plan.helpers.get(&id) {
+                    result.plan.loops.insert(id, span);
+                }
+            }
+        }
+        for cause in direct.get(&id).into_iter().flat_map(|d| &d.causes) {
+            let witness = (!cause.is_conservative).then(|| {
+                EffectWitness::Lock(LockEffectWitness {
+                    owner: id,
+                    cause: cause.clone(),
+                })
+            });
+            seed.add_effect(cause.kind.effects(), witness.as_ref());
+        }
+        if let Some(sites) = graph.get(&id) {
+            if sites.has_unknown {
+                seed.add_effect(PANIC, None);
+                io_seeds.insert(id);
+            }
+            external_changed.extend(
+                sites
+                    .targets
+                    .iter()
+                    .filter(|target| !result.preemption_bodies.contains(target))
+                    .copied(),
+            );
+        } else if copy.provider != unit {
+            seed.add_effect(PANIC, None);
+        }
+        seeds.insert(id, seed);
+    }
+    changed.extend(changed_copies.iter().copied());
+    // Newly added owned callees may be discovered after their callers. Do not
+    // overwrite their direct seed with a provisional external classification.
+    external_changed.retain(|id| !result.preemption_bodies.contains(id));
+    let mut pending_external: Vec<_> = external_changed.iter().copied().collect();
+    while let Some(id) = pending_external.pop() {
+        if let Some(sites) = graph.get(&id) {
+            for &target in &sites.targets {
+                if !result.preemption_bodies.contains(&target) && external_changed.insert(target) {
+                    pending_external.push(target);
+                }
+            }
+        }
+    }
+    for &target in &external_changed {
+        // An expression lambda may retain its previous block-lambda identity
+        // without a graph entry of its own. A current incoming edge still
+        // requires its external equation; it is not a deleted vertex.
+        removed.remove(&target);
+        let mut seed = EffectSummary::new(
+            external(&target).intersection(ANY_PANIC),
+            Some(EffectWitness::External(target)),
+        );
+        if queries
+            .external_capabilities(unit, &target, &imports)
+            .may_io
+        {
+            io_seeds.insert(target);
+        }
+        if let Some(origin) = queries.external_target(unit, &target, &imports) {
+            result.plan.providers.insert(origin.0);
+            result
+                .plan
+                .external
+                .entry(origin)
+                .or_default()
+                .insert(target);
+        }
+        if let Some((declaring, id, is_async)) =
+            queries.external_lock_callable(unit, &target, &imports)
+            && !is_async
+        {
+            let evidence = queries.effect_evidence(declaring, id);
+            let waiting = evidence.as_ref().map_or(LOCK_EFFECT_WAIT, |s| {
+                s.effects().intersection(LOCK_EFFECT_WAIT)
+            });
+            seed.add_effect(
+                waiting,
+                evidence.as_ref().and_then(|s| s.witness(LOCK_EFFECT_WAIT)),
+            );
+        }
+        seeds.insert(target, seed);
+    }
+    changed.extend(external_changed);
+    // A cycle altered by an outgoing edge must contain the edited owner, so
+    // every potentially changed cycle member lies in its old reverse closure.
+    let closure = solution.reverse_closure(changed.iter().copied());
+    let mut helper_graph = CallGraph::default();
+    for &id in &closure {
+        if !result.plan.helpers.contains_key(&id) {
+            continue;
+        }
+        if let Some(sites) = graph.get(&id) {
+            let mut sites = sites.clone();
+            sites.targets.retain(|target| {
+                closure.contains(target) && result.plan.helpers.contains_key(target)
+            });
+            helper_graph.merge(id, sites);
+        }
+    }
+    let cycles = crate::semantic::effects::cycle_members(&helper_graph, std::iter::empty());
+    for &id in &closure {
+        if removed.contains(&id) {
+            continue;
+        }
+        let seed = seeds
+            .entry(id)
+            .or_insert_with(|| solution.equation(id).unwrap().seed.clone());
+        if !result.plan.helpers.contains_key(&id) {
+            seed.remove_effect(NO_PREEMPT);
+            continue;
+        }
+        seed.remove_effect(NO_PREEMPT);
+        let reason = if result.plan.loops.contains_key(&id) {
+            Some(NonpreemptibleReason::Loop)
+        } else if cycles.contains(&id) {
+            Some(NonpreemptibleReason::Recursion)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let span = result
+                .plan
+                .loops
+                .get(&id)
+                .copied()
+                .or_else(|| {
+                    result
+                        .plan
+                        .bodies
+                        .get(&id)
+                        .and_then(|body| locations.get(&(unit, *body)))
+                        .and_then(|location| location.span(program))
+                })
+                .unwrap_or(result.plan.helpers[&id]);
+            seed.add_effect(
+                NO_PREEMPT,
+                Some(&EffectWitness::Helper {
+                    reason,
+                    owner: id,
+                    source: (span.file_id.0, span.start, span.end),
+                }),
+            );
+        }
+    }
+    let mask = |target: &FunctionId| {
+        let base = ANY_PANIC.union(RuntimeEffects::MAY_ALLOCATE);
+        if callables.get(target) == Some(&true) {
+            base
+        } else if result.plan.helpers.contains_key(target) {
+            base.union(LOCK_EFFECT_WAIT).union(NO_PREEMPT)
+        } else {
+            base.union(LOCK_EFFECT_WAIT)
+        }
+    };
+    let mut updates = Vec::new();
+    let mut compared = 0;
+    for (id, seed) in seeds {
+        compared += 1;
+        let mut edges: Vec<_> = graph
+            .get(&id)
+            .map(|sites| {
+                sites
+                    .targets
+                    .iter()
+                    .filter(|target| !removed.contains(target))
+                    .map(|&target| (target, mask(&target)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(copy) = result.plan.copies.get(&id)
+            && copy.provider == unit
+            && !edges.iter().any(|(target, _)| *target == copy.source)
+        {
+            edges.push((copy.source, mask(&copy.source)));
+        }
+        let equation = EffectEquation { seed, edges };
+        if !solution
+            .equation(id)
+            .is_some_and(|old| old.edges == equation.edges && same_seed(&old.seed, &equation.seed))
+        {
+            updates.push((id, Some(equation)));
+        }
+    }
+    for id in &removed {
+        result.plan.bodies.remove(id);
+        result.plan.helpers.remove(id);
+        result.callables.remove(id);
+    }
+    updates.extend(removed.iter().map(|&id| (id, None)));
+    solution.apply_delta(updates);
+    let io_bit = RuntimeEffects::MAY_ALLOCATE;
+    let mut io_updates = Vec::new();
+    for &id in &changed {
+        if removed.contains(&id) {
+            io_updates.push((id, None));
+            continue;
+        }
+        compared += 1;
+        let mut equation = EffectEquation {
+            seed: EffectSummary::new(
+                if io_seeds.contains(&id) {
+                    io_bit
+                } else {
+                    RuntimeEffects::NONE
+                },
+                None,
+            ),
+            edges: graph
+                .get(&id)
+                .map(|sites| {
+                    sites
+                        .targets
+                        .iter()
+                        .filter(|target| !removed.contains(target))
+                        .map(|&target| (target, io_bit))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        if let Some(copy) = result.plan.copies.get(&id)
+            && copy.provider == unit
+            && !equation
+                .edges
+                .iter()
+                .any(|(target, _)| *target == copy.source)
+        {
+            equation.edges.push((copy.source, io_bit));
+        }
+        if !io_solution.equation(id).is_some_and(|old| old == &equation) {
+            io_updates.push((id, Some(equation)));
+        }
+    }
+    io_solution.apply_delta(io_updates);
+    for target in old_external_targets {
+        if !result.preemption_bodies.contains(&target) && solution.prune_unreferenced_leaf(target) {
+            io_solution.prune_unreferenced_leaf(target);
+            if let Some(origin) = queries.external_target(unit, &target, &imports)
+                && let Some(targets) = result.plan.external.get_mut(&origin)
+            {
+                targets.remove(&target);
+                if targets.is_empty() {
+                    result.plan.external.remove(&origin);
+                }
+            }
+        }
+    }
+    for &id in &io_solution.affected {
+        if io_solution
+            .facts
+            .get(&id)
+            .is_some_and(|s| s.intersects(io_bit))
+        {
+            result.may_io.insert(id);
+        } else {
+            result.may_io.remove(&id);
+        }
+    }
+    let helpers = Arc::make_mut(&mut result.helpers);
+    for &id in &solution.affected {
+        if let Some(&span) = result.plan.helpers.get(&id)
+            && let Some(EffectWitness::Helper { reason, .. }) =
+                solution.facts.get(&id).and_then(|s| s.witness(NO_PREEMPT))
+        {
+            let span = result
+                .plan
+                .bodies
+                .get(&id)
+                .and_then(|body| locations.get(&(unit, *body)))
+                .and_then(|location| location.span(program))
+                .unwrap_or(span);
+            helpers.insert(
+                id,
+                NonpreemptibleHelper {
+                    span,
+                    reason: *reason,
+                },
+            );
+        } else {
+            helpers.remove(&id);
+        }
+    }
+    solution.affected.extend(changed.iter().copied());
+    queries.compared.set(queries.compared.get() + compared);
+    queries
+        .recomputed
+        .set(queries.recomputed.get() + solution.recomputed + io_solution.recomputed);
+    result.facts = solution.facts.clone();
+    queries
+        .solutions
+        .borrow_mut()
+        .insert(unit, Arc::new(solution));
+    queries
+        .io_solutions
+        .borrow_mut()
+        .insert(unit, Arc::new(io_solution));
+    Some(result)
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct DirectBodyEffects {
     id: FunctionId,
     body: BodyId,
@@ -1289,6 +2752,33 @@ struct DirectBodyEffects {
     #[serde(default)]
     preemption_loop: bool,
     may_io: bool,
+}
+
+// Graph-only expression lambdas have no block contribution but still own an
+// equation, including when they are not called directly from their enclosing body.
+fn graph_lambdas(
+    root: BodyId,
+    body: &Block,
+    index: Option<&super::ids::BodyIndex>,
+) -> Vec<FunctionId> {
+    let mut result = Vec::new();
+    let mut pending = vec![(root, AstEvent::Block(body))];
+    while let Some((parent, body)) = pending.pop() {
+        let mut walk = AstWalk::new(body);
+        while let Some(event) = walk.next() {
+            if let AstEvent::Lambda(lambda) = event {
+                if let Some(id) = index.and_then(|i| i.lambda_in(parent, lambda.id)) {
+                    result.push(FunctionId::lambda(id));
+                    match &lambda.body {
+                        LambdaBody::Block(block) => pending.push((id, AstEvent::Block(block))),
+                        LambdaBody::Expr(expr) => pending.push((id, AstEvent::Expr(expr))),
+                    }
+                }
+                walk.skip_children();
+            }
+        }
+    }
+    result
 }
 
 fn scan_direct_effects<N: std::fmt::Display>(
@@ -2575,6 +4065,8 @@ mod tests {
                             CapturedEffect {
                                 capabilities,
                                 evidence: EffectEvidence::new(EffectSummary::default()),
+                                helper: None,
+                                loop_bodies: Vec::new(),
                             },
                         )]),
                         vec![],
@@ -3119,17 +4611,48 @@ impl super::retained::Retained for EffectCapabilities {
         0
     }
 }
+fn witness_type_bytes(ty: &Type) -> usize {
+    match ty {
+        Type::Named(name) => name.capacity(),
+        Type::Array(child) | Type::FixedArray(child, _) => {
+            std::mem::size_of::<Type>() + witness_type_bytes(child)
+        }
+        Type::Generic(name, args) => {
+            name.capacity()
+                + args.capacity() * std::mem::size_of::<Type>()
+                + args.iter().map(witness_type_bytes).sum::<usize>()
+        }
+        Type::Fn(args, result) | Type::Closure(args, result) => {
+            args.capacity() * std::mem::size_of::<Type>()
+                + args.iter().map(witness_type_bytes).sum::<usize>()
+                + std::mem::size_of::<Type>()
+                + witness_type_bytes(result)
+        }
+        _ => 0,
+    }
+}
 impl super::retained::Retained for EffectEvidence {
     fn heap_bytes(&self) -> usize {
-        // Canonical evidence contains the same owned witness strings. Charge
-        // it twice plus the maximum B-tree storage for all runtime effect bits.
-        2 * self.canonical.heap_bytes()
-            + RuntimeEffects::BIT_COUNT as usize * (std::mem::size_of::<EffectWitness>() + 64) * 2
+        // At most one witness per runtime bit. Include dynamic witness storage.
+        let dynamic: usize = (0..RuntimeEffects::BIT_COUNT)
+            .filter_map(
+                |bit| match self.summary.witness(RuntimeEffects::from_bit(bit)) {
+                    Some(EffectWitness::Lock(w)) => Some(
+                        w.cause.operation.len()
+                            + w.cause.lock.as_ref().map_or(0, |lock| {
+                                lock.mode.len() + lock.r#type.as_ref().map_or(0, witness_type_bytes)
+                            }),
+                    ),
+                    _ => None,
+                },
+            )
+            .sum();
+        dynamic + RuntimeEffects::BIT_COUNT as usize * (std::mem::size_of::<EffectWitness>() + 64)
     }
 }
 impl super::retained::Retained for CapturedEffect {
     fn heap_bytes(&self) -> usize {
-        self.evidence.heap_bytes()
+        self.evidence.heap_bytes() + self.loop_bodies.capacity() * std::mem::size_of::<BodyId>()
     }
 }
 

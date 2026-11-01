@@ -25,7 +25,7 @@ pub(crate) mod static_init;
 pub(crate) mod syntax;
 pub(crate) mod tracked;
 pub use checked::CheckedUnit;
-pub type HelperSummary = std::collections::HashMap<
+pub type HelperSummary = im::HashMap<
     crate::semantic::ids::FunctionId,
     crate::semantic::concurrency::NonpreemptibleHelper,
 >;

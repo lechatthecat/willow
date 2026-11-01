@@ -3,6 +3,12 @@ use crate::semantic::analysis_symbols::Declaration;
 
 impl TypeChecker {
     pub(super) fn record_annotation_uses(&mut self, program: &Program) {
+        if let Some((_, unit)) = &self.effect_queries {
+            crate::ai::incremental_snapshot::record_annotation_start(
+                *unit,
+                self.analysis_symbols.references.len(),
+            );
+        }
         if !self.capture_call_sites && program.imports.is_empty() {
             return;
         }

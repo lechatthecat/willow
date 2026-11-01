@@ -10,10 +10,13 @@ use std::collections::{HashMap, HashSet};
 pub struct AnalysisRevision {
     symbols: crate::semantic::ids::SymbolInterner,
     frontend: Option<Frontend>,
+    pub(crate) snapshot_state: ai::VerificationSnapshotState,
+    pub(crate) verification_capture: Option<ai::verify::semantic_diff::Capture>,
     tracked: tracked::TrackedQueryTable,
     syntax: std::rc::Rc<std::cell::RefCell<incremental::SyntaxQueries>>,
     pub incremental_stats: serde_json::Value,
     pub typechecks: usize,
+    pub(crate) changed_bodies: HashSet<crate::parser::ast::BodyId>,
     pub reused_bodies: usize,
     pub retained_artifact_bytes: u64,
     pub input_visits: usize,
@@ -56,6 +59,28 @@ impl AnalysisRevision {
         artifact_limit: u64,
         verification: bool,
     ) -> Result<ai::Snapshot> {
+        match self.analyze_policy_update(session, emitter, artifact_limit, verification, false)? {
+            ai::VerificationSnapshotUpdate::Full(snapshot) => Ok(snapshot),
+            _ => unreachable!("full analysis policy"),
+        }
+    }
+
+    pub(crate) fn analyze_verification_delta(
+        &mut self,
+        session: CompilerSession<'_>,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    ) -> Result<ai::VerificationSnapshotUpdate> {
+        self.analyze_policy_update(session, emitter, 128 * 1024 * 1024, true, true)
+    }
+
+    fn analyze_policy_update(
+        &mut self,
+        session: CompilerSession<'_>,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+        artifact_limit: u64,
+        verification: bool,
+        delta: bool,
+    ) -> Result<ai::VerificationSnapshotUpdate> {
         use anyhow::Context;
         let prepare_start = std::time::Instant::now();
         let _symbols = self.symbols.enter();
@@ -113,6 +138,12 @@ impl AnalysisRevision {
             .configure_sources(inputs.package_graph.as_deref());
         let prepare_us = prepare_start.elapsed().as_micros();
         let frontend_start = std::time::Instant::now();
+        let mut snapshot_state = if previous.is_some() {
+            self.snapshot_state.clone()
+        } else {
+            ai::VerificationSnapshotState::default()
+        };
+        let capture_scope = delta.then(|| snapshot_state.capture_scope());
         let frontend = crate::run_frontend_revision(
             &source,
             root,
@@ -135,8 +166,30 @@ impl AnalysisRevision {
             "revision artifacts exceed {artifact_limit} bytes"
         );
         let snapshot_start = std::time::Instant::now();
-        let snapshot = ai::snapshot(&frontend, &path, &source, session.project_root.as_deref())?;
-        ai::check_size(&snapshot)?;
+        let changed_bodies = syntax.borrow().changed_bodies();
+        let update = if delta {
+            ai::incremental_snapshot(
+                &frontend,
+                &path,
+                &source,
+                session.project_root.as_deref(),
+                &mut snapshot_state,
+                &changed_bodies,
+            )?
+        } else {
+            ai::VerificationSnapshotUpdate::Full(ai::snapshot(
+                &frontend,
+                &path,
+                &source,
+                session.project_root.as_deref(),
+            )?)
+        };
+        drop(capture_scope);
+        let snapshot = match &update {
+            ai::VerificationSnapshotUpdate::Full(snapshot) => snapshot,
+            ai::VerificationSnapshotUpdate::Delta { patch, .. } => patch,
+        };
+        ai::check_size(snapshot)?;
         let snapshot_us = snapshot_start.elapsed().as_micros();
         if let Some(cold_session) = cold_session {
             let mut cold_diagnostics = Vec::new();
@@ -150,7 +203,14 @@ impl AnalysisRevision {
                     "E0800: incremental verification mismatch: warm analysis succeeded but cold analysis failed; query graph={}",
                     syntax.borrow().verification_dump()
                 ))?;
-            let warm_value = serde_json::to_value(&snapshot)?;
+            let materialized;
+            let warm = if delta {
+                materialized = snapshot_state.materialize()?;
+                &materialized
+            } else {
+                snapshot
+            };
+            let warm_value = serde_json::to_value(warm)?;
             let cold_value = serde_json::to_value(&cold)?;
             anyhow::ensure!(
                 warm_value == cold_value && observed == cold_diagnostics,
@@ -182,13 +242,16 @@ impl AnalysisRevision {
             "revision query bytes exceed 512 MiB: accounted {retained_query_bytes} bytes"
         );
         let stats = syntax.borrow().stats();
-        let incremental_stats = serde_json::json!({
+        let mut incremental_stats = serde_json::json!({
             "state_prepare_us": prepare_us,
             "typechecks": frontend.db.typed_bodies.typechecks(),
+            "changed_typed_bodies": changed_bodies.len(),
             "effects_scanned": frontend.db.effects.work().0,
             "effects_recomputed": frontend.db.effects.work().1,
+            "effect_equations_compared": frontend.db.effects.equation_comparisons(),
+            "effect_inventory_owners": syntax.borrow().effect_inventory_owners(),
+            "effect_dependency_reads": syntax.borrow().effect_dependency_reads(),
             "frontend_us": frontend_us,
-            "snapshot_us": snapshot_us,
             "semantic_check_entries": frontend.db.typed_bodies.semantic_check_entries(),
             "precheck_replay_us": frontend.db.prechecks.replay_us.get(), "precheck_semantic_us": frontend.db.prechecks.semantic_us.get(), "declaration_validations": frontend.db.prechecks.validations.get(), "precheck_declarations": frontend.db.prechecks.declarations.get(), "precheck_bodies": frontend.db.prechecks.bodies.get(), "precheck_signatures": frontend.db.prechecks.signatures.get(), "precheck_instances": frontend.db.prechecks.instances.get(), "precheck_templates": frontend.db.prechecks.templates.get(), "signature_checks": frontend.db.typed_bodies.signature_checks.get(),
             "concurrency_checks": frontend.db.typed_bodies.concurrency_checks.get(), "async_borrow_checks": frontend.db.typed_bodies.async_borrow_checks.get(),
@@ -205,8 +268,55 @@ impl AnalysisRevision {
             "query_nodes": nodes,
             "dependency_edges": edges,
         });
+        for (key, value) in [
+            ("candidate_entries_cloned", stats.candidate_entries_cloned),
+            (
+                "validation_metadata_entries",
+                stats.validation_metadata_entries,
+            ),
+            ("memo_entries_written", stats.memo_entries_written),
+            (
+                "auxiliary_accounting_entries",
+                stats.auxiliary_accounting_entries,
+            ),
+            ("reclamation_nodes_visited", stats.reclamation_nodes_visited),
+            ("reclamation_edges_visited", stats.reclamation_edges_visited),
+            (
+                "accounting_entries_visited",
+                stats.accounting_entries_visited,
+            ),
+            ("accounting_edges_visited", stats.accounting_edges_visited),
+            ("reclamation_credit_added", stats.reclamation_credit_added),
+            (
+                "snapshot_projection_items_cloned",
+                snapshot_state.projection_items_cloned(),
+            ),
+            (
+                "snapshot_boundary_functions",
+                snapshot_state.boundary_functions(),
+            ),
+            ("snapshot_dispatch_visits", snapshot_state.dispatch_visits()),
+            ("snapshot_dispatch_nodes", snapshot_state.dispatch_nodes()),
+            ("snapshot_owner_checks", snapshot_state.owner_checks()),
+            (
+                "snapshot_coordinate_owners",
+                snapshot_state.coordinate_owners(),
+            ),
+            ("snapshot_functions_rebuilt", snapshot.functions.len()),
+            ("snapshot_symbols_rebuilt", snapshot.semantic.symbols.len()),
+        ] {
+            incremental_stats[key] = serde_json::json!(value);
+        }
+        incremental_stats["snapshot_us"] = serde_json::json!(snapshot_us);
         self.tracked.replace_inputs(accepted)?;
+        if delta {
+            self.snapshot_state = snapshot_state;
+        } else {
+            self.snapshot_state = ai::VerificationSnapshotState::default();
+            self.verification_capture = None;
+        }
         self.incremental_stats = incremental_stats;
+        self.changed_bodies = changed_bodies;
         self.syntax = syntax;
         self.retained_artifact_bytes = retained;
         (self.input_visits, self.invalidation_visits) = frontend.db.revision_work.get();
@@ -215,7 +325,7 @@ impl AnalysisRevision {
         self.signature_edges = frontend.db.typed_bodies.signature_edge_count();
         self.distinct_signatures = frontend.db.typed_bodies.distinct_signature_count();
         self.frontend = Some(frontend);
-        Ok(snapshot)
+        Ok(update)
     }
 }
 
@@ -719,6 +829,7 @@ mod tests {
 
     #[test]
     fn review_effect_recomputation_is_independent_of_unrelated_body_count() {
+        let mut effectful_work = None;
         for count in [8, 32, 128] {
             let f = Fixture::new();
             let unrelated: String = (0..count)
@@ -748,13 +859,62 @@ mod tests {
             assert!(f.compare(&mut revision));
             let work = revision.frontend.as_ref().unwrap().db.effects.work();
             assert_eq!(work.0, 1);
+            // `get`, `caller` and `main` are affected; the effect and I/O
+            // solutions each count their recomputed equations.
             assert!(
-                work.1 > 0 && work.1 <= 6,
+                work.1 > 0 && work.1 <= 2 * 3 + 2,
                 "unrelated effects must be reused: {work:?}"
+            );
+            assert_eq!(
+                *effectful_work.get_or_insert(work),
+                work,
+                "effect-changing edit work grew with unrelated bodies, count={count}"
             );
             f.write("main.wi", &source);
             assert!(f.compare(&mut revision));
             assert_eq!(revision.frontend.as_ref().unwrap().db.effects.work().0, 1);
+        }
+    }
+
+    #[test]
+    fn review_effect_relocation_is_independent_of_unrelated_unit_count() {
+        let mut shifted_visits = None;
+        for count in [8, 32, 128] {
+            let f = Fixture::new();
+            for i in 0..count {
+                f.write(
+                    &format!("u{i}.wi"),
+                    "pub fn f(n: i64) -> i64 { return 10 / n; } pub fn g(n: i64) -> i64 { return f(n) + 1; }",
+                );
+            }
+            let imports: String = (0..count).map(|i| format!("import u{i};\n")).collect();
+            let calls: String = (0..count)
+                .map(|i| format!("println(u{i}::g({}));", i + 1))
+                .collect();
+            let source = format!(
+                "{imports}fn div(n: i64) -> i64 {{ return 100 / n; }} fn main() {{ println(div(4)); {calls} }}"
+            );
+            f.write("main.wi", &source);
+            let mut revision = AnalysisRevision::default();
+            assert!(f.compare(&mut revision));
+            // Inserting lines before every entry declaration moves all of its
+            // coordinates, while the imported units keep theirs.
+            f.write("main.wi", &format!("\n\n{source}"));
+            assert!(f.compare(&mut revision));
+            let visits = revision
+                .frontend
+                .as_ref()
+                .unwrap()
+                .db
+                .effects
+                .relocation_visits();
+            println!("review_relocation units={count} visits={visits}");
+            assert!(visits > 0, "entry coordinates must be relocated");
+            assert_eq!(
+                *shifted_visits.get_or_insert(visits),
+                visits,
+                "relocation work grew with unrelated units, count={count}"
+            );
         }
     }
 
@@ -1686,6 +1846,38 @@ mod tests {
         assert_eq!((warm.typechecks, warm.reused_bodies), (0, 1));
     }
     #[test]
+    fn verification_revision_compiler_stamp_invalidates_reuse() {
+        let f = Fixture::new();
+        f.write("main.wi", "fn helper() {} fn main() { helper(); }");
+        let path = f.0.join("main.wi");
+        let options = crate::CompilerOptions::debug();
+        let session = || CompilerSession::new(path.to_str().unwrap(), "", &options, None);
+        let mut warm = AnalysisRevision::default();
+        let first = warm
+            .analyze_verification(session(), &mut Diagnostics::default())
+            .unwrap();
+        warm.analyze_verification(session(), &mut Diagnostics::default())
+            .unwrap();
+        assert_eq!(warm.typechecks, 0);
+        // A live revision cannot cross an executable replacement. Inject an
+        // incompatible stamp to exercise the same configuration invalidation.
+        warm.tracked
+            .accept(vec![(
+                tracked::InputNode::CompilerStamp,
+                captured::bytes(b"different compiler".to_vec()),
+            )])
+            .unwrap();
+        let next = warm
+            .analyze_verification(session(), &mut Diagnostics::default())
+            .unwrap();
+        assert_eq!(warm.typechecks, 2);
+        assert_eq!(
+            serde_json::to_value(first).unwrap(),
+            serde_json::to_value(next).unwrap()
+        );
+    }
+
+    #[test]
     fn revision_configuration_manifest_and_entry_boundaries_match_cold() {
         let f = Fixture::new();
         f.write("main.wi", "fn main() {}");
@@ -2137,6 +2329,57 @@ mod tests {
         for value in [41, 42, 42, 43] {
             f.write("values.wi", &format!("pub enum Value {{ Empty, Number(i64) }} pub class Counter {{ pub static fn answer() -> i64 {{ return {value}; }} }} pub fn identity<T>(v: T) -> T {{ return v; }} pub fn read(v: Value) -> i64 {{ return match v {{ Empty => 0, Number(n) => n }}; }}"));
             assert!(f.compare(&mut warm));
+        }
+    }
+    #[test]
+    fn revision_effect_owner_removal_releases_persisted_indexes() {
+        fn counts(revision: &AnalysisRevision) -> Vec<usize> {
+            let stored = serde_json::to_value(
+                revision
+                    .frontend
+                    .as_ref()
+                    .unwrap()
+                    .db
+                    .effects
+                    .disk_snapshot(),
+            )
+            .unwrap();
+            [
+                "bodies",
+                "roots",
+                "source_roots",
+                "direct",
+                "callables",
+                "helpers",
+                "helper_spans",
+                "loops",
+            ]
+            .map(|field| {
+                stored["units"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|unit| unit[1][field].as_array().unwrap().len())
+                    .sum()
+            })
+            .into()
+        }
+        let fixture = Fixture::new();
+        let mut revision = AnalysisRevision::default();
+        let _symbols = revision.symbols.enter();
+        fixture.write("main.wi", "fn main() {}");
+        assert!(fixture.compare(&mut revision));
+        let baseline = counts(&revision);
+        for index in 0..16 {
+            fixture.write("main.wi", &format!("fn temporary_{index}() {{ let f = |x:i64| {{ println(x); return x; }}; f(1); }} fn main() {{}}"));
+            assert!(fixture.compare(&mut revision));
+            fixture.write("main.wi", "fn main() {}");
+            assert!(fixture.compare(&mut revision));
+            assert_eq!(
+                counts(&revision),
+                baseline,
+                "deleted owner retained at edit {index}"
+            );
         }
     }
 }

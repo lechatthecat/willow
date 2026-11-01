@@ -34,7 +34,9 @@
 //! worklist below keeps each edge's mask. [`cycle_members`] still exposes the
 //! SCC pass on its own, because "is in a call cycle" is a seed for E0810.
 
+use im::{OrdMap, OrdSet};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use crate::semantic::call_graph::CallGraph;
 use crate::semantic::ids::FunctionId;
@@ -43,6 +45,7 @@ pub use willow_abi::RuntimeEffects;
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static DELTA_QUEUE_POPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static REACHABLE_EDGE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -109,6 +112,14 @@ impl<W: Clone + Ord> EffectSummary<W> {
             .find_map(|bit| self.witnesses.get(&bit))
     }
 
+    pub(crate) fn remove_effect(&mut self, effect: RuntimeEffects) {
+        self.effects = self.effects.difference(effect);
+        self.witnesses
+            .retain(|&bit, _| !effect.intersects(RuntimeEffects::from_bit(bit)));
+    }
+    pub(crate) fn add_effect(&mut self, effect: RuntimeEffects, witness: Option<&W>) {
+        self.add(effect, witness);
+    }
     /// Union in a leaf fact. Returns whether anything changed, which is what
     /// drives the worklist.
     fn add(&mut self, effects: RuntimeEffects, witness: Option<&W>) -> bool {
@@ -350,7 +361,10 @@ impl<W: Clone + Ord> EffectProblem<W> {
             }
         }
         EffectFacts {
-            summaries: nodes.into_iter().zip(summaries).collect(),
+            summaries: nodes
+                .into_iter()
+                .zip(summaries.into_iter().map(Arc::new))
+                .collect(),
         }
     }
 
@@ -371,153 +385,297 @@ impl<W: Clone + Ord> EffectProblem<W> {
         let mut universe = self.bodies.clone();
         universe.extend(graph.ids().cloned());
         universe.extend(self.seeds.keys().cloned());
-        let nodes: Vec<FunctionId> = universe.into_iter().collect();
-        let index: HashMap<&FunctionId, usize> = nodes
+        let known: HashSet<_> = universe.iter().copied().collect();
+        let equations: BTreeMap<_, _> = universe
             .iter()
-            .enumerate()
-            .map(|(position, id)| (id, position))
-            .collect();
-
-        let mut summaries: Vec<EffectSummary<W>> = vec![EffectSummary::default(); nodes.len()];
-        // (callee, mask) per caller, and the reverse index the worklist walks.
-        let mut edges: Vec<Vec<(usize, RuntimeEffects)>> = vec![Vec::new(); nodes.len()];
-        let mut callers: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
-
-        for (position, id) in nodes.iter().enumerate() {
-            if let Some(seed) = self.seeds.get(id) {
-                // Seeds may carry the compiler-internal checked-panic bit.
-                summaries[position].join(
-                    seed,
-                    RuntimeEffects::ALL.union(RuntimeEffects::MAY_CHECKED_PANIC),
-                );
-            }
-            let Some(sites) = graph.get(id) else {
-                if self.bodies.contains(id) {
-                    summaries[position].add(self.missing_body, None);
-                }
-                continue;
-            };
-            if sites.has_unknown {
-                summaries[position].add(self.unknown_callee, None);
-            }
-            for target in &sites.targets {
-                let mask = self
-                    .transmit
-                    .get(target)
-                    .copied()
-                    .unwrap_or(self.default_transmit);
-                match index.get(target) {
-                    Some(&callee) => {
-                        edges[position].push((callee, mask));
-                        callers[callee].push(position);
+            .map(|&id| {
+                let mut seed = self.seeds.get(&id).cloned().unwrap_or_default();
+                let mut edges = Vec::new();
+                if let Some(sites) = graph.get(&id) {
+                    if sites.has_unknown {
+                        seed.add(self.unknown_callee, None);
                     }
-                    None => {
-                        summaries[position].add(self.external_callee.intersection(mask), None);
+                    for target in &sites.targets {
+                        let mask = self
+                            .transmit
+                            .get(target)
+                            .copied()
+                            .unwrap_or(self.default_transmit);
+                        if known.contains(target) {
+                            edges.push((*target, mask));
+                        } else {
+                            seed.add(self.external_callee.intersection(mask), None);
+                        }
                     }
+                } else if self.bodies.contains(&id) {
+                    seed.add(self.missing_body, None);
                 }
-            }
-        }
-
-        let equations: BTreeMap<_, _> = nodes
-            .iter()
-            .enumerate()
-            .map(|(i, id)| {
-                (
-                    *id,
-                    EffectEquation {
-                        seed: summaries[i].clone(),
-                        edges: edges[i]
-                            .iter()
-                            .map(|(target, mask)| (nodes[*target], *mask))
-                            .collect(),
-                    },
-                )
+                (id, EffectEquation { seed, edges })
             })
             .collect();
-        // Reset the reverse closure of changed equations to their direct seeds.
-        // Keeping an old fixed point inside an affected cycle would retain
-        // effects after the last source of an effect is removed.
-        let mut dirty = vec![false; nodes.len()];
-        let mut invalidate = VecDeque::new();
-        for (position, id) in nodes.iter().enumerate() {
-            let unchanged = previous
-                .and_then(|old| old.equations.get(id))
-                .is_some_and(|old| {
-                    let current = &equations[id];
-                    old.edges == current.edges && same_seed(&old.seed, &current.seed)
-                });
-            if !unchanged {
-                dirty[position] = true;
-                invalidate.push_back(position);
-            }
-        }
-        while let Some(callee) = invalidate.pop_front() {
-            for &caller in &callers[callee] {
-                if !dirty[caller] {
-                    dirty[caller] = true;
-                    invalidate.push_back(caller);
-                }
-            }
-        }
-        if let Some(previous) = previous {
-            for (position, id) in nodes.iter().enumerate() {
-                if !dirty[position] {
-                    summaries[position] = previous
-                        .facts
-                        .get(id)
-                        .expect("unchanged equation has a fact")
-                        .clone();
-                }
-            }
-        }
-        let recomputed = dirty.iter().filter(|dirty| **dirty).count();
-        let mut queued: HashSet<usize> = (0..nodes.len()).filter(|i| dirty[*i]).collect();
-        let mut work: VecDeque<usize> = (0..nodes.len()).filter(|i| dirty[*i]).collect();
-        while let Some(position) = work.pop_front() {
-            queued.remove(&position);
-            let mut changed = false;
-            // Lift the caller's summary out so the callees can be read in
-            // place. A self-edge is skipped rather than handled: joining a
-            // summary with itself under any mask can only re-add effects and
-            // witnesses it already has.
-            let mut summary = std::mem::take(&mut summaries[position]);
-            for &(callee, mask) in &edges[position] {
-                if callee == position {
-                    continue;
-                }
-                changed |= summary.join(&summaries[callee], mask);
-            }
-            summaries[position] = summary;
-            if !changed {
-                continue;
-            }
-            for &caller in &callers[position] {
-                if caller != position && queued.insert(caller) {
-                    work.push_back(caller);
-                }
-            }
-        }
-
-        EffectSolution {
+        // This compatibility adapter still receives a complete problem. The
+        // retained solver below accepts explicit equation deltas; producers can
+        // bypass this inventory comparison when they already know dirty owners.
+        let compared = equations.len();
+        let mut solution = previous.cloned().unwrap_or_else(|| EffectSolution {
             facts: EffectFacts {
-                summaries: nodes.into_iter().zip(summaries).collect(),
+                summaries: OrdMap::new(),
             },
-            equations,
-            recomputed,
+            equations: OrdMap::new(),
+            callers: OrdMap::new(),
+            recomputed: 0,
+            compared: 0,
+            affected: HashSet::new(),
+            witness_facts: OrdSet::new(),
+            witness_equations: OrdSet::new(),
+        });
+        let mut changes = Vec::new();
+        for &id in solution.equations.keys() {
+            if !equations.contains_key(&id) {
+                changes.push((id, None));
+            }
         }
+        for (id, equation) in equations {
+            if !solution.equations.get(&id).is_some_and(|old| {
+                old.edges == equation.edges && same_seed(&old.seed, &equation.seed)
+            }) {
+                changes.push((id, Some(equation)));
+            }
+        }
+        solution.apply_delta(changes);
+        solution.compared = compared;
+        solution
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct EffectEquation<W> {
-    seed: EffectSummary<W>,
-    edges: Vec<(FunctionId, RuntimeEffects)>,
+pub(crate) struct EffectEquation<W> {
+    pub(crate) seed: EffectSummary<W>,
+    pub(crate) edges: Vec<(FunctionId, RuntimeEffects)>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct EffectSolution<W> {
     pub(crate) facts: EffectFacts<W>,
-    equations: BTreeMap<FunctionId, EffectEquation<W>>,
+    equations: OrdMap<FunctionId, Arc<EffectEquation<W>>>,
+    callers: OrdMap<FunctionId, OrdSet<FunctionId>>,
+    pub(crate) affected: HashSet<FunctionId>,
+    witness_facts: OrdSet<FunctionId>,
+    witness_equations: OrdSet<FunctionId>,
     pub(crate) recomputed: usize,
+    /// Equations visited for invalidation, including unchanged equations.
+    pub(crate) compared: usize,
+}
+
+impl<W: Clone> Clone for EffectSolution<W> {
+    fn clone(&self) -> Self {
+        Self {
+            facts: self.facts.clone(),
+            equations: self.equations.clone(),
+            callers: self.callers.clone(),
+            affected: HashSet::new(),
+            witness_facts: self.witness_facts.clone(),
+            witness_equations: self.witness_equations.clone(),
+            recomputed: 0,
+            compared: 0,
+        }
+    }
+}
+
+impl<W: Clone + Ord> EffectSolution<W> {
+    pub(crate) fn equation(&self, id: FunctionId) -> Option<&EffectEquation<W>> {
+        self.equations.get(&id).map(Arc::as_ref)
+    }
+    pub(crate) fn prune_unreferenced_leaf(&mut self, id: FunctionId) -> bool {
+        if self
+            .callers
+            .get(&id)
+            .is_some_and(|callers| !callers.is_empty())
+            || self.equations.get(&id).is_none_or(|e| !e.edges.is_empty())
+        {
+            return false;
+        }
+        self.equations.remove(&id);
+        self.facts.summaries.remove(&id);
+        self.witness_equations.remove(&id);
+        self.witness_facts.remove(&id);
+        self.affected.insert(id);
+        true
+    }
+    pub(crate) fn reverse_closure(
+        &self,
+        roots: impl IntoIterator<Item = FunctionId>,
+    ) -> HashSet<FunctionId> {
+        let mut result: HashSet<_> = roots.into_iter().collect();
+        let mut pending: Vec<_> = result.iter().copied().collect();
+        while let Some(id) = pending.pop() {
+            for &caller in self.callers.get(&id).into_iter().flatten() {
+                #[cfg(test)]
+                REACHABLE_EDGE_VISITS.with(|v| v.set(v.get() + 1));
+                if result.insert(caller) {
+                    pending.push(caller);
+                }
+            }
+        }
+        result
+    }
+    /// Apply final equations for changed owners only. A removed callee must also
+    /// update its callers' equations (including their external-call seed), as
+    /// the equation producer owns external and missing-body policy.
+    pub(crate) fn apply_delta(&mut self, changes: Vec<(FunctionId, Option<EffectEquation<W>>)>) {
+        self.compared = changes.len();
+        let mut dirty = BTreeSet::new();
+        let mut pending = VecDeque::new();
+        for (id, _) in &changes {
+            if dirty.insert(*id) {
+                pending.push_back(*id);
+            }
+        }
+        // Follow old edges before removing them: deleted edges and vertices
+        // must invalidate witnesses and cycles that depended on them.
+        while let Some(id) = pending.pop_front() {
+            #[cfg(test)]
+            DELTA_QUEUE_POPS.with(|v| v.set(v.get() + 1));
+            for &caller in self.callers.get(&id).into_iter().flatten() {
+                #[cfg(test)]
+                REACHABLE_EDGE_VISITS.with(|v| v.set(v.get() + 1));
+                if dirty.insert(caller) {
+                    pending.push_back(caller);
+                }
+            }
+        }
+        for (id, equation) in changes {
+            if let Some(old) = self.equations.remove(&id) {
+                for &(callee, _) in &old.edges {
+                    #[cfg(test)]
+                    REACHABLE_EDGE_VISITS.with(|v| v.set(v.get() + 1));
+                    if let Some(callers) = self.callers.get_mut(&callee) {
+                        callers.remove(&id);
+                        if callers.is_empty() {
+                            self.callers.remove(&callee);
+                        }
+                    }
+                }
+            }
+            if let Some(equation) = equation {
+                if equation.seed.witnesses.is_empty() {
+                    self.witness_equations.remove(&id);
+                } else {
+                    self.witness_equations.insert(id);
+                }
+                for &(callee, _) in &equation.edges {
+                    #[cfg(test)]
+                    REACHABLE_EDGE_VISITS.with(|v| v.set(v.get() + 1));
+                    self.callers.entry(callee).or_default().insert(id);
+                }
+                self.equations.insert(id, Arc::new(equation));
+            } else {
+                self.facts.summaries.remove(&id);
+                self.witness_equations.remove(&id);
+                self.witness_facts.remove(&id);
+            }
+        }
+        // New reverse edges can introduce callers outside the old closure.
+        pending.extend(dirty.iter().copied());
+        while let Some(id) = pending.pop_front() {
+            #[cfg(test)]
+            DELTA_QUEUE_POPS.with(|v| v.set(v.get() + 1));
+            for &caller in self.callers.get(&id).into_iter().flatten() {
+                #[cfg(test)]
+                REACHABLE_EDGE_VISITS.with(|v| v.set(v.get() + 1));
+                if dirty.insert(caller) {
+                    pending.push_back(caller);
+                }
+            }
+        }
+        self.affected = dirty.iter().copied().collect();
+        dirty.retain(|id| self.equations.contains_key(id));
+        self.recomputed = dirty.len();
+        // Solve only the affected graph. Unchanged callees are frozen boundary
+        // seeds. For each bit, visit witness roots in increasing witness order:
+        // the first root reaching a node is its final minimum, including cycles.
+        // Thus competing witnesses cannot repeatedly requeue preceding callers.
+        let nodes: Vec<_> = dirty.into_iter().collect();
+        let index: HashMap<_, _> = nodes.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let mut summaries: Vec<_> = nodes
+            .iter()
+            .map(|id| self.equations[id].seed.clone())
+            .collect();
+        let mut callers = vec![Vec::new(); nodes.len()];
+        for (caller, id) in nodes.iter().enumerate() {
+            for &(callee, mask) in &self.equations[id].edges {
+                #[cfg(test)]
+                REACHABLE_EDGE_VISITS.with(|v| v.set(v.get() + 1));
+                if let Some(&callee) = index.get(&callee) {
+                    callers[callee].push((caller, mask));
+                } else {
+                    summaries[caller].join(
+                        self.facts.summaries.get(&callee).expect("equation callee"),
+                        mask,
+                    );
+                }
+            }
+        }
+        for bit_index in 0..RuntimeEffects::BIT_COUNT {
+            let bit = RuntimeEffects::from_bit(bit_index);
+            let mut roots: Vec<_> = summaries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, summary)| summary.witness(bit).map(|w| (w.clone(), i)))
+                .collect();
+            roots.sort();
+            let mut work: Vec<_> = summaries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, summary)| summary.intersects(bit).then_some(i))
+                .collect();
+            let mut seen = vec![false; nodes.len()];
+            for &root in &work {
+                seen[root] = true;
+            }
+            while let Some(callee) = work.pop() {
+                #[cfg(test)]
+                DELTA_QUEUE_POPS.with(|v| v.set(v.get() + 1));
+                for &(caller, mask) in &callers[callee] {
+                    #[cfg(test)]
+                    REACHABLE_EDGE_VISITS.with(|v| v.set(v.get() + 1));
+                    if mask.intersects(bit) && !seen[caller] {
+                        seen[caller] = true;
+                        summaries[caller].add(bit, None);
+                        work.push(caller);
+                    }
+                }
+            }
+            seen.fill(false);
+            for (witness, root) in roots {
+                if seen[root] {
+                    continue;
+                }
+                seen[root] = true;
+                work.push(root);
+                while let Some(callee) = work.pop() {
+                    #[cfg(test)]
+                    DELTA_QUEUE_POPS.with(|v| v.set(v.get() + 1));
+                    summaries[callee].record_witness(bit_index, &witness);
+                    for &(caller, mask) in &callers[callee] {
+                        #[cfg(test)]
+                        REACHABLE_EDGE_VISITS.with(|v| v.set(v.get() + 1));
+                        if mask.intersects(bit) && !seen[caller] {
+                            seen[caller] = true;
+                            work.push(caller);
+                        }
+                    }
+                }
+            }
+        }
+        for (id, summary) in nodes.into_iter().zip(summaries) {
+            if summary.witnesses.is_empty() {
+                self.witness_facts.remove(&id);
+            } else {
+                self.witness_facts.insert(id);
+            }
+            self.facts.summaries.insert(id, Arc::new(summary));
+        }
+    }
 }
 
 /// Version-bound persistence for solved equations. Structured function IDs are
@@ -540,17 +698,35 @@ struct StoredEffectSummary<W> {
 }
 impl<W: Clone> EffectSolution<W> {
     /// Relocate evidence without solving unchanged semantic equations again.
-    pub(crate) fn map_witnesses(&mut self, mut map: impl FnMut(&mut W)) {
-        for summary in self.facts.summaries.values_mut() {
+    pub(crate) fn map_witnesses(
+        &mut self,
+        mut map: impl FnMut(&mut W) -> bool,
+    ) -> HashSet<FunctionId> {
+        let mut relocated = HashSet::new();
+        for &id in &self.witness_facts {
+            let mut summary = (*self.facts.summaries[&id]).clone();
+            let mut changed = false;
             for witness in summary.witnesses.values_mut() {
-                map(witness);
+                changed |= map(witness);
+            }
+            if changed {
+                self.facts.summaries.insert(id, Arc::new(summary));
+                relocated.insert(id);
             }
         }
-        for equation in self.equations.values_mut() {
-            for witness in equation.seed.witnesses.values_mut() {
-                map(witness);
+        for &id in &self.witness_equations {
+            let mut seed = self.equations[&id].seed.clone();
+            let mut changed = false;
+            for witness in seed.witnesses.values_mut() {
+                changed |= map(witness);
+            }
+            if changed {
+                let mut equation = (*self.equations[&id]).clone();
+                equation.seed = seed;
+                self.equations.insert(id, Arc::new(equation));
             }
         }
+        relocated
     }
 
     pub(crate) fn store(&self) -> StoredEffectSolution<W> {
@@ -581,7 +757,7 @@ impl<W: Clone> EffectSolution<W> {
         }
     }
 }
-impl<W> StoredEffectSolution<W> {
+impl<W: Clone> StoredEffectSolution<W> {
     pub(crate) fn restore(self) -> anyhow::Result<EffectSolution<W>> {
         fn effects(bits: u8) -> anyhow::Result<RuntimeEffects> {
             let mut value = RuntimeEffects::NONE;
@@ -610,14 +786,14 @@ impl<W> StoredEffectSolution<W> {
                 witnesses: s.witnesses,
             })
         }
-        let mut facts = BTreeMap::new();
+        let mut facts = OrdMap::new();
         for (id, value) in self.facts {
             anyhow::ensure!(
-                facts.insert(id, summary(value)?).is_none(),
+                facts.insert(id, Arc::new(summary(value)?)).is_none(),
                 "duplicate effect fact"
             );
         }
-        let mut equations = BTreeMap::new();
+        let mut equations = OrdMap::new();
         for StoredEffectEquation { id, seed, edges } in self.equations {
             let edges = edges
                 .into_iter()
@@ -627,10 +803,10 @@ impl<W> StoredEffectSolution<W> {
                 equations
                     .insert(
                         id,
-                        EffectEquation {
+                        Arc::new(EffectEquation {
                             seed: summary(seed)?,
                             edges
-                        }
+                        })
                     )
                     .is_none(),
                 "duplicate effect equation"
@@ -640,10 +816,30 @@ impl<W> StoredEffectSolution<W> {
             facts.keys().eq(equations.keys()),
             "effect solution inventory mismatch"
         );
+        let mut callers: OrdMap<_, OrdSet<_>> = OrdMap::new();
+        for (&caller, equation) in &equations {
+            for &(callee, _) in &equation.edges {
+                anyhow::ensure!(equations.contains_key(&callee), "missing equation callee");
+                callers.entry(callee).or_default().insert(caller);
+            }
+        }
+        let witness_facts = facts
+            .iter()
+            .filter_map(|(&id, s)| (!s.witnesses.is_empty()).then_some(id))
+            .collect();
+        let witness_equations = equations
+            .iter()
+            .filter_map(|(&id, e)| (!e.seed.witnesses.is_empty()).then_some(id))
+            .collect();
         Ok(EffectSolution {
+            witness_facts,
+            witness_equations,
+            affected: HashSet::new(),
+            callers,
             facts: EffectFacts { summaries: facts },
             equations,
             recomputed: 0,
+            compared: 0,
         })
     }
 }
@@ -651,12 +847,12 @@ impl<W> StoredEffectSolution<W> {
 /// The solved summaries, keyed by [`FunctionId`].
 #[derive(Debug, Clone)]
 pub struct EffectFacts<W> {
-    summaries: BTreeMap<FunctionId, EffectSummary<W>>,
+    summaries: OrdMap<FunctionId, Arc<EffectSummary<W>>>,
 }
 
 impl<W: Clone + Ord> EffectFacts<W> {
     pub fn get(&self, id: &FunctionId) -> Option<&EffectSummary<W>> {
-        self.summaries.get(id)
+        self.summaries.get(id).map(Arc::as_ref)
     }
 
     /// Fail-closed lookup: an id with no summary is assumed to do `effects`.
@@ -667,7 +863,13 @@ impl<W: Clone + Ord> EffectFacts<W> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&FunctionId, &EffectSummary<W>)> {
-        self.summaries.iter()
+        self.summaries
+            .iter()
+            .map(|(id, summary)| (id, summary.as_ref()))
+    }
+
+    pub(crate) fn shared(&self, id: &FunctionId) -> Option<&Arc<EffectSummary<W>>> {
+        self.summaries.get(id)
     }
 
     pub fn len(&self) -> usize {
@@ -894,6 +1096,109 @@ mod tests {
             .get(&id(name))
             .map(EffectSummary::effects)
             .unwrap_or(NONE)
+    }
+
+    #[test]
+    fn retained_equation_delta_is_independent_of_unrelated_inventory() {
+        for count in [8, 32, 128] {
+            let mut graph = CallGraph::default();
+            calls(&mut graph, "caller", &["leaf"]);
+            calls(&mut graph, "leaf", &[]);
+            for i in 0..count {
+                calls(&mut graph, &format!("unrelated_{i}"), &[]);
+            }
+            let mut solution = permissive::<u8>().solve_incremental(&graph, None);
+            for effect in [PANIC, NONE, BLOCK, NONE] {
+                REACHABLE_EDGE_VISITS.with(|v| v.set(0));
+                solution.apply_delta(vec![(
+                    id("leaf"),
+                    Some(EffectEquation {
+                        seed: EffectSummary::new(effect, Some(1)),
+                        edges: vec![],
+                    }),
+                )]);
+                let visits = REACHABLE_EDGE_VISITS.with(|v| v.get());
+                assert_eq!(solution.compared, 1);
+                assert_eq!(solution.recomputed, 2);
+                assert!(visits <= 5, "unrelated={count} visits={visits}");
+                let cold = permissive().seed(id("leaf"), effect, Some(1)).solve(&graph);
+                assert_eq!(solution.facts.summaries, cold.summaries);
+                println!(
+                    "retained_delta unrelated={count} equations=1 recomputed=2 edge_visits={visits}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_equation_delta_handles_topology_masks_and_persistence() {
+        for count in [8, 32, 128] {
+            for shape in ["chain", "fanout", "cycle", "multi_exit"] {
+                let names: Vec<_> = (0..count).map(|i| format!("node_{i}")).collect();
+                let mut graph = CallGraph::default();
+                for (i, name) in names.iter().enumerate() {
+                    let targets: Vec<_> = match shape {
+                        "chain" => names.get(i + 1).into_iter().map(String::as_str).collect(),
+                        "fanout" if i > 0 => vec![names[0].as_str()],
+                        "cycle" => vec![names[(i + 1) % count].as_str()],
+                        "multi_exit" if i > 1 => vec![names[0].as_str(), names[1].as_str()],
+                        _ => vec![],
+                    };
+                    calls(&mut graph, name, &targets);
+                }
+                let mut solution = permissive::<u8>().solve_incremental(&graph, None);
+                let root = id(&names[0]);
+                for effect in [PANIC, NONE, BLOCK, RuntimeEffects::MAY_CHECKED_PANIC, NONE] {
+                    let mut equation = (*solution.equations[&root]).clone();
+                    equation.seed = EffectSummary::new(effect, Some(1));
+                    solution.apply_delta(vec![(root, Some(equation))]);
+                    let cold = permissive().seed(root, effect, Some(1)).solve(&graph);
+                    assert_eq!(solution.facts.summaries, cold.summaries, "{shape}/{count}");
+                    let bytes = serde_json::to_vec(&solution.store()).unwrap();
+                    solution = serde_json::from_slice::<StoredEffectSolution<u8>>(&bytes)
+                        .unwrap()
+                        .restore()
+                        .unwrap();
+                }
+                // Remove every outgoing edge of one node, then delete it. Both
+                // changes must drop obsolete reverse edges without losing callers.
+                let detached = id(&names[count - 1]);
+                let mut equation = (*solution.equations[&detached]).clone();
+                equation.edges.clear();
+                solution.apply_delta(vec![(detached, Some(equation))]);
+                let affected: Vec<_> = solution
+                    .callers
+                    .get(&detached)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                let mut changes = vec![(detached, None)];
+                for caller in affected {
+                    let mut equation = (*solution.equations[&caller]).clone();
+                    equation.edges.retain(|(callee, _)| *callee != detached);
+                    changes.push((caller, Some(equation)));
+                }
+                solution.apply_delta(changes);
+                assert!(!solution.facts.summaries.contains_key(&detached));
+                assert!(!solution.callers.contains_key(&detached));
+                assert!(
+                    solution
+                        .callers
+                        .values()
+                        .all(|callers| !callers.contains(&detached))
+                );
+                solution.apply_delta(vec![(
+                    detached,
+                    Some(EffectEquation {
+                        seed: EffectSummary::new(BLOCK, Some(2)),
+                        edges: vec![(root, NONE)],
+                    }),
+                )]);
+                assert_eq!(solution.recomputed, 1);
+                assert_eq!(solution.facts.get(&detached).unwrap().effects(), BLOCK);
+            }
+        }
     }
 
     #[test]
@@ -1381,6 +1686,74 @@ mod tests {
 mod frozen_proof_tests {
     use super::*;
     use crate::semantic::call_graph::CallSites;
+
+    #[test]
+    fn incremental_competing_witnesses_have_bounded_propagation() {
+        for n in [8usize, 32, 128] {
+            let mut nodes: Vec<_> = (0..n)
+                .map(|i| FunctionId::free(format!("competing_caller_{i:04}")))
+                .collect();
+            nodes.sort();
+            let leaves: Vec<_> = (0..n)
+                .map(|i| FunctionId::free(format!("competing_leaf_{i:04}")))
+                .collect();
+            let extra = FunctionId::free("competing_pure_boundary");
+            let mut graph = CallGraph::default();
+            let mut problem = EffectProblem::<usize>::new()
+                .external_callee(RuntimeEffects::NONE)
+                .missing_body(RuntimeEffects::NONE);
+            for i in 0..n {
+                let targets = std::iter::once(leaves[i])
+                    .chain(nodes.get(i + 1).copied())
+                    .collect();
+                graph.merge(
+                    nodes[i],
+                    CallSites {
+                        targets,
+                        ..Default::default()
+                    },
+                );
+                graph.merge(leaves[i], CallSites::default());
+                problem = problem.body(nodes[i]).body(leaves[i]).seed(
+                    leaves[i],
+                    RuntimeEffects::MAY_PANIC,
+                    Some(n - i),
+                );
+            }
+            graph.merge(extra, CallSites::default());
+            problem = problem.body(extra);
+            let mut warm = problem.clone().solve_incremental(&graph, None);
+            let terminal = nodes[n - 1];
+            let mut equation = warm.equation(terminal).unwrap().clone();
+            equation.edges.push((extra, RuntimeEffects::ALL));
+            DELTA_QUEUE_POPS.with(|v| v.set(0));
+            REACHABLE_EDGE_VISITS.with(|v| v.set(0));
+            warm.apply_delta(vec![(terminal, Some(equation))]);
+            let pops = DELTA_QUEUE_POPS.with(|v| v.get());
+            let edges = REACHABLE_EDGE_VISITS.with(|v| v.get());
+            graph.merge(
+                terminal,
+                CallSites {
+                    targets: [extra].into(),
+                    ..Default::default()
+                },
+            );
+            let cold = problem.solve(&graph);
+            for node in &nodes {
+                assert_eq!(warm.facts.get(node), cold.get(node));
+                assert_eq!(
+                    warm.facts
+                        .get(node)
+                        .unwrap()
+                        .witness(RuntimeEffects::MAY_PANIC),
+                    Some(&1)
+                );
+            }
+            assert!(pops <= 4 * n, "n={n} pops={pops}");
+            assert!(edges <= 8 * n + 1, "n={n} edges={edges}");
+            println!("competing-solver size={n} queue_pops={pops} edges={edges}");
+        }
+    }
 
     #[test]
     fn effect_contract_reachability_matches_fixpoint_and_bounds_work() {

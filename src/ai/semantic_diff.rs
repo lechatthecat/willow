@@ -5,6 +5,8 @@ mod tree;
 pub use tree::resolve_base;
 #[path = "semantic_diff_impact.rs"]
 mod impact;
+#[path = "semantic_diff_state.rs"]
+mod state;
 
 #[derive(Debug)]
 pub struct Options {
@@ -147,17 +149,28 @@ impl SemanticDiff {
         text
     }
 }
-struct Capture {
+#[derive(Clone)]
+pub(crate) struct Capture {
     baseline: Baseline,
-    contracts: BTreeMap<String, BTreeSet<String>>,
+    retained: state::ReportState,
+    fact_updates: usize,
+    witness_updates: usize,
+    witness_edges: usize,
+    witness_queue: usize,
+    graph_edges: usize,
+    coordinate_updates: usize,
+    contracts: im::OrdMap<String, BTreeSet<String>>,
     causes: CausePaths,
-    ambiguous: BTreeSet<String>,
+    ambiguous: im::OrdSet<String>,
+    contract_index: Option<Node>,
+    violations: im::OrdSet<String>,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CausePaths {
-    next: BTreeMap<(String, u8), String>,
-    leaves: BTreeMap<(String, u8), Value>,
-    unknown: BTreeSet<String>,
+    next: im::OrdMap<(String, u8), String>,
+    leaves: im::OrdMap<(String, u8), Value>,
+    unknown: im::OrdSet<String>,
+    locations: im::OrdMap<(String, usize, String, u8), usize>,
 }
 impl CausePaths {
     fn render(&self, key: &str, bit: u8) -> Value {
@@ -167,23 +180,13 @@ impl CausePaths {
             chain.push(target.clone());
             cursor = target;
         }
-        let leaf = self.leaves.get(&(cursor.to_owned(), bit));
+        let address = (cursor.to_owned(), bit);
+        let leaf = self.leaves.get(&address);
+        let location = leaf.map_or(Value::Null, |v| v["location"].clone());
         json!({"effect":effect_names(bit), "chain":chain,
-            "location":leaf.map(|v| &v["location"]),
+            "location":location,
             "certainty":leaf.map_or(if self.unknown.contains(key) {"missing-source"} else {"conservative-bound"}, |v| v["certainty"].as_str().unwrap())})
     }
-}
-fn symbol_stem(s: &symbols::Symbol, workspace: &str) -> Option<String> {
-    let location = s.location.as_ref()?;
-    if super::super::bundled_source(&location.path).is_some() {
-        return None;
-    }
-    Some(format!(
-        "{}::{}::{}",
-        relative(&location.path, workspace),
-        s.kind,
-        s.source_name.as_deref().unwrap_or(&s.name)
-    ))
 }
 fn effect_names(bits: u8) -> Vec<String> {
     (0..RuntimeEffects::BIT_COUNT)
@@ -217,55 +220,18 @@ fn contract_bits(contracts: &BTreeSet<String>) -> u8 {
 }
 impl Capture {
     fn from_snapshot(snapshot: &Snapshot, diagnostics: Vec<DiagnosticFact>) -> Result<Self> {
-        let mut baseline = Baseline::from_snapshot(snapshot, diagnostics)?;
-        let mut declarations: Vec<_> = snapshot
-            .semantic
-            .symbols
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.kind.as_str(),
-                    "function"
-                        | "method"
-                        | "constructor"
-                        | "class"
-                        | "interface"
-                        | "enum"
-                        | "variant"
-                        | "field"
-                        | "static-field"
-                        | "const"
-                )
-            })
-            .collect();
-        declarations.sort_by_key(|s| s.location.as_ref().map(|l| (&l.path, l.start, l.end)));
-        let mut ordinals = BTreeMap::new();
-        let mut ids = BTreeMap::new();
-        let mut contracts = BTreeMap::new();
-        for s in declarations {
-            let Some(stem) = symbol_stem(s, &snapshot.workspace) else {
-                continue;
-            };
-            let ordinal = ordinals.entry(stem.clone()).or_insert(0usize);
-            let key = format!("{stem}#{ordinal}");
-            *ordinal += 1;
-            ids.insert(s.id.clone(), key.clone());
-            contracts.insert(key, s.details.effect_contracts.iter().cloned().collect());
-        }
-        for f in &snapshot.functions {
-            ids.entry(f.id.clone()).or_insert_with(|| {
-                format!(
-                    "{}::function::{}",
-                    relative(&f.module, &snapshot.workspace),
-                    f.name
-                )
-            });
-        }
+        let (mut baseline, names) = Baseline::from_snapshot_with_names(snapshot, diagnostics)?;
+        let super::SnapshotNames {
+            type_names,
+            ids,
+            ambiguous,
+            contracts,
+        } = names;
         // Compiler waiting summaries apply async transmission masks. Legacy
         // graph aggregation is intentionally unchanged; use those summaries
         // here so merely creating a Task does not introduce a wait.
         for f in &snapshot.functions {
-            if let Some(fact) = baseline.facts.get_mut(&ids[&f.id]) {
+            if let Some(fact) = baseline.facts.get_mut(&ids[&f.id]).map(Arc::make_mut) {
                 let waiting = RuntimeEffects::MAY_BLOCK
                     .union(RuntimeEffects::MAY_SUSPEND)
                     .bits();
@@ -276,7 +242,7 @@ impl Capture {
                     .map_or(f.runtime_effects, |checked| {
                         (f.runtime_effects & !waiting) | (checked & waiting)
                     });
-                fact.effects = Some(EffectState {
+                let effects = Some(EffectState {
                     may: bits,
                     unknown: if f.unknown {
                         RuntimeEffects::ALL.bits() & !bits
@@ -284,101 +250,46 @@ impl Capture {
                         0
                     },
                 });
+                if fact.effects != effects {
+                    fact.effects = effects;
+                    baseline.refresh_effect_fact_index(&ids[&f.id])?;
+                }
             }
         }
-        baseline.reindex()?;
-        let ambiguous = ordinals
-            .into_iter()
-            .filter(|(_, n)| *n > 1)
-            .map(|(s, _)| s)
-            .collect();
         let mut causes = CausePaths::default();
-        let functions: BTreeMap<_, _> = snapshot
-            .functions
-            .iter()
-            .map(|f| (f.id.as_str(), f))
-            .collect();
-        let mut reverse: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for f in &snapshot.functions {
-            for callee in &f.callees {
-                reverse.entry(callee).or_default().push(&f.id);
+        let mut retained = state::ReportState::new(snapshot, ids, type_names);
+        retained.replace_leaves(snapshot, &mut causes);
+        let affected = retained.functions.keys().cloned().collect();
+        let (witness_updates, witness_edges, witness_queue) =
+            retained.repair_causes(&affected, &mut causes);
+        // Reuse the baseline fact index; only contracts need an extra index.
+        // Empty contracts are the default, so unrelated declarations cost no
+        // additional index storage or hashing here.
+        let mut entries = Vec::new();
+        let mut violations = im::OrdSet::new();
+        for (key, contract) in &contracts {
+            let bits = baseline
+                .facts
+                .get(key)
+                .and_then(|f| f.effects.as_ref())
+                .map_or(0, |e| e.may | e.unknown);
+            if bits & contract_bits(contract) != 0 {
+                violations.insert(key.clone());
             }
+            entries.push((hash(key), key.clone(), hash_serialized(contract)?));
         }
-        for callers in reverse.values_mut() {
-            callers.sort_by_key(|id| &ids[*id]);
-            callers.dedup();
-        }
-        let mut ordered: Vec<_> = snapshot.functions.iter().collect();
-        ordered.sort_by_key(|f| &ids[&f.id]);
-        // A deterministic next-hop forest per capability, shared by all reports.
-        for i in 0..RuntimeEffects::BIT_COUNT {
-            let bit = RuntimeEffects::from_bit(i).bits();
-            let mut next: BTreeMap<&str, &str> = BTreeMap::new();
-            let mut leaves = BTreeMap::new();
-            let mut queue = VecDeque::new();
-            for f in &ordered {
-                let mut witnesses: Vec<_> = snapshot
-                    .semantic
-                    .witnesses
-                    .get(&f.id)
-                    .into_iter()
-                    .flatten()
-                    .filter(|w| w["effect"] == bit && !w["witness"]["cause"]["location"].is_null())
-                    .collect();
-                witnesses.sort_by_cached_key(|w| w.to_string());
-                if let Some(w) = witnesses.first() {
-                    let mut location = w["witness"]["cause"]["location"].clone();
-                    if let Some(path) = location["path"].as_str() {
-                        location["path"] = json!(relative(path, &snapshot.workspace));
-                    }
-                    let certainty = if w["witness"]["cause"]["is_conservative"] == true {
-                        "conservative-bound"
-                    } else {
-                        w["witness"]["certainty"]
-                            .as_str()
-                            .unwrap_or("compiler-proven")
-                    };
-                    leaves.insert(
-                        f.id.as_str(),
-                        json!({"location":location,"certainty":certainty}),
-                    );
-                    next.insert(&f.id, &f.id);
-                    queue.push_back(f.id.as_str());
-                }
-            }
-            while let Some(callee) = queue.pop_front() {
-                for &caller in reverse.get(callee).into_iter().flatten() {
-                    if functions[caller].runtime_effects & bit != 0
-                        && !next.contains_key(caller)
-                        && !(bit
-                            & RuntimeEffects::MAY_BLOCK
-                                .union(RuntimeEffects::MAY_SUSPEND)
-                                .bits()
-                            != 0
-                            && snapshot.semantic.async_functions.contains(callee))
-                    {
-                        next.insert(caller, callee);
-                        queue.push_back(caller);
-                    }
-                }
-            }
-            for (id, target) in next {
-                if id != target {
-                    causes
-                        .next
-                        .insert((ids[id].clone(), bit), ids[target].clone());
-                }
-            }
-            for (id, leaf) in leaves {
-                causes.leaves.insert((ids[id].clone(), bit), leaf);
-            }
-        }
-        causes.unknown = ordered
-            .iter()
-            .filter(|f| f.unknown && super::super::bundled_source(&f.module).is_none())
-            .map(|f| ids[&f.id].clone())
-            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let contract_index = Node::build(&entries);
         Ok(Self {
+            fact_updates: snapshot.functions.len(),
+            witness_updates,
+            witness_edges,
+            witness_queue,
+            graph_edges: 0,
+            coordinate_updates: 0,
+            retained,
+            contract_index,
+            violations,
             baseline,
             contracts,
             causes,
@@ -423,61 +334,170 @@ fn analyze(
     let mut compiler_options = crate::CompilerOptions::debug();
     compiler_options.offline = project;
     compiler_options.locked = project && scratch.0.join("project.lock").is_file();
-    let session = crate::CompilerSession::new(
-        entry.to_str().context("non UTF-8 entry")?,
-        "",
-        &compiler_options,
-        project.then(|| scratch.0.clone()),
-    );
-    let mut diagnostics = Diagnostics::default();
-    let mut snapshot = revision
-        .analyze_verification(session, &mut diagnostics)
-        .map_err(|error| {
-            let messages = diagnostics
-                .facts
-                .iter()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            anyhow::anyhow!("{error:#}: {messages}")
-        })?;
-    for path in snapshot.sources.keys() {
-        ensure!(
-            Path::new(path).starts_with(&scratch.0) || super::super::bundled_source(path).is_some(),
-            "dependency outside captured inputs"
+    let run = |revision: &mut crate::compiler_db::revision::AnalysisRevision,
+               diagnostics: &mut Diagnostics| {
+        let session = crate::CompilerSession::new(
+            entry.to_str().context("non UTF-8 entry")?,
+            "",
+            &compiler_options,
+            project.then(|| scratch.0.clone()),
         );
+        revision.analyze_verification_delta(session, diagnostics)
+    };
+    let mut diagnostics = Diagnostics::default();
+    let result = run(revision, &mut diagnostics);
+    let mut update = match result {
+        Err(error)
+            if error
+                .downcast_ref::<crate::ai::VerificationSnapshotColdFallback>()
+                .is_some() =>
+        {
+            // Duplicate declaration identities cannot safely key reusable body
+            // or call-graph facts. Rebuild this ambiguous scope from source.
+            *revision = crate::compiler_db::revision::AnalysisRevision::default();
+            diagnostics = Diagnostics::default();
+            run(revision, &mut diagnostics)
+        }
+        Err(error)
+            if error
+                .downcast_ref::<crate::ai::VerificationSnapshotFallback>()
+                .is_some() =>
+        {
+            revision.snapshot_state = crate::ai::VerificationSnapshotState::default();
+            diagnostics = Diagnostics::default();
+            run(revision, &mut diagnostics)
+        }
+        result => result,
     }
-    // Standalone analysis uses the entry's parent for compiler resolution.
-    // Evidence, including baseline identities and diagnostics, uses --root.
-    snapshot.workspace = scratch
-        .0
-        .to_str()
-        .context("non UTF-8 captured root")?
-        .to_owned();
-    Capture::from_snapshot(&snapshot, diagnostics.facts)
+    .map_err(|error| {
+        let messages = diagnostics
+            .facts
+            .iter()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::anyhow!("{error:#}: {messages}")
+    })?;
+    let capture_result = (|| -> Result<Capture> {
+        let snapshot = match &mut update {
+            crate::ai::VerificationSnapshotUpdate::Full(snapshot) => snapshot,
+            crate::ai::VerificationSnapshotUpdate::Delta { patch, .. } => patch,
+        };
+        for path in snapshot.sources.keys() {
+            ensure!(
+                Path::new(path).starts_with(&scratch.0)
+                    || super::super::bundled_source(path).is_some(),
+                "dependency outside captured inputs"
+            );
+        }
+        // Standalone analysis uses the entry's parent for compiler resolution.
+        // Evidence, including baseline identities and diagnostics, uses --root.
+        snapshot.workspace = scratch
+            .0
+            .to_str()
+            .context("non UTF-8 captured root")?
+            .to_owned();
+        let capture = match &update {
+            crate::ai::VerificationSnapshotUpdate::Full(snapshot) => {
+                Capture::from_snapshot(snapshot, diagnostics.facts)?
+            }
+            crate::ai::VerificationSnapshotUpdate::Delta {
+                patch,
+                removed_functions,
+                removed_symbols,
+                relocations,
+            } => revision
+                .verification_capture
+                .as_ref()
+                .context("retained report baseline")?
+                .update(
+                    patch,
+                    removed_functions,
+                    removed_symbols,
+                    relocations,
+                    diagnostics.facts,
+                )?,
+        };
+        Ok(capture)
+    })();
+    let capture = match capture_result {
+        Ok(capture) => capture,
+        Err(error) => {
+            revision.snapshot_state = crate::ai::VerificationSnapshotState::default();
+            revision.verification_capture = None;
+            return Err(error);
+        }
+    };
+    revision.incremental_stats["report_facts_rebuilt"] = json!(capture.fact_updates);
+    revision.incremental_stats["report_witness_owners_visited"] = json!(capture.witness_updates);
+    revision.incremental_stats["report_witness_edges_visited"] = json!(capture.witness_edges);
+    revision.incremental_stats["report_witness_queue_operations"] = json!(capture.witness_queue);
+    revision.incremental_stats["report_dependency_edges_visited"] = json!(capture.graph_edges);
+    revision.incremental_stats["report_coordinate_leaves_visited"] =
+        json!(capture.coordinate_updates);
+    revision.verification_capture = Some(capture.clone());
+    Ok(capture)
+}
+fn comparison_keys(before: &Capture, after: &Capture, work: &mut Work) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    Node::difference(
+        before.baseline.index.as_ref(),
+        after.baseline.index.as_ref(),
+        &mut keys,
+        work,
+    );
+    Node::difference(
+        before.contract_index.as_ref(),
+        after.contract_index.as_ref(),
+        &mut keys,
+        work,
+    );
+    // Existing violations remain evidence even when their summaries are equal.
+    keys.extend(
+        before
+            .violations
+            .iter()
+            .chain(after.violations.iter())
+            .cloned(),
+    );
+    work.compared_symbols = keys.len();
+    keys
 }
 fn compare(before: &Capture, after: &Capture, fail_on_growth: bool) -> Result<SemanticDiff> {
+    let keys = comparison_keys(before, after, &mut Work::default());
+    compare_keys(before, after, fail_on_growth, keys)
+}
+fn compare_keys(
+    before: &Capture,
+    after: &Capture,
+    fail_on_growth: bool,
+    keys: BTreeSet<String>,
+) -> Result<SemanticDiff> {
     let old = &before.baseline;
     let new = &after.baseline;
     let legacy = old.compare(new)?;
-    let keys: BTreeSet<_> = old.facts.keys().chain(new.facts.keys()).collect();
     let empty = BTreeSet::new();
     let mut changes = Vec::new();
     let mut growth = 0;
     let mut emitted_hops = 0usize;
     let mut uncertainty = Vec::new();
-    for stem in before.ambiguous.union(&after.ambiguous) {
+    for stem in before.ambiguous.clone().union(after.ambiguous.clone()) {
         uncertainty.push(format!("ambiguous symbol: {stem}"));
         changes.push(json!({"symbol":stem,"match":"ambiguous","effects":null,"cause":[],"impacted_callers":[],"contract":null,"public_api":"unknown","targets":null}));
     }
-    for key in before.causes.unknown.union(&after.causes.unknown) {
+    for key in before
+        .causes
+        .unknown
+        .clone()
+        .union(after.causes.unknown.clone())
+    {
         uncertainty.push(format!("missing-source: {key}"));
     }
     for key in keys {
-        let a = old.facts.get(key);
-        let b = new.facts.get(key);
-        let ca = before.contracts.get(key).unwrap_or(&empty);
-        let cb = after.contracts.get(key).unwrap_or(&empty);
+        let a = old.facts.get(&key);
+        let b = new.facts.get(&key);
+        let ca = before.contracts.get(&key).unwrap_or(&empty);
+        let cb = after.contracts.get(&key).unwrap_or(&empty);
         let ae = a
             .and_then(|f| f.effects.as_ref())
             .map_or(0, |e| e.may | e.unknown);
@@ -542,7 +562,7 @@ fn compare(before: &Capture, after: &Capture, fail_on_growth: bool) -> Result<Se
                 (after, added | bv, "target"),
             ] {
                 if bits & bit != 0 {
-                    let mut cause = capture.causes.render(key, bit);
+                    let mut cause = capture.causes.render(&key, bit);
                     emitted_hops += cause["chain"].as_array().map_or(0, Vec::len);
                     ensure!(
                         emitted_hops <= 1_000_000,

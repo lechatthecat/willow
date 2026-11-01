@@ -6,7 +6,7 @@ use super::*;
 use crate::semantic::indirect_lock::IndirectCall;
 use std::collections::HashSet;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct Inputs {
     pub values: Vec<(Option<FunctionId>, u64, Option<String>)>,
     pub calls: Vec<IndirectCall>,
@@ -148,14 +148,14 @@ fn bucket(
     }
 }
 
-fn bucket_id(slot: usize) -> String {
+pub(super) fn bucket_id(slot: usize) -> String {
     format!("$indirect-arity:{slot}")
 }
 
-fn wild_bucket_id(slot: usize) -> String {
+pub(super) fn wild_bucket_id(slot: usize) -> String {
     format!("$indirect-arity:{slot}:*")
 }
 
-fn typed_bucket_id(slot: usize, key: &str) -> String {
+pub(super) fn typed_bucket_id(slot: usize, key: &str) -> String {
     format!("$indirect-arity:{slot}:{}", hash(key))
 }

@@ -949,6 +949,7 @@ mod tests {
                 lambda_names: HashMap::new(),
                 rename_calls: Vec::new(),
                 direct: HashMap::new(),
+                own_effects: HashMap::new(),
                 dispatches: HashMap::new(),
                 dispatch_sites: HashMap::new(),
             };
@@ -1035,6 +1036,7 @@ mod tests {
                     lambda_names: HashMap::new(),
                     rename_calls: Vec::new(),
                     direct: HashMap::new(),
+                    own_effects: HashMap::new(),
                     dispatches: HashMap::new(),
                     dispatch_sites: HashMap::new(),
                 };

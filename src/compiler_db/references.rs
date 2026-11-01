@@ -101,6 +101,16 @@ impl ReferenceQueries {
                 result.push(serde_json::from_value::<Reference>(reference)?);
             }
         }
+        Ok(Self::sorted(result))
+    }
+    /// A retained-snapshot patch carries only affected owners' references;
+    /// unchanged owners keep theirs in the retained snapshot. Capturing this
+    /// partial inventory would mark every other use removed, so the tracked
+    /// reference table keeps its last complete inventory instead.
+    pub(crate) fn patch(&self, references: Vec<Reference>) -> Vec<Reference> {
+        Self::sorted(references)
+    }
+    fn sorted(mut result: Vec<Reference>) -> Vec<Reference> {
         result.sort_by(|a, b| {
             (
                 &a.location.path,
@@ -117,7 +127,7 @@ impl ReferenceQueries {
                     &b.role,
                 ))
         });
-        Ok(result)
+        result
     }
 }
 

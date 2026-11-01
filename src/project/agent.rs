@@ -120,7 +120,7 @@ pub fn render_agent_instructions(agent: Agent, caps: AgentCapabilities) -> Strin
             text.push_str(&format!("Direct rename is unavailable. Use the low-level structured edit protocol: `{command}`, then edit validate and edit apply for the returned transaction.\n\n"));
         }
         if caps.machine_check.is_some() {
-            text.push_str("After changes run `willow check .`.\n");
+            text.push_str("For semantic edits, choose a Git base before editing. Inspect overview/refs/type/effects/impact as needed, make the change, then run `willow check . --format ndjson` and `willow verify-edit --base BASE --format json`. Fix reported problems, rerun verification, run focused tests, and review the diff. The verification report uses willow.semantic-diff.v1, not the check NDJSON event stream. Exit 0 means complete with no policy violations, 1 means contract or requested policy violations, 2 means command failure, and 3 means incomplete evidence; never treat incomplete as success. Use --fail-on effect-growth when growth must fail verification and --explain for human witness chains.\n");
         }
         if caps.machine_build.is_some() {
             text.push_str("When executable validation is needed, run `willow build .`.\n");
@@ -307,6 +307,29 @@ mod tests {
             assert!(partial.contains("type-example"));
             assert!(partial.contains("edit-fallback-example"));
             assert_eq!(caps.instruction_schema(), 3);
+        }
+    }
+
+    #[test]
+    fn semantic_edit_loop_keeps_protocols_distinct() {
+        for agent in [Agent::Codex, Agent::Claude] {
+            let caps = AgentCapabilities {
+                direct_overview: Some("willow overview ."),
+                machine_check: Some("willow check . --format ndjson"),
+                ..Default::default()
+            };
+            let instructions = render_agent_instructions(agent, caps);
+            for expected in [
+                "overview/refs/type/effects/impact",
+                "willow check . --format ndjson",
+                "willow verify-edit --base BASE --format json",
+                "willow.semantic-diff.v1",
+                "3 means incomplete",
+                "focused tests",
+                "review the diff",
+            ] {
+                assert!(instructions.contains(expected), "{expected}");
+            }
         }
     }
 

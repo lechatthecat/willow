@@ -8,12 +8,20 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+type TokenPositions = HashMap<(crate::diagnostics::FileId, usize), (usize, usize, usize)>;
+#[derive(Default, Debug)]
+struct TokenBoundaries {
+    starts: TokenPositions,
+    ends: TokenPositions,
+}
+
 #[derive(Default, Debug)]
 pub(crate) struct Correspondence {
     pub spans: HashMap<Span, Span>,
     pub unchanged: HashSet<BodyId>,
     pub unchanged_initializers: HashSet<ExprId>,
     token_ranges: Vec<(Span, Span)>,
+    token_boundaries: TokenBoundaries,
 }
 
 fn span(value: &Value) -> Option<Span> {
@@ -262,6 +270,12 @@ impl Correspondence {
             {
                 for ((_, a), (_, b)) in previous.iter().zip(current) {
                     self.spans.insert(*a, *b);
+                    self.token_boundaries
+                        .ends
+                        .insert((a.file_id, a.end), (b.end, b.line, b.col));
+                    self.token_boundaries
+                        .starts
+                        .insert((a.file_id, a.start), (b.start, b.line, b.col));
                 }
             }
         }
@@ -288,23 +302,79 @@ impl Correspondence {
         value: &T,
         local: &HashMap<Span, Span>,
     ) -> Result<T> {
-        fn walk(value: &mut Value, spans: &HashMap<Span, Span>, local: &HashMap<Span, Span>) {
+        fn walk(
+            value: &mut Value,
+            spans: &HashMap<Span, Span>,
+            local: &HashMap<Span, Span>,
+            boundaries: &TokenBoundaries,
+        ) {
             if let Some(old) = span(value) {
-                if let Some(new) = local.get(&old).or_else(|| spans.get(&old)) {
+                if let Some(new) = local
+                    .get(&old)
+                    .copied()
+                    .or_else(|| relocate_span(spans, boundaries, old))
+                {
                     *value = serde_json::to_value(new).expect("span");
                 }
                 return;
             }
             match value {
-                Value::Object(object) => object.values_mut().for_each(|v| walk(v, spans, local)),
-                Value::Array(array) => array.iter_mut().for_each(|v| walk(v, spans, local)),
+                Value::Object(object) => object
+                    .values_mut()
+                    .for_each(|v| walk(v, spans, local, boundaries)),
+                Value::Array(array) => array
+                    .iter_mut()
+                    .for_each(|v| walk(v, spans, local, boundaries)),
                 _ => {}
             }
         }
         let mut value = serde_json::to_value(value)?;
-        walk(&mut value, &self.spans, local);
+        walk(&mut value, &self.spans, local, &self.token_boundaries);
         Ok(serde_json::from_value(value)?)
     }
+
+    /// The current coordinates of one retained span, or `None` when it does
+    /// not follow an unchanged token sequence.
+    /// Files containing at least one relocated coordinate.
+    pub(crate) fn moved_files(&self) -> HashSet<crate::diagnostics::FileId> {
+        self.spans
+            .iter()
+            .filter(|(old, new)| old != new)
+            .map(|(old, _)| old.file_id)
+            .collect()
+    }
+    pub(crate) fn span(&self, old: Span) -> Option<Span> {
+        relocate_span(&self.spans, &self.token_boundaries, old)
+    }
+}
+
+fn relocate_span(
+    spans: &HashMap<Span, Span>,
+    boundaries: &TokenBoundaries,
+    old: Span,
+) -> Option<Span> {
+    if let Some(new) = spans.get(&old) {
+        return Some(*new);
+    }
+    let &(start, line, col) = boundaries
+        .starts
+        .get(&(old.file_id, old.start))
+        .or_else(|| boundaries.ends.get(&(old.file_id, old.start)))?;
+    let &(end, _, _) = boundaries
+        .ends
+        .get(&(old.file_id, old.end))
+        .or_else(|| boundaries.starts.get(&(old.file_id, old.end)))?;
+    // Analysis may narrow an AST range to several source tokens (for example
+    // a member call before its first argument). Such ranges are not exact
+    // AST/token spans, but both ends follow the already matched unchanged
+    // token sequence.
+    (start <= end).then_some(Span {
+        start,
+        end,
+        line,
+        col,
+        ..old
+    })
 }
 
 #[cfg(test)]
@@ -314,6 +384,63 @@ mod tests {
         ast::*,
         iter::{AstEvent, AstWalk},
     };
+
+    #[test]
+    fn narrowed_reference_ranges_follow_matched_token_boundaries() {
+        let old = Span::new(10, 30, 1, 1);
+        let new = Span::new(20, 40, 2, 1);
+        let mut correspondence = Correspondence {
+            token_ranges: vec![(old, new)],
+            ..Default::default()
+        };
+        correspondence.map_tokens(
+            &[
+                ("member".into(), Span::new(12, 18, 1, 3)),
+                ("arg".into(), Span::new(19, 22, 1, 10)),
+            ],
+            &[
+                ("member".into(), Span::new(22, 28, 2, 3)),
+                ("arg".into(), Span::new(29, 32, 2, 10)),
+            ],
+        );
+        assert_eq!(
+            correspondence.remap(&Span::new(12, 19, 1, 3)).unwrap(),
+            Span::new(22, 29, 2, 3)
+        );
+        // An unmatched endpoint must not manufacture a source correspondence.
+        assert_eq!(
+            correspondence.remap(&Span::new(12, 17, 1, 3)).unwrap(),
+            Span::new(12, 17, 1, 3)
+        );
+    }
+
+    #[test]
+    fn composite_span_end_does_not_absorb_inserted_whitespace() {
+        let mut correspondence = Correspondence {
+            token_ranges: vec![(Span::new(0, 3, 1, 1), Span::new(10, 15, 2, 1))],
+            ..Default::default()
+        };
+        correspondence.map_tokens(
+            &[
+                ("a".into(), Span::new(0, 1, 1, 1)),
+                ("b".into(), Span::new(1, 2, 1, 2)),
+                ("c".into(), Span::new(2, 3, 1, 3)),
+            ],
+            &[
+                ("a".into(), Span::new(10, 11, 2, 1)),
+                ("b".into(), Span::new(11, 12, 2, 2)),
+                ("c".into(), Span::new(14, 15, 2, 5)),
+            ],
+        );
+        assert_eq!(
+            correspondence.remap(&Span::new(0, 2, 1, 1)).unwrap(),
+            Span::new(10, 12, 2, 1)
+        );
+        assert_eq!(
+            correspondence.remap(&Span::new(1, 3, 1, 2)).unwrap(),
+            Span::new(11, 15, 2, 2)
+        );
+    }
 
     #[test]
     fn span_probe_matches_exact_serde_schema() {

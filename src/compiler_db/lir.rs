@@ -105,10 +105,13 @@ impl LirQueries {
             .borrow_mut()
             .validate_derived_typed::<V>(node.clone(), deps.clone())?;
         if let Some(value) = cached {
-            if !tracking.bodies.cached_coordinates_changed() {
-                return Ok(value);
-            }
-            let result = tracking.bodies.remap_cached(&value)?;
+            use super::incremental::DerivedCoordinates;
+            let coordinates = tracking.queries.borrow().derived_coordinates(&node);
+            let result = match coordinates {
+                DerivedCoordinates::Current => return Ok(value),
+                DerivedCoordinates::Previous => tracking.bodies.remap_cached(&value)?,
+                DerivedCoordinates::Stale => compute()?,
+            };
             tracking
                 .queries
                 .borrow_mut()
