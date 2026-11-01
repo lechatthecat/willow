@@ -41,6 +41,11 @@ use crate::semantic::ids::FunctionId;
 
 pub use willow_abi::RuntimeEffects;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REACHABLE_EDGE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// What one body can do, plus the witness that proves each effect.
 ///
 /// A witness is whatever the consumer needs to point at in a diagnostic: the
@@ -255,6 +260,98 @@ impl<W: Clone + Ord> EffectProblem<W> {
     /// revisited only when its callee's summary actually grows.
     pub fn solve(self, graph: &CallGraph) -> EffectFacts<W> {
         self.solve_incremental(graph, None).facts
+    }
+
+    /// Non-incremental reachability for consumers needing only a frozen proof.
+    /// Process witness roots in ascending order: the first root to reach a node
+    /// is its minimum witness, so no later root revisits that node's callers.
+    /// With a fixed number of bits this costs O((V + E) log V) time and O(V + E)
+    /// space, rather than repeatedly scanning callers after decreasing witnesses.
+    pub(crate) fn solve_reachable(self, graph: &CallGraph) -> EffectFacts<W> {
+        let mut universe = self.bodies.clone();
+        universe.extend(self.seeds.keys().copied());
+        universe.extend(graph.ids().copied());
+        let nodes: Vec<_> = universe.into_iter().collect();
+        let index: HashMap<_, _> = nodes.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let mut summaries = vec![EffectSummary::default(); nodes.len()];
+        let mut callers = vec![Vec::new(); nodes.len()];
+        for (i, id) in nodes.iter().enumerate() {
+            if let Some(seed) = self.seeds.get(id) {
+                summaries[i] = seed.clone();
+            }
+            let Some(sites) = graph.get(id) else {
+                if self.bodies.contains(id) {
+                    summaries[i].add(self.missing_body, None);
+                }
+                continue;
+            };
+            if sites.has_unknown {
+                summaries[i].add(self.unknown_callee, None);
+            }
+            for target in &sites.targets {
+                let mask = self
+                    .transmit
+                    .get(target)
+                    .copied()
+                    .unwrap_or(self.default_transmit);
+                if let Some(&callee) = index.get(target) {
+                    callers[callee].push((i, mask));
+                } else {
+                    summaries[i].add(self.external_callee.intersection(mask), None);
+                }
+            }
+        }
+        for bit_index in 0..RuntimeEffects::BIT_COUNT {
+            let bit = RuntimeEffects::from_bit(bit_index);
+            let mut roots: Vec<_> = summaries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.witness(bit).map(|w| (w.clone(), i)))
+                .collect();
+            roots.sort();
+            let mut work: Vec<_> = summaries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.intersects(bit).then_some(i))
+                .collect();
+            let mut seen = vec![false; nodes.len()];
+            for &i in &work {
+                seen[i] = true;
+            }
+            while let Some(callee) = work.pop() {
+                for &(caller, mask) in &callers[callee] {
+                    #[cfg(test)]
+                    REACHABLE_EDGE_VISITS.with(|v| v.set(v.get() + 1));
+                    if mask.intersects(bit) && !seen[caller] {
+                        seen[caller] = true;
+                        summaries[caller].add(bit, None);
+                        work.push(caller);
+                    }
+                }
+            }
+            seen.fill(false);
+            for (witness, root) in roots {
+                if seen[root] {
+                    continue;
+                }
+                seen[root] = true;
+                work.push(root);
+                while let Some(callee) = work.pop() {
+                    summaries[callee].record_witness(bit_index, &witness);
+                    for &(caller, mask) in &callers[callee] {
+                        #[cfg(test)]
+                        REACHABLE_EDGE_VISITS.with(|v| v.set(v.get() + 1));
+                        if mask.intersects(bit) && !seen[caller] {
+                            seen[caller] = true;
+                            work.push(caller);
+                        }
+                    }
+                }
+            }
+        }
+        EffectFacts {
+            summaries: nodes.into_iter().zip(summaries).collect(),
+        }
     }
 
     pub(crate) fn solve_incremental(
@@ -1277,5 +1374,71 @@ mod tests {
             .seed(id(&names[DEPTH - 1]), PANIC, None)
             .solve(&graph);
         assert_eq!(effects_of(&facts, &names[0]), PANIC);
+    }
+}
+
+#[cfg(test)]
+mod frozen_proof_tests {
+    use super::*;
+    use crate::semantic::call_graph::CallSites;
+
+    #[test]
+    fn effect_contract_reachability_matches_fixpoint_and_bounds_work() {
+        let wait = RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_SUSPEND);
+        for shape in ["chain", "cycle", "fanout", "many-roots"] {
+            for n in [8, 32, 128, 512] {
+                let ids: Vec<_> = (0..n)
+                    .map(|i| FunctionId::free(format!("f{i:04}")))
+                    .collect();
+                let mut graph = CallGraph::default();
+                let mut problem = EffectProblem::<usize>::new()
+                    .unknown_callee(wait)
+                    .external_callee(wait)
+                    .missing_body(wait)
+                    .default_transmit(wait);
+                for i in 0..n {
+                    let target = match shape {
+                        "fanout" => (i > 0).then_some(ids[0]),
+                        "cycle" => Some(ids[(i + 1) % n]),
+                        _ => (i > 0).then(|| ids[i - 1]),
+                    };
+                    graph.merge(
+                        ids[i],
+                        CallSites {
+                            targets: target.into_iter().collect(),
+                            has_unknown: i == n / 2,
+                            ..Default::default()
+                        },
+                    );
+                    problem = problem.body(ids[i]);
+                    if i == 0 || shape == "many-roots" {
+                        problem = problem.seed(ids[i], wait, Some(n - i));
+                    }
+                    if i % 7 == 6 {
+                        problem = problem.transmit(ids[i], RuntimeEffects::MAY_BLOCK);
+                    }
+                }
+                let missing = FunctionId::free("missing-body");
+                problem = problem.body(missing);
+                graph.merge(
+                    ids[0],
+                    CallSites {
+                        targets: [FunctionId::free("external"), missing].into(),
+                        ..Default::default()
+                    },
+                );
+                let expected = problem.clone().solve(&graph);
+                REACHABLE_EDGE_VISITS.with(|v| v.set(0));
+                let actual = problem.solve_reachable(&graph);
+                assert_eq!(expected.summaries, actual.summaries, "{shape} {n}");
+                let visits = REACHABLE_EDGE_VISITS.with(|v| v.get());
+                let edges = graph
+                    .iter()
+                    .map(|(_, sites)| sites.targets.len())
+                    .sum::<usize>();
+                assert!(visits <= 4 * edges, "{shape} {n}: {visits} > {}", 4 * edges);
+                println!("contract-solver shape={shape} nodes={n} edges={edges} visits={visits}");
+            }
+        }
     }
 }

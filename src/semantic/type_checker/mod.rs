@@ -906,6 +906,7 @@ impl TypeChecker {
             methods.insert(
                 method.name.clone(),
                 MethodInfo {
+                    effect_contracts: method.effect_contracts.clone(),
                     array_body_optimization: method.array_body_optimization,
                     param_infos: self.normalize_decl_param_infos(&method.params, module_prefix),
                     params,
@@ -2169,6 +2170,7 @@ fn imported_class_info_from_decl(
         methods.insert(
             method.name.clone(),
             MethodInfo {
+                effect_contracts: method.effect_contracts.clone(),
                 array_body_optimization: method.array_body_optimization,
                 param_infos: qualify_params(&method.params),
                 params,

@@ -117,6 +117,9 @@ pub(crate) struct UnitEffects {
 }
 
 pub(crate) struct EffectQueries {
+    /// Verified contract proofs for this checking session only. Never restored
+    /// from persistent runtime summaries or copied across source revisions.
+    pub(crate) contract_facts: std::cell::RefCell<HashMap<UnitId, Arc<EffectFacts<EffectWitness>>>>,
     pub(crate) static_initializers: super::static_init::StaticInitQueries,
     solutions: std::cell::RefCell<
         HashMap<UnitId, Arc<crate::semantic::effects::EffectSolution<EffectWitness>>>,
@@ -152,6 +155,7 @@ pub(crate) struct EffectQueries {
 impl Default for EffectQueries {
     fn default() -> Self {
         Self {
+            contract_facts: Default::default(),
             static_initializers: Default::default(),
             solutions: Default::default(),
             io_solutions: Default::default(),
@@ -2699,6 +2703,65 @@ mod tests {
                 }
             );
             assert!(fact.witness(LOCK_EFFECT_WAIT).is_none(), "{fact:?}");
+        }
+    }
+
+    #[test]
+    fn effect_contract_imported_proofs_require_current_verification() {
+        use crate::diagnostics::ErrorCode;
+        for mode in ["missing", "current", "stale", "waiting", "callback", "ffi"] {
+            let dependency = crate::module::ModuleId(7);
+            let worker = program(match mode {
+                "waiting" => "pub fn run(c: BlockingCell<i64>) { c.get(); }",
+                "callback" => "pub fn run(f: fn()) { f(); }",
+                "ffi" => "extern rust { fn foreign(); } pub fn run() { foreign(); }",
+                _ => "pub fn run() {}",
+            });
+            let mut queries = EffectQueries::default();
+            queries.names.insert("dependency".into(), dependency);
+            let mut queries = std::rc::Rc::new(queries);
+            if mode != "missing" {
+                let mut provider = crate::semantic::TypeChecker::new();
+                provider.set_effect_queries(queries.clone(), dependency);
+                provider.check_program(&worker);
+                assert!(provider.errors.is_empty(), "{mode}: {:?}", provider.errors);
+            }
+            if mode == "stale" {
+                let mut fresh = EffectQueries::default();
+                fresh.names.insert("dependency".into(), dependency);
+                fresh.reuse_from(&queries);
+                queries = std::rc::Rc::new(fresh);
+                assert!(queries.contract_facts.borrow().is_empty());
+            }
+            let source = match mode {
+                "waiting" => {
+                    "import dependency as alias; @effects(no_wait) fn guard(c: BlockingCell<i64>) { alias::run(c); }"
+                }
+                "callback" => {
+                    "import dependency as alias; @effects(no_wait) fn guard(f: fn()) { alias::run(f); }"
+                }
+                _ => "import dependency as alias; @effects(no_wait) fn guard() { alias::run(); }",
+            };
+            let mut checker = crate::semantic::TypeChecker::new();
+            checker.register_module("alias", "dependency", "dependency", &worker);
+            checker.set_effect_queries(queries, UnitId::ENTRY);
+            checker.check_program(&program(source));
+            let codes: Vec<_> = checker.errors.iter().map(|e| e.code).collect();
+            let expected = match mode {
+                "current" => None,
+                "waiting" => Some(ErrorCode::E2610),
+                _ => Some(ErrorCode::E2612),
+            };
+            if let Some(code) = expected {
+                assert!(codes.contains(&code), "{mode}: {:?}", checker.errors);
+                assert!(
+                    codes.iter().all(|c| *c == code),
+                    "{mode}: {:?}",
+                    checker.errors
+                );
+            } else {
+                assert!(codes.is_empty(), "{mode}: {:?}", checker.errors);
+            }
         }
     }
 

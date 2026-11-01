@@ -316,7 +316,7 @@ impl EffectContractKind {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EffectContract {
     pub kind: EffectContractKind,
     pub span: Span,

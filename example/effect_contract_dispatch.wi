@@ -1,0 +1,28 @@
+interface Counter {
+    @effects(no_wait)
+    fn next(self, value: i64) -> i64;
+}
+
+open class Increment implements Counter {
+    @effects(no_wait)
+    pub open fn next(self, value: i64) -> i64 {
+        return value + 1;
+    }
+}
+
+class DoubleIncrement extends Increment {
+    @effects(no_block, no_suspend)
+    pub override fn next(self, value: i64) -> i64 {
+        return value + 2;
+    }
+}
+
+@effects(no_wait)
+fn advance(counter: Counter, value: i64) -> i64 {
+    return counter.next(value);
+}
+
+fn main() {
+    let counter: Counter = new DoubleIncrement();
+    println(advance(counter, 40));
+}

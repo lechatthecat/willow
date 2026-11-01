@@ -480,6 +480,26 @@ pub(crate) const ADDRESSABLE_BUILTINS: [&str; 2] = ["pow", "powf"];
 /// A user declaration of the same name is a graph node and is looked up
 /// before this is consulted.
 pub(crate) fn builtin_target_effects(target: &FunctionId) -> Option<RuntimeEffects> {
+    if target.is_method_of("$output") && matches!(target.name().as_ref(), "print" | "println") {
+        // All scalar output overloads participate in the same source operation.
+        // Union the ABI rows so future overload-specific effects remain sound.
+        return Some(
+            [
+                "willow_print_i64",
+                "willow_println_i64",
+                "willow_print_bool",
+                "willow_println_bool",
+                "willow_print_f64",
+                "willow_println_f64",
+                "willow_print_string",
+                "willow_println_string",
+            ]
+            .into_iter()
+            .fold(RuntimeEffects::NONE, |effects, symbol| {
+                effects.union(symbol_effects(symbol))
+            }),
+        );
+    }
     if let Some(intrinsic) = Intrinsic::from_function_id(target) {
         return Some(intrinsic.runtime_effects());
     }

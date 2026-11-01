@@ -1247,6 +1247,7 @@ impl TypeChecker {
             methods.insert(
                 m.name.clone(),
                 InterfaceMethodInfo {
+                    effect_contracts: m.effect_contracts.clone(),
                     name: m.name.clone(),
                     params,
                     param_infos,
@@ -1348,6 +1349,7 @@ impl TypeChecker {
                 (
                     k.clone(),
                     InterfaceMethodInfo {
+                        effect_contracts: m.effect_contracts.clone(),
                         name: m.name.clone(),
                         params: m
                             .params

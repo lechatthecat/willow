@@ -136,6 +136,7 @@ mod tests {
                     (
                         name.to_string(),
                         MethodInfo {
+                            effect_contracts: vec![],
                             array_body_optimization:
                                 crate::parser::ast::ArrayBodyOptimization::None,
                             params: vec![],

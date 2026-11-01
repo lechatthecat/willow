@@ -7,6 +7,8 @@ use std::collections::VecDeque;
 
 #[cfg(test)]
 thread_local! {
+    static OBLIGATION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CONTRACT_GRAPH_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PATH_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -25,6 +27,7 @@ fn witness_paths(
             PATH_WORK.with(|n| n.set(n.get() + 1));
             match summary.witness(bit)? {
                 EffectWitness::Lock(w) => Some((id, w.owner)),
+                EffectWitness::External(owner) => Some((id, *owner)),
                 _ => None,
             }
         })
@@ -70,6 +73,444 @@ fn witness_paths(
 }
 
 impl TypeChecker {
+    /// Contract proofs are deliberately separate from the runtime/lock lattice:
+    /// an unknown callback must fail a declaration proof even outside a lock.
+    /// Arity hub nodes reuse the existing address-taken analysis without a
+    /// call-sites × candidate-values expansion.
+    fn solve_contracts(
+        &self,
+        graph: &CallGraph,
+        facts: &EffectFacts<EffectWitness>,
+        roots: impl Iterator<Item = FunctionId>,
+    ) -> (CallGraph, EffectFacts<EffectWitness>) {
+        use crate::compiler_db::effects::LOCK_EFFECT_WAIT;
+        use crate::semantic::{call_graph::CallSites, effects::EffectProblem};
+        let mut graph = graph.clone();
+        for call in &self.indirect_lock.calls {
+            #[cfg(test)]
+            CONTRACT_GRAPH_WORK.with(|n| n.set(n.get() + 1));
+            graph.merge(
+                call.caller,
+                CallSites {
+                    targets: [FunctionId::free(format!(
+                        "$contract$arity{}",
+                        call.bit.trailing_zeros()
+                    ))]
+                    .into(),
+                    // The arity set is conservative, not a proof that an arbitrary
+                    // parameter cannot receive an unseen value.
+                    has_unknown: true,
+                    ..Default::default()
+                },
+            );
+        }
+        for value in &self.indirect_lock.values {
+            #[cfg(test)]
+            CONTRACT_GRAPH_WORK.with(|n| n.set(n.get() + 1));
+            graph.merge(
+                FunctionId::free(format!("$contract$arity{}", value.bit.trailing_zeros())),
+                CallSites {
+                    has_unknown: value.target.is_none(),
+                    ..Default::default()
+                },
+            );
+        }
+        let mut problem = EffectProblem::new()
+            .external_callee(LOCK_EFFECT_WAIT)
+            .unknown_callee(LOCK_EFFECT_WAIT)
+            .missing_body(LOCK_EFFECT_WAIT)
+            .default_transmit(LOCK_EFFECT_WAIT);
+        // A matching arity identifies a possible target, not an exact dynamic
+        // target. External witnesses sort after proven Lock witnesses, so an
+        // uncertain candidate cannot hide an independently proven violation.
+        for value in &self.indirect_lock.values {
+            let Some(target) = value.target else {
+                continue;
+            };
+            let target = self.effect_index.local_target(target);
+            if self.lock_callee_is_async(&target) == Some(true) {
+                continue;
+            }
+            let Some(summary) = facts.get(&target) else {
+                continue;
+            };
+            let hub = FunctionId::free(format!("$contract$arity{}", value.bit.trailing_zeros()));
+            for bit in [RuntimeEffects::MAY_BLOCK, RuntimeEffects::MAY_SUSPEND] {
+                if summary.intersects(bit) {
+                    problem = problem.seed(hub, bit, Some(EffectWitness::External(hub)));
+                }
+            }
+        }
+        let mut nodes: HashSet<_> = graph.ids().copied().chain(roots).collect();
+        for (_, sites) in graph.iter() {
+            nodes.extend(&sites.targets);
+        }
+        // Lambdas and implicit constructors can have empty bodies without a
+        // call-graph entry. Their checked summaries still establish purity.
+        nodes.extend(
+            facts
+                .iter()
+                .filter_map(|(&id, _)| (id.is_lambda()).then_some(id)),
+        );
+        let mut normalized = CallGraph::default();
+        let mut abi_effects = HashMap::new();
+        for (&id, sites) in graph.iter() {
+            let mut sites = sites.clone();
+            if sites.has_unknown
+                && !sites.targets.is_empty()
+                && sites.unsupported_initialization.len() == 1
+                && sites.unsupported_initialization.contains(
+                    &crate::semantic::call_graph::UnsupportedInitialization::InjectedDefault,
+                )
+            {
+                sites.has_unknown = false;
+            }
+            // A dependency is checked before its consumers. Open dispatch in
+            // that dependency is not a closed set: a consumer may introduce a
+            // new override. Do not export a proof based on today's subset.
+            if self
+                .effect_queries
+                .as_ref()
+                .is_some_and(|(_, unit)| *unit != crate::module::UnitId::ENTRY)
+                && sites.virtual_calls.iter().any(|target| {
+                    let Some(owner) = target.owner_type().map(|ty| ty.to_string()) else {
+                        return true;
+                    };
+                    if self.symbols.lookup_interface(&owner).is_some() {
+                        return true;
+                    }
+                    self.symbols.lookup_class(&owner).is_none_or(|class| {
+                        class.is_open
+                            && self
+                                .resolved_method_class(&owner, &target.name())
+                                .and_then(|declaring| self.symbols.lookup_class(&declaring))
+                                .and_then(|class| class.methods.get(target.name().as_ref()))
+                                .is_none_or(|method| method.is_open)
+                    })
+                })
+            {
+                sites.has_unknown = true;
+            }
+            normalized.merge(id, sites);
+        }
+        #[cfg(test)]
+        CONTRACT_GRAPH_WORK.with(|n| {
+            n.set(
+                n.get()
+                    + nodes.len()
+                    + normalized
+                        .iter()
+                        .map(|(_, sites)| sites.targets.len())
+                        .sum::<usize>(),
+            )
+        });
+        for id in nodes {
+            let local = graph.get(&id).is_some()
+                || id.is_lambda()
+                || (id.name().as_ref() == "init"
+                    && id.owner().is_some_and(|owner| {
+                        self.symbols
+                            .lookup_class(&owner)
+                            .is_some_and(|_| id.namespace().is_none())
+                    }));
+            let summary = if local {
+                facts.get(&id).cloned()
+            } else {
+                self.effect_queries.as_ref().and_then(|(queries, unit)| {
+                    let (owner, target) =
+                        queries.external_target(*unit, &id, &self.effect_index.imports)?;
+                    queries
+                        .contract_facts
+                        .borrow()
+                        .get(&owner)?
+                        .get(&target)
+                        .cloned()
+                })
+            };
+            if let Some(summary) = summary {
+                problem = problem.seed(id, RuntimeEffects::NONE, None);
+                for bit in [RuntimeEffects::MAY_BLOCK, RuntimeEffects::MAY_SUSPEND] {
+                    if summary.intersects(bit) {
+                        let witness = summary.witness(bit).cloned().filter(|w| {
+                            w.lock()
+                                .is_some_and(|c| !c.is_conservative && c.operation != "extern rust")
+                        });
+                        // A solved runtime bound may include unavailable imported
+                        // evidence. Re-resolve those edges against current proofs;
+                        // only proven local waits are valid additional seeds.
+                        if !local || witness.is_some() {
+                            problem = problem.seed(id, bit, witness);
+                        }
+                    }
+                }
+                if summary
+                    .witness(LOCK_EFFECT_WAIT)
+                    .and_then(EffectWitness::lock)
+                    .is_some_and(|c| c.operation == "extern rust")
+                {
+                    problem = problem.seed(id, LOCK_EFFECT_WAIT, None);
+                }
+            } else if !local
+                && let Some(effects) = crate::semantic::intrinsics::builtin_target_effects(&id)
+                    .or_else(|| {
+                        crate::semantic::intrinsics::builtin_static_effects(&id, &HashMap::new())
+                    })
+            {
+                abi_effects.insert(id, effects);
+                problem = problem.seed(id, effects.intersection(LOCK_EFFECT_WAIT), None);
+            } else if id.name().starts_with("$contract$arity") {
+                problem = problem.body(id);
+            } else {
+                problem = problem.seed(id, LOCK_EFFECT_WAIT, None);
+            }
+            // Interface union nodes with no implementation do not prove a
+            // signature merely because an empty runtime fact was allocated.
+            if let Some(owner) = id.owner()
+                && self.symbols.lookup_interface(&owner).is_some()
+                && !id.name().starts_with("$default$")
+                && graph.get(&id).is_none_or(|sites| sites.targets.is_empty())
+            {
+                problem = problem.seed(id, LOCK_EFFECT_WAIT, None);
+            }
+            if self.lock_callee_is_async(&id) == Some(true) {
+                problem = problem.transmit(id, RuntimeEffects::NONE);
+            }
+        }
+        // ABI effects are proved at each actual source call, not at a shared
+        // synthetic leaf whose representative span might belong to another caller.
+        for (&caller, sites) in normalized.iter() {
+            for (target, span) in &sites.call_spans {
+                let Some(effects) = abi_effects
+                    .get(target)
+                    .filter(|e| **e != RuntimeEffects::ALL)
+                else {
+                    continue;
+                };
+                for (bit, kind) in [
+                    (RuntimeEffects::MAY_BLOCK, LockEffectKind::Block),
+                    (RuntimeEffects::MAY_SUSPEND, LockEffectKind::Suspend),
+                ] {
+                    if effects.intersects(bit) {
+                        problem = problem.seed(
+                            caller,
+                            bit,
+                            Some(EffectWitness::Lock(
+                                crate::compiler_db::effects::LockEffectWitness {
+                                    owner: caller,
+                                    cause: LockEffectCause {
+                                        is_conservative: false,
+                                        span: *span,
+                                        operation: target.to_string().into(),
+                                        kind,
+                                        lock: None,
+                                    },
+                                },
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+        let facts = problem.solve_reachable(&normalized);
+        (normalized, facts)
+    }
+
+    /// Propagate each of the three contract kinds once per (type, method).
+    /// In particular, a deep chain never rescans all its ancestors per method.
+    fn contract_obligations(
+        &mut self,
+        program: &Program,
+        templates: bool,
+    ) -> Vec<(FunctionId, EffectContract)> {
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        let mut obligations: HashMap<String, HashMap<String, [Option<EffectContract>; 3]>> =
+            HashMap::new();
+        let mut queue = VecDeque::new();
+        let mut types = HashSet::new();
+        let canonical = |name: &str| {
+            self.symbols
+                .lookup_class(name)
+                .map(|c| c.name.clone())
+                .or_else(|| self.symbols.lookup_interface(name).map(|i| i.name.clone()))
+                .unwrap_or_else(|| name.to_string())
+        };
+        // Only local declarations and their ancestors can impose an obligation
+        // in this unit. Do not rescan unrelated imported type families.
+        let mut pending: Vec<_> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(c) if c.type_params.is_empty() != templates => Some(canonical(&c.name)),
+                Item::Interface(i) if i.type_params.is_empty() != templates => {
+                    Some(canonical(&i.name))
+                }
+                _ => None,
+            })
+            .collect();
+        while let Some(name) = pending.pop() {
+            if !types.insert(name.clone()) {
+                continue;
+            }
+            if let Some(class) = self.symbols.lookup_class(&name) {
+                for parent in class.base_class.iter().map(String::as_str).chain(
+                    class.implements.iter().filter_map(|ty| match ty {
+                        Type::Named(name) | Type::Generic(name, _) => Some(name.as_str()),
+                        _ => None,
+                    }),
+                ) {
+                    let parent = canonical(parent);
+                    children
+                        .entry(parent.clone())
+                        .or_default()
+                        .push(name.clone());
+                    pending.push(parent);
+                }
+                for (method, info) in &class.methods {
+                    if !info.is_static {
+                        for contract in &info.effect_contracts {
+                            queue.push_back((name.clone(), method.clone(), contract.clone()));
+                        }
+                    }
+                }
+            } else if let Some(interface) = self.symbols.lookup_interface(&name) {
+                for parent in &interface.extends {
+                    let parent = canonical(parent);
+                    children
+                        .entry(parent.clone())
+                        .or_default()
+                        .push(name.clone());
+                    pending.push(parent);
+                }
+                for (method, info) in &interface.methods {
+                    for contract in &info.effect_contracts {
+                        queue.push_back((name.clone(), method.clone(), contract.clone()));
+                    }
+                }
+            }
+        }
+        // Stable declaration locations make inherited diagnostic labels stable
+        // even when several ancestors impose the same contract.
+        queue.make_contiguous().sort_by_key(|(owner, method, c)| {
+            (c.span.file_id, c.span.start, owner.clone(), method.clone())
+        });
+        while let Some((owner, method, contract)) = queue.pop_front() {
+            #[cfg(test)]
+            OBLIGATION_WORK.with(|n| n.set(n.get() + 1));
+            let index = match contract.kind {
+                EffectContractKind::NoWait => 0,
+                EffectContractKind::NoBlock => 1,
+                EffectContractKind::NoSuspend => 2,
+            };
+            let entry = obligations
+                .entry(owner.clone())
+                .or_default()
+                .entry(method.clone())
+                .or_default();
+            if entry[index].is_some() {
+                continue;
+            }
+            entry[index] = Some(contract.clone());
+            for child in children.get(&owner).into_iter().flatten() {
+                queue.push_back((child.clone(), method.clone(), contract.clone()));
+            }
+        }
+        let mut declarations = Vec::new();
+        let mut diagnostics = Vec::new();
+        for item in &program.items {
+            match item {
+                Item::Function(f) if f.type_params.is_empty() != templates => {
+                    declarations.extend(
+                        f.effect_contracts
+                            .iter()
+                            .cloned()
+                            .map(|c| (FunctionId::free(&f.name), c)),
+                    );
+                }
+                Item::Class(class) if class.type_params.is_empty() != templates => {
+                    let owner = canonical(&class.name);
+                    for method in &class.methods {
+                        let id = FunctionId::method(TypeId::local(&class.name), &method.name);
+                        declarations
+                            .extend(method.effect_contracts.iter().cloned().map(|c| (id, c)));
+                    }
+                    // Include inherited implementations, even if the class adds
+                    // an interface without declaring a new method body.
+                    let explicit_methods: HashMap<_, _> =
+                        class.methods.iter().map(|m| (m.name.as_str(), m)).collect();
+                    let mut required: Vec<_> = obligations
+                        .get(&owner)
+                        .into_iter()
+                        .flat_map(|m| m.iter())
+                        .collect();
+                    required.sort_by_key(|(method, _)| *method);
+                    for (method, contracts) in required {
+                        let Some(declaring) = self.resolved_method_class(&class.name, method)
+                        else {
+                            continue;
+                        };
+                        let id = self.effect_index.local_target(FunctionId::method(
+                            TypeId::from_source_name(&declaring),
+                            method,
+                        ));
+                        let explicit = explicit_methods.get(method.as_str()).copied();
+                        for contract in contracts.iter().flatten() {
+                            if let Some(m) = explicit
+                                && !m.effect_contracts.is_empty()
+                                && !m
+                                    .effect_contracts
+                                    .iter()
+                                    .fold(RuntimeEffects::NONE, |bits, c| {
+                                        bits.union(c.kind.forbidden())
+                                    })
+                                    .contains(contract.kind.forbidden())
+                            {
+                                diagnostics.push(Diagnostic::new(Severity::Error, ErrorCode::E2611, format!("override `{id}` weakens inherited effect contract `{}`", contract.kind.name()))
+                                        .with_label(Label::primary(m.span, "override must preserve all inherited prohibitions"))
+                                        .with_label(Label::secondary(contract.span, "inherited contract declared here")));
+                            }
+                            declarations.push((id, contract.clone()));
+                        }
+                    }
+                }
+                Item::Interface(interface) if interface.type_params.is_empty() != templates => {
+                    let owner = canonical(&interface.name);
+                    for method in &interface.methods {
+                        let inherited = obligations.get(&owner).and_then(|m| m.get(&method.name));
+                        for contract in inherited.into_iter().flatten().flatten() {
+                            if !method.effect_contracts.is_empty()
+                                && !method
+                                    .effect_contracts
+                                    .iter()
+                                    .fold(RuntimeEffects::NONE, |bits, c| {
+                                        bits.union(c.kind.forbidden())
+                                    })
+                                    .contains(contract.kind.forbidden())
+                            {
+                                diagnostics.push(Diagnostic::new(Severity::Error, ErrorCode::E2611, format!("interface method `{}::{}` weakens an inherited effect contract", interface.name, method.name))
+                                    .with_label(Label::primary(method.span, "weakened contract"))
+                                    .with_label(Label::secondary(contract.span, "inherited contract declared here")));
+                            }
+                            if method.default_body.is_some() {
+                                declarations.push((
+                                    interface_default_effect_id(&interface.name, &method.name),
+                                    contract.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for diagnostic in diagnostics {
+            self.push(diagnostic);
+        }
+        declarations
+            .sort_by_key(|(id, c)| (*id, c.kind.forbidden().bits(), c.span.file_id, c.span.start));
+        declarations.dedup_by_key(|(id, c)| (*id, c.kind.forbidden().bits()));
+        declarations
+    }
+
     pub(super) fn report_effect_contracts(
         &mut self,
         program: &Program,
@@ -77,38 +518,17 @@ impl TypeChecker {
         facts: &EffectFacts<EffectWitness>,
         templates: bool,
     ) {
-        let mut declarations = Vec::new();
-        for item in &program.items {
-            match item {
-                Item::Function(f)
-                    if f.type_params.is_empty() != templates && !f.effect_contracts.is_empty() =>
-                {
-                    declarations.push((FunctionId::free(&f.name), &f.effect_contracts))
-                }
-                Item::Class(c) if c.type_params.is_empty() != templates => {
-                    for m in &c.methods {
-                        if !m.is_default_injected && !m.effect_contracts.is_empty() {
-                            declarations.push((
-                                FunctionId::method(TypeId::local(&c.name), &m.name),
-                                &m.effect_contracts,
-                            ));
-                        }
-                    }
-                }
-                Item::Interface(i) if i.type_params.is_empty() != templates => {
-                    for m in &i.methods {
-                        // Signature contracts are retained for conformance checking;
-                        // Check executable defaults independently of conformance obligations.
-                        if m.default_body.is_some() && !m.effect_contracts.is_empty() {
-                            declarations.push((
-                                interface_default_effect_id(&i.name, &m.name),
-                                &m.effect_contracts,
-                            ));
-                        }
-                    }
-                }
-                _ => {}
-            }
+        let declarations = self.contract_obligations(program, templates);
+        let (graph, contract_facts) =
+            self.solve_contracts(graph, facts, declarations.iter().map(|(id, _)| *id));
+        let contract_facts = std::sync::Arc::new(contract_facts);
+        let facts = &contract_facts;
+        let graph = &graph;
+        if !templates && let Some((queries, unit)) = &self.effect_queries {
+            queries
+                .contract_facts
+                .borrow_mut()
+                .insert(*unit, std::sync::Arc::clone(&contract_facts));
         }
         if declarations.is_empty() {
             return;
@@ -116,69 +536,100 @@ impl TypeChecker {
         let summaries: HashMap<_, _> = facts.iter().map(|(&id, summary)| (id, summary)).collect();
         let bits = [RuntimeEffects::MAY_BLOCK, RuntimeEffects::MAY_SUSPEND];
         let paths = bits.map(|bit| witness_paths(graph, facts, &self.effect_index.callables, bit));
-        for (id, contracts) in declarations {
-            for contract in contracts {
-                let Some(summary) = summaries.get(&id) else {
-                    continue;
-                };
-                let Some(index) = bits.iter().position(|bit| {
-                    contract.kind.forbidden().intersects(*bit) && summary.intersects(*bit)
-                }) else {
-                    continue;
-                };
-                let bit = bits[index];
-                let cause = summary.witness(bit).and_then(EffectWitness::lock);
-                let mut diagnostic = Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E2610,
-                    format!(
-                        "effect contract `{}` violated by `{id}`",
-                        contract.kind.name()
-                    ),
-                )
-                .with_label(Label::secondary(
-                    contract.span,
-                    "effect contract declared here",
-                ));
-                let mut chain = vec![id.to_string()];
-                let mut cursor = id;
-                while let Some(&(callee, span)) = paths[index].get(&cursor) {
-                    if let Some(span) = span {
-                        diagnostic = diagnostic.with_label(Label::secondary(
-                            span,
-                            format!("`{cursor}` calls `{callee}`"),
-                        ));
+        for (id, contract) in declarations {
+            let Some(summary) = summaries.get(&id) else {
+                self.push(Diagnostic::new(Severity::Error, ErrorCode::E2612,
+                        format!("effect contract `{}` cannot be proven for `{id}`: missing verified summary", contract.kind.name()))
+                        .with_label(Label::primary(contract.span, "effect contract declared here")));
+                continue;
+            };
+            // Prefer a proven violation over uncertainty in another bit.
+            let matching = |bit: &RuntimeEffects| {
+                contract.kind.forbidden().intersects(*bit) && summary.intersects(*bit)
+            };
+            let Some(index) = bits
+                .iter()
+                .position(|bit| {
+                    matching(bit)
+                        && summary
+                            .witness(*bit)
+                            .and_then(EffectWitness::lock)
+                            .is_some_and(|c| !c.is_conservative)
+                })
+                .or_else(|| bits.iter().position(matching))
+            else {
+                continue;
+            };
+            let bit = bits[index];
+            let cause = summary.witness(bit).and_then(EffectWitness::lock);
+            let proven = cause.is_some_and(|c| !c.is_conservative);
+            let mut diagnostic = Diagnostic::new(
+                Severity::Error,
+                if proven {
+                    ErrorCode::E2610
+                } else {
+                    ErrorCode::E2612
+                },
+                format!(
+                    "effect contract `{}` {} `{id}`",
+                    contract.kind.name(),
+                    if proven {
+                        "violated by"
+                    } else {
+                        "cannot be proven for"
                     }
-                    chain.push(callee.to_string());
-                    cursor = callee;
+                ),
+            )
+            .with_label(Label::secondary(
+                contract.span,
+                "effect contract declared here",
+            ));
+            let mut chain = vec![id.to_string()];
+            let mut cursor = id;
+            while let Some(&(callee, span)) = paths[index].get(&cursor) {
+                if let Some(span) = span {
+                    diagnostic = diagnostic.with_label(Label::secondary(
+                        span,
+                        format!("`{cursor}` calls `{callee}`"),
+                    ));
                 }
-                let certainty = match cause {
-                    Some(cause) => {
-                        diagnostic = diagnostic.with_label(Label::primary(
-                            cause.span,
-                            format!("root operation `{}`", cause.operation),
-                        ));
-                        chain.push(cause.operation.to_string());
-                        if cause.is_conservative {
-                            "conservative-bound"
-                        } else {
-                            "compiler-proven"
-                        }
-                    }
-                    None => {
-                        diagnostic = diagnostic.with_label(Label::primary(
-                            contract.span,
-                            "waiting effect has no available source witness",
-                        ));
-                        "conservative-bound"
-                    }
-                };
-                diagnostic = diagnostic.with_note(format!(
-                    "certainty: {certainty}; call chain: {}",
-                    chain.join(" -> ")
-                ));
-                self.push(diagnostic);
+                chain.push(callee.to_string());
+                cursor = callee;
             }
+            let certainty = match cause {
+                Some(cause) => {
+                    diagnostic = diagnostic.with_label(Label::primary(
+                        cause.span,
+                        format!(
+                            "{} operation `{}`",
+                            if cause.is_conservative {
+                                "possible"
+                            } else {
+                                "root"
+                            },
+                            cause.operation
+                        ),
+                    ));
+                    chain.push(cause.operation.to_string());
+                    if cause.is_conservative {
+                        "conservative-bound"
+                    } else {
+                        "compiler-proven"
+                    }
+                }
+                None => {
+                    diagnostic = diagnostic.with_label(Label::primary(
+                        contract.span,
+                        "waiting effect has no available source witness",
+                    ));
+                    "conservative-bound"
+                }
+            };
+            diagnostic = diagnostic.with_note(format!(
+                "certainty: {certainty}; call chain: {}",
+                chain.join(" -> ")
+            ));
+            self.push(diagnostic);
         }
     }
 }
@@ -187,6 +638,242 @@ impl TypeChecker {
 mod tests {
     use super::super::check::check_source;
     use super::*;
+
+    #[test]
+    fn effect_contract_proven_wait_dominates_uncertain_value() {
+        let errors = check_source(
+            "fn wait() { println(1); } @effects(no_wait) fn guard() { let f = wait; f(); println(2); }",
+        );
+        assert!(
+            errors.iter().any(|d| d.code == ErrorCode::E2610),
+            "{errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|d| d.code == ErrorCode::E2612),
+            "{errors:?}"
+        );
+        let errors = check_source(
+            "async fn guard() { let m = Mutex::new(0); lock m as value { println(1); } }",
+        );
+        assert!(
+            errors.iter().all(|d| d.severity != Severity::Error),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn effect_contract_obligation_and_arity_work_bounds() {
+        for n in [8, 32, 128] {
+            for shape in ["chain", "fanout"] {
+                let mut source =
+                    String::from("open class C0 { @effects(no_wait) pub open fn f(self) {} }\n");
+                for i in 1..n {
+                    let parent = if shape == "chain" { i - 1 } else { 0 };
+                    source.push_str(&format!("open class C{i} extends C{parent} {{ @effects(no_wait) pub open override fn f(self) {{}} }}\n"));
+                }
+                OBLIGATION_WORK.with(|v| v.set(0));
+                let errors = check_source(&source);
+                assert!(
+                    errors.iter().all(|d| d.severity != Severity::Error),
+                    "{errors:?}"
+                );
+                let work = OBLIGATION_WORK.with(|v| v.get());
+                assert_eq!(work, 2 * n - 1, "{shape} {n}");
+                println!("contract-obligations shape={shape} classes={n} visits={work}");
+            }
+            let mut source = String::from("fn wait(c: BlockingCell<i64>) { c.get(); }\n");
+            for i in 0..n {
+                source.push_str(&format!(
+                    "fn relay{i}(c: BlockingCell<i64>) {{ let f = wait; f(c); }}\n"
+                ));
+            }
+            CONTRACT_GRAPH_WORK.with(|v| v.set(0));
+            let errors = check_source(&source);
+            assert!(
+                errors.iter().all(|d| d.severity != Severity::Error),
+                "{errors:?}"
+            );
+            let work = CONTRACT_GRAPH_WORK.with(|v| v.get());
+            assert!(work <= 5 * n + 10, "{n}: {work}");
+            println!("contract-arity callers={n} values={n} visits={work}");
+        }
+    }
+
+    #[test]
+    fn effect_contract_polymorphic_perspectives() {
+        let cases = [
+            (
+                "trusted blocking ABI",
+                "@effects(no_wait) fn guard() { println(1); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "printing does not suspend",
+                "@effects(no_suspend) fn guard() { print(1); }",
+                None,
+            ),
+            (
+                "blocking ABI through helper",
+                "fn helper() { print(1); } @effects(no_block) fn guard() { helper(); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "unannotated interface implementation waits",
+                "interface I { @effects(no_wait) fn f(self, c: BlockingCell<i64>); } class C implements I { pub fn f(self, c: BlockingCell<i64>) { c.get(); } }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "unannotated interface implementation pure",
+                "interface I { @effects(no_wait) fn f(self); } class C implements I { pub fn f(self) {} }",
+                None,
+            ),
+            (
+                "override weakens",
+                "open class B { @effects(no_wait) pub open fn f(self) {} } class C extends B { @effects(no_suspend) pub override fn f(self) {} }",
+                Some(ErrorCode::E2611),
+            ),
+            (
+                "override strengthens",
+                "open class B { @effects(no_suspend) pub open fn f(self) {} } class C extends B { @effects(no_wait) pub override fn f(self) {} }",
+                None,
+            ),
+            (
+                "override preserves",
+                "open class B { @effects(no_wait) pub open fn f(self) {} } class C extends B { @effects(no_wait) pub override fn f(self) {} }",
+                None,
+            ),
+            (
+                "omitted annotation inherits",
+                "open class B { @effects(no_wait) pub open fn f(self, c: BlockingCell<i64>) {} } class C extends B { pub override fn f(self, c: BlockingCell<i64>) { c.get(); } }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "omitted annotation pure",
+                "open class B { @effects(no_wait) pub open fn f(self) {} } class C extends B { pub override fn f(self) {} }",
+                None,
+            ),
+            (
+                "combined prohibitions preserve",
+                "open class B { @effects(no_wait) pub open fn f(self) {} } class C extends B { @effects(no_suspend, no_block) pub override fn f(self) {} }",
+                None,
+            ),
+            (
+                "interface weakening",
+                "interface I { @effects(no_wait) fn f(self); } class C implements I { @effects(no_block) pub fn f(self) {} }",
+                Some(ErrorCode::E2611),
+            ),
+            (
+                "deep inherited implementation",
+                "interface I { @effects(no_wait) fn f(self, c: BlockingCell<i64>); } open class B { pub fn f(self, c: BlockingCell<i64>) { c.get(); } } class C extends B implements I {}",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "virtual mixture",
+                "open class B { pub open fn f(self, c: BlockingCell<i64>) {} } class C extends B { pub override fn f(self, c: BlockingCell<i64>) { c.get(); } } @effects(no_wait) fn guard(b: B, c: BlockingCell<i64>) { b.f(c); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "virtual all pure",
+                "open class B { pub open fn f(self) {} } class C extends B { pub override fn f(self) {} } @effects(no_wait) fn guard(b: B) { b.f(); }",
+                None,
+            ),
+            (
+                "interface mixture",
+                "interface I { fn f(self, c: BlockingCell<i64>); } class A implements I { pub fn f(self, c: BlockingCell<i64>) {} } class B implements I { pub fn f(self, c: BlockingCell<i64>) { c.get(); } } @effects(no_wait) fn guard(i: I, c: BlockingCell<i64>) { i.f(c); }",
+                Some(ErrorCode::E2610),
+            ),
+            (
+                "unknown interface target",
+                "interface I { fn f(self); } @effects(no_wait) fn guard(i: I) { i.f(); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "unknown function parameter",
+                "@effects(no_wait) fn guard(f: fn()) { f(); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "unknown closure parameter",
+                "@effects(no_wait) fn guard(f: closure()) { f(); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "unknown helper callback",
+                "fn relay(f: fn()) { f(); } @effects(no_wait) fn guard(f: fn()) { relay(f); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "waiting named function value",
+                "fn wait(c: BlockingCell<i64>) { c.get(); } @effects(no_wait) fn guard(c: BlockingCell<i64>) { let f = wait; f(c); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "waiting value through argument",
+                "fn wait(c: BlockingCell<i64>) { c.get(); } fn relay(f: fn(BlockingCell<i64>), c: BlockingCell<i64>) { f(c); } @effects(no_wait) fn guard(c: BlockingCell<i64>) { relay(wait, c); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "waiting captured closure",
+                "@effects(no_wait) fn guard(c: BlockingCell<i64>) { let f = || { c.get(); }; f(); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "closure captures waiting value",
+                "fn wait(c: BlockingCell<i64>) { c.get(); } @effects(no_wait) fn guard(c: BlockingCell<i64>) { let f = wait; let g = || { f(c); }; g(); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "unverified ffi",
+                "extern rust { fn foreign(); } @effects(no_wait) fn guard() { foreign(); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "ffi cannot prove no suspend",
+                "extern rust { fn foreign(); } @effects(no_suspend) fn guard() { foreign(); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "ffi transitive",
+                "extern rust { fn foreign(); } fn relay() { foreign(); } @effects(no_block) fn guard() { relay(); }",
+                Some(ErrorCode::E2612),
+            ),
+            (
+                "trusted arithmetic",
+                "@effects(no_wait) fn guard(n: i64) -> i64 { return n + 1; }",
+                None,
+            ),
+            (
+                "async creation",
+                "async fn wait() { await sleep(1); } @effects(no_wait) fn guard() { wait(); }",
+                None,
+            ),
+            (
+                "unannotated ffi unaffected",
+                "extern rust { fn foreign(); } fn guard() { foreign(); }",
+                None,
+            ),
+        ];
+        for (label, source, expected) in cases {
+            let errors = check_source(source);
+            let codes: Vec<_> = errors
+                .iter()
+                .filter(|d| d.severity == Severity::Error)
+                .map(|d| d.code)
+                .collect();
+            if let Some(code) = expected {
+                assert!(codes.contains(&code), "{label}: {errors:?}");
+                assert!(codes.iter().all(|c| [ErrorCode::E2610, ErrorCode::E2611, ErrorCode::E2612].contains(c)), "{label}: {errors:?}");
+                if code == ErrorCode::E2612 {
+                    assert!(
+                        !codes.contains(&ErrorCode::E2610),
+                        "{label}: uncertainty was reported as proof: {errors:?}"
+                    );
+                }
+            } else {
+                assert!(codes.is_empty(), "{label}: {errors:?}");
+            }
+        }
+    }
 
     #[test]
     fn effect_contract_generic_default_check_count_is_linear() {

@@ -235,6 +235,8 @@ error_codes! {
     E2604, // cannot suspend (`await`/`select`) while holding a Willow lock
     E2605, // nested `lock` acquisition is not supported in V1
     E2610, // declared effect contract violated
+    E2611, // inherited effect contract weakened
+    E2612, // effect contract cannot be proven
     E2606, // `lock` inside a `match` arm has no frame-backed resume shape
 }
 

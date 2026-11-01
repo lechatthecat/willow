@@ -368,9 +368,8 @@ impl TypeChecker {
             Item::Class(c) if !c.type_params.is_empty() => Some(c.span.file_id),
             Item::Interface(i)
                 if !i.type_params.is_empty()
-                    && i.methods
-                        .iter()
-                        .any(|m| m.default_body.is_some() && !m.effect_contracts.is_empty()) =>
+                    && (!i.extends.is_empty()
+                        || i.methods.iter().any(|m| !m.effect_contracts.is_empty())) =>
             {
                 Some(i.span.file_id)
             }
@@ -2637,6 +2636,12 @@ impl TypeChecker {
                     .insert(*id, Some(FunctionId::free_from_source_name(name)));
                 return;
             }
+            // Printing is syntax rather than an ordinary Call expression, but
+            // contract proofs still need its trusted runtime ABI edge.
+            Expr::Print(_, newline, _, _) => vec![FunctionId::method(
+                TypeId::local("$output"),
+                if *newline { "println" } else { "print" },
+            )],
             // A variant constructor (`Err(e)` inferred without context) is a
             // value, like the contextual form that never records a call.
             Expr::Call(call) if self.enum_variant_resolutions.contains_key(&call.id) => return,

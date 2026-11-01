@@ -2663,13 +2663,14 @@ impl TypeChecker {
             Item::Function(f) => !f.type_params.is_empty() && !f.effect_contracts.is_empty(),
             Item::Class(c) => {
                 !c.type_params.is_empty()
-                    && c.methods.iter().any(|m| !m.effect_contracts.is_empty())
+                    && (c.base_class.is_some()
+                        || !c.implements.is_empty()
+                        || c.methods.iter().any(|m| !m.effect_contracts.is_empty()))
             }
             Item::Interface(i) => {
                 !i.type_params.is_empty()
-                    && i.methods
-                        .iter()
-                        .any(|m| m.default_body.is_some() && !m.effect_contracts.is_empty())
+                    && (!i.extends.is_empty()
+                        || i.methods.iter().any(|m| !m.effect_contracts.is_empty()))
             }
             _ => false,
         });
@@ -2678,6 +2679,8 @@ impl TypeChecker {
             // diagnostic-only template cache. It stays in this isolated checker.
             checker.prechecks = None;
             checker.effect_index = self.effect_index.clone();
+            checker.effect_queries = self.effect_queries.clone();
+            checker.indirect_lock = self.indirect_lock.clone();
             checker.expr_types = self.expr_types.clone();
             checker.resolved_calls = self.resolved_calls.clone();
             checker.effect_inputs.direct = self.effect_inputs.direct.clone();
@@ -2757,9 +2760,10 @@ impl TypeChecker {
             Item::Interface(i)
                 if !i.type_params.is_empty()
                     && i.span.file_id == file
-                    && i.methods
-                        .iter()
-                        .any(|m| m.default_body.is_some() && !m.effect_contracts.is_empty()) =>
+                    && (!i.extends.is_empty()
+                        || i.methods.iter().any(|m| {
+                            m.default_body.is_some() && !m.effect_contracts.is_empty()
+                        })) =>
             {
                 Some(i)
             }

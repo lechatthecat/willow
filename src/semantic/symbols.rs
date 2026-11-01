@@ -219,6 +219,8 @@ pub struct StaticPropInfo {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MethodInfo {
     #[serde(default)]
+    pub effect_contracts: Vec<crate::parser::ast::EffectContract>,
+    #[serde(default)]
     pub array_body_optimization: crate::parser::ast::ArrayBodyOptimization,
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
@@ -286,6 +288,8 @@ impl InstantiationType {
 /// A required method signature declared inside an `interface`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InterfaceMethodInfo<N = String> {
+    #[serde(default)]
+    pub effect_contracts: Vec<crate::parser::ast::EffectContract>,
     pub name: String,
     pub params: Vec<Type<N>>,
     /// The same parameters with their declared [`ParamMode`], mirroring
@@ -792,6 +796,7 @@ impl InterfaceInfo {
                     (
                         name.clone(),
                         InterfaceMethodInfo {
+                            effect_contracts: m.effect_contracts.clone(),
                             name: m.name.clone(),
                             params: m.params.iter().map(Into::into).collect(),
                             param_infos: m

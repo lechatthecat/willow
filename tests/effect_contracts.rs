@@ -206,3 +206,137 @@ fn effect_contract_generic_interface_defaults_check_and_build() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn effect_contract_polymorphic_module_revisions() {
+    let fixture = Fixture::new(
+        "import worker; @effects(no_wait) fn guard(c: BlockingCell<i64>) { worker::run(c); } fn main() {}",
+    );
+    let module = fixture.0.join("worker.wi");
+    for (body, expected) in [
+        ("pub fn run(c: BlockingCell<i64>) {}", None),
+        (
+            "pub fn run(c: BlockingCell<i64>) { c.get(); }",
+            Some("E2610"),
+        ),
+        (
+            "extern rust { fn foreign(); } pub fn run(c: BlockingCell<i64>) { foreign(); }",
+            Some("E2612"),
+        ),
+        ("pub fn run(c: BlockingCell<i64>) {}", None),
+    ] {
+        fs::write(&module, body).unwrap();
+        for _ in 0..2 {
+            let out = fixture.command("check");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.success(), expected.is_none(), "{body}: {stderr}");
+            if let Some(code) = expected {
+                assert!(stderr.contains(code), "{stderr}");
+            }
+        }
+    }
+}
+
+#[test]
+fn effect_contract_polymorphic_imported_obligations() {
+    let fixture = Fixture::new(
+        "import worker; class C implements worker::I { pub fn run(self, c: BlockingCell<i64>) { c.get(); } } fn main() {}",
+    );
+    fs::write(
+        fixture.0.join("worker.wi"),
+        "pub interface I { @effects(no_wait) fn run(self, c: BlockingCell<i64>); }",
+    )
+    .unwrap();
+    for command in ["check", "build"] {
+        let out = fixture.command(command);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && stderr.contains("E2610"),
+            "{command}: {stderr}"
+        );
+    }
+    fs::write(
+        fixture.0.join("worker.wi"),
+        "pub open class B { @effects(no_wait) pub open fn run(self) {} }",
+    )
+    .unwrap();
+    fs::write(fixture.0.join("main.wi"), "import worker; class C extends worker::B { @effects(no_suspend) pub override fn run(self) {} } fn main() {}").unwrap();
+    let out = fixture.command("check");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("E2611"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn effect_contract_polymorphic_generics_and_defaults() {
+    for (source, expected) in [
+        (
+            "interface I { @effects(no_wait) fn run(self, c: BlockingCell<i64>); } interface J<T> extends I { fn run(self, c: BlockingCell<i64>) { c.get(); } } fn main() {}",
+            Some("E2610"),
+        ),
+        (
+            "interface I { @effects(no_wait) fn run(self, c: BlockingCell<i64>); } class C<T> implements I { pub fn run(self, c: BlockingCell<i64>) { c.get(); } } fn main() {}",
+            Some("E2610"),
+        ),
+        (
+            "interface I<T> { @effects(no_wait) fn run(self, c: BlockingCell<i64>); } class C implements I<i64> { pub fn run(self, c: BlockingCell<i64>) { c.get(); } } fn main() {}",
+            Some("E2610"),
+        ),
+        (
+            "interface I { @effects(no_wait) fn run(self) {} } class C implements I {} @effects(no_wait) fn guard(c: C) { c.run(); } fn main() {}",
+            None,
+        ),
+        (
+            "interface I { @effects(no_wait) fn run(self); } interface J extends I { @effects(no_suspend) fn run(self); } fn main() {}",
+            Some("E2611"),
+        ),
+        (
+            "extern rust { @effects(no_wait) fn foreign(); } @effects(no_wait) fn guard() { foreign(); } fn main() {}",
+            Some("E0105"),
+        ),
+    ] {
+        let fixture = Fixture::new(source);
+        let out = fixture.command("check");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.success(),
+            expected.is_none(),
+            "{source}: {stderr}"
+        );
+        if let Some(code) = expected {
+            assert!(stderr.contains(code), "{source}: {stderr}");
+        }
+    }
+}
+
+#[test]
+fn effect_contract_polymorphic_example_runs() {
+    let fixture = Fixture::new(include_str!("../example/effect_contract_dispatch.wi"));
+    let out = fixture.command("run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line.trim() == "42")
+    );
+}
+
+#[test]
+fn effect_contract_polymorphic_imported_virtual_caller() {
+    let fixture = Fixture::new(
+        "import worker; class C extends worker::B { pub override fn run(self, c: BlockingCell<i64>) { c.get(); } } fn main() { worker::guard(new C(), BlockingCell::new(0)); }",
+    );
+    fs::write(fixture.0.join("worker.wi"), "pub open class B { pub open fn run(self, c: BlockingCell<i64>) {} } @effects(no_wait) pub fn guard(b: B, c: BlockingCell<i64>) { b.run(c); }").unwrap();
+    let out = fixture.command("check");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && (stderr.contains("E2610") || stderr.contains("E2612")),
+        "{stderr}"
+    );
+}
