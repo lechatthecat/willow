@@ -639,3 +639,17 @@ fn monotonic_clock_abi() {
         willow_abi::RuntimeEffects::NONE
     );
 }
+
+#[test]
+fn numeric_conversions_abi_and_effects() {
+    let _: extern "C" fn(i64) -> f64 = crate::math::willow_f64_from_i64;
+    let _: extern "C" fn(f64) -> i64 = crate::math::willow_f64_trunc_to_i64;
+    assert_schema("willow_f64_from_i64", &[I64], Some(F64));
+    assert_schema("willow_f64_trunc_to_i64", &[F64], Some(I64));
+    for name in ["willow_f64_from_i64", "willow_f64_trunc_to_i64"] {
+        assert_eq!(
+            runtime_symbol(name).unwrap().effects,
+            willow_abi::RuntimeEffects::NONE
+        );
+    }
+}

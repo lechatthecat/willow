@@ -2503,6 +2503,39 @@ impl TypeChecker {
             };
         }
 
+        if class_name == "f64" && matches!(method_name, "from_i64" | "trunc_to_i64") {
+            if !type_args.is_empty() {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("function `f64::{method_name}` expects no type arguments"),
+                    )
+                    .with_label(Label::primary(span, "unexpected type arguments")),
+                );
+            }
+            if args.len() != 1 {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "function `f64::{method_name}` expects 1 argument, got {}",
+                            args.len()
+                        ),
+                    )
+                    .with_label(Label::primary(span, "wrong number of arguments")),
+                );
+            }
+            let (param, ret) = if method_name == "from_i64" {
+                (Type::I64, Type::F64)
+            } else {
+                (Type::F64, Type::I64)
+            };
+            self.check_value_call_args(&[param], args);
+            return ret;
+        }
+
         if class_name == "f64" && method_name == "to_string" {
             if args.len() != 1 {
                 self.push(

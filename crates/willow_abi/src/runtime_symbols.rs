@@ -113,6 +113,8 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     BLOCK; "willow_print_string" => ([Ptr] -> None);
     BLOCK; "willow_println_string" => ([Ptr] -> None);
     // --- math / float formatting ---
+    NONE; "willow_f64_from_i64" => ([I64] -> Some(F64));
+    NONE; "willow_f64_trunc_to_i64" => ([F64] -> Some(I64));
     PANIC_ALLOC; "willow_pow_negative_exponent" => ([I64, Ptr, I32, I32] -> None);
     ALLOC; "willow_f64_to_string" => ([F64] -> Some(Ptr));
     ALLOC; "willow_i64_to_string" => ([I64] -> Some(Ptr));

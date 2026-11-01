@@ -170,7 +170,7 @@ impl TypeChecker {
                 if (lty == Type::I64 && rty == Type::F64) || (lty == Type::F64 && rty == Type::I64)
                 {
                     diagnostic = diagnostic.with_help(
-                        "`**` does not mix `i64` and `f64`; make both operands the same type",
+                        "`**` does not mix `i64` and `f64`; convert explicitly with `f64::from_i64(integer)` or `f64::trunc_to_i64(float)` (truncates and saturates; NaN becomes 0)",
                     );
                 }
                 self.push(diagnostic);
@@ -220,27 +220,34 @@ impl TypeChecker {
                 }
 
                 if (lty != Type::I64 && lty != Type::F64) || lty != rty {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0202,
-                            format!(
-                                "cannot apply operator `{}` to `{}` and `{}`",
-                                b.op.symbol(),
-                                type_name(&lty),
-                                type_name(&rty)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            b.span,
-                            format!(
-                                "`{}` not defined for `{}` and `{}`",
-                                b.op.symbol(),
-                                type_name(&lty),
-                                type_name(&rty)
-                            ),
-                        )),
-                    );
+                    let mut diagnostic = Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0202,
+                        format!(
+                            "cannot apply operator `{}` to `{}` and `{}`",
+                            b.op.symbol(),
+                            type_name(&lty),
+                            type_name(&rty)
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        b.span,
+                        format!(
+                            "`{}` not defined for `{}` and `{}`",
+                            b.op.symbol(),
+                            type_name(&lty),
+                            type_name(&rty)
+                        ),
+                    ));
+                    if matches!(
+                        (&lty, &rty),
+                        (Type::I64, Type::F64) | (Type::F64, Type::I64)
+                    ) {
+                        diagnostic = diagnostic.with_help(
+                            "convert explicitly with `f64::from_i64(integer)` or `f64::trunc_to_i64(float)` (truncates and saturates; NaN becomes 0)",
+                        );
+                    }
+                    self.push(diagnostic);
                 }
                 lty
             }

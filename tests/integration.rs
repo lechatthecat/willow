@@ -381,3 +381,6 @@ mod fixed_arrays;
 
 #[path = "integration/constrained_methods.rs"]
 mod constrained_methods;
+
+#[path = "integration/numeric_conversions.rs"]
+mod numeric_conversions;

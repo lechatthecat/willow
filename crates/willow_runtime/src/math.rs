@@ -90,6 +90,20 @@ pub extern "C" fn willow_pow_negative_exponent(
     crate::panic_context::raise_language_message_at(&message, file, line.into(), col.into());
 }
 
+/// Convert with IEEE round-to-nearest, ties-to-even; large integers may lose precision.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_f64_from_i64(value: i64) -> f64 {
+    value as f64
+}
+
+/// Truncate toward zero, saturate overflow/infinities, and map NaN to zero.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_f64_trunc_to_i64(value: f64) -> i64 {
+    value as i64
+}
+
 /// Returns a GC-managed WillowString representation of `value`.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]

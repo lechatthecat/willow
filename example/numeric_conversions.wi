@@ -1,0 +1,9 @@
+// Explicit numeric conversion. Integer-to-float rounds to nearest, ties to even.
+// Float-to-integer truncates toward zero and saturates to the i64 limits.
+// NaN becomes 0; positive/negative infinity becomes the corresponding limit.
+fn main() {
+    let units = 3;
+    let price = 1.5;
+    println(f64::from_i64(units) * price);
+    println(f64::trunc_to_i64(-4.9));
+}

@@ -2200,6 +2200,18 @@ pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBu
     use crate::stdlib_schema::{self, StdItemKind};
     if class == "f64" {
         return match method {
+            "from_i64" => Some(NamespaceBuiltin {
+                runtime: "willow_f64_from_i64",
+                params: vec![Type::I64],
+                ret: Type::F64,
+                narrow_to_bool: false,
+            }),
+            "trunc_to_i64" => Some(NamespaceBuiltin {
+                runtime: "willow_f64_trunc_to_i64",
+                params: vec![Type::F64],
+                ret: Type::I64,
+                narrow_to_bool: false,
+            }),
             "to_string" => Some(NamespaceBuiltin {
                 runtime: "willow_f64_to_string",
                 params: vec![Type::F64],
