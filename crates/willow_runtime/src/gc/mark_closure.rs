@@ -184,6 +184,7 @@ pub(super) fn finish_with_policy(
             wait(delay);
             continue;
         }
+        sweep::publish_regions_concurrently(cycle);
         before_recheck();
         cycle
             .phase
@@ -371,6 +372,7 @@ pub(super) fn finish_recovery_with_wait(
             .lock()
             .unwrap()
             .transition(old_cycle::Phase::RemarkRequested);
+        sweep::publish_regions_concurrently(marking);
         let plan = with_stw(
             crate::gc_telemetry::stops::StopReason::Recovery,
             |coord, stop_work| {

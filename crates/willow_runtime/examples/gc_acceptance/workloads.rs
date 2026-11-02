@@ -19,6 +19,71 @@ pub fn overlap_counts() -> (u64, u64) {
     )
 }
 
+static BURST_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static BURST_MUTATIONS: AtomicU64 = AtomicU64::new(0);
+pub fn burst_counts() -> (u64, u64) {
+    (
+        BURST_ALLOCATIONS.load(Ordering::Relaxed),
+        BURST_MUTATIONS.load(Ordering::Relaxed),
+    )
+}
+
+/// Begin the burst at the mark/sweep transition. Count only complete batches
+/// bracketed by the same active sweep, so a missed scheduling window is visible.
+pub fn burst(roots: &[*mut u8], count: usize) {
+    use willow_runtime::gc_telemetry::milestones::{CycleMilestones, snapshot};
+    let prior = snapshot().epoch;
+    let collector = std::thread::spawn(|| {
+        let _registration = gc::MutatorRegistration::new();
+        gc::willow_gc_collect();
+        gc::willow_gc_safepoint();
+    });
+    while !collector.is_finished() {
+        let phase = snapshot();
+        if phase.epoch > prior && phase.stage >= 1 {
+            break;
+        }
+        gc::willow_gc_safepoint();
+        std::thread::yield_now();
+    }
+    let during_sweep = |before: CycleMilestones, after: CycleMilestones| {
+        before.epoch > prior && before.epoch == after.epoch && before.stage == 1 && after.stage == 1
+    };
+    let first = count.min(64);
+    let before = snapshot();
+    allocate(first, 128);
+    if during_sweep(before, snapshot()) {
+        BURST_ALLOCATIONS.fetch_add(first as u64, Ordering::Relaxed);
+    }
+    let before = snapshot();
+    for &head in roots {
+        // The caller owns these registered, nonmoving old graph roots. Keep the
+        // detached child rooted until every barrier/store pair restores it.
+        let mut saved = unsafe { *head.cast::<*mut u8>() };
+        gc::willow_push_root(&mut saved);
+        for _ in 0..64 {
+            gc::willow_gc_write_barrier(head, saved, std::ptr::null_mut(), 1);
+            unsafe {
+                *head.cast::<*mut u8>() = std::ptr::null_mut();
+            }
+            gc::willow_gc_write_barrier(head, std::ptr::null_mut(), saved, 1);
+            unsafe {
+                *head.cast::<*mut u8>() = saved;
+            }
+        }
+        gc::willow_pop_root();
+    }
+    if during_sweep(before, snapshot()) {
+        BURST_MUTATIONS.fetch_add(roots.len() as u64 * 128, Ordering::Relaxed);
+    }
+    allocate(count - first, 128);
+    while !collector.is_finished() {
+        gc::willow_gc_safepoint();
+        std::thread::yield_now();
+    }
+    collector.join().unwrap();
+}
+
 static CANCELLED: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "C" {

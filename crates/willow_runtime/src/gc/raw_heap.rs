@@ -274,8 +274,8 @@ impl Object {
         }
     }
 
-    fn descriptor(self) -> willow_abi::GcLayoutDescriptor {
-        let address = if let Some(target) = self.forwarded_to() {
+    pub(super) fn descriptor_address(self) -> usize {
+        if let Some(target) = self.forwarded_to() {
             let target = Self::from_payload(target);
             // Destinations are never sources in the same minor cycle. No
             // forwarding-chain traversal or additional registry reference.
@@ -283,7 +283,11 @@ impl Object {
             unsafe { (*target.as_ptr()).descriptor }
         } else {
             unsafe { (*self.as_ptr()).descriptor }
-        };
+        }
+    }
+
+    fn descriptor(self) -> willow_abi::GcLayoutDescriptor {
+        let address = self.descriptor_address();
         // SAFETY: live headers own a registry reference or point to static
         // generated data. Evacuated sources borrow their live destination's
         // descriptor, under STW, until the source storage is reclaimed.

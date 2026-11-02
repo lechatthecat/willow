@@ -125,3 +125,14 @@ AGENTS.md
 
 # Compiler analysis caches beside standalone sources.
 **/target/willow-query-cache/
+
+# Public GC acceptance harness; generated captures remain local.
+!/benches/gc_acceptance/
+/benches/gc_acceptance/*
+!/benches/gc_acceptance/README.md
+!/benches/gc_acceptance/matrix.json
+!/benches/gc_acceptance/suite.py
+!/benches/gc_acceptance/faults.py
+!/benches/gc_acceptance/test_suite.py
+!/benches/gc_acceptance/observation_check.py
+!/benches/gc_acceptance/test_native.py

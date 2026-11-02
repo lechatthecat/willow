@@ -2768,6 +2768,8 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
                         branch_children: Vec::new(),
                         discovery_counts: [0; 3],
                         region_hint: None,
+                        claimed_children: [0; 256],
+                        follow_inline_child: true,
                         inline_types: [None; 4],
                         local_child: None,
                         cycle: &cycle,
@@ -2877,6 +2879,8 @@ fn m3_real_closure_last_work_latency_and_cpu() {
                             branch_children: Vec::new(),
                             discovery_counts: [0; 3],
                             region_hint: None,
+                            claimed_children: [0; 256],
+                            follow_inline_child: true,
                             inline_types: [None; 4],
                             local_child: None,
                             cycle: &cycle,
@@ -3101,6 +3105,8 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
                 branch_children: Vec::new(),
                 discovery_counts: [0; 3],
                 region_hint: None,
+                claimed_children: [0; 256],
+                follow_inline_child: true,
                 inline_types: [None; 4],
                 local_child: None,
                 cycle: &cycle,
@@ -5301,4 +5307,126 @@ fn map_remove_compaction_during_slices_preserves_satb_and_live_values() {
     willow_pop_root();
     willow_gc_collect();
     reset_internal_for_test();
+}
+
+#[test]
+fn branching_continuations_amortize_publication_and_preserve_drain_tails() {
+    let _guard = runtime_test_guard();
+    for count in [100usize, 1_000, 10_000] {
+        for limit in [1usize, 64, 1024] {
+            reset_internal_for_test();
+            let mut head = std::ptr::null_mut();
+            willow_push_root(&mut head);
+            let mut shared = willow_alloc(8);
+            willow_push_root(&mut shared);
+            for _ in 0..count {
+                let mut branch = willow_alloc_typed(8, 1);
+                willow_push_root(&mut branch);
+                unsafe {
+                    store_gc_reference(branch.cast(), shared);
+                }
+                let node = willow_alloc_typed(16, 3);
+                unsafe {
+                    store_gc_reference(node.cast(), head);
+                    store_gc_reference(node.add(8).cast(), branch);
+                }
+                head = node;
+                willow_pop_root();
+            }
+            let (_, cycle) = root_handshake::begin().unwrap();
+            let mut consumer = cycle.queue.register_assist();
+            let mut children = Vec::new();
+            let before = cycle.queue.snapshot().injected;
+            let mut scanned = 0;
+            while !cycle.queue.snapshot().is_drained() {
+                let (processed, _) = cycle.drain_worker(limit, &mut children, &mut consumer);
+                assert!(processed > 0 && processed <= limit + 31);
+                scanned += processed;
+                assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
+            }
+            assert_eq!(scanned, 2 * count + 1);
+            let jobs = cycle.queue.snapshot().injected - before;
+            assert!(
+                jobs <= (count.div_ceil(32) + 2 * (2 * count + 1).div_ceil(limit)) as u64,
+                "nodes={count} limit={limit} jobs={jobs}"
+            );
+            assert_eq!(cycle.queue.snapshot().counter_underflows, 0);
+            let mut node = head;
+            for _ in 0..count {
+                assert!(cycle.is_marked(node as usize));
+                let branch = unsafe { load_gc_reference(node.add(8).cast()) };
+                assert!(cycle.is_marked(branch as usize));
+                assert_eq!(unsafe { load_gc_reference(branch.cast()) }, shared);
+                node = unsafe { load_gc_reference(node.cast()) };
+            }
+            assert!(node.is_null());
+            assert!(cycle.is_marked(shared as usize));
+            eprintln!("branching nodes={count} limit={limit} scanned={scanned} jobs={jobs}");
+            drop(consumer);
+            assert_eq!(cycle.queue.end_epoch(), 0);
+            marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+            GC_MARK_PHASE.store(0, Ordering::Release);
+            willow_pop_root();
+            willow_pop_root();
+        }
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn bounded_drain_claim_cache_preserves_graph_and_resets_between_drains() {
+    let _guard = runtime_test_guard();
+    for stride in [2usize, 512] {
+        let leaves = vec![0usize; 64 * stride];
+        let children: Vec<_> = (0..64)
+            .map(|i| unsafe { leaves.as_ptr().add(stride * i) } as usize)
+            .collect();
+        for count in [16usize, 64, 256] {
+            let parents: Vec<_> = (0..count)
+                .map(|_| children.clone().into_boxed_slice())
+                .collect();
+            for limit in [1usize, 16, usize::MAX] {
+                let metadata = |mask, bytes| raw_heap::TraceMetadata {
+                    type_id: 0,
+                    layout_id: 0,
+                    gc_ref_mask: mask,
+                    payload_size: bytes,
+                };
+                let cycle = ConcurrentCycle::new(
+                    children.iter().map(|&p| (p, metadata(0, 0))).chain(
+                        parents
+                            .iter()
+                            .map(|p| (p.as_ptr() as usize, metadata(u64::MAX, 512))),
+                    ),
+                    IdSet::default(),
+                    IdMap::default(),
+                    0,
+                );
+                for parent in &parents {
+                    cycle.enqueue(parent.as_ptr() as *mut u8);
+                }
+                let before = epoch_index::CLAIM_METADATA_CALLS.get();
+                let mut drains = 0;
+                while !cycle.queue.snapshot().is_drained() {
+                    cycle.drain(limit);
+                    drains += 1;
+                }
+                assert_eq!(cycle.objects.marked_count(), count + 64);
+                let expected_claims = if stride == 2 { drains * 64 } else { count * 64 };
+                assert_eq!(
+                    epoch_index::CLAIM_METADATA_CALLS.get() - before,
+                    expected_claims
+                );
+                assert_eq!(
+                    cycle.work.lock().unwrap().scanned_bytes,
+                    (count * 64 * 8) as u64
+                );
+                assert_eq!(cycle.queue.end_epoch(), 0);
+                eprintln!(
+                    "stride={stride} parents={count} limit={limit} slots={} claims={expected_claims} drains={drains}",
+                    count * 64
+                );
+            }
+        }
+    }
 }

@@ -15,9 +15,10 @@
 //! - A buffer owns a stable region base. Incremental sweep may swap vector
 //!   positions; flush/retirement resolve that base through old_addresses before
 //!   using the cached region index. New buffers survive unrelated releases.
-//! - An active buffer's `sweep_pending` copy equals its region's flag:
-//!   `sweep::prepare` retires every buffer before setting the flags, and
-//!   `sweep_region` retires the region's buffers before visiting it.
+//! - While marking is active, concurrent region publication may precede a
+//!   buffer's cached sweep flag: allocation still sets the concurrent mark bit.
+//!   Final mark closure retires these buffers before phase 0. Outside marking,
+//!   the copy equals its region's flag; sweep retires buffers before visiting.
 //! - Mark closure retires every buffer before clearing `GC_MARK_PHASE`, so no
 //!   buffer allocation observes phase 0 while its region still awaits a
 //!   pending sweep without `sweep_pending`.

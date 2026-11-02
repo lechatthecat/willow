@@ -9,6 +9,7 @@ const PAGE_BYTES: usize = 4096;
 thread_local! {
     static READER_ACQUIRED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static REGION_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static CLAIM_METADATA_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static EPOCH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -433,6 +434,8 @@ impl EpochReader<'_> {
         address: usize,
         hint: &mut Option<usize>,
     ) -> Option<Option<raw_heap::TraceMetadata>> {
+        #[cfg(test)]
+        CLAIM_METADATA_CALLS.set(CLAIM_METADATA_CALLS.get() + 1);
         match &*self.0 {
             EpochData::Regions(index) => {
                 let (view, bit) = index.locate_cached(address, hint)?;

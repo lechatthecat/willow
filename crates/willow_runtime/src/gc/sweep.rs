@@ -75,8 +75,9 @@ pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>
     }
 }
 
-/// Only region flags are published under normal remark. Object reclamation
-/// starts in execute(), after with_stw has released the stop gate.
+/// Retire allocation buffers and finish any newly appended region suffix under
+/// bounded remark. Existing region flags were published concurrently. Object
+/// reclamation starts in execute(), after the stop gate has been released.
 pub(super) fn prepare_bounded(
     state: &mut GcState,
     marking: Arc<ConcurrentCycle>,
@@ -99,20 +100,78 @@ pub(super) fn prepare_bounded(
     })
 }
 
-/// The heap lock serializes this cursor with append-only old-region growth.
-/// Minor collection does not remove/reorder old regions; only the subsequent
-/// major sweep does. Flags already published remain set across remark restarts,
-/// and new buffers copy them, so their allocations remain black. Retiring all
-/// current buffers before each call also freezes buffers with older clear flags.
+#[cfg(test)]
+pub(super) static CONCURRENT_PUBLICATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Publish the existing prefix outside global stops, releasing the heap lock
+/// between bounded chunks. Mark coloring remains active: a pre-existing LAB
+/// whose cached sweep flag is clear still allocates black. Final stopped closure
+/// retires every such LAB before disabling marking. Newly appended regions are
+/// handled by the final bounded check, never chased indefinitely in this loop.
+pub(super) fn publish_regions_concurrently(marking: &ConcurrentCycle) {
+    let end = runtime().heap.lock().unwrap().old_regions.len();
+    loop {
+        let mut state = runtime().heap.lock().unwrap();
+        let before = marking.sweep_publication_cursor.load(Ordering::Relaxed);
+        if before >= end {
+            return;
+        }
+        assert_ne!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+        assert!(state.sweeping.is_none());
+        let mut budget = old_cycle::RemarkBudget::new(
+            64,
+            64 * REGION_PUBLICATION_BYTES,
+            100_000,
+            crate::gc_telemetry::timestamp_ns(),
+        );
+        publish_region_prefix_bounded(
+            &mut state,
+            marking,
+            end,
+            &mut budget,
+            crate::gc_telemetry::timestamp_ns,
+        );
+        let after = marking.sweep_publication_cursor.load(Ordering::Relaxed);
+        drop(state);
+        let regions = (after - before) as u64;
+        crate::gc_telemetry::observations::work(
+            1,
+            crate::gc_telemetry::observations::Work {
+                slots: regions,
+                metadata_bytes: regions * REGION_PUBLICATION_BYTES,
+                yields: u64::from(after < end),
+                ..Default::default()
+            },
+        );
+        #[cfg(test)]
+        CONCURRENT_PUBLICATIONS.fetch_add(after - before, Ordering::Relaxed);
+        std::thread::yield_now();
+    }
+}
+
 fn publish_regions_bounded(
     state: &mut GcState,
     marking: &ConcurrentCycle,
+    budget: &mut old_cycle::RemarkBudget,
+    now: impl FnMut() -> u64,
+) -> bool {
+    publish_region_prefix_bounded(state, marking, state.old_regions.len(), budget, now)
+}
+
+/// The heap lock serializes the cursor with append-only old-region growth.
+/// Minor collection does not remove/reorder old regions. Published flags survive
+/// retries; marking colors existing buffers until final stopped retirement.
+fn publish_region_prefix_bounded(
+    state: &mut GcState,
+    marking: &ConcurrentCycle,
+    end: usize,
     budget: &mut old_cycle::RemarkBudget,
     mut now: impl FnMut() -> u64,
 ) -> bool {
     let mut cursor = marking.sweep_publication_cursor.load(Ordering::Relaxed);
     assert!(cursor <= state.old_regions.len());
-    while cursor < state.old_regions.len() {
+    assert!(end <= state.old_regions.len());
+    while cursor < end {
         if !budget.reserve(1, REGION_PUBLICATION_BYTES, now()) {
             return false;
         }
@@ -614,6 +673,39 @@ mod publication_tests {
             state
                 .old_regions
                 .push(OldRegion::new(RegionKind::Old, 16).unwrap());
+        }
+    }
+
+    #[test]
+    fn concurrent_publication_prefix_bounds_chunks_and_does_not_chase_growth() {
+        for regions in [16usize, 64, 256, 1024] {
+            let mut state = GcState::default();
+            append(&mut state, regions);
+            let marking = cycle();
+            let mut visits = 0;
+            let mut chunks = 0;
+            while marking.sweep_publication_cursor.load(Ordering::Relaxed) < regions {
+                let mut budget =
+                    old_cycle::RemarkBudget::new(64, 64 * REGION_PUBLICATION_BYTES, 100000, 0);
+                publish_region_prefix_bounded(&mut state, &marking, regions, &mut budget, || 0);
+                let [slots, bytes, published] = budget.counts();
+                assert!(slots <= 64 && bytes <= 64 * REGION_PUBLICATION_BYTES);
+                visits += published;
+                chunks += 1;
+                append(&mut state, 17);
+            }
+            assert_eq!(visits as usize, regions);
+            assert_eq!(chunks, regions.div_ceil(64));
+            assert!(state.old_regions[..regions].iter().all(|r| r.sweep_pending));
+            assert!(
+                state.old_regions[regions..]
+                    .iter()
+                    .all(|r| !r.sweep_pending)
+            );
+            println!(
+                "regions={regions} publications={visits} chunks={chunks} appended_unpublished={}",
+                state.old_regions.len() - regions
+            );
         }
     }
 

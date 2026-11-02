@@ -107,6 +107,11 @@ impl RememberedSet {
     pub(super) fn contains_card(&self, card: usize) -> bool {
         self.cards.contains_key(&card)
     }
+    /// Number of members whose header flag must be set. Card owners are
+    /// also members, but deliberately leave their header flag clear.
+    pub(super) fn whole_owner_count(&self) -> usize {
+        self.owners.len() - self.array_cards.len()
+    }
     /// Recorded slot cards of a card-remembered owner.
     pub(super) fn owner_cards(&self, owner: usize) -> Option<&IdSet<usize>> {
         self.array_cards.get(&owner)

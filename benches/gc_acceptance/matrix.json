@@ -1,0 +1,1033 @@
+{
+  "schema": 1,
+  "repeats": 5,
+  "timeout_seconds": 180,
+  "budgets": {
+    "throughput_min_ratio": 0.97,
+    "cpu_max_ratio": 1.0,
+    "footprint_max_ratio": 1.1,
+    "pause_p99_aim_ns": 2000000,
+    "local_wait_max_ns": 5000000000,
+    "elasticity_max": 0.5
+  },
+  "variants": {
+    "stw_reference": {
+      "WILLOW_GC_CONCURRENT_MARK": "0"
+    },
+    "concurrent": {
+      "WILLOW_GC_CONCURRENT_MARK": "1"
+    },
+    "pacer_off": {
+      "WILLOW_GC_PACER": "0"
+    },
+    "assist_off": {
+      "WILLOW_GC_ASSIST": "0"
+    }
+  },
+  "profiles": {
+    "pr": [
+      {
+        "id": "linked",
+        "shape": "linked",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "array",
+        "shape": "array",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 6,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "fanout",
+        "shape": "fanout",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "cyclic",
+        "shape": "cyclic",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "churn",
+        "shape": "churn",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 4096,
+        "checksum": 32640,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "burst",
+        "shape": "burst",
+        "live_bytes": 8388608,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 536854528,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "fragmented",
+        "shape": "fragmented",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "young",
+        "shape": "young",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "ffi_pins",
+        "shape": "ffi_pins",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "catalog",
+        "shape": "catalog",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "tasks",
+        "shape": "tasks",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "cancellation",
+        "shape": "cancellation",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "pingpong",
+        "shape": "pingpong",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "fanin",
+        "shape": "fanin",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "2"
+        }
+      },
+      {
+        "id": "producer_consumer",
+        "shape": "producer_consumer",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "2"
+        }
+      },
+      {
+        "id": "mutators_1",
+        "shape": "workers",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "mutators_5",
+        "shape": "workers",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 163200,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "5"
+        }
+      },
+      {
+        "id": "mutators_8",
+        "shape": "workers",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 261120,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "8"
+        }
+      },
+      {
+        "id": "hard_cap_1",
+        "shape": "workers",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1",
+          "WILLOW_GC_MEMORY_LIMIT": "8388608"
+        }
+      },
+      {
+        "id": "hard_cap_2",
+        "shape": "workers",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 65280,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "2",
+          "WILLOW_GC_MEMORY_LIMIT": "8388608"
+        }
+      },
+      {
+        "id": "hard_cap_4",
+        "shape": "workers",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 130560,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "4",
+          "WILLOW_GC_MEMORY_LIMIT": "8388608"
+        }
+      },
+      {
+        "id": "hard_cap_8",
+        "shape": "workers",
+        "live_bytes": 65536,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 32640,
+        "workload_checksum": 261120,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "8",
+          "WILLOW_GC_MEMORY_LIMIT": "8388608"
+        }
+      },
+      {
+        "id": "soft_85",
+        "shape": "array",
+        "live_bytes": 4194304,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 2016,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        },
+        "soft_target_percent": 85
+      },
+      {
+        "id": "soft_95",
+        "shape": "array",
+        "live_bytes": 4194304,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 2016,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        },
+        "soft_target_percent": 95
+      },
+      {
+        "id": "soft_105",
+        "shape": "array",
+        "live_bytes": 4194304,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 2016,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        },
+        "soft_target_percent": 105
+      },
+      {
+        "id": "overload",
+        "shape": "overload",
+        "live_bytes": 1048576,
+        "roots": 64,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 32768,
+        "checksum": 523776,
+        "workload_checksum": 4294836224,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "8",
+          "WILLOW_GC_MARK_THREADS": "1",
+          "WILLOW_GC_MEMORY_LIMIT_BYTES": "8388608"
+        },
+        "assist_phase_limit_bytes": 8388608
+      },
+      {
+        "id": "young_overlap",
+        "shape": "young_overlap",
+        "live_bytes": 1048576,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 256,
+        "checksum": 8386560,
+        "workload_checksum": 32640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "sweep_overlap",
+        "shape": "sweep_overlap",
+        "live_bytes": 8388608,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 4,
+        "operations": 32768,
+        "checksum": 536854528,
+        "workload_checksum": 2684272640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "5"
+        }
+      }
+    ],
+    "nightly": [
+      {
+        "id": "linked",
+        "shape": "linked",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "array",
+        "shape": "array",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 523776,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "fanout",
+        "shape": "fanout",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "cyclic",
+        "shape": "cyclic",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "churn",
+        "shape": "churn",
+        "live_bytes": 1048576,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 65536,
+        "checksum": 8386560,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "burst",
+        "shape": "burst",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "fragmented",
+        "shape": "fragmented",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 8386560,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "young",
+        "shape": "young",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 8386560,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "ffi_pins",
+        "shape": "ffi_pins",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 8386560,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "catalog",
+        "shape": "catalog",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 8386560,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "tasks",
+        "shape": "tasks",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 2,
+        "operations": 1000000,
+        "checksum": 34359607296,
+        "workload_checksum": 499999500000,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "cancellation",
+        "shape": "cancellation",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 2,
+        "operations": 1000000,
+        "checksum": 34359607296,
+        "workload_checksum": 499999500000,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "pingpong",
+        "shape": "pingpong",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 8386560,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "fanin",
+        "shape": "fanin",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 8386560,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "5"
+        }
+      },
+      {
+        "id": "producer_consumer",
+        "shape": "producer_consumer",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 8386560,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "5"
+        }
+      },
+      {
+        "id": "heap_linked_64",
+        "shape": "linked",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 256,
+        "checksum": 34359607296,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "heap_linked_256",
+        "shape": "linked",
+        "live_bytes": 268435456,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 256,
+        "checksum": 549755289600,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "heap_linked_1024",
+        "shape": "linked",
+        "live_bytes": 1073741824,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 256,
+        "checksum": 8796090925056,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "heap_fanout_64",
+        "shape": "fanout",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 256,
+        "checksum": 34359607296,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "heap_fanout_256",
+        "shape": "fanout",
+        "live_bytes": 268435456,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 256,
+        "checksum": 549755289600,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "heap_fanout_1024",
+        "shape": "fanout",
+        "live_bytes": 1073741824,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 256,
+        "checksum": 8796090925056,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "roots_1",
+        "shape": "linked",
+        "live_bytes": 67108864,
+        "roots": 1,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 256,
+        "checksum": 34359607296,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "roots_64",
+        "shape": "linked",
+        "live_bytes": 67108864,
+        "roots": 64,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 256,
+        "checksum": 34359607296,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "roots_4096",
+        "shape": "linked",
+        "live_bytes": 67108864,
+        "roots": 4096,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 256,
+        "checksum": 34359607296,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "mutators_1",
+        "shape": "workers",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 32768,
+        "checksum": 34359607296,
+        "workload_checksum": 536854528,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "mutators_5",
+        "shape": "workers",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 32768,
+        "checksum": 34359607296,
+        "workload_checksum": 2684272640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "5"
+        }
+      },
+      {
+        "id": "mutators_8",
+        "shape": "workers",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 32768,
+        "checksum": 34359607296,
+        "workload_checksum": 4294836224,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "8"
+        }
+      },
+      {
+        "id": "hard_cap_1",
+        "shape": "workers",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 32768,
+        "checksum": 34359607296,
+        "workload_checksum": 536854528,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1",
+          "WILLOW_GC_MEMORY_LIMIT": "134217728"
+        }
+      },
+      {
+        "id": "hard_cap_2",
+        "shape": "workers",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 32768,
+        "checksum": 34359607296,
+        "workload_checksum": 1073709056,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "2",
+          "WILLOW_GC_MEMORY_LIMIT": "134217728"
+        }
+      },
+      {
+        "id": "hard_cap_4",
+        "shape": "workers",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 32768,
+        "checksum": 34359607296,
+        "workload_checksum": 2147418112,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "4",
+          "WILLOW_GC_MEMORY_LIMIT": "134217728"
+        }
+      },
+      {
+        "id": "hard_cap_8",
+        "shape": "workers",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 32768,
+        "checksum": 34359607296,
+        "workload_checksum": 4294836224,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "8",
+          "WILLOW_GC_MEMORY_LIMIT": "134217728"
+        }
+      },
+      {
+        "id": "soft_85",
+        "shape": "array",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 256,
+        "checksum": 523776,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        },
+        "soft_target_percent": 85
+      },
+      {
+        "id": "soft_95",
+        "shape": "array",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 256,
+        "checksum": 523776,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        },
+        "soft_target_percent": 95
+      },
+      {
+        "id": "soft_105",
+        "shape": "array",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 256,
+        "checksum": 523776,
+        "workload_checksum": 0,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        },
+        "soft_target_percent": 105
+      },
+      {
+        "id": "overload",
+        "shape": "overload",
+        "live_bytes": 536870912,
+        "roots": 4096,
+        "warmup": 2,
+        "cycles": 5,
+        "operations": 8192,
+        "checksum": 137438691328,
+        "workload_checksum": 536805376,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "16",
+          "WILLOW_GC_MARK_THREADS": "1",
+          "WILLOW_GC_MEMORY_LIMIT_BYTES": "671088640",
+          "GC_ACCEPTANCE_OVERLOAD_PAYLOAD": "4096"
+        },
+        "assist_phase_limit_bytes": 671088640
+      },
+      {
+        "id": "young_overlap",
+        "shape": "young_overlap",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 20,
+        "operations": 4096,
+        "checksum": 34359607296,
+        "workload_checksum": 8386560,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "1"
+        }
+      },
+      {
+        "id": "sweep_overlap",
+        "shape": "sweep_overlap",
+        "live_bytes": 67108864,
+        "roots": 4,
+        "warmup": 2,
+        "cycles": 8,
+        "operations": 32768,
+        "checksum": 34359607296,
+        "workload_checksum": 2684272640,
+        "require_cycles": true,
+        "env": {
+          "WILLOW_WORKERS": "5"
+        }
+      }
+    ]
+  },
+  "coverage_note": "PR uses reduced deterministic counts. Nightly includes millions of tasks and 64 MiB\u20131 GiB pointer graphs. Foreign execution remains independently unverified.",
+  "release_variants": [
+    "concurrent"
+  ]
+}

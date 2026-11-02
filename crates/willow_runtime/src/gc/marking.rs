@@ -54,6 +54,7 @@ pub(super) struct ConcurrentCycle {
     pub(super) closing: std::sync::atomic::AtomicBool,
     pub(super) tracing_enabled: std::sync::atomic::AtomicBool,
     pub(super) active_drains: AtomicUsize,
+    active_assists: AtomicUsize,
     pub(super) deferred: Mutex<Vec<usize>>,
     pub(super) unindexed: Mutex<HashSet<usize>>,
     /// False between the root handshake and late-extent publication, when an
@@ -95,6 +96,8 @@ pub(super) struct MarkBatch<'a> {
     pub(super) branch_children: Vec<crate::gc_mark_queue::ObjectRef>,
     pub(super) discovery_counts: [u64; 3],
     pub(super) region_hint: Option<usize>,
+    pub(super) claimed_children: [usize; 256],
+    pub(super) follow_inline_child: bool,
     pub(super) inline_types: [Option<(u32, bool)>; 4],
     pub(super) local_child: Option<(crate::gc_mark_queue::ObjectRef, raw_heap::TraceMetadata)>,
 }
@@ -292,6 +295,7 @@ impl ConcurrentCycle {
             closing: std::sync::atomic::AtomicBool::new(false),
             tracing_enabled: std::sync::atomic::AtomicBool::new(true),
             active_drains: AtomicUsize::new(0),
+            active_assists: AtomicUsize::new(0),
             legacy_traces,
             traces,
             slices: IdMap::default(),
@@ -496,6 +500,7 @@ impl ConcurrentCycle {
         true
     }
 
+    #[inline(always)]
     fn discover_child(
         &self,
         child: *mut u8,
@@ -506,9 +511,17 @@ impl ConcurrentCycle {
             return;
         }
         batch.discovery_counts[0] += 1;
+        // A bounded drain cannot cross relocation or epoch retirement. Remember
+        // only positively claimed starts; exact addresses make collisions misses.
+        let slot = (child as usize / GC_HEADER_SIZE) % batch.claimed_children.len();
+        if batch.claimed_children[slot] == child as usize {
+            batch.discovery_counts[1] += 1;
+            return;
+        }
         let metadata = match index.claim_metadata(child as usize, &mut batch.region_hint) {
             Some(Some(metadata)) => metadata,
             Some(None) => {
+                batch.claimed_children[slot] = child as usize;
                 batch.discovery_counts[1] += 1;
                 return;
             }
@@ -526,6 +539,7 @@ impl ConcurrentCycle {
                 return;
             }
         };
+        batch.claimed_children[slot] = child as usize;
         // A pointer-free generated leaf needs only its mark bit and byte
         // accounting. The active drain owns termination across this claim;
         // avoid allocating and synchronizing a queue item with no trace work.
@@ -541,11 +555,16 @@ impl ConcurrentCycle {
             let child = crate::gc_mark_queue::ObjectRef::from_ptr(child).unwrap();
             // Keep one descendant in the active drain. Branches remain visible
             // to other workers; chains avoid a global enqueue/dequeue per edge.
-            if batch.inline_children && batch.local_child.is_none() {
+            if batch.inline_children && batch.follow_inline_child && batch.local_child.is_none() {
                 batch.local_child = Some((child, metadata));
                 return;
             }
             if batch.inline_children {
+                // The publication bound is fixed. Allocate its final capacity
+                // once, rather than grow 4/8/16/32 slots for every new batch.
+                if batch.branch_children.capacity() == 0 {
+                    batch.branch_children.reserve_exact(32);
+                }
                 batch.branch_children.push(child);
                 if batch.branch_children.len() == 32 {
                     batch.publish_branches();
@@ -849,6 +868,8 @@ impl ConcurrentCycle {
             branch_children: Vec::new(),
             discovery_counts: [0; 3],
             region_hint: None,
+            claimed_children: [0; 256],
+            follow_inline_child: true,
             inline_types: [None; 4],
             local_child: None,
         };
@@ -864,7 +885,12 @@ impl ConcurrentCycle {
             // Recovery owns retry pacing. Mutator assists/background consumers
             // relinquish work so they cannot consume the allowance while the
             // collector is giving a contended owner time to run.
-            if self.recovering.load(Ordering::Acquire) && !is_collector {
+            let recovering = self.recovering.load(Ordering::Acquire);
+            if (recovering && !is_collector)
+                || (!recovering && is_collector && self.active_assists.load(Ordering::Acquire) != 0)
+            {
+                // Admitted mutators and background workers own mark progress.
+                // The collector retires its private tail before joining them.
                 break;
             }
             // Always permit one work item, even after descheduling at entry.
@@ -904,6 +930,8 @@ impl ConcurrentCycle {
                             metadata.payload_size,
                             metadata.gc_ref_mask,
                         );
+                        // Keep wide fanout in shared batches; sparse chains retain locality.
+                        batch.follow_inline_child = metadata.inline_ref_mask().count_ones() <= 32;
                         let slots = inline_references(object.addr(), metadata, |child| {
                             self.discover_child(child, &mut batch, reader);
                         });
@@ -936,6 +964,8 @@ impl ConcurrentCycle {
                                 metadata.payload_size,
                                 metadata.gc_ref_mask,
                             );
+                            batch.follow_inline_child =
+                                metadata.inline_ref_mask().count_ones() <= 32;
                             let slots = inline_references(object.addr(), metadata, |child| {
                                 self.discover_child(child, &mut batch, reader);
                             });
@@ -980,7 +1010,8 @@ impl ConcurrentCycle {
                 }
                 _ => unreachable!("major marker queues only object work"),
             }
-            batch.publish_branches();
+            // Keep partial branches until the fixed batch bound or drain exit.
+            // The active drain and termination owner retain them across queue completion.
             if batch.local_child.is_none() {
                 worker.complete_current();
             }
@@ -1222,6 +1253,27 @@ fn assist_open(cycle: &ConcurrentCycle) -> bool {
     GC_MARK_PHASE.load(Ordering::Acquire) == 1 && !cycle.closing.load(Ordering::Acquire)
 }
 
+/// Releases cycle-local assist admission on return and unwind.
+struct AssistPermit<'a>(&'a AtomicUsize);
+impl<'a> AssistPermit<'a> {
+    fn acquire(active: &'a AtomicUsize, limit: usize) -> Option<Self> {
+        let count = active.load(Ordering::Relaxed);
+        if count >= limit {
+            return None;
+        }
+        // One attempt: contention returns to the bounded wait, not a CAS spin.
+        active
+            .compare_exchange(count, count + 1, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self(active))
+    }
+}
+impl Drop for AssistPermit<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// One bounded assist batch; empty queues never block or manufacture credit.
 /// Legacy callbacks are indivisible and measured by native telemetry.
 /// Returns the credited work.
@@ -1232,9 +1284,23 @@ fn assist_batch(cycle: &ConcurrentCycle) -> u64 {
         let _assist = crate::gc_telemetry::measurement::Span::new(
             crate::gc_telemetry::measurement::Phase::Assist,
         );
-        let work = cycle.drain_checked_until(8, Some(deadline));
-        assist::credit(cycle.assist_epoch, work);
-        work
+        // Extra allocating mutators must not create unbounded marker parallelism.
+        // Failed admission remains inside both CPU and Assist observation scopes.
+        let permit = AssistPermit::acquire(
+            &cycle.active_assists,
+            mark_workers::configured_count().max(1),
+        );
+        if let Some(_permit) = permit {
+            // Amortize registration while retaining per-object stop/deadline checks.
+            let work = cycle.drain_checked_until(256, Some(deadline));
+            assist::credit(cycle.assist_epoch, work);
+            work
+        } else {
+            // No heap, queue, reader or permit is held. The caller polls before
+            // retrying, retains unpaid debt, and keeps the exhausted-runway gate.
+            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+            0
+        }
     };
     let overhead = cpu.overhead();
     let mut total = cycle.work.lock().unwrap();
@@ -1331,4 +1397,84 @@ pub(super) fn mark_worklist(
     work.cpu_incomplete = cpu.is_none();
     crate::gc_telemetry::observations::graph_work(work);
     work
+}
+
+#[cfg(test)]
+mod assist_admission_tests {
+    use super::*;
+
+    #[test]
+    fn collector_yields_to_admitted_assist_without_losing_queue_work() {
+        let _guard = runtime_test_guard();
+        let cycle = ConcurrentCycle::new(
+            (1..=64).map(|address| {
+                (
+                    address,
+                    raw_heap::TraceMetadata {
+                        type_id: 0,
+                        layout_id: 0,
+                        gc_ref_mask: 0,
+                        payload_size: 0,
+                    },
+                )
+            }),
+            IdSet::default(),
+            IdMap::default(),
+            0,
+        );
+        for address in 1..=64 {
+            cycle.enqueue(address as *mut u8);
+        }
+        let permit = AssistPermit::acquire(&cycle.active_assists, 1).unwrap();
+        assert_eq!(cycle.drain(256), 0);
+        assert_eq!(cycle.queue.snapshot().outstanding, 64);
+        assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
+        drop(permit);
+        cycle.drain(256);
+        assert_eq!(cycle.work.lock().unwrap().objects, 64);
+        assert_eq!(cycle.queue.end_epoch(), 0);
+    }
+
+    #[test]
+    fn assist_admission_bounds_parallelism_and_releases_on_unwind() {
+        for limit in [1, 2, 4, 8] {
+            let active = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let barrier = std::sync::Barrier::new(16);
+            std::thread::scope(|scope| {
+                for _ in 0..16 {
+                    let (active, peak, barrier) = (&active, &peak, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..32 {
+                            loop {
+                                if let Some(_permit) = AssistPermit::acquire(active, limit) {
+                                    peak.fetch_max(
+                                        active.load(Ordering::Acquire),
+                                        Ordering::Relaxed,
+                                    );
+                                    std::thread::yield_now();
+                                    break;
+                                }
+                                std::thread::yield_now();
+                            }
+                        }
+                    });
+                }
+            });
+            assert_eq!(active.load(Ordering::Acquire), 0);
+            assert!((1..=limit).contains(&peak.load(Ordering::Relaxed)));
+            let held: Vec<_> = (0..limit)
+                .map(|_| AssistPermit::acquire(&active, limit).unwrap())
+                .collect();
+            assert!(AssistPermit::acquire(&active, limit).is_none());
+            drop(held);
+            let panic = std::panic::catch_unwind(|| {
+                let _permit = AssistPermit::acquire(&active, limit).unwrap();
+                panic!("test permit unwind");
+            });
+            assert!(panic.is_err());
+            assert_eq!(active.load(Ordering::Acquire), 0);
+        }
+    }
 }

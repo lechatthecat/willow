@@ -4537,3 +4537,274 @@ fn refill_accounting_triggers_without_registry_rescan() {
     willow_gc_unregister_mutator();
     reset_gc();
 }
+
+#[test]
+fn inline_slot_enumeration_preserves_payload_bounds_and_existing_slots() {
+    let _guard = gc_test_guard();
+    for words in [0usize, 1, 2, 63, 64, 65, 128] {
+        for mask in [0u64, 1, 1 << 63, u64::MAX, 0xaaaaaaaaaaaaaaaa] {
+            reset_gc();
+            let payload = willow_alloc_typed((words * GC_STORAGE_WORD_BYTES) as i64, mask);
+            let object = HeapObject::from_raw(payload_to_header(payload)).unwrap();
+            let actual_words = object.trace_metadata().payload_size / GC_STORAGE_WORD_BYTES;
+            let mut slots = vec![std::ptr::null_mut()];
+            append_object_reference_slots(object, &HashMap::new(), &mut slots);
+            let expected: Vec<_> = (0..actual_words.min(64))
+                .filter(|&bit| mask & (1u64 << bit) != 0)
+                .map(|bit| unsafe { payload.add(bit * GC_STORAGE_WORD_BYTES).cast() })
+                .collect();
+            assert!(slots[0].is_null());
+            assert_eq!(
+                &slots[1..],
+                expected.as_slice(),
+                "words={words} mask={mask:x}"
+            );
+        }
+    }
+    reset_gc();
+}
+
+#[test]
+fn barrier_verifier_preserves_both_membership_flag_implications() {
+    let _guard = gc_test_guard();
+    for remembered in [false, true] {
+        for flagged in [false, true] {
+            for carded in [false, true] {
+                reset_gc();
+                let owner = willow_gc_alloc_layout(52, 0, 8, 0);
+                let object = HeapObject::from_raw(payload_to_header(owner)).unwrap();
+                let mut state = runtime().heap.lock().unwrap();
+                if remembered {
+                    if carded {
+                        state.remembered_set.insert_card(owner as usize, 0);
+                    } else {
+                        state.remembered_set.insert(owner as usize);
+                    }
+                }
+                object.set_remembered(flagged);
+                let result = verify_remembered_set(&state, &HashMap::new());
+                assert_eq!(
+                    result.is_ok(),
+                    flagged == (remembered && !carded),
+                    "remembered={remembered} flagged={flagged} carded={carded}"
+                );
+            }
+        }
+    }
+    reset_gc();
+}
+
+#[test]
+fn verifier_trace_cache_tracks_type_changes_and_registry_lifetime() {
+    unsafe fn first(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+        slots.push(payload.cast());
+    }
+    unsafe fn second(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+        slots.push(unsafe { payload.add(GC_STORAGE_WORD_BYTES).cast() });
+    }
+    let _guard = gc_test_guard();
+    for target in 0..3 {
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let young = willow_gc_alloc_slow(&mut tls, 51, 0, 8, 0);
+        let owners = [
+            willow_alloc_object(71, 16),
+            willow_alloc_object(72, 16),
+            willow_alloc_object(71, 16),
+        ];
+        let slot = if target == 1 {
+            GC_STORAGE_WORD_BYTES
+        } else {
+            0
+        };
+        unsafe {
+            owners[target].add(slot).cast::<*mut u8>().write(young);
+        }
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_locked(&mut state);
+        let mut registry: HashMap<u32, TraceFn> = HashMap::new();
+        assert!(verify_remembered_set(&state, &registry).is_ok());
+        registry.insert(71, first);
+        registry.insert(72, second);
+        assert!(
+            verify_remembered_set(&state, &registry)
+                .unwrap_err()
+                .contains("without a remembered-set entry")
+        );
+        remember_owner(&mut state, owners[target] as usize);
+        assert!(verify_remembered_set(&state, &registry).is_ok());
+        drop(state);
+    }
+    reset_gc();
+}
+
+#[test]
+fn barrier_verifier_visits_dense_sparse_and_fragmented_objects_once() {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    unsafe fn trace(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        slots.push(payload.cast());
+    }
+    let _guard = gc_test_guard();
+    for count in [16usize, 1024, 4096] {
+        for payload_bytes in [8, 4096] {
+            reset_gc();
+            runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+            let objects: Vec<_> = (0..count)
+                .map(|_| willow_alloc_object(91, payload_bytes))
+                .collect();
+            let mut registry: HashMap<u32, TraceFn> = HashMap::new();
+            registry.insert(91, trace);
+            let mut state = runtime().heap.lock().unwrap();
+            retire_all_tlabs_locked(&mut state);
+            for fragmented in [false, true] {
+                if fragmented {
+                    for region in &mut state.old_regions {
+                        let offsets: Vec<_> =
+                            region.allocations.keys().copied().step_by(2).collect();
+                        for offset in offsets {
+                            let object =
+                                HeapObject::from_raw(unsafe { region.base.add(offset) }.cast())
+                                    .unwrap();
+                            region.release_object(object);
+                        }
+                    }
+                }
+                let expected: usize = state.old_regions.iter().map(|r| r.allocations.len()).sum();
+                CALLS.store(0, Ordering::Relaxed);
+                assert!(verify_remembered_set(&state, &registry).is_ok());
+                assert_eq!(CALLS.load(Ordering::Relaxed), expected);
+                let bitmap_words: usize = state
+                    .old_regions
+                    .iter()
+                    .filter(|r| r.mark_bitmap.bits.word_count() <= r.allocations.len())
+                    .map(|r| r.mark_bitmap.bits.word_count())
+                    .sum();
+                assert!(bitmap_words <= expected);
+                eprintln!(
+                    "verifier count={count} payload={payload_bytes} fragmented={fragmented} objects={expected} trace_calls={expected} bitmap_words={bitmap_words}"
+                );
+            }
+            drop(state);
+            std::hint::black_box(objects);
+        }
+    }
+    reset_gc();
+}
+
+#[test]
+fn barrier_verifier_checks_active_and_retired_zero_payload_boundaries() {
+    let _guard = gc_test_guard();
+    for bytes in [0, 8, 128] {
+        for retired in [false, true] {
+            reset_gc();
+            let mut tls = new_tlab_state();
+            let child = willow_gc_alloc_slow(&mut tls, 51, 0, bytes, 0);
+            let owner = willow_gc_alloc_layout(52, 0, 8, 1);
+            unsafe { owner.cast::<*mut u8>().write(child) };
+            let mut state = runtime().heap.lock().unwrap();
+            if retired {
+                retire_all_tlabs_locked(&mut state);
+            }
+            assert!(
+                verify_remembered_set(&state, &HashMap::new())
+                    .unwrap_err()
+                    .contains("without a remembered-set entry"),
+                "bytes={bytes} retired={retired}"
+            );
+            remember_owner(&mut state, owner as usize);
+            assert!(verify_remembered_set(&state, &HashMap::new()).is_ok());
+        }
+    }
+    reset_gc();
+}
+
+#[test]
+fn verifier_layout_cache_distinguishes_masks_with_the_same_type() {
+    let _guard = gc_test_guard();
+    for target in 0..3 {
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let child = willow_gc_alloc_slow(&mut tls, 51, 0, 8, 0);
+        let objects = [
+            willow_gc_alloc_layout(90, 1, 16, 1),
+            willow_gc_alloc_layout(90, 2, 16, 2),
+            willow_gc_alloc_layout(90, 1, 16, 1),
+        ];
+        let offset = if target == 1 {
+            GC_STORAGE_WORD_BYTES
+        } else {
+            0
+        };
+        unsafe { objects[target].add(offset).cast::<*mut u8>().write(child) };
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_locked(&mut state);
+        assert!(
+            verify_remembered_set(&state, &HashMap::new())
+                .unwrap_err()
+                .contains("without a remembered-set entry")
+        );
+        remember_owner(&mut state, objects[target] as usize);
+        assert!(verify_remembered_set(&state, &HashMap::new()).is_ok());
+    }
+    reset_gc();
+}
+
+#[test]
+fn barrier_verifier_checks_all_streams_after_single_slot_fast_path() {
+    unsafe fn native_slot(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+        slots.push(unsafe { payload.add(2 * GC_STORAGE_WORD_BYTES).cast() });
+    }
+    static BITMAP: [u64; 3] = [2, 0b10, 0b10];
+    let _guard = gc_test_guard();
+    for mode in 0..4 {
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let child = willow_gc_alloc_slow(&mut tls, 51, 0, 8, 0);
+        // Exercise ordinary singleton objects in the same stopped traversal.
+        for _ in 0..16 {
+            willow_gc_alloc_layout(90, 1, 16, 1);
+        }
+        let (owner, slot) = if mode == 1 || mode == 2 {
+            let bytes = 66 * GC_STORAGE_WORD_BYTES;
+            let id = willow_abi::gc_bitmap_layout_id(
+                bytes as i64,
+                17,
+                willow_abi::gc_bitmap_fingerprint(&BITMAP[1..]),
+            );
+            (
+                willow_gc_alloc_bitmap(id as i64, bytes as i64, BITMAP.as_ptr()),
+                if mode == 1 { 1 } else { 65 },
+            )
+        } else {
+            (
+                willow_gc_alloc_layout(1, 92, 24, 1),
+                if mode == 0 { 0 } else { 2 },
+            )
+        };
+        unsafe {
+            owner
+                .add(slot * GC_STORAGE_WORD_BYTES)
+                .cast::<*mut u8>()
+                .write(child)
+        };
+        let mut registry: HashMap<u32, TraceFn> = HashMap::new();
+        if mode == 3 {
+            registry.insert(92, native_slot);
+        }
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_locked(&mut state);
+        assert!(
+            verify_remembered_set(&state, &registry)
+                .expect_err(&format!("mode={mode}"))
+                .contains("without a remembered-set entry"),
+            "mode={mode}"
+        );
+        remember_owner(&mut state, owner as usize);
+        assert!(
+            verify_remembered_set(&state, &registry).is_ok(),
+            "mode={mode}"
+        );
+    }
+    reset_gc();
+}

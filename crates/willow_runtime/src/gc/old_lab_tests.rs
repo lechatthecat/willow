@@ -104,6 +104,8 @@ fn buffer_allocations_survive_mark_closure_and_a_pending_sweep() {
             let mut rooted = willow_alloc(16);
             willow_push_root(&mut rooted);
             let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
+            // Publish region flags while the old cached LAB flag is still clear.
+            sweep::publish_regions_concurrently(&cycle);
             // Allocated black while marking, from the buffer carved before the cycle.
             let during_mark = willow_alloc(24);
             assert!(local_pending_for_test() > 0);

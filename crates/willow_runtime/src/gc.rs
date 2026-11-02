@@ -2123,27 +2123,39 @@ pub(crate) fn stress_collect(kind: &str) {
 
 /// Extend tracing beyond the inline mask. Bitmap descriptors are immutable
 /// static data whose lifetime covers every object using them, including moves.
-fn append_bitmap_slots(object: HeapObject, slots: &mut Vec<*mut *mut u8>) {
-    let metadata = object.trace_metadata();
-    if metadata.type_id != willow_abi::GC_BITMAP_TYPE_ID {
-        return;
-    }
+#[inline(always)]
+fn bitmap_reference_slots(
+    object: HeapObject,
+    metadata: raw_heap::TraceMetadata,
+) -> impl Iterator<Item = *mut *mut u8> {
     let descriptor = metadata.gc_ref_mask as *const u64;
-    // SAFETY: only willow_gc_alloc_bitmap installs the reserved tracing type, after validating a
-    // compiler-owned, process-lifetime descriptor. Moving GC copies the pointer.
-    let count = unsafe { *descriptor } as usize;
+    // SAFETY: only bitmap objects interpret the mask as an immutable,
+    // process-lifetime compiler descriptor. Other types have no extra words.
+    let count = if metadata.type_id == willow_abi::GC_BITMAP_TYPE_ID {
+        unsafe { *descriptor as usize }
+    } else {
+        0
+    };
     let payload_words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
-    for word in 1..count {
+    (1..count).flat_map(move |word| {
+        // SAFETY: word + 1 addresses a descriptor word below its declared count.
         let mut bits = unsafe { *descriptor.add(word + 1) };
-        while bits != 0 {
-            let bit = bits.trailing_zeros() as usize;
-            let index = word * 64 + bit;
-            if index < payload_words {
-                slots.push(object.payload_slot(index));
+        std::iter::from_fn(move || {
+            while bits != 0 {
+                let index = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if index < payload_words {
+                    return Some(object.payload_slot(index));
+                }
             }
-            bits &= bits - 1;
-        }
-    }
+            None
+        })
+    })
+}
+
+#[inline(always)]
+fn append_bitmap_slots(object: HeapObject, slots: &mut Vec<*mut *mut u8>) {
+    slots.extend(bitmap_reference_slots(object, object.trace_metadata()));
 }
 
 fn object_reference_slots(
@@ -2155,19 +2167,32 @@ fn object_reference_slots(
     slots
 }
 
+#[inline(always)]
+fn inline_reference_slots(
+    object: HeapObject,
+    metadata: raw_heap::TraceMetadata,
+) -> impl Iterator<Item = *mut *mut u8> {
+    let words = (metadata.payload_size / GC_STORAGE_WORD_BYTES).min(64);
+    let mut mask =
+        metadata.inline_ref_mask() & u64::MAX.checked_shr((64 - words) as u32).unwrap_or(0);
+    std::iter::from_fn(move || {
+        if mask == 0 {
+            return None;
+        }
+        let index = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        Some(object.payload_slot(index))
+    })
+}
+
+#[inline(always)]
 fn append_object_reference_slots(
     object: HeapObject,
     trace_registry: &HashMap<u32, TraceFn, impl std::hash::BuildHasher>,
     slots: &mut Vec<*mut *mut u8>,
 ) {
     let metadata = object.trace_metadata();
-    let payload_words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
-    let inline_mask = metadata.inline_ref_mask();
-    for index in 0..payload_words.min(64) {
-        if (inline_mask & (1u64 << index)) != 0 {
-            slots.push(object.payload_slot(index));
-        }
-    }
+    slots.extend(inline_reference_slots(object, metadata));
     append_bitmap_slots(object, slots);
     if let Some(trace) = trace_registry.get(&metadata.type_id).copied() {
         // SAFETY: trace is registered for this runtime type and exposes mutable

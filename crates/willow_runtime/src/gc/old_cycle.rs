@@ -330,6 +330,7 @@ mod integration_tests {
             take_stop_diagnostics();
             let views = REGION_VIEWS.load(Ordering::Relaxed);
             let checks = BUDGET_CHECKS.load(Ordering::Relaxed);
+            let concurrent_regions = sweep::CONCURRENT_PUBLICATIONS.load(Ordering::Relaxed);
             willow_gc_collect();
             let stops = crate::gc_telemetry::stops::snapshot_stops();
             assert_eq!(stops.by_reason[0].work.metadata_objects, 0);
@@ -337,21 +338,10 @@ mod integration_tests {
             assert_eq!(stops.by_reason[1].work.metadata_objects, 0);
             assert_eq!(stops.by_reason[1].work.swept_objects, 0);
             assert!(stops.by_reason[1].requests <= 2);
-            if mib == 1024 {
-                assert!(
-                    stops.by_reason[3].requests >= 1,
-                    "region publication must continue in classified bounded Recovery slices"
-                );
-                for sample in mark_closure::RECOVERY_SAMPLES.lock().unwrap().iter() {
-                    assert!(sample[0] <= mark_closure::RECOVERY_SLOTS);
-                    assert!(sample[1] <= mark_closure::RECOVERY_BYTES);
-                }
-            } else {
-                assert_eq!(
-                    stops.by_reason[3].requests, 0,
-                    "smaller fixtures fit normal remark"
-                );
-            }
+            assert_eq!(
+                stops.by_reason[3].requests, 0,
+                "region work must not force recovery"
+            );
             assert_eq!(willow_gc_allocated_bytes(), before);
             let diagnostics = take_stop_diagnostics();
             let mut published_regions = 0;
@@ -370,7 +360,9 @@ mod integration_tests {
                         diagnostic.reason,
                         budget.regions,
                         budget.regions,
-                        budget.regions,
+                        budget
+                            .regions
+                            .saturating_mul(sweep::REGION_PUBLICATION_BYTES),
                         budget.used[0],
                         budget.used[1],
                         budget.limits[0],
@@ -382,14 +374,19 @@ mod integration_tests {
                     );
                 }
             }
-            if mib == 1024 {
-                assert!(published_regions > 0 && published_regions <= 4096);
-            } else {
-                assert_eq!(
-                    published_regions as usize,
-                    runtime().heap.lock().unwrap().old_regions.len()
-                );
-            }
+            assert_eq!(
+                published_regions, 0,
+                "existing regions publish outside stops"
+            );
+            let concurrent_regions =
+                sweep::CONCURRENT_PUBLICATIONS.load(Ordering::Relaxed) - concurrent_regions;
+            assert_eq!(
+                concurrent_regions,
+                runtime().heap.lock().unwrap().old_regions.len()
+            );
+            println!(
+                "live_mib={mib} concurrent_region_publications={concurrent_regions} stopped_region_publications={published_regions}"
+            );
             let preparation = *PREPARATION.lock().unwrap();
             println!(
                 "live_mib={mib} concurrent_prepare_regions={} concurrent_index_entries={} concurrent_bitmap_words={} concurrent_bitmap_bytes={} concurrent_heap_hold_ns={}",

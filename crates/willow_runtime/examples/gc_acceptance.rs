@@ -51,6 +51,7 @@ fn endpoint(label: &str) {
 fn sample(index: usize, elapsed: u128, operations: usize, checksum: u64, workload_checksum: u64) {
     let s = snapshot();
     let overload_peak = workloads::overload_peak();
+    let (burst_allocation_overlap, burst_mutation_overlap) = workloads::burst_counts();
     let (channel_overlap, sweep_overlap) = workloads::overlap_counts();
     let b = s.baseline.baseline.baseline;
     let p = t::pacing::snapshot();
@@ -59,7 +60,7 @@ fn sample(index: usize, elapsed: u128, operations: usize, checksum: u64, workloa
     let (peak_committed, wasted_bytes) = t::footprint::snapshot();
     let peak_rss = t::peak_resident_bytes().expect("OS peak RSS unavailable");
     println!(
-        "{{\"schema\":1,\"event\":\"sample\",\"index\":{index},\"elapsed_ns\":{elapsed},\"operations\":{operations},\"checksum\":{checksum},\"workload_checksum\":{workload_checksum},\"channel_overlap\":{channel_overlap},\"sweep_overlap\":{sweep_overlap},\"overload_peak\":{overload_peak},\"peak_committed_bytes\":{peak_committed},\"peak_rss_bytes\":{peak_rss},\"wasted_bytes\":{wasted_bytes},\"sweep_objects\":{sweep_objects},\"sweep_bytes\":{sweep_bytes},\"sweep_ns\":{sweep_ns},\"timestamp_ns\":{},\"allocation_bytes\":{},\"committed_bytes\":{},\"reserved_bytes\":{},\"rss_bytes\":{},\"rss_valid\":{},\"live_bytes\":{},\"quarantine_bytes\":{},\"reclaimed_bytes\":{},\"copied_bytes\":{},\"promoted_bytes\":{},\"fragmentation_bytes\":{},\"barrier_ops\":{},\"gc_cpu_ns\":{},\"cpu_missing_cycles\":{},\"goal_bytes\":{},\"cycles\":{}}}",
+        "{{\"schema\":1,\"event\":\"sample\",\"index\":{index},\"elapsed_ns\":{elapsed},\"operations\":{operations},\"checksum\":{checksum},\"workload_checksum\":{workload_checksum},\"channel_overlap\":{channel_overlap},\"sweep_overlap\":{sweep_overlap},\"burst_allocation_overlap\":{burst_allocation_overlap},\"burst_mutation_overlap\":{burst_mutation_overlap},\"overload_peak\":{overload_peak},\"peak_committed_bytes\":{peak_committed},\"peak_rss_bytes\":{peak_rss},\"wasted_bytes\":{wasted_bytes},\"sweep_objects\":{sweep_objects},\"sweep_bytes\":{sweep_bytes},\"sweep_ns\":{sweep_ns},\"timestamp_ns\":{},\"allocation_bytes\":{},\"committed_bytes\":{},\"reserved_bytes\":{},\"rss_bytes\":{},\"rss_valid\":{},\"live_bytes\":{},\"quarantine_bytes\":{},\"reclaimed_bytes\":{},\"copied_bytes\":{},\"promoted_bytes\":{},\"fragmentation_bytes\":{},\"barrier_ops\":{},\"gc_cpu_ns\":{},\"cpu_missing_cycles\":{},\"goal_bytes\":{},\"cycles\":{}}}",
         s.timestamp_ns,
         b.counters.allocation_bytes,
         b.heap.committed_bytes,
@@ -219,33 +220,20 @@ pub extern "C" fn willow_user_main() {
             } else {
                 256
             };
-            for i in 0..allocations {
-                let size = if shape == "fragmented" {
-                    4096 + (i % 7) * 1024
-                } else {
-                    128
-                };
-                std::hint::black_box(gc::willow_alloc(size as i64));
-                gc::willow_gc_safepoint();
-                if i % 64 == 0 {
-                    t::flush_observations();
-                }
-            }
             if shape == "burst" {
-                for &head in &roots {
-                    let mut saved = unsafe { *head.cast::<*mut u8>() };
-                    gc::willow_push_root(&mut saved);
-                    for _ in 0..64 {
-                        gc::willow_gc_write_barrier(head, saved, std::ptr::null_mut(), 1);
-                        unsafe {
-                            *head.cast::<*mut u8>() = std::ptr::null_mut();
-                        }
-                        gc::willow_gc_write_barrier(head, std::ptr::null_mut(), saved, 1);
-                        unsafe {
-                            *head.cast::<*mut u8>() = saved;
-                        }
+                workloads::burst(&roots, allocations);
+            } else {
+                for i in 0..allocations {
+                    let size = if shape == "fragmented" {
+                        4096 + (i % 7) * 1024
+                    } else {
+                        128
+                    };
+                    std::hint::black_box(gc::willow_alloc(size as i64));
+                    gc::willow_gc_safepoint();
+                    if i % 64 == 0 {
+                        t::flush_observations();
                     }
-                    gc::willow_pop_root();
                 }
             }
             if let Ok(fault) = std::env::var("GC_ACCEPTANCE_FAULT") {
@@ -255,10 +243,15 @@ pub extern "C" fn willow_user_main() {
             gc::willow_gc_collect();
             let mut checksum = 0u64;
             let mut visited = 0;
-            for &head in &roots {
-                let mut cursor = head;
+            let mut cursor = std::ptr::null_mut();
+            gc::willow_push_root(&mut cursor);
+            // Do not hold a slice iterator over root slots across a poll: a
+            // relocating collection may rewrite those slots through registration.
+            let mut root_index = 0;
+            while root_index < roots.len() {
+                cursor = roots[root_index];
                 while !cursor.is_null() {
-                    // No allocation/safepoint during this read of rooted chains.
+                    // The cursor is rooted across bounded verification polls.
                     unsafe {
                         checksum = checksum.wrapping_add(*cursor.add(id_offset).cast::<u64>());
                         let child = *cursor.cast::<*mut u8>();
@@ -283,8 +276,13 @@ pub extern "C" fn willow_user_main() {
                     }
                     visited += 1;
                     assert!(visited <= count, "corrupt/cyclic chain");
+                    if visited % 64 == 0 {
+                        gc::willow_gc_safepoint();
+                    }
                 }
+                root_index += 1;
             }
+            gc::willow_pop_roots(1);
             assert_eq!(visited, count);
             assert_eq!(checksum, (count as u64).wrapping_mul(count as u64 - 1) / 2);
             let elapsed = start.elapsed().as_nanos();
@@ -295,7 +293,19 @@ pub extern "C" fn willow_user_main() {
                     + count
                     + if matches!(shape, "workers" | "overload" | "sweep_overlap") {
                         workers * work
-                    } else if workload_checksum > 0 {
+                    } else if matches!(
+                        shape,
+                        "tasks"
+                            | "cancellation"
+                            | "pingpong"
+                            | "fanin"
+                            | "producer_consumer"
+                            | "young"
+                            | "ffi_pins"
+                            | "catalog"
+                            | "fragmented"
+                            | "young_overlap"
+                    ) {
                         work
                     } else {
                         0

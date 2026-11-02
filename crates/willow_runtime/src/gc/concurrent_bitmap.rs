@@ -91,14 +91,43 @@ impl ConcurrentMarkBits {
             mask = u64::MAX;
         }
     }
-    /// Visit set indices in ascending order: O(words + set bits).
-    pub(super) fn for_each_set(&self, mut visit: impl FnMut(usize)) {
+    /// Visit set bits directly, without resumable iterator state per object.
+    pub(super) fn try_for_each_set<E>(
+        &self,
+        mut visit: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
         for (word_index, word) in self.words.iter().enumerate() {
             let mut bits = word.load(Ordering::Acquire);
             while bits != 0 {
-                visit(word_index * 64 + bits.trailing_zeros() as usize);
+                let index = word_index * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
+                visit(index)?;
             }
+        }
+        Ok(())
+    }
+    /// Enumerate set indices without allocating a snapshot: O(words + set bits).
+    pub(super) fn iter_set(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words
+            .iter()
+            .enumerate()
+            .flat_map(|(word_index, word)| {
+                let mut bits = word.load(Ordering::Acquire);
+                std::iter::from_fn(move || {
+                    if bits == 0 {
+                        return None;
+                    }
+                    let index = word_index * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    Some(index)
+                })
+            })
+    }
+
+    /// Visit set indices in ascending order: O(words + set bits).
+    pub(super) fn for_each_set(&self, mut visit: impl FnMut(usize)) {
+        for index in self.iter_set() {
+            visit(index);
         }
     }
     pub(super) fn count(&self) -> usize {
@@ -146,6 +175,24 @@ mod tests {
             let mut seen = Vec::new();
             bits.for_each_set(|index| seen.push(index));
             assert_eq!(seen, expected);
+            assert_eq!(bits.iter_set().collect::<Vec<_>>(), expected);
+            seen.clear();
+            bits.try_for_each_set(|index| {
+                seen.push(index);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+            assert_eq!(seen, expected);
+            seen.clear();
+            let stop = expected[expected.len() / 2];
+            assert_eq!(
+                bits.try_for_each_set(|index| {
+                    seen.push(index);
+                    if index == stop { Err(index) } else { Ok(()) }
+                }),
+                Err(stop)
+            );
+            assert_eq!(seen, expected[..=expected.len() / 2]);
         }
     }
 
