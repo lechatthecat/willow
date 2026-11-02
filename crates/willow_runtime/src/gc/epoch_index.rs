@@ -401,6 +401,29 @@ impl EpochReader<'_> {
         }
     }
 
+    /// Uniform liveness of an extent in a sealed epoch: false is all dead,
+    /// true is all live. Mixed or missing/new extents require object checks.
+    pub(super) fn uniform_extent(&self, base: usize, capacity: usize) -> Option<bool> {
+        match &*self.0 {
+            EpochData::Regions(index) => index
+                .locate_extent_cached(base + GC_HEADER_SIZE, &mut None)
+                .and_then(|(view, _)| {
+                    if view.base != base || view.capacity != capacity {
+                        return None;
+                    }
+                    if view.marks.iter_set().next().is_none() {
+                        Some(false)
+                    } else if view.marks.contains_all(&view.starts) {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }),
+            #[cfg(test)]
+            EpochData::Synthetic { .. } => None,
+        }
+    }
+
     /// Allocations were validated by the sweep index; starts may be rebuilding.
     #[inline]
     pub(super) fn retains_allocated_cached(
@@ -1138,6 +1161,30 @@ mod tests {
             #[cfg(test)]
             refresh_page_visits: 0,
         }
+    }
+
+    #[test]
+    fn uniform_extent_requires_exact_captured_bounds_and_uniform_marks() {
+        let mut index = empty();
+        let starts = Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(512));
+        let marks = Arc::new(concurrent_bitmap::ConcurrentMarkBits::new(512));
+        starts.set(0);
+        starts.set(64);
+        starts.set(511);
+        index.add(8192, 4096, &starts, &marks, false);
+        let epoch = EpochIndex::regions(index);
+        let reader = epoch.reader();
+        assert_eq!(reader.uniform_extent(8192, 4096), Some(false));
+        for (base, size) in [(0, 4096), (8192, 2048), (8200, 4096), (16384, 4096)] {
+            assert_eq!(reader.uniform_extent(base, size), None);
+        }
+        marks.set(0);
+        assert_eq!(reader.uniform_extent(8192, 4096), None);
+        marks.set(64);
+        marks.set(511);
+        assert_eq!(reader.uniform_extent(8192, 4096), Some(true));
+        marks.unset(64);
+        assert_eq!(reader.uniform_extent(8192, 4096), None);
     }
 
     #[test]

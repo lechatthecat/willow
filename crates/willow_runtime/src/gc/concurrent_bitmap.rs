@@ -31,6 +31,18 @@ impl ConcurrentMarkBits {
             .get(index / 64)
             .is_some_and(|word| word.load(Ordering::Acquire) & (1u64 << (index % 64)) != 0)
     }
+    /// Whether all starts in a sealed extent are marked. O(bitmap words).
+    pub(super) fn contains_all(&self, starts: &Self) -> bool {
+        self.words.len() == starts.words.len()
+            && self
+                .words
+                .iter()
+                .zip(starts.words.iter())
+                .all(|(marks, starts)| {
+                    let starts = starts.load(Ordering::Acquire);
+                    marks.load(Ordering::Acquire) & starts == starts
+                })
+    }
     pub(super) fn word_count(&self) -> usize {
         self.words.len()
     }

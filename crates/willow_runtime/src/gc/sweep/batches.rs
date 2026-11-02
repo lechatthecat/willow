@@ -57,6 +57,12 @@ struct Report {
     reclaimed_bytes: u64,
     metadata_items: u64,
     swept_objects: u64,
+    #[cfg(test)]
+    bulk_nursery_chunks: u64,
+    #[cfg(test)]
+    bulk_nursery_objects: u64,
+    #[cfg(test)]
+    bulk_live_nursery_chunks: u64,
     swept_bytes: u64,
     assist_cpu_ns: u64,
     assist_cpu_incomplete: bool,
@@ -617,6 +623,95 @@ impl Cursor {
             self.report.objects += 1;
             return Action::Progress;
         }
+        // An untouched nursery prefix contains only young objects: the
+        // slow-path first object may own an interned descriptor, subsequent
+        // generated/runtime bump allocations use static descriptors. A sealed
+        // epoch can retain a wholly marked prefix without decoding headers.
+        // No marks plus an empty drop registry proves that no per-object
+        // liveness or hook work is needed. Indexed, pinned, survivor
+        // and post-snapshot chunks retain the ordinary object path.
+        if self.plan.authoritative_epoch_marks
+            && !self.chunk_started
+            && !assist
+            && chunk.kind == RegionKind::Nursery
+            && chunk.needs_index()
+            && chunk.used as u64 <= remaining
+            && let Some(live) = self.plan.marking.as_ref().and_then(|cycle| {
+                cycle
+                    .objects
+                    .reader()
+                    .uniform_extent(chunk.base as usize, chunk.capacity)
+            })
+        {
+            if live {
+                let objects = chunk.mark_bitmap.bits.count() as u64;
+                chunk.live_bytes = chunk.used;
+                self.report.objects += 1;
+                self.report.bytes += chunk.used as u64;
+                self.report.swept_objects += objects;
+                self.report.swept_bytes += chunk.used as u64;
+                #[cfg(test)]
+                {
+                    self.report.bulk_live_nursery_chunks += 1;
+                }
+                self.dead_chunks.push(false);
+                self.chunks += 1;
+                state.pending_sweep_chunks.start = self.chunks;
+                return Action::Progress;
+            }
+            let hooks = match drop_registry().try_lock() {
+                Ok(hooks) => hooks,
+                Err(TryLockError::WouldBlock) => return Action::Yield,
+                Err(TryLockError::Poisoned(_)) => panic!("drop registry poisoned"),
+            };
+            if hooks.is_empty() {
+                let first = HeapObject::from_raw(chunk.base.cast()).unwrap();
+                if !first.is_async_frame()
+                    && let Some(permit) = first.try_reclaim_permit()
+                {
+                    #[cfg(debug_assertions)]
+                    {
+                        let mut end = 0;
+                        chunk.mark_bitmap.bits.for_each_set(|bit| {
+                            let offset = bit * GC_REGION_MARK_GRANULE;
+                            assert_eq!(offset, end);
+                            let object =
+                                HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())
+                                    .unwrap();
+                            assert!(object.allocated() && !object.marked());
+                            assert_eq!(object.generation(), GC_GENERATION_YOUNG);
+                            assert!(!object.is_async_frame());
+                            assert!(offset == 0 || !unsafe { (*object.as_ptr()).descriptor_owned });
+                            end += object.size();
+                        });
+                        assert_eq!(end, chunk.used);
+                    }
+                    let objects = chunk.mark_bitmap.bits.count() as u64;
+                    #[cfg(test)]
+                    {
+                        self.report.bulk_nursery_chunks += 1;
+                        self.report.bulk_nursery_objects += objects;
+                    }
+                    let bytes = chunk.used;
+                    first.reclaim_with_permit(permit);
+                    chunk.mark_bitmap.clear();
+                    chunk.used = 0;
+                    chunk.live_bytes = 0;
+                    state.allocated_bytes = state.allocated_bytes.saturating_sub(bytes);
+                    state.young_allocated_bytes = state.young_allocated_bytes.saturating_sub(bytes);
+                    state.total_frees = state.total_frees.saturating_add(objects);
+                    self.report.objects += 1;
+                    self.report.bytes += bytes as u64;
+                    self.report.swept_objects += objects;
+                    self.report.swept_bytes += bytes as u64;
+                    self.report.reclaimed_bytes += bytes as u64;
+                    self.dead_chunks.push(true);
+                    self.chunks += 1;
+                    state.pending_sweep_chunks.start = self.chunks;
+                    return Action::Progress;
+                }
+            }
+        }
         if !self.chunk_started {
             self.chunk_started = true;
             self.build_headers = chunk.needs_index();
@@ -896,6 +991,201 @@ mod tests {
             cursor.batch(BACKGROUND, false);
         }
         panic!("sweep cursor did not finish");
+    }
+
+    // Model the compiler's static-descriptor bump path after one slow refill.
+    fn static_nursery(tls: &mut GcTlabState, objects: usize) -> *mut u8 {
+        static DESCRIPTOR: willow_abi::GcLayoutDescriptor = willow_abi::GcLayoutDescriptor {
+            type_id: 0,
+            layout_id: 0,
+            gc_ref_mask: 0,
+            size: (GC_HEADER_SIZE + 8) as u64,
+        };
+        let first = willow_gc_alloc_slow(tls, 0, 0, 8, 0);
+        for _ in 1..objects {
+            let cursor = tls.cursor.load(Ordering::Acquire);
+            assert!(cursor + GC_HEADER_SIZE + 8 <= tls.limit.load(Ordering::Acquire));
+            unsafe {
+                (cursor as *mut GcHeader).write(GcHeader {
+                    marked: false,
+                    allocated: true,
+                    generation: GC_GENERATION_YOUNG,
+                    age: 0,
+                    remembered: 0,
+                    descriptor_owned: false,
+                    descriptor: &DESCRIPTOR as *const _ as usize,
+                });
+            }
+            publish_tlab_start_for_test(tls, cursor as *mut u8);
+            tls.cursor
+                .store(cursor + GC_HEADER_SIZE + 8, Ordering::Release);
+        }
+        first
+    }
+
+    fn closed_cursor() -> Cursor {
+        let (_, cycle) = root_handshake::begin().unwrap();
+        let (_, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
+        Cursor::new(plan)
+    }
+
+    #[test]
+    fn bulk_nursery_sweep_counts_chunks_not_dead_objects() {
+        let _guard = runtime_test_guard();
+        for objects in [32usize, 128, 512] {
+            for chunks in [1usize, 4, 16] {
+                reset_internal_for_test();
+                {
+                    let mut state = runtime().heap.lock().unwrap();
+                    state.pacer.disable_for_test();
+                    state.threshold_bytes = usize::MAX;
+                    state.nursery_threshold_bytes = usize::MAX;
+                }
+                let shape = willow_abi::GcLayoutDescriptor {
+                    type_id: 0,
+                    layout_id: 0,
+                    gc_ref_mask: 0,
+                    size: (GC_HEADER_SIZE + 8) as u64,
+                };
+                let before = layouts::references(shape);
+                let mut tls = tlab_state_for_test();
+                for _ in 0..chunks {
+                    static_nursery(&mut tls, objects);
+                }
+                let mut cursor = closed_cursor();
+                finish(&mut cursor);
+                assert_eq!(cursor.report.bulk_nursery_chunks, chunks as u64);
+                assert_eq!(
+                    cursor.report.bulk_nursery_objects,
+                    (chunks * objects) as u64
+                );
+                assert_eq!(cursor.report.metadata_items, 0);
+                assert_eq!(
+                    cursor.report.reclaimed_bytes,
+                    (chunks * objects * (GC_HEADER_SIZE + 8)) as u64
+                );
+                assert_eq!(willow_gc_allocated_bytes(), 0);
+                assert_eq!(layouts::references(shape), before);
+                eprintln!(
+                    "bulk chunks={chunks} objects_per_chunk={objects} steps={} reclaimed={}",
+                    cursor.report.objects, cursor.report.bulk_nursery_objects
+                );
+            }
+        }
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn bulk_nursery_sweep_preserves_live_chunks_and_falls_back_for_hooks() {
+        let _guard = runtime_test_guard();
+        for hooks in [false, true] {
+            reset_internal_for_test();
+            runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+            let mut tls = tlab_state_for_test();
+            let mut live = static_nursery(&mut tls, 128);
+            willow_push_root(&mut live);
+            static_nursery(&mut tls, 128);
+            COUNTED_HOOKS.store(0, Ordering::Relaxed);
+            if hooks {
+                willow_register_drop(0, counted_hook);
+            }
+            let mut cursor = closed_cursor();
+            finish(&mut cursor);
+            assert_eq!(cursor.report.bulk_nursery_chunks, u64::from(!hooks));
+            assert_eq!(
+                COUNTED_HOOKS.load(Ordering::Relaxed),
+                if hooks { 255 } else { 0 }
+            );
+            assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
+            assert!(validate_payload_pointer_locked(&runtime().heap.lock().unwrap(), live).is_ok());
+            willow_pop_root();
+        }
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn bulk_nursery_sweep_keeps_all_live_prefix_unindexed() {
+        let _guard = runtime_test_guard();
+        for count in [32usize, 128, 512] {
+            reset_internal_for_test();
+            runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+            let mut tls = tlab_state_for_test();
+            let first = static_nursery(&mut tls, count);
+            let mut roots: Vec<_> = (0..count)
+                .map(|i| unsafe { first.add(i * (GC_HEADER_SIZE + 8)) })
+                .collect();
+            for root in &mut roots {
+                willow_push_root(root);
+            }
+            let mut cursor = closed_cursor();
+            finish(&mut cursor);
+            assert_eq!(cursor.report.bulk_live_nursery_chunks, 1);
+            assert_eq!(cursor.report.bulk_nursery_chunks, 0);
+            assert_eq!(cursor.report.metadata_items, 0);
+            assert_eq!(
+                willow_gc_allocated_bytes(),
+                (count * (GC_HEADER_SIZE + 8)) as i64
+            );
+            assert!(
+                runtime().heap.lock().unwrap().tlab_chunks[0]
+                    .header_offsets
+                    .is_empty()
+            );
+            willow_pop_roots(count as i32);
+            willow_gc_collect();
+            assert_eq!(willow_gc_allocated_bytes(), 0);
+        }
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn bulk_nursery_sweep_respects_cursor_modes_and_contention() {
+        let _guard = runtime_test_guard();
+        for mode in 0..6 {
+            reset_internal_for_test();
+            runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+            let mut tls = tlab_state_for_test();
+            static_nursery(&mut tls, 128);
+            let mut cursor = closed_cursor();
+            match mode {
+                0 => cursor.plan.authoritative_epoch_marks = false,
+                1 => {
+                    index_retired_chunk(&mut runtime().heap.lock().unwrap().tlab_chunks[0]);
+                }
+                2 => {
+                    let hooks = drop_registry().lock().unwrap();
+                    cursor.batch(BACKGROUND, false);
+                    assert_eq!(cursor.chunks, 0);
+                    assert_eq!(cursor.report.reclaimed_bytes, 0);
+                    drop(hooks);
+                }
+                3 => layouts::with_exclusive_registry(|| {
+                    cursor.batch(BACKGROUND, false);
+                    assert_eq!(cursor.report.reclaimed_bytes, 0);
+                }),
+                4 => {
+                    cursor.batch(ALLOCATION, true);
+                    assert_eq!(cursor.report.bulk_nursery_chunks, 0);
+                }
+                5 => {
+                    cursor.batch(
+                        Limits {
+                            bytes: 64,
+                            ..BACKGROUND
+                        },
+                        false,
+                    );
+                    assert_eq!(cursor.report.bulk_nursery_chunks, 0);
+                }
+                _ => unreachable!(),
+            }
+            finish(&mut cursor);
+            if mode <= 1 {
+                assert_eq!(cursor.report.bulk_nursery_chunks, 0);
+            }
+            assert_eq!(willow_gc_allocated_bytes(), 0);
+        }
+        reset_internal_for_test();
     }
 
     #[test]

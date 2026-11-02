@@ -481,6 +481,21 @@ pub(crate) fn write_barrier_array_slot(
     old_value: *mut u8,
     value: *mut u8,
 ) {
+    // A cached card is already guaranteed to be scanned at the next minor.
+    // The runtime caller supplies an actual array element slot, so its card
+    // can be calculated without reclassifying either object. Observe the mark
+    // phase first: active SATB epochs must still publish deletion/insertion.
+    // There is no safepoint between this check and the caller's atomic store.
+    if GC_MARK_PHASE.load(Ordering::Acquire) == 0
+        && card_cache_hit(
+            buffer as usize,
+            super::remembered::array_slot_card(buffer as usize, slot as usize),
+        )
+    {
+        #[cfg(test)]
+        CARD_CACHE_HITS.set(CARD_CACHE_HITS.get() + 1);
+        return;
+    }
     if !object_store_needs_barrier(buffer, value) {
         return;
     }

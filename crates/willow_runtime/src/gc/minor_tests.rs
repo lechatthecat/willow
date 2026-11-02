@@ -760,7 +760,8 @@ fn fill_chunks(
         ));
         for _ in 1..per_chunk {
             let cursor = tls.cursor.load(Ordering::Acquire);
-            initialize_object_at(cursor as *mut u8, size, fast_type, 1, 0).unwrap();
+            initialize_generated_object_at_for_test(cursor as *mut u8, size, fast_type, 1, 0)
+                .unwrap();
             publish_tlab_start_for_test(tls, cursor as *mut u8);
             tls.cursor.store(cursor + size, Ordering::Release);
             payloads.push((cursor + GC_HEADER_SIZE) as *mut u8);
@@ -1121,7 +1122,7 @@ fn minor_rejects_unpublished_and_overlapping_start_bits_in_unindexed_chunk() {
         let mut root = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
         let bytes = GC_HEADER_SIZE + 8;
         let cursor = tls.cursor.load(Ordering::Acquire);
-        initialize_object_at(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
+        initialize_generated_object_at_for_test(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
         if extra_bit {
             publish_tlab_start_for_test(&tls, cursor as *mut u8);
             publish_tlab_start_for_test(&tls, (cursor + GC_REGION_MARK_GRANULE) as *mut u8);

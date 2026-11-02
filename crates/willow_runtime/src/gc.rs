@@ -857,11 +857,6 @@ fn pacer_inputs(state: &GcState) -> pacer::Inputs {
             gc_cpu_ns: (cpu.window_end_ns != 0 && cpu.window_cpu_missing == 0)
                 .then_some(cpu.window_cpu_ns),
             root_work: history.last_major_cycle.root_scan_bytes,
-            barrier_work: runtime()
-                .write_barrier_calls
-                .load(Ordering::Relaxed)
-                .saturating_sub(state.pacer.barrier_baseline)
-                .saturating_mul(8),
             resident_bytes: memory.process_resident,
             soft_limit: state.soft_memory.limit(),
             ..pacer::Feedback::default()
@@ -1135,6 +1130,45 @@ static DIAGNOSTIC_READY: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 fn runtime() -> &'static GcRuntime {
     &GC_RUNTIME
+}
+
+/// Model the generated bump path in tests, including its static descriptor
+/// lifetime. Runtime slow-path interning is intentionally a different contract.
+#[cfg(test)]
+fn initialize_generated_object_at_for_test(
+    raw: *mut u8,
+    size: usize,
+    type_id: u32,
+    layout_id: u64,
+    gc_ref_mask: u64,
+) -> Option<HeapObject> {
+    static DESCRIPTORS: std::sync::LazyLock<
+        Mutex<HashMap<willow_abi::GcLayoutDescriptor, &'static willow_abi::GcLayoutDescriptor>>,
+    > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    let shape = willow_abi::GcLayoutDescriptor {
+        size: size as u64,
+        type_id: u64::from(type_id),
+        layout_id,
+        gc_ref_mask,
+    };
+    let descriptor = *DESCRIPTORS
+        .lock()
+        .unwrap()
+        .entry(shape)
+        .or_insert_with(|| Box::leak(Box::new(shape)));
+    let object = HeapObject::from_raw(raw.cast())?;
+    unsafe {
+        object.as_ptr().write(GcHeader {
+            marked: false,
+            allocated: true,
+            generation: GC_GENERATION_YOUNG,
+            age: 0,
+            remembered: 0,
+            descriptor_owned: false,
+            descriptor: descriptor as *const _ as usize,
+        });
+    }
+    Some(object)
 }
 
 fn initialize_object_at(

@@ -715,7 +715,7 @@ fn telemetry_merges_fast_tlab_deltas_once_and_on_unregister() {
     let bytes = GC_HEADER_SIZE + 8;
     let cursor = tls.cursor.load(Ordering::Acquire);
     // Reproduce the generated bump fast path: header, start bit, cursor.
-    initialize_object_at(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
+    initialize_generated_object_at_for_test(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
     publish_tlab_start_for_test(&tls, cursor as *mut u8);
     tls.cursor.store(cursor + bytes, Ordering::Release);
     let first = crate::gc_telemetry::snapshot();
@@ -744,7 +744,7 @@ fn telemetry_merges_fast_tlab_deltas_once_and_on_unregister() {
 /// Reproduce one generated bump allocation: header, start bit, cursor.
 fn fast_alloc_for_test(tls: &GcTlabState, bytes: usize) -> usize {
     let cursor = tls.cursor.load(Ordering::Acquire);
-    initialize_object_at(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
+    initialize_generated_object_at_for_test(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
     publish_tlab_start_for_test(tls, cursor as *mut u8);
     tls.cursor.store(cursor + bytes, Ordering::Release);
     cursor
@@ -805,7 +805,7 @@ fn retirement_rejects_unpublished_and_overlapping_start_bits() {
         assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
         let bytes = GC_HEADER_SIZE + 8;
         let cursor = tls.cursor.load(Ordering::Acquire);
-        initialize_object_at(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
+        initialize_generated_object_at_for_test(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
         if extra_bit {
             publish_tlab_start_for_test(&tls, cursor as *mut u8);
             publish_tlab_start_for_test(&tls, (cursor + GC_REGION_MARK_GRANULE) as *mut u8);

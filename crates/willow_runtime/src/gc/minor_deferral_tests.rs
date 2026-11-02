@@ -169,8 +169,14 @@ fn minor_deferral_parallel_tlab_refills_count_once() {
                     for _ in 0..16 {
                         assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
                         let cursor = tls.cursor.load(Ordering::Acquire);
-                        initialize_object_at(cursor as *mut u8, GC_HEADER_SIZE + 8, 0, 1, 0)
-                            .unwrap();
+                        initialize_generated_object_at_for_test(
+                            cursor as *mut u8,
+                            GC_HEADER_SIZE + 8,
+                            0,
+                            1,
+                            0,
+                        )
+                        .unwrap();
                         publish_tlab_start_for_test(&tls, cursor as *mut u8);
                         tls.cursor
                             .store(cursor + GC_HEADER_SIZE + 8, Ordering::Release);

@@ -448,3 +448,85 @@ fn compiled_array_stores_without_value_header_hit_card_cache() {
     willow_pop_root();
     reset_internal_for_test();
 }
+
+#[test]
+fn runtime_array_card_filter_counts_cards_instead_of_stores() {
+    use super::super::barrier::CARD_CACHE_HITS;
+    let _guard = runtime_test_guard();
+    for count in [64usize, 128, 512, 1024] {
+        quiet_heap();
+        let mut array = new_old_array(4096, 1);
+        willow_push_root(&mut array);
+        let mut tls = tlab_state_for_test();
+        let child = young(&mut tls, 42);
+        let before = runtime().write_barrier_calls.load(Ordering::Relaxed);
+        let cached = CARD_CACHE_HITS.get();
+        for index in 0..count {
+            willow_array_set(array, index as i64, child as i64);
+        }
+        let cards = count.div_ceil(ARRAY_CARD_SLOTS) as u64;
+        assert_eq!(
+            runtime().write_barrier_calls.load(Ordering::Relaxed) - before,
+            cards
+        );
+        assert_eq!(CARD_CACHE_HITS.get() - cached, count as u64 - cards);
+        verify().unwrap();
+        assert_eq!(minor().remembered_card_slots, count as u64);
+        for index in 0..count {
+            assert_eq!(element_value(array, index as i64), 42);
+        }
+        willow_pop_root();
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn runtime_cached_card_still_publishes_during_active_marking() {
+    let _guard = runtime_test_guard();
+    quiet_heap();
+    let mut array = new_old_array(4096, 1);
+    willow_push_root(&mut array);
+    let mut tls = tlab_state_for_test();
+    let child = young(&mut tls, 42);
+    willow_array_set(array, 0, child as i64);
+    let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
+    let before = runtime().write_barrier_calls.load(Ordering::Relaxed);
+    willow_array_set(array, 0, 0);
+    assert_eq!(
+        runtime().write_barrier_calls.load(Ordering::Relaxed),
+        before + 1
+    );
+    let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now())
+        .expect("native array tracing closes concurrently");
+    assert!(cycle.is_marked(child as usize));
+    sweep::concurrent(plan);
+    assert_eq!(willow_array_get(array, 0), 0);
+    willow_pop_root();
+    reset_internal_for_test();
+}
+
+#[test]
+fn reference_array_growth_barriers_scale_with_cards() {
+    let _guard = runtime_test_guard();
+    for count in [512usize, 1024, 2048, 4096] {
+        quiet_heap();
+        let mut array = new_old_array(count as i64, 1);
+        willow_push_root(&mut array);
+        let mut tls = tlab_state_for_test();
+        let child = young(&mut tls, 42);
+        for index in 0..count {
+            willow_array_set(array, index as i64, child as i64);
+        }
+        let before = runtime().write_barrier_calls.load(Ordering::Relaxed);
+        willow_array_push(array, child as i64);
+        let calls = runtime().write_barrier_calls.load(Ordering::Relaxed) - before;
+        assert!(calls <= count.div_ceil(ARRAY_CARD_SLOTS) as u64 + 2);
+        verify().unwrap();
+        minor();
+        for index in 0..=count {
+            assert_eq!(element_value(array, index as i64), 42);
+        }
+        willow_pop_root();
+    }
+    reset_internal_for_test();
+}

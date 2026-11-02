@@ -31,6 +31,8 @@ pub(super) struct SweepPlan {
     chunks: usize,
     epoch: u64,
     marking: Option<Arc<ConcurrentCycle>>,
+    // Only concurrent closure makes epoch marks authoritative without header marks.
+    authoritative_epoch_marks: bool,
     /// Released storage left idle too long; freed by `execute`
     /// outside the heap lock.
     stale_storage: region_cache::StaleStorage,
@@ -71,6 +73,7 @@ pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>
         chunks: state.tlab_chunks.len(),
         epoch: state.major_collections,
         marking,
+        authoritative_epoch_marks: false,
         stale_storage: state.region_cache.begin_sweep(),
     }
 }
@@ -96,6 +99,7 @@ pub(super) fn prepare_bounded(
         chunks: state.tlab_chunks.len(),
         epoch: state.major_collections,
         marking: Some(marking),
+        authoritative_epoch_marks: true,
         stale_storage: state.region_cache.begin_sweep(),
     })
 }

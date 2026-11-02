@@ -90,9 +90,6 @@ pub(super) fn complete_threshold(state: &mut super::GcState, previous_goal: u64)
         publish_decision(decision);
         (decision.goal, decision.trigger, "cycle_fixed")
     };
-    state.pacer.barrier_baseline = super::runtime()
-        .write_barrier_calls
-        .load(std::sync::atomic::Ordering::Relaxed);
     publish(state, goal, trigger, reason);
 }
 
@@ -116,7 +113,6 @@ pub(super) struct Inputs {
 pub(super) struct Feedback {
     pub occupied: u64,
     pub root_work: u64,
-    pub barrier_work: u64,
     pub window_ns: u64,
     pub gc_cpu_ns: Option<u64>,
     pub pressure: bool,
@@ -161,9 +157,9 @@ pub(super) struct Decision {
 fn minimum_trigger(live: u64, work: u64) -> u64 {
     // Major occupancy excludes the nursery, but tracing may still visit its
     // surviving objects to find old edges. Budget at most one byte of repeated
-    // trace work per four allocated bytes. This is a throughput/memory tradeoff,
+    // trace work per two allocated bytes. This is a throughput/memory tradeoff,
     // not a CPU percentage guarantee; soft/hard memory limits still win.
-    live.saturating_add(work.saturating_mul(4).max(live / 4).max(MIN_GOAL / 4))
+    live.saturating_add(work.saturating_mul(2).max(live / 4).max(MIN_GOAL / 4))
 }
 
 fn mul_div_ceil(a: u64, b: u64, divisor: u128) -> u64 {
@@ -178,10 +174,11 @@ pub(super) fn decide(input: Inputs) -> Decision {
     let cpus = input.cpu_capacity.clamp(1, 65536) as u64;
     let worker_capacity_ppm =
         (cpus * NORMAL_CPU).min((input.max_workers.min(65536) as u64) * SCALE);
-    let expected_work = input
-        .expected_work
-        .saturating_add(feedback.root_work)
-        .saturating_add(feedback.barrier_work);
+    // Completed barrier calls are mutator history, not pending trace work.
+    // Charging them here makes a longer allocation interval buy a still longer
+    // next interval, even when almost the entire heap dies at each collection.
+    // Actual retained SATB objects are counted by marking in expected_work.
+    let expected_work = input.expected_work.saturating_add(feedback.root_work);
     let mut reasons = 0;
     // Unlimited goals never clamp to RSS or commitment: the separate memory
     // controller owns that policy. Preserve missing observations diagnostically.
@@ -310,7 +307,6 @@ pub(super) struct Sampler {
     last: Option<(u64, u64)>,
     allocation_rate: u64,
     mark_rate: Option<u64>,
-    pub(super) barrier_baseline: u64,
 }
 
 impl Default for Sampler {
@@ -320,7 +316,6 @@ impl Default for Sampler {
             last: None,
             allocation_rate: 0,
             mark_rate: None,
-            barrier_baseline: 0,
         }
     }
 }
@@ -460,6 +455,34 @@ mod tests {
     }
 
     #[test]
+    fn completed_barrier_calls_do_not_inflate_trace_work_or_heap_goal() {
+        use super::super::*;
+        let _guard = runtime_test_guard();
+        reset_internal();
+        let mut state = runtime().heap.lock().unwrap();
+        state.pacer.set_enabled_for_test(true);
+        for live in [0, 1024, 32 * 1024, MIN_GOAL] {
+            state.last_major_live_bytes = live;
+            state.last_major_policy_live_bytes = live;
+            state.last_major_mark_work = live * 2;
+            runtime().write_barrier_calls.store(0, Ordering::Relaxed);
+            let base = state.pacer.decision(pacer_inputs(&state));
+            for calls in [1, 100, 1000, 100_000, 15_000_000, u64::MAX] {
+                runtime()
+                    .write_barrier_calls
+                    .store(calls, Ordering::Relaxed);
+                let decision = state.pacer.decision(pacer_inputs(&state));
+                assert_eq!(decision.expected_work, base.expected_work);
+                assert_eq!(decision.goal, base.goal);
+                assert_eq!(decision.trigger, base.trigger);
+                assert_eq!(decision.runway, base.runway);
+            }
+        }
+        drop(state);
+        reset_internal();
+    }
+
+    #[test]
     fn threshold_policy_completion_reset_and_samples() {
         use super::super::*;
         let _guard = runtime_test_guard();
@@ -497,7 +520,7 @@ mod tests {
                 };
                 let decision = decide(base);
                 let progress = decision.trigger - live;
-                assert!(progress >= 4 * work);
+                assert!(progress >= 2 * work);
                 assert!(!decision.start_now);
                 eprintln!("old_live={live} trace_work={work} minimum_progress={progress}");
                 // Explicit pressure still starts a collection, and a soft cap
@@ -847,25 +870,17 @@ mod tests {
     #[test]
     fn work_pressure_and_exhaustion_inputs() {
         let base = decide(input());
-        for feedback in [
-            Feedback {
-                root_work: MIN_GOAL,
-                ..Feedback::default()
-            },
-            Feedback {
-                barrier_work: MIN_GOAL,
-                ..Feedback::default()
-            },
-        ] {
-            assert!(
-                decide(Inputs {
-                    feedback,
-                    ..input()
-                })
-                .runway
-                    > base.runway
-            );
-        }
+        assert!(
+            decide(Inputs {
+                feedback: Feedback {
+                    root_work: MIN_GOAL,
+                    ..Feedback::default()
+                },
+                ..input()
+            })
+            .runway
+                > base.runway
+        );
         for feedback in [
             Feedback {
                 occupied: u64::MAX,

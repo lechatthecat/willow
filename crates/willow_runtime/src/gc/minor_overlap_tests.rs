@@ -437,7 +437,7 @@ fn concurrent_minor_snapshot_and_relocation_scale_linearly() {
             let node = if cursor == 0 || limit - cursor < bytes {
                 willow_gc_alloc_slow(&mut tls, 1, 0, size_of::<usize>() as i64, 1)
             } else {
-                initialize_object_at(cursor as *mut u8, bytes, 0, 1, 1).unwrap();
+                initialize_generated_object_at_for_test(cursor as *mut u8, bytes, 0, 1, 1).unwrap();
                 publish_tlab_start_for_test(&tls, cursor as *mut u8);
                 tls.cursor.store(cursor + bytes, Ordering::Release);
                 (cursor + GC_HEADER_SIZE) as *mut u8

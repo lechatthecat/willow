@@ -4780,7 +4780,10 @@ fn stage6_recovery_sweep_is_outside_stop() {
         // Start with an entirely undrained graph, so every chain edge is
         // processed by recovery between stopped ownership/publication slices.
         let (_, cycle) = root_handshake::begin().unwrap();
+        let publication_before = sweep::CONCURRENT_PUBLICATIONS.load(Ordering::Relaxed);
         let (work, plan, _) = mark_closure::finish_stopped(&cycle, Instant::now());
+        let concurrent_publications =
+            sweep::CONCURRENT_PUBLICATIONS.load(Ordering::Relaxed) - publication_before;
         sweep::concurrent(plan.unwrap());
         assert_eq!(work.objects, count as u64);
         assert_eq!(DROPS.load(Ordering::Relaxed), count);
@@ -4796,11 +4799,14 @@ fn stage6_recovery_sweep_is_outside_stop() {
             assert!(regions <= mark_closure::RECOVERY_SLOTS);
             assert!(metadata <= mark_closure::RECOVERY_SLOTS / 2);
         }
-        assert!(samples.iter().map(|sample| sample[2]).sum::<u64>() >= (count / 16) as u64);
+        // Recovery publishes the known region prefix while mutators run;
+        // stopped samples account only for a late suffix. Count both paths.
+        let published =
+            concurrent_publications as u64 + samples.iter().map(|sample| sample[2]).sum::<u64>();
+        assert!(published >= (count / 16) as u64);
         let max_slots = samples.iter().map(|s| s[0]).max().unwrap();
         let max_bytes = samples.iter().map(|s| s[1]).max().unwrap();
         let max_metadata = samples.iter().map(|s| s[3]).max().unwrap();
-        let published = samples.iter().map(|s| s[2]).sum::<u64>();
         println!(
             "stage6_bounds nodes={count} max_slots={max_slots} max_bytes={max_bytes} max_metadata={max_metadata} published_regions={published} stopped_callbacks=0 stopped_trace=0"
         );
@@ -5429,4 +5435,55 @@ fn bounded_drain_claim_cache_preserves_graph_and_resets_between_drains() {
             }
         }
     }
+}
+
+#[test]
+fn reference_array_growth_during_marking_preserves_copied_edges() {
+    let _guard = runtime_test_guard();
+    for count in [512i64, 4096] {
+        reset_internal_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.pacer.disable_for_test();
+            state.threshold_bytes = usize::MAX;
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let mut array = crate::array::new_old_array(count, 1);
+        willow_push_root(&mut array);
+        let old = willow_alloc(8);
+        let mut tls = tlab_state_for_test();
+        let young = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+        for index in 0..count {
+            let value = match index % 3 {
+                0 => old,
+                1 => young,
+                _ => std::ptr::null_mut(),
+            };
+            crate::array::willow_array_set(array, index, value as i64);
+        }
+        let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
+        crate::array::willow_array_push(array, old as i64);
+        let (_, plan) = mark_closure::finish(&cycle, Instant::now())
+            .expect("native array tracing closes concurrently");
+        assert!(cycle.is_marked(old as usize));
+        assert!(cycle.is_marked(young as usize));
+        sweep::concurrent(plan);
+        for index in 0..=count {
+            let expected = if index == count {
+                old
+            } else {
+                match index % 3 {
+                    0 => old,
+                    1 => young,
+                    _ => std::ptr::null_mut(),
+                }
+            };
+            assert_eq!(
+                crate::array::willow_array_get(array, index),
+                expected as i64
+            );
+        }
+        willow_pop_root();
+    }
+    reset_internal_for_test();
 }

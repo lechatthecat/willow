@@ -682,7 +682,7 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
         };
         unsafe {
             let old_buf = handle_buffer(arr);
-            if is_ref && !clone_pairs && owned_pair {
+            if is_ref && !clone_pairs {
                 // The source buffer remains owned by arr throughout this
                 // non-safepoint copy. The handle barrier below publishes its
                 // deletion to SATB, retaining every copied old edge. A fresh
@@ -708,10 +708,6 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
                             );
                         }
                     }
-                }
-            } else if is_ref && !clone_pairs {
-                for i in 0..len {
-                    store_buffer_slot(new_buf, i, *buf_slot(old_buf, i), true);
                 }
             } else if !is_ref && len != 0 {
                 // Separate live allocations; copy only initialized scalar slots.
