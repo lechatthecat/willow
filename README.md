@@ -104,6 +104,139 @@ These features belong together: the parser, effect checker, async lowering, clea
 
 See [Mutex example](example/scheduler_aware_lock.wi), [RwLock example](example/scheduler_aware_rwlock.wi), and [concurrency regression tests](tests/integration/concurrency/).
 
+### Working within E2605: three practical rewrites
+
+V1 rejects lexical nesting even for different locks and even if the programmer
+always acquires them in the same order. These are design constraints, not a
+promise that every multi-lock algorithm has an equivalent rewrite. Each block
+below is a standalone program; the rejected blocks deliberately fail compilation.
+Use `willow build snippet.wi -o snippet` (the current compiler CLI) to compile a
+saved block, and run the resulting executable for the accepted examples.
+
+**1. Transfer between two shared balances.** Taking both account locks directly
+is rejected with E2605:
+
+```willow
+async fn main() {
+    let debit = Mutex::new(100);
+    let credit = Mutex::new(0);
+    lock debit as mut a {
+        lock credit as mut b {
+            a = a - 10;
+            b = b + 10;
+        }
+    }
+}
+```
+
+If the invariant is “both balances change together”, put the pair behind one
+lock. All readers and writers of the balances must use that same lock; do not
+retain and mutate an unprotected alias to the pair.
+
+```willow
+class Balances {
+    pub debit: i64;
+    pub credit: i64;
+}
+async fn main() {
+    let ledger = Mutex::new(new Balances(100, 0));
+    lock ledger as mut pair {
+        pair.debit = pair.debit - 10;
+        pair.credit = pair.credit + 10;
+    }
+    lock ledger as pair {
+        println(pair.debit);  // 90
+        println(pair.credit); // 10
+    }
+}
+```
+
+This serializes otherwise independent account operations: a larger ledger trades
+concurrency for a single consistency boundary. It provides mutual exclusion, not
+transactional rollback on panic or durable financial transactions. Debiting,
+releasing, then crediting two separate locks is **not** an atomic transfer:
+observers can see the intermediate state, and interruption can leave it incomplete.
+
+**2. Calling a helper that needs another lock.** Moving an acquisition into an
+async helper does not make awaiting it inside a critical section legal. This
+form is rejected with **E2604** (the `await`), rather than lexical E2605:
+
+```willow
+async fn read_fee(fees: Mutex<i64>) -> i64 {
+    lock fees as value { return value; }
+}
+async fn main() {
+    let balance = Mutex::new(100);
+    let fees = Mutex::new(3);
+    lock balance as mut value {
+        value = value - await read_fee(fees);
+    }
+}
+```
+
+Read the fee before acquiring the balance lock, and pass the scalar snapshot into
+the critical section:
+
+```willow
+async fn read_fee(fees: Mutex<i64>) -> i64 {
+    lock fees as value { return value; }
+}
+async fn main() {
+    let balance = Mutex::new(100);
+    let fees = Mutex::new(3);
+    let fee = await read_fee(fees);
+    lock balance as mut value { value = value - fee; }
+    lock balance as value { println(value); } // 97
+}
+```
+
+The balance read-modify-write remains protected, but the fee can change between
+the two sections. This is appropriate only when charging a previously sampled
+fee is allowed. If fee and balance must be consistent at one instant, combine
+them under one lock as in the first rewrite. Merely creating an async Task is
+not the same as awaiting its result; dropping `await` is not this rewrite.
+
+**3. Parent/child locks, including a locked collection of locked elements.**
+Holding a parent lock while acquiring the selected child's lock is also E2605:
+
+```willow
+async fn main() {
+    let parent = Mutex::new(Mutex::new(7));
+    lock parent as child {
+        lock child as value { println(value); }
+    }
+}
+```
+
+Copy the child handle under the parent lock, release the parent, then operate on
+that child. A helper can return the handle without leaking a held lock:
+
+```willow
+async fn selected_child(parent: Mutex<Mutex<i64>>) -> Mutex<i64> {
+    lock parent as child { return child; }
+}
+async fn main() {
+    let parent = Mutex::new(Mutex::new(7));
+    let child = await selected_child(parent);
+    lock child as mut value { value = value + 1; }
+    lock child as value { println(value); } // 8
+}
+```
+
+Copying a handle does not copy its mutable payload or freeze the parent-child
+relationship. Another task can replace the selected child after the first
+section; this updates the **previously selected** child, not necessarily the
+current one. The same issue applies to removing an element from a collection.
+If membership and element updates must be atomic together, use one lock for the
+combined state and route all access through it. For workloads organized around
+messages, a single owner task is another architectural option, with queuing,
+reply, cancellation, and backpressure policies to design explicitly.
+
+**Future relaxation:** the current implementation has no general lock-order
+proof. These examples rely only on V1 behavior; no commitment to a lock-ordering
+feature or delivery date is made here. Do not design a V1 application assuming
+nested acquisition will become available.
+
 ## The same semantic knowledge is available to AI agents
 
 Many languages already offer navigation, refactoring, or LSP/MCP integration. **That alone is not a reason to invent a new language.** Willow's more interesting combination is:
