@@ -390,3 +390,6 @@ mod reachable_generic_methods;
 
 #[path = "integration/array_utilities.rs"]
 mod array_utilities;
+
+#[path = "integration/math_helpers.rs"]
+mod math_helpers;

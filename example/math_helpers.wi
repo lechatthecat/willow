@@ -1,0 +1,49 @@
+// Numeric namespaces: i64/f64 abs, min, max, clamp; f64 sqrt, floor, ceil, round.
+// All arguments and results have the namespace's type; no implicit conversions.
+// abs(i64 minimum) and clamp with reversed bounds raise recoverable panics.
+// Float clamp also rejects NaN bounds, but preserves a NaN input value.
+// Float min/max return the non-NaN operand when exactly one is NaN;
+// equal signed zeros may return either sign. abs clears the sign of zero.
+// sqrt of a negative value returns NaN; sqrt preserves negative zero.
+// floor rounds down, ceil rounds up, round rounds ties away from zero.
+// floor/ceil/round preserve infinities; all unary operations propagate NaN.
+fn main() {
+    let nan = f64::parse("NaN").unwrap();
+    let inf = f64::parse("inf").unwrap();
+    if !(i64::abs(-3) == 3) { panic("negative integer"); }
+    if !(i64::abs(0) == 0) { panic("integer zero"); }
+    if !(i64::abs(9223372036854775807) == 9223372036854775807) { panic("integer max"); }
+    if !(i64::min(-9, 3) == -9) { panic("integer min"); }
+    if !(i64::max(-9, 3) == 3) { panic("integer max pair"); }
+    if !(i64::min(2, 2) == 2) { panic("equal integers"); }
+    if !(i64::clamp(-9, -3, 4) == -3) { panic("lower clamp"); }
+    if !(i64::clamp(9, -3, 4) == 4) { panic("upper clamp"); }
+    if !(i64::clamp(2, -3, 4) == 2) { panic("inside clamp"); }
+    if !(i64::clamp(9, 2, 2) == 2) { panic("equal bounds"); }
+    if !(f64::abs(-3.5) == 3.5) { panic("float abs"); }
+    if !(f64::to_string(f64::abs(-0.0)) == "0") { panic("abs signed zero"); }
+    if !(f64::min(-1.5, 2.0) == -1.5) { panic("float min"); }
+    if !(f64::max(-1.5, 2.0) == 2.0) { panic("float max"); }
+    if !(f64::clamp(-3.0, -2.0, 2.0) == -2.0) { panic("float lower"); }
+    if !(f64::clamp(3.0, -2.0, 2.0) == 2.0) { panic("float upper"); }
+    if !(f64::clamp(1.0, -2.0, 2.0) == 1.0) { panic("float inside"); }
+    if !(f64::sqrt(9.0) == 3.0) { panic("sqrt"); }
+    if !(f64::sqrt(2.0) > 1.414 && f64::sqrt(2.0) < 1.415) { panic("irrational sqrt"); }
+    if !(f64::floor(-1.2) == -2.0) { panic("negative floor"); }
+    if !(f64::floor(1.2) == 1.0) { panic("positive floor"); }
+    if !(f64::ceil(-1.2) == -1.0) { panic("negative ceil"); }
+    if !(f64::ceil(1.2) == 2.0) { panic("positive ceil"); }
+    if !(f64::round(1.5) == 2.0) { panic("positive tie"); }
+    if !(f64::round(-1.5) == -2.0) { panic("negative tie"); }
+    if !(f64::round(1.4) == 1.0) { panic("below tie"); }
+    if !(f64::to_string(f64::sqrt(-1.0)) == "NaN") { panic("negative sqrt"); }
+    if !(f64::min(nan, 3.0) == 3.0 && f64::min(3.0, nan) == 3.0) { panic("min one NaN"); }
+    if !(f64::max(nan, 3.0) == 3.0 && f64::max(3.0, nan) == 3.0) { panic("max one NaN"); }
+    if !(f64::to_string(f64::min(nan, nan)) == "NaN") { panic("two NaN"); }
+    if !(f64::to_string(f64::clamp(nan, 0.0, 1.0)) == "NaN") { panic("clamp NaN value"); }
+    if !(f64::sqrt(inf) == inf && f64::round(inf) == inf) { panic("infinity"); }
+    if !(f64::to_string(f64::sqrt(-0.0)) == "-0") { panic("sqrt signed zero"); }
+    if !(f64::to_string(f64::ceil(-0.2)) == "-0") { panic("ceil signed zero"); }
+    if !(f64::sqrt(1e-300) > 0.0) { panic("small magnitude"); }
+    println("math helpers ok");
+}

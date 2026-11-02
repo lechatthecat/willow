@@ -2504,6 +2504,38 @@ impl TypeChecker {
             };
         }
 
+        if let Some(entry) =
+            crate::semantic::intrinsics::math_namespace_builtin(class_name, method_name)
+        {
+            if !type_args.is_empty() {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("function `{class_name}::{method_name}` expects no type arguments"),
+                    )
+                    .with_label(Label::primary(span, "unexpected type arguments")),
+                );
+            }
+            if args.len() != entry.params.len() {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "function `{class_name}::{method_name}` expects {} arguments, got {}",
+                            entry.params.len(),
+                            args.len()
+                        ),
+                    )
+                    .with_label(Label::primary(span, "wrong number of arguments")),
+                );
+            }
+            let params: Vec<_> = entry.params.iter().map(|ty| ty.to_source()).collect();
+            self.check_value_call_args(&params, args);
+            return entry.ret.to_source();
+        }
+
         if class_name == "f64" && matches!(method_name, "from_i64" | "trunc_to_i64") {
             if !type_args.is_empty() {
                 self.push(

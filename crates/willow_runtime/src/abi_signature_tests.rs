@@ -662,3 +662,79 @@ fn numeric_conversions_abi_and_effects() {
         );
     }
 }
+
+#[test]
+fn math_helpers_abi_and_effects() {
+    let _: extern "C" fn(i64) -> i64 = crate::math::willow_i64_abs;
+    assert_schema("willow_i64_abs", &[I64], Some(I64));
+    assert_eq!(
+        runtime_symbol("willow_i64_abs").unwrap().effects,
+        willow_abi::RuntimeEffects::MAY_PANIC.union(willow_abi::RuntimeEffects::MAY_ALLOCATE)
+    );
+    let _: extern "C" fn(i64, i64) -> i64 = crate::math::willow_i64_min;
+    assert_schema("willow_i64_min", &[I64, I64], Some(I64));
+    assert_eq!(
+        runtime_symbol("willow_i64_min").unwrap().effects,
+        willow_abi::RuntimeEffects::NONE
+    );
+    let _: extern "C" fn(i64, i64) -> i64 = crate::math::willow_i64_max;
+    assert_schema("willow_i64_max", &[I64, I64], Some(I64));
+    assert_eq!(
+        runtime_symbol("willow_i64_max").unwrap().effects,
+        willow_abi::RuntimeEffects::NONE
+    );
+    let _: extern "C" fn(i64, i64, i64) -> i64 = crate::math::willow_i64_clamp;
+    assert_schema("willow_i64_clamp", &[I64, I64, I64], Some(I64));
+    assert_eq!(
+        runtime_symbol("willow_i64_clamp").unwrap().effects,
+        willow_abi::RuntimeEffects::MAY_PANIC.union(willow_abi::RuntimeEffects::MAY_ALLOCATE)
+    );
+    let _: extern "C" fn(f64) -> f64 = crate::math::willow_f64_abs;
+    assert_schema("willow_f64_abs", &[F64], Some(F64));
+    assert_eq!(
+        runtime_symbol("willow_f64_abs").unwrap().effects,
+        willow_abi::RuntimeEffects::NONE
+    );
+    let _: extern "C" fn(f64, f64) -> f64 = crate::math::willow_f64_min;
+    assert_schema("willow_f64_min", &[F64, F64], Some(F64));
+    assert_eq!(
+        runtime_symbol("willow_f64_min").unwrap().effects,
+        willow_abi::RuntimeEffects::NONE
+    );
+    let _: extern "C" fn(f64, f64) -> f64 = crate::math::willow_f64_max;
+    assert_schema("willow_f64_max", &[F64, F64], Some(F64));
+    assert_eq!(
+        runtime_symbol("willow_f64_max").unwrap().effects,
+        willow_abi::RuntimeEffects::NONE
+    );
+    let _: extern "C" fn(f64, f64, f64) -> f64 = crate::math::willow_f64_clamp;
+    assert_schema("willow_f64_clamp", &[F64, F64, F64], Some(F64));
+    assert_eq!(
+        runtime_symbol("willow_f64_clamp").unwrap().effects,
+        willow_abi::RuntimeEffects::MAY_PANIC.union(willow_abi::RuntimeEffects::MAY_ALLOCATE)
+    );
+    let _: extern "C" fn(f64) -> f64 = crate::math::willow_f64_sqrt;
+    assert_schema("willow_f64_sqrt", &[F64], Some(F64));
+    assert_eq!(
+        runtime_symbol("willow_f64_sqrt").unwrap().effects,
+        willow_abi::RuntimeEffects::NONE
+    );
+    let _: extern "C" fn(f64) -> f64 = crate::math::willow_f64_floor;
+    assert_schema("willow_f64_floor", &[F64], Some(F64));
+    assert_eq!(
+        runtime_symbol("willow_f64_floor").unwrap().effects,
+        willow_abi::RuntimeEffects::NONE
+    );
+    let _: extern "C" fn(f64) -> f64 = crate::math::willow_f64_ceil;
+    assert_schema("willow_f64_ceil", &[F64], Some(F64));
+    assert_eq!(
+        runtime_symbol("willow_f64_ceil").unwrap().effects,
+        willow_abi::RuntimeEffects::NONE
+    );
+    let _: extern "C" fn(f64) -> f64 = crate::math::willow_f64_round;
+    assert_schema("willow_f64_round", &[F64], Some(F64));
+    assert_eq!(
+        runtime_symbol("willow_f64_round").unwrap().effects,
+        willow_abi::RuntimeEffects::NONE
+    );
+}

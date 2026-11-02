@@ -2210,9 +2210,40 @@ pub(crate) struct NamespaceBuiltin {
     pub narrow_to_bool: bool,
 }
 
+pub(crate) fn math_namespace_builtin(class: &str, method: &str) -> Option<NamespaceBuiltin> {
+    use crate::semantic::ids::SemanticType as Type;
+    let math = match (class, method) {
+        ("i64", "abs") => Some(("willow_i64_abs", Type::I64, 1)),
+        ("i64", "min") => Some(("willow_i64_min", Type::I64, 2)),
+        ("i64", "max") => Some(("willow_i64_max", Type::I64, 2)),
+        ("i64", "clamp") => Some(("willow_i64_clamp", Type::I64, 3)),
+        ("f64", "abs") => Some(("willow_f64_abs", Type::F64, 1)),
+        ("f64", "min") => Some(("willow_f64_min", Type::F64, 2)),
+        ("f64", "max") => Some(("willow_f64_max", Type::F64, 2)),
+        ("f64", "clamp") => Some(("willow_f64_clamp", Type::F64, 3)),
+        ("f64", "sqrt") => Some(("willow_f64_sqrt", Type::F64, 1)),
+        ("f64", "floor") => Some(("willow_f64_floor", Type::F64, 1)),
+        ("f64", "ceil") => Some(("willow_f64_ceil", Type::F64, 1)),
+        ("f64", "round") => Some(("willow_f64_round", Type::F64, 1)),
+        _ => None,
+    };
+    if let Some((runtime, ty, arity)) = math {
+        return Some(NamespaceBuiltin {
+            runtime,
+            params: vec![ty.clone(); arity],
+            ret: ty,
+            narrow_to_bool: false,
+        });
+    }
+    None
+}
+
 pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBuiltin> {
     use crate::semantic::ids::SemanticType as Type;
     use crate::stdlib_schema::{self, StdItemKind};
+    if let Some(entry) = math_namespace_builtin(class, method) {
+        return Some(entry);
+    }
     if class == "i64" && method == "parse" {
         return Some(NamespaceBuiltin {
             runtime: "willow_i64_parse",

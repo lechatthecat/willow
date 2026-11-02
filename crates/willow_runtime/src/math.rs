@@ -377,3 +377,130 @@ mod tests {
         }
     }
 }
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_i64_abs(value: i64) -> i64 {
+    match value.checked_abs() {
+        Some(result) => result,
+        None => {
+            crate::panic_context::raise_language_message("integer overflow: i64::abs");
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_i64_min(value: i64, other: i64) -> i64 {
+    value.min(other)
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_i64_max(value: i64, other: i64) -> i64 {
+    value.max(other)
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_i64_clamp(value: i64, lower: i64, upper: i64) -> i64 {
+    if lower > upper {
+        crate::panic_context::raise_language_message("invalid bounds: i64::clamp");
+        return 0;
+    }
+    value.clamp(lower, upper)
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_f64_abs(value: f64) -> f64 {
+    value.abs()
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_f64_min(value: f64, other: f64) -> f64 {
+    value.min(other)
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_f64_max(value: f64, other: f64) -> f64 {
+    value.max(other)
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_f64_clamp(value: f64, lower: f64, upper: f64) -> f64 {
+    if lower.is_nan() || upper.is_nan() || lower > upper {
+        crate::panic_context::raise_language_message("invalid bounds: f64::clamp");
+        return 0.0;
+    }
+    value.clamp(lower, upper)
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_f64_sqrt(value: f64) -> f64 {
+    value.sqrt()
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_f64_floor(value: f64) -> f64 {
+    value.floor()
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_f64_ceil(value: f64) -> f64 {
+    value.ceil()
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_f64_round(value: f64) -> f64 {
+    value.round()
+}
+
+#[cfg(test)]
+mod math_helpers_tests {
+    use super::*;
+
+    #[test]
+    fn math_helpers_ieee_boundaries() {
+        for op in [
+            willow_f64_abs,
+            willow_f64_sqrt,
+            willow_f64_floor,
+            willow_f64_ceil,
+            willow_f64_round,
+        ] {
+            assert!(op(f64::NAN).is_nan());
+            assert_eq!(op(f64::INFINITY), f64::INFINITY);
+        }
+        for op in [
+            willow_f64_floor,
+            willow_f64_ceil,
+            willow_f64_round,
+            willow_f64_sqrt,
+        ] {
+            assert_eq!(op(-0.0).to_bits(), (-0.0f64).to_bits());
+        }
+        for op in [willow_f64_floor, willow_f64_ceil, willow_f64_round] {
+            assert_eq!(op(f64::NEG_INFINITY), f64::NEG_INFINITY);
+        }
+        assert_eq!(willow_f64_abs(f64::NEG_INFINITY), f64::INFINITY);
+        assert!(willow_f64_sqrt(f64::NEG_INFINITY).is_nan());
+        assert_eq!(
+            willow_f64_clamp(-0.0, -1.0, 1.0).to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(willow_f64_clamp(3.0, 2.0, 2.0), 2.0);
+        assert_eq!(willow_f64_clamp(f64::INFINITY, -1.0, 1.0), 1.0);
+        assert_eq!(willow_i64_min(i64::MIN, i64::MAX), i64::MIN);
+        assert_eq!(willow_i64_max(i64::MIN, i64::MAX), i64::MAX);
+        assert_eq!(willow_i64_clamp(i64::MIN, i64::MIN, i64::MAX), i64::MIN);
+    }
+}
