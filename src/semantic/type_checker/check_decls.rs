@@ -1212,6 +1212,9 @@ impl TypeChecker {
             // A method declared on the class itself or inherited from an ancestor
             // can satisfy the requirement.
             let found = self.lookup_method_in_hierarchy(&c.name, req_name);
+            if let Some((owner, _)) = &found {
+                self.request_class_method(owner, req_name);
+            }
             let Some((owner, method)) = found else {
                 self.push(
                     Diagnostic::new(

@@ -16,6 +16,14 @@ struct InstantiatedClass {
     types: ImportedTypes,
 }
 
+/// Concrete metadata shared by independently requested method bodies.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct DeferredClass {
+    template: String,
+    shell: ClassDecl,
+    bindings: HashMap<String, Type>,
+}
+
 /// One owned template per source declaration across every checker in a build.
 pub(crate) struct TemplateRegistry {
     pub capture_source_references: bool,
@@ -23,6 +31,9 @@ pub(crate) struct TemplateRegistry {
     requested: Map<InstantiationKey, ()>,
     nominal_types: Map<String, Rc<InstantiationType>>,
     instantiated_classes: Map<InstantiationKey, Rc<InstantiatedClass>>,
+    requested_methods: Map<(crate::diagnostics::FileId, String, String), ()>,
+    deferred_classes: Map<(crate::diagnostics::FileId, String), Rc<DeferredClass>>,
+    method_templates: Map<(crate::diagnostics::FileId, String, String), Rc<MethodDecl>>,
     functions: Map<(crate::diagnostics::FileId, String), Rc<FunctionDecl>>,
     // Read-only declaration identities are shared with abstract checking; its
     // speculative instances still use a separate registry.
@@ -61,6 +72,9 @@ impl Default for TemplateRegistry {
             requested: Map::new("registry.requested"),
             nominal_types: Map::new("registry.nominal_types"),
             instantiated_classes: Map::new("registry.instantiated_classes"),
+            requested_methods: Map::new("registry.requested_methods"),
+            deferred_classes: Map::new("registry.deferred_classes"),
+            method_templates: Map::new("registry.method_templates"),
             functions: Map::new("registry.functions"),
             classes: Rc::new(Map::new("registry.classes")),
             interfaces: Map::new("registry.interfaces"),
@@ -133,6 +147,16 @@ impl TemplateRegistry {
         let key = (declaration.span.file_id, declaration.name.clone());
         if let Some(template) = self.classes.get(&key) {
             return Rc::clone(template);
+        }
+        for method in &declaration.methods {
+            self.method_templates.insert(
+                (
+                    declaration.span.file_id,
+                    declaration.name.clone(),
+                    method.name.clone(),
+                ),
+                Rc::new(method.clone()),
+            );
         }
         Rc::make_mut(&mut self.classes)
             .entry(key)
@@ -503,6 +527,45 @@ mod template_registry_tests {
     }
 
     #[test]
+    fn reachable_method_specialization_counts_ignore_unused_body_width() {
+        for methods in [1, 8, 32] {
+            for width in [1, 16, 64] {
+                let unused: String = (0..methods)
+                    .map(|n| format!("pub fn unused{n}() {{ {} }}", "println(0);".repeat(width)))
+                    .collect();
+                let source = format!(
+                    "class Cell<T> {{ pub value: T; pub fn get() -> T {{ return self.value; }} {unused} }} fn main() {{ let a = new Cell<i64>(7); println(a.get()); println(a.get()); }}"
+                );
+                let mut checker = TypeChecker::new();
+                checker.check_program(&parse(&source));
+                let mut bodies = 0;
+                while let Some(instance) = checker.generics.pending.pop_front() {
+                    bodies += usize::from(instance.method_only);
+                    checker.check_generic_instance(instance);
+                }
+                assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                assert_eq!(bodies, 1, "methods={methods} width={width}");
+                let emitted: usize = checker
+                    .generics
+                    .emitted
+                    .iter()
+                    .map(|item| {
+                        if let Item::Class(c) = item {
+                            c.methods.len()
+                        } else {
+                            0
+                        }
+                    })
+                    .sum();
+                assert_eq!(emitted, 1);
+                println!(
+                    "methods={methods} body_width={width} specialized={bodies} emitted={emitted}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn specialization_reservations_enforce_limit_before_body_cloning() {
         let mut registry = TemplateRegistry::default();
         for index in 0..4096 {
@@ -629,7 +692,7 @@ mod template_registry_tests {
                     pending += checker.generics.pending.len();
                 }
                 let registry = registry.borrow();
-                assert_eq!(pending, 2, "width={width} consumers={count}");
+                assert_eq!(pending, 3, "width={width} consumers={count}");
                 assert_eq!(registry.function_specializations, 1);
                 assert_eq!(registry.class_specializations, 1);
                 println!(
@@ -883,6 +946,10 @@ mod template_registry_tests {
 pub(crate) struct Instantiation {
     pub item: Item,
     pub classes: ImportedTypes,
+    /// A class item containing one requested method, without a declaration
+    /// header. Its class signature is registered by an earlier queue item.
+    #[serde(default)]
+    pub method_only: bool,
 }
 
 #[derive(Default)]
@@ -2060,9 +2127,11 @@ impl TypeChecker {
                 let mut item = Item::Function(f);
                 substitute_item(&mut item, &bindings)
                     .record_bodies(&mut self.generics.registry.borrow_mut().origins);
-                self.generics
-                    .pending
-                    .push_back(Instantiation { item, classes });
+                self.generics.pending.push_back(Instantiation {
+                    item,
+                    classes,
+                    method_only: false,
+                });
             }
             name
         };
@@ -2143,6 +2212,78 @@ impl TypeChecker {
             }
         }
         name.to_owned()
+    }
+
+    /// Queue one concrete body. The class signature is already available, so
+    /// recursion and calls discovered in other units share the same request.
+    pub(super) fn request_class_method(&mut self, owner: &str, method: &str) {
+        if self.generics.abstract_check {
+            return;
+        }
+        let Some(info) = self.symbols.lookup_class(owner) else {
+            return;
+        };
+        if !info.methods.contains_key(method) {
+            return;
+        }
+        let local = info
+            .name
+            .rsplit("::")
+            .next()
+            .unwrap_or(&info.name)
+            .to_string();
+        let file = info.declaration_span.file_id;
+        let deferred = self
+            .generics
+            .registry
+            .borrow()
+            .deferred_classes
+            .get(&(file, local.clone()))
+            .cloned();
+        let Some(deferred) = deferred else {
+            return;
+        };
+        let key = (file, local.clone(), method.to_string());
+        {
+            let mut registry = self.generics.registry.borrow_mut();
+            if registry.requested_methods.contains_key(&key) {
+                return;
+            }
+            registry.requested_methods.insert(key, ());
+        }
+        let template = self
+            .generics
+            .registry
+            .borrow()
+            .method_templates
+            .get(&(file, deferred.template.clone(), method.to_string()))
+            .cloned();
+        let Some(template) = template else {
+            return;
+        };
+        let mut class = deferred.shell.clone();
+        let mut method = (*template).clone();
+        method.constraint = None;
+        class.methods.push(method);
+        let mut item = Item::Class(class);
+        let mut ids = FreshIds::default();
+        visit_item(
+            &mut item,
+            &mut |ty| crate::semantic::generic_inference::substitute(ty, &deferred.bindings),
+            &mut |_| {},
+            true,
+            true,
+            Some((&deferred.template, &local)),
+            &mut ids,
+        );
+        ids.record_bodies(&mut self.generics.registry.borrow_mut().origins);
+        self.generics.pending.push_back(Instantiation {
+            item,
+            // The signature request precedes every method request and installs
+            // nominal aliases once in the declaring checker.
+            classes: Vec::new(),
+            method_only: true,
+        });
     }
 
     pub(super) fn instantiate_class(
@@ -2261,11 +2402,11 @@ impl TypeChecker {
         {
             self.generics.registry.borrow_mut().class_specializations += 1;
         }
-        let mut class = if self.generics.abstract_check {
-            class_signature(&template)
-        } else {
-            (*template).clone()
-        };
+        let mut class = class_signature(&template);
+        if !self.generics.abstract_check {
+            class.fields = template.fields.clone();
+            class.constructors = template.constructors.clone();
+        }
         class.methods.retain(|m| {
             m.constraint.as_ref().is_none_or(|bound| {
                 bindings
@@ -2373,10 +2514,36 @@ impl TypeChecker {
                 }),
             );
         if !self.generics.abstract_check {
-            class.name = local_name;
+            class.name = local_name.clone();
+            // Method checking only needs the receiver and owner identity.
+            // Do not copy fields, constructor bodies, interfaces or the entire
+            // method-signature table into each queued method fragment.
+            let shell = ClassDecl {
+                abi_storage: class.abi_storage.clone(),
+                type_params: Vec::new(),
+                name: class.name.clone(),
+                public: class.public,
+                is_open: class.is_open,
+                base_class: None,
+                implements: Vec::new(),
+                source_implements_len: 0,
+                fields: Vec::new(),
+                methods: Vec::new(),
+                constructors: Vec::new(),
+                span: class.span,
+            };
+            self.generics.registry.borrow_mut().deferred_classes.insert(
+                (class.span.file_id, local_name),
+                Rc::new(DeferredClass {
+                    template: template.name.clone(),
+                    shell,
+                    bindings,
+                }),
+            );
             self.generics.pending.push_back(Instantiation {
                 item: Item::Class(class),
                 classes,
+                method_only: false,
             });
         }
         Some(Type::Named(name))
@@ -2564,6 +2731,7 @@ impl TypeChecker {
             .interface_instances
             .insert(key, Rc::clone(&instance));
         self.generics.pending.push_back(Instantiation {
+            method_only: false,
             item: Item::Interface((*instance).clone()),
             classes,
         });
@@ -2853,7 +3021,11 @@ impl TypeChecker {
             let (name, file, id) = match &instance.item {
                 Item::Function(f) => (f.name.clone(), f.span.file_id, f.body.id),
                 Item::Class(c) => (
-                    c.name.clone(),
+                    if instance.method_only {
+                        format!("{}::{}", c.name, c.methods[0].name)
+                    } else {
+                        c.name.clone()
+                    },
                     c.span.file_id,
                     c.methods.first().map_or_else(BodyId::fresh, |m| m.body.id),
                 ),
@@ -2899,15 +3071,43 @@ impl TypeChecker {
                 );
                 self.check_function(f);
             }
+            Item::Class(c) if instance.method_only => {
+                let receiver = c.receiver_type();
+                let method = &c.methods[0];
+                let foreign_default = self
+                    .generics
+                    .default_copies
+                    .get(&c.name)
+                    .is_some_and(|copies| copies.contains_key(&method.name));
+                if !foreign_default && !method.is_default_injected {
+                    self.check_method(method, c, &receiver);
+                }
+            }
             Item::Class(c) => {
                 self.register_class(c);
-                self.check_class(c);
+                let receiver = self.cached_class_validation(c);
+                self.check_static_property_initializers(c);
+                self.cached_class_defaults(c);
+                for method in &c.methods {
+                    if !method.is_static && (method.is_open || method.is_override) {
+                        self.request_class_method(&c.name, &method.name);
+                    }
+                }
+                for ctor in &c.constructors {
+                    self.check_constructor(ctor, c, &receiver);
+                }
             }
             Item::Interface(i) => {
                 self.register_interface(i, None);
                 self.check_interface(i);
             }
             Item::Enum(_) => unreachable!(),
+        }
+        let mut item = item;
+        if !instance.method_only
+            && let Item::Class(class) = &mut item
+        {
+            class.methods.clear();
         }
         self.generics.emitted.push(item);
     }
@@ -2945,7 +3145,24 @@ impl TypeChecker {
             Item::Class(c) => c.type_params.is_empty(),
             _ => true,
         });
-        program.items.append(&mut self.generics.emitted);
+        // A signature item precedes its body fragments in the work queue.
+        // Merge once with an index, never scan all classes for each method.
+        let mut classes = HashMap::new();
+        for item in std::mem::take(&mut self.generics.emitted) {
+            if let Item::Class(mut class) = item {
+                if let Some(&index) = classes.get(&class.name) {
+                    let Item::Class(existing) = &mut program.items[index] else {
+                        unreachable!()
+                    };
+                    existing.methods.append(&mut class.methods);
+                } else {
+                    classes.insert(class.name.clone(), program.items.len());
+                    program.items.push(Item::Class(class));
+                }
+            } else {
+                program.items.push(item);
+            }
+        }
         if !self.generics.default_copies.is_empty() {
             for item in &mut program.items {
                 let Item::Class(c) = item else { continue };
@@ -3382,6 +3599,27 @@ impl Generics {
                     registry.nominal_types.read_value(key)
                 }
             }
+            "registry.requested_methods" => {
+                if raw {
+                    registry.requested_methods.output_value(key)
+                } else {
+                    registry.requested_methods.read_value(key)
+                }
+            }
+            "registry.deferred_classes" => {
+                if raw {
+                    registry.deferred_classes.output_value(key)
+                } else {
+                    registry.deferred_classes.read_value(key)
+                }
+            }
+            "registry.method_templates" => {
+                if raw {
+                    registry.method_templates.output_value(key)
+                } else {
+                    registry.method_templates.read_value(key)
+                }
+            }
             "registry.instantiated_classes" => {
                 if raw {
                     registry.instantiated_classes.output_value(key)
@@ -3530,6 +3768,9 @@ impl Generics {
             "registry.module_paths" => registry.module_paths.validate_key(key),
             "registry.requested" => registry.requested.validate_key(key),
             "registry.nominal_types" => registry.nominal_types.validate_key(key),
+            "registry.requested_methods" => registry.requested_methods.validate_key(key),
+            "registry.deferred_classes" => registry.deferred_classes.validate_key(key),
+            "registry.method_templates" => registry.method_templates.validate_key(key),
             "registry.instantiated_classes" => registry.instantiated_classes.validate_key(key),
             "registry.functions" => registry.functions.validate_key(key),
             "registry.classes" => registry.classes.validate_key(key),
@@ -3590,6 +3831,9 @@ impl Generics {
             "registry.instantiated_classes" => {
                 registry.instantiated_classes.restore_value(key, value)?
             }
+            "registry.deferred_classes" => registry.deferred_classes.restore_value(key, value)?,
+            "registry.method_templates" => registry.method_templates.restore_value(key, value)?,
+            "registry.requested_methods" => registry.requested_methods.restore_value(key, value)?,
             "registry.functions" => registry.functions.restore_value(key, value)?,
             "registry.classes" => Rc::make_mut(&mut registry.classes).restore_value(key, value)?,
             "registry.interfaces" => registry.interfaces.restore_value(key, value)?,

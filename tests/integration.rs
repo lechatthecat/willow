@@ -384,3 +384,6 @@ mod constrained_methods;
 
 #[path = "integration/numeric_conversions.rs"]
 mod numeric_conversions;
+
+#[path = "integration/reachable_generic_methods.rs"]
+mod reachable_generic_methods;

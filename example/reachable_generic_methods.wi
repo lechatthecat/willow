@@ -1,0 +1,14 @@
+import std::collections::Array;
+
+class Cell<T> {
+    pub value: T;
+    pub fn get() -> T { return self.value; }
+    pub fn unused() -> i64 { return 999; }
+}
+
+fn main() {
+    println(new Cell<i64>(42).get());
+    println(new Cell<String>("hello").get());
+    let empty: Array<i64> = Array::new();
+    println(empty.len());
+}

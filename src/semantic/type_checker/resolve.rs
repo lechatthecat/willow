@@ -1826,6 +1826,7 @@ impl TypeChecker {
                 Type::Void
             }
             Some((owner, mi)) => {
+                self.request_class_method(&owner, method_name);
                 self.record_typed_method_use(
                     method_name,
                     "method",
@@ -2720,6 +2721,7 @@ impl TypeChecker {
                 Type::Void
             }
             Some(mi) => {
+                self.request_class_method(class_name, method_name);
                 self.record_method_use(method_name, "method", span, mi.declaration_span, args);
                 if !mi.is_static {
                     let mut diagnostic = Diagnostic::new(

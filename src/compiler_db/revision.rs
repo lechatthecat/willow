@@ -2291,6 +2291,34 @@ mod tests {
         assert!(f.compare(&mut warm));
     }
     #[test]
+    fn revision_generic_method_demand_changes_match_cold() {
+        let f = Fixture::new();
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        let library = |second: &str| {
+            format!(
+                "pub class Cell<T> {{ pub value: T; pub fn first() -> T {{ return self.value; }} pub fn second() -> T {{ {second} }} }}"
+            )
+        };
+        f.write("lib.wi", &library("return self.value;"));
+        for method in ["first", "second", "first", "second"] {
+            f.write(
+                "main.wi",
+                &format!("import lib::Cell; fn main() {{ println(new Cell<i64>(1).{method}()); }}"),
+            );
+            assert!(f.compare(&mut warm));
+            assert!(f.compare(&mut warm));
+        }
+        f.write("lib.wi", &library("let x = self.value; return x;"));
+        assert!(f.compare(&mut warm));
+        f.write(
+            "main.wi",
+            "import lib::Cell; fn main() { let c = new Cell<i64>(1); }",
+        );
+        assert!(f.compare(&mut warm));
+    }
+
+    #[test]
     fn revision_generic_instances_bind_template_syntax() {
         let f = Fixture::new();
         let mut warm = AnalysisRevision::default();

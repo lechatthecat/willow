@@ -1042,18 +1042,28 @@ fn run_frontend_revision_cached(
             released_entry = Some(expanded);
         }
         let mut seen = std::collections::HashSet::new();
+        let mut instance_count = 0;
         while let Some(item) = pending.pop_front() {
             let (file, name, kind) = match &item.item {
                 parser::ast::Item::Function(f) => (f.span.file_id, f.name.clone(), 0u8),
-                parser::ast::Item::Class(c) => (c.span.file_id, c.name.clone(), 1u8),
+                parser::ast::Item::Class(c) => (
+                    c.span.file_id,
+                    if item.method_only {
+                        format!("{}::{}", c.name, c.methods[0].name)
+                    } else {
+                        c.name.clone()
+                    },
+                    if item.method_only { 3u8 } else { 1u8 },
+                ),
                 parser::ast::Item::Interface(i) => (i.span.file_id, i.name.clone(), 2u8),
                 parser::ast::Item::Enum(_) => unreachable!(),
             };
             if !seen.insert((file, name, kind)) {
                 continue;
             }
+            instance_count += usize::from(kind != 3);
             anyhow::ensure!(
-                seen.len() <= 4096,
+                instance_count <= 4096,
                 "generic instantiation limit exceeded (possible polymorphic recursion)"
             );
             let checker = &mut checkers[owners[&file]];
