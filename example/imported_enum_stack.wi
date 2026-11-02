@@ -1,0 +1,19 @@
+import imported_enum_stack_support::stack::Stack;
+
+enum Op { Add(i64), Label(String), Stop }
+
+fn main() {
+    let stack = new Stack<Op>();
+    stack.push(Op::Add(42));
+    stack.push(Op::Label("saved"));
+    println(stack.len());
+    gc_collect();
+    while stack.len() > 0 {
+        match stack.pop().unwrap() {
+            Op::Add(value) => println(value),
+            Op::Label(text) => println(text),
+            Op::Stop => println("stop"),
+        }
+    }
+    println(stack.pop().is_none());
+}

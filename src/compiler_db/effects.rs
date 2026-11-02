@@ -1719,7 +1719,12 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
                     && let Some(origin) = queries.external_target(unit, target, &imports)
                 {
                     plan.external.entry(origin).or_default().insert(*target);
-                    plan.providers.insert(origin.0);
+                    // Qualified enum constructors can resolve to this unit.
+                    // Their conservative external facts do not make the unit
+                    // inventory depend on itself.
+                    if origin.0 != unit {
+                        plan.providers.insert(origin.0);
+                    }
                 }
                 // Every unproved external call is conservatively IO-capable.
                 // Known runtime/stat/math intrinsics are the only pure leaves;
@@ -2495,7 +2500,9 @@ fn solve_unit_delta<N: std::fmt::Display>(
             io_seeds.insert(target);
         }
         if let Some(origin) = queries.external_target(unit, &target, &imports) {
-            result.plan.providers.insert(origin.0);
+            if origin.0 != unit {
+                result.plan.providers.insert(origin.0);
+            }
             result
                 .plan
                 .external

@@ -72,8 +72,8 @@ impl TypeChecker {
                                 ErrorCode::E0201,
                                 format!(
                                     "select send value type `{}` does not match channel element `{}`",
-                                    type_name(&v_ty),
-                                    type_name(&elem)
+                                    self.diagnostic_type_name(&v_ty),
+                                    self.diagnostic_type_name(&elem)
                                 ),
                             )
                             .with_label(Label::primary(value.span(), "wrong value type")),
@@ -89,7 +89,7 @@ impl TypeChecker {
                                 ErrorCode::E0201,
                                 format!(
                                     "select `sleep` timeout must be `i64` milliseconds, found `{}`",
-                                    type_name(&ms_ty)
+                                    self.diagnostic_type_name(&ms_ty)
                                 ),
                             )
                             .with_label(Label::primary(millis.span(), "expected `i64`")),
@@ -130,7 +130,7 @@ impl TypeChecker {
                                     ErrorCode::E0805,
                                     format!(
                                         "cannot await `{}` in a select case",
-                                        type_name(&task_ty)
+                                        self.diagnostic_type_name(&task_ty)
                                     ),
                                 )
                                 .with_label(Label::primary(task.span(), "expected a task")),
@@ -263,7 +263,7 @@ impl TypeChecker {
                                         ErrorCode::E0201,
                                         format!(
                                             "expect message must be `String`, found `{}`",
-                                            type_name(&msg_ty)
+                                            self.diagnostic_type_name(&msg_ty)
                                         ),
                                     )
                                     .with_label(
@@ -302,14 +302,17 @@ impl TypeChecker {
                                         ErrorCode::E0201,
                                         format!(
                                             "mismatched types: expected `{}`, found `{}`",
-                                            type_name(&inner),
-                                            type_name(&default_ty)
+                                            self.diagnostic_type_name(&inner),
+                                            self.diagnostic_type_name(&default_ty)
                                         ),
                                     )
                                     .with_label(
                                         Label::primary(
                                             call.args[0].expr.span(),
-                                            format!("expected `{}`", type_name(&inner)),
+                                            format!(
+                                                "expected `{}`",
+                                                self.diagnostic_type_name(&inner)
+                                            ),
                                         ),
                                     ),
                                 );
@@ -345,7 +348,7 @@ impl TypeChecker {
                                     if !self.types_compatible(&inner, &params[0]) {
                                         self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                             format!("`Option::map` closure argument type mismatch: expected `{}`, found `{}`",
-                                                type_name(&inner), type_name(&params[0])))
+                                                self.diagnostic_type_name(&inner), self.diagnostic_type_name(&params[0])))
                                             .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
                                     }
                                     Some(B::Option.apply(vec![*ret.clone()]))
@@ -358,7 +361,7 @@ impl TypeChecker {
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Option::map` expects a function `fn({}) -> U`, found `{}`",
-                                            type_name(&inner), type_name(&f_ty)))
+                                            self.diagnostic_type_name(&inner), self.diagnostic_type_name(&f_ty)))
                                         .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
                                     Some(obj_ty.clone())
                                 }
@@ -393,7 +396,7 @@ impl TypeChecker {
                                     if !self.types_compatible(&inner, &params[0]) {
                                         self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                             format!("`Option::and_then` closure argument type mismatch: expected `{}`, found `{}`",
-                                                type_name(&inner), type_name(&params[0])))
+                                                self.diagnostic_type_name(&inner), self.diagnostic_type_name(&params[0])))
                                             .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
                                     }
                                     Some(*ret.clone())
@@ -406,7 +409,7 @@ impl TypeChecker {
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Option::and_then` expects a function `fn({}) -> Option<U>`, found `{}`",
-                                            type_name(&inner), type_name(&f_ty)))
+                                            self.diagnostic_type_name(&inner), self.diagnostic_type_name(&f_ty)))
                                         .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
                                     Some(obj_ty.clone())
                                 }
@@ -448,7 +451,7 @@ impl TypeChecker {
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Option::or_else` expects a function `fn() -> Option<{}>`, found `{}`",
-                                            type_name(&inner), type_name(&f_ty)))
+                                            self.diagnostic_type_name(&inner), self.diagnostic_type_name(&f_ty)))
                                         .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
                                     Some(obj_ty.clone())
                                 }
@@ -520,7 +523,7 @@ impl TypeChecker {
                                         ErrorCode::E0201,
                                         format!(
                                             "expect message must be `String`, found `{}`",
-                                            type_name(&msg_ty)
+                                            self.diagnostic_type_name(&msg_ty)
                                         ),
                                     )
                                     .with_label(
@@ -559,14 +562,17 @@ impl TypeChecker {
                                         ErrorCode::E0201,
                                         format!(
                                             "mismatched types: expected `{}`, found `{}`",
-                                            type_name(&ok_ty),
-                                            type_name(&default_ty)
+                                            self.diagnostic_type_name(&ok_ty),
+                                            self.diagnostic_type_name(&default_ty)
                                         ),
                                     )
                                     .with_label(
                                         Label::primary(
                                             call.args[0].expr.span(),
-                                            format!("expected `{}`", type_name(&ok_ty)),
+                                            format!(
+                                                "expected `{}`",
+                                                self.diagnostic_type_name(&ok_ty)
+                                            ),
                                         ),
                                     ),
                                 );
@@ -618,7 +624,7 @@ impl TypeChecker {
                                     if !self.types_compatible(&ok_ty, &params[0]) {
                                         self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                             format!("`Result::map` closure argument type mismatch: expected `{}`, found `{}`",
-                                                type_name(&ok_ty), type_name(&params[0])))
+                                                self.diagnostic_type_name(&ok_ty), self.diagnostic_type_name(&params[0])))
                                             .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
                                     }
                                     Some(Type::Generic(
@@ -634,7 +640,7 @@ impl TypeChecker {
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Result::map` expects a function `fn({}) -> U`, found `{}`",
-                                            type_name(&ok_ty), type_name(&f_ty)))
+                                            self.diagnostic_type_name(&ok_ty), self.diagnostic_type_name(&f_ty)))
                                         .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
                                     Some(obj_ty.clone())
                                 }
@@ -669,7 +675,7 @@ impl TypeChecker {
                                     if !self.types_compatible(&err_ty, &params[0]) {
                                         self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                             format!("`Result::map_err` closure argument type mismatch: expected `{}`, found `{}`",
-                                                type_name(&err_ty), type_name(&params[0])))
+                                                self.diagnostic_type_name(&err_ty), self.diagnostic_type_name(&params[0])))
                                             .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
                                     }
                                     Some(Type::Generic(
@@ -685,7 +691,7 @@ impl TypeChecker {
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Result::map_err` expects a function `fn({}) -> F`, found `{}`",
-                                            type_name(&err_ty), type_name(&f_ty)))
+                                            self.diagnostic_type_name(&err_ty), self.diagnostic_type_name(&f_ty)))
                                         .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
                                     Some(obj_ty.clone())
                                 }
@@ -720,7 +726,7 @@ impl TypeChecker {
                                     if !self.types_compatible(&ok_ty, &params[0]) {
                                         self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                             format!("`Result::and_then` closure argument type mismatch: expected `{}`, found `{}`",
-                                                type_name(&ok_ty), type_name(&params[0])))
+                                                self.diagnostic_type_name(&ok_ty), self.diagnostic_type_name(&params[0])))
                                             .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
                                     }
                                     Some(*ret.clone())
@@ -733,7 +739,7 @@ impl TypeChecker {
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Result::and_then` expects a function `fn({}) -> Result<U, E>`, found `{}`",
-                                            type_name(&ok_ty), type_name(&f_ty)))
+                                            self.diagnostic_type_name(&ok_ty), self.diagnostic_type_name(&f_ty)))
                                         .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
                                     Some(obj_ty.clone())
                                 }
@@ -768,7 +774,7 @@ impl TypeChecker {
                                     if !self.types_compatible(&err_ty, &params[0]) {
                                         self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                             format!("`Result::or_else` closure argument type mismatch: expected `{}`, found `{}`",
-                                                type_name(&err_ty), type_name(&params[0])))
+                                                self.diagnostic_type_name(&err_ty), self.diagnostic_type_name(&params[0])))
                                             .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
                                     }
                                     Some(*ret.clone())
@@ -781,7 +787,7 @@ impl TypeChecker {
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                                         format!("`Result::or_else` expects a function `fn({}) -> Result<T, F>`, found `{}`",
-                                            type_name(&err_ty), type_name(&f_ty)))
+                                            self.diagnostic_type_name(&err_ty), self.diagnostic_type_name(&f_ty)))
                                         .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
                                     Some(obj_ty.clone())
                                 }
@@ -875,8 +881,8 @@ impl TypeChecker {
                         format!(
                             "`{lock}::{}` expects `{}`, got `{}`",
                             call.method,
-                            type_name(&expected),
-                            type_name(&got)
+                            self.diagnostic_type_name(&expected),
+                            self.diagnostic_type_name(&got)
                         ),
                     )
                     .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
@@ -949,8 +955,8 @@ impl TypeChecker {
                         format!(
                             "`{atomic}::{}` expects `{}`, got `{}`",
                             call.method,
-                            type_name(expected),
-                            type_name(&got)
+                            self.diagnostic_type_name(expected),
+                            self.diagnostic_type_name(&got)
                         ),
                     )
                     .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
@@ -1075,7 +1081,7 @@ impl TypeChecker {
                                     format!(
                                         "`{kind}::{}` expects `Task<T>`, found `{}`",
                                         call.method,
-                                        type_name(&task_ty)
+                                        self.diagnostic_type_name(&task_ty)
                                     ),
                                 )
                                 .with_label(Label::primary(
@@ -1182,7 +1188,7 @@ impl TypeChecker {
                         code,
                         format!(
                             "`{}::{}` has been removed",
-                            type_name(obj_ty),
+                            self.diagnostic_type_name(obj_ty),
                             if is_try_join { "try_join()" } else { "join()" }
                         ),
                     )
@@ -1213,7 +1219,10 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0806,
-                            format!("cannot call `send` on `{}`", type_name(obj_ty)),
+                            format!(
+                                "cannot call `send` on `{}`",
+                                self.diagnostic_type_name(obj_ty)
+                            ),
                         )
                         .with_label(Label::primary(call.span, "expected `Channel<T>`")),
                     );
@@ -1231,7 +1240,7 @@ impl TypeChecker {
                             ErrorCode::E2403,
                             format!(
                                 "channel item type `{}` must be `Send`",
-                                type_name(&element_ty)
+                                self.diagnostic_type_name(&element_ty)
                             ),
                         )
                         .with_label(Label::primary(
@@ -1276,8 +1285,8 @@ impl TypeChecker {
                                 arg.span,
                                 format!(
                                     "send expects `{}`, not `& {}`",
-                                    type_name(&element_ty),
-                                    type_name(&arg_ty)
+                                    self.diagnostic_type_name(&element_ty),
+                                    self.diagnostic_type_name(&arg_ty)
                                 ),
                             )),
                         );
@@ -1288,16 +1297,16 @@ impl TypeChecker {
                                 ErrorCode::E0802,
                                 format!(
                                     "cannot send `{}` into `Channel<{}>`",
-                                    type_name(&arg_ty),
-                                    type_name(&element_ty)
+                                    self.diagnostic_type_name(&arg_ty),
+                                    self.diagnostic_type_name(&element_ty)
                                 ),
                             )
                             .with_label(Label::primary(
                                 arg.expr.span(),
                                 format!(
                                     "expected `{}`, found `{}`",
-                                    type_name(&element_ty),
-                                    type_name(&arg_ty)
+                                    self.diagnostic_type_name(&element_ty),
+                                    self.diagnostic_type_name(&arg_ty)
                                 ),
                             )),
                         );
@@ -1331,7 +1340,10 @@ impl TypeChecker {
                             Diagnostic::new(
                                 Severity::Error,
                                 ErrorCode::E0806,
-                                format!("cannot call `{method}` on `{}`", type_name(obj_ty)),
+                                format!(
+                                    "cannot call `{method}` on `{}`",
+                                    self.diagnostic_type_name(obj_ty)
+                                ),
                             )
                             .with_label(Label::primary(call.span, "expected `Channel<T>`")),
                         );
@@ -1358,7 +1370,10 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0806,
-                            format!("cannot call `close` on `{}`", type_name(obj_ty)),
+                            format!(
+                                "cannot call `close` on `{}`",
+                                self.diagnostic_type_name(obj_ty)
+                            ),
                         )
                         .with_label(Label::primary(call.span, "expected `Channel<T>`")),
                     );

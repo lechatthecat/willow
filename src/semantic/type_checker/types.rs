@@ -214,7 +214,7 @@ pub(crate) fn param_modes_match(a: &ParamMode, b: &ParamMode) -> bool {
 /// Render a parameter the way it is written in source, including its `&`/`&mut`
 /// mode. The mode is part of the signature a class must match, because a
 /// reference parameter is passed as a pointer (willow-0g8j.9).
-pub(crate) fn param_info_name(p: &ParamInfo) -> String {
+pub(crate) fn param_info_name(p: &ParamInfo, type_name: impl Fn(&Type) -> String) -> String {
     match &p.mode {
         ParamMode::Reference { mutable: true, .. } => format!("&mut {}", type_name(&p.ty)),
         ParamMode::Reference { mutable: false, .. } => format!("& {}", type_name(&p.ty)),
@@ -222,12 +222,15 @@ pub(crate) fn param_info_name(p: &ParamInfo) -> String {
     }
 }
 
-pub(crate) fn interface_method_signature(m: &InterfaceMethodInfo) -> String {
+pub(crate) fn interface_method_signature(
+    m: &InterfaceMethodInfo,
+    type_name: impl Fn(&Type) -> String,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !m.is_static {
         parts.push("self".to_string());
     }
-    parts.extend(m.param_infos.iter().map(param_info_name));
+    parts.extend(m.param_infos.iter().map(|p| param_info_name(p, &type_name)));
     let ret = if matches!(m.return_type, Type::Void) {
         String::new()
     } else {

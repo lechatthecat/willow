@@ -29,7 +29,7 @@ impl TypeChecker {
                                 ErrorCode::E1807,
                                 format!(
                                     "`?` on `Option<T>` can only be used inside a function returning `Option<U>`, found `{}`",
-                                    type_name(other)
+                                    self.diagnostic_type_name(other)
                                 ),
                             )
                             .with_label(Label::primary(span, "invalid context for Option `?`"))
@@ -55,7 +55,7 @@ impl TypeChecker {
                         ErrorCode::E1806,
                         format!(
                             "the `?` operator requires `Result<T,E>` or `Option<T>`, found `{}`",
-                            type_name(other)
+                            self.diagnostic_type_name(other)
                         ),
                     )
                     .with_label(Label::primary(span, "not a Result or Option"))
@@ -92,15 +92,15 @@ impl TypeChecker {
                             ErrorCode::E1805,
                             format!(
                                 "error type mismatch: function returns `Result<_, {}>` but `?` propagates `{}`",
-                                type_name(return_err),
-                                type_name(&err_ty)
+                                self.diagnostic_type_name(return_err),
+                                self.diagnostic_type_name(&err_ty)
                             ),
                         )
                         .with_label(Label::primary(span, "error type mismatch"))
                         .with_help(format!(
                             "implement `Into<{}>` on `{}` to allow `?` to convert the error",
-                            type_name(return_err),
-                            type_name(&err_ty)
+                            self.diagnostic_type_name(return_err),
+                            self.diagnostic_type_name(&err_ty)
                         )),
                     );
                     ok_ty
@@ -114,7 +114,7 @@ impl TypeChecker {
                         ErrorCode::E1807,
                         format!(
                             "`?` can only be used inside a function returning `Result<T,E>`, found `{}`",
-                            type_name(other)
+                            self.diagnostic_type_name(other)
                         ),
                     )
                     .with_label(Label::primary(span, "invalid context for `?`"))
@@ -190,10 +190,10 @@ impl TypeChecker {
                 "a `fn` value carries no environment: take what it reads as a parameter, or, where the signature can be changed, declare it `closure({}) -> {}`",
                 signature_params
                     .iter()
-                    .map(type_name)
+                    .map(|ty| self.diagnostic_type_name(ty))
                     .collect::<Vec<_>>()
                     .join(", "),
-                type_name(signature_ret)
+                self.diagnostic_type_name(signature_ret)
             )),
         );
         (Type::Fn(actual_params.clone(), actual_ret.clone()), true)
@@ -552,8 +552,8 @@ impl TypeChecker {
                             self.type_mismatch_error_code(ann, &body_ty),
                             format!(
                                 "lambda return type mismatch: expected `{}`, found `{}`",
-                                type_name(ann),
-                                type_name(&body_ty)
+                                self.diagnostic_type_name(ann),
+                                self.diagnostic_type_name(&body_ty)
                             ),
                         )
                         .with_label(Label::primary(l.span, "return type mismatch")),
@@ -570,8 +570,8 @@ impl TypeChecker {
                                 self.type_mismatch_error_code(expected, &body_ty),
                                 format!(
                                     "lambda return type mismatch: expected `{}`, found `{}`",
-                                    type_name(expected),
-                                    type_name(&body_ty)
+                                    self.diagnostic_type_name(expected),
+                                    self.diagnostic_type_name(&body_ty)
                                 ),
                             )
                             .with_label(Label::primary(l.span, "return type mismatch")),
@@ -728,12 +728,15 @@ impl TypeChecker {
                     ErrorCode::E0203,
                     format!(
                         "match guard must be `bool`, found `{}`",
-                        type_name(&guard_ty)
+                        self.diagnostic_type_name(&guard_ty)
                     ),
                 )
                 .with_label(Label::primary(
                     guard.span(),
-                    format!("expected `bool`, found `{}`", type_name(&guard_ty)),
+                    format!(
+                        "expected `bool`, found `{}`",
+                        self.diagnostic_type_name(&guard_ty)
+                    ),
                 ))
                 .with_help("use an explicit comparison, e.g. `!= 0`"),
             );
@@ -934,7 +937,7 @@ impl TypeChecker {
                         ErrorCode::E1205,
                         format!(
                             "pattern type mismatch: expected `Option`, found `{}`",
-                            type_name(&scrutinee_ty)
+                            self.diagnostic_type_name(&scrutinee_ty)
                         ),
                     )
                     .with_label(Label::primary(
@@ -991,7 +994,7 @@ impl TypeChecker {
                                 ErrorCode::E1205,
                                 format!(
                                     "bool pattern cannot match scrutinee of type `{}`",
-                                    type_name(&scrutinee_ty)
+                                    self.diagnostic_type_name(&scrutinee_ty)
                                 ),
                             )
                             .with_label(Label::primary(*span, "pattern type mismatch")),
@@ -1011,7 +1014,7 @@ impl TypeChecker {
                                 ErrorCode::E1205,
                                 format!(
                                     "integer pattern cannot match scrutinee of type `{}`",
-                                    type_name(&scrutinee_ty)
+                                    self.diagnostic_type_name(&scrutinee_ty)
                                 ),
                             )
                             .with_label(Label::primary(*span, "pattern type mismatch")),
@@ -1042,7 +1045,7 @@ impl TypeChecker {
                                             "enum pattern `{}::{}` cannot match scrutinee of type `{}`",
                                             enum_name,
                                             variant,
-                                            type_name(&scrutinee_ty)
+                                            self.diagnostic_type_name(&scrutinee_ty)
                                         ),
                                     )
                                     .with_label(Label::primary(*span, "pattern type mismatch")),
@@ -1106,7 +1109,7 @@ impl TypeChecker {
                             _ => {
                                 self.push(Diagnostic::new(Severity::Error, ErrorCode::E1205,
                                     format!("enum pattern `{}::{}(..)` cannot match scrutinee of type `{}`",
-                                        enum_name, variant, type_name(&scrutinee_ty)))
+                                        enum_name, variant, self.diagnostic_type_name(&scrutinee_ty)))
                                     .with_label(Label::primary(*span, "pattern type mismatch")));
                             }
                         }
@@ -1188,7 +1191,7 @@ impl TypeChecker {
                                 format!(
                                     "class pattern `{}(..)` requires an interface scrutinee, found `{}`",
                                     class_name,
-                                    type_name(&scrutinee_ty)
+                                    self.diagnostic_type_name(&scrutinee_ty)
                                 ),
                             )
                             .with_label(Label::primary(*span, "scrutinee is not an interface"))
@@ -1211,7 +1214,7 @@ impl TypeChecker {
                                 format!(
                                     "class `{}` does not implement `{}`, so this pattern can never match",
                                     class_name,
-                                    type_name(&scrutinee_ty)
+                                    self.diagnostic_type_name(&scrutinee_ty)
                                 ),
                             )
                             .with_label(Label::primary(*span, "unrelated class")),
@@ -1382,13 +1385,13 @@ impl TypeChecker {
                                 ErrorCode::E1201,
                                 format!(
                                     "match arms have incompatible types: `{}` and `{}`",
-                                    type_name(existing),
-                                    type_name(&arm_ty)
+                                    self.diagnostic_type_name(existing),
+                                    self.diagnostic_type_name(&arm_ty)
                                 ),
                             )
                             .with_label(Label::primary(
                                 arm.span,
-                                format!("found `{}`", type_name(&arm_ty)),
+                                format!("found `{}`", self.diagnostic_type_name(&arm_ty)),
                             ))
                             .with_help(help),
                         );

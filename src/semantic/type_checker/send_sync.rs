@@ -95,7 +95,10 @@ impl TypeChecker {
                     Diagnostic::new(
                         Severity::Error,
                         code,
-                        format!("interface value `{}` is not `{kind}`", type_name(ty)),
+                        format!(
+                            "interface value `{}` is not `{kind}`",
+                            self.diagnostic_type_name(ty)
+                        ),
                     )
                     .with_label(Label::primary(
                         arg.expr.span(),
@@ -104,7 +107,7 @@ impl TypeChecker {
                     .with_note(ASYNC_CAPTURE_SHARING_NOTE)
                     .with_help(format!(
                         "declare `interface {} extends Sync` if every implementation is Sync",
-                        type_name(ty)
+                        self.diagnostic_type_name(ty)
                     )),
                 );
                 continue;
@@ -122,12 +125,15 @@ impl TypeChecker {
                 ErrorCode::E2402,
                 format!(
                     "cannot pass `{}` to an async call: it is not `{marker}`",
-                    type_name(ty)
+                    self.diagnostic_type_name(ty)
                 ),
             )
             .with_label(Label::primary(
                 arg.expr.span(),
-                format!("`{}` crosses a task boundary here", type_name(ty)),
+                format!(
+                    "`{}` crosses a task boundary here",
+                    self.diagnostic_type_name(ty)
+                ),
             ));
             // Labels render against one source; a field declared in another
             // module is named by the note instead.
@@ -259,7 +265,7 @@ impl TypeChecker {
                         ErrorCode::E2402,
                         format!(
                             "async task frame is not `Send`: `{}` cannot move between workers",
-                            type_name(ty)
+                            self.diagnostic_type_name(ty)
                         ),
                     )
                     .with_label(Label::primary(
@@ -289,7 +295,7 @@ impl TypeChecker {
             ErrorCode::E2402,
             format!(
                 "async task frame is not `Send`: `{}` cannot move between workers",
-                type_name(first_bad)
+                self.diagnostic_type_name(first_bad)
             ),
         )
         .with_label(Label::primary(
@@ -556,7 +562,7 @@ impl TypeChecker {
         {
             reasons.notes.push(format!(
                 "`{}` is not `{}`",
-                type_name(ty),
+                self.diagnostic_type_name(ty),
                 if send { "Send" } else { "Sync" }
             ));
         }
@@ -613,7 +619,7 @@ impl TypeChecker {
                             reasons.reassigned_field.get_or_insert(f.declaration_span);
                             reasons.notes.push(format!(
                                 "field `{name}: {}` is reassigned after construction, so tasks sharing a `{}` would race on it",
-                                type_name(&f.ty),
+                                self.diagnostic_type_name(&f.ty),
                                 class.name
                             ));
                             reasons.help = Some(REASSIGNED_FIELD_HELP);
@@ -623,11 +629,11 @@ impl TypeChecker {
                     let ok = self.marker_holds_with_reason(&f.ty, marker, visiting, reasons);
                     if !ok && let Some(reasons) = reasons {
                         reasons.field_span.get_or_insert(f.declaration_span);
-                        let prefix = format!("`{}` is not `", type_name(&f.ty));
+                        let prefix = format!("`{}` is not `", self.diagnostic_type_name(&f.ty));
                         if reasons.notes.len() == 1 && reasons.notes[0].starts_with(&prefix) {
                             reasons.notes[0] = format!(
                                 "field `{name}: {}` is not `{}`",
-                                type_name(&f.ty),
+                                self.diagnostic_type_name(&f.ty),
                                 if matches!(marker, Marker::Send) {
                                     "Send"
                                 } else {
@@ -637,7 +643,7 @@ impl TypeChecker {
                         } else {
                             reasons
                                 .notes
-                                .push(format!("field `{name}: {}`", type_name(&f.ty)));
+                                .push(format!("field `{name}: {}`", self.diagnostic_type_name(&f.ty)));
                         }
                     }
                     ok

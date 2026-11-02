@@ -1067,7 +1067,7 @@ impl TypeChecker {
                         ErrorCode::E0807,
                         format!(
                             "select case requires a `Channel<T>`, found `{}`",
-                            type_name(ch_ty)
+                            self.diagnostic_type_name(ch_ty)
                         ),
                     )
                     .with_label(Label::primary(span, "not a channel")),
@@ -1319,7 +1319,7 @@ impl TypeChecker {
         }
         match common {
             Some(ty) => {
-                let ty = type_name(&ty);
+                let ty = self.diagnostic_type_name(&ty);
                 format!(
                     "both values convert to `{ty}`; give the expression that type, e.g. `let value: {ty} = ...;` or a `-> {ty}` return type"
                 )

@@ -1054,8 +1054,8 @@ impl TypeChecker {
                     "static property `{}::{}` has type `{}` but its initializer is `{}`",
                     c.name,
                     field.name,
-                    type_name(&declared),
-                    type_name(&init_ty)
+                    self.diagnostic_type_name(&declared),
+                    self.diagnostic_type_name(&init_ty)
                 ),
             )
             .with_label(Label::primary(init.span(), "initializer type mismatch"));
@@ -1231,7 +1231,10 @@ impl TypeChecker {
                     )
                     .with_label(Label::primary(
                         c.span,
-                        format!("missing method `{}`", interface_method_signature(req)),
+                        format!(
+                            "missing method `{}`",
+                            interface_method_signature(req, |ty| self.diagnostic_type_name(ty))
+                        ),
                     ))
                     .with_label(Label::secondary(
                         req.declaration_span,
@@ -1322,7 +1325,8 @@ impl TypeChecker {
                             method
                                 .param_infos
                                 .iter()
-                                .map(param_info_name)
+                                .map(|param| param_info_name(param, |ty| self
+                                    .diagnostic_type_name(ty)))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ),
@@ -1333,7 +1337,8 @@ impl TypeChecker {
                             "interface requires `({})`",
                             req.param_infos
                                 .iter()
-                                .map(param_info_name)
+                                .map(|param| param_info_name(param, |ty| self
+                                    .diagnostic_type_name(ty)))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ),
@@ -1353,9 +1358,9 @@ impl TypeChecker {
                         format!(
                             "method `{}` returns `{}`, but interface `{}` requires `{}`",
                             req_name,
-                            type_name(&actual_return_type),
+                            self.diagnostic_type_name(&actual_return_type),
                             iface.name,
-                            type_name(&req.return_type)
+                            self.diagnostic_type_name(&req.return_type)
                         ),
                     )
                     .with_label(Label::primary(
@@ -1691,7 +1696,7 @@ impl TypeChecker {
                 )
                 .with_label(Label::primary(
                     m.span,
-                    format!("`{}` is a task handle", type_name(&return_type)),
+                    format!("`{}` is a task handle", self.diagnostic_type_name(&return_type)),
                 ))
                 .with_help(
                     "an async method returns `Task<T>` automatically — annotate `T` (e.g. `-> i64`)",
@@ -1816,7 +1821,10 @@ impl TypeChecker {
                 )
                 .with_label(Label::primary(
                     f.span,
-                    format!("`{}` is a task handle", type_name(&return_type)),
+                    format!(
+                        "`{}` is a task handle",
+                        self.diagnostic_type_name(&return_type)
+                    ),
                 ))
                 .with_help(
                     "an async fn returns `Task<T>` automatically — annotate `T` (e.g. `-> i64`); \

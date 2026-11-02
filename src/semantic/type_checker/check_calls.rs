@@ -159,8 +159,8 @@ impl TypeChecker {
                 span,
                 format!(
                     "parameter expects `{}`, not `& {}`",
-                    type_name(param_ty),
-                    type_name(arg_ty)
+                    self.diagnostic_type_name(param_ty),
+                    self.diagnostic_type_name(arg_ty)
                 ),
             )),
         );
@@ -214,22 +214,21 @@ impl TypeChecker {
                 self.type_mismatch_error_code(param_ty, &arg_ty),
                 format!(
                     "mismatched types: expected `{}`, found `{}`",
-                    type_name(param_ty),
-                    type_name(&arg_ty)
+                    self.diagnostic_type_name(param_ty),
+                    self.diagnostic_type_name(&arg_ty)
                 ),
             )
             .with_label(Label::primary(
                 arg.expr.span(),
-                format!("expected `{}`", type_name(param_ty)),
+                format!("expected `{}`", self.diagnostic_type_name(param_ty)),
             ));
-            self.push(Self::with_fn_closure_help(
-                diagnostic, param_ty, &arg_ty, &arg.expr,
-            ));
+            self.push(self.with_fn_closure_help(diagnostic, param_ty, &arg_ty, &arg.expr));
         }
     }
 
     /// Advice only: a named function still requires an explicit closure wrapper.
     pub(super) fn with_fn_closure_help(
+        &self,
         diagnostic: Diagnostic,
         expected: &Type,
         actual: &Type,
@@ -256,7 +255,7 @@ impl TypeChecker {
         let declarations = names
             .iter()
             .zip(params)
-            .map(|(name, ty)| format!("{name}: {}", type_name(ty)))
+            .map(|(name, ty)| format!("{name}: {}", self.diagnostic_type_name(ty)))
             .collect::<Vec<_>>()
             .join(", ");
         diagnostic.with_help(format!(
@@ -513,12 +512,15 @@ impl TypeChecker {
                     ErrorCode::E0901,
                     format!(
                         "if-expression condition must be `bool`, found `{}`",
-                        type_name(&cond_ty)
+                        self.diagnostic_type_name(&cond_ty)
                     ),
                 )
                 .with_label(Label::primary(
                     t.condition.span(),
-                    format!("expected `bool`, found `{}`", type_name(&cond_ty)),
+                    format!(
+                        "expected `bool`, found `{}`",
+                        self.diagnostic_type_name(&cond_ty)
+                    ),
                 )),
             );
         }
@@ -544,21 +546,24 @@ impl TypeChecker {
                     ErrorCode::E0902,
                     format!(
                         "ternary branches have incompatible types: `{}` and `{}`",
-                        type_name(&then_ty),
-                        type_name(&else_ty)
+                        self.diagnostic_type_name(&then_ty),
+                        self.diagnostic_type_name(&else_ty)
                     ),
                 )
                 .with_label(Label::primary(
                     t.else_expr.span(),
                     format!(
                         "expected `{}`, found `{}`",
-                        type_name(&then_ty),
-                        type_name(&else_ty)
+                        self.diagnostic_type_name(&then_ty),
+                        self.diagnostic_type_name(&else_ty)
                     ),
                 ))
                 .with_label(Label::secondary(
                     t.then_expr.span(),
-                    format!("this branch has type `{}`", type_name(&then_ty)),
+                    format!(
+                        "this branch has type `{}`",
+                        self.diagnostic_type_name(&then_ty)
+                    ),
                 )),
             );
             Type::Void
@@ -663,8 +668,8 @@ impl TypeChecker {
                         ErrorCode::E0201,
                         format!(
                             "mismatched types: expected `{}`, found `{}`",
-                            type_name(param_ty),
-                            type_name(&arg_ty)
+                            self.diagnostic_type_name(param_ty),
+                            self.diagnostic_type_name(&arg_ty)
                         ),
                     )
                     .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
@@ -789,8 +794,8 @@ impl TypeChecker {
                             ErrorCode::E0201,
                             format!(
                                 "tuple element expects `{}`, found `{}`",
-                                type_name(param_ty),
-                                type_name(&arg_ty)
+                                self.diagnostic_type_name(param_ty),
+                                self.diagnostic_type_name(&arg_ty)
                             ),
                         )
                         .with_label(Label::primary(arg.expr.span(), "wrong tuple element type")),
@@ -809,8 +814,8 @@ impl TypeChecker {
                         ErrorCode::E0201,
                         format!(
                             "mismatched types: expected `{}`, found `{}`",
-                            type_name(&result),
-                            type_name(&actual_result)
+                            self.diagnostic_type_name(&result),
+                            self.diagnostic_type_name(&actual_result)
                         ),
                     )
                     .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
@@ -1054,18 +1059,18 @@ impl TypeChecker {
             )
             .with_label(Label::primary(
                 arg.span,
-                format!("found `{}`", type_name(&place.ty)),
+                format!("found `{}`", self.diagnostic_type_name(&place.ty)),
             ));
 
             if param.type_span != Span::dummy() {
                 diagnostic = diagnostic.with_label(Label::secondary(
                     param.type_span,
-                    format!("expected `{}`", type_name(&param.ty)),
+                    format!("expected `{}`", self.diagnostic_type_name(&param.ty)),
                 ));
             } else {
                 diagnostic = diagnostic.with_label(Label::secondary(
                     param.span,
-                    format!("expected `{}`", type_name(&param.ty)),
+                    format!("expected `{}`", self.diagnostic_type_name(&param.ty)),
                 ));
             }
 
@@ -1245,7 +1250,7 @@ impl TypeChecker {
                                 ErrorCode::E0201,
                                 format!(
                                     "mismatched types: expected `f64`, found `{}`",
-                                    type_name(&ty)
+                                    self.diagnostic_type_name(&ty)
                                 ),
                             )
                             .with_label(Label::primary(arg.expr.span(), "expected `f64`")),
@@ -1260,7 +1265,7 @@ impl TypeChecker {
                                 ErrorCode::E1401,
                                 format!(
                                     "`{{}}` cannot format a value of type `{}`",
-                                    type_name(&ty)
+                                    self.diagnostic_type_name(&ty)
                                 ),
                             )
                             .with_label(Label::primary(

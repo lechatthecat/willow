@@ -1,0 +1,12 @@
+module imported_enum_stack_support::stack;
+import std::collections::Array;
+pub class Stack<T> {
+    items: Array<T>;
+    pub init(self) { self.items = []; }
+    pub fn push(self, value: T) { self.items.push(value); }
+    pub fn pop(self) -> Option<T> {
+        if self.items.len() == 0 { return None; }
+        return Some(self.items.pop());
+    }
+    pub fn len(self) -> i64 { return self.items.len(); }
+}

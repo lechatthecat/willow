@@ -42,8 +42,8 @@ impl TypeChecker {
                             self.type_mismatch_error_code(expected, &ty),
                             format!(
                                 "array element expects `{}`, found `{}`",
-                                type_name(expected),
-                                type_name(&ty)
+                                self.diagnostic_type_name(expected),
+                                self.diagnostic_type_name(&ty)
                             ),
                         )
                         .with_label(Label::primary(el.span(), "mismatched element type")),
@@ -66,8 +66,8 @@ impl TypeChecker {
                         ErrorCode::E0201,
                         format!(
                             "array elements must have the same type: expected `{}`, found `{}`",
-                            type_name(&first_ty),
-                            type_name(&ty)
+                            self.diagnostic_type_name(&first_ty),
+                            self.diagnostic_type_name(&ty)
                         ),
                     )
                     .with_label(Label::primary(el.span(), "mismatched element type"))
@@ -88,7 +88,10 @@ impl TypeChecker {
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0201,
-                    format!("array index must be `i64`, found `{}`", type_name(&idx_ty)),
+                    format!(
+                        "array index must be `i64`, found `{}`",
+                        self.diagnostic_type_name(&idx_ty)
+                    ),
                 )
                 .with_label(Label::primary(index.span(), "index is not an `i64`")),
             );
@@ -111,7 +114,10 @@ impl TypeChecker {
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
-                        format!("cannot index a value of type `{}`", type_name(other)),
+                        format!(
+                            "cannot index a value of type `{}`",
+                            self.diagnostic_type_name(other)
+                        ),
                     )
                     .with_label(Label::primary(span, "not an array"))
                     .with_help("indexing with `[..]` requires an `Array<T>` or `FrozenArray<T>`"),
@@ -188,11 +194,15 @@ impl TypeChecker {
                     let mut diagnostic = Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
-                        format!("no method `{}` on type `{}`", m.method, type_name(obj_ty)),
+                        format!(
+                            "no method `{}` on type `{}`",
+                            m.method,
+                            self.diagnostic_type_name(obj_ty)
+                        ),
                     )
                     .with_label(Label::primary(m.span, "unknown method"))
                     .with_help(format!("available methods: {methods}"));
-                    Self::label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
+                    self.label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
                     self.push(diagnostic);
                     for arg in &m.args {
                         self.check_expr(&arg.expr);
@@ -249,7 +259,7 @@ impl TypeChecker {
                             format!(
                                 "method `{}` is unavailable for `{}`",
                                 m.method,
-                                type_name(obj_ty)
+                                self.diagnostic_type_name(obj_ty)
                             ),
                         )
                         .with_label(Label::primary(m.span, "method constraint is not satisfied")),
@@ -343,7 +353,7 @@ impl TypeChecker {
                         ErrorCode::E0201,
                         format!(
                             "no method `{other}` on `FrozenArray<{}>`",
-                            type_name(elem_ty)
+                            self.diagnostic_type_name(elem_ty)
                         ),
                     )
                     .with_label(Label::primary(m.span, "unknown method"))
@@ -424,8 +434,8 @@ impl TypeChecker {
                         ErrorCode::E0201,
                         format!(
                             "map key type mismatch: expected `{}`, found `{}`",
-                            type_name(&key_ty),
-                            type_name(&k)
+                            checker.diagnostic_type_name(&key_ty),
+                            checker.diagnostic_type_name(&k)
                         ),
                     )
                     .with_label(Label::primary(arg.expr.span(), "wrong key type")),
@@ -454,8 +464,8 @@ impl TypeChecker {
                                 ErrorCode::E0201,
                                 format!(
                                     "map value type mismatch: expected `{}`, found `{}`",
-                                    type_name(&val_ty),
-                                    type_name(&v)
+                                    self.diagnostic_type_name(&val_ty),
+                                    self.diagnostic_type_name(&v)
                                 ),
                             )
                             .with_label(Label::primary(m.args[1].expr.span(), "wrong value type")),
@@ -550,7 +560,10 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E1402,
-                            format!("cannot toString a map with `{}` values", type_name(&val_ty)),
+                            format!(
+                                "cannot toString a map with `{}` values",
+                                self.diagnostic_type_name(&val_ty)
+                            ),
                         )
                         .with_label(Label::primary(
                             m.span,
@@ -583,15 +596,15 @@ impl TypeChecker {
                         format!(
                             "no method `{}` on type `Map<{}, {}>`",
                             other,
-                            type_name(&key_ty),
-                            type_name(&val_ty)
+                            self.diagnostic_type_name(&key_ty),
+                            self.diagnostic_type_name(&val_ty)
                         ),
                     )
                     .with_label(Label::primary(m.span, "unknown map method"))
                     .with_help(
                         "maps support `.insert(k, v)`, `.get(k)`, `.remove(k)`, `.keys()`, `.values()`, `.entries()`, `.contains(k)`, `.len()`, `.freeze()`, `.toString()`",
                     );
-                Self::label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
+                self.label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
                 self.push(diagnostic);
                 Some(Type::Void)
             }
@@ -621,8 +634,8 @@ impl TypeChecker {
                         ErrorCode::E0201,
                         format!(
                             "map key type mismatch: expected `{}`, found `{}`",
-                            type_name(&key_ty),
-                            type_name(&k)
+                            self.diagnostic_type_name(&key_ty),
+                            self.diagnostic_type_name(&k)
                         ),
                     )
                     .with_label(Label::primary(arg.expr.span(), "wrong key type")),
@@ -652,8 +665,8 @@ impl TypeChecker {
                         ErrorCode::E0201,
                         format!(
                             "no method `{other}` on `FrozenMap<{}, {}>`",
-                            type_name(&key_ty),
-                            type_name(&val_ty)
+                            self.diagnostic_type_name(&key_ty),
+                            self.diagnostic_type_name(&val_ty)
                         ),
                     )
                     .with_label(Label::primary(m.span, "unknown method"))

@@ -41,7 +41,6 @@
 use super::TypeChecker;
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
-use crate::semantic::type_checker::types::type_name;
 
 /// What a body belongs to, for the diagnostic's wording.
 pub(crate) enum ReturnSite<'a> {
@@ -132,9 +131,9 @@ impl TypeChecker {
                 match site {
                     ReturnSite::Lambda { inferred: true } => format!(
                         "`{}` inferred from a `return` in this body",
-                        type_name(return_type)
+                        self.diagnostic_type_name(return_type)
                     ),
-                    _ => format!("`{}` declared here", type_name(return_type)),
+                    _ => format!("`{}` declared here", self.diagnostic_type_name(return_type)),
                 },
             ))
             .with_help(

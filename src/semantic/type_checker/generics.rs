@@ -1285,6 +1285,13 @@ impl TypeChecker {
     }
 
     fn register_instantiation_type(&mut self, alias: &str, info: Rc<InstantiationType>) {
+        // Provider and final checkers did not necessarily create the binding.
+        // Carry its display name too, once per alias, so diagnostics need only
+        // a name lookup rather than reading full declaration metadata.
+        let canonical = self.generic_nominal_identity(info.name(), info.declaration_span());
+        self.generics
+            .nominal_aliases
+            .insert(alias.to_owned(), canonical);
         match info.as_ref() {
             InstantiationType::Class(info) => {
                 self.symbols.define_class(alias.to_string(), info.clone())
@@ -1376,14 +1383,14 @@ impl TypeChecker {
         if !mentions(&ty, |name| name == "Self") {
             return Some(ty);
         }
-        let interface = type_name(&interface);
+        let interface = self.diagnostic_type_name(&interface);
         self.push(
             Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E0201,
                 format!(
                     "`{}` cannot be passed to generic function `{callee}`: its `Self` is not a whole value that converts to `{interface}`",
-                    type_name(&ty)
+                    self.diagnostic_type_name(&ty)
                 ),
             )
             .with_label(Label::primary(span, "the implementing class is unknown here"))
@@ -1895,10 +1902,10 @@ impl TypeChecker {
                         "argument {} (`{}`): expected `{}`, found `{}`; {message}",
                         i + 1,
                         template.params[i].name,
-                        type_name(
+                        self.diagnostic_type_name(
                             &params[i].substitute_names(|name| inference.binding(name).cloned())
                         ),
-                        type_name(&ty)
+                        self.diagnostic_type_name(&ty)
                     )
                 });
             }
@@ -1996,10 +2003,10 @@ impl TypeChecker {
                         "argument {} (`{}`): expected `{}`, found `{}`; {message}",
                         i + 1,
                         template.params[i].name,
-                        type_name(
+                        self.diagnostic_type_name(
                             &params[i].substitute_names(|name| inference.binding(name).cloned())
                         ),
-                        type_name(&lambda_ty)
+                        self.diagnostic_type_name(&lambda_ty)
                     )
                 });
             }
@@ -2012,7 +2019,7 @@ impl TypeChecker {
                     Diagnostic::new(Severity::Error, ErrorCode::E0201, message).with_label(
                         Label::primary(call_args[i].expr.span(), "argument type mismatch"),
                     );
-                self.push(Self::with_fn_closure_help(
+                self.push(self.with_fn_closure_help(
                     diagnostic,
                     &params[i],
                     &actual[i],
@@ -2228,6 +2235,9 @@ impl TypeChecker {
     /// Only class-name slots use this helper; member names and fix text must
     /// retain their original spelling even when they match a generic class.
     pub(super) fn diagnostic_class_name(&self, name: &str) -> String {
+        if let Some(canonical) = self.generics.nominal_aliases.get(name) {
+            return canonical.clone();
+        }
         let source = name.split_once("$mono$").map_or(name, |(base, _)| base);
         if let Some(template) = self.generics.classes.get(source) {
             return format!("{source}<{}>", template.type_params.join(", "));

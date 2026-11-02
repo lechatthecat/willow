@@ -759,9 +759,15 @@ impl TypeChecker {
                 let ty = ty.map_names(|name| {
                     #[cfg(test)]
                     ENUM_IDENTITY_LOOKUPS.with(|count| count.set(count.get() + 1));
-                    self.symbols
-                        .lookup_enum(name)
-                        .map_or_else(|| name.clone(), |info| info.name.clone())
+                    // A carried nominal alias remains resolvable in the provider;
+                    // its caller-local enum name need not be in that scope.
+                    if name.starts_with("$type$mono$") {
+                        name.clone()
+                    } else {
+                        self.symbols
+                            .lookup_enum(name)
+                            .map_or_else(|| name.clone(), |info| info.name.clone())
+                    }
                 });
                 super::bundled_storage_spelling(&storage_templates, &ty)
             };
@@ -1310,7 +1316,7 @@ impl TypeChecker {
                 ErrorCode::E0201,
                 format!(
                     "method `{method}` names `Self` in {position}, so it cannot be called through interface type `{}`",
-                    type_name(obj_ty)
+                    self.diagnostic_type_name(obj_ty)
                 ),
             )
             .with_label(Label::primary(span, "the implementing class is unknown here"))
@@ -1423,7 +1429,7 @@ impl TypeChecker {
                     ErrorCode::E0201,
                     format!(
                         "cannot access field `{field_name}` on `{}` without handling absence",
-                        type_name(obj_ty)
+                        self.diagnostic_type_name(obj_ty)
                     ),
                 )
                 .with_label(Label::primary(span, "this Option may be `None`"))
@@ -1438,7 +1444,7 @@ impl TypeChecker {
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
-                        format!("type `{}` has no fields", type_name(obj_ty)),
+                        format!("type `{}` has no fields", self.diagnostic_type_name(obj_ty)),
                     )
                     .with_label(Label::primary(span, "field access on non-class type")),
                 );
@@ -1450,7 +1456,7 @@ impl TypeChecker {
         if class_name == "Self"
             && let Some(interface) = &self.local.self_interface
         {
-            let interface = type_name(interface);
+            let interface = self.diagnostic_type_name(interface);
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -1469,7 +1475,10 @@ impl TypeChecker {
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0350,
-                    format!("class `{}` not found", class_name),
+                    format!(
+                        "class `{}` not found",
+                        self.diagnostic_class_name(&class_name)
+                    ),
                 )
                 .with_label(Label::primary(span, "unknown class")),
             );
@@ -1533,7 +1542,7 @@ impl TypeChecker {
                             .with_help(format!(
                                 "private members are accessible only within their declaring class, even in the same module; expose it using `pub {}: {}` or provide a public getter method",
                                 field_name,
-                                type_name(&fi.ty)
+                                self.diagnostic_type_name(&fi.ty)
                             )),
                         );
                     }
@@ -1575,6 +1584,7 @@ impl TypeChecker {
 
     /// Label the already-checked receiver without rechecking or walking its expression tree.
     pub(super) fn label_receiver_call_origin(
+        &self,
         diagnostic: &mut Diagnostic,
         receiver: &Expr,
         ty: &Type,
@@ -1585,7 +1595,10 @@ impl TypeChecker {
         ) {
             diagnostic.labels.push(Label::secondary(
                 receiver.span(),
-                format!("this call returns `{}`, the receiver type", type_name(ty)),
+                format!(
+                    "this call returns `{}`, the receiver type",
+                    self.diagnostic_type_name(ty)
+                ),
             ));
         }
     }
@@ -1658,7 +1671,7 @@ impl TypeChecker {
                     ErrorCode::E0201,
                     format!(
                         "cannot call method `{method_name}` on `{}` without handling absence",
-                        type_name(obj_ty)
+                        self.diagnostic_type_name(obj_ty)
                     ),
                 )
                 .with_label(Label::primary(span, "this Option may be `None`"))
@@ -1703,7 +1716,10 @@ impl TypeChecker {
                 let mut diagnostic = Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0201,
-                    format!("no method `{method_name}` on type `{}`", type_name(obj_ty)),
+                    format!(
+                        "no method `{method_name}` on type `{}`",
+                        self.diagnostic_type_name(obj_ty)
+                    ),
                 )
                 .with_label(Label::primary(span, "unknown method"));
                 let methods = match obj_ty {
@@ -1719,7 +1735,7 @@ impl TypeChecker {
                 if !methods.is_empty() {
                     diagnostic = diagnostic.with_help(format!("available methods: {methods}"));
                 }
-                Self::label_receiver_call_origin(&mut diagnostic, receiver, obj_ty);
+                self.label_receiver_call_origin(&mut diagnostic, receiver, obj_ty);
                 if *obj_ty == Type::I64
                     && matches!(
                         method_name,
@@ -1761,7 +1777,10 @@ impl TypeChecker {
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0350,
-                    format!("class `{}` not found", class_name),
+                    format!(
+                        "class `{}` not found",
+                        self.diagnostic_class_name(&class_name)
+                    ),
                 )
                 .with_label(Label::primary(span, "unknown class")),
             );
@@ -2000,13 +2019,13 @@ impl TypeChecker {
                             "argument {} of `{}` expects `{}`, found `{}`",
                             idx + 1,
                             method_name,
-                            type_name(param_ty),
-                            type_name(&arg_ty)
+                            self.diagnostic_type_name(param_ty),
+                            self.diagnostic_type_name(&arg_ty)
                         ),
                     )
                     .with_label(Label::primary(
                         arg.expr.span(),
-                        format!("expected `{}`", type_name(param_ty)),
+                        format!("expected `{}`", self.diagnostic_type_name(param_ty)),
                     )),
                 );
             }
@@ -2209,13 +2228,13 @@ impl TypeChecker {
                                     ErrorCode::E0201,
                                     format!(
                                         "mismatched types: expected `{}`, found `{}`",
-                                        type_name(param_ty),
-                                        type_name(&arg_ty)
+                                        self.diagnostic_type_name(param_ty),
+                                        self.diagnostic_type_name(&arg_ty)
                                     ),
                                 )
                                 .with_label(Label::primary(
                                     arg.expr.span(),
-                                    format!("expected `{}`", type_name(param_ty)),
+                                    format!("expected `{}`", self.diagnostic_type_name(param_ty)),
                                 )),
                             );
                         }
@@ -2376,9 +2395,9 @@ impl TypeChecker {
                                 ErrorCode::E0201,
                                 format!(
                                     "`{class_name}<{}>::new` expects `{}`, got `{}`",
-                                    type_name(t),
-                                    type_name(t),
-                                    type_name(&arg_ty)
+                                    self.diagnostic_type_name(t),
+                                    self.diagnostic_type_name(t),
+                                    self.diagnostic_type_name(&arg_ty)
                                 ),
                             )
                             .with_label(Label::primary(args[0].expr.span(), "wrong argument type")),
@@ -2431,8 +2450,8 @@ impl TypeChecker {
                             ErrorCode::E0201,
                             format!(
                                 "`{class_name}::new` expects `{}`, got `{}`",
-                                type_name(&expected),
-                                type_name(&arg_ty)
+                                self.diagnostic_type_name(&expected),
+                                self.diagnostic_type_name(&arg_ty)
                             ),
                         )
                         .with_label(Label::primary(args[0].expr.span(), "wrong argument type")),
@@ -2484,7 +2503,7 @@ impl TypeChecker {
                             ErrorCode::E0201,
                             format!(
                                 "channel capacity must be `i64`, found `{}`",
-                                type_name(&cap_ty)
+                                self.diagnostic_type_name(&cap_ty)
                             ),
                         )
                         .with_label(Label::primary(args[0].expr.span(), "expected `i64`")),

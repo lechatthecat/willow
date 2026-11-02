@@ -155,16 +155,16 @@ impl TypeChecker {
                     ErrorCode::E0202,
                     format!(
                         "cannot raise `{}` to the power of `{}`",
-                        type_name(&lty),
-                        type_name(&rty)
+                        self.diagnostic_type_name(&lty),
+                        self.diagnostic_type_name(&rty)
                     ),
                 )
                 .with_label(Label::primary(
                     b.span,
                     format!(
                         "`**` is defined for `i64 ** i64` and `f64 ** f64`, not `{} ** {}`",
-                        type_name(&lty),
-                        type_name(&rty)
+                        self.diagnostic_type_name(&lty),
+                        self.diagnostic_type_name(&rty)
                     ),
                 ));
                 if (lty == Type::I64 && rty == Type::F64) || (lty == Type::F64 && rty == Type::I64)
@@ -200,13 +200,16 @@ impl TypeChecker {
                     let diagnostic = Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0202,
-                        format!("cannot concatenate `String` with `{}`", type_name(non_str)),
+                        format!(
+                            "cannot concatenate `String` with `{}`",
+                            self.diagnostic_type_name(non_str)
+                        ),
                     )
                     .with_label(Label::primary(
                         b.span,
                         format!(
                             "the {side} operand is `{}`, not `String`",
-                            type_name(non_str)
+                            self.diagnostic_type_name(non_str)
                         ),
                     ));
                     self.push(if *non_str == Type::Void {
@@ -226,8 +229,8 @@ impl TypeChecker {
                         format!(
                             "cannot apply operator `{}` to `{}` and `{}`",
                             b.op.symbol(),
-                            type_name(&lty),
-                            type_name(&rty)
+                            self.diagnostic_type_name(&lty),
+                            self.diagnostic_type_name(&rty)
                         ),
                     )
                     .with_label(Label::primary(
@@ -235,8 +238,8 @@ impl TypeChecker {
                         format!(
                             "`{}` not defined for `{}` and `{}`",
                             b.op.symbol(),
-                            type_name(&lty),
-                            type_name(&rty)
+                            self.diagnostic_type_name(&lty),
+                            self.diagnostic_type_name(&rty)
                         ),
                     ));
                     if matches!(
@@ -261,8 +264,8 @@ impl TypeChecker {
                         format!(
                             "cannot apply operator `{}` to `{}` and `{}`",
                             b.op.symbol(),
-                            type_name(&lty),
-                            type_name(&rty)
+                            self.diagnostic_type_name(&lty),
+                            self.diagnostic_type_name(&rty)
                         ),
                     )
                     .with_label(Label::primary(
@@ -293,16 +296,16 @@ impl TypeChecker {
                             ErrorCode::E0202,
                             format!(
                                 "cannot compare `{}` and `{}`",
-                                type_name(&lty),
-                                type_name(&rty)
+                                self.diagnostic_type_name(&lty),
+                                self.diagnostic_type_name(&rty)
                             ),
                         )
                         .with_label(Label::primary(
                             b.span,
                             format!(
                                 "comparison not defined for `{}` and `{}`",
-                                type_name(&lty),
-                                type_name(&rty)
+                                self.diagnostic_type_name(&lty),
+                                self.diagnostic_type_name(&rty)
                             ),
                         )),
                     );
@@ -345,16 +348,16 @@ impl TypeChecker {
                             ErrorCode::E0201,
                             format!(
                                 "mismatched types: `{}` and `{}`",
-                                type_name(&lty),
-                                type_name(&rty)
+                                self.diagnostic_type_name(&lty),
+                                self.diagnostic_type_name(&rty)
                             ),
                         )
                         .with_label(Label::primary(
                             b.span,
                             format!(
                                 "cannot compare `{}` and `{}`",
-                                type_name(&lty),
-                                type_name(&rty)
+                                self.diagnostic_type_name(&lty),
+                                self.diagnostic_type_name(&rty)
                             ),
                         )),
                     );
@@ -367,11 +370,17 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0201,
-                            format!("`{}` does not support `{operator}`", type_name(ty)),
+                            format!(
+                                "`{}` does not support `{operator}`",
+                                self.diagnostic_type_name(ty)
+                            ),
                         )
                         .with_label(Label::primary(
                             b.span,
-                            format!("`{}` values have no defined equality", type_name(ty)),
+                            format!(
+                                "`{}` values have no defined equality",
+                                self.diagnostic_type_name(ty)
+                            ),
                         ))
                         .with_help(
                             "`==` and `!=` compare scalars, strings, payload-free enums, \
@@ -389,8 +398,8 @@ impl TypeChecker {
                             ErrorCode::E0202,
                             format!(
                                 "logical operator requires `bool` operands, found `{}` and `{}`",
-                                type_name(&lty),
-                                type_name(&rty)
+                                self.diagnostic_type_name(&lty),
+                                self.diagnostic_type_name(&rty)
                             ),
                         )
                         .with_label(Label::primary(b.span, "operands must be `bool`")),
@@ -437,11 +446,17 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0202,
-                            format!("unary `-` cannot be applied to `{}`", type_name(&ty)),
+                            format!(
+                                "unary `-` cannot be applied to `{}`",
+                                self.diagnostic_type_name(&ty)
+                            ),
                         )
                         .with_label(Label::primary(
                             u.span,
-                            format!("requires `i64` or `f64`, found `{}`", type_name(&ty)),
+                            format!(
+                                "requires `i64` or `f64`, found `{}`",
+                                self.diagnostic_type_name(&ty)
+                            ),
                         )),
                     );
                 }
@@ -455,11 +470,17 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0202,
-                            format!("unary `!` cannot be applied to `{}`", type_name(&ty)),
+                            format!(
+                                "unary `!` cannot be applied to `{}`",
+                                self.diagnostic_type_name(&ty)
+                            ),
                         )
                         .with_label(Label::primary(
                             u.span,
-                            format!("requires `bool` or `i64`, found `{}`", type_name(&ty)),
+                            format!(
+                                "requires `bool` or `i64`, found `{}`",
+                                self.diagnostic_type_name(&ty)
+                            ),
                         )),
                     );
                 }
@@ -547,13 +568,13 @@ impl TypeChecker {
                     self.type_mismatch_error_code(&info.ty, &val_ty),
                     format!(
                         "mismatched types: expected `{}`, found `{}`",
-                        type_name(&info.ty),
-                        type_name(&val_ty)
+                        self.diagnostic_type_name(&info.ty),
+                        self.diagnostic_type_name(&val_ty)
                     ),
                 )
                 .with_label(Label::primary(
                     s.span,
-                    format!("expected `{}`", type_name(&info.ty)),
+                    format!("expected `{}`", self.diagnostic_type_name(&info.ty)),
                 )),
             );
         }

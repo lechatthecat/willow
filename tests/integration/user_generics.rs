@@ -1568,3 +1568,401 @@ fn generic_parameter_method_diagnostics_distinct_errors_preserved() {
     );
     assert!(stderr.contains("aborting due to 3 error(s)"), "{stderr}");
 }
+
+const ENUM_STACK: &str = r#"module stk;
+import std::collections::Array;
+pub class Stack<T> {
+    items: Array<T>;
+    pub init(self) { self.items = []; }
+    pub fn push(self, value: T) { self.items.push(value); }
+    pub fn pop(self) -> Option<T> { if self.items.len() == 0 { return None; } return Some(self.items.pop()); }
+    pub fn len(self) -> i64 { return self.items.len(); }
+}
+"#;
+
+#[test]
+fn imported_enum_stack_round_trip() {
+    let (output, ok) = compile_temp_project_and_run(
+        &[
+            ("stk.wi", ENUM_STACK),
+            (
+                "main.wi",
+                r#"import stk::Stack;
+enum Op { A(i64), B }
+fn main() {
+    let s = new Stack<Op>(); s.push(Op::A(1)); println(s.len());
+    match s.pop().unwrap() { Op::A(n) => println(n), Op::B => println(0), }
+}"#,
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "{output}");
+    assert_eq!(output, "1\n1\n");
+}
+
+#[test]
+fn imported_enum_stack_twenty_payload_scope_and_gc_cases() {
+    for (declaration, ty, value, read, expected) in [
+        (
+            "pub enum Op { A, B }",
+            "Op",
+            "Op::B",
+            "println(value == Op::B);",
+            "true\n",
+        ),
+        (
+            "pub enum Op { A(i64), B }",
+            "Op",
+            "Op::A(37)",
+            "match value { Op::A(n) => println(n), Op::B => println(0), }",
+            "37\n",
+        ),
+        (
+            "pub enum Op { A(String), B }",
+            "Op",
+            "Op::A(\"kept\")",
+            "match value { Op::A(s) => println(s), Op::B => println(\"bad\"), }",
+            "kept\n",
+        ),
+        (
+            "pub enum Op { A(Option<String>), B }",
+            "Op",
+            "Op::A(Some(\"nested\"))",
+            "match value { Op::A(s) => println(s.unwrap()), Op::B => println(\"bad\"), }",
+            "nested\n",
+        ),
+        (
+            "pub enum Op<T> { A(T), B }",
+            "Op<String>",
+            "Op<String>::A(\"generic\")",
+            "match value { Op::A(s) => println(s), Op::B => println(\"bad\"), }",
+            "generic\n",
+        ),
+    ] {
+        for intermediate in [false, true] {
+            for collect in [false, true] {
+                let gc = if collect {
+                    "gc_collect(); gc_minor_collect();"
+                } else {
+                    ""
+                };
+                let body = format!(
+                    "let s = new Stack<{ty}>(); println(s.pop().is_none()); s.push({value}); println(s.len()); {gc} let value = s.pop().unwrap(); {read} println(s.len());"
+                );
+                let consumer =
+                    format!("import stk::Stack; {declaration} pub fn exercise() {{ {body} }}");
+                let direct = format!("{consumer} fn main() {{ exercise(); }}");
+                let (output, ok) = if intermediate {
+                    compile_temp_project_and_run(
+                        &[
+                            ("stk.wi", ENUM_STACK),
+                            ("mid.wi", &format!("module mid; {consumer}")),
+                            ("main.wi", "import mid::exercise; fn main() { exercise(); }"),
+                        ],
+                        "main.wi",
+                    )
+                } else {
+                    compile_temp_project_and_run(
+                        &[("stk.wi", ENUM_STACK), ("main.wi", &direct)],
+                        "main.wi",
+                    )
+                };
+                assert!(
+                    ok,
+                    "{ty}, intermediate={intermediate}, collect={collect}: {output}"
+                );
+                assert_eq!(output, format!("true\n1\n{expected}0\n"));
+            }
+        }
+    }
+}
+
+#[test]
+fn imported_enum_stack_diagnostics_use_source_types() {
+    for (provider, body) in [
+        (
+            ENUM_STACK.to_owned(),
+            "let s = new Stack<Op>(); s.push(Other::A(1));",
+        ),
+        (
+            ENUM_STACK.to_owned(),
+            "let s = new Stack<Op>(); let value: Other = s.pop().unwrap();",
+        ),
+        (
+            ENUM_STACK.replace("self.items.push(value)", "self.items.push(1)"),
+            "let s = new Stack<Op>(); s.push(Op::A(1));",
+        ),
+        (
+            ENUM_STACK.replace("Some(self.items.pop())", "Some(1)"),
+            "let s = new Stack<Op>(); s.pop();",
+        ),
+        (
+            ENUM_STACK.replace("Some(self.items.pop())", "self.items.pop()"),
+            "let s = new Stack<Op>(); s.pop();",
+        ),
+    ] {
+        let source = format!(
+            "import stk::Stack; enum Op {{ A(i64), B }} enum Other {{ A(i64), B }} fn main() {{ {body} }}"
+        );
+        let error = compile_temp_project_error_stderr(
+            &[("stk.wi", &provider), ("main.wi", &source)],
+            "main.wi",
+        );
+        assert!(error.contains("error[E0201]"), "{error}");
+        assert!(!error.contains("$type"), "{error}");
+    }
+}
+
+#[test]
+fn imported_enum_stack_example_runs() {
+    let (output, ok) = compile_file_and_run("example/imported_enum_stack.wi");
+    assert!(ok, "{output}");
+    assert_eq!(output, "2\nsaved\n42\ntrue\n");
+}
+
+#[test]
+fn imported_enum_stack_repeated_calls_share_specialization() {
+    for count in [1, 16, 64] {
+        let calls = "s.push(Op::A(1));".repeat(count);
+        let source = format!(
+            "import stk::Stack; enum Op {{ A(i64), B }} fn main() {{ let s = new Stack<Op>(); {calls} println(s.len()); }}"
+        );
+        let project = TestProject::new(
+            "enum_stack_reuse",
+            &[("stk.wi", ENUM_STACK), ("main.wi", &source)],
+        );
+        let compiled = project.compile_with_env("main.wi", &[("WILLOW_KEEP_OBJECT", "1")]);
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let symbols = project.defined_object_symbols();
+        let pushes: Vec<_> = symbols
+            .iter()
+            .filter(|symbol| symbol.contains("Stack$mono$") && symbol.ends_with(".push"))
+            .collect();
+        assert_eq!(pushes.len(), 1, "{symbols:#?}");
+        let result = project.run();
+        assert!(result.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            format!("{count}\n")
+        );
+        println!("push_calls={count} stack_push_definitions={}", pushes.len());
+    }
+}
+
+#[test]
+fn imported_enum_stack_provider_namesake_keeps_caller_identity() {
+    let provider = format!("{ENUM_STACK} enum Op {{ A(String), B }}");
+    let (output, ok) = compile_temp_project_and_run(
+        &[
+            ("stk.wi", &provider),
+            (
+                "main.wi",
+                "import stk::Stack as Store; enum Op { A(i64), B } fn main() { let s = new Store<Op>(); s.push(Op::A(91)); match s.pop().unwrap() { Op::A(n) => println(n), Op::B => println(0), } }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "{output}");
+    assert_eq!(output, "91\n");
+}
+
+#[test]
+fn imported_enum_stack_direct_and_intermediate_print_one() {
+    for intermediate in [false, true] {
+        let consumer = "import stk::Stack; pub enum Op { A(i64), B } pub fn make() -> i64 { let s = new Stack<Op>(); s.push(Op::A(1)); return s.len(); }";
+        let direct = format!("{consumer} fn main() {{ println(make()); }}");
+        let mid = format!("module mid; {consumer}");
+        let entry = if intermediate {
+            "import mid::make; fn main() { println(make()); }"
+        } else {
+            &direct
+        };
+        let (output, ok) = compile_temp_project_and_run(
+            &[("stk.wi", ENUM_STACK), ("mid.wi", &mid), ("main.wi", entry)],
+            "main.wi",
+        );
+        assert!(ok, "{output}");
+        assert_eq!(output, "1\n");
+    }
+}
+
+#[test]
+fn imported_enum_stack_distinct_module_enums_are_rejected() {
+    let error = compile_temp_project_error_stderr(
+        &[
+            ("stk.wi", ENUM_STACK),
+            ("left.wi", "module left; pub enum Op { A(i64), B }"),
+            ("right.wi", "module right; pub enum Op { A(i64), B }"),
+            (
+                "main.wi",
+                "import stk::Stack; import left::Op; import right::Op as Other; fn main() { let s = new Stack<Op>(); s.push(Other::A(1)); }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(error.contains("error[E0201]"), "{error}");
+    assert!(
+        error.contains("left::Op") && error.contains("right::Op"),
+        "{error}"
+    );
+    assert!(!error.contains("$type"), "{error}");
+}
+
+#[test]
+fn imported_enum_stack_reference_diagnostic_uses_source_types() {
+    let provider = ENUM_STACK.replace("self.items.push(value)", "self.items.push(&value)");
+    let error = compile_temp_project_error_stderr(
+        &[
+            ("stk.wi", &provider),
+            (
+                "main.wi",
+                "import stk::Stack; enum Op { A(i64), B } fn main() { let s = new Stack<Op>(); s.push(Op::A(1)); }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(error.contains("error[E1703]"), "{error}");
+    assert!(!error.contains("$type"), "{error}");
+    assert!(
+        error.contains("parameter expects `Op`, not `& Op`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn imported_enum_stack_condition_diagnostics_use_source_types() {
+    for (body, code) in [
+        ("if value { self.items.push(value); }", "E0203"),
+        ("while value { self.items.push(value); }", "E0203"),
+        ("let n = value ? 1 : 2; self.items.push(value);", "E0901"),
+        (
+            "let n: i64 = value ? 1 : 2; self.items.push(value);",
+            "E0901",
+        ),
+    ] {
+        let provider = ENUM_STACK.replace("self.items.push(value);", body);
+        for intermediate in [false, true] {
+            let consumer = "import stk::Stack; pub enum Op { A(i64), B } pub fn exercise() { let s = new Stack<Op>(); s.push(Op::A(1)); }";
+            let direct = format!("{consumer} fn main() {{ exercise(); }}");
+            let mid = format!("module mid; {consumer}");
+            let entry = if intermediate {
+                "import mid::exercise; fn main() { exercise(); }"
+            } else {
+                &direct
+            };
+            let error = compile_temp_project_error_stderr(
+                &[("stk.wi", &provider), ("mid.wi", &mid), ("main.wi", entry)],
+                "main.wi",
+            );
+            assert!(error.contains(&format!("error[{code}]")), "{body}: {error}");
+            assert!(!error.contains("$type"), "{body}: {error}");
+            let name = if intermediate { "mid::Op" } else { "Op" };
+            assert!(
+                error.contains(&format!("condition must be `bool`, found `{name}`")),
+                "{body}: {error}"
+            );
+            assert!(
+                error.contains(&format!("expected `bool`, found `{name}`")),
+                "{body}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn imported_enum_stack_expression_diagnostics_use_source_types() {
+    for (body, code, label) in [
+        ("let n = -value;", "E0202", "requires `i64` or `f64`, found"),
+        (
+            "let n = !value;",
+            "E0202",
+            "requires `bool` or `i64`, found",
+        ),
+        ("let mut x = value; x = 1;", "E0201", "expected"),
+        ("let x = true ? value : 1;", "E0902", "this branch has type"),
+        (
+            "let x: i64 = true ? value : 1;",
+            "E0902",
+            "this branch has type",
+        ),
+    ] {
+        let provider = ENUM_STACK.replace("self.items.push(value);", body);
+        for intermediate in [false, true] {
+            let consumer = "import stk::Stack; pub enum Op { A(i64), B } pub fn exercise() { let s = new Stack<Op>(); s.push(Op::A(1)); }";
+            let direct = format!("{consumer} fn main() {{ exercise(); }}");
+            let mid = format!("module mid; {consumer}");
+            let entry = if intermediate {
+                "import mid::exercise; fn main() { exercise(); }"
+            } else {
+                &direct
+            };
+            let error = compile_temp_project_error_stderr(
+                &[("stk.wi", &provider), ("mid.wi", &mid), ("main.wi", entry)],
+                "main.wi",
+            );
+            assert!(error.contains(&format!("error[{code}]")), "{body}: {error}");
+            assert!(!error.contains("$type"), "{body}: {error}");
+            let name = if intermediate { "mid::Op" } else { "Op" };
+            assert!(
+                error.contains(&format!("{label} `{name}`")),
+                "{body}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn imported_enum_stack_neighboring_diagnostics_use_source_types() {
+    for body in [
+        "let n = value + 1;",
+        "let n = value * 1;",
+        "let n = value && true;",
+        "let n = value < 1;",
+        "let n = value == 1;",
+        "let n = \"text\" + value;",
+        "self.items = value;",
+        "let n = self.items[value];",
+        "self.items[value] = value;",
+        "self.items[0] = 1;",
+        "let n = value[0];",
+        "let n = [value, 1];",
+        "for x in value {}",
+        "let n = value..1;",
+        "println(value);",
+        "value.missing();",
+        "let n = value.missing;",
+        "let option: Option<T> = Some(value); let n = option.unwrap_or(1);",
+        "let n = match true { true if value => 1, _ => 2 };",
+        "let n = match true { true => value, false => 1 };",
+    ] {
+        let provider = ENUM_STACK.replace("self.items.push(value);", body);
+        for intermediate in [false, true] {
+            let consumer = "import stk::Stack; pub enum Op { A(i64), B } pub fn exercise() { let s = new Stack<Op>(); s.push(Op::A(1)); }";
+            let direct = format!("{consumer} fn main() {{ exercise(); }}");
+            let mid = format!("module mid; {consumer}");
+            let entry = if intermediate {
+                "import mid::exercise; fn main() { exercise(); }"
+            } else {
+                &direct
+            };
+            let error = compile_temp_project_error_stderr(
+                &[("stk.wi", &provider), ("mid.wi", &mid), ("main.wi", entry)],
+                "main.wi",
+            );
+            assert!(error.contains("error["), "{body}: {error}");
+            assert!(!error.contains("$type"), "{body}: {error}");
+            let name = if intermediate { "mid::Op" } else { "Op" };
+            // Unknown members can be rejected while checking the template,
+            // before any concrete method is requested.
+            assert!(
+                error.contains(name) || error.contains("`T`"),
+                "{body}: {error}"
+            );
+        }
+    }
+}

@@ -1224,6 +1224,24 @@ mod tests {
     }
 
     #[test]
+    fn revision_imported_enum_stack_matches_cold_after_payload_edits() {
+        let f = Fixture::new();
+        f.write(
+            "stk.wi",
+            &include_str!("../../example/imported_enum_stack_support/stack.wi")
+                .replace("module imported_enum_stack_support::stack;", "module stk;"),
+        );
+        f.write("main.wi", "import mid::exercise; fn main() { exercise(); }");
+        let mut warm = AnalysisRevision::default();
+        for value in ["1", "2", "3"] {
+            f.write("mid.wi", &format!(
+                "module mid; import stk::Stack; pub enum Op {{ A(i64), B }} pub fn exercise() {{ let s = new Stack<Op>(); s.push(Op::A({value})); println(s.len()); match s.pop().unwrap() {{ Op::A(n) => println(n), Op::B => println(0), }} }}"
+            ));
+            assert!(f.compare(&mut warm));
+        }
+    }
+
+    #[test]
     fn revision_gc_layout_edits_match_cold_and_emission_stays_frozen() {
         use super::super::{layout::TargetLayoutKey, tracked::QueryNode};
         use crate::semantic::ids::TypeId;

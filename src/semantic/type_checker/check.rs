@@ -1564,7 +1564,7 @@ impl TypeChecker {
             format!(
                 "`{}` requires `{required}<T>`, found `{}`",
                 s.mode.keyword(),
-                type_name(target_ty)
+                self.diagnostic_type_name(target_ty)
             ),
         )
         .with_label(Label::primary(
@@ -1620,24 +1620,24 @@ impl TypeChecker {
                         let message = if code == ErrorCode::E0704 {
                             format!(
                                 "cannot assign `{}` to variable `{}` of type `{}`",
-                                type_name(&inferred),
+                                self.diagnostic_type_name(&inferred),
                                 s.name,
-                                type_name(ann)
+                                self.diagnostic_type_name(ann)
                             )
                         } else {
                             format!(
                                 "mismatched types: expected `{}`, found `{}`",
-                                type_name(ann),
-                                type_name(&inferred)
+                                self.diagnostic_type_name(ann),
+                                self.diagnostic_type_name(&inferred)
                             )
                         };
                         let label = if code == ErrorCode::E0704 {
                             format!(
                                 "expected `{}` because of this type annotation",
-                                type_name(ann)
+                                self.diagnostic_type_name(ann)
                             )
                         } else {
-                            format!("expected `{}`", type_name(ann))
+                            format!("expected `{}`", self.diagnostic_type_name(ann))
                         };
                         self.push(
                             Diagnostic::new(Severity::Error, code, message)
@@ -1748,13 +1748,13 @@ impl TypeChecker {
                             self.type_mismatch_error_code(&field_ty, &val_ty),
                             format!(
                                 "mismatched types: expected `{}`, found `{}`",
-                                type_name(&field_ty),
-                                type_name(&val_ty)
+                                self.diagnostic_type_name(&field_ty),
+                                self.diagnostic_type_name(&val_ty)
                             ),
                         )
                         .with_label(Label::primary(
                             s.span,
-                            format!("expected `{}`", type_name(&field_ty)),
+                            format!("expected `{}`", self.diagnostic_type_name(&field_ty)),
                         )),
                     );
                 }
@@ -1784,7 +1784,10 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0201,
-                            format!("array index must be `i64`, found `{}`", type_name(&idx_ty)),
+                            format!(
+                                "array index must be `i64`, found `{}`",
+                                self.diagnostic_type_name(&idx_ty)
+                            ),
                         )
                         .with_label(Label::primary(s.index.span(), "index is not an `i64`")),
                     );
@@ -1799,13 +1802,13 @@ impl TypeChecker {
                                     self.type_mismatch_error_code(elem, &val_ty),
                                     format!(
                                         "cannot assign `{}` to an element of `Array<{}>`",
-                                        type_name(&val_ty),
-                                        type_name(elem)
+                                        self.diagnostic_type_name(&val_ty),
+                                        self.diagnostic_type_name(elem)
                                     ),
                                 )
                                 .with_label(Label::primary(
                                     s.span,
-                                    format!("expected `{}`", type_name(elem)),
+                                    format!("expected `{}`", self.diagnostic_type_name(elem)),
                                 )),
                             );
                         }
@@ -1822,7 +1825,10 @@ impl TypeChecker {
                             Diagnostic::new(
                                 Severity::Error,
                                 ErrorCode::E0201,
-                                format!("cannot index a value of type `{}`", type_name(other)),
+                                format!(
+                                    "cannot index a value of type `{}`",
+                                    self.diagnostic_type_name(other)
+                                ),
                             )
                             .with_label(Label::primary(s.span, "not an array")),
                         );
@@ -1948,13 +1954,13 @@ impl TypeChecker {
                                     self.type_mismatch_error_code(&info.ty, &got),
                                     format!(
                                         "mismatched types: expected `{}`, found `{}`",
-                                        type_name(&info.ty),
-                                        type_name(&got)
+                                        self.diagnostic_type_name(&info.ty),
+                                        self.diagnostic_type_name(&got)
                                     ),
                                 )
                                 .with_label(Label::primary(
                                     s.span,
-                                    format!("expected `{}`", type_name(&info.ty)),
+                                    format!("expected `{}`", self.diagnostic_type_name(&info.ty)),
                                 )),
                             );
                         }
@@ -1972,11 +1978,17 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0203,
-                            format!("condition must be `bool`, found `{}`", type_name(&cond_ty)),
+                            format!(
+                                "condition must be `bool`, found `{}`",
+                                self.diagnostic_type_name(&cond_ty)
+                            ),
                         )
                         .with_label(Label::primary(
                             s.cond.span(),
-                            format!("expected `bool`, found `{}`", type_name(&cond_ty)),
+                            format!(
+                                "expected `bool`, found `{}`",
+                                self.diagnostic_type_name(&cond_ty)
+                            ),
                         ))
                         .with_help("use an explicit comparison, e.g. `!= 0`"),
                     );
@@ -1997,11 +2009,17 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0203,
-                            format!("condition must be `bool`, found `{}`", type_name(&cond_ty)),
+                            format!(
+                                "condition must be `bool`, found `{}`",
+                                self.diagnostic_type_name(&cond_ty)
+                            ),
                         )
                         .with_label(Label::primary(
                             s.cond.span(),
-                            format!("expected `bool`, found `{}`", type_name(&cond_ty)),
+                            format!(
+                                "expected `bool`, found `{}`",
+                                self.diagnostic_type_name(&cond_ty)
+                            ),
                         ))
                         .with_help("use an explicit comparison, e.g. `!= 0`"),
                     );
@@ -2051,7 +2069,10 @@ impl TypeChecker {
                             Diagnostic::new(
                                 Severity::Error,
                                 ErrorCode::E0201,
-                                format!("cannot iterate over `{}`", type_name(other)),
+                                format!(
+                                    "cannot iterate over `{}`",
+                                    self.diagnostic_type_name(other)
+                                ),
                             )
                             .with_label(Label::primary(
                                 s.iterable.span(),
@@ -2403,13 +2424,16 @@ impl TypeChecker {
                             self.type_mismatch_error_code(&self.local.current_return_type, &ret_ty),
                             format!(
                                 "mismatched types: expected `{}`, found `{}`",
-                                type_name(&self.local.current_return_type),
-                                type_name(&ret_ty)
+                                self.diagnostic_type_name(&self.local.current_return_type),
+                                self.diagnostic_type_name(&ret_ty)
                             ),
                         )
                         .with_label(Label::primary(
                             s.span,
-                            format!("expected `{}`", type_name(&self.local.current_return_type)),
+                            format!(
+                                "expected `{}`",
+                                self.diagnostic_type_name(&self.local.current_return_type)
+                            ),
                         )),
                     );
                 }
@@ -2938,7 +2962,7 @@ impl TypeChecker {
                 ErrorCode::E0201,
                 format!(
                     "cannot call constant `{name}` of type `{}`",
-                    type_name(&info.return_type)
+                    self.diagnostic_type_name(&info.return_type)
                 ),
             )
             .with_label(Label::primary(span, "constants are values, not functions"))
@@ -3088,7 +3112,7 @@ impl TypeChecker {
                         let typed = params
                             .iter()
                             .enumerate()
-                            .map(|(i, ty)| format!("a{i}: {}", type_name(ty)))
+                            .map(|(i, ty)| format!("a{i}: {}", self.diagnostic_type_name(ty)))
                             .collect::<Vec<_>>()
                             .join(", ");
                         self.push(
@@ -3248,7 +3272,7 @@ impl TypeChecker {
                                     format!(
                                         "cannot call value `{}` of type `{}`",
                                         c.callee,
-                                        type_name(ty)
+                                        self.diagnostic_type_name(ty)
                                     ),
                                 )
                                 .with_label(Label::primary(
@@ -3418,7 +3442,7 @@ impl TypeChecker {
                                     a.expr.span(),
                                     format!(
                                         "this call returns `{}` immediately",
-                                        type_name(&other)
+                                        self.diagnostic_type_name(&other)
                                     ),
                                 ))
                                 .with_help(format!(
@@ -3431,7 +3455,7 @@ impl TypeChecker {
                             Diagnostic::new(
                                 Severity::Error,
                                 ErrorCode::E0803,
-                                format!("cannot await value of type `{}`", type_name(&other)),
+                                format!("cannot await value of type `{}`", self.diagnostic_type_name(&other)),
                             )
                             .with_label(Label::primary(a.expr.span(), "expected an awaitable"))
                             .with_help(
@@ -3465,7 +3489,7 @@ impl TypeChecker {
                             ErrorCode::E1402,
                             format!(
                                 "cannot {fn_name} a value of type `{}`",
-                                type_name(&arg_ty)
+                                self.diagnostic_type_name(&arg_ty)
                             ),
                         )
                         .with_label(Label::primary(
@@ -3492,12 +3516,15 @@ impl TypeChecker {
                             ErrorCode::E0901,
                             format!(
                                 "if-expression condition must be `bool`, found `{}`",
-                                type_name(&cond_ty)
+                                self.diagnostic_type_name(&cond_ty)
                             ),
                         )
                         .with_label(Label::primary(
                             t.condition.span(),
-                            format!("expected `bool`, found `{}`", type_name(&cond_ty)),
+                            format!(
+                                "expected `bool`, found `{}`",
+                                self.diagnostic_type_name(&cond_ty)
+                            ),
                         )),
                     );
                 }
@@ -3515,21 +3542,24 @@ impl TypeChecker {
                             ErrorCode::E0902,
                             format!(
                                 "ternary branches have incompatible types: `{}` and `{}`",
-                                type_name(&then_ty),
-                                type_name(&else_ty)
+                                self.diagnostic_type_name(&then_ty),
+                                self.diagnostic_type_name(&else_ty)
                             ),
                         )
                         .with_label(Label::primary(
                             t.else_expr.span(),
                             format!(
                                 "expected `{}`, found `{}`",
-                                type_name(&then_ty),
-                                type_name(&else_ty)
+                                self.diagnostic_type_name(&then_ty),
+                                self.diagnostic_type_name(&else_ty)
                             ),
                         ))
                         .with_label(Label::secondary(
                             t.then_expr.span(),
-                            format!("this branch has type `{}`", type_name(&then_ty)),
+                            format!(
+                                "this branch has type `{}`",
+                                self.diagnostic_type_name(&then_ty)
+                            ),
                         ))
                         .with_help(help),
                     );
@@ -3655,8 +3685,8 @@ impl TypeChecker {
                     ErrorCode::E0201,
                     format!(
                         "range bounds must be `i64`, found `{}` and `{}`",
-                        type_name(&start_ty),
-                        type_name(&end_ty)
+                        self.diagnostic_type_name(&start_ty),
+                        self.diagnostic_type_name(&end_ty)
                     ),
                 )
                 .with_label(Label::primary(range.span, "range bounds must be `i64`")),
@@ -3728,7 +3758,7 @@ impl TypeChecker {
                     format!("type parameter `{name}` has no method `{}`", m.method),
                 )
                 .with_label(Label::primary(m.span, "unknown method on a type parameter"));
-                Self::label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
+                self.label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
                 self.push(diagnostic);
             }
             for arg in &m.args {
