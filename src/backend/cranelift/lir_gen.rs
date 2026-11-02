@@ -7300,8 +7300,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if *operand_ty == Type::String {
                     let name = if matches!(op, BinOp::Add) {
                         "willow_string_concat"
-                    } else {
+                    } else if matches!(op, BinOp::Eq | BinOp::Ne) {
                         "willow_string_eq"
+                    } else {
+                        "willow_string_cmp"
                     };
                     self.emit_push_call_root(lhs);
                     self.emit_push_call_root(rhs);
@@ -7317,6 +7319,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         BinOp::Ne => {
                             let raw = self.builder.ins().bxor_imm_s(raw, 1);
                             self.builder.ins().ireduce(types::I8, raw)
+                        }
+                        BinOp::Lt => self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, raw, 0),
+                        BinOp::Le => {
+                            self.builder
+                                .ins()
+                                .icmp_imm_s(IntCC::SignedLessThanOrEqual, raw, 0)
+                        }
+                        BinOp::Gt => {
+                            self.builder
+                                .ins()
+                                .icmp_imm_s(IntCC::SignedGreaterThan, raw, 0)
+                        }
+                        BinOp::Ge => {
+                            self.builder
+                                .ins()
+                                .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, raw, 0)
                         }
                         _ => unreachable!("string operator validated"),
                     };
@@ -11070,6 +11088,12 @@ fn main() {
     fn may_allocate_distinguishes_string_comparison_from_concatenation() {
         let eq = returned_hir_expr("fn f(a: String, b: String) -> bool { return a == b; }");
         let ne = returned_hir_expr("fn f(a: String, b: String) -> bool { return a != b; }");
+        for op in ["<", "<=", ">", ">="] {
+            let expr = returned_hir_expr(&format!(
+                "fn f(a: String, b: String) -> bool {{ return a {op} b; }}"
+            ));
+            assert!(!may_allocate(&expr), "{op} must not allocate");
+        }
         let concat = returned_hir_expr("fn f(a: String, b: String) -> String { return a + b; }");
 
         assert!(

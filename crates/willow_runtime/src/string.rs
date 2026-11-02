@@ -194,6 +194,34 @@ pub extern "C" fn willow_string_eq(lhs: *const u8, rhs: *const u8) -> i64 {
     i64::from(l == r)
 }
 
+/// Lexicographic unsigned UTF-8 byte ordering, returning -1, 0, or 1.
+/// Prefixes sort before extensions; no normalization or locale collation.
+/// Inputs are live string payloads. Null is ordered before any real string.
+/// No allocation, safepoint, decoding, or full-string validation is needed.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_cmp(lhs: *const u8, rhs: *const u8) -> i64 {
+    if lhs == rhs {
+        return 0;
+    }
+    if lhs.is_null() {
+        return -1;
+    }
+    if rhs.is_null() {
+        return 1;
+    }
+    let (l, ln) = unsafe { ws_as_bytes(lhs) };
+    let (r, rn) = unsafe { ws_as_bytes(rhs) };
+    // SAFETY: live string payloads contain their declared number of bytes.
+    let ordering =
+        unsafe { std::slice::from_raw_parts(l, ln).cmp(std::slice::from_raw_parts(r, rn)) };
+    match ordering {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
 /// Concatenate two WillowStrings and return a new GC-managed WillowString.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -877,6 +905,32 @@ mod tests {
         let ptr = willow_string_alloc(std::ptr::null(), 0);
         assert!(!ptr.is_null());
         assert_eq!(unsafe { willow_string_as_str(ptr) }, "");
+    }
+
+    #[test]
+    fn string_ordering_runtime_lengths_and_no_allocation() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let null = std::ptr::null();
+        let empty = willow_string_from_str("");
+        assert_eq!(willow_string_cmp(null, null), 0);
+        assert_eq!(willow_string_cmp(null, empty), -1);
+        assert_eq!(willow_string_cmp(empty, null), 1);
+        for n in [0, 16, 256, 4096] {
+            let prefix = "x".repeat(n);
+            let a = willow_string_from_str(&(prefix.clone() + "\0a"));
+            let b = willow_string_from_str(&(prefix + "\0b"));
+            let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
+            for _ in 0..32 {
+                assert_eq!(willow_string_cmp(a, b), -1);
+                assert_eq!(willow_string_cmp(b, a), 1);
+                assert_eq!(willow_string_cmp(a, a), 0);
+            }
+            assert_eq!(
+                crate::gc::telemetry_heap_snapshot().0.allocation_count,
+                before
+            );
+        }
     }
 
     fn concat_n(parts: &mut [u64]) -> String {

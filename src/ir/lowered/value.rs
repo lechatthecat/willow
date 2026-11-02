@@ -471,7 +471,7 @@ impl LirRvalue {
                         Type::I64 => true,
                         Type::F64 => !op.is_integer_only(),
                         Type::Bool => matches!(op, BinOp::Eq | BinOp::Ne),
-                        Type::String => matches!(op, BinOp::Add | BinOp::Eq | BinOp::Ne),
+                        Type::String => *op == BinOp::Add || comparison,
                         Type::Named(_) | Type::Generic(_, _) => matches!(op, BinOp::Eq | BinOp::Ne),
                         _ => false,
                     }

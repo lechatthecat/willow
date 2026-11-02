@@ -286,7 +286,7 @@ impl TypeChecker {
                 Type::I64
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                if (lty != Type::I64 && lty != Type::F64) || lty != rty {
+                if !matches!(lty, Type::I64 | Type::F64 | Type::String) || lty != rty {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,

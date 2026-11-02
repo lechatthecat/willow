@@ -701,6 +701,7 @@ mod alloc_effects_tests {
         assert!(!allocates("willow_debug_reference_call"));
         assert!(!allocates("willow_debug_reference_call_clear"));
         assert!(!allocates("willow_string_eq"));
+        assert!(!allocates("willow_string_cmp"));
     }
 
     #[test]

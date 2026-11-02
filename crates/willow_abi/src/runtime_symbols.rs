@@ -152,6 +152,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_string_contains" => ([Ptr, Ptr] -> Some(I64));
     NONE; "willow_string_find" => ([Ptr, Ptr] -> Some(I64));
     NONE; "willow_string_starts_with" => ([Ptr, Ptr] -> Some(I64));
+    NONE; "willow_string_cmp" => ([Ptr, Ptr] -> Some(I64));
     NONE; "willow_string_eq" => ([Ptr, Ptr] -> Some(I64));
     ALLOC; "willow_string_alloc" => ([Ptr, I64] -> Some(Ptr));
     ALLOC; "willow_string_literal_slot" => ([Ptr, Ptr, I64] -> Some(Ptr));

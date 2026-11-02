@@ -3,6 +3,7 @@
 // is_none()/is_some(); Option does not define structural equality.
 
 fn main() {
+    ordering_example();
     let name = "wil" + "low";
     println(name == "willow");
     println(name != "meadow");
@@ -12,4 +13,17 @@ fn main() {
 
     let missing: Option<String> = None;
     println(missing.is_none());
+}
+
+// String ordering compares unsigned UTF-8 bytes lexicographically. A proper
+// prefix sorts first; case is significant. There is no Unicode normalization
+// or locale collation. For valid UTF-8 this agrees with Unicode scalar order.
+// Embedded NUL bytes participate; lengths are not C-string terminators.
+// Each comparison uses O(min(left bytes, right bytes)) worst-case time and
+// O(1) extra space, without allocating a string.
+fn ordering_example() {
+    println("Alice" < "Bob");
+    println("a" <= "aa");
+    println("水" > "é");
+    println("same" >= "same");
 }
