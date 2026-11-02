@@ -1,0 +1,22 @@
+// Every select arm uses a block, including a single call or assignment.
+import std::collections::Array;
+
+async fn main() {
+    let ch = Channel<i64>::new();
+    ch.send(7);
+    let mut total = 0;
+    let values: Array<i64> = [];
+    select {
+        let value = ch.recv() => {
+            values.push(value);
+            total = value;
+            println(value);
+        }
+    }
+    select {
+        default => { println(total); }
+    }
+    select {
+        default => { return; }
+    }
+}

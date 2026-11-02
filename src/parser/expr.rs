@@ -1200,6 +1200,15 @@ impl Parser {
                 }
             };
             self.expect(TokenKind::FatArrow)?;
+            if !self.check(TokenKind::LBrace) {
+                return Err(self
+                    .err_at(
+                        ErrorCode::E0102,
+                        "select arm body must be a block",
+                        self.current_span(),
+                    )
+                    .with_help("wrap the arm body in braces, for example `=> { println(v); }`"));
+            }
             let scope = self.default_import_usage.scope();
             match &kind {
                 SelectCaseKind::Recv { binding, .. } | SelectCaseKind::Join { binding, .. } => {
