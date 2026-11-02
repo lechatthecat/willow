@@ -33,6 +33,7 @@ use marking::*;
 mod registry;
 mod remembered;
 pub use registry::*;
+pub(crate) use remembered::ARRAY_CARD_SLOTS;
 mod root_arena;
 pub(crate) use root_arena::*;
 mod tlab;

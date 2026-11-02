@@ -750,6 +750,7 @@ mod alloc_effects_tests {
         for name in [
             "willow_map_len",
             "willow_gc_write_barrier",
+            "willow_gc_array_write_barrier",
             "willow_push_root",
             "willow_pop_roots",
             "willow_root_depth",

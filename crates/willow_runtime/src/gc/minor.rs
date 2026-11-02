@@ -29,6 +29,10 @@ mod tests;
 mod deferral_tests;
 
 #[cfg(test)]
+#[path = "remembered_card_tests.rs"]
+mod card_tests;
+
+#[cfg(test)]
 #[path = "minor_m4_probe.rs"]
 mod m4_probe;
 
@@ -59,6 +63,8 @@ struct MinorCollector<'a> {
     last_chunk: std::cell::Cell<Option<usize>>,
     forwarded_objects: usize,
     forwarded_per_chunk: Vec<usize>,
+    /// Source chunks holding a young object promoted in place this cycle.
+    pinned_per_chunk: Vec<bool>,
     published: Vec<usize>,
     // Old edges from inline generated layouts scanned by this minor. Publish
     // after all relocated targets have their epoch marks, so new-to-new edges
@@ -129,6 +135,7 @@ impl<'a> MinorCollector<'a> {
             last_chunk: std::cell::Cell::new(None),
             forwarded_objects: 0,
             forwarded_per_chunk: vec![0; source_chunks],
+            pinned_per_chunk: vec![false; source_chunks],
             published: Vec::new(),
             major_old_edges: AddressSet::default(),
             already_queued: AddressSet::default(),
@@ -248,6 +255,9 @@ impl<'a> MinorCollector<'a> {
                 ));
             }
             object.set_generation(GC_GENERATION_OLD);
+            // young_source cached the stable index of this source chunk.
+            let chunk = self.last_chunk.get().expect("validated young source chunk");
+            self.pinned_per_chunk[chunk] = true;
             if self.state.concurrent_cycle.is_some() {
                 self.published.push(address);
             }
@@ -645,6 +655,14 @@ impl<'a> MinorCollector<'a> {
         {
             self.work
                 .object(GC_HEADER_SIZE + metadata.payload_size, count);
+            if old_owner && super::remembered::card_array_capacity(object).is_some() {
+                // Large old buffers stay remembered per card, not as a whole.
+                let cards = count.div_ceil(super::remembered::ARRAY_CARD_SLOTS);
+                for card in 0..cards {
+                    self.scan_array_card(address, first, count, card);
+                }
+                return;
+            }
             for index in 0..count {
                 // Built-in buffer length bounds this contiguous slot range.
                 has_young_child |=
@@ -666,6 +684,56 @@ impl<'a> MinorCollector<'a> {
         if has_young_child {
             super::barrier::remember_owner(self.state, address);
         }
+    }
+
+    /// Scan the slots of one card of the old card-remembered buffer `owner`
+    /// (element slots start at `first`, `len` are traced), and record the card
+    /// again when it still holds a young child. Returns the slots visited.
+    fn scan_array_card(
+        &mut self,
+        owner: usize,
+        first: *mut *mut u8,
+        len: usize,
+        card: usize,
+    ) -> usize {
+        let start = card.saturating_mul(super::remembered::ARRAY_CARD_SLOTS);
+        let end = start
+            .saturating_add(super::remembered::ARRAY_CARD_SLOTS)
+            .min(len);
+        let mut young = false;
+        for index in start..end {
+            // SAFETY: `len` is the buffer's published traced prefix.
+            young |= self.scan_reference_slot(unsafe { first.add(index) }, false, true);
+        }
+        if young {
+            super::barrier::remember_card(self.state, owner, card);
+        }
+        end.saturating_sub(start)
+    }
+
+    /// Scan only the recorded cards of a card-remembered old buffer. A buffer
+    /// whose trace hook was replaced falls back to a whole-owner scan.
+    fn scan_remembered_cards(&mut self, owner: usize, cards: Vec<usize>) {
+        let object = HeapObject::from_payload(GcPayload::from_raw(owner as *mut u8).unwrap());
+        let metadata = object.trace_metadata();
+        let range = (metadata.gc_ref_mask == 0)
+            .then(|| unsafe {
+                crate::array::minor_reference_range(
+                    metadata.type_id,
+                    self.registry.trace.get(&metadata.type_id).copied(),
+                    owner as *mut u8,
+                )
+            })
+            .flatten();
+        let Some((first, len)) = range else {
+            self.pin_root(owner as *mut u8, PinSource::RememberedOwner);
+            return;
+        };
+        let mut slots = 0usize;
+        for card in cards {
+            slots += self.scan_array_card(owner, first, len, card);
+        }
+        self.work.remembered_card_slots(slots);
     }
 
     fn scan_reference_slot(
@@ -787,12 +855,18 @@ impl<'a> MinorCollector<'a> {
         let remembered_scan = crate::gc_telemetry::pause::Span::new(
             crate::gc_telemetry::pause::Component::Remembered,
         );
-        for owner in remembered {
+        let (whole, carded) = remembered.into_parts();
+        for owner in whole {
             // The set was taken; `scan_object` re-remembers owners that keep
             // a young child after this collection.
             HeapObject::from_payload(GcPayload::from_raw(owner as *mut u8).unwrap())
                 .set_remembered(false);
             self.pin_root(owner as *mut u8, PinSource::RememberedOwner);
+        }
+        for (owner, cards) in carded {
+            // Card-remembered buffers keep a clear header flag; only cards
+            // still holding a young child are recorded again.
+            self.scan_remembered_cards(owner, cards);
         }
         drop(remembered_scan);
         for slot in roots.slots {
@@ -853,7 +927,7 @@ impl<'a> MinorCollector<'a> {
         let mut reclaimed_young = 0u64;
         // Nursery runs are usually one type; skip the registry probe for them.
         let mut last_type: Option<(u32, Option<DropFn>)> = None;
-        let poison_moved = cfg!(debug_assertions) || super::gc_stress_enabled("relocate");
+        let poison_moved = moved_sources_poisoned();
         self.state.survivor_stats.survivor_space_reserved = 0;
         self.state.survivor_stats.survivor_space_live = 0;
         let mut chunk_identities: Vec<_> = (0..self.state.tlab_chunks.len()).collect();
@@ -886,14 +960,16 @@ impl<'a> MinorCollector<'a> {
             }
             if !poison_moved
                 && self.forwarded_per_chunk[identity] != 0
-                && self.forwarded_per_chunk[identity]
+                && (self.forwarded_per_chunk[identity]
                     == self.state.tlab_chunks[chunk_index].header_offsets.len()
+                    || self.sparse_survivor_chunk_is_dead(chunk_index, identity))
             {
                 // Every validated header in this chunk was forwarded exactly
-                // once. Descriptor ownership moved with each destination;
-                // no source owns a drop or descriptor release. Discard the
-                // whole prefix without decoding all forwarded headers again.
-                let objects = self.forwarded_per_chunk[identity] as u64;
+                // once, or the rest are unreachable young objects without
+                // drop hooks. Descriptor ownership moved with each
+                // destination; no source owns a drop or descriptor release.
+                // Discard the whole prefix without decoding every header.
+                let objects = self.state.tlab_chunks[chunk_index].header_offsets.len() as u64;
                 self.stop_work.swept_objects += objects;
                 reclaimed_young += objects;
                 self.state.allocated_bytes = self.state.allocated_bytes.saturating_sub(used);
@@ -1098,6 +1174,27 @@ impl<'a> MinorCollector<'a> {
         (reclaimed_bytes, std::mem::take(&mut self.work))
     }
 
+    /// An indexed source chunk with survivors that holds only young
+    /// objects, all allocated, none needing a drop hook: after evacuation
+    /// nothing in it is live or owns a resource, so the whole chunk can be
+    /// released without the per-object walk. A major sweep that reclaimed
+    /// holes rebuilt the start bits from live objects only, so equal counts
+    /// mean no reclaimed header remains; old objects exist only in pinned
+    /// chunks or in sources promoted in place this cycle. O(chunk words).
+    /// Only used when moved sources are not poisoned (release builds
+    /// without relocation stress), like the all-forwarded shortcut.
+    /// Restricted to nursery chunks: `may_drop` inspects only offset 0,
+    /// which is sound only where generated fast-path allocation filled the
+    /// rest; survivor chunks receive droppable copies at any offset.
+    fn sparse_survivor_chunk_is_dead(&self, chunk_index: usize, identity: usize) -> bool {
+        let chunk = &self.state.tlab_chunks[chunk_index];
+        chunk.kind == RegionKind::Nursery
+            && !self.pinned_per_chunk[identity]
+            && !chunk.header_offsets.is_empty()
+            && chunk.header_offsets.len() == chunk.mark_bitmap.bits.count()
+            && !self.may_drop(chunk_index)
+    }
+
     /// Whether an unindexed source chunk may hold an object with a drop hook.
     /// O(1): only its slow-path first object at offset 0 can, unless
     /// `generated_drop`.
@@ -1293,7 +1390,7 @@ fn minor_collect_with_roots(
     }
     let remembered_reset =
         crate::gc_telemetry::pause::Span::new(crate::gc_telemetry::pause::Component::Remembered);
-    let remembered = std::mem::take(&mut state.remembered_set);
+    let remembered = state.remembered_set.take();
     state.dirty_cards.clear();
     drop(remembered_reset);
     state.minor_collections = state.minor_collections.saturating_add(1);
@@ -1640,4 +1737,10 @@ impl Drop for SurvivorAdmission {
     fn drop(&mut self) {
         release_survivor_reserve(&mut runtime().heap.lock().unwrap_or_else(|p| p.into_inner()));
     }
+}
+
+/// Debug builds and relocation stress poison every moved source payload,
+/// which needs the per-object sweep walk of each source chunk.
+fn moved_sources_poisoned() -> bool {
+    cfg!(debug_assertions) || super::gc_stress_enabled("relocate")
 }

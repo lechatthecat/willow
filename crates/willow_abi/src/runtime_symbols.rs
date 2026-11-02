@@ -156,6 +156,8 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     ALLOC; "willow_gc_alloc_bitmap" => ([I64, I64, Ptr] -> Some(Ptr));
     ALLOC; "willow_gc_alloc_slow" => ([Ptr, I64, I64, I64, I64] -> Some(Ptr));
     NONE; "willow_gc_write_barrier" => ([Ptr, Ptr, Ptr, I64] -> None);
+    // Arguments: buffer payload, element slot address, previous, value, destination.
+    NONE; "willow_gc_array_write_barrier" => ([Ptr, Ptr, Ptr, Ptr, I64] -> None);
     PREEMPT; "willow_gc_collect" => ([] -> None);
     PREEMPT; "willow_gc_minor_collect" => ([] -> None);
     NONE; "willow_gc_stats_snapshot_v1" => ([Ptr] -> Some(I32));

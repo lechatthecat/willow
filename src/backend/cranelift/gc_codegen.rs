@@ -852,6 +852,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             word,
             publish,
         );
+        let is_array_element = destination == GcStoreDestination::ArrayElement;
         let destination_kind = if refinement == BarrierRefinement::OldValueSkips {
             destination as i64 | willow_abi::GC_STORE_VALUE_HAS_HEADER
         } else {
@@ -863,13 +864,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             types::I64,
             destination_kind | willow_abi::GC_STORE_OWNER_HAS_HEADER,
         );
-        let barrier_id = self.func_id("willow_gc_write_barrier");
-        let barrier_ref = self
-            .module
-            .declare_func_in_func(barrier_id, self.builder.func);
-        self.builder
-            .ins()
-            .call(barrier_ref, &[owner, previous, word, destination]);
+        if is_array_element {
+            // Pass the element slot so a large old buffer is remembered per
+            // card and a minor scans only the written cards.
+            let barrier_id = self.func_id("willow_gc_array_write_barrier");
+            let barrier_ref = self
+                .module
+                .declare_func_in_func(barrier_id, self.builder.func);
+            self.builder
+                .ins()
+                .call(barrier_ref, &[owner, slot, previous, word, destination]);
+        } else {
+            let barrier_id = self.func_id("willow_gc_write_barrier");
+            let barrier_ref = self
+                .module
+                .declare_func_in_func(barrier_id, self.builder.func);
+            self.builder
+                .ins()
+                .call(barrier_ref, &[owner, previous, word, destination]);
+        }
         self.builder.ins().jump(publish, &[]);
         self.builder.switch_to_block(publish);
         self.builder.seal_block(publish);

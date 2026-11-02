@@ -299,6 +299,8 @@ pub(crate) struct MarkWork {
     pub descriptor_bytes: u64,
     pub frame_scans: u64,
     pub remembered_owners: u64,
+    /// Element slots visited for card-remembered array buffers.
+    pub remembered_card_slots: u64,
     pub collector_mark_cpu_ns: u64,
     pub sweep_assist_cpu_ns: u64,
     pub sweep_cpu_incomplete: bool,
@@ -332,6 +334,12 @@ impl MarkWork {
             root_scan_bytes: (count as u64).saturating_mul(std::mem::size_of::<usize>() as u64),
             ..Self::default()
         }
+    }
+    pub(crate) fn remembered_card_slots(&mut self, slots: usize) {
+        self.remembered_card_slots = self.remembered_card_slots.saturating_add(slots as u64);
+        self.scanned_bytes = self
+            .scanned_bytes
+            .saturating_add((slots as u64).saturating_mul(std::mem::size_of::<usize>() as u64));
     }
     pub(crate) fn object(&mut self, bytes: usize, slots: usize) {
         self.objects = self.objects.saturating_add(1);

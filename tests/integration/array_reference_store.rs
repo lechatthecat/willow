@@ -36,6 +36,37 @@ fn array_reference_store_example_passes_barrier_verification() {
     }
 }
 
+const CARD_EXAMPLE_OUTPUT: &str = "true\ntrue\n-4030\ntrue\n-4000\n9096\n8383500\n8033426\n";
+
+#[test]
+fn array_card_remembering_example_in_debug_release_stress_and_verification() {
+    // Large old buffers are remembered per written card: several cards of one
+    // buffer add one remembered entry, children survive across minors and
+    // growth, and the barrier verifier accepts the recorded cards.
+    let source = include_str!("../../example/array_card_remembering.wi");
+    for (out, ok) in [
+        compile_and_run(source),
+        compile_and_run_release(source),
+        compile_and_run_gc_stress_mode(source, "minor"),
+        compile_and_run_with_runtime_env(
+            source,
+            &[("WILLOW_GC_VERIFY_BARRIER", "1")],
+            Duration::from_secs(60),
+        ),
+        compile_and_run_with_runtime_env(
+            source,
+            &[
+                ("WILLOW_GC_VERIFY_BARRIER", "1"),
+                ("WILLOW_GC_STRESS", "minor"),
+            ],
+            Duration::from_secs(60),
+        ),
+    ] {
+        assert!(ok, "{out}");
+        assert_eq!(out, CARD_EXAMPLE_OUTPUT);
+    }
+}
+
 #[test]
 fn array_reference_store_bounds_panic_for_every_reference_kind() {
     let mut source = String::from(
@@ -236,7 +267,7 @@ fn array_reference_store_sites_match_scalar_store_runtime_calls() {
         "root_pop",
         "inline_panic_depth",
         "willow_array_set",
-        "willow_gc_write_barrier",
+        "willow_gc_array_write_barrier",
         "willow_gc_mark_phase",
     ];
     let counts = |element: &str, array: &str, value: &str, sites: usize| {

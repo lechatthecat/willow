@@ -1,0 +1,79 @@
+// Large reference arrays remember written cards, not the whole buffer.
+//
+// An old reference-array buffer of at least 256 slots that receives a young
+// element is remembered per 64-slot card. Its header flag stays clear, so
+// later young stores into other cards still reach the write barrier and
+// record their own card. A minor collection then scans only the recorded
+// cards instead of the complete buffer, so minor work stays proportional to
+// the slots written since the previous minor, not to the array length.
+import std::collections::Array;
+
+class Node { pub value: i64; }
+
+fn sum(xs: Array<Node>) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < xs.len() {
+        total = total + xs[i].value;
+        i = i + 1;
+    }
+    return total;
+}
+
+fn minors(n: i64) {
+    let mut i = 0;
+    while i < n {
+        gc_minor_collect();
+        i = i + 1;
+    }
+}
+
+fn main() {
+    let mut xs: Array<Node> = [];
+    let mut i = 0;
+    while i < 4096 {
+        xs.push(new Node(i));
+        i = i + 1;
+    }
+    // Tenure every element; the large buffer was allocated old.
+    minors(10);
+    let remembered = gc_remembered_set_size();
+    let hits = gc_write_barrier_hits();
+
+    // Two cards of one owner: one new remembered entry.
+    xs[10] = new Node(-10);
+    xs[20] = new Node(-20);
+    xs[4000] = new Node(-4000);
+    println(gc_remembered_set_size() == remembered + 1);
+    println(gc_write_barrier_hits() == hits + 1);
+    minors(2);
+    println(xs[10].value + xs[20].value + xs[4000].value);
+
+    // Young children stay recorded until they tenure, then the entry drops.
+    minors(8);
+    println(gc_remembered_set_size() == remembered);
+    println(xs[4000].value);
+
+    // Growth copies into a fresh large buffer; every young element survives.
+    i = 0;
+    while i < 5000 {
+        xs.push(new Node(1));
+        i = i + 1;
+    }
+    minors(3);
+    println(xs.len());
+    println(sum(xs));
+
+    // Overwrite a stride of elements across many cards between minors.
+    let mut round = 0;
+    while round < 4 {
+        let mut j = round;
+        while j < xs.len() {
+            xs[j] = new Node(2);
+            j = j + 97;
+        }
+        gc_minor_collect();
+        round = round + 1;
+    }
+    println(sum(xs));
+}

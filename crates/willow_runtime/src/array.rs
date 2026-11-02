@@ -27,7 +27,8 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::gc::{
-    GcObjectKind, GcStoreDestination, willow_alloc_with_layout, write_barrier_object_owner,
+    GcObjectKind, GcStoreDestination, willow_alloc_with_layout, write_barrier_array_slot,
+    write_barrier_object_owner,
 };
 
 use willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID;
@@ -163,11 +164,12 @@ unsafe fn buf_slot(buffer: *mut u8, index: i64) -> *mut i64 {
 
 unsafe fn store_buffer_slot(buffer: *mut u8, index: i64, value: i64, is_ref: bool) {
     if is_ref {
-        write_barrier_object_owner(
+        let slot = unsafe { buf_slot(buffer, index) }.cast::<u8>();
+        write_barrier_array_slot(
             buffer,
-            unsafe { crate::gc::load_gc_reference(buf_slot(buffer, index).cast()) },
+            slot,
+            unsafe { crate::gc::load_gc_reference(slot.cast()) },
             value as *mut u8,
-            GcStoreDestination::ArrayElement as i64,
         );
     }
     if is_ref {
@@ -685,27 +687,27 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool, owned_pair: bo
                 // non-safepoint copy. The handle barrier below publishes its
                 // deletion to SATB, retaining every copied old edge. A fresh
                 // destination has no deleted edges of its own; one young edge
-                // suffices to remember the whole destination buffer.
-                let mut young: *mut u8 = std::ptr::null_mut();
+                // per remembered card suffices: a small destination is
+                // remembered whole, a large old one per card.
+                let mut young_card = None;
                 for i in 0..len {
                     let value = crate::gc::load_gc_reference(buf_slot(old_buf, i).cast());
                     crate::gc::store_gc_reference(buf_slot(new_buf, i).cast(), value);
-                    if young.is_null() && !value.is_null() {
+                    let card = i as usize / crate::gc::ARRAY_CARD_SLOTS;
+                    if young_card != Some(card) && !value.is_null() {
                         let header = value
                             .sub(crate::gc::GC_HEADER_SIZE)
                             .cast::<crate::gc::GcHeader>();
                         if (*header).generation == willow_abi::gc_header::GENERATION_YOUNG {
-                            young = value;
+                            young_card = Some(card);
+                            write_barrier_array_slot(
+                                new_buf,
+                                buf_slot(new_buf, i).cast(),
+                                std::ptr::null_mut(),
+                                value,
+                            );
                         }
                     }
-                }
-                if !young.is_null() {
-                    write_barrier_object_owner(
-                        new_buf,
-                        std::ptr::null_mut(),
-                        young,
-                        GcStoreDestination::ArrayElement as i64,
-                    );
                 }
             } else if is_ref && !clone_pairs {
                 for i in 0..len {

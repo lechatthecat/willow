@@ -24,7 +24,10 @@ pub(super) fn verify_remembered_set(
     }
     for object in old_objects {
         let owner = object.payload().as_ptr() as usize;
-        if object.remembered() != state.remembered_set.contains(&owner) {
+        // Card-remembered buffers are members with a clear header flag.
+        let cards = state.remembered_set.owner_cards(owner);
+        let flag_expected = state.remembered_set.contains(&owner) && cards.is_none();
+        if object.remembered() != flag_expected {
             return Err(format!(
                 "old object 0x{owner:x} remembered flag disagrees with the remembered set"
             ));
@@ -35,9 +38,20 @@ pub(super) fn verify_remembered_set(
             }
             // SAFETY: trace/layout slots are readable under stop-the-world.
             let child = unsafe { *slot };
-            if payload_generation(state, child) == Some(GC_GENERATION_YOUNG)
-                && !state.remembered_set.contains(&owner)
-            {
+            if payload_generation(state, child) != Some(GC_GENERATION_YOUNG) {
+                continue;
+            }
+            if let Some(cards) = cards {
+                let card = super::remembered::array_slot_card(owner, slot as usize);
+                if !cards.contains(&card) {
+                    return Err(format!(
+                        "old buffer 0x{owner:x} contains young reference 0x{:x} in unrecorded card {card}",
+                        child as usize
+                    ));
+                }
+                continue;
+            }
+            if !state.remembered_set.contains(&owner) {
                 return Err(format!(
                     "old object 0x{owner:x} contains young reference 0x{:x} without a remembered-set entry",
                     child as usize

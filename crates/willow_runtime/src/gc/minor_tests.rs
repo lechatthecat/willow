@@ -181,7 +181,15 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
             // skips (willow-jz15.120). The n dead chunks are released without
             // a header walk (willow-8hq4.21), and the young set is not
             // pre-indexed (willow-8hq4.16).
-            assert_eq!(stop.metadata_objects, (2 * n) as u64);
+            // Without source poisoning the evacuated chunks are released
+            // whole after their index; only the chunk of the value root
+            // promoted in place is swept.
+            let swept = if super::moved_sources_poisoned() {
+                n
+            } else {
+                1
+            };
+            assert_eq!(stop.metadata_objects, (n + swept) as u64);
             assert_eq!(state.promoted_objects, 1);
             assert_eq!(state.survivor_stats.survivor_copies, (n - 1) as u64);
             assert_eq!(state.moved_objects, (n - 1) as u64);
@@ -224,7 +232,7 @@ fn collect(roots: Vec<*mut u8>) -> crate::gc_telemetry::MarkWork {
     let registry = minor_registry_snapshot();
     let mut state = runtime().heap.lock().unwrap();
     retire_all_tlabs_unindexed(&mut state);
-    let remembered = std::mem::take(&mut state.remembered_set);
+    let remembered = state.remembered_set.take();
     state.dirty_cards.clear();
     let (_, work) = MinorCollector::new(&mut state, registry, &mut Default::default()).run(
         MinorRoots {
@@ -424,7 +432,7 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
                 }
                 let mut state = runtime().heap.lock().unwrap();
                 retire_all_tlabs_unindexed(&mut state);
-                let remembered = std::mem::take(&mut state.remembered_set);
+                let remembered = state.remembered_set.take();
                 state.dirty_cards.clear();
                 let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
                 let roots = if young == 0 { vec![] } else { vec![owner] };
@@ -441,7 +449,14 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
                 // Child chunks are indexed and swept; survivor copies sit in
                 // destination chunks the sweep skips (willow-jz15.120); dead
                 // chunks are released unwalked (willow-8hq4.21).
-                let expected = if cycle % 2 == 0 { 2 * young } else { young };
+                // Without source poisoning a fully evacuated chunk is
+                // released whole after its (one-time) index.
+                let swept = if super::moved_sources_poisoned() {
+                    young
+                } else {
+                    0
+                };
+                let expected = if cycle % 2 == 0 { young + swept } else { swept };
                 assert_eq!(stop.metadata_objects, expected as u64);
                 if young == 0 {
                     assert_eq!(work.marked_bytes, 0);
@@ -795,9 +810,15 @@ fn fully_dead_nursery_chunks_are_released_without_header_walks() {
             let stop = collect_with_stop(slots);
             let state = runtime().heap.lock().unwrap();
             if rooted {
-                // The rooted chunk: index + sweep walk. The copy's destination
-                // chunk is not swept (willow-jz15.120).
-                assert_eq!(stop.metadata_objects, 2 * per_chunk as u64);
+                // The rooted chunk: index, plus a sweep walk only when moved
+                // sources are poisoned; otherwise the evacuated chunk is
+                // released whole. The copy's destination chunk is not swept.
+                let walks = if super::moved_sources_poisoned() {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(stop.metadata_objects, walks * per_chunk as u64);
                 assert_ne!(root, payloads[per_chunk / 2]);
                 assert_eq!(state.survivor_stats.survivor_copies, 1);
                 assert_eq!(state.young_allocated_bytes, size);
@@ -827,6 +848,132 @@ fn fully_dead_nursery_chunks_are_released_without_header_walks() {
             reset_internal();
         }
     }
+}
+
+/// Sparse survivors: an evacuated source chunk whose remaining objects are
+/// dead and need no drop hook is released whole, without a sweep walk; a
+/// chunk starting with a droppable object is still walked and drops each dead
+/// object exactly once. Accounting is identical on both paths.
+#[test]
+fn evacuated_sparse_survivor_chunks_release_whole_or_drop_dead_objects_once() {
+    use crate::gc::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    unsafe fn count_drop(_: *mut u8) {
+        DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+    let native = willow_abi::runtime_type_ids::NETWORK_HANDLE_TYPE_ID;
+    let _guard = runtime_test_guard();
+    let size = GC_HEADER_SIZE + 8;
+    let chunks = 4;
+    let stride = 8;
+    for per_chunk in [64, GC_TLAB_CHUNK_SIZE / size] {
+        reset_internal();
+        DROPS.store(0, Ordering::Relaxed);
+        willow_register_drop(native, count_drop);
+        let mut tls = tlab_state_for_test();
+        // Odd chunks start with a droppable native object that dies.
+        let payloads = fill_chunks(
+            &mut tls,
+            chunks,
+            per_chunk,
+            |chunk| if chunk % 2 == 1 { native } else { 0 },
+            0,
+        );
+        let mut roots: Vec<*mut u8> = payloads
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % per_chunk % stride == 1)
+            .map(|(_, &payload)| payload)
+            .collect();
+        let survivors = roots.len();
+        let slots = roots.iter_mut().map(|root| root as *mut *mut u8).collect();
+        let stop = collect_with_stop(slots);
+        let objects = chunks * per_chunk;
+        let walked_chunks = if super::moved_sources_poisoned() {
+            chunks
+        } else {
+            chunks / 2
+        };
+        assert_eq!(DROPS.load(Ordering::Relaxed), chunks / 2);
+        assert_eq!(
+            stop.metadata_objects,
+            ((chunks + walked_chunks) * per_chunk) as u64,
+            "every source is indexed once; only droppable ones are swept"
+        );
+        assert_eq!(stop.swept_objects, objects as u64);
+        {
+            let state = runtime().heap.lock().unwrap();
+            assert_eq!(state.survivor_stats.survivor_copies, survivors as u64);
+            assert_eq!(state.total_frees, (objects - survivors) as u64);
+            assert_eq!(state.young_allocated_bytes, survivors * size);
+            assert_eq!(state.allocated_bytes, survivors * size);
+            // Only the survivor destination chunk remains.
+            assert_eq!(state.tlab_chunks.len(), 1);
+        }
+        for (root, old) in roots.iter().zip(
+            payloads
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| index % per_chunk % stride == 1),
+        ) {
+            assert_ne!(*root, *old.1);
+        }
+        collect_with_stop(Vec::new());
+        assert_eq!(DROPS.load(Ordering::Relaxed), chunks / 2);
+        eprintln!(
+            "sparse-survivor per_chunk={per_chunk} survivors={survivors} metadata={} walked_chunks={walked_chunks}",
+            stop.metadata_objects
+        );
+        reset_internal();
+    }
+}
+
+/// A survivor chunk receives copies at any offset, including droppable
+/// native objects. When such a copy dies while another object in the same
+/// survivor chunk is forwarded, the sweep must still run its drop hook: the
+/// first-object drop check only holds for nursery chunks.
+#[test]
+fn dead_droppable_copy_inside_evacuated_survivor_chunk_still_drops() {
+    use crate::gc::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    unsafe fn count_drop(_: *mut u8) {
+        DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+    let native = willow_abi::runtime_type_ids::NETWORK_HANDLE_TYPE_ID;
+    let _guard = runtime_test_guard();
+    reset_internal();
+    DROPS.store(0, Ordering::Relaxed);
+    willow_register_drop(native, count_drop);
+    let mut tls = tlab_state_for_test();
+    runtime().heap.lock().unwrap().nursery_threshold_bytes = usize::MAX;
+    // A plain object first, then a droppable native object.
+    let mut plain = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+    let mut handle = willow_gc_alloc_slow(&mut tls, 1, i64::from(native), 8, 0);
+    collect_with_stop(vec![&raw mut plain, &raw mut handle]);
+    {
+        // Both copies share one survivor chunk; the handle is not at offset 0.
+        let state = runtime().heap.lock().unwrap();
+        let chunk = state
+            .tlab_chunks
+            .iter()
+            .find(|chunk| {
+                let base = chunk.base as usize;
+                (base..base + chunk.used).contains(&(handle as usize))
+            })
+            .expect("handle copied into a survivor chunk");
+        assert_eq!(chunk.kind, RegionKind::Survivor);
+        assert!((chunk.base as usize..handle as usize).contains(&(plain as usize)));
+        assert!(handle as usize - chunk.base as usize > GC_HEADER_SIZE);
+    }
+    assert_eq!(DROPS.load(Ordering::Relaxed), 0);
+    // The plain copy is forwarded again; the handle dies in the same chunk.
+    collect_with_stop(vec![&raw mut plain]);
+    assert_eq!(DROPS.load(Ordering::Relaxed), 1);
+    collect_with_stop(vec![&raw mut plain]);
+    assert_eq!(DROPS.load(Ordering::Relaxed), 1);
+    reset_internal();
 }
 
 /// Drop hooks still run exactly once when the dead-chunk shortcut cannot be

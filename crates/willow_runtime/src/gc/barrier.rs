@@ -58,6 +58,67 @@ pub(super) fn remember_owner(state: &mut GcState, owner_payload: usize) -> bool 
     state.remembered_set.insert(owner_payload)
 }
 
+/// Record one slot card of a card-remembered reference-array buffer
+/// (`remembered::card_array_capacity`). Its header flag stays clear, so later
+/// young stores into other cards still reach the barrier. Returns whether the
+/// owner entry is new.
+pub(super) fn remember_card(state: &mut GcState, owner_payload: usize, card: usize) -> bool {
+    state.dirty_cards.insert(owner_payload / GC_CARD_SIZE);
+    state.remembered_set.insert_card(owner_payload, card)
+}
+
+/// Remember an old owner with a young child stored at `slot` (null when the
+/// caller has no slot address): per card for a large reference-array buffer
+/// whose slot is known, otherwise as a whole owner.
+fn remember_store(state: &mut GcState, owner_payload: usize, slot: *mut u8) -> bool {
+    if !slot.is_null()
+        && let Some(card) = slot_card(owner_payload, slot as usize)
+    {
+        return remember_card(state, owner_payload, card);
+    }
+    remember_owner(state, owner_payload)
+}
+
+/// Card of `slot` when `owner_payload` is a card-remembered array buffer and
+/// `slot` is one of its element slots.
+fn slot_card(owner_payload: usize, slot: usize) -> Option<usize> {
+    let owner = HeapObject::from_payload(GcPayload::from_raw(owner_payload as *mut u8)?);
+    let capacity = super::remembered::card_array_capacity(owner)?;
+    let first =
+        owner_payload + willow_abi::array_layout::BUFFER_HEADER_WORDS * GC_STORAGE_WORD_BYTES;
+    let index = slot.checked_sub(first)?;
+    (index % GC_STORAGE_WORD_BYTES == 0 && index / GC_STORAGE_WORD_BYTES < capacity)
+        .then(|| super::remembered::array_slot_card(owner_payload, slot))
+}
+
+const CARD_CACHE_ENTRIES: usize = 64;
+thread_local! {
+    /// Direct-mapped `(owner, card, epoch)` entries this thread recorded under
+    /// the heap lock. A hit proves the card is still in the remembered set, so
+    /// repeated young stores into a card-remembered buffer skip the lock.
+    static CARD_CACHE: [std::cell::Cell<(usize, usize, u64)>; CARD_CACHE_ENTRIES] =
+        const { [const { std::cell::Cell::new((0, 0, 0)) }; CARD_CACHE_ENTRIES] };
+}
+fn card_cache_index(owner: usize, card: usize) -> usize {
+    let key = (owner >> 3) ^ card.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (key ^ (key >> 29)) % CARD_CACHE_ENTRIES
+}
+#[cfg(test)]
+thread_local! {
+    /// Barrier calls on this thread that returned through the card cache
+    /// without taking the heap lock.
+    pub(super) static CARD_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+fn card_cache_hit(owner: usize, card: usize) -> bool {
+    let epoch = super::remembered::card_epoch();
+    CARD_CACHE.with(|cache| cache[card_cache_index(owner, card)].get() == (owner, card, epoch))
+}
+/// Call under the heap lock after the card was recorded.
+fn card_cache_fill(owner: usize, card: usize) {
+    let epoch = super::remembered::card_epoch();
+    CARD_CACHE.with(|cache| cache[card_cache_index(owner, card)].set((owner, card, epoch)));
+}
+
 pub(super) fn barrier_owner_payload(
     state: &GcState,
     owner_or_slot: *mut u8,
@@ -262,6 +323,38 @@ pub extern "C" fn willow_gc_write_barrier(
     value: *mut u8,
     destination_kind: i64,
 ) {
+    write_barrier(
+        owner,
+        std::ptr::null_mut(),
+        old_value,
+        value,
+        destination_kind,
+    );
+}
+
+/// [`willow_gc_write_barrier`] for a store into element `slot` of the
+/// reference-array buffer whose payload starts at `buffer`. Large old buffers
+/// are remembered per slot card, so a minor scans only the written cards.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_gc_array_write_barrier(
+    buffer: *mut u8,
+    slot: *mut u8,
+    old_value: *mut u8,
+    value: *mut u8,
+    destination_kind: i64,
+) {
+    write_barrier(buffer, slot, old_value, value, destination_kind);
+}
+
+#[inline]
+fn write_barrier(
+    owner: *mut u8,
+    slot: *mut u8,
+    old_value: *mut u8,
+    value: *mut u8,
+    destination_kind: i64,
+) {
     let value_has_header = destination_kind & willow_abi::GC_STORE_VALUE_HAS_HEADER != 0;
     let owner_has_header = destination_kind & willow_abi::GC_STORE_OWNER_HAS_HEADER != 0;
     let destination_kind = destination_kind
@@ -304,6 +397,23 @@ pub extern "C" fn willow_gc_write_barrier(
     if !young_edge_possible && (published || !marking_active) {
         return;
     }
+    // A store into an already recorded card of an old card-remembered buffer
+    // needs no lock: the cache entry proves the card is recorded for this
+    // epoch, so the next minor scans it whatever the value is. Compiled
+    // array stores carry no value-header proof, so none is required.
+    let cached_card = (young_edge_possible
+        && owner_has_header
+        && !slot.is_null()
+        && (published || !marking_active))
+        .then(|| slot_card(owner as usize, slot as usize))
+        .flatten();
+    if let Some(card) = cached_card
+        && card_cache_hit(owner as usize, card)
+    {
+        #[cfg(test)]
+        CARD_CACHE_HITS.set(CARD_CACHE_HITS.get() + 1);
+        return;
+    }
     let _interval = crate::gc_telemetry::observations::Span::new(
         crate::gc_telemetry::observations::Kind::BarrierSlow,
     );
@@ -319,10 +429,19 @@ pub extern "C" fn willow_gc_write_barrier(
     {
         return;
     }
-    if let Some(owner_payload) = barrier_owner_payload(&state, owner, destination_kind)
-        && remember_owner(&mut state, owner_payload)
-    {
-        state.write_barrier_hits = state.write_barrier_hits.saturating_add(1);
+    if let Some(owner_payload) = barrier_owner_payload(&state, owner, destination_kind) {
+        if remember_store(&mut state, owner_payload, slot) {
+            state.write_barrier_hits = state.write_barrier_hits.saturating_add(1);
+        }
+        if let Some(card) = cached_card
+            && owner_payload == owner as usize
+            && state
+                .remembered_set
+                .owner_cards(owner_payload)
+                .is_some_and(|cards| cards.contains(&card))
+        {
+            card_cache_fill(owner_payload, card);
+        }
     }
 }
 
@@ -348,6 +467,29 @@ pub(crate) fn write_barrier_object_owner(
         old_value,
         value,
         destination_kind
+            | willow_abi::GC_STORE_VALUE_HAS_HEADER
+            | willow_abi::GC_STORE_OWNER_HAS_HEADER,
+    );
+}
+
+/// [`write_barrier_object_owner`] for a store into element `slot` of the
+/// reference-array buffer `buffer`, so a large old buffer records only the
+/// slot's card.
+pub(crate) fn write_barrier_array_slot(
+    buffer: *mut u8,
+    slot: *mut u8,
+    old_value: *mut u8,
+    value: *mut u8,
+) {
+    if !object_store_needs_barrier(buffer, value) {
+        return;
+    }
+    write_barrier(
+        buffer,
+        slot,
+        old_value,
+        value,
+        GcStoreDestination::ArrayElement as i64
             | willow_abi::GC_STORE_VALUE_HAS_HEADER
             | willow_abi::GC_STORE_OWNER_HAS_HEADER,
     );
