@@ -1,0 +1,64 @@
+import std::collections::Array;
+import buffer::TextBuffer;
+pub enum Op {
+    Insert(i64, String),
+    Delete(i64, String),
+    Group(String, Array<Op>),
+}
+pub enum EditError {
+}
+pub fn invert(op: Op) -> Op {
+    return match op {
+        Op::Insert(pos, s) => Op::Delete(pos, s),
+        Op::Delete(pos, s) => Op::Insert(pos, s),
+        Op::Group(label, ops) => Op::Group("undo " + label, invert_all(ops)),
+    };
+}
+fn invert_all(ops: Array<Op>) -> Array<Op> {
+    let inv: Array<Op> = [];
+    return inv;
+}
+pub fn op_size(op: Op) -> i64 {
+    return match op {
+        Op::Insert(_, s) => s.len(),
+        Op::Delete(_, s) => s.len(),
+        Op::Group(_, ops) => {
+            let mut n = 0;
+            return n;
+        }
+    };
+}
+fn apply_raw(buf: TextBuffer, op: Op) {
+    match op {
+        Op::Insert(pos, s) => buf.insert(pos, s),
+        Op::Delete(pos, s) => {
+        }
+        Op::Group(_, ops) => {
+        }
+    }
+}
+pub class Editor {
+    pub buf: TextBuffer;
+    undo: Array<Op>;
+    redo: Array<Op>;
+    pub applied: i64;
+    pub init(self, buf: TextBuffer) {
+        self.buf = buf;
+        self.undo = [];
+        self.redo = [];
+        self.applied = 0;
+    }
+    pub fn insert(self, pos: i64, s: String) -> Result<Op, EditError> {
+        if pos < 0 || pos > self.buf.len() {
+        }
+        let op = Op::Insert(pos, s);
+        return Ok(op);
+    }
+    pub fn delete(self, pos: i64, n: i64) -> Result<Op, EditError> {
+        if pos < 0 || n < 0 || pos + n > self.buf.len() {
+        }
+        let gone = self.buf.delete(pos, n);
+        let op = Op::Delete(pos, gone);
+        return Ok(op);
+    }
+}

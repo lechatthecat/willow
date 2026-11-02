@@ -1,0 +1,2 @@
+import edit::Op;
+fn main() { let o = Op::Insert(1, "x"); println("ok"); }

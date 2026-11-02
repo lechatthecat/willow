@@ -1,0 +1,99 @@
+import std::collections::Array;
+pub interface TextBuffer extends Send {
+    fn insert(self, pos: i64, s: String);
+    fn delete(self, pos: i64, n: i64) -> String;
+    fn len(self) -> i64;
+}
+pub open class Metered {
+    pub edits: i64;
+    pub cost: i64;
+    pub init(self) {
+        self.edits = 0;
+        self.cost = 0;
+    }
+    pub open fn edit_cost(self, n: i64) -> i64 {
+        return n;
+    }
+}
+pub class NaiveBuffer extends Metered implements TextBuffer {
+    data: String;
+    pub init(self, s: String) {
+        super.init();
+        self.data = s;
+    }
+    pub fn kind(self) -> String {
+        return "naive";
+    }
+    pub override fn edit_cost(self, n: i64) -> i64 {
+        return self.data.len();
+    }
+    pub fn insert(self, pos: i64, s: String) {
+    }
+    pub fn delete(self, pos: i64, n: i64) -> String {
+        return self.data;
+    }
+    pub fn len(self) -> i64 {
+        return self.data.len();
+    }
+}
+enum Source { Original, Added }
+class Piece {
+    pub src: Source;
+    pub chunk: i64;
+    pub start: i64;
+    pub n: i64;
+}
+pub class PieceTable extends Metered implements TextBuffer {
+    original: String;
+    added: Array<String>;
+    pieces: Array<Piece>;
+    total: i64;
+    pub init(self, s: String) {
+        super.init();
+        self.original = s;
+        self.added = [];
+        self.pieces = [];
+        if s.len() > 0 {
+        }
+        self.total = s.len();
+    }
+    pub fn kind(self) -> String {
+        return "piece";
+    }
+    pub override fn edit_cost(self, n: i64) -> i64 {
+        return self.pieces.len();
+    }
+    fn piece_text(self, p: Piece) -> String {
+        return match p.src {
+            Source::Original => self.original.substring(p.start, p.start + p.n),
+            Source::Added => self.added[p.chunk].substring(p.start, p.start + p.n),
+        };
+    }
+    fn split_at(self, pos: i64) -> i64 {
+        let mut off = 0;
+        let mut i = 0;
+        while i < self.pieces.len() {
+            if off == pos {
+            }
+        }
+        return self.pieces.len();
+    }
+    pub fn insert(self, pos: i64, s: String) {
+        if s.len() == 0 {
+        }
+    }
+    pub fn delete(self, pos: i64, n: i64) -> String {
+        if n == 0 {
+        }
+        let first = self.split_at(pos);
+        let last = self.split_at(pos + n);
+        let parts: Array<String> = [];
+        let mut i = first;
+        while i < last {
+        }
+        return parts.join("");
+    }
+    pub fn len(self) -> i64 {
+        return self.pieces.len();
+    }
+}

@@ -389,3 +389,64 @@ fn readonly_query_cache_isolated_candidate_rejects_foreign_entry() {
         SOURCE
     );
 }
+
+// Qualified constructors in an imported editor module must not make its effect
+// inventory depend on itself, including with inherited interface implementations.
+#[test]
+fn editor_effect_inventory_cache_check_run_and_queries_match_disabled() {
+    let fixture = Fixture::new(include_str!("../example/effect_inventory_editor/m2.wi"));
+    for (name, source) in [
+        (
+            "edit.wi",
+            include_str!("../example/effect_inventory_editor/edit.wi"),
+        ),
+        (
+            "buffer.wi",
+            include_str!("../example/effect_inventory_editor/buffer.wi"),
+        ),
+    ] {
+        fs::write(fixture.0.join(name), source).unwrap();
+    }
+    let diagnostics = |output: &Output| {
+        stderr(output)
+            .lines()
+            .filter(|line| !line.starts_with("willow-query-cache "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    for command in ["check", "run"] {
+        let cache = fixture.0.join("cache");
+        if cache.exists() {
+            fs::remove_dir_all(cache).unwrap();
+        }
+        let disabled = fixture.run(&[command, "main.wi"], true);
+        assert!(
+            disabled.status.success(),
+            "{command}: {}",
+            stderr(&disabled)
+        );
+        for warm in [false, true] {
+            let cached = fixture.run(&[command, "main.wi"], false);
+            assert!(
+                cached.status.success(),
+                "{command}, warm={warm}: {}",
+                stderr(&cached)
+            );
+            assert_eq!(cached.stdout, disabled.stdout, "{command}, warm={warm}");
+            if command == "check" {
+                assert_eq!(diagnostics(&cached), diagnostics(&disabled));
+            }
+            assert_eq!(stats(&cached)["loaded"], warm);
+            if command == "run" {
+                assert_eq!(String::from_utf8_lossy(&cached.stdout).trim(), "ok");
+            }
+        }
+    }
+    for kind in ["symbol", "type", "refs", "effects", "impact"] {
+        fs::remove_dir_all(fixture.0.join("cache")).unwrap();
+        let args = [kind, "main", "--source", "main.wi", "--format", "json"];
+        fixture.parity(&args, Some((false, 27)));
+        fixture.warm();
+        fixture.parity(&args, Some((true, 0)));
+    }
+}

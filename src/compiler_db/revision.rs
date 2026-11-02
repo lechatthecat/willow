@@ -2309,6 +2309,33 @@ mod tests {
         assert!(f.compare(&mut warm));
     }
     #[test]
+    fn revision_editor_effect_inventory_body_edits_match_cold() {
+        let f = Fixture::new();
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        f.write(
+            "main.wi",
+            include_str!("../../example/effect_inventory_editor/m2.wi"),
+        );
+        f.write(
+            "buffer.wi",
+            include_str!("../../example/effect_inventory_editor/buffer.wi"),
+        );
+        let editor = include_str!("../../example/effect_inventory_editor/edit.wi");
+        for replacement in ["", "println(pos);", "", "println(s);"] {
+            f.write(
+                "edit.wi",
+                &editor.replace(
+                    "let op = Op::Insert(pos, s);",
+                    &format!("{replacement} let op = Op::Insert(pos, s);"),
+                ),
+            );
+            assert!(f.compare(&mut warm));
+            assert!(f.compare(&mut warm));
+        }
+    }
+
+    #[test]
     fn revision_generic_method_demand_changes_match_cold() {
         let f = Fixture::new();
         let mut warm = AnalysisRevision::default();
