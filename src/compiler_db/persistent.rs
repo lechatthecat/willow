@@ -242,7 +242,7 @@ pub(crate) fn run(
     let Ok(key) = CacheKey::new(&inputs, entry) else {
         return crate::run_frontend_revision(source, root, map, inputs, emitter, None, None);
     };
-    let path = cache_path(root, entry);
+    let path = cache_path(inputs.query_cache_root.as_deref().unwrap_or(root), entry);
     let restore_start = std::time::Instant::now();
     let loaded = load(&path, &key).ok();
     let hit = loaded.is_some();

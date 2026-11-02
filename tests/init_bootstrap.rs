@@ -568,3 +568,84 @@ fn init_works_without_git_executable() {
     assert!(!f.0.join(".git").exists());
     assert!(String::from_utf8(out.stdout).unwrap().contains("git init"));
 }
+
+#[test]
+fn project_query_cache_location_and_overrides() {
+    let f = Fixture::new();
+    assert!(f.run(&["init", "basic"]).status.success());
+    let root = f.0.join("basic");
+    let run = |args: &[&str], override_dir: Option<&std::path::Path>, disabled: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
+        command
+            .current_dir(&root)
+            .args(args)
+            .env_remove("WILLOW_QUERY_CACHE_DIR")
+            .env("WILLOW_QUERY_CACHE", if disabled { "0" } else { "1" })
+            .env("WILLOW_QUERY_CACHE_STATS", "1");
+        if let Some(dir) = override_dir {
+            command.env("WILLOW_QUERY_CACHE_DIR", dir);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    run(&["check", "."], None, true);
+    assert!(!root.join("target").exists());
+    run(&["check", "."], None, false);
+    let cache = root.join("target/willow-query-cache");
+    let files: Vec<_> = fs::read_dir(&cache)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].extension().unwrap(), "cache");
+    assert!(!root.join("src/target").exists());
+    let warm = run(&["check", root.to_str().unwrap()], None, false);
+    assert!(String::from_utf8_lossy(&warm.stderr).contains("\"loaded\":true"));
+    assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+    // The scaffold's ignore rule works in an actual repository.
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["check-ignore", "--quiet"])
+            .arg(&files[0])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let external = f.0.join("external-cache");
+    run(&["check", "."], Some(&external), false);
+    assert_eq!(fs::read_dir(&external).unwrap().count(), 1);
+    // Standalone source mode retains its source-relative cache location.
+    run(&["check", "src/main.wi"], None, false);
+    assert_eq!(
+        fs::read_dir(root.join("src/target/willow-query-cache"))
+            .unwrap()
+            .count(),
+        1
+    );
+    // Legacy manifests also carry the explicitly selected project directory.
+    fs::write(
+        root.join("project.toml"),
+        "[project]\nname = \"basic\"\nversion = \"0.1.0\"\nentry = \"src/main.wi\"\n",
+    )
+    .unwrap();
+    fs::remove_dir_all(root.join("src/target")).unwrap();
+    fs::remove_dir_all(&cache).unwrap();
+    run(&["check", "."], None, false);
+    assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+    assert!(!root.join("src/target").exists());
+}

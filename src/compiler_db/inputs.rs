@@ -35,6 +35,8 @@ pub struct CompilerInputs {
     pub(crate) check_modules: std::collections::BTreeMap<String, PathBuf>,
     pub options: crate::CompilerOptions,
     pub project_root: PathBuf,
+    /// Explicit project directory for disk caches; import resolution stays source-relative.
+    pub(crate) query_cache_root: Option<PathBuf>,
     /// An explicitly selected project, including legacy manifests without packages.
     pub(crate) project_mode: bool,
     pub target: TargetCapabilities,
@@ -57,6 +59,7 @@ impl CompilerInputs {
         );
         if let Some(root) = root {
             self.project_mode = true;
+            self.query_cache_root = Some(root.to_path_buf());
             // Lock all projects, while preserving legacy compiler identities.
             if let Some(graph) = crate::package::resolve_project_analysis(
                 root,
@@ -84,6 +87,7 @@ impl CompilerInputs {
             check_modules: Default::default(),
             options,
             project_root,
+            query_cache_root: None,
             project_mode: false,
             target: TargetCapabilities::native(),
             package_graph: None,

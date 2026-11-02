@@ -13,7 +13,7 @@ pub const MAIN: &str = "fn main() {\n    println(\"Hello, Willow!\");\n}\n";
 /// Ignores local build output (`willow build .` writes the project-named
 /// binary) and structured-edit state. Never written over an existing file.
 pub fn gitignore(name: &str) -> String {
-    format!("/{name}\n/{name}.exe\n/.willow-edits/\n")
+    format!("/{name}\n/{name}.exe\n/.willow-edits/\n/target/\n")
 }
 
 pub fn manifest(name: &str) -> Result<String> {
