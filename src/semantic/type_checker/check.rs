@@ -2439,7 +2439,27 @@ impl TypeChecker {
                 }
             }
             Stmt::Expr(s) => {
-                self.check_expr(&s.expr);
+                let errors_before = self.error_generation;
+                let ty = self.check_expr(&s.expr);
+                // Inspect the already computed outer type, without traversing or
+                // cloning its result type. Value-consuming contexts never enter
+                // this statement branch.
+                // Generic prechecking revisits these bodies in the final pass;
+                // emit this advisory only with the final resolved types.
+                if !self.template_precheck
+                    && self.error_generation == errors_before
+                    && (is_task_handle_type(&ty) || builtin_types::is(&ty, B::TaskResult))
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Warning,
+                            ErrorCode::W0802,
+                            "task or future value discarded without awaiting",
+                        )
+                        .with_label(Label::primary(s.expr.span(), "unused awaitable value"))
+                        .with_help("use `await ...` to wait for completion, or explicitly bind the value with `let task = ...;` (or `let _ = ...;`) to discard it intentionally"),
+                    );
+                }
             }
         }
     }

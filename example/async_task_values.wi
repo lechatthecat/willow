@@ -1,0 +1,14 @@
+// Await a future directly, or retain an eagerly started task for later.
+// Bare `sleep(1);` or `work();` statements produce warning W0802.
+async fn work() -> i64 {
+    await sleep(1);
+    return 42;
+}
+
+async fn main() {
+    await sleep(1);
+    let task = work();
+    println(await task);
+    // Explicitly acknowledge an intentionally unused task handle.
+    let _ = work();
+}

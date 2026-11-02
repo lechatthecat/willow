@@ -8995,6 +8995,9 @@ mod contextual_ctor_args_tests;
 mod diagnostic_recovery_tests;
 
 #[cfg(test)]
+mod discarded_task_tests;
+
+#[cfg(test)]
 mod generic_lambda_tests;
 
 #[cfg(test)]

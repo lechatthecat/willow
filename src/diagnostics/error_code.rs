@@ -117,6 +117,7 @@ error_codes! {
     E0812, // `Task.join()` has been removed — use `await task`
     E0813, // `Task.try_join()` has been removed — use `await`
     W0801, // async frame exceeds the large-frame warning threshold
+    W0802, // discarded task/future expression statement
     // Static members / implicit self E083x (willow-qsqf)
     E0830, // static property requires an initializer
     E0831, // `self` not available in static method (or explicit self on static)

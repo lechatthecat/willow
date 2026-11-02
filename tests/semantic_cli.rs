@@ -6623,3 +6623,37 @@ fn inherited_method_effects_preserve_waits_and_contract_rejection() {
         "{text}"
     );
 }
+
+#[test]
+fn discarded_task_check_warns_for_direct_and_imported_calls() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/order.wi"),
+        "module order; async fn base() -> i64 { return 1; } pub fn work<T>(value: T) -> Task<i64> { return base(); }",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import order; async fn main() { sleep(1); order::work(1); }",
+    )
+    .unwrap();
+    for args in [vec!["check"], vec!["check", "src/main.wi"]] {
+        let output = f.run(&args);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr.matches("warning[W0802]").count(), 2, "{stderr}");
+        assert!(stderr.contains("await ..."), "{stderr}");
+        assert!(
+            stderr.contains("check ok: no errors, 2 warnings"),
+            "{stderr}"
+        );
+    }
+    fs::write(f.0.join("src/main.wi"), "import order; async fn main() { await sleep(1); let task = order::work(1); await task; let _ = order::work(1); }").unwrap();
+    let output = f.run(&["check"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("check ok: no errors, 0 warnings"),
+        "{stderr}"
+    );
+}
