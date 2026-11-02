@@ -2967,6 +2967,21 @@ impl TypeChecker {
         }
     }
 
+    pub(super) fn check_new_with_effects(&mut self, n: &NewExpr, class: &str) -> Type {
+        let result = self.check_new(n, class);
+        if self
+            .symbols
+            .lookup_class(class)
+            .is_some_and(|info| info.constructor.is_some())
+        {
+            self.record_lock_effect_call(
+                FunctionId::method(TypeId::from_source_name(class), "init"),
+                n.span,
+            );
+        }
+        result
+    }
+
     fn check_expr_inner(&mut self, expr: &Expr) -> Type {
         if let Expr::Var(name, span, _) = expr
             && self.symbols.lookup_var(name).is_none()
@@ -2996,12 +3011,12 @@ impl TypeChecker {
                 return ty;
             };
             self.generics.objects.insert(expr.id(), name.clone());
+            if let Expr::New(n) = expr {
+                return self.check_new_with_effects(n, name);
+            }
+
             let mut concrete = expr.clone();
             match &mut concrete {
-                Expr::New(n) => {
-                    n.class_name = name.clone();
-                    n.type_args.clear();
-                }
                 Expr::StaticCall(c) => {
                     c.class = name.clone();
                     c.type_args.clear();
@@ -3357,20 +3372,7 @@ impl TypeChecker {
             }
             Expr::StaticCall(s) => self.check_static_call(s, None),
             Expr::StaticField(s) => self.resolve_static_field_read(&s.class, &s.field, s.span),
-            Expr::New(n) => {
-                let result = self.check_new(n);
-                if self
-                    .symbols
-                    .lookup_class(&n.class_name)
-                    .is_some_and(|info| info.constructor.is_some())
-                {
-                    self.record_lock_effect_call(
-                        FunctionId::method(TypeId::from_source_name(&n.class_name), "init"),
-                        n.span,
-                    );
-                }
-                result
-            }
+            Expr::New(n) => self.check_new_with_effects(n, &n.class_name),
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
             Expr::Await(a) => {
                 self.record_direct_lock_effect(a.span, "await", LockEffectKind::Suspend);

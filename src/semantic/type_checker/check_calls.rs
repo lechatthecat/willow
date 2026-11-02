@@ -294,6 +294,18 @@ impl TypeChecker {
                 &HashSet::from([crate::semantic::generic_inference::ENUM_HOLE]),
             );
         }
+        if let Expr::New(n) = expr {
+            let generation = self.error_generation;
+            if let Some(ty) = self.contextual_new_type(n, expected) {
+                let ty = if let Type::Named(name) = &ty {
+                    self.generics.objects.insert(n.id, name.clone());
+                    self.check_new_with_effects(n, name)
+                } else {
+                    ty
+                };
+                return self.finish_checked_expr(expr, ty, generation);
+            }
+        }
         // Every array element receives the contextual element type, including
         // nested literals and class values stored through an interface.
         if let (Expr::ArrayLiteral(elements, _, _), Type::Array(elem)) = (expr, expected) {

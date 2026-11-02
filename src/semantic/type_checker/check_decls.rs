@@ -725,10 +725,10 @@ impl TypeChecker {
     /// Type-check `new Class(args...)` (willow-scq2 §10): resolve the class, pick
     /// the explicit `init` or the implicit memberwise constructor, check
     /// visibility and arguments, and yield `Class`.
-    pub(super) fn check_new(&mut self, n: &NewExpr) -> Type {
+    pub(super) fn check_new(&mut self, n: &NewExpr, class_name: &str) -> Type {
         let resolved = self
-            .resolve_static_call_class_name(&n.class_name, n.span)
-            .unwrap_or_else(|| n.class_name.clone());
+            .resolve_static_call_class_name(class_name, n.span)
+            .unwrap_or_else(|| class_name.to_owned());
 
         // Generic expansion already reported the invalid constructor type.
         // Keep independent argument errors, but do not look up the recovery marker.
@@ -799,7 +799,7 @@ impl TypeChecker {
         // Constructor signature: explicit `init`, else implicit memberwise
         // (inherited fields first, then this class's fields in declaration
         // order, matching the runtime object layout).
-        let param_infos: Vec<ParamInfo> = match &class.constructor {
+        let mut param_infos: Vec<ParamInfo> = match &class.constructor {
             Some(ci) => {
                 // Visibility of an explicit constructor (willow-scq2 §9).
                 if !ci.public {
@@ -842,7 +842,11 @@ impl TypeChecker {
                 value_param_infos(&field_types)
             }
         };
-        let params: Vec<Type> = param_infos.iter().map(|p| p.ty.clone()).collect();
+        // Imported signatures can still contain logical generic applications.
+        // Use their concrete identity for both argument context and compatibility.
+        for param in &mut param_infos {
+            param.ty = self.normalize_type(&param.ty, n.span);
+        }
 
         // A constructor is a typed call like any other call. Propagate each
         // declared parameter/field type into its argument so contextual enum
@@ -852,13 +856,13 @@ impl TypeChecker {
         // Extra arguments have no corresponding context but are still checked.
         let mut arg_types = Vec::with_capacity(n.args.len());
         for (idx, arg) in n.args.iter().enumerate() {
-            arg_types.push(match params.get(idx) {
-                Some(ty) => self.check_expr_expecting(&arg.expr, ty),
+            arg_types.push(match param_infos.get(idx) {
+                Some(param) => self.check_expr_expecting(&arg.expr, &param.ty),
                 None => self.check_expr(&arg.expr),
             });
         }
 
-        if arg_types.len() != params.len() {
+        if arg_types.len() != param_infos.len() {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -866,7 +870,7 @@ impl TypeChecker {
                     format!(
                         "constructor `{}::init` expects {} argument(s) but got {}",
                         self.diagnostic_class_name(&resolved),
-                        params.len(),
+                        param_infos.len(),
                         arg_types.len()
                     ),
                 )

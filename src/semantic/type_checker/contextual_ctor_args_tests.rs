@@ -363,3 +363,139 @@ fn contextual_ctor_args_generic_class_static_calls_instantiate() {
     let wrong = errors_of("fn f() { let h: Holder<i64> = Holder<i64>::make(\"a\"); }");
     assert_eq!(wrong.len(), 1, "{wrong:?}");
 }
+
+#[test]
+fn contextual_new_expected_type_perspectives() {
+    let cases = [
+        ("annotation", "fn f() { let b: Box<i64> = new Box(); }"),
+        ("parameter", "fn g(b: Box<i64>) {} fn f() { g(new Box()); }"),
+        ("return", "fn f() -> Box<i64> { return new Box(); }"),
+        (
+            "memberwise field",
+            "class H { pub b: Box<i64>; } fn f() { let h = new H(new Box()); }",
+        ),
+        (
+            "explicit init field",
+            "class H { pub b: Box<i64>; pub init(self) { self.b = new Box(); } }",
+        ),
+        (
+            "field assignment",
+            "class H { pub b: Box<i64>; } fn f() { let h = new H(new Box<i64>()); h.b = new Box(); }",
+        ),
+        (
+            "assignment",
+            "fn f() { let mut b: Box<i64> = new Box(); b = new Box(); }",
+        ),
+        (
+            "nested class",
+            "fn f() { let b: Holder<Box<i64>> = new Holder(new Box()); }",
+        ),
+        (
+            "array element",
+            "fn f() { let bs: Array<Box<i64>> = [new Box(), new Box()]; }",
+        ),
+        (
+            "option payload",
+            "fn f() { let b: Option<Box<i64>> = Some(new Box()); }",
+        ),
+        (
+            "ternary",
+            "fn f(c: bool) { let b: Box<i64> = c ? new Box() : new Box(); }",
+        ),
+        (
+            "match",
+            "fn f(c: bool) { let b: Box<i64> = match c { true => new Box(), false => new Box() }; }",
+        ),
+        (
+            "multiple parameters",
+            "fn f() { let p: Pair<i64, String> = new Pair(1, \"x\"); }",
+        ),
+        (
+            "empty array argument",
+            "fn f() { let h: Holder<Array<i64>> = new Holder([]); }",
+        ),
+        (
+            "empty map argument",
+            "fn f() { let h: Holder<Map<i64, String>> = new Holder(Map::new()); }",
+        ),
+        (
+            "explicit unchanged",
+            "fn f() { let b = new Box<String>(); }",
+        ),
+        (
+            "different specializations",
+            "fn f() { let a: Box<i64> = new Box(); let b: Box<String> = new Box(); }",
+        ),
+        (
+            "generic function body",
+            "fn make<T>() -> Box<T> { return new Box(); } fn f() { let b = make<i64>(); }",
+        ),
+        ("non generic", "fn f() { let a: A = new A(); }"),
+        (
+            "constructor argument",
+            "class H { pub init(self, b: Box<i64>) {} } fn f() { let h = new H(new Box()); }",
+        ),
+        (
+            "nested expected type",
+            "fn f() { let b: Box<Array<Map<i64, String>>> = new Box(); }",
+        ),
+    ];
+    for (name, body) in cases {
+        let (_, errors) = checked(&format!(
+            "class Box<T> {{ pub v: Option<T>; pub init(self) {{ self.v = None; }} }} {body}"
+        ));
+        assert!(errors.is_empty(), "{name}: {errors:?}");
+    }
+}
+
+#[test]
+fn contextual_new_rejects_invalid_construction() {
+    let cases = [
+        (
+            "no context",
+            "let b = new Box();",
+            "expects 1 type argument(s), got 0",
+        ),
+        (
+            "different class",
+            "let b: Holder<i64> = new Box();",
+            "expects 1 type argument(s), got 0",
+        ),
+        (
+            "explicit mismatch",
+            "let b: Box<i64> = new Box<String>();",
+            "cannot assign",
+        ),
+        (
+            "wrong argument",
+            "let b: Holder<i64> = new Holder(\"x\");",
+            "expects `i64`",
+        ),
+        (
+            "wrong arity",
+            "let b: Holder<i64> = new Holder();",
+            "expects 1 argument",
+        ),
+        (
+            "partial explicit arguments",
+            "let b: Pair<i64, String> = new Pair<i64>(1, \"x\");",
+            "expects 2 type argument(s), got 1",
+        ),
+    ];
+    for (name, body, message) in cases {
+        let (_, errors) = checked(&format!(
+            "class Box<T> {{ pub v: Option<T>; pub init(self) {{ self.v = None; }} }} fn f() {{ {body} }}"
+        ));
+        assert!(
+            errors.iter().any(|error| error.message.contains(message)),
+            "{name}: {errors:?}"
+        );
+        if name == "no context" || name == "different class" {
+            assert!(
+                errors.iter().any(|error| error.code == ErrorCode::E0201
+                    && error.helps.iter().any(|help| help.contains("new Box<T>()"))),
+                "{errors:?}"
+            );
+        }
+    }
+}

@@ -393,3 +393,6 @@ mod array_utilities;
 
 #[path = "integration/math_helpers.rs"]
 mod math_helpers;
+
+#[path = "integration/contextual_new.rs"]
+mod contextual_new;

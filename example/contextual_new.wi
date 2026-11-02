@@ -1,0 +1,15 @@
+class Box<T> {
+    pub value: Option<T>;
+    pub init(self) { self.value = None; }
+}
+class Holder<T> { pub value: T; }
+fn make<T>() -> Box<T> { return new Box(); }
+fn read(box: Box<i64>) -> i64 { return box.value.unwrap_or(3); }
+fn main() {
+    let box: Box<i64> = new Box();
+    let nested: Holder<Box<i64>> = new Holder(new Box());
+    println(read(box));
+    println(read(new Box()));
+    println(read(make<i64>()));
+    println(read(nested.value));
+}

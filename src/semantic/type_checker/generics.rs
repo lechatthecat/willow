@@ -249,6 +249,7 @@ thread_local! {
     pub(super) static GENERIC_ENUM_ARGUMENT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static GENERIC_CALL_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static EXPECTED_RESULT_HINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CONTEXTUAL_NEW_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INSTANTIATION_METADATA_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -288,6 +289,39 @@ mod template_registry_tests {
         let (program, diagnostics) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         program
+    }
+
+    #[test]
+    fn contextual_new_reuses_specializations_at_increasing_sizes() {
+        for uses in [1, 8, 32] {
+            for depth in [1, 4, 8] {
+                let mut ty = "i64".to_string();
+                let mut value = "1".to_string();
+                for _ in 0..depth {
+                    ty = format!("Wrap<{ty}>");
+                    value = format!("new Wrap({value})");
+                }
+                let declarations: String = (0..uses)
+                    .map(|i| format!("let x{i}: {ty} = {value};"))
+                    .collect();
+                let source =
+                    format!("class Wrap<T> {{ pub v: T; }} fn main() {{ {declarations} }}");
+                let mut checker = TypeChecker::new();
+                CONTEXTUAL_NEW_CHECKS.with(|count| count.set(0));
+                checker.check_program(&parse(&source));
+                assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                let checks = CONTEXTUAL_NEW_CHECKS.with(|count| count.get());
+                assert_eq!(checks, uses * depth);
+                assert_eq!(checker.generics.objects.len(), uses * depth);
+                let registry = checker.generics.registry.borrow();
+                assert_eq!(registry.class_specializations, depth);
+                println!(
+                    "contextual new: uses={uses} depth={depth} objects={} specializations={}",
+                    checker.generics.objects.len(),
+                    registry.class_specializations
+                );
+            }
+        }
     }
 
     #[test]
@@ -2286,6 +2320,55 @@ impl TypeChecker {
         });
     }
 
+    /// Only the matching nominal class supplies omitted constructor arguments.
+    /// Inspect the outer logical type; do not traverse or clone the expression tree.
+    pub(super) fn contextual_new_type(&mut self, n: &NewExpr, expected: &Type) -> Option<Type> {
+        if !n.type_args.is_empty() || !self.generics.classes.contains_key(&n.class_name) {
+            return None;
+        }
+        let logical = match expected {
+            Type::Named(name) => self
+                .generics
+                .logical_types
+                .get(name)
+                .or_else(|| {
+                    let class = self.symbols.lookup_class(name)?;
+                    self.generics.logical_types.get(&class.name)
+                })
+                .unwrap_or(expected),
+            _ => expected,
+        };
+        let Type::Generic(name, args) = logical else {
+            return None;
+        };
+        if self.generic_type_identity(name) != self.generic_type_identity(&n.class_name) {
+            return None;
+        }
+        #[cfg(test)]
+        CONTEXTUAL_NEW_CHECKS.with(|count| count.set(count.get() + 1));
+        // An annotated/parameter type already owns a checked specialization.
+        // Reuse it without re-expanding nested logical arguments at every `new`.
+        if let Type::Named(name) = expected {
+            let template = &self.generics.classes[&n.class_name];
+            if !self.signature_metadata
+                && !template.public
+                && template.span.file_id != n.span.file_id
+            {
+                self.generic_error(
+                    n.span,
+                    format!("generic class `{}` is private", n.class_name),
+                );
+                return Some(Self::error_type());
+            }
+            // Alias names describe a storage type, not an emitted constructor.
+            // Effects and lowering must call the specialization's real owner.
+            let class = self.symbols.lookup_class(name)?;
+            return Some(Type::Named(class.name.clone()));
+        }
+        let args = args.clone();
+        self.instantiate_class(&n.class_name, &args, n.span)
+    }
+
     pub(super) fn instantiate_class(
         &mut self,
         name: &str,
@@ -2302,14 +2385,23 @@ impl TypeChecker {
             return Some(Self::error_type());
         }
         if args.len() != template.type_params.len() {
-            self.generic_error(
-                span,
+            let mut diagnostic = Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0201,
                 format!(
                     "generic class `{name}` expects {} type argument(s), got {}",
                     template.type_params.len(),
                     args.len()
                 ),
-            );
+            )
+            .with_label(Label::primary(span, "generic instantiation"));
+            if args.is_empty() {
+                diagnostic = diagnostic.with_help(format!(
+                    "specify type arguments explicitly, for example `new {name}<{}>()`, or provide a matching expected class type",
+                    template.type_params.join(", ")
+                ));
+            }
+            self.push(diagnostic);
             return Some(Self::error_type());
         }
         let args: Vec<_> = args.iter().map(|t| self.normalize_type(t, span)).collect();
