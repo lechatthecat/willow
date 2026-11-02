@@ -42,7 +42,17 @@ fn overlap_graph_copy_promotion_and_snapshot_only_reachability() {
             // The mark queue alone now owns snapshot reachability. Alternate
             // unscanned and fully scanned young graphs before minor relocation.
             if count % 2 == 0 {
-                cycle.drain(usize::MAX);
+                // A drain publishes its partial branch batch on return. A
+                // fan-out graph may therefore need more than one drain to
+                // establish this fixture's fully scanned snapshot.
+                for _ in 0..count {
+                    if cycle.queue.snapshot().is_drained() {
+                        break;
+                    }
+                    cycle.drain(usize::MAX);
+                }
+                assert!(cycle.queue.snapshot().is_drained());
+                assert_eq!(cycle.objects.marked_count(), count);
             }
             for pass in 0..2 {
                 let before = runtime().heap.lock().unwrap().moved_objects;

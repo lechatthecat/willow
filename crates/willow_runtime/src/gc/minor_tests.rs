@@ -176,20 +176,23 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
                 work.root_scan_bytes,
                 (root_count * size_of::<usize>()) as u64
             );
-            // The n chunks holding a node are indexed once and swept once;
-            // survivor copies land in fresh destination chunks that the sweep
-            // skips (willow-jz15.120). The n dead chunks are released without
-            // a header walk (willow-8hq4.21), and the young set is not
-            // pre-indexed (willow-8hq4.16).
-            // Without source poisoning the evacuated chunks are released
-            // whole after their index; only the chunk of the value root
-            // promoted in place is swept.
+            // Debug indexes every reachable source and poisons moved ones.
+            // Release indexes only swept chunks: the value-root chunk is
+            // retained in place; evacuated sources are released whole.
+            // Dead chunks and new survivor destinations need no header walk.
             let swept = if super::moved_sources_poisoned() {
                 n
             } else {
                 1
             };
-            assert_eq!(stop.metadata_objects, (n + swept) as u64);
+            assert_eq!(
+                stop.metadata_objects,
+                if cfg!(debug_assertions) {
+                    (n + swept) as u64
+                } else {
+                    (2 * swept) as u64
+                }
+            );
             assert_eq!(state.promoted_objects, 1);
             assert_eq!(state.survivor_stats.survivor_copies, (n - 1) as u64);
             assert_eq!(state.moved_objects, (n - 1) as u64);
@@ -446,17 +449,15 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
                     },
                     remembered,
                 );
-                // Child chunks are indexed and swept; survivor copies sit in
-                // destination chunks the sweep skips (willow-jz15.120); dead
-                // chunks are released unwalked (willow-8hq4.21).
-                // Without source poisoning a fully evacuated chunk is
-                // released whole after its (one-time) index.
+                // New child chunks require an index only for poisoning;
+                // existing survivor sources already have their full index.
+                // Release discards fully evacuated sources without a walk.
                 let swept = if super::moved_sources_poisoned() {
                     young
                 } else {
                     0
                 };
-                let expected = if cycle % 2 == 0 { young + swept } else { swept };
+                let expected = if cycle % 2 == 0 { 2 * swept } else { swept };
                 assert_eq!(stop.metadata_objects, expected as u64);
                 if young == 0 {
                     assert_eq!(work.marked_bytes, 0);
@@ -786,9 +787,80 @@ fn collect_with_stop(slots: Vec<*mut *mut u8>) -> crate::gc_telemetry::stops::St
     stop
 }
 
+/// Source validation and evacuation must not index unrelated nursery objects.
+/// Debug builds deliberately retain the full publication invariant check.
+#[test]
+fn sparse_source_validation_does_not_index_dead_neighbors() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    let _stress = GcStressTestScope::normal();
+    for count in [1, 16, 256, GC_TLAB_CHUNK_SIZE / (GC_HEADER_SIZE + 8)] {
+        for position in [0, count / 2, count - 1] {
+            reset_internal();
+            let mut tls = tlab_state_for_test();
+            let payloads = fill_chunks(&mut tls, 1, count, |_| 0, 0);
+            let mut state = runtime().heap.lock().unwrap();
+            retire_all_tlabs_unindexed(&mut state);
+            let mut stop = Default::default();
+            let mut collector = MinorCollector::new(&mut state, Default::default(), &mut stop);
+            let source = payloads[position];
+            for _ in 0..16 {
+                assert!(collector.young_source(source as usize).is_some());
+            }
+            let copy = collector.evacuate(source);
+            assert_ne!(copy, source);
+            for _ in 0..16 {
+                assert_eq!(collector.evacuate(source), copy);
+            }
+            assert_eq!(collector.forwarded_per_chunk[0], 1);
+            let indexed = if cfg!(debug_assertions) { count } else { 0 };
+            assert_eq!(collector.state.tlab_chunks[0].header_offsets.len(), indexed);
+            drop(collector);
+            assert_eq!(stop.metadata_objects, indexed as u64);
+            assert_eq!(stop.metadata_bytes, (indexed * GC_HEADER_SIZE) as u64);
+            eprintln!(
+                "source count={count} position={position} metadata={} bytes={}",
+                stop.metadata_objects, stop.metadata_bytes
+            );
+            drop(state);
+        }
+    }
+    reset_internal();
+}
+
+#[test]
+fn sparse_unindexed_source_keeps_relocation_poisoning() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    let _normal = GcStressTestScope::normal();
+    for count in [16, 256] {
+        reset_internal();
+        let mut tls = tlab_state_for_test();
+        let payloads = fill_chunks(&mut tls, 1, count, |_| 0, 0);
+        let mut root = payloads[count / 2];
+        let _stress = GcStressTestScope::with_modes("relocate");
+        assert!(super::moved_sources_poisoned());
+        let stop = collect_with_stop(vec![&raw mut root]);
+        assert_ne!(root, payloads[count / 2]);
+        // A full index and poison sweep remain required even in release.
+        assert_eq!(stop.metadata_objects, 2 * count as u64);
+        assert_eq!(stop.swept_objects, count as u64);
+        assert_eq!(
+            runtime()
+                .heap
+                .lock()
+                .unwrap()
+                .survivor_stats
+                .survivor_copies,
+            1
+        );
+    }
+    reset_internal();
+}
+
 /// willow-8hq4.21: a nursery chunk without survivors or droppable objects is
 /// released without visiting a header, so minor metadata work is independent
-/// of its object count; a chunk with one survivor is indexed and walked once.
+/// of its object count; debug builds index and poison reachable sources.
 #[test]
 fn fully_dead_nursery_chunks_are_released_without_header_walks() {
     use crate::gc::*;
@@ -810,13 +882,13 @@ fn fully_dead_nursery_chunks_are_released_without_header_walks() {
             let stop = collect_with_stop(slots);
             let state = runtime().heap.lock().unwrap();
             if rooted {
-                // The rooted chunk: index, plus a sweep walk only when moved
-                // sources are poisoned; otherwise the evacuated chunk is
-                // released whole. The copy's destination chunk is not swept.
+                // Debug indexes and poisons the rooted source; release
+                // trusts published starts and discards the source whole.
+                // The copy's destination chunk is not swept.
                 let walks = if super::moved_sources_poisoned() {
                     2
                 } else {
-                    1
+                    0
                 };
                 assert_eq!(stop.metadata_objects, walks * per_chunk as u64);
                 assert_ne!(root, payloads[per_chunk / 2]);
@@ -898,8 +970,8 @@ fn evacuated_sparse_survivor_chunks_release_whole_or_drop_dead_objects_once() {
         assert_eq!(DROPS.load(Ordering::Relaxed), chunks / 2);
         assert_eq!(
             stop.metadata_objects,
-            ((chunks + walked_chunks) * per_chunk) as u64,
-            "every source is indexed once; only droppable ones are swept"
+            (2 * walked_chunks * per_chunk) as u64,
+            "only swept sources require a complete header index"
         );
         assert_eq!(stop.swept_objects, objects as u64);
         {
@@ -1035,9 +1107,10 @@ fn droppable_nursery_chunks_are_walked_and_drop_exactly_once() {
 }
 
 /// A chunk retired without its header index is validated when the minor
-/// collector first finds a reachable object in it: gaps and overlaps in its
-/// start bits are still rejected.
+/// collector first finds a reachable object in it in debug builds: gaps and
+/// overlaps in its start bits are still rejected. Release trusts publication.
 #[test]
+#[cfg(debug_assertions)]
 fn minor_rejects_unpublished_and_overlapping_start_bits_in_unindexed_chunk() {
     use crate::gc::*;
     use std::sync::atomic::Ordering;
@@ -1426,11 +1499,11 @@ fn fully_forwarded_chunks_release_without_a_second_header_walk() {
         let stop = collect_with_stop(payloads.iter_mut().map(|p| p as *mut *mut u8).collect());
         let count = payloads.len() as u64;
         assert_eq!(stop.swept_objects, count);
-        // Debug retains the source poison walk; release discards the fully
-        // forwarded chunk after its one validation/indexing pass.
+        // Debug retains validation and source poisoning; release discards
+        // the fully forwarded chunk without indexing its headers.
         assert_eq!(
             stop.metadata_objects,
-            count * if cfg!(debug_assertions) { 2 } else { 1 }
+            count * if cfg!(debug_assertions) { 2 } else { 0 }
         );
         for (index, payload) in payloads.iter().enumerate() {
             assert_eq!(unsafe { *(*payload).cast::<usize>() }, index);

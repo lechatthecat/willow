@@ -102,9 +102,9 @@ impl<'a> MinorCollector<'a> {
                 .all(|chunk| chunk.owner_state.is_none()),
             "minor collection requires retired TLABs"
         );
-        // A newly retired chunk is validated and indexed only when the cycle
-        // first finds a young object in it (`young_source`) or must walk it in
-        // the sweep; the collector wrote every survivor header. Young
+        // A newly retired chunk is indexed only when a sweep needs its
+        // headers (or debug validation first finds a young object in it);
+        // the collector wrote every survivor header. Young
         // membership is answered by the chunk index plus start bitmap, so no
         // per-object index is built for the (mostly dead) nursery.
         #[cfg(test)]
@@ -207,7 +207,7 @@ impl<'a> MinorCollector<'a> {
     /// nursery or survivor chunk that existed when this cycle began. Chunks
     /// created by `allocate_survivor` are destinations, never sources.
     /// Expected O(1) for the bounded page index and start bit,
-    /// plus the one-time validation of a chunk not yet indexed.
+    /// with full publication validation retained in debug builds.
     fn young_source(&mut self, address: usize) -> Option<HeapObject> {
         let header = address.checked_sub(GC_HEADER_SIZE)?;
         let index = self.chunk_index(header)?;
@@ -223,12 +223,15 @@ impl<'a> MinorCollector<'a> {
         {
             return None;
         }
-        // A chunk holding a reachable object is walked by the sweep anyway;
-        // validate its start bits before trusting one (willow-8hq4.21).
-        let indexed = index_retired_chunk(chunk) as u64;
-        self.stop_work.metadata_objects += indexed;
-        self.stop_work.metadata_bytes += indexed * GC_HEADER_SIZE as u64;
-        // SAFETY: a validated start bit inside the retired prefix names a header.
+        #[cfg(debug_assertions)]
+        {
+            let indexed = index_retired_chunk(chunk) as u64;
+            self.stop_work.metadata_objects += indexed;
+            self.stop_work.metadata_bytes += indexed * GC_HEADER_SIZE as u64;
+        }
+        // SAFETY: the stopped mutator publishes a start bit only after fully
+        // initializing its header. Retirement fixes the allocated prefix;
+        // alignment, bounds and exact publication were checked above.
         let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())?;
         (object.allocated() && object.generation() == GC_GENERATION_YOUNG).then_some(object)
     }
@@ -434,7 +437,7 @@ impl<'a> MinorCollector<'a> {
         }
         // This slot already proves an exact allocated payload. Locate its
         // chunk only to distinguish pre-cycle sources from survivor targets;
-        // root/publication boundaries still use young_source's full checks.
+        // root/publication boundaries still check exact start membership.
         let Some(index) = self.chunk_index(object.as_ptr() as usize) else {
             return payload;
         };
@@ -445,7 +448,8 @@ impl<'a> MinorCollector<'a> {
         if chunk.kind == RegionKind::Pinned {
             return payload;
         }
-        if chunk.needs_index() {
+        #[cfg(debug_assertions)]
+        {
             let indexed = index_retired_chunk(chunk) as u64;
             self.stop_work.metadata_objects += indexed;
             self.stop_work.metadata_bytes += indexed * GC_HEADER_SIZE as u64;
@@ -958,18 +962,27 @@ impl<'a> MinorCollector<'a> {
                 chunk_index += 1;
                 continue;
             }
+            let source_objects = if !poison_moved && self.forwarded_per_chunk[identity] != 0 {
+                let chunk = &self.state.tlab_chunks[chunk_index];
+                if chunk.needs_index() {
+                    chunk.mark_bitmap.bits.count()
+                } else {
+                    chunk.header_offsets.len()
+                }
+            } else {
+                0
+            };
             if !poison_moved
                 && self.forwarded_per_chunk[identity] != 0
-                && (self.forwarded_per_chunk[identity]
-                    == self.state.tlab_chunks[chunk_index].header_offsets.len()
+                && (self.forwarded_per_chunk[identity] == source_objects
                     || self.sparse_survivor_chunk_is_dead(chunk_index, identity))
             {
-                // Every validated header in this chunk was forwarded exactly
+                // Every published object in this chunk was forwarded exactly
                 // once, or the rest are unreachable young objects without
                 // drop hooks. Descriptor ownership moved with each
                 // destination; no source owns a drop or descriptor release.
                 // Discard the whole prefix without decoding every header.
-                let objects = self.state.tlab_chunks[chunk_index].header_offsets.len() as u64;
+                let objects = source_objects as u64;
                 self.stop_work.swept_objects += objects;
                 reclaimed_young += objects;
                 self.state.allocated_bytes = self.state.allocated_bytes.saturating_sub(used);
@@ -980,10 +993,13 @@ impl<'a> MinorCollector<'a> {
                 continue;
             }
             if self.state.tlab_chunks[chunk_index].needs_index() {
-                // Marking never found a young object here, or `young_source`
-                // would have indexed the chunk: every object in it is dead
-                // and young (willow-8hq4.21).
-                if !self.may_drop(chunk_index) {
+                // An unindexed chunk can now also contain forwarded or
+                // pinned sources. Those require the shortcuts above or a
+                // complete sweep below, including relocation poisoning.
+                if self.forwarded_per_chunk[identity] == 0
+                    && !self.pinned_per_chunk[identity]
+                    && !self.may_drop(chunk_index)
+                {
                     // Nothing to run per object: account the whole chunk from
                     // its bump prefix and start-bit popcount, O(chunk words).
                     let objects = self.state.tlab_chunks[chunk_index].mark_bitmap.bits.count();
@@ -998,7 +1014,8 @@ impl<'a> MinorCollector<'a> {
                     self.release_chunk(chunk_index, &mut chunk_identities);
                     continue;
                 }
-                // Drop hooks need the per-object walk; validate it first.
+                // Drops, retained objects and poisoning need a per-object
+                // walk; build the complete validated index first.
                 let indexed = index_retired_chunk(&mut self.state.tlab_chunks[chunk_index]) as u64;
                 self.stop_work.metadata_objects += indexed;
                 self.stop_work.metadata_bytes += indexed * GC_HEADER_SIZE as u64;
@@ -1190,8 +1207,7 @@ impl<'a> MinorCollector<'a> {
         let chunk = &self.state.tlab_chunks[chunk_index];
         chunk.kind == RegionKind::Nursery
             && !self.pinned_per_chunk[identity]
-            && !chunk.header_offsets.is_empty()
-            && chunk.header_offsets.len() == chunk.mark_bitmap.bits.count()
+            && (chunk.needs_index() || chunk.header_offsets.len() == chunk.mark_bitmap.bits.count())
             && !self.may_drop(chunk_index)
     }
 
