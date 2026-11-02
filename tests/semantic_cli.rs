@@ -6115,3 +6115,100 @@ fn effect_states_versioned_schema_matches_impact_and_preserves_witnesses() {
             .all(|e| e["state"] == "none")
     );
 }
+
+#[test]
+fn open_self_call_effects_use_closed_dispatch_family() {
+    // Five inheritance shapes crossed with four call paths: twenty explicit
+    // dispatch perspectives, including inherited bodies and sibling overrides.
+    for classes in [
+        "class Child extends Base {}",
+        "class Child extends Base { pub override fn weight(self) -> i64 { return 2; } }",
+        "open class Middle extends Base {} class Child extends Middle {}",
+        "open class Middle extends Base { pub open override fn weight(self) -> i64 { return 2; } } class Child extends Middle { pub override fn weight(self) -> i64 { return 3; } }",
+        "class Sibling extends Base { pub override fn weight(self) -> i64 { return 3; } } class Child extends Base {}",
+    ] {
+        let f = Fixture::new();
+        let source = include_str!("../example/open_method_effect_queries.wi");
+        let begin = source.find("class Child").unwrap();
+        let end = source.find("fn through_interface").unwrap();
+        let source = format!("{}{}\n{}", &source[..begin], classes, &source[end..]);
+        fs::write(f.0.join("src/main.wi"), &source).unwrap();
+        for name in ["Base::count", "through_interface", "through_base", "relay"] {
+            let value = f.json(&["effects", &format!("main::{name}")], 0);
+            for effect in value["result"]["effects"].as_array().unwrap() {
+                // Panic capability is separately conservative for interface
+                // contracts; the five scheduler/allocation effects are pure.
+                if effect["effect"] != 32 {
+                    assert_eq!(effect["state"], "none", "{name}: {value}");
+                    assert_eq!(effect["unknown_reasons"], serde_json::json!([]), "{value}");
+                }
+                for reason in effect["unknown_reasons"].as_array().unwrap() {
+                    let location = &reason["location"];
+                    assert!(location.is_object(), "{name}: {value}");
+                    let start = location["start"].as_u64().unwrap() as usize;
+                    let end = location["end"].as_u64().unwrap() as usize;
+                    assert!(source[start..end].contains("weight"), "{name}: {value}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn open_self_call_effects_preserve_effectful_overrides() {
+    for (body, bit) in [
+        ("select { sleep(0) => {} } return 2;", 2),
+        ("let values = [1, 2]; return 2;", 1),
+        ("return 1 / 0;", 32),
+    ] {
+        let f = Fixture::new();
+        let source =
+            include_str!("../example/open_method_effect_queries.wi").replace("return 2;", body);
+        fs::write(f.0.join("src/main.wi"), source).unwrap();
+        for name in ["Base::count", "through_interface", "relay"] {
+            let value = f.json(&["effects", &format!("main::{name}")], 0);
+            let effect = value["result"]["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|effect| effect["effect"] == bit)
+                .unwrap();
+            assert_eq!(effect["state"], "may", "{name}: {value}");
+            assert!(effect["witness"]["location"].is_object(), "{value}");
+        }
+    }
+}
+
+#[test]
+fn interface_boundary_reasons_keep_reachable_caller_provenance() {
+    let f = Fixture::new();
+    let source = "interface W { fn weight(self) -> i64; }\nclass C implements W { pub fn weight(self) -> i64 { return 1; } }\nfn first(w: W) -> i64 { return w.weight(); }\nfn second(w: W) -> i64 { return w.weight(); }\nfn wrap_first(w: W) -> i64 { return first(w); }\nfn wrap_second(w: W) -> i64 { return second(w); }\nfn outer(w: W) -> i64 { return wrap_second(w); }\nfn main() {}\n";
+    fs::write(f.0.join("src/main.wi"), source).unwrap();
+    let first = source.find("w.weight()").unwrap() + 2;
+    let second = source.rfind("w.weight()").unwrap() + 2;
+    for (name, start) in [
+        ("first", first),
+        ("second", second),
+        ("wrap_first", first),
+        ("wrap_second", second),
+        ("outer", second),
+    ] {
+        let value = f.json(&["effects", &format!("main::{name}")], 0);
+        let reasons: Vec<_> = value["result"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|e| e["unknown_reasons"].as_array().unwrap())
+            .collect();
+        assert!(!reasons.is_empty(), "{name}: {value}");
+        for reason in reasons {
+            assert_eq!(reason["location"]["path"], "src/main.wi", "{name}: {value}");
+            assert_eq!(reason["location"]["start"], start, "{name}: {value}");
+            assert_eq!(
+                reason["location"]["end"],
+                start + "weight".len(),
+                "{name}: {value}"
+            );
+        }
+    }
+}

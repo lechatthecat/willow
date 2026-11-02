@@ -255,6 +255,25 @@ pub(super) fn finish(
             end: span.end,
         })
     };
+    // Compiler summaries include transitive boundary witnesses. Seed only at
+    // the owning call; the effect graph propagates evidence to reachable callers.
+    // Retain one span per caller/target pair without rescanning call sites.
+    let mut boundary_sites = HashMap::new();
+    for (&unit, capture) in captures {
+        for (caller, span, target, _) in &capture.semantic.call_sites {
+            if let Some(target) = target {
+                boundary_sites
+                    .entry((resolve(unit, *caller), resolve(unit, *target)))
+                    .and_modify(|previous: &mut Span| {
+                        let key = |s: Span| (s.file_id.0, s.start, s.end);
+                        if key(*span) < key(*previous) {
+                            *previous = *span;
+                        }
+                    })
+                    .or_insert(*span);
+            }
+        }
+    }
     let async_functions = captures
         .iter()
         .flat_map(|(&unit, capture)| {
@@ -297,8 +316,8 @@ pub(super) fn finish(
             }
             // Calls whose effects are already known without a body (variant
             // constructors, intrinsics) do not explain an unknown caller.
-            if target.is_some_and(|target| {
-                functions.contains_key(&resolve(unit, target)) || bodyless(unit, &target)
+            if effect_target.is_some_and(|target| {
+                functions.contains_key(&resolve(unit, *target)) || bodyless(unit, target)
             }) {
                 continue;
             }
@@ -328,8 +347,21 @@ pub(super) fn finish(
             .chain(&captures[&unit].semantic.suspension_sites)
         {
             let function = &functions[&resolve(unit, *id)].id;
-            let mut witnesses = witnesses.clone();
-            for witness in &mut witnesses {
+            let mut local_witnesses = Vec::with_capacity(witnesses.len());
+            for mut witness in witnesses.iter().cloned() {
+                if let Some(w) = witness.get_mut("witness")
+                    && let Some(target) = w.as_object_mut().and_then(|w| w.remove("target_key"))
+                {
+                    let target: FunctionId = serde_json::from_value(target)?;
+                    let Some(site) =
+                        boundary_sites.get(&(resolve(unit, *id), resolve(unit, target)))
+                    else {
+                        // This summary inherited the boundary from a callee.
+                        // Do not create a second, unlocated seed on the wrapper.
+                        continue;
+                    };
+                    w["cause"] = json!({"location":location(*site)?,"operation":"external-call"});
+                }
                 if let Some(w) = witness.get_mut("witness")
                     && let Some(owner) = w.as_object_mut().and_then(|w| w.remove("owner_key"))
                 {
@@ -360,12 +392,13 @@ pub(super) fn finish(
                             .map_or(Value::Null, |l| serde_json::to_value(l).unwrap());
                     }
                 }
+                local_witnesses.push(witness);
             }
             result
                 .witnesses
                 .entry(function.clone())
                 .or_default()
-                .extend(witnesses);
+                .extend(local_witnesses);
         }
         for body in &captures[&unit].semantic.bodies {
             let function = functions
@@ -2086,6 +2119,91 @@ mod tests {
                 RuntimeEffects::BIT_COUNT
             );
         }
+    }
+
+    #[test]
+    fn boundary_call_provenance_scales_with_disconnected_callers_and_wrappers() {
+        let directory =
+            std::env::temp_dir().join(format!("willow-boundary-provenance-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("main.wi");
+        for n in [16, 64, 256] {
+            let mut source = String::from(
+                "interface W { fn weight(self) -> i64; }\nclass C implements W { pub fn weight(self) -> i64 { return 1; } }\n",
+            );
+            let mut origins = Vec::new();
+            for i in 0..n {
+                source.push_str(&format!("fn caller{i}(w: W) -> i64 {{ return w."));
+                origins.push(source.len());
+                source.push_str("weight(); }\n");
+                source.push_str(&format!(
+                    "fn wrapper{i}(w: W) -> i64 {{ return caller{i}(w); }}\n"
+                ));
+                let callee = if i == 0 {
+                    "wrapper0".to_owned()
+                } else {
+                    format!("chain{}", i - 1)
+                };
+                source.push_str(&format!(
+                    "fn chain{i}(w: W) -> i64 {{ return {callee}(w); }}\n"
+                ));
+            }
+            source.push_str("fn main() {}\n");
+            std::fs::write(&path, source).unwrap();
+            let snapshot = crate::CompilerSession::new(
+                path.to_str().unwrap(),
+                "",
+                &crate::CompilerOptions::debug(),
+                None,
+            )
+            .analysis_with_emitter(&mut crate::diagnostics::HumanEmitter)
+            .unwrap();
+            let seeds = snapshot
+                .semantic
+                .witnesses
+                .values()
+                .flatten()
+                .filter(|w| w["witness"]["kind"] == "external-boundary")
+                .count();
+            assert_eq!(
+                seeds, n,
+                "transitive summaries must not duplicate local seeds"
+            );
+            let analysis = super::super::effect_states::Analysis::new(&snapshot);
+            let by_name: HashMap<_, _> = snapshot
+                .functions
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.name.as_str(), i))
+                .collect();
+            for (i, &origin) in origins.iter().enumerate() {
+                for (name, expected) in [
+                    (format!("caller{i}"), origin),
+                    (format!("wrapper{i}"), origin),
+                    (format!("chain{i}"), origins[0]),
+                ] {
+                    let output = analysis.output(by_name[name.as_str()]);
+                    let reasons = output[5]["unknown_reasons"].as_array().unwrap();
+                    assert_eq!(reasons.len(), 1, "{name}: {output}");
+                    assert_eq!(
+                        reasons[0]["location"]["start"], expected,
+                        "{name}: {output}"
+                    );
+                    assert_eq!(
+                        reasons[0]["location"]["end"],
+                        expected + 6,
+                        "{name}: {output}"
+                    );
+                }
+            }
+            // Exactly one boundary reason traverses each wrapper and chain edge.
+            assert_eq!(analysis.edge_visits, 2 * n);
+            println!(
+                "boundary callers={n} seeds={seeds} propagated_edge_visits={}",
+                analysis.edge_visits
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

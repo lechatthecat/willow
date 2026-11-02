@@ -72,16 +72,6 @@ impl Analysis {
             if !bodies[i] && !f.synthetic {
                 result.reason(i, RuntimeEffects::ALL.bits(), 3, f.locations.first());
             }
-            if !f.unresolved.is_empty() || (f.synthetic && f.unknown && index.callees[i].is_empty())
-            {
-                result.reason(i, RuntimeEffects::ALL.bits(), 1, f.locations.first());
-            }
-            if f.callees
-                .iter()
-                .any(|id| !index.by_id.contains_key(id.as_str()))
-            {
-                result.reason(i, RuntimeEffects::ALL.bits(), 1, f.locations.first());
-            }
             if f.id.starts_with("$indirect-arity:") {
                 result.reason(i, f.runtime_effects, 0, None);
             }
@@ -98,6 +88,16 @@ impl Analysis {
                         Some(&site.location),
                     );
                 }
+            }
+            if !f.unresolved.is_empty() || (f.synthetic && f.unknown && index.callees[i].is_empty())
+            {
+                result.reason(i, RuntimeEffects::ALL.bits(), 1, f.locations.first());
+            }
+            if f.callees
+                .iter()
+                .any(|id| !index.by_id.contains_key(id.as_str()))
+            {
+                result.reason(i, RuntimeEffects::ALL.bits(), 1, f.locations.first());
             }
             let ranges = super::semantic::local_ranges(&f.locations);
             if let Some(facts) = snapshot.semantic.witnesses.get(&f.id) {
@@ -381,6 +381,31 @@ mod tests {
         let mut s = fixture(1);
         s.functions[0].unresolved.push("callee".into());
         assert!(reason(&output(&s, 0), "unresolved-callee"));
+    }
+    #[test]
+    fn unresolved_reason_prefers_call_site_over_declaration() {
+        let mut s = fixture(2);
+        link(&mut s, 1, 0);
+        s.functions[0].unresolved.push("callee".into());
+        s.semantic.unresolved_calls.insert(
+            "f0".into(),
+            vec![semantic::UnresolvedCall {
+                operation: "callee".into(),
+                location: Location {
+                    path: "test.wi".into(),
+                    start: 3,
+                    end: 7,
+                },
+            }],
+        );
+        for i in [0, 1] {
+            let value = output(&s, i);
+            for effect in value.as_array().unwrap() {
+                assert_eq!(effect["state"], "unknown");
+                assert_eq!(effect["unknown_reasons"][0]["location"]["start"], 3);
+                assert_eq!(effect["unknown_reasons"][0]["location"]["end"], 7);
+            }
+        }
     }
     #[test]
     fn indirect_witness_is_unknown() {

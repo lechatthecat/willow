@@ -1,0 +1,17 @@
+interface Weighted { fn weight(self) -> i64; }
+open class Base implements Weighted {
+    pub open fn weight(self) -> i64 { return 1; }
+    pub fn count(self) -> i64 { return self.weight() + 1; }
+}
+class Child extends Base {
+    pub override fn weight(self) -> i64 { return 2; }
+}
+fn through_interface(value: Weighted) -> i64 { return value.weight(); }
+fn through_base(value: Base) -> i64 { return value.count(); }
+fn relay(value: Base) -> i64 { return through_base(value); }
+fn main() {
+    let value: Base = new Child();
+    println(value.count());
+    println(through_interface(value));
+    println(relay(value));
+}
