@@ -1,0 +1,20 @@
+// Signed division truncates toward zero; remainder has the dividend's sign.
+// Zero divisors and MIN / -1 (including MIN % -1) panic in both build modes.
+fn divide(a: i64, b: i64) -> i64 { return a / b; }
+fn remainder(a: i64, b: i64) -> i64 { return a % b; }
+
+fn main() {
+    println(divide(-7, 2));
+    println(remainder(-7, 2));
+    println(divide(7, -2));
+    println(remainder(7, -2));
+    if true {
+        defer match recover() { Some(info) => println(info.message), None => {} }
+        println(divide((0 - 9223372036854775807 - 1), -1));
+    }
+    if true {
+        defer match recover() { Some(info) => println(info.message), None => {} }
+        println(remainder((0 - 9223372036854775807 - 1), -1));
+    }
+    println("after");
+}

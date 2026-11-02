@@ -1,4 +1,4 @@
-//! Integer overflow policy (willow-jz15.14, docs/decisions/0012).
+//! Integer overflow policy (docs/decisions/0012).
 //!
 //! Debug builds check `+ - * **` and prefix `-` on `i64` and raise a
 //! recoverable panic; release builds wrap. `wrapping_*` / `checked_*` behave
@@ -465,4 +465,119 @@ fn integer_overflow_25_division_overflow_still_panics_in_release() {
     let (out, err, ok) = run_mode(source, true);
     assert!(!ok, "{out}");
     assert!(err.contains("integer overflow"), "{err}");
+}
+
+/// Signed division truncates toward zero; remainder follows the dividend.
+/// Exercise all sign pairs, small dividends, zero, exact multiples, both
+/// endpoints and constant folding as well as calls with dynamic operands.
+#[test]
+fn integer_division_signed_matrix_both_modes() {
+    let cases: &[(i64, i64, i64, i64)] = &[
+        (7, 2, 3, 1),
+        (-7, 2, -3, -1),
+        (7, -2, -3, 1),
+        (-7, -2, 3, -1),
+        (1, 2, 0, 1),
+        (-1, 2, 0, -1),
+        (1, -2, 0, 1),
+        (-1, -2, 0, -1),
+        (0, 2, 0, 0),
+        (0, -2, 0, 0),
+        (8, 2, 4, 0),
+        (-8, 2, -4, 0),
+        (8, -2, -4, 0),
+        (-8, -2, 4, 0),
+        (i64::MIN, 1, i64::MIN, 0),
+        (i64::MIN, 2, -4611686018427387904, 0),
+        (i64::MIN, -2, 4611686018427387904, 0),
+        (i64::MIN, i64::MAX, -1, -1),
+        (i64::MAX, -1, -9223372036854775807, 0),
+        (i64::MAX, i64::MIN, 0, i64::MAX),
+        (i64::MIN, i64::MIN, 1, 0),
+    ];
+    let mut source = String::from(
+        "fn div(a: i64, b: i64) -> i64 { return a / b; }\n\
+         fn rem(a: i64, b: i64) -> i64 { return a % b; }\nfn main() {\n",
+    );
+    let mut expected = String::new();
+    for &(a, b, q, r) in cases {
+        source.push_str(&format!(
+            "println(div({a}, {b})); println(rem({a}, {b}));\n\
+             println(({a}) / ({b})); println(({a}) % ({b}));\n"
+        ));
+        expected.push_str(&format!("{q}\n{r}\n{q}\n{r}\n"));
+    }
+    source.push_str("}\n");
+    // The lexer accepts positive i64 literals; construct MIN without an out-of-range token.
+    let source = source.replace("-9223372036854775808", "(0 - 9223372036854775807 - 1)");
+    for release in [false, true] {
+        let (out, err, ok) = run_mode(&source, release);
+        assert!(ok, "release={release}: {out}\n{err}");
+        assert_eq!(out, expected, "release={release}");
+    }
+}
+
+#[test]
+fn integer_division_faults_recover_in_both_modes() {
+    let mut source = String::from(
+        "fn div(a: i64, b: i64) -> i64 { defer println(\"cleanup\"); return a / b; }\n\
+         fn rem(a: i64, b: i64) -> i64 { defer println(\"cleanup\"); return a % b; }\n\
+         fn main() {\n",
+    );
+    let mut expected = String::new();
+    for (expression, message, cleanup) in [
+        (
+            "div((0 - 9223372036854775807 - 1), -1)",
+            "integer overflow: `i64::MIN / -1`",
+            true,
+        ),
+        (
+            "rem((0 - 9223372036854775807 - 1), -1)",
+            "integer overflow: `i64::MIN % -1`",
+            true,
+        ),
+        ("div(7, 0)", "division by zero", true),
+        ("rem(-7, 0)", "remainder by zero", true),
+        (
+            "(0 - 9223372036854775807 - 1) / (-1)",
+            "integer overflow: `i64::MIN / -1`",
+            false,
+        ),
+        (
+            "(0 - 9223372036854775807 - 1) % (-1)",
+            "integer overflow: `i64::MIN % -1`",
+            false,
+        ),
+        ("7 / 0", "division by zero", false),
+        ("(-7) % 0", "remainder by zero", false),
+    ] {
+        source.push_str(&format!(
+            "if true {{ defer match recover() {{ Some(info) => println(info.message), None => {{}} }}\n\
+             println({expression}); println(\"unreachable\"); }}\n"
+        ));
+        if cleanup {
+            expected.push_str("cleanup\n");
+        }
+        expected.push_str(message);
+        expected.push('\n');
+    }
+    source.push_str("println(\"after\"); }\n");
+    expected.push_str("after\n");
+    for release in [false, true] {
+        let (out, err, ok) = run_mode(&source, release);
+        assert!(ok, "release={release}: {out}\n{err}");
+        assert_eq!(out, expected, "release={release}");
+    }
+}
+
+#[test]
+fn integer_division_example_both_modes() {
+    for release in [false, true] {
+        let (out, err, ok) = run_mode(include_str!("../../example/integer_division.wi"), release);
+        assert!(ok, "release={release}: {out}\n{err}");
+        assert_eq!(
+            out,
+            "-3\n-1\n-3\n1\ninteger overflow: `i64::MIN / -1`\ninteger overflow: `i64::MIN % -1`\nafter\n"
+        );
+    }
 }
