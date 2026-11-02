@@ -1381,6 +1381,105 @@ fn async_capture_diagnostic_explains_nested_field_without_package_hash() {
 }
 
 #[test]
+fn suspension_evidence_preserves_await_sites_alongside_locks() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    for (mode, ty) in [
+        ("lock", "Mutex"),
+        ("lock read", "RwLock"),
+        ("lock write", "RwLock"),
+    ] {
+        for first in [false, true] {
+            let lock = format!("    {mode} m as v {{ }}\n");
+            let waits = "    await sleep(0);\n    await yield();\n";
+            let body = if first {
+                format!("{waits}{lock}")
+            } else {
+                format!("{lock}{waits}")
+            };
+            fs::write(
+                f.0.join("src/main.wi"),
+                format!("async fn watch(m: {ty}<i64>) {{\n{body}}}\nfn main() {{}}\n"),
+            )
+            .unwrap();
+            let expected = if first { [2, 3] } else { [3, 4] };
+            for source in [false, true] {
+                let mut args = vec!["effects", "main::watch", "--all"];
+                if source {
+                    args.extend(["--source", "src/main.wi"]);
+                }
+                let mut json_args = args.clone();
+                json_args.push("--explain");
+                let value = f.json(&json_args, 0);
+                let evidence = value["result"]["effect_evidence"].as_array().unwrap();
+                let awaits: Vec<_> = evidence
+                    .iter()
+                    .filter(|e| {
+                        e["effect"] == E::MAY_SUSPEND.bits()
+                            && e["witness"]["cause"]["operation"] == "await"
+                    })
+                    .collect();
+                assert_eq!(awaits.len(), 2, "{value}");
+                for (site, line) in awaits.iter().zip(expected) {
+                    assert_eq!(
+                        site["witness"]["cause"]["location"]["line"], line,
+                        "{value}"
+                    );
+                    assert_eq!(site["witness"]["cause"]["location"]["column"], 5);
+                    assert_eq!(site["witness"]["awaited_type"], "Future<void>");
+                    assert_eq!(site["task_relationship"]["kind"], "await");
+                }
+                assert!(
+                    evidence.iter().any(|e| e["effect"] == E::MAY_SUSPEND.bits()
+                        && e["witness"]["cause"]["operation"] == "lock"),
+                    "{value}"
+                );
+                for explain in [false, true] {
+                    let mut args = args.clone();
+                    if explain {
+                        args.push("--explain");
+                    }
+                    let out = f.run(&args);
+                    assert!(out.status.success());
+                    let text = String::from_utf8(out.stdout).unwrap();
+                    for line in expected {
+                        assert!(text.contains(&format!("main.wi:{line}:5")), "{text}");
+                    }
+                    assert!(text.contains("operation=lock"), "{text}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn suspension_evidence_all_preserves_large_await_loop_body() {
+    let f = Fixture::new();
+    for n in [8, 32, 64] {
+        let waits = "    await sleep(0);\n".repeat(n);
+        fs::write(f.0.join("src/main.wi"), format!("async fn watch(m: Mutex<i64>) {{\n  let mut i = 0;\n  while i < 1 {{\n    lock m as v {{ }}\n{waits}    i += 1;\n  }}\n}}\nfn main() {{}}\n")).unwrap();
+        for all in [false, true] {
+            let mut args = vec!["effects", "main::watch"];
+            if all {
+                args.push("--all");
+            }
+            let out = f.run(&args);
+            assert!(out.status.success());
+            let text = String::from_utf8(out.stdout).unwrap();
+            if all {
+                assert_eq!(text.matches("operation=await").count(), n, "{text}");
+                for line in 5..5 + n {
+                    assert!(text.contains(&format!("main.wi:{line}:5")), "{text}");
+                }
+                assert!(text.contains("operation=lock"), "{text}");
+            } else {
+                assert!(text.matches("operation=await").count() <= 50, "{text}");
+            }
+        }
+    }
+}
+
+#[test]
 fn locks_have_suspend_compiler_evidence_after_await_and_in_callers() {
     let f = Fixture::new();
     for (mode, ty) in [

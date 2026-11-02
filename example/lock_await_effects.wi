@@ -1,0 +1,24 @@
+class Snap {
+    pub version: i64;
+    pub init(self, version: i64) { self.version = version; }
+}
+
+async fn watch(view: RwLock<Snap>, target: i64) -> i64 {
+    let mut seen = 0;
+    while seen < target {
+        lock read view as v { seen = v.version; }
+        await sleep(1);
+    }
+    return seen;
+}
+
+async fn nap_loop(n: i64) {
+    let mut i = 0;
+    while i < n { i += 1; await sleep(1); }
+}
+
+async fn main() {
+    let view = RwLock::new(new Snap(3));
+    println(await watch(view, 1));
+    await nap_loop(2);
+}

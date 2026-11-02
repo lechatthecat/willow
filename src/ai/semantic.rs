@@ -198,6 +198,17 @@ impl Captured {
                 "Conservative await bound for {operand_name}; waiting may park or block depending on the selected lowering. This summary does not establish which path executes."
             )
         };
+        // Summary witnesses retain one representative per effect. Preserve each
+        // await independently, including when a lock already owns that bit.
+        self.suspension_sites
+            .entry(function)
+            .or_default()
+            .push(json!({
+                "effect": RuntimeEffects::MAY_SUSPEND.bits(),
+                "witness": {"kind":"runtime-capability", "certainty":"conservative-bound",
+                    "cause":{"span":span,"operation":"await"},
+                    "awaited_type":operand, "reason":reason}
+            }));
         if let Some(witnesses) = self.witnesses.get_mut(&function) {
             let site = json!(span);
             for entry in witnesses {
@@ -1344,12 +1355,9 @@ impl QuerySession {
                                 {
                                     continue;
                                 }
-                                let channel = effect
-                                    == u64::from(RuntimeEffects::MAY_SUSPEND.bits())
-                                    && fact["witness"]["cause"]["operation"]
-                                        .as_str()
-                                        .is_some_and(|op| op.starts_with("channel-"));
-                                if !channel
+                                let suspension =
+                                    effect == u64::from(RuntimeEffects::MAY_SUSPEND.bits());
+                                if !suspension
                                     && evidence.get(&effect).is_some_and(|entry: &Value| {
                                         !prefer_allocation(
                                             effect as u8,
@@ -1371,7 +1379,7 @@ impl QuerySession {
                                     explained["task_relationship"] = json!({"kind":"await", "function":self.snapshot.functions[via_function].id,
                                         "location":fact["witness"]["cause"]["location"]});
                                 }
-                                if channel {
+                                if suspension {
                                     suspension_sites.push(explained);
                                 } else {
                                     evidence.insert(effect, explained);
@@ -2090,6 +2098,27 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn await_capture_keeps_summary_scans_bounded() {
+        for n in [1, 8, 64, 512] {
+            let mut captured = Captured::default();
+            let function = FunctionId::free("worker");
+            for _ in 0..n {
+                captured.capability(function, RuntimeEffects::ALL.bits(), Span::dummy(), "await");
+                captured.await_type(function, Span::dummy(), Some("Future<void>"), true);
+            }
+            assert_eq!(captured.suspension_sites[&function].len(), n);
+            assert_eq!(
+                captured.witnesses[&function].len(),
+                RuntimeEffects::BIT_COUNT as usize
+            );
+            println!(
+                "awaits={n}, stored sites={n}, summary scan bound={}",
+                RuntimeEffects::BIT_COUNT
+            );
+        }
     }
 
     #[test]
