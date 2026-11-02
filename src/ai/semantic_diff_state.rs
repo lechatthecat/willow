@@ -137,7 +137,7 @@ struct Route {
 #[derive(Clone)]
 pub(super) struct ReportState {
     pub(super) functions: im::OrdMap<String, std::sync::Arc<Function>>,
-    ids: im::OrdMap<String, String>,
+    pub(super) ids: im::OrdMap<String, String>,
     types: Arc<display::TypeNames>,
     reverse: im::OrdMap<String, im::OrdSet<String>>,
     asynchronous: im::OrdSet<String>,
@@ -362,6 +362,16 @@ impl Capture {
         }
         for id in removed_symbols.iter().chain(removed_functions) {
             if let Some(key) = next.retained.ids.get(id) {
+                next.shapes.remove(key);
+                if matching::is_lambda(key)
+                    && let Some(owner) = matching::scope(key)
+                    && let Some(lambdas) = next.lambda_owners.get_mut(&owner)
+                {
+                    lambdas.remove(key);
+                    if lambdas.is_empty() {
+                        next.lambda_owners.remove(&owner);
+                    }
+                }
                 if let Some(old) = next.baseline.facts.remove(key) {
                     next.baseline.public_count -=
                         usize::from(public_signature(old.signature.as_ref()));
@@ -686,6 +696,12 @@ impl Capture {
         next.baseline.reindex_diagnostics()?;
         // This private capture is compared in memory; the public report receives
         // the independently captured source-tree digest, not a serialized baseline.
+        matching::update_shapes(
+            &mut next.shapes,
+            &mut next.lambda_owners,
+            patch,
+            &next.retained.ids,
+        )?;
         next.baseline.revision = patch.revision.clone();
         Ok(next)
     }

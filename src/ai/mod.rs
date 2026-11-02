@@ -1670,6 +1670,9 @@ struct TokenHashes {
 }
 impl TokenHashes {
     fn new(source: &str) -> Result<Self> {
+        Self::with_identifier_shape(source, false)
+    }
+    fn with_identifier_shape(source: &str, normalize: bool) -> Result<Self> {
         let tokens = crate::lexer::Lexer::new(source)
             .tokenize()
             .map_err(|_| anyhow::anyhow!("snapshot source lexing failed"))?;
@@ -1683,12 +1686,20 @@ impl TokenHashes {
             if matches!(token.kind, crate::lexer::token::TokenKind::Eof) {
                 continue;
             }
-            result
-                .names
-                .entry(source[token.span.start..token.span.end].to_owned())
-                .or_default()
-                .push((token.span.start, token.span.end));
-            let hash = Sha256::digest(format!("{:?}", token.kind).as_bytes());
+            if !normalize {
+                result
+                    .names
+                    .entry(source[token.span.start..token.span.end].to_owned())
+                    .or_default()
+                    .push((token.span.start, token.span.end));
+            }
+            let spelling =
+                if normalize && matches!(token.kind, crate::lexer::token::TokenKind::Ident(_)) {
+                    "identifier".to_owned()
+                } else {
+                    format!("{:?}", token.kind)
+                };
+            let hash = Sha256::digest(spelling.as_bytes());
             let mut next = [0; 2];
             let mut power = [0; 2];
             for (i, base) in [0x9e3779b185ebca87u64, 0xc2b2ae3d27d4eb4fu64]

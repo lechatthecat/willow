@@ -11,6 +11,13 @@ pub(super) fn assign(changes: &mut [Value], before: &Baseline, after: &Baseline)
     if seeds.is_empty() {
         return Ok(0);
     }
+    let mut aliases: BTreeMap<String, String> = BTreeMap::new();
+    for change in changes.iter() {
+        if let (Some(old), Some(new)) = (change["symbol"].as_str(), change["renamed_to"].as_str()) {
+            aliases.insert(old.to_owned(), new.to_owned());
+            aliases.insert(new.to_owned(), old.to_owned());
+        }
+    }
     let mut reached: BTreeSet<String> = seeds.iter().map(|(_, s)| s.clone()).collect();
     let mut pending: VecDeque<_> = reached.iter().cloned().collect();
     let mut graph = BTreeMap::new();
@@ -21,6 +28,14 @@ pub(super) fn assign(changes: &mut [Value], before: &Baseline, after: &Baseline)
             .into_iter()
             .flatten()
             .chain(after.callers.get(&node).into_iter().flatten())
+            .chain(aliases.get(&node).into_iter().flat_map(|alias| {
+                before
+                    .callers
+                    .get(alias)
+                    .into_iter()
+                    .flatten()
+                    .chain(after.callers.get(alias).into_iter().flatten())
+            }))
             .cloned()
             .collect();
         for caller in &edges {

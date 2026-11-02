@@ -187,8 +187,17 @@ JSON uses `schema: "willow.semantic-diff.v1"` with `status`, `base`, `target`,
 `changes`, and `summary`. Each change identifies its symbol and match result,
 added/removed effects, witness causes and certainty, impacted callers, contracts,
 public API changes, and call-target changes. Symbol matching uses module-relative
-declaration names and kinds, compares signatures, and rejects ambiguous duplicate
-names instead of guessing renames. Paths use workspace-relative `/` separators.
+declaration names and kinds, then pairs unique unmatched declarations within the
+same scope by signature and identifier-independent body structure. Such changes
+use `match: "renamed"` and `renamed_to`; exported renames use `public_api: "renamed"`.
+Ambiguous declaration candidates remain additions/removals. Lambda correspondence
+ignores byte displacement and follows the owning declaration's correspondence;
+equal byte ranges across revisions do not establish lambda identity. Equal-shaped
+occurrences within one owner retain source order when their counts agree. Local-only spelling edits do not create API changes.
+Call-target comparison follows the correspondence while retaining the original
+`targets.base` and `targets.target` identities; `targets.change` indicates whether
+the target set actually changed. Text output presents source names for dispatch,
+lambda and function-value summaries. Paths use workspace-relative `/` separators.
 The legacy `edit verify` and effects JSON formats remain unchanged.
 
 Exit codes are 0 for a complete result without violations, 1 for a contract

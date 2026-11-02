@@ -1,7 +1,10 @@
 use super::*;
 use std::{fs, path::PathBuf, process::Command};
 
-fn captures(a: &str, b: &str) -> (Capture, Capture) {
+pub(super) fn captures(a: &str, b: &str) -> (Capture, Capture) {
+    captures_mode(a, b, true)
+}
+fn captures_mode(a: &str, b: &str, retained: bool) -> (Capture, Capture) {
     let scratch = tree::Scratch::new().unwrap();
     let options = Options {
         root: scratch.0.clone(),
@@ -14,6 +17,9 @@ fn captures(a: &str, b: &str) -> (Capture, Capture) {
     fs::write(scratch.0.join("main.wi"), a).unwrap();
     let before = analyze(&options, &scratch, &mut revision, Path::new("main.wi")).unwrap();
     fs::write(scratch.0.join("main.wi"), b).unwrap();
+    if !retained {
+        revision = crate::compiler_db::revision::AnalysisRevision::default();
+    }
     let after = analyze(&options, &scratch, &mut revision, Path::new("main.wi")).unwrap();
     (before, after)
 }
@@ -44,14 +50,9 @@ fn semantic_diff_public_signature_add_remove_and_rename() {
         assert!(r.changes.iter().any(|v| v["public_api"] == kind), "{r:?}");
     }
     let r = report("pub fn f() {} fn main() {}", "pub fn g() {} fn main() {}");
-    assert_eq!(
-        r.changes.iter().filter(|v| v["match"] == "added").count(),
-        1
-    );
-    assert_eq!(
-        r.changes.iter().filter(|v| v["match"] == "removed").count(),
-        1
-    );
+    assert_eq!(r.changes.len(), 1, "{r:?}");
+    assert_eq!(r.changes[0]["match"], "renamed");
+    assert_eq!(r.changes[0]["public_api"], "renamed");
 }
 #[test]
 fn semantic_diff_contract_strength_and_weakness() {
@@ -2161,4 +2162,340 @@ fn semantic_diff_candidate_reclamation_is_amortized() {
             "candidate-amortized size={size} revisions=128 gc_work={work} mutation_credit={credit} collections={collections}"
         );
     }
+}
+
+#[test]
+fn semantic_diff_rename_five_kinds() {
+    let source = include_str!("../../example/rename_semantic_verification.wi");
+    let edits = [
+        ("paid_total", "settled_total"),
+        ("Borrowed", "Lent"),
+        ("digest", "fingerprint"),
+        ("member", "require_member"),
+        ("tag", "reason_tag"),
+    ];
+    for individual in 0..=edits.len() {
+        let mut target = source.to_owned();
+        for (i, (old, new)) in edits.iter().enumerate() {
+            if individual == edits.len() || individual == i {
+                target = target.replace(old, new);
+            }
+        }
+        let r = report(source, &target);
+        assert_eq!(r.exit_code(), 0, "{individual}: {r:?}");
+        assert_eq!(r.changes.len(), [1, 1, 2, 1, 0, 5][individual], "{r:?}");
+        assert!(
+            r.changes.iter().all(|c| c["match"] == "renamed"),
+            "{individual}: {r:?}"
+        );
+        assert!(r.changes.iter().all(|c| c["effects"]["added"] == json!([]) && c["effects"]["removed"] == json!([])), "{r:?}");
+        let text = r.human(true);
+        assert!(
+            !text.contains("$dispatch$")
+                && !text.contains("@")
+                && !text.contains("function-value candidates"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn semantic_diff_rename_boundaries() {
+    // Each row is a separate acceptance perspective, not a whole-suite run.
+    for (label, source, target, renamed, added) in [
+        (
+            "private function",
+            "fn f() {} fn main() { f(); }",
+            "fn longer() {} fn main() { longer(); }",
+            1,
+            false,
+        ),
+        (
+            "recursive",
+            "fn f(n:i64)->i64 { if n == 0 { return 0; } return f(n-1); } fn main() {}",
+            "fn g(n:i64)->i64 { if n == 0 { return 0; } return g(n-1); } fn main() {}",
+            1,
+            false,
+        ),
+        (
+            "literal change",
+            "fn f()->i64 { return 1; } fn main() {}",
+            "fn g()->i64 { return 2; } fn main() {}",
+            0,
+            true,
+        ),
+        (
+            "operator change",
+            "fn f(n:i64)->i64 { return n+1; } fn main() {}",
+            "fn g(n:i64)->i64 { return n-1; } fn main() {}",
+            0,
+            true,
+        ),
+        (
+            "signature change",
+            "fn f(n:i64) {} fn main() {}",
+            "fn g(n:bool) {} fn main() {}",
+            0,
+            true,
+        ),
+        (
+            "visibility change",
+            "fn f() {} fn main() {}",
+            "pub fn g() {} fn main() {}",
+            0,
+            true,
+        ),
+        (
+            "ambiguous candidates",
+            "fn a() {} fn b() {} fn main() {}",
+            "fn c() {} fn d() {} fn main() {}",
+            0,
+            true,
+        ),
+        (
+            "different owners",
+            "class A { fn f(self) {} } class B {} fn main() {}",
+            "class A {} class B { fn g(self) {} } fn main() {}",
+            0,
+            true,
+        ),
+        (
+            "lambda displacement",
+            "fn f() {} fn main() { let f = |x:i64| x+1; println(f(2)); }",
+            "// moved\nfn f() {} fn main() { let f = |x:i64| x+1; println(f(2)); }",
+            0,
+            false,
+        ),
+        (
+            "local rename",
+            "fn main() { let x = 1; println(x); }",
+            "fn main() { let longer = 1; println(longer); }",
+            0,
+            false,
+        ),
+        (
+            "parameter rename",
+            "fn main() { let f = |x:i64| x+1; println(f(2)); }",
+            "fn main() { let f = |longer:i64| longer+1; println(f(2)); }",
+            0,
+            false,
+        ),
+        (
+            "field type change",
+            "class A { pub x:i64; } fn main() {}",
+            "class A { pub y:bool; } fn main() {}",
+            0,
+            true,
+        ),
+        (
+            "variant payload change",
+            "enum E { A(i64) } fn main() {}",
+            "enum E { B(bool) } fn main() {}",
+            0,
+            true,
+        ),
+        (
+            "unchanged sibling",
+            "fn keep() {} fn a() {} fn main() {}",
+            "fn keep() {} fn b() {} fn main() {}",
+            1,
+            false,
+        ),
+    ] {
+        let r = report(source, target);
+        assert_eq!(r.exit_code(), 0, "{label}: {r:?}");
+        assert_eq!(
+            r.changes.iter().filter(|c| c["match"] == "renamed").count(),
+            renamed,
+            "{label}: {r:?}"
+        );
+        assert_eq!(
+            r.changes.iter().any(|c| c["match"] == "added"),
+            added,
+            "{label}: {r:?}"
+        );
+        if !added {
+            assert_eq!(r.changes.len(), renamed, "{label}: {r:?}");
+        }
+    }
+}
+
+#[test]
+fn semantic_diff_rename_preserves_effect_and_contract_evidence() {
+    let a = "fn f(c:BlockingCell<i64>) { c.get(); } fn main() {}";
+    let b = "@effects(no_wait) fn g(c:BlockingCell<i64>) { c.get(); } fn main() {}";
+    let r = report(a, b);
+    assert_eq!(r.exit_code(), 1, "{r:?}");
+    let change = r.changes.iter().find(|c| c["match"] == "renamed").unwrap();
+    assert_eq!(change["contract"]["change"], "added");
+    assert!(
+        !change["contract"]["target_violations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        change["cause"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cause| cause["side"] == "target" && cause["chain"][0] == change["renamed_to"])
+    );
+}
+
+#[test]
+fn semantic_diff_rename_repeated_lambdas_keep_occurrence_order() {
+    let source = "fn main() { let a = |x:i64| x+1; let b = |x:i64| x+1; println(a(1)+b(2)); }";
+    let r = report(source, &format!("// shift all identical bodies\n{source}"));
+    assert_eq!(r.exit_code(), 0, "{r:?}");
+    assert!(r.changes.is_empty(), "{r:?}");
+}
+
+#[test]
+fn semantic_diff_rename_does_not_hide_effect_growth_or_retargeting() {
+    let prefix = "fn quiet(c:BlockingCell<i64>) {} fn loud(c:BlockingCell<i64>) { c.get(); } ";
+    let a = format!("{prefix} fn f(c:BlockingCell<i64>) {{ quiet(c); }} fn main() {{}}");
+    let b = format!("{prefix} fn g(c:BlockingCell<i64>) {{ loud(c); }} fn main() {{}}");
+    let (before, after) = captures(&a, &b);
+    let r = compare(&before, &after, true).unwrap();
+    assert_eq!(r.exit_code(), 1, "{r:?}");
+    let change = r.changes.iter().find(|c| c["match"] == "renamed").unwrap();
+    assert!(
+        change["effects"]["added"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("may-block"))
+    );
+    assert_eq!(change["targets"]["change"], "changed");
+    assert!(
+        change["targets"]["base"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("main.wi::function::quiet#0"))
+    );
+    assert!(
+        change["targets"]["target"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("main.wi::function::loud#0"))
+    );
+}
+
+#[test]
+fn semantic_diff_rename_cold_and_retained_agree() {
+    let source = include_str!("../../example/rename_semantic_verification.wi");
+    let target = source
+        .replace("paid_total", "settled_total")
+        .replace("Borrowed", "Lent")
+        .replace("digest", "fingerprint")
+        .replace("member", "require_member")
+        .replace("tag", "reason_tag");
+    let scratch = tree::Scratch::new().unwrap();
+    let opts = Options {
+        root: scratch.0.clone(),
+        entry: Some("main.wi".into()),
+        project: false,
+        base: String::new(),
+        fail_on_growth: false,
+    };
+    let mut revision = crate::compiler_db::revision::AnalysisRevision::default();
+    fs::write(scratch.0.join("main.wi"), source).unwrap();
+    let before = analyze(&opts, &scratch, &mut revision, Path::new("main.wi")).unwrap();
+    fs::write(scratch.0.join("main.wi"), &target).unwrap();
+    let retained = analyze(&opts, &scratch, &mut revision, Path::new("main.wi")).unwrap();
+    let cold = analyze(
+        &opts,
+        &scratch,
+        &mut crate::compiler_db::revision::AnalysisRevision::default(),
+        Path::new("main.wi"),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(compare(&before, &retained, false).unwrap()).unwrap(),
+        serde_json::to_value(compare(&before, &cold, false).unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn semantic_diff_rename_lambda_offset_collision() {
+    let source = "fn main() { let a = |x:i64| x+1; let b = |x:i64| x+2; println(a(1)+b(2)); }";
+    let prefix = "//123456789012345678\n";
+    assert_eq!(prefix.len(), 21);
+    for (before, after) in [
+        (source.to_owned(), format!("{prefix}{source}")),
+        (format!("{prefix}{source}"), source.to_owned()),
+    ] {
+        for retained in [false, true] {
+            let (before, after) = captures_mode(&before, &after, retained);
+            let r = compare(&before, &after, false).unwrap();
+            assert_eq!(r.exit_code(), 0, "{r:?}");
+            assert!(r.changes.is_empty(), "{r:?}");
+        }
+    }
+}
+
+#[test]
+fn semantic_diff_rename_lambda_owner_correspondence() {
+    for source in [
+        "fn f()->i64 { let h = |x:i64| x+1; return h(1); } fn main() { println(f()); }",
+        "class C { fn f(self)->i64 { let h = |x:i64| x+1; return h(1); } pub fn call(self)->i64 { return self.f(); } } fn main() { let c = new C(); println(c.call()); }",
+    ] {
+        let target = source.replace("f(", "g(");
+        for retained in [false, true] {
+            let (before, after) = captures_mode(source, &target, retained);
+            let r = compare(&before, &after, false).unwrap();
+            assert_eq!(r.exit_code(), 0, "{r:?}");
+            assert_eq!(r.changes.len(), 1, "{r:?}");
+            assert_eq!(r.changes[0]["match"], "renamed");
+            assert_eq!(r.changes[0]["effects"]["added"], json!([]));
+            assert_eq!(r.changes[0]["effects"]["removed"], json!([]));
+            assert_eq!(r.changes[0]["targets"]["change"], "unchanged");
+        }
+    }
+}
+
+#[test]
+fn semantic_diff_rename_lambda_shared_equal_keys() {
+    // The colliding middle key has equal facts and is absent from the diff
+    // index. Matching must still include every occurrence of this owner.
+    let source = "fn main() { let a = |x:i64| x+1; let b = |x:i64| x+1; println(a(1)+b(2)); }";
+    let target = format!("//123456789012345678\n{source}");
+    let (before, after) = captures_mode(source, &target, false);
+    let keys = comparison_keys(&before, &after, &mut Work::default());
+    let shared: Vec<_> = before
+        .baseline
+        .facts
+        .keys()
+        .filter(|k| matching::is_lambda(k) && after.baseline.facts.contains_key(*k))
+        .collect();
+    assert_eq!(shared.len(), 1);
+    assert!(!keys.contains(shared[0]));
+    let r = compare(&before, &after, false).unwrap();
+    assert_eq!(r.exit_code(), 0, "{r:?}");
+    assert!(r.changes.is_empty(), "{r:?}");
+}
+
+#[test]
+fn semantic_diff_rename_lambda_collision_preserves_effect_growth() {
+    let source = "fn quiet(c:BlockingCell<i64>)->i64 { return 0; } fn noisy(c:BlockingCell<i64>)->i64 { return c.get(); } fn main() { let a = |x:BlockingCell<i64>| quiet(x); let b = |x:BlockingCell<i64>| quiet(x); }";
+    let positions: Vec<_> = source.match_indices("|x:").map(|(at, _)| at).collect();
+    let shift = positions[1] - positions[0];
+    let target = format!(
+        "//{}\n{}",
+        "s".repeat(shift - 3),
+        source.replacen("| quiet(x)", "| noisy(x)", 1)
+    );
+    let (before, after) = captures(source, &target);
+    let r = compare(&before, &after, true).unwrap();
+    assert_eq!(r.exit_code(), 1, "{r:?}");
+    assert!(
+        r.changes
+            .iter()
+            .any(|c| c["symbol"].as_str().is_some_and(matching::is_lambda)
+                && c["effects"]["added"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("may-block"))),
+        "{r:?}"
+    );
 }

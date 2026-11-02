@@ -1,0 +1,19 @@
+// Rename fields, variants, interface methods, private methods and locals,
+// then compare with willow verify-edit against the original Git revision.
+
+pub interface Projection { fn digest(self) -> i64; }
+pub class Library implements Projection {
+    pub paid_total: i64;
+    pub init(self) { self.paid_total = 3; }
+    fn member(self) -> i64 { return self.paid_total; }
+    pub fn digest(self) -> i64 { return self.member(); }
+}
+pub enum Event { Borrowed(i64), Returned }
+fn submit(value: i64) -> i64 { let tag = value; return tag; }
+fn main() {
+    let library = new Library();
+    let event = Event::Borrowed(1);
+    let value = match event { Event::Borrowed(n) => n, Event::Returned => 0 };
+    let f = |n: i64| n + 1;
+    println(f(library.digest() + submit(value)));
+}

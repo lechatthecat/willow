@@ -5,6 +5,8 @@ mod tree;
 pub use tree::resolve_base;
 #[path = "semantic_diff_impact.rs"]
 mod impact;
+#[path = "semantic_diff_matching.rs"]
+mod matching;
 #[path = "semantic_diff_state.rs"]
 mod state;
 
@@ -56,6 +58,7 @@ impl SemanticDiff {
                     items
                         .iter()
                         .filter_map(Value::as_str)
+                        .map(matching::human_name)
                         .collect::<Vec<_>>()
                         .join(", ")
                 })
@@ -72,9 +75,12 @@ impl SemanticDiff {
         for change in &self.changes {
             text.push_str(&format!(
                 "{}: {}\n",
-                change["symbol"].as_str().unwrap_or("?"),
+                matching::human_name(change["symbol"].as_str().unwrap_or("?")),
                 change["match"].as_str().unwrap_or("?")
             ));
+            if let Some(target) = change["renamed_to"].as_str() {
+                text.push_str(&format!("  Renamed to: {}\n", matching::human_name(target)));
+            }
             text.push_str(&format!(
                 "  Effects added: {}; removed: {}\n",
                 list(&change["effects"]["added"]),
@@ -97,7 +103,7 @@ impl SemanticDiff {
                     change["public_api"].as_str().unwrap_or("unknown")
                 ));
             }
-            if change["targets"]["base"] != change["targets"]["target"] {
+            if change["targets"]["change"] == "changed" {
                 text.push_str(&format!(
                     "  Call targets: {} -> {}\n",
                     list(&change["targets"]["base"]),
@@ -111,6 +117,7 @@ impl SemanticDiff {
                         .into_iter()
                         .flatten()
                         .filter_map(Value::as_str)
+                        .map(matching::human_name)
                         .collect::<Vec<_>>()
                         .join(" -> ");
                     text.push_str(&format!(
@@ -144,7 +151,7 @@ impl SemanticDiff {
             .flatten()
             .filter_map(Value::as_str)
         {
-            text.push_str(&format!("Incomplete: {reason}\n"));
+            text.push_str(&format!("Incomplete: {}\n", matching::human_name(reason)));
         }
         text
     }
@@ -152,6 +159,8 @@ impl SemanticDiff {
 #[derive(Clone)]
 pub(crate) struct Capture {
     baseline: Baseline,
+    shapes: im::OrdMap<String, String>,
+    lambda_owners: im::OrdMap<String, im::OrdSet<String>>,
     retained: state::ReportState,
     fact_updates: usize,
     witness_updates: usize,
@@ -280,7 +289,12 @@ impl Capture {
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         let contract_index = Node::build(&entries);
+        let mut shapes = im::OrdMap::new();
+        let mut lambda_owners = im::OrdMap::new();
+        matching::update_shapes(&mut shapes, &mut lambda_owners, snapshot, &retained.ids)?;
         Ok(Self {
+            shapes,
+            lambda_owners,
             fact_updates: snapshot.functions.len(),
             witness_updates,
             witness_edges,
@@ -476,6 +490,8 @@ fn compare_keys(
     let old = &before.baseline;
     let new = &after.baseline;
     let legacy = old.compare(new)?;
+    let (renames, keys) = matching::pairs(before, after, &keys)?;
+    let renamed_targets: BTreeSet<_> = renames.values().collect();
     let empty = BTreeSet::new();
     let mut changes = Vec::new();
     let mut growth = 0;
@@ -493,11 +509,35 @@ fn compare_keys(
     {
         uncertainty.push(format!("missing-source: {key}"));
     }
-    for key in keys {
-        let a = old.facts.get(&key);
-        let b = new.facts.get(&key);
-        let ca = before.contracts.get(&key).unwrap_or(&empty);
-        let cb = after.contracts.get(&key).unwrap_or(&empty);
+    // Source and target identities are separate namespaces: a displaced lambda
+    // may consume a key which is also the source of another correspondence.
+    let mut comparisons = Vec::new();
+    for key in &keys {
+        if old.facts.contains_key(key) {
+            let target = renames.get(key).or_else(|| {
+                (!matching::is_lambda(key) && new.facts.contains_key(key)).then_some(key)
+            });
+            comparisons.push((Some(key), target));
+        }
+        if new.facts.contains_key(key)
+            && !renamed_targets.contains(key)
+            && (matching::is_lambda(key) || !old.facts.contains_key(key))
+        {
+            comparisons.push((None, Some(key)));
+        }
+    }
+    for (base_key, new_key) in comparisons {
+        let key = base_key.or(new_key).expect("comparison identity");
+        let target_key = new_key.unwrap_or(key);
+        let a = base_key.and_then(|key| old.facts.get(key));
+        let renamed = target_key != key && a.is_some_and(|f| f.signature.is_some());
+        let b = new_key.and_then(|key| new.facts.get(key));
+        let ca = base_key
+            .and_then(|key| before.contracts.get(key))
+            .unwrap_or(&empty);
+        let cb = new_key
+            .and_then(|key| after.contracts.get(key))
+            .unwrap_or(&empty);
         let ae = a
             .and_then(|f| f.effects.as_ref())
             .map_or(0, |e| e.may | e.unknown);
@@ -517,20 +557,23 @@ fn compare_keys(
         }
         let signature_a = a.and_then(|f| f.signature.as_ref());
         let signature_b = b.and_then(|f| f.signature.as_ref());
-        let targets_a = a.map(|f| &f.callees);
+        let targets_a = a.map(|f| matching::targets(&f.callees, &renames));
         let targets_b = b.map(|f| &f.callees);
         let effects_changed =
             a.and_then(|f| f.effects.as_ref()) != b.and_then(|f| f.effects.as_ref());
         if signature_a == signature_b
             && !effects_changed
             && ca == cb
-            && targets_a == targets_b
+            && targets_a.as_ref() == targets_b
+            && !renamed
             && av == 0
             && bv == 0
         {
             continue;
         }
-        let matching = if a.is_none() {
+        let matching = if renamed {
+            "renamed"
+        } else if a.is_none() {
             "added"
         } else if b.is_none() {
             "removed"
@@ -562,7 +605,8 @@ fn compare_keys(
                 (after, added | bv, "target"),
             ] {
                 if bits & bit != 0 {
-                    let mut cause = capture.causes.render(&key, bit);
+                    let cause_key = if side == "base" { key } else { target_key };
+                    let mut cause = capture.causes.render(cause_key, bit);
                     emitted_hops += cause["chain"].as_array().map_or(0, Vec::len);
                     ensure!(
                         emitted_hops <= 1_000_000,
@@ -576,18 +620,27 @@ fn compare_keys(
         let public_api = match (public_signature(signature_a), public_signature(signature_b)) {
             (true, false) => "removed",
             (false, true) => "added",
+            (true, true) if renamed => "renamed",
             (true, true) if signature_a != signature_b => "signature-changed",
             _ => "unchanged",
         };
         changes.push(json!({"symbol":key,"match":matching,
+            "renamed_to": if base_key.is_some() && new_key.is_some() && target_key != key { Some(target_key) } else { None },
             "signature":{"base":signature_a,"target":signature_b},
             "effects":{"added":effect_names(added),"removed":effect_names(removed),"base":effect_names(ae),"target":effect_names(be)},
             "cause":causes,"impacted_callers":[],
             "contract":{"change":contract_change,"base":ca,"target":cb,"base_violations":effect_names(av),"target_violations":effect_names(bv)},
             "public_api":public_api,
-            "targets":{"base":targets_a,"target":targets_b}}));
+            "targets":{"base":a.map(|f| &f.callees),"target":targets_b,
+                "change":if targets_a.as_ref() == targets_b {"unchanged"} else {"changed"}}}));
     }
     impact::assign(&mut changes, old, new)?;
+    let impacted: BTreeSet<_> = changes
+        .iter()
+        .flat_map(|c| c["impacted_callers"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect();
+    let impacted_count = impacted.len();
     let violations = old
         .diagnostics
         .iter()
@@ -616,7 +669,7 @@ fn compare_keys(
         target: Value::Null,
         changes,
         summary: json!({"contract_violations":violations,"policy_violations":if fail_on_growth {growth} else {0},
-            "effect_growth":growth,"impacted_callers":legacy.affected_callers,"uncertainty":uncertainty,
+            "effect_growth":growth,"impacted_callers":impacted_count,"uncertainty":uncertainty,
             "diagnostics":{"base":old.diagnostics,"target":new.diagnostics}}),
     })
 }
