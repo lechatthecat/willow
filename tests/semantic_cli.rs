@@ -6143,6 +6143,89 @@ fn direct_kind_rejects_effect_names_and_unknown_values() {
 }
 
 #[test]
+fn unresolved_effect_selectors_have_no_effect_values() {
+    let f = Fixture::new();
+    for selector in ["order::Ordr::value", "totally_absent", "submit"] {
+        for format in ["human", "json", "ndjson"] {
+            for explain in [false, true] {
+                let mut args = vec!["effects", selector, "--format", format];
+                if explain {
+                    args.push("--explain");
+                }
+                let output = f.run(&args);
+                assert_eq!(output.status.code(), Some(1));
+                let text = String::from_utf8(output.stdout).unwrap();
+                if format == "human" {
+                    assert!(!text.contains("missing-body"), "{text}");
+                    assert!(!text.contains("Evidence for selected"), "{text}");
+                    assert!(!text.contains("may-allocate:"), "{text}");
+                    if selector == "order::Ordr::value" {
+                        assert!(text.contains("suggestion: order::Order::value"), "{text}");
+                    }
+                } else {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    let result = &value["result"];
+                    assert_eq!(
+                        result["status"],
+                        if selector == "submit" {
+                            "ambiguous"
+                        } else {
+                            "unknown"
+                        }
+                    );
+                    for key in ["effects", "bounds", "effect_evidence", "runtime_effects"] {
+                        assert!(result.get(key).is_none(), "{text}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn wrong_module_effect_selector_suggests_single_file_module() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("ow.wi"),
+        "module ow;\nclass Base { pub fn count(self) -> i64 { return 1; } }\nfn main() {}\n",
+    )
+    .unwrap();
+    for selector in ["main::Base::count", "unrelated::Base::count"] {
+        let value = f.json(&["effects", selector, "--source", "ow.wi"], 1);
+        assert_eq!(value["result"]["status"], "unknown");
+        assert!(value["result"].get("effects").is_none());
+        assert!(
+            value["result"]["suggestions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s == "ow::Base::count"),
+            "{value}"
+        );
+    }
+    let human = f.run(&["effects", "main::Base::count", "--source", "ow.wi"]);
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(text.contains("suggestion: ow::Base::count"), "{text}");
+    assert_eq!(text.lines().count(), 3, "{text}");
+    let position = f.json(&["effects", "ow.wi:1:1", "--source", "ow.wi"], 1);
+    assert!(position["result"].get("effects").is_none());
+    let filtered = f.json(
+        &[
+            "effects",
+            "main::Base::count",
+            "--source",
+            "ow.wi",
+            "--module",
+            "main",
+        ],
+        1,
+    );
+    assert_eq!(filtered["result"]["suggestions"], serde_json::json!([]));
+    let resolved = f.json(&["effects", "ow::Base::count", "--source", "ow.wi"], 0);
+    assert!(resolved["result"]["effects"].is_array());
+}
+
+#[test]
 fn effect_states_versioned_schema_matches_impact_and_preserves_witnesses() {
     let f = Fixture::new();
     fs::write(
@@ -6172,13 +6255,8 @@ fn effect_states_versioned_schema_matches_impact_and_preserves_witnesses() {
     assert!(node.get("unknown").is_none());
     let missing = f.json(&["effects", "main::absent"], 1);
     assert_eq!(missing["result"]["schema"], "willow.effects.v2");
-    assert!(
-        missing["result"]["effects"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|e| e["state"] == "unknown")
-    );
+    assert_eq!(missing["result"]["status"], "unknown");
+    assert!(missing["result"].get("effects").is_none());
     let pure = f.json(&["effects", "main::pure"], 0);
     assert!(
         pure["result"]["effects"]

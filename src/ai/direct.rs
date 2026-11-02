@@ -722,7 +722,25 @@ impl DirectSession {
                 let same_scope = selector_scope.is_none_or(|scope| {
                     owner == scope || owner.strip_suffix(scope).is_some_and(|p| p.ends_with("::"))
                 });
-                let score = selector_suggestion_score(name, &segments);
+                let score = selector_suggestion_score(name, &segments).or_else(|| {
+                    // An exact declaration path under a different module is a
+                    // useful fallback, even when the module is not a typo.
+                    // Keep locals scoped and rank spelling matches ahead of it.
+                    if local_name.is_some() || lambda {
+                        return None;
+                    }
+                    let module = symbol
+                        .identity
+                        .as_ref()
+                        .map(|i| std::borrow::Cow::Borrowed(i.module.as_str()))
+                        .or_else(|| {
+                            symbol.location.as_ref().map(|loc| {
+                                std::borrow::Cow::Owned(source_module(&loc.path, self.workspace()))
+                            })
+                        })?;
+                    wrong_module_suggestion(name, &module, &suggestion_selector)
+                        .then_some(usize::MAX - 1)
+                });
                 if local_name.is_some() && same_scope && selector_scope.is_some() {
                     scoped_locals += 1;
                     sole_local = (scoped_locals == 1).then(|| qualified.to_owned());
@@ -912,8 +930,8 @@ impl DirectSession {
         let mut resolved = self.resolve(selector, filter)?;
         if resolved["status"] != "ok" {
             if command == "effects" {
+                // No selected declaration means there are no effects to describe.
                 resolved["schema"] = json!(super::effect_states::SCHEMA);
-                resolved["effects"] = super::effect_states::Analysis::unavailable();
             }
             return Ok(resolved);
         }
@@ -1453,6 +1471,14 @@ fn normalize_local_suggestions(suggestions: &mut [String], locals: impl Iterator
     }
 }
 
+/// Compare only the declaration suffix, without allocating or rescanning paths.
+fn wrong_module_suggestion(name: &str, module: &str, selector: &str) -> bool {
+    name.strip_prefix(module)
+        .filter(|suffix| suffix.starts_with("::"))
+        .and_then(|suffix| selector.strip_suffix(suffix))
+        .is_some_and(|prefix| !prefix.is_empty() && prefix != module)
+}
+
 /// Compare aligned path segments from the leaf, permitting the same omitted
 /// module prefix as exact resolution. Each segment is visited at most once.
 fn selector_suggestion_score(name: &str, segments: &[(&str, Vec<char>)]) -> Option<usize> {
@@ -1583,6 +1609,26 @@ mod typo_tests {
                 .collect::<Vec<_>>(),
         )
     }
+    #[test]
+    fn wrong_module_suggestions_preserve_the_entire_declaration_path() {
+        for (name, module, selector, expected) in [
+            ("ow::Base::count", "ow", "main::Base::count", true),
+            ("ow::Base::count", "ow", "other::nested::Base::count", true),
+            ("pkg::ow::Base::count", "pkg::ow", "main::Base::count", true),
+            ("ow::count", "ow", "main::count", true),
+            ("ow::Base::count", "ow", "main::Other::count", false),
+            ("ow::Base::count", "ow", "main::Base::coun", false),
+            ("ow::Base::count", "ow", "Base::count", false),
+            ("ow::Base::count", "ow", "::Base::count", false),
+            ("ow::Base::count", "ow", "ow::Base::count", false),
+        ] {
+            assert_eq!(
+                super::wrong_module_suggestion(name, module, selector),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn segment_scores_cover_edits_suffixes_and_ranking() {
         for (name, selector, expected) in [
