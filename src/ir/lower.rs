@@ -1126,7 +1126,7 @@ struct LowerCtx<'a> {
     /// Scope depth immediately outside the current function/lambda body.
     /// Used to distinguish a body-wide callable shadow from a nested one.
     namespace_scope_base: usize,
-    /// How many bindings of each source name this function has lowered so far.
+    /// Binding suffix counters, also reserving free callees already used.
     /// Not popped with a scope: the suffix has to be unique across the whole
     /// function, not only across the scopes currently open.
     binds_seen: HashMap<String, usize>,
@@ -2077,7 +2077,15 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
     });
     let callee = match &indirect {
         Some((name, _)) => name.clone(),
-        None => c.callee.clone(),
+        None => {
+            // The later operand pass sees all locals at once. Reserve this
+            // free callee's spelling so a subsequent local binding cannot
+            // retroactively turn this call into an indirect local call.
+            if !ctx.binds_seen.contains_key(&c.callee) {
+                ctx.binds_seen.insert(c.callee.clone(), 1);
+            }
+            c.callee.clone()
+        }
     };
     let ty = indirect
         .map(|(_, ret)| ret)
@@ -4400,6 +4408,34 @@ mod tests {
                 assert_eq!(args[0].ty, Type::I64);
             }
             other => panic!("expected call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn free_callee_reservation_shares_repeated_names() {
+        for n in [8, 16, 32, 64] {
+            let source = format!(
+                "fn open() -> i64 {{ return 1; }} fn main() {{ {} let open = 7; println(open); }}",
+                "println(open());".repeat(n)
+            );
+            let (hir, diags) = lower_src(&source);
+            assert!(diags.is_empty(), "{diags:?}");
+            let main = hir
+                .functions
+                .iter()
+                .find(|f| f.name.is_free_named("main"))
+                .unwrap();
+            assert_eq!(main.body.len(), n + 2);
+            let HirStmt::Let { name, .. } = &main.body[n] else {
+                panic!("missing local")
+            };
+            // Repeated calls reserve one spelling; they do not consume suffixes
+            // or emit additional HIR instructions.
+            assert_eq!(name, "open$2");
+            eprintln!(
+                "free callee calls={n} statements={} local={name}",
+                main.body.len()
+            );
         }
     }
 

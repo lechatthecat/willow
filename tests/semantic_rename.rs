@@ -862,7 +862,7 @@ fn rename_keywords_name_the_reserved_word_for_all_target_kinds() {
         ),
         ("fn main() { let old = 1; println(old); }", "old"),
     ] {
-        for keyword in ["open", "if", "class", "return", "i64", "print", "println"] {
+        for keyword in ["if", "class", "return", "i64", "print", "println"] {
             let f = Fixture::new(source);
             let result = f.run(&["rename", selector, keyword], 1);
             assert!(
@@ -1252,4 +1252,23 @@ fn rename_diff_option_validation_and_help() {
         help.contains("files / edits (declarations, references) / collisions / unresolved"),
         "{help}"
     );
+}
+
+#[test]
+fn rename_to_contextual_open_for_all_target_kinds() {
+    for (source, selector) in [
+        ("fn old() {} fn main() { old(); }", "old"),
+        ("class A { pub old: i64; } fn main() {}", "main::A::old"),
+        (
+            "class A { pub fn old(self) {} } fn main() {}",
+            "main::A::old",
+        ),
+        ("fn main() { let old = 1; println(old); }", "old"),
+    ] {
+        let f = Fixture::new(source);
+        let result = f.run(&["rename", selector, "open"], 0);
+        assert_eq!(result["result"]["validation"], "passed");
+        let after = fs::read_to_string(f.0.join("main.wi")).unwrap();
+        assert_eq!(after, source.replace("old", "open"));
+    }
 }

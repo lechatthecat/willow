@@ -1,0 +1,24 @@
+// `open` remains a declaration modifier and can also name ordinary values.
+open class Counter {
+    pub open: i64;
+    pub open fn value(self) -> i64 { return self.open; }
+}
+class Doubled extends Counter {
+    pub override fn value(self) -> i64 { return self.open * 2; }
+}
+fn open(open: i64) -> i64 { return open + 1; }
+fn value(counter: Counter) -> i64 { return counter.value(); }
+fn main() {
+    println(open(4));
+    println(value(new Doubled(4)));
+    let mut open = 1;
+    println(open);
+    open = open + 2;
+    println(open);
+    let read = || open;
+    println(read());
+    println(true ? open : 0);
+    let counter = new Counter(open);
+    println(counter.value());
+    println(counter.open);
+}

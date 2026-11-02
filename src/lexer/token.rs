@@ -23,9 +23,6 @@ pub enum TokenKind {
     Class,
     Pub,
     Prot,
-    /// Reserved modifier, including in member/local names; use `open_gate`
-    /// or `is_open` as identifiers (willow-jz15.26, policy b).
-    Open,
     Override,
     Static,
     New,
@@ -135,7 +132,6 @@ impl TokenKind {
             Self::Class => Some("class"),
             Self::Pub => Some("pub"),
             Self::Prot => Some("prot"),
-            Self::Open => Some("open"),
             Self::Override => Some("override"),
             Self::Static => Some("static"),
             Self::New => Some("new"),

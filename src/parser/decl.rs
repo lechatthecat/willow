@@ -172,12 +172,25 @@ impl Parser {
         Ok(contracts)
     }
 
+    // `open` is contextual: at declaration modifier positions only. A field
+    // named `open` is followed by `:`, so leave it for ordinary name parsing.
+    fn eat_open_modifier(&mut self) -> bool {
+        if matches!(self.peek_kind(), TokenKind::Ident(name) if name == "open")
+            && !matches!(self.peek_kind_at(1), TokenKind::Colon)
+        {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
     /// `Ok(None)`: the item was consumed but rejected, with its diagnostic
     /// already recorded in `recovered_errors` (see [`Self::parse_const`]).
     pub(super) fn parse_item(&mut self) -> Result<Option<Item>, Diagnostic> {
         let contracts = self.parse_effect_contracts()?;
         let public = self.eat(TokenKind::Pub);
-        let is_open = self.eat(TokenKind::Open);
+        let is_open = self.eat_open_modifier();
         let is_async = self.eat(TokenKind::Async);
         if !contracts.is_empty() && !self.check(TokenKind::Fn) {
             return Err(self.err(
@@ -393,12 +406,7 @@ impl Parser {
                     ));
             }
             let member_static = member_static_span.is_some();
-            // `open:` is an attempted field name, not a method modifier.
-            // Diagnose while the cursor still points at the reserved name.
-            if self.check(TokenKind::Open) && matches!(self.peek_kind_at(1), TokenKind::Colon) {
-                return Err(self.err(ErrorCode::E0102, "expected identifier"));
-            }
-            let member_open = self.eat(TokenKind::Open);
+            let member_open = self.eat_open_modifier();
             let member_override = self.eat(TokenKind::Override);
             let member_async = self.eat(TokenKind::Async);
 

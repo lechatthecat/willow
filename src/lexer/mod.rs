@@ -727,7 +727,6 @@ impl<'a> Lexer<'a> {
             "class" => TokenKind::Class,
             "pub" => TokenKind::Pub,
             "prot" => TokenKind::Prot,
-            "open" => TokenKind::Open,
             "override" => TokenKind::Override,
             "static" => TokenKind::Static,
             "new" => TokenKind::New,

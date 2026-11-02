@@ -242,3 +242,17 @@ fn main() { println(chosen()); }
         "indirect call must remain fail-closed: {targets:?}"
     );
 }
+
+#[test]
+fn free_call_before_body_local_shadow() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn f(x: i64) -> i64 { return x + 1; }
+fn scalar() { println(f(1)); let f = 7; println(f); }
+fn callable() { println(f(2)); let f = |x: i64| x + 10; println(f(2)); }
+fn main() { scalar(); callable(); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n7\n3\n12\n");
+}

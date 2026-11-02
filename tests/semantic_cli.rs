@@ -1220,7 +1220,7 @@ fn project_check_checks_unimported_sources_without_importing_names() {
             "fn value() -> i64 { return \"bad\"; }",
             false,
         ),
-        ("reserved keyword", "junk.wi", "fn open() {}", false),
+        ("reserved keyword", "junk.wi", "fn override() {}", false),
         (
             "nested module",
             "nested/junk.wi",

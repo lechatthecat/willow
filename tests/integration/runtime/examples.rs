@@ -5,6 +5,7 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),
+        ("example/contextual_open.wi", "5\n8\n1\n3\n3\n3\n3\n3\n"),
         (
             "example/array_utilities.wi",
             "7\n[2, 7, 7]\n[7, 7]\ntrue\n1\n[4, 4, 4]\nfirst\nsecond\nthird\n",
@@ -1894,4 +1895,11 @@ fn a9_restored_sync_helper_examples() {
         assert!(ok, "{path}: {out}");
         assert_eq!(out, expected, "{path}");
     }
+}
+
+#[test]
+fn test_contextual_open_example() {
+    let (out, ok) = compile_file_and_run("example/contextual_open.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n8\n1\n3\n3\n3\n3\n3\n");
 }

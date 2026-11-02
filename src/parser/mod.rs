@@ -548,20 +548,20 @@ impl Parser {
     }
 
     fn at_item_start(&self) -> bool {
-        matches!(
-            self.peek_kind(),
-            TokenKind::At
-                | TokenKind::Fn
-                | TokenKind::Async
-                | TokenKind::Class
-                | TokenKind::Open
-                | TokenKind::Const
-                | TokenKind::Interface
-                | TokenKind::Pub
-                | TokenKind::Prot
-                | TokenKind::Import
-                | TokenKind::Enum
-        )
+        matches!(self.peek_kind(), TokenKind::Ident(name) if name == "open")
+            || matches!(
+                self.peek_kind(),
+                TokenKind::At
+                    | TokenKind::Fn
+                    | TokenKind::Async
+                    | TokenKind::Class
+                    | TokenKind::Const
+                    | TokenKind::Interface
+                    | TokenKind::Pub
+                    | TokenKind::Prot
+                    | TokenKind::Import
+                    | TokenKind::Enum
+            )
     }
 }
 
@@ -1907,7 +1907,6 @@ class ProtectedCtor { prot init(self) {} }
             | TokenKind::Class
             | TokenKind::Pub
             | TokenKind::Prot
-            | TokenKind::Open
             | TokenKind::Override
             | TokenKind::Static
             | TokenKind::Extends
@@ -1948,7 +1947,6 @@ class ProtectedCtor { prot init(self) {} }
             TokenKind::Class,
             TokenKind::Pub,
             TokenKind::Prot,
-            TokenKind::Open,
             TokenKind::Override,
             TokenKind::Static,
             TokenKind::New,
