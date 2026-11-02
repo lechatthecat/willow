@@ -1,3 +1,6 @@
+mod contracts;
+#[cfg(test)]
+mod contracts_tests;
 mod effect_contracts;
 // Conditional advice also covers stored results without tracking value provenance.
 const STRING_FIND_SENTINEL_HELP: &str = "if this i64 came from String.find(needle), it is a byte offset, not an Option: -1 means not found; test `index >= 0` before using it, or use `contains(needle)` for a bool";

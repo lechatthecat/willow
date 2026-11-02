@@ -3402,6 +3402,7 @@ fn visit_item(
                 p.ty = ty(&p.ty);
             }
             f.return_type = ty(&f.return_type);
+            initializers.extend(f.requires.iter_mut().chain(&mut f.ensures));
             blocks.push(&mut f.body);
         }
         Item::Class(c) => {

@@ -10,3 +10,6 @@ pub mod lowered;
 pub mod module_init;
 mod optimize;
 pub mod typed_ast;
+
+#[cfg(test)]
+mod contracts_tests;

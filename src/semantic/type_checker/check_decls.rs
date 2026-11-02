@@ -1852,6 +1852,7 @@ impl TypeChecker {
                 },
             );
         }
+        self.check_contracts(f, &return_type);
         self.check_block(&f.body);
         // Entry-point status comes from WHICH PROGRAM this is, never from the
         // name: a module's `main` is called and compiled like any other

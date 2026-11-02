@@ -38,11 +38,17 @@ fn format_function(f: &HirFunction, level: usize, out: &mut String) {
         .join(", ");
     indent(level, out);
     out.push_str(&format!(
-        "fn {}({}) -> {} {{\n",
+        "fn {}({}) -> {}",
         f.name,
         params,
         type_str(&f.return_type)
     ));
+    for (kind, clauses) in [("requires", &f.requires), ("ensures", &f.ensures)] {
+        for clause in clauses {
+            out.push_str(&format!(" {kind} {}", format_expr(clause)));
+        }
+    }
+    out.push_str(" {\n");
     for stmt in &f.body {
         format_stmt(stmt, level + 1, out);
     }

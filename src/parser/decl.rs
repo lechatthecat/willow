@@ -931,9 +931,31 @@ impl Parser {
             (Type::Void, None)
         };
 
+        let mut requires = Vec::new();
+        let mut ensures = Vec::new();
+        while let TokenKind::Ident(keyword) = self.peek_kind() {
+            let post = match keyword.as_str() {
+                "requires" => false,
+                "ensures" => true,
+                _ => break,
+            };
+            self.advance();
+            let previous = self.allow_object_literals;
+            self.allow_object_literals = false;
+            let expression = self.parse_expr();
+            self.allow_object_literals = previous;
+            let expression = expression?;
+            if post {
+                ensures.push(expression);
+            } else {
+                requires.push(expression);
+            }
+        }
         let body = self.parse_block()?;
         let span = start.to(body.span);
         Ok(FunctionDecl {
+            requires,
+            ensures,
             effect_contracts: Vec::new(),
             type_params,
             name,
@@ -987,6 +1009,8 @@ impl Parser {
             span,
         };
         Ok(Some(FunctionDecl {
+            requires: Vec::new(),
+            ensures: Vec::new(),
             effect_contracts: Vec::new(),
             type_params: Vec::new(),
             name,

@@ -166,6 +166,13 @@ fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type) -> bool {
     if !callee.is_free_named(name) {
         return false;
     }
+    if name == "$contract_i64" {
+        return args.len() == 3 && args.iter().all(|a| a.ty == Type::I64) && *result == Type::I64;
+    }
+    if name == "$contract_check" {
+        return matches!(args, [a, b] if a.ty == Type::Bool && b.ty == Type::I64)
+            && *result == Type::Void;
+    }
     if name == "panic" {
         return *result == Type::Never
             && match args {

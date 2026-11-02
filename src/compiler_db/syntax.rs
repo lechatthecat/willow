@@ -188,10 +188,15 @@ fn reconcile(old: &Value, new: &mut Value, result: &mut Correspondence) {
                     ));
                 }
             }
+            let contracts_unchanged = ["requires", "ensures"]
+                .iter()
+                .all(|key| a.get(*key).map(semantic) == b.get(*key).map(semantic));
             for (key, value) in b {
                 let Some(previous) = a.get(key) else { continue };
-                if matches!(key.as_str(), "body" | "default_body" | "initializer") {
-                    if semantic(previous) == semantic(value) {
+                if matches!(key.as_str(), "requires" | "ensures") && contracts_unchanged {
+                    copy_ids(previous, value, &mut result.spans);
+                } else if matches!(key.as_str(), "body" | "default_body" | "initializer") {
+                    if contracts_unchanged && semantic(previous) == semantic(value) {
                         if let (Some(a), Some(b)) = (
                             previous.get("span").and_then(span),
                             value.get("span").and_then(span),
@@ -501,6 +506,44 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn contracts_unchanged_preserve_expression_ids() {
+        let old = parse("fn f(x:i64)->i64 requires x > 0 ensures result == x { return x; }");
+        let mut new = parse("\nfn f(x:i64)->i64 requires x > 0 ensures result == x { return x; }");
+        let mut correspondence = Correspondence::default();
+        correspondence.reconcile(&old, &mut new).unwrap();
+        let (Item::Function(a), Item::Function(b)) = (&old.items[0], &new.items[0]) else {
+            panic!()
+        };
+        for (a, b) in a
+            .requires
+            .iter()
+            .chain(&a.ensures)
+            .zip(b.requires.iter().chain(&b.ensures))
+        {
+            assert_eq!(a.id(), b.id());
+        }
+        assert!(correspondence.unchanged.contains(&b.body.id));
+    }
+
+    #[test]
+    fn contracts_changes_invalidate_body_even_when_statements_match() {
+        for (before, after) in [
+            ("requires true", "requires false"),
+            ("", "ensures true"),
+            ("ensures true", ""),
+        ] {
+            let old = parse(&format!("fn f() {before} {{}}"));
+            let mut new = parse(&format!("fn f() {after} {{}}"));
+            let mut correspondence = Correspondence::default();
+            correspondence.reconcile(&old, &mut new).unwrap();
+            let Item::Function(f) = &new.items[0] else {
+                panic!()
+            };
+            assert!(!correspondence.unchanged.contains(&f.body.id));
+        }
     }
 
     #[test]

@@ -484,6 +484,10 @@ pub struct MethodDecl {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionDecl {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<Expr>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ensures: Vec<Expr>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effect_contracts: Vec<EffectContract>,
     #[serde(default)]
     pub type_params: Vec<String>,

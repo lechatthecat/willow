@@ -1244,6 +1244,7 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
     let index = origins.map(|(index, _)| index);
     let overflow_checks = origins.is_none_or(|(_, queries)| queries.overflow_checks);
     let mut plan = EffectPlan::default();
+    let mut contract_spans = HashMap::new();
     let mut pending = Vec::new();
     let mut helpers = HashMap::new();
     let mut foreign = Vec::new();
@@ -1255,6 +1256,9 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
         match item {
             Item::Function(f) => {
                 let id = FunctionId::free(&f.name);
+                if let Some(clause) = f.requires.first().or(f.ensures.first()) {
+                    contract_spans.insert(f.body.id, clause.span());
+                }
                 if f.rust_bridge.is_some() {
                     foreign.push((FunctionId::free_from_source_name(&f.name), f.span));
                     continue;
@@ -1481,13 +1485,9 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
             if let Some((_, queries)) = origins {
                 queries.scanned.set(queries.scanned.get() + 1);
             }
-            Ok(scan_direct_effects(
-                id,
-                body_id,
-                body,
-                types,
-                index,
-                overflow_checks,
+            Ok(with_contract_effects(
+                scan_direct_effects(id, body_id, body, types, index, overflow_checks),
+                contract_spans.get(&body_id).copied(),
             ))
         };
         let queries = origins.and_then(|(_, effects)| effects.body_queries.borrow().upgrade());
@@ -2165,13 +2165,18 @@ fn solve_unit_delta<N: std::fmt::Display>(
         }
         let scan = || {
             queries.scanned.set(queries.scanned.get() + 1);
-            Ok(scan_direct_effects(
-                id,
-                root,
-                body,
-                types,
-                Some(index),
-                queries.overflow_checks,
+            let contract = match location {
+                EffectRootLocation::Function(item) => match program.items.get(item) {
+                    Some(Item::Function(f)) => {
+                        f.requires.first().or(f.ensures.first()).map(Expr::span)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            Ok(with_contract_effects(
+                scan_direct_effects(id, root, body, types, Some(index), queries.overflow_checks),
+                contract,
             ))
         };
         let scan = match queries.body_queries.borrow().upgrade() {
@@ -4750,4 +4755,17 @@ mod direct_wait_tests {
             }
         }
     }
+}
+
+/// Include generated guards in the persistent direct contribution, so both
+/// cold solving and incremental provider/caller updates retain the panic edge.
+fn with_contract_effects(
+    mut direct: Vec<DirectBodyEffects>,
+    span: Option<crate::diagnostics::Span>,
+) -> Vec<DirectBodyEffects> {
+    if let (Some(root), Some(span)) = (direct.first_mut(), span) {
+        root.panics = true;
+        root.panic_span.get_or_insert(span);
+    }
+    direct
 }

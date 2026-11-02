@@ -21,7 +21,7 @@ struct ReuseCandidate {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 enum NormalizedBody {
-    Function(FunctionDecl),
+    Function(Box<FunctionDecl>),
     Method(MethodDecl),
     Constructor(ConstructorDecl),
     Static(FieldDecl),
@@ -1239,12 +1239,12 @@ impl BodyQueries {
                 Item::Function(function) => {
                     let body =
                         self.normalized_body(function.body.id, &imports, &walk_only, || {
-                            NormalizedBody::Function(function.clone())
+                            NormalizedBody::Function(Box::new(function.clone()))
                         })?;
                     let NormalizedBody::Function(function) = body else {
                         anyhow::bail!("function body kind mismatch")
                     };
-                    Item::Function(function)
+                    Item::Function(*function)
                 }
                 Item::Class(class) => {
                     let mut class = class.clone();

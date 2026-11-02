@@ -396,3 +396,6 @@ mod math_helpers;
 
 #[path = "integration/contextual_new.rs"]
 mod contextual_new;
+
+#[path = "integration/runtime_contracts.rs"]
+mod runtime_contracts;

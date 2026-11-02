@@ -1,0 +1,20 @@
+// Both debug and release enforce these scalar contracts.
+fn discounted(price: i64) -> i64
+    requires price >= 0
+    ensures result >= 0
+    ensures result <= price
+{
+    return price / 10 * 9;
+}
+
+fn main() {
+    println(discounted(100));
+    if true {
+        defer match recover() {
+            Some(info) => println(info.message),
+            None => {}
+        }
+        println(discounted(-1));
+    }
+    println("recovered");
+}

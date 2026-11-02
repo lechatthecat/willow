@@ -63,6 +63,8 @@ impl Parser {
                 );
                 symbol.close_handle = true;
                 items.push(Item::Function(FunctionDecl {
+                    requires: Vec::new(),
+                    ensures: Vec::new(),
                     effect_contracts: Vec::new(),
                     return_type_span: None,
                     type_params: Vec::new(),
@@ -127,6 +129,8 @@ impl Parser {
             self.expect(TokenKind::Semicolon)?;
             let span = span.to(self.previous_span());
             items.push(Item::Function(FunctionDecl {
+                requires: Vec::new(),
+                ensures: Vec::new(),
                 effect_contracts: Vec::new(),
                 return_type_span: None,
                 type_params: Vec::new(),

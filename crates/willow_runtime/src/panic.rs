@@ -195,3 +195,74 @@ mod tests {
         assert_eq!(abort_message(ws("panic.wi"), 9), "panic at panic.wi:9");
     }
 }
+
+/// Contract arithmetic is checked in every build mode. Operation codes are
+/// add, subtract, multiply, divide, remainder, power, negate, left/right shift.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_contract_i64(
+    op: i64,
+    a: i64,
+    b: i64,
+    file: *const u8,
+    line: i32,
+    col: i32,
+) -> i64 {
+    let value = contract_i64(op, a, b);
+    if let Some(value) = value {
+        return value;
+    }
+    crate::panic_context::raise_language_message_at(
+        "contract evaluation error: invalid or overflowing i64 arithmetic",
+        file,
+        line.into(),
+        col.into(),
+    );
+    0
+}
+
+fn contract_i64(op: i64, a: i64, b: i64) -> Option<i64> {
+    match op {
+        0 => a.checked_add(b),
+        1 => a.checked_sub(b),
+        2 => a.checked_mul(b),
+        3 => a.checked_div(b),
+        4 => a.checked_rem(b),
+        6 => a.checked_neg(),
+        7 => u32::try_from(b).ok().and_then(|b| a.checked_shl(b)),
+        8 => u32::try_from(b).ok().and_then(|b| a.checked_shr(b)),
+        5 if b >= 0 => {
+            let (mut base, mut exponent, mut value) = (a, b as u64, 1i64);
+            while exponent != 0 {
+                if exponent & 1 != 0 {
+                    value = value.checked_mul(base)?;
+                }
+                exponent >>= 1;
+                if exponent != 0 {
+                    base = base.checked_mul(base)?;
+                }
+            }
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_contract_check(
+    condition: i64,
+    post: i64,
+    file: *const u8,
+    line: i32,
+    col: i32,
+) {
+    if condition == 0 {
+        let message = if post == 0 {
+            "contract violation: requires"
+        } else {
+            "contract violation: ensures"
+        };
+        crate::panic_context::raise_language_message_at(message, file, line.into(), col.into());
+    }
+}

@@ -1146,7 +1146,13 @@ fn lower_function(
     let mut b = Builder::new(&f.params, f.is_async);
     b.resolution = resolution;
     b.return_type = f.return_type.clone();
+    for clause in &f.requires {
+        b.lower_stmt(&contract_check(clause.clone(), false));
+    }
     b.lower_scope(&f.body);
+    if !f.ensures.is_empty() {
+        b.contract_epilogue(f);
+    }
     b.materialize_preemption_safepoints();
     // The fall-through end of a function is an implicit `return;` (the type
     // checker has already guaranteed value-returning paths return).
@@ -6942,4 +6948,77 @@ pub fn format_program(program: &LirProgram) -> String {
         output.push_str("}\n");
     }
     output
+}
+
+fn contract_check(clause: HirExpr, post: bool) -> HirStmt {
+    let span = clause.span;
+    HirStmt::Expr(HirExpr {
+        kind: HirExprKind::Call {
+            callee: "$contract_check".into(),
+            args: vec![
+                clause,
+                HirExpr {
+                    kind: HirExprKind::Int(i64::from(post)),
+                    ty: Type::I64,
+                    span,
+                },
+            ],
+        },
+        ty: Type::Void,
+        span,
+    })
+}
+
+impl Builder {
+    /// Share the postcondition CFG across all normal returns. Neither clause
+    /// trees nor their arithmetic are copied per exit.
+    fn contract_epilogue(&mut self, f: &HirFunction) {
+        let result = (f.return_type != Type::Void).then(|| {
+            self.declare_local(
+                "$contract_result".into(),
+                f.return_type.clone(),
+                None,
+                true,
+                false,
+            )
+        });
+        let exit = self.new_block();
+        for index in 0..exit.0 {
+            let term = &mut self.blocks[index].1;
+            let value = match term {
+                Some(SourceTerminator::Return(None)) if f.return_type != Type::Void => continue,
+                Some(SourceTerminator::Return(value)) => value.take(),
+                None if f.return_type == Type::Void => None,
+                _ => continue,
+            };
+            if let Some(value) = value {
+                self.blocks[index].0.push(if let Some(local) = result {
+                    SourceInst::Assign {
+                        local,
+                        name: "$contract_result".into(),
+                        value,
+                    }
+                } else {
+                    SourceInst::Expr(value)
+                });
+            }
+            self.blocks[index].1 = Some(SourceTerminator::Jump(exit));
+        }
+        self.switch_to(exit);
+        for clause in &f.ensures {
+            let mut clause = clause.clone();
+            clause.visit_mut_preorder(false, |node| {
+                if let HirExprKind::Var(name) = &mut node.kind
+                    && name == "result"
+                {
+                    *name = "$contract_result".into();
+                }
+                true
+            });
+            self.lower_stmt(&contract_check(clause, true));
+        }
+        self.terminate(SourceTerminator::Return(
+            result.map(|local| self.local_expr(local, f.span)),
+        ));
+    }
 }

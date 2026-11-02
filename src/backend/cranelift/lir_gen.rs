@@ -7014,7 +7014,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .iter()
                     .map(|arg| self.emit_lir_operand(function, arg))
                     .collect();
-                self.emit_flat_builtin_call(callee, &args)
+                if callee.is_free_named("$contract_i64") || callee.is_free_named("$contract_check")
+                {
+                    let runtime = if callee.is_free_named("$contract_i64") {
+                        "willow_contract_i64"
+                    } else {
+                        "willow_contract_check"
+                    };
+                    let mut args = args;
+                    if callee.is_free_named("$contract_check") {
+                        args[0] = self.builder.ins().uextend(types::I64, args[0]);
+                    }
+                    let file = self.emit_string_literal(self.source_file);
+                    let line = self.builder.ins().iconst(types::I32, span.line as i64);
+                    let col = self.builder.ins().iconst(types::I32, span.col as i64);
+                    args.extend([file, line, col]);
+                    self.emit_runtime_call_with_cleanup(runtime, &args, |_| {})
+                        .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+                } else {
+                    self.emit_flat_builtin_call(callee, &args)
+                }
             }
             LirRvalue::FormatScalar { value, ty, format } => {
                 let value = self.emit_lir_operand(function, value);
@@ -8728,6 +8747,8 @@ fn flat_rvalue_supported(
         V::Range { start, end } => ty(start) == Some(Type::I64) && ty(end) == Some(Type::I64),
         V::EnumMethod { receiver_ty, method, arg_types, result, .. } => ctx.supported_enum_type(receiver_ty) && ctx.supported_type(result) && arg_types.iter().all(|ty| ctx.supported_type(ty)) && option_result_method(receiver_ty, method, arg_types).is_some_and(|ret| ctx.same_repr(&ret, result)),
         V::BuiltinCall { callee, params, result, .. } => {
+            if callee.is_free_named("$contract_i64") { return params == &[Type::I64, Type::I64, Type::I64] && *result == Type::I64; }
+            if callee.is_free_named("$contract_check") { return params == &[Type::Bool, Type::I64] && *result == Type::Void; }
             let void_future = *result == Type::Void || builtin_types::unary_arg(result, B::Future) == Some(&Type::Void);
             if callee.is_free_named("sleep") { return params == &[Type::I64] && void_future; }
             if callee.is_free_named("yield") { return params.is_empty() && void_future; }

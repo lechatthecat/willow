@@ -3518,6 +3518,8 @@ mod tests {
     #[test]
     fn unit_async_codegen_08_async_function_call_returns_task_type() {
         let function = FunctionDecl {
+            requires: Vec::new(),
+            ensures: Vec::new(),
             effect_contracts: Vec::new(),
             return_type_span: None,
             type_params: Vec::new(),

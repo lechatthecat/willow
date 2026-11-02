@@ -1454,6 +1454,8 @@ impl UnitCodegenContext<'_> {
             },
         };
         let f = FunctionDecl {
+            requires: Vec::new(),
+            ensures: Vec::new(),
             effect_contracts: Vec::new(),
             return_type_span: None,
             type_params: Vec::new(),
@@ -2261,6 +2263,8 @@ impl UnitCodegenContext<'_> {
             let initializer_name =
                 crate::ir::typed_ast::static_initializer_name(class_key, &field.name);
             let initializer = FunctionDecl {
+                requires: Vec::new(),
+                ensures: Vec::new(),
                 effect_contracts: Vec::new(),
                 return_type_span: None,
                 type_params: Vec::new(),

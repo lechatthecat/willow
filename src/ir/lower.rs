@@ -492,6 +492,8 @@ fn lower_program_except_partial(
                                 let return_type = ctx.normalize(&field.ty);
                                 retype_array_literal(&mut value, &return_type);
                                 functions.push(HirFunction {
+                                    requires: Vec::new(),
+                                    ensures: Vec::new(),
                                     name: crate::semantic::ids::FunctionId::method(
                                         crate::semantic::ids::TypeId::from_source_name(&c.name),
                                         format!("$static_init.{}", field.name),
@@ -966,8 +968,28 @@ fn lower_function(
         });
     }
     let return_type = ctx.normalize(&f.return_type);
+    let requires = f
+        .requires
+        .iter()
+        .map(|e| lower_expr(e, &mut ctx).map(contract_expression))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ensures = if f.ensures.is_empty() {
+        Vec::new()
+    } else {
+        ctx.push_scope();
+        ctx.bind("result".into(), return_type.clone());
+        let clauses = f
+            .ensures
+            .iter()
+            .map(|e| lower_expr(e, &mut ctx).map(contract_expression))
+            .collect::<Result<Vec<_>, _>>()?;
+        ctx.pop_scope();
+        clauses
+    };
     let body = lower_block(&f.body, &mut ctx)?;
     Ok(HirFunction {
+        requires,
+        ensures,
         name: f.name.clone().into(),
         is_async: f.is_async,
         params,
@@ -1023,6 +1045,8 @@ fn lower_method(
     let return_type = ctx.normalize(&m.return_type);
     let body = lower_block(&m.body, &mut ctx)?;
     Ok(HirFunction {
+        requires: Vec::new(),
+        ensures: Vec::new(),
         name: m.name.clone().into(),
         is_async: m.is_async,
         params,
@@ -1065,6 +1089,8 @@ fn lower_constructor(
     }
     let body = lower_block(&ctor.body, &mut ctx)?;
     Ok(HirFunction {
+        requires: Vec::new(),
+        ensures: Vec::new(),
         name: "init".into(),
         is_async: false,
         params,
@@ -4172,6 +4198,8 @@ mod tests {
                         module: None,
                         imports: vec![],
                         items: vec![Item::Function(FunctionDecl {
+                            requires: Vec::new(),
+                            ensures: Vec::new(),
                             effect_contracts: Vec::new(),
                             return_type_span: None,
                             type_params: Vec::new(),
@@ -5432,3 +5460,52 @@ mod tests {
 #[cfg(test)]
 #[path = "lower_facts_tests.rs"]
 mod facts_tests;
+
+/// Only contract arithmetic uses this internal builtin. It cannot be spelled
+/// by source identifiers and remains an effectful call through optimization.
+fn contract_expression(mut expression: HirExpr) -> HirExpr {
+    expression.visit_mut_preorder(false, |node| {
+        use crate::parser::ast::{BinOp, UnaryOp};
+        let op = match &node.kind {
+            HirExprKind::Binary { op, lhs, .. }
+                if lhs.ty == crate::semantic::ids::SemanticType::I64 =>
+            {
+                match op {
+                    BinOp::Add => Some(0),
+                    BinOp::Sub => Some(1),
+                    BinOp::Mul => Some(2),
+                    BinOp::Div => Some(3),
+                    BinOp::Rem => Some(4),
+                    BinOp::Pow => Some(5),
+                    BinOp::Shl => Some(7),
+                    BinOp::Shr => Some(8),
+                    _ => None,
+                }
+            }
+            HirExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } if operand.ty == crate::semantic::ids::SemanticType::I64 => Some(6),
+            _ => None,
+        };
+        if let Some(op) = op {
+            let int = |n| HirExpr {
+                kind: HirExprKind::Int(n),
+                ty: crate::semantic::ids::SemanticType::I64,
+                span: node.span,
+            };
+            let old = std::mem::replace(&mut node.kind, HirExprKind::Int(0));
+            let (lhs, rhs) = match old {
+                HirExprKind::Binary { lhs, rhs, .. } => (*lhs, *rhs),
+                HirExprKind::Unary { operand, .. } => (*operand, int(0)),
+                _ => unreachable!(),
+            };
+            node.kind = HirExprKind::Call {
+                callee: "$contract_i64".into(),
+                args: vec![int(op), lhs, rhs],
+            };
+        }
+        true
+    });
+    expression
+}

@@ -287,6 +287,9 @@ pub(crate) fn normalize_std_collection_function(
         normalize_std_collection_type(&mut param.ty, imports);
     }
     normalize_std_collection_type(&mut function.return_type, imports);
+    for clause in function.requires.iter_mut().chain(&mut function.ensures) {
+        normalize_std_collection_expr(clause, imports);
+    }
     normalize_std_collection_block(&mut function.body, imports);
 }
 

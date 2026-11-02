@@ -131,6 +131,8 @@ pub struct HirClass {
 /// type, and a typed statement body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirFunction {
+    pub requires: Vec<HirExpr>,
+    pub ensures: Vec<HirExpr>,
     pub name: FunctionId,
     /// Whether this body is compiled as a cooperative poll state machine.
     pub is_async: bool,
