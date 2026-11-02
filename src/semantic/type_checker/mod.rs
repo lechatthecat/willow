@@ -195,6 +195,8 @@ pub struct TypeChecker {
     /// syntax identity rather than a source coordinate, so a pass that rebuilds
     /// a node cannot silently inherit its neighbour's type (willow-njot).
     pub expr_types: HashMap<ExprId, Type>,
+    // One-shot argument results used to infer a source Array static call.
+    prechecked_array_args: HashMap<ExprId, Type>,
     /// Reference modes and async retention of resolved calls, keyed by argument identity.
     pub reference_arg_modes: HashMap<ExprId, ReferenceArgMode>,
     /// What every type ANNOTATION the checker normalized became: the written
@@ -392,6 +394,7 @@ impl TypeChecker {
             pattern_resolutions: HashMap::new(),
             arm_leaves: HashMap::new(),
             expr_types: HashMap::new(),
+            prechecked_array_args: HashMap::new(),
             reference_arg_modes: HashMap::new(),
             normalized_types: HashMap::new(),
             signature_reads: None,

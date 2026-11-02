@@ -17,6 +17,7 @@ use super::*;
 
 #[cfg(test)]
 thread_local! {
+    static ARRAY_CONSTRUCTOR_ARGUMENT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LOCAL_INTERFACE_METHOD_RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -2430,8 +2431,7 @@ impl TypeChecker {
     ) -> Type {
         // Constructor syntax supplies a class argument from the expected array
         // when omitted, then uses the declaration's ordinary static dispatch.
-        if s.method == "new"
-            && self.resolve_static_call_class_quiet(&s.class).as_deref() == Some("Array")
+        if self.resolve_static_call_class_quiet(&s.class).as_deref() == Some("Array")
             && self
                 .generics
                 .classes
@@ -2445,10 +2445,33 @@ impl TypeChecker {
             }
             self.check_collection_type_imported("Array", s.span);
             let inferred;
+            let mut checked_argument = None;
             let arguments = if s.type_args.is_empty() {
                 inferred = match expected {
                     Some(Type::Array(element)) => vec![element.as_ref().clone()],
-                    _ => vec![Type::Void],
+                    _ => {
+                        // Infer from a declared T parameter, then reuse that check
+                        // during ordinary argument validation. Nested constructors
+                        // must not recursively check their value twice.
+                        let template = &self.generics.classes["$std::collections::Array"];
+                        let argument = template.methods.iter()
+                            .find(|method| method.name == s.method && method.is_static)
+                            .and_then(|method| method.params.iter().zip(&s.args).find_map(|(param, arg)| {
+                                (matches!(&param.ty, Type::Named(name) if template.type_params.contains(name))
+                                    && param.mode == ParamMode::Value && arg.mode == CallArgMode::Value)
+                                    .then_some(arg)
+                            }));
+                        if let Some(argument) = argument {
+                            #[cfg(test)]
+                            ARRAY_CONSTRUCTOR_ARGUMENT_CHECKS
+                                .with(|count| count.set(count.get() + 1));
+                            let ty = self.check_expr(&argument.expr);
+                            checked_argument = Some((argument.expr.id(), ty.clone()));
+                            vec![ty]
+                        } else {
+                            vec![Type::Void]
+                        }
+                    }
                 };
                 &inferred
             } else {
@@ -2494,7 +2517,13 @@ impl TypeChecker {
                     })
                     .collect();
                 self.check_call_argument_count(&s.method, params.len(), s.args.len(), s.span);
+                if let Some((id, ty)) = &checked_argument {
+                    self.prechecked_array_args.insert(*id, ty.clone());
+                }
                 self.check_call_args_against_param_infos(&params, &s.args);
+                if let Some((id, _)) = checked_argument {
+                    self.prechecked_array_args.remove(&id);
+                }
                 self.check_async_call_captures(&params, &s.args, method.is_async);
                 self.record_method_use(&s.method, "method", s.span, method.span, &s.args);
                 let result =
@@ -2514,6 +2543,9 @@ impl TypeChecker {
             self.generics.objects.insert(s.id, owner.clone());
             self.static_call_classes
                 .insert(s.id, TypeId::from_source_name(owner));
+            if let Some((id, ty)) = &checked_argument {
+                self.prechecked_array_args.insert(*id, ty.clone());
+            }
             let result = self.resolve_static_call(
                 owner,
                 &[],
@@ -2523,6 +2555,9 @@ impl TypeChecker {
                 s.method_span,
                 expected,
             );
+            if let Some((id, _)) = checked_argument {
+                self.prechecked_array_args.remove(&id);
+            }
             self.record_lock_effect_call(
                 FunctionId::method(TypeId::from_source_name(owner), &s.method),
                 s.span,
@@ -4806,6 +4841,24 @@ mod condition_recovery_tests {
 #[cfg(test)]
 mod source_array_constructor_tests {
     use super::*;
+
+    #[test]
+    fn array_utilities_nested_constructor_checks_are_linear() {
+        for depth in [4, 8, 16] {
+            let mut value = "7".to_string();
+            for _ in 0..depth {
+                value = format!("Array::with_len(1, {value})");
+            }
+            ARRAY_CONSTRUCTOR_ARGUMENT_CHECKS.with(|count| count.set(0));
+            let errors = check_source(&format!(
+                "import std::collections::Array; fn main() {{ let a = {value}; }}"
+            ));
+            assert!(errors.is_empty(), "{errors:?}");
+            let checks = ARRAY_CONSTRUCTOR_ARGUMENT_CHECKS.with(|count| count.get());
+            eprintln!("array constructor depth={depth} inferred argument checks={checks}");
+            assert_eq!(checks, depth);
+        }
+    }
 
     #[test]
     fn source_array_unresolved_constructor_checks_declared_arguments() {

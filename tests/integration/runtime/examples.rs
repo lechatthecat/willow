@@ -6,6 +6,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/abi_handshake.wi", "42\n"),
         (
+            "example/array_utilities.wi",
+            "7\n[2, 7, 7]\n[7, 7]\ntrue\n1\n[4, 4, 4]\nfirst\nsecond\nthird\n",
+        ),
+        (
             "example/array_join.wi",
             "日本 / Willow / 😀\n119999\ntrue\n",
         ),

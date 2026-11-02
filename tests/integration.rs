@@ -387,3 +387,6 @@ mod numeric_conversions;
 
 #[path = "integration/reachable_generic_methods.rs"]
 mod reachable_generic_methods;
+
+#[path = "integration/array_utilities.rs"]
+mod array_utilities;

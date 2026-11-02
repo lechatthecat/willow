@@ -4,6 +4,99 @@ import std::collections::FrozenArray;
 pub class Array<T> {
     pub static fn new() -> Array<T> { return []; }
     pub fn len() -> i64 { return self.__abi_len(); }
+    // Repeats the value (reference elements share their referent).
+    pub static fn with_len(length: i64, value: T) -> Array<T> {
+        if length < 0 { panic("array length must be non-negative"); }
+        let result: Array<T> = [];
+        result.__abi_resize(length);
+        result.fill(value);
+        return result;
+    }
+    pub fn fill(value: T) {
+        for index in 0..self.__abi_len() { self[index] = value; }
+    }
+    // Scalar/string value equality; returns the first matching index, or None.
+    pub fn index_of(value: T) -> Option<i64> where T: i64 | f64 | bool | String {
+        for index in 0..self.__abi_len() {
+            if self[index] == value { return Some(index); }
+        }
+        return None;
+    }
+    pub fn contains(value: T) -> bool where T: i64 | f64 | bool | String {
+        for index in 0..self.__abi_len() {
+            if self[index] == value { return true; }
+        }
+        return false;
+    }
+    // Independent, shallow copy of the half-open range [start, end).
+    pub fn slice(start: i64, end: i64) -> Array<T> {
+        if start < 0 || end < start || end > self.__abi_len() {
+            panic("array slice out of bounds");
+        }
+        let result: Array<T> = [];
+        result.__abi_resize(end - start);
+        for index in start..end { result[index - start] = self[index]; }
+        return result;
+    }
+    pub fn insert(index: i64, value: T) {
+        let length = self.__abi_len();
+        if index < 0 || index > length { panic("array insert out of bounds"); }
+        self.__abi_resize(length + 1);
+        let mut cursor = length;
+        while cursor > index {
+            self[cursor] = self[cursor - 1];
+            cursor = cursor - 1;
+        }
+        self[index] = value;
+    }
+    pub fn remove(index: i64) -> T {
+        let length = self.__abi_len();
+        if index < 0 || index >= length { panic("array remove out of bounds"); }
+        let value = self[index];
+        for cursor in index..(length - 1) { self[cursor] = self[cursor + 1]; }
+        self.__abi_resize(length - 1);
+        return value;
+    }
+    pub fn swap(first: i64, second: i64) {
+        let value = self[first];
+        let other = self[second];
+        self[first] = other;
+        self[second] = value;
+    }
+    // Unstable ascending numeric sort; NaNs follow all numbers.
+    pub fn sort() where T: i64 | f64 {
+        self.sort_by(|a: T, b: T| -> bool { return a < b || (a == a && b != b); });
+    }
+    // less(a, b) must define a strict weak ordering and must not mutate self.
+    // In-place heapsort: O(n log n) comparisons, O(1) auxiliary storage.
+    pub fn sort_by(less: closure(T, T) -> bool) {
+        let mut end = self.__abi_len();
+        let mut start = end / 2;
+        while end > 1 {
+            let mut root = 0;
+            if start > 0 {
+                start = start - 1;
+                root = start;
+            } else {
+                end = end - 1;
+                self.swap(0, end);
+            }
+            // Shared sift for heap construction and extraction.
+            let mut sinking = true;
+            while sinking && root < end / 2 {
+                let mut child = root * 2 + 1;
+                if child + 1 < end && less(self[child], self[child + 1]) {
+                    child = child + 1;
+                }
+                if less(self[root], self[child]) {
+                    self.swap(root, child);
+                    root = child;
+                } else {
+                    sinking = false;
+                }
+            }
+        }
+    }
     pub fn push(value: T) {
         let index = self.__abi_len();
         self.__abi_resize(index + 1);

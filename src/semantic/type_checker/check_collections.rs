@@ -131,7 +131,9 @@ impl TypeChecker {
         let (Type::Array(elem) | Type::FixedArray(elem, _)) = obj_ty else {
             return None;
         };
-        if matches!(obj_ty, Type::FixedArray(..)) && matches!(m.method.as_str(), "push" | "pop") {
+        if matches!(obj_ty, Type::FixedArray(..))
+            && matches!(m.method.as_str(), "push" | "pop" | "insert" | "remove")
+        {
             self.push(
                 Diagnostic::new(
                     Severity::Error,

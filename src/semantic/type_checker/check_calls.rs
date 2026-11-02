@@ -203,7 +203,11 @@ impl TypeChecker {
         // construction in argument position (`unwrap_or_zero(Ok(42))`) resolves
         // against the parameter type, just like a contextually-typed lambda
         // (willow-60o.1).
-        let arg_ty = self.check_expr_expecting(&arg.expr, param_ty);
+        let arg_ty = if let Some(ty) = self.prechecked_array_args.remove(&arg.expr.id()) {
+            ty
+        } else {
+            self.check_expr_expecting(&arg.expr, param_ty)
+        };
         if !self.types_compatible(param_ty, &arg_ty) {
             let diagnostic = Diagnostic::new(
                 Severity::Error,
