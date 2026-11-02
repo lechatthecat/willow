@@ -1,4 +1,7 @@
-// Rebuild after changing the value body; the other bodies remain reusable.
+// Run `willow check example/persistent_query_cache.wi` to populate the cache.
+// Then `willow refs value --source example/persistent_query_cache.wi` reads it
+// without writing files. Set WILLOW_QUERY_CACHE_STATS=1 to see reuse counts.
+// Change the value body: only that body needs typechecking on the next query.
 fn value() -> i64 { return 17; }
 fn stable() -> i64 { return 25; }
 fn main() { print(value() + stable()); }

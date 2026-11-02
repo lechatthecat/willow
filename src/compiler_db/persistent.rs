@@ -25,7 +25,8 @@ use std::{
     rc::Rc,
 };
 
-const FORMAT: u32 = 1;
+// Version 2 records include source-reference facts for read-only AI consumers.
+const FORMAT: u32 = 2;
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
 type ModuleIdentity = (UnitId, PathBuf, Option<SymbolModule>);
 
@@ -228,16 +229,18 @@ pub(crate) fn run(
     source: &str,
     root: &Path,
     map: &SourceMap,
-    inputs: CompilerInputs,
+    mut inputs: CompilerInputs,
     emitter: &mut dyn DiagnosticEmitter,
 ) -> Result<Frontend> {
-    // Read-only AI/edit sessions must not add cache files to isolated inputs.
-    if (inputs.capture_analysis && !inputs.verification)
-        || std::env::var_os("WILLOW_QUERY_CACHE").is_some_and(|v| v == "0")
-    {
+    if std::env::var_os("WILLOW_QUERY_CACHE").is_some_and(|v| v == "0") {
         return crate::run_frontend_revision(source, root, map, inputs, emitter, None, None);
     }
-    let read_only = inputs.verification;
+    // Analysis may reuse validated build/check records, but must never publish
+    // caches, including when analyzing isolated edit candidates or a cache miss.
+    let read_only = inputs.capture_analysis || inputs.verification;
+    // Persist complete semantic facts so later read-only queries can replay
+    // bodies without losing references that build/check would otherwise omit.
+    inputs.cache_analysis = true;
     let entry = Path::new(&map.path);
     let Ok(key) = CacheKey::new(&inputs, entry) else {
         return crate::run_frontend_revision(source, root, map, inputs, emitter, None, None);

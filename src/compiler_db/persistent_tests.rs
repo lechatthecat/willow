@@ -427,3 +427,97 @@ fn persistent_precheck_malformed_keys_and_outputs_are_cache_misses() {
     std::fs::write(&path, valid).unwrap();
     assert!(load(&path, &fixture.key()).is_ok());
 }
+
+#[test]
+fn readonly_analysis_cache_overlay_scaling_and_input_validation() {
+    for count in [8, 32, 128] {
+        let fixture = Fixture::new();
+        let entry = fixture.0.join("main.wi");
+        let mut source = String::from(SOURCE);
+        // Fan-out: callers depend on the same leaf, but a value-only edit does
+        // not change its signature or force any caller to be rechecked.
+        for i in 0..count {
+            source.push_str(&format!(" fn caller{i}() -> i64 {{ return first(); }}"));
+        }
+        std::fs::write(&entry, &source).unwrap();
+        let compile = |text: &str, analysis: bool| {
+            let mut inputs = fixture.inputs();
+            inputs.capture_analysis = analysis;
+            run(
+                text,
+                &fixture.0,
+                &SourceMap::new(entry.to_str().unwrap(), text),
+                inputs,
+                &mut Diagnostics::default(),
+            )
+        };
+        compile(&source, false).unwrap();
+        let path = cache_path(&fixture.0, &entry);
+        let bytes = std::fs::read(&path).unwrap();
+        let unchanged = compile(&source, true).unwrap();
+        assert_eq!(unchanged.db.typed_bodies.typechecks(), 0);
+        assert_eq!(unchanged.db.typed_bodies.reused(), count + 3);
+        let edited = source.replacen("return 1;", "return 9;", 1);
+        {
+            let _overlay = super::super::captured::SourceOverlay::enter(
+                [(entry.clone(), edited.clone())].into_iter().collect(),
+            );
+            let candidate = compile(&edited, true).unwrap();
+            assert_eq!(candidate.db.typed_bodies.typechecks(), 1);
+            assert_eq!(candidate.db.typed_bodies.reused(), count + 2);
+            println!(
+                "readonly_fanout bodies={} unchanged_typechecks=0 edited_typechecks=1 reused={} cache_bytes={}",
+                count + 3,
+                candidate.db.typed_bodies.reused(),
+                bytes.len(),
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&entry).unwrap(), source);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            compile(&source, true).unwrap().db.typed_bodies.typechecks(),
+            0
+        );
+        // A stale record cannot hide an invalid isolated candidate body.
+        let invalid = source.replacen("return 1;", "return unknown_name;", 1);
+        let _overlay = super::super::captured::SourceOverlay::enter(
+            [(entry.clone(), invalid.clone())].into_iter().collect(),
+        );
+        assert!(compile(&invalid, true).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn persistent_build_captures_reference_facts_without_query_source_views() {
+    let fixture = Fixture::new();
+    let source = "fn id<T>(value: T) -> T { return value; } fn main() { println(id(42)); }";
+    let entry = fixture.0.join("main.wi");
+    std::fs::write(&entry, source).unwrap();
+    let map = SourceMap::new(entry.to_str().unwrap(), source);
+    let built = run(
+        source,
+        &fixture.0,
+        &map,
+        fixture.inputs(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(built.db.generic_sources.is_empty());
+    assert!(!built.db.inputs().capture_analysis);
+    assert!(built.db.inputs().cache_analysis);
+    let mut inputs = fixture.inputs();
+    inputs.capture_analysis = true;
+    let queried = run(
+        source,
+        &fixture.0,
+        &map,
+        inputs,
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(!queried.db.generic_sources.is_empty());
+    assert_eq!(queried.db.typed_bodies.typechecks(), 0);
+    let snapshot = crate::ai::snapshot(&queried, &entry, source, None).unwrap();
+    assert!(snapshot.functions.iter().any(|f| f.name == "id"));
+}

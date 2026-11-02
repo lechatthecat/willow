@@ -885,7 +885,8 @@ fn run_frontend_revision_cached(
         let registry = std::rc::Rc::new(std::cell::RefCell::new(
             semantic::type_checker::generics::TemplateRegistry::default(),
         ));
-        registry.borrow_mut().capture_source_references = inputs.capture_analysis;
+        registry.borrow_mut().capture_source_references =
+            inputs.capture_analysis || inputs.cache_analysis;
         for module in &graph.files {
             std::rc::Rc::make_mut(&mut registry.borrow_mut().module_paths)
                 .insert(module.id.file_id(), module.identity_path().to_string());
@@ -1294,7 +1295,7 @@ fn run_frontend_revision_cached(
         )?;
     }
     db.effects.relocate_solutions(&artifacts.correspondence);
-    if db.inputs().capture_analysis {
+    if db.inputs().capture_analysis || db.inputs().cache_analysis {
         *db.effects.analysis.borrow_mut() = Some(Default::default());
     }
     let options = &db.inputs().options;
