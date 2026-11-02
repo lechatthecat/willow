@@ -263,6 +263,11 @@ fn discover_sources_with_aliases(
             let path = entry
                 .map_err(|e| failure("source_layout_invalid", e))?
                 .path();
+            // Standalone edits may keep their isolated candidates under src/.
+            // These are transaction metadata, never package source modules.
+            if path.file_name().is_some_and(|name| name == ".willow-edits") {
+                continue;
+            }
             let canonical = contained_path(root, &path).map_err(package_error)?;
             if canonical.is_dir() {
                 stack.push(path);
@@ -384,6 +389,36 @@ fn check_tags(source: &PathSource) -> Result<(), VerificationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_discovery_excludes_nested_edit_candidates() {
+        for n in [1, 8, 32] {
+            let root = std::env::temp_dir().join(format!(
+                "willow-discovery-edit-candidates-{}-{n}",
+                std::process::id()
+            ));
+            let src = root.join("src");
+            std::fs::create_dir_all(src.join("nested")).unwrap();
+            std::fs::write(src.join("main.wi"), "fn main() {}").unwrap();
+            for parent in [&src, &src.join("nested")] {
+                for i in 0..n {
+                    let candidate = parent.join(format!(".willow-edits/{i}"));
+                    std::fs::create_dir_all(&candidate).unwrap();
+                    std::fs::write(candidate.join("invalid-name.wi"), "not source").unwrap();
+                }
+            }
+            for aliases in [false, true] {
+                let modules = discover_sources_with_aliases(&root, &src, aliases).unwrap();
+                assert_eq!(modules.len(), 1);
+                assert!(modules.contains_key("main"));
+                // Ordinary invalid source names remain errors, even beside metadata.
+                std::fs::write(src.join("invalid-name.wi"), "fn main() {}").unwrap();
+                assert!(discover_sources_with_aliases(&root, &src, aliases).is_err());
+                std::fs::remove_file(src.join("invalid-name.wi")).unwrap();
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn shared_imports_load_each_source_once_at_increasing_sizes() {
         for n in [8, 32, 128] {

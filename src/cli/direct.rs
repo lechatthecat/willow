@@ -229,7 +229,7 @@ impl Options {
         };
         let mut session = DirectSession::new(snapshot)?;
         if self.command == "rename" {
-            let mut result = session.rename(
+            let mut result = session.rename_with_emitter(
                 std::path::Path::new(&entry),
                 project,
                 &self.selector,
@@ -242,6 +242,7 @@ impl Options {
                 } else {
                     RenameMode::Summary
                 },
+                emitter,
             )?;
             if self.dry_run && result["status"] == "ok" {
                 let mut summary = json!({

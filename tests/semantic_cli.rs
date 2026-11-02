@@ -48,6 +48,79 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn applied_rename_obeys_warning_policy_in_every_output_mode() {
+    for project in [false, true] {
+        for format in ["human", "json", "ndjson"] {
+            for warnings in [false, true] {
+                for dry_run in [false, true] {
+                    let f = Fixture::new();
+                    let path = f.0.join("src/order.wi");
+                    let original = fs::read_to_string(&path).unwrap();
+                    fs::write(
+                        &path,
+                        original.replace(
+                            "module order;",
+                            "module order;\nimport std::collections::Array;",
+                        ),
+                    )
+                    .unwrap();
+                    let mut args = vec![
+                        "rename",
+                        "order::Order::qty",
+                        "renamed_qty",
+                        "--format",
+                        format,
+                    ];
+                    if !project {
+                        args.extend(["--source", "src/main.wi"]);
+                    }
+                    if warnings {
+                        args.push("--warnings");
+                    }
+                    if dry_run {
+                        args.push("--dry-run");
+                    }
+                    let output = f.run(&args);
+                    let stderr = String::from_utf8(output.stderr).unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{args:?}: {stderr} {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                    assert_eq!(
+                        stderr.contains("warning[W2003]"),
+                        warnings,
+                        "{args:?}: {stderr}"
+                    );
+                    if !warnings && format != "human" {
+                        assert!(stderr.is_empty(), "{args:?}: {stderr}");
+                    }
+                    if format != "human" {
+                        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                        assert_eq!(value["status"], "ok");
+                        // Initial, candidate, and published-source analyses each
+                        // report the warning; dry-run performs initial analysis only.
+                        assert_eq!(
+                            value["diagnostics"]["warnings"],
+                            if dry_run { 1 } else { 3 }
+                        );
+                    }
+                    let changed = fs::read_to_string(path).unwrap();
+                    assert_eq!(changed.contains("pub renamed_qty:"), !dry_run);
+                    let check = f.run(&["check"]);
+                    assert!(
+                        check.status.success(),
+                        "{args:?}: {} {}",
+                        String::from_utf8_lossy(&check.stdout),
+                        String::from_utf8_lossy(&check.stderr)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn direct_checker_warnings_use_check_project_paths() {
     let f = Fixture::new();
     for file in ["src/main.wi", "src/order.wi"] {

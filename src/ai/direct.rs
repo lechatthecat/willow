@@ -234,6 +234,27 @@ impl DirectSession {
         &self.session.snapshot
     }
     pub fn rename(
+        self,
+        entry: &Path,
+        project: bool,
+        selector: &str,
+        filter: &SelectorFilter,
+        name: &str,
+        mode: impl Into<RenameMode>,
+    ) -> Result<Value> {
+        self.rename_with_emitter(
+            entry,
+            project,
+            selector,
+            filter,
+            name,
+            mode,
+            &mut crate::diagnostics::HumanEmitter,
+        )
+    }
+    /// Preserve the caller's diagnostic policy through validation and publication.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rename_with_emitter(
         mut self,
         entry: &Path,
         project: bool,
@@ -241,6 +262,7 @@ impl DirectSession {
         filter: &SelectorFilter,
         name: &str,
         mode: impl Into<RenameMode>,
+        emitter: &mut dyn crate::diagnostics::DiagnosticEmitter,
     ) -> Result<Value> {
         let mode = mode.into();
         self.session
@@ -359,9 +381,8 @@ impl DirectSession {
         let transaction = preview["transaction"]
             .as_str()
             .context("missing transaction identity")?;
-        let mut emitter = crate::diagnostics::HumanEmitter;
-        workspace.validate(transaction, &mut emitter)?;
-        workspace.apply_with_rollback(transaction, &mut emitter)?;
+        workspace.validate(transaction, emitter)?;
+        workspace.apply_with_rollback(transaction, emitter)?;
         let mut result = json!({"status":"ok","old":selector,"new":name,"validation":"passed","transaction":transaction,"selected":selected});
         // Source publication has committed. Advisory history failure must not
         // make callers believe the rename failed or invite an unsafe retry.
