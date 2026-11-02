@@ -6462,3 +6462,164 @@ fn interface_boundary_reasons_keep_reachable_caller_provenance() {
         }
     }
 }
+
+#[test]
+fn inherited_method_effects_match_base_and_contract() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/inherited_method_effects.wi"),
+    )
+    .unwrap();
+    let base = f.json(&["effects", "main::Base::charge"], 0);
+    let child = f.json(&["effects", "main::Child::work"], 0);
+    assert_eq!(
+        child["result"]["effects"], base["result"]["effects"],
+        "{child}"
+    );
+    assert!(
+        child["result"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["effect"] == 32 || e["state"] == "none")
+    );
+}
+
+#[test]
+fn inherited_method_effects_resolve_twenty_call_shapes() {
+    // Five inheritance shapes x four paths, all with a checked no_wait contract.
+    for classes in [
+        "class Child extends Base { @effects(no_wait) pub fn work(self) { self.charge(); } }",
+        "open class Middle extends Base {} class Child extends Middle { @effects(no_wait) pub fn work(self) { self.charge(); } }",
+        "open class Middle extends Base { @effects(no_wait) pub fn work(self) { self.charge(); } } class Child extends Middle {}",
+        "class Sibling extends Base {} class Child extends Base { @effects(no_wait) pub fn work(self) { self.charge(); } }",
+        "open class Middle extends Base {} open class Deep extends Middle {} class Child extends Deep { @effects(no_wait) pub fn work(self) { self.charge(); } }",
+    ] {
+        let f = Fixture::new();
+        let source = format!(
+            "open class Base {{ pub n: i64; @effects(no_wait) pub fn charge(self) {{ self.n = 0; }} }} {classes}\n@effects(no_wait) fn through_child(c: Child) {{ c.charge(); }}\n@effects(no_wait) fn through_base(c: Base) {{ c.charge(); }}\n@effects(no_wait) fn relay(c: Child) {{ c.work(); }} fn main() {{}}"
+        );
+        fs::write(f.0.join("src/main.wi"), source).unwrap();
+        assert!(f.run(&["check"]).status.success());
+        let method = if classes.contains("Middle extends Base { @") {
+            "Middle::work"
+        } else {
+            "Child::work"
+        };
+        let base = f.json(&["effects", "main::Base::charge", "--explain"], 0);
+        let id = &base["result"]["selected"]["id"];
+        for name in [method, "through_child", "through_base", "relay"] {
+            let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+            assert!(
+                value["result"]["effects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e["state"] == "none"),
+                "{name}: {value}"
+            );
+            assert!(
+                value["result"]["witness"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| &w["function"] == id && w["via"].is_string()),
+                "{value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn inherited_method_effects_show_override_witness_chain() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "fn allocate() -> i64 { let xs = [1, 2]; return 2; } open class Metered { pub fn charge(self) -> i64 { return self.edit_cost(); } pub open fn edit_cost(self) -> i64 { return 0; } } class PieceTable extends Metered { pub override fn edit_cost(self) -> i64 { return allocate(); } } fn main() { println(new PieceTable().charge()); }").unwrap();
+    let value = f.json(&["effects", "main::Metered::charge", "--explain"], 0);
+    let allocation = value["result"]["effect_evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["effect"] == 1)
+        .unwrap();
+    let ids: Vec<_> = ["Metered::charge", "PieceTable::edit_cost", "allocate"]
+        .iter()
+        .map(|name| {
+            f.json(&["effects", &format!("main::{name}")], 0)["result"]["selected"]["id"].clone()
+        })
+        .collect();
+    assert_eq!(allocation["call_chain"], serde_json::json!(ids), "{value}");
+    for explain in [false, true] {
+        let mut args = vec!["effects", "main::Metered::charge"];
+        if explain {
+            args.push("--explain");
+        }
+        let output = f.run(&args);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(
+                "chain=main::Metered::charge -> main::PieceTable::edit_cost -> main::allocate"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("$dispatch$"), "{text}");
+    }
+}
+
+#[test]
+fn inherited_method_effects_keep_imported_override_and_std_chain() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/base.wi"), "module base; import std::collections::Array; pub open class Base { pub fn charge(self, xs: Array<i64>) -> i64 { return self.cost(xs); } pub open fn cost(self, xs: Array<i64>) -> i64 { return 0; } }").unwrap();
+    fs::write(f.0.join("src/main.wi"), "import base; import std::collections::Array; class Child extends base::Base { pub override fn cost(self, xs: Array<i64>) -> i64 { return xs.len(); } pub fn work(self, xs: Array<i64>) -> i64 { return self.charge(xs); } } fn main() { println(new Child().work([1, 2])); }").unwrap();
+    for source in [false, true] {
+        let mut args = vec!["effects", "main::Child::work", "--explain"];
+        if source {
+            args.extend(["--source", "src/main.wi"]);
+        }
+        let value = f.json(&args, 0);
+        assert!(
+            value["result"]["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|e| e["unknown_reasons"].as_array().unwrap())
+                .all(|r| r["code"] != "unresolved-callee" && r["code"] != "external-interop"),
+            "{value}"
+        );
+        let output = f.run(&args);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("chain=main::Child::work -> base::Base::charge -> main::Child::cost -> <std>::collections::len"), "{text}");
+    }
+}
+
+#[test]
+fn inherited_method_effects_preserve_waits_and_contract_rejection() {
+    let f = Fixture::new();
+    let source = "open class Base { pub fn charge(self) { select { sleep(0) => {} } } } class Child extends Base { pub fn work(self) { self.charge(); } } fn main() {}";
+    fs::write(f.0.join("src/main.wi"), source).unwrap();
+    let value = f.json(&["effects", "main::Child::work"], 0);
+    assert!(
+        value["result"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["effect"] == 2 && e["state"] == "may"),
+        "{value}"
+    );
+    fs::write(
+        f.0.join("src/main.wi"),
+        source.replace("pub fn work", "@effects(no_wait) pub fn work"),
+    )
+    .unwrap();
+    let output = f.run(&["check"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success() && text.contains("E2610") && text.contains("no_wait"),
+        "{text}"
+    );
+}

@@ -255,6 +255,7 @@ pub(super) fn finish(
     resolve: &impl Fn(UnitId, FunctionId) -> (UnitId, FunctionId),
     bodyless: &impl Fn(UnitId, &FunctionId) -> bool,
     fingerprints: &HashMap<Span, String>,
+    dispatch_sites: &HashMap<(&str, usize, usize), String>,
 ) -> Result<SemanticFacts> {
     let location = |span: Span| -> Result<Location> {
         Ok(Location {
@@ -307,9 +308,11 @@ pub(super) fn finish(
     units.sort();
     for unit in units {
         for (caller, span, target, operation) in &captures[&unit].semantic.call_sites {
-            // Virtual calls may deliberately have no single checked target.
-            // Their receiver/method identity still locates the dispatch edge.
-            let effect_target = captures[&unit].dispatch_sites.get(span).or(target.as_ref());
+            // Prefer the checked implementation (which may belong to a base
+            // class). A receiver-qualified name need not have its own body.
+            let effect_target = target.as_ref();
+            let site = location(*span)?;
+            let dispatch = dispatch_sites.get(&(site.path.as_str(), site.start, site.end));
             if let Some(target) = effect_target
                 && let (Some(caller), Some(target)) = (
                     functions.get(&resolve(unit, *caller)),
@@ -327,9 +330,24 @@ pub(super) fn finish(
             }
             // Calls whose effects are already known without a body (variant
             // constructors, intrinsics) do not explain an unknown caller.
-            if effect_target.is_some_and(|target| {
-                functions.contains_key(&resolve(unit, *target)) || bodyless(unit, target)
-            }) {
+            let resolved_dispatch = dispatch.is_some();
+            if let Some(dispatch) = dispatch
+                && let Some(caller) = functions.get(&resolve(unit, *caller))
+            {
+                result
+                    .effect_calls
+                    .entry(caller.id.clone())
+                    .or_default()
+                    .push(EffectCall {
+                        target: dispatch.clone(),
+                        location: site,
+                    });
+            }
+            if resolved_dispatch
+                || effect_target.is_some_and(|target| {
+                    functions.contains_key(&resolve(unit, *target)) || bodyless(unit, target)
+                })
+            {
                 continue;
             }
             if let Some(caller) = functions.get(&resolve(unit, *caller)) {
@@ -364,6 +382,17 @@ pub(super) fn finish(
                     && let Some(target) = w.as_object_mut().and_then(|w| w.remove("target_key"))
                 {
                     let target: FunctionId = serde_json::from_value(target)?;
+                    // Unit-local compiler summaries can treat an imported
+                    // implementation as external. The completed snapshot owns
+                    // its body and propagates its actual evidence instead.
+                    if functions
+                        .get(&resolve(unit, target))
+                        .is_some_and(|function| {
+                            !function.synthetic && function.body_location.is_some()
+                        })
+                    {
+                        continue;
+                    }
                     let Some(site) =
                         boundary_sites.get(&(resolve(unit, *id), resolve(unit, target)))
                     else {
@@ -1476,6 +1505,45 @@ impl QuerySession {
                     evidence.extend(suspension_sites);
                     deduplicate_evidence(&mut evidence);
                     self.present_lock_types(&mut evidence);
+                    // The traversal is a parent-before-child spanning tree. Share
+                    // parent links, compress synthetic dispatch hops once, and
+                    // materialize only the paths actually emitted as evidence.
+                    let mut parents = HashMap::new();
+                    let mut executable = HashMap::new();
+                    for node in &witness {
+                        let id = node["function"].as_str().unwrap();
+                        let parent = node["via"]
+                            .as_str()
+                            .and_then(|id| executable.get(id).copied())
+                            .flatten();
+                        if self
+                            .functions
+                            .get(id)
+                            .is_some_and(|&k| !self.snapshot.functions[k].synthetic)
+                        {
+                            parents.insert(id, parent);
+                            executable.insert(id, Some(id));
+                        } else {
+                            executable.insert(id, parent);
+                        }
+                    }
+                    for fact in &mut evidence {
+                        let owner = fact["witness"]["owner"]
+                            .as_str()
+                            .filter(|id| parents.contains_key(id))
+                            .or_else(|| fact["via_function"].as_str());
+                        let mut chain = Vec::new();
+                        let mut cursor = owner;
+                        while let Some(id) = cursor {
+                            let Some(parent) = parents.get(id) else { break };
+                            chain.push(id);
+                            cursor = *parent;
+                        }
+                        chain.reverse();
+                        if !chain.is_empty() {
+                            fact["call_chain"] = json!(chain);
+                        }
+                    }
                     let mut compiler_witnesses =
                         self.snapshot.semantic.witnesses.get(&f.id).cloned();
                     if let Some(facts) = &mut compiler_witnesses {
@@ -1945,6 +2013,75 @@ mod tests {
             vec![("a", 2, 20), ("a", 30, 40), ("b", 1, 4)]
         );
         assert!(local_ranges(&[]).is_empty());
+    }
+
+    #[test]
+    fn inherited_effect_chain_scales_with_dispatch_edges() {
+        let directory =
+            std::env::temp_dir().join(format!("willow-inherited-evidence-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("main.wi");
+        for shape in ["chain", "fanout"] {
+            for n in [8, 32, 128] {
+                let mut source = String::from(
+                    "fn allocate() -> i64 { let xs = [1, 2]; return 2; } open class Base { pub fn charge(self) -> i64 { self.cost(); self.cost(); return self.cost(); } pub open fn cost(self) -> i64 { return 0; } }\n",
+                );
+                for i in 0..n {
+                    let base = if shape == "chain" && i != 0 {
+                        format!("C{}", i - 1)
+                    } else {
+                        "Base".to_owned()
+                    };
+                    let method = if shape == "fanout" || i == n - 1 {
+                        "pub override fn cost(self) -> i64 { allocate(); allocate(); return allocate(); }"
+                    } else {
+                        ""
+                    };
+                    source.push_str(&format!("open class C{i} extends {base} {{ {method} }}\n"));
+                }
+                source.push_str("fn main() {}\n");
+                std::fs::write(&path, source).unwrap();
+                let snapshot = crate::CompilerSession::new(
+                    path.to_str().unwrap(),
+                    "",
+                    &crate::CompilerOptions::debug(),
+                    None,
+                )
+                .analysis_with_emitter(&mut crate::diagnostics::HumanEmitter)
+                .unwrap();
+                let function = snapshot
+                    .functions
+                    .iter()
+                    .find(|f| f.name == "Base::charge")
+                    .unwrap()
+                    .id
+                    .clone();
+                let edges: usize = snapshot.functions.iter().map(|f| f.callees.len()).sum();
+                let stored: usize = snapshot.semantic.effect_calls.values().map(Vec::len).sum();
+                let revision = snapshot.revision.clone();
+                let mut session = QuerySession::new(snapshot).unwrap();
+                let value = session.query(QueryRequest::Effects { revision, function });
+                let allocation = value["result"]["effect_evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["effect"] == 1)
+                    .unwrap();
+                assert_eq!(
+                    allocation["call_chain"].as_array().unwrap().len(),
+                    3,
+                    "{value}"
+                );
+                assert!(edges <= 4 * n + 10, "edges={edges}");
+                assert!(stored <= 3 * n + 10, "stored={stored}");
+                assert!(session.effect_edge_visits <= edges);
+                println!(
+                    "inherited shape={shape} n={n} edges={edges} stored={stored} visits={} emitted_chain=3",
+                    session.effect_edge_visits
+                );
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

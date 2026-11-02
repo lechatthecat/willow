@@ -736,7 +736,9 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
                     .unwrap_or("unavailable")
             );
             let locked = locked_label(&witness["cause"]);
+            let chain = effect_call_chain(fact);
             for (name, value) in [
+                ("chain", &chain),
                 ("via", &fact["via_function"]),
                 ("target", &witness["target"]),
                 ("owner", &witness["owner"]),
@@ -798,12 +800,27 @@ fn locked_label(cause: &Value) -> Value {
     Value::from(label)
 }
 
+fn effect_call_chain(fact: &Value) -> Value {
+    fact["call_chain"]
+        .as_array()
+        .map(|chain| {
+            Value::from(
+                chain
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" -> "),
+            )
+        })
+        .unwrap_or(Value::Null)
+}
+
 // Preserve input order while indexing identities and reasons: expected O(input bytes).
 fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut Vec<String>) {
     use std::collections::{HashMap, HashSet};
     // Facts merged at one site keep one field per key; distinct values of a
     // key are listed together so a merged line never repeats `status=`/`kind=`.
-    const KEYS: [&str; 8] = [
+    const KEYS: [&str; 9] = [
         "status",
         "kind",
         "via",
@@ -812,6 +829,7 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
         "operation",
         "locked",
         "task",
+        "chain",
     ];
     #[derive(Default)]
     struct Entry {
@@ -864,6 +882,7 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
         let entry = &mut entries[index];
         entry.bits |= fact["effect"].as_u64().unwrap_or(0);
         let locked = locked_label(cause);
+        let chain = effect_call_chain(fact);
         let task = task_relationship_label(fact)
             .map(|label| Value::from(label.trim_start_matches("task=")))
             .unwrap_or(Value::Null);
@@ -876,6 +895,7 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
             &cause["operation"],
             &locked,
             &task,
+            &chain,
         ]
         .into_iter()
         .enumerate()

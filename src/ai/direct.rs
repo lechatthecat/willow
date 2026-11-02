@@ -1156,6 +1156,13 @@ impl DirectSession {
                 for fact in facts {
                     ids.extend(fact["via_function"].as_str());
                     ids.extend(fact["witness"]["owner"].as_str());
+                    ids.extend(
+                        fact["call_chain"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str),
+                    );
                 }
             }
         }
@@ -1204,6 +1211,13 @@ impl DirectSession {
         for key in ["effect_evidence", "compiler_witnesses"] {
             if let Some(facts) = result[key].as_array_mut() {
                 for fact in facts {
+                    if let Some(chain) = fact["call_chain"].as_array_mut() {
+                        for step in chain {
+                            if let Some(label) = step.as_str().and_then(name) {
+                                *step = json!(label);
+                            }
+                        }
+                    }
                     if let Some(name) = fact["via_function"].as_str().and_then(name) {
                         fact["via_function"] = json!(name);
                     }

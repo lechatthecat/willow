@@ -1380,14 +1380,6 @@ fn snapshot_with_boundary(
             }
         }
     }
-    let mut semantic = semantic::finish(
-        &captured,
-        &paths,
-        &nodes,
-        &resolve,
-        &|unit, target| bodyless_target_effects(unit, target).is_some(),
-        &fingerprints,
-    )?;
     let mut dispatch_sites = HashMap::new();
     for (&unit, capture) in &captured {
         for (&span, &target) in &capture.dispatch_sites {
@@ -1401,6 +1393,15 @@ fn snapshot_with_boundary(
             }
         }
     }
+    let mut semantic = semantic::finish(
+        &captured,
+        &paths,
+        &nodes,
+        &resolve,
+        &|unit, target| bodyless_target_effects(unit, target).is_some(),
+        &fingerprints,
+        &dispatch_sites,
+    )?;
     for expression in &mut semantic.expressions {
         let l = &expression.location;
         if let Some(target) = dispatch_sites.get(&(l.path.as_str(), l.start, l.end)) {
@@ -1422,22 +1423,6 @@ fn snapshot_with_boundary(
                     },
                 });
         }
-    }
-    for sites in semantic.effect_calls.values_mut() {
-        // Keep the source call location for both the checked target and its
-        // shared dispatch edge. Asyncness is decided per executable candidate.
-        let dispatch_calls: Vec<_> = sites
-            .iter()
-            .filter_map(|site| {
-                let l = &site.location;
-                let target = dispatch_sites.get(&(l.path.as_str(), l.start, l.end))?;
-                Some(semantic::EffectCall {
-                    target: target.clone(),
-                    location: l.clone(),
-                })
-            })
-            .collect();
-        sites.extend(dispatch_calls);
     }
     for (key, targets) in edges {
         nodes.get_mut(&key).unwrap().callees = targets.into_iter().collect();

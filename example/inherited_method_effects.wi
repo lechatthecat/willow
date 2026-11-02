@@ -1,0 +1,14 @@
+open class Base {
+    pub n: i64;
+    @effects(no_wait)
+    pub fn charge(self) { self.n = self.n + 1; }
+}
+class Child extends Base {
+    @effects(no_wait)
+    pub fn work(self) { self.charge(); }
+}
+fn main() {
+    let child = new Child(0);
+    child.work();
+    println(child.n);
+}
