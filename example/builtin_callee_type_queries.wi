@@ -1,0 +1,35 @@
+import std::collections::Map;
+
+// Callee tokens expose signatures; other tokens keep expression inference.
+class Label {
+    pub fn text(self) -> String { return "a b"; }
+}
+fn text() -> String { return "a b"; }
+fn main() {
+    let mapping: Map<String, i64> = Map::new();
+    let channel: Channel<String> = Channel::new();
+    let parsed = i64::parse("+42").unwrap();
+    let s = text();
+    let label = new Label();
+    let t = label.text();
+    let parts = text().split(" ");
+    let n = s.len();
+    let trimmed = s.trim();
+    let sub = s.substring(0, 1);
+    let sliced = s.slice(0, 1);
+    let repeated = s.repeat(2);
+    let byte = s.byte_at(0);
+    let contains = s.contains("a");
+    let found = s.find("b");
+    let starts = s.starts_with("a");
+    let shown = n.toString();
+    let sum = n.wrapping_add(1);
+    let neg = n.wrapping_neg();
+    let checked = n.checked_add(1);
+    let count = parts.len();
+    let upper = parts[0].trim().len();
+    let timer = sleep(0);
+    let next = yield();
+    print(1);
+    println(t);
+}

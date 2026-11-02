@@ -281,6 +281,7 @@ impl TypeChecker {
 
     pub(super) fn check_expr_expecting(&mut self, expr: &Expr, expected: &Type) -> Type {
         let ty = self.check_expr_expecting_inner(expr, expected);
+        self.finalize_builtin_static_call(expr, &ty);
         self.record_static_target(expr);
         self.expr_types.insert(expr.id(), ty.clone());
         ty

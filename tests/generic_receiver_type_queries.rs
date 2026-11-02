@@ -155,7 +155,7 @@ fn generic_bodies_report_template_types_without_aliases() {
 #[test]
 fn builtin_members_and_plain_symbols_are_unchanged() {
     let snapshot = snapshot(&[("main.wi", SOURCE)], "builtin");
-    // Only resolved user member calls carry a substituted callee type.
+    // Resolved member calls and builtins carry callee types.
     assert!(snapshot.semantic.references.iter().any(|r| r.ty.is_some()));
     assert!(
         snapshot
@@ -287,14 +287,14 @@ fn non_generic_member_calls_store_no_redundant_callee_type() {
     let source = "class Plain {\n    value: i64;\n    pub init(self, value: i64) { self.value = value; }\n    pub fn get(self) -> i64 { return self.value; }\n}\nfn main() {\n    let plain = new Plain(1);\n    println(plain.get());\n}\n";
     let snapshot = snapshot(&[("main.wi", source)], "plain");
     // The declaration already answers; no per-call copy is persisted.
-    assert!(
-        snapshot
-            .semantic
-            .references
-            .iter()
-            .filter(|r| !r.location.path.starts_with("<std>"))
-            .all(|r| r.ty.is_none())
-    );
+    let calls: Vec<_> = snapshot
+        .semantic
+        .references
+        .iter()
+        .filter(|r| source.get(r.location.start..r.location.end) == Some("get"))
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].ty.is_none());
     let revision = snapshot.revision.clone();
     let mut session = QuerySession::new(snapshot).unwrap();
     let at = byte(source, "plain.get", 0, "get");

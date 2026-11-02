@@ -348,6 +348,7 @@ impl TypeChecker {
         call: &MethodCallExpr,
         start: usize,
         errors: usize,
+        result: &Type,
     ) {
         if !self.capture_call_sites
             || self.error_generation != errors
@@ -365,6 +366,14 @@ impl TypeChecker {
         {
             return;
         }
+        // Reuse checked argument types, including contextual closure inference.
+        // Builtins have no source declaration; their signature is specialized
+        // to this successful call. Never re-check arguments to obtain metadata.
+        let params: Option<Vec<_>> = call
+            .args
+            .iter()
+            .map(|arg| self.expr_types.get(&arg.expr.id()).cloned())
+            .collect();
         self.record_method_use(
             &call.method,
             "builtin-method",
@@ -372,7 +381,58 @@ impl TypeChecker {
             Span::new(0, 0, 0, 0),
             &call.args,
         );
+        self.analysis_symbols.references.last_mut().unwrap().ty =
+            params.map(|params| Type::Fn(params, Box::new(result.clone())));
+        self.mark_last_member_use_call();
     }
+    /// Builtin static calls have an exact parser token and no source declaration.
+    /// The resolver calls this only after successful checking, excluding source
+    /// members and enum variants. Reuse checked types without revisiting args.
+    pub(super) fn record_builtin_static_call(
+        &mut self,
+        name: &str,
+        call_span: Span,
+        token: Span,
+        args: &[CallArg],
+        result: &Type,
+    ) {
+        let params: Option<Vec<_>> = args
+            .iter()
+            .map(|arg| self.expr_types.get(&arg.expr.id()).cloned())
+            .collect();
+        self.member_uses.insert(
+            (call_span.file_id, call_span.start),
+            self.analysis_symbols.references.len(),
+        );
+        self.analysis_symbols.reference(
+            token,
+            name,
+            Declaration::new(name, "builtin-function", Span::dummy(), None),
+            "call",
+            false,
+        );
+        self.analysis_symbols.references.last_mut().unwrap().ty =
+            params.map(|params| Type::Fn(params, Box::new(result.clone())));
+    }
+
+    /// Contextual constructor inference can replace placeholder return types
+    /// after resolution. Update the already-recorded call in O(1) index lookups.
+    pub(super) fn finalize_builtin_static_call(&mut self, expr: &Expr, result: &Type) {
+        if !self.capture_call_sites {
+            return;
+        }
+        if let Expr::StaticCall(call) = expr
+            && let Some(&index) = self.member_uses.get(&(call.span.file_id, call.span.start))
+            && let Some(reference) = self.analysis_symbols.references.get_mut(index)
+            && reference.span == call.method_span
+            && reference.target.kind == "builtin-function"
+            && let Some(Type::Fn(_, return_type)) = &mut reference.ty
+            && return_type.as_ref() != result
+        {
+            **return_type = result.clone();
+        }
+    }
+
     pub(super) fn record_type_use(&mut self, written: &str, normalized: &Type, span: Span) {
         self.mark_import_used(written, span);
         self.record_type_reference(written, normalized, span);
@@ -470,6 +530,13 @@ impl TypeChecker {
                             "call",
                             false,
                         );
+                        // Builtin free functions have no declaration to supply
+                        // their signature to the semantic snapshot.
+                        if info.declaration_span == Span::dummy() {
+                            self.analysis_symbols.references.last_mut().unwrap().ty = Some(
+                                Type::Fn(info.params.clone(), Box::new(info.return_type.clone())),
+                            );
+                        }
                     }
                 }
             }
@@ -486,7 +553,7 @@ impl TypeChecker {
                     .unwrap_or_else(|| call.class.clone());
                 self.record_type_use(&call.class, &Type::Named(name), call.span);
             }
-            Expr::Print(_, newline, span, _) => {
+            Expr::Print(value, newline, span, _) => {
                 let name = if *newline { "println" } else { "print" };
                 self.analysis_symbols.reference(
                     *span,
@@ -495,6 +562,10 @@ impl TypeChecker {
                     "call",
                     false,
                 );
+                if let Some(ty) = self.expr_types.get(&value.id()) {
+                    self.analysis_symbols.references.last_mut().unwrap().ty =
+                        Some(Type::Fn(vec![ty.clone()], Box::new(Type::Void)));
+                }
             }
             Expr::StaticField(field) => {
                 let name = self

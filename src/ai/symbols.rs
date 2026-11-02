@@ -317,8 +317,8 @@ pub struct Reference {
     pub target: String,
     pub location: Location,
     pub role: String,
-    /// A member call's callee type as seen through its receiver (generic
-    /// owner type arguments substituted). Absent when the target's declared
+    /// A call's signature specialized to its receiver or builtin arguments
+    /// (generic owner type arguments substituted). Absent when the target's declared
     /// type already answers, or when instantiations disagree at this token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ty: Option<Type>,

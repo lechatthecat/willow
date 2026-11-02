@@ -3712,7 +3712,7 @@ impl TypeChecker {
         let references = self.analysis_symbols.references.len();
         let errors = self.error_generation;
         let result = self.check_receiver_method_call(&obj_ty, m);
-        self.record_builtin_method_use(m, references, errors);
+        self.record_builtin_method_use(m, references, errors, &result);
         result
     }
 

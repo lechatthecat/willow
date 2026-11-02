@@ -2033,6 +2033,48 @@ impl TypeChecker {
         method_span: Span,
         expected: Option<&Type>,
     ) -> Type {
+        let references = self.analysis_symbols.references.len();
+        let errors = self.error_generation;
+        let result = self.resolve_static_call_inner(
+            class_name,
+            type_args,
+            method_name,
+            args,
+            span,
+            method_span,
+            expected,
+        );
+        if self.capture_call_sites
+            && self.error_generation == errors
+            && !Self::contains_error_type(&result)
+        {
+            let owner = self.resolve_static_call_class_quiet(class_name);
+            let is_variant = owner
+                .as_deref()
+                .is_some_and(|owner| self.symbols.lookup_enum(owner).is_some());
+            let has_source = self
+                .member_uses
+                .get(&(span.file_id, span.start))
+                .is_some_and(|&index| index >= references);
+            if !is_variant && !has_source {
+                self.record_builtin_static_call(method_name, span, method_span, args, &result);
+            }
+        }
+        result
+    }
+
+    // Keep the existing resolver inputs together; the wrapper only captures metadata.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_static_call_inner(
+        &mut self,
+        class_name: &str,
+        type_args: &[Type],
+        method_name: &str,
+        args: &[CallArg],
+        span: Span,
+        method_span: Span,
+        expected: Option<&Type>,
+    ) -> Type {
         if let Some(ty) =
             self.resolve_fully_qualified_std_module_call(class_name, method_name, args, span)
         {
