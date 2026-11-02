@@ -1,0 +1,24 @@
+// UTF-8 byte access returns i64 values in 0..255. Offsets match String.len().
+// ASCII bytes can be written as b'a'; escapes include b'\0' and b'\xFF'.
+// Iterate without allocating an array or repeatedly decoding a prefix.
+fn print_numbers(input: String) {
+    let mut value = 0;
+    let mut in_number = false;
+    for i in 0..input.len() {
+        let byte = input.byte_at(i);
+        if byte >= b'0' && byte <= b'9' {
+            value = value * 10 + byte - b'0';
+            in_number = true;
+        } else if in_number {
+            println(value);
+            value = 0;
+            in_number = false;
+        }
+    }
+    if in_number { println(value); }
+}
+
+fn main() {
+    print_numbers("項目123, 🌲42");
+    println("é".byte_at(1) == b'\xa9');
+}

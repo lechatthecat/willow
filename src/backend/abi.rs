@@ -482,6 +482,7 @@ mod alloc_effects_tests {
         "willow_string_repeat",
         "willow_string_split",
         "willow_string_substring",
+        "willow_string_byte_at",
         "willow_string_trim",
         "willow_runtime_arg",
         "willow_runtime_program_name",

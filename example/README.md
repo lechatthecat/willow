@@ -256,6 +256,21 @@ the trailing NUL: `"".len()` is 0, `"abc".len()` is 3, and `"日本語".len()`
 is 9. It does not measure Unicode characters, grapheme clusters, or terminal
 columns. See `language_gaps/main.wi` for length and imported-array examples.
 
+[Byte access and tokenization](string_bytes.wi) uses
+`s.byte_at(index: i64) -> i64` to read one unsigned UTF-8 byte (0–255).
+Access is constant time with no allocation on success; negative or past-end
+indices raise a recoverable panic, including every index into an empty string.
+Offsets need not be Unicode character boundaries: `"é".byte_at(1) == 169`.
+This is byte access, not Unicode scalar or grapheme indexing.
+
+Byte literals such as `b'a'` have type `i64`. They accept one printable ASCII
+character or `\n`, `\r`, `\t`, `\e`, `\0`, `\\`, `\'`, `\"`, and
+`\xHH` (exactly two hexadecimal digits, allowing all 256 byte values).
+Empty, multiple-character, raw non-ASCII, and unknown-escape literals are
+compile errors. Use `for i in 0..s.len() { let byte = s.byte_at(i); ... }`
+for O(n) traversal with O(1) extra space; bytes can be compared with literals,
+used in arithmetic, or stored in existing `Array<i64>` values.
+
 [String methods](string_methods.wi) demonstrates the remaining core API:
 
 | Method | Result and semantics |

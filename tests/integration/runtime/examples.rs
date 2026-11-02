@@ -189,6 +189,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/session_symbols.wi", "42\n"),
         ("example/static_atomic.wi", "2\n"),
+        ("example/string_bytes.wi", "123\n42\ntrue\n"),
         ("example/static_dependency_graph.wi", "42\n"),
         (
             "example/string_methods.wi",

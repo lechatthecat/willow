@@ -82,6 +82,7 @@ pub enum Intrinsic {
     /// UTF-8 byte length, excluding the trailing NUL.
     StringLen,
     StringSubstring,
+    StringByteAt,
     StringSplit,
     StringContains,
     StringFind,
@@ -260,6 +261,7 @@ impl Intrinsic {
         Intrinsic::StringToString,
         Intrinsic::StringLen,
         Intrinsic::StringSubstring,
+        Intrinsic::StringByteAt,
         Intrinsic::StringSplit,
         Intrinsic::StringContains,
         Intrinsic::StringFind,
@@ -344,6 +346,7 @@ impl Intrinsic {
             I64WrappingAdd | I64WrappingSub | I64WrappingMul | I64WrappingNeg | I64CheckedAdd
             | I64CheckedSub | I64CheckedMul | I64CheckedNeg => &[],
             StringLen => &[],
+            StringByteAt => &["willow_string_byte_at"],
             StringSubstring => &["willow_string_substring"],
             StringSplit => &["willow_string_split"],
             StringContains => &["willow_string_contains"],
@@ -611,6 +614,7 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
     if matches!(recv, Type::String) {
         let entry = match (method, arity) {
             ("len", 0) => Some((Intrinsic::StringLen, Type::I64)),
+            ("byte_at", 1) => Some((Intrinsic::StringByteAt, Type::I64)),
             ("substring" | "slice", 2) => Some((Intrinsic::StringSubstring, Type::String)),
             ("split", 1) => Some((Intrinsic::StringSplit, Type::Array(Box::new(Type::String)))),
             ("contains", 1) => Some((Intrinsic::StringContains, Type::Bool)),
@@ -877,6 +881,7 @@ mod tests {
         for (method, arity, result, allocates, panics) in [
             ("len", 0, Type::I64, false, false),
             ("substring", 2, Type::String, true, true),
+            ("byte_at", 1, Type::I64, true, true),
             ("slice", 2, Type::String, true, true),
             ("split", 1, Type::Array(Box::new(Type::String)), true, false),
             ("contains", 1, Type::Bool, false, false),
@@ -1453,6 +1458,7 @@ mod tests {
             "__abi_concat",
             "__abi_debug",
             "join",
+            "byte_at",
             "substring",
             "slice",
             "split",
@@ -1465,6 +1471,10 @@ mod tests {
             "push",
             "pop",
             "freeze",
+            "remove",
+            "keys",
+            "values",
+            "entries",
             "insert",
             "get",
             "set",
@@ -1524,7 +1534,7 @@ mod tests {
         assert_eq!(unique.len(), Intrinsic::ALL.len(), "duplicate in ALL");
         assert_eq!(
             Intrinsic::ALL.len(),
-            61,
+            66,
             "Intrinsic::ALL must list every variant; update the count when adding one"
         );
     }
@@ -1719,6 +1729,7 @@ mod checker_agreement_tests {
 
     const STRINGS: &str = r#"
 fn f(s: String) {
+    let byte = s.byte_at(0);
     let part = s.substring(0, 1);
     let pieces = s.split(",");
     let contains = s.contains("a");
@@ -1778,6 +1789,10 @@ import std::collections::Map;
 fn f() {
     let m: Map<String, i64> = Map::new();
     m.insert("ann", 87);
+    let removed = m.remove("ann");
+    let keys = m.keys();
+    let values = m.values();
+    let entries = m.entries();
     let hit = m.get("ann");
     let has = m.contains("ann");
     let size = m.len();
@@ -1902,7 +1917,7 @@ async fn f() {
     /// backend's structural walk had no answer for at all before this table.
     #[test]
     fn p39_map_and_frozen_map_agree() {
-        assert_agrees(MAPS, 9);
+        assert_agrees(MAPS, 13);
     }
 
     /// Perspective 40: `AtomicI64` and `AtomicBool` share method names but not
@@ -2058,9 +2073,9 @@ fn f() {
         for (src, expected) in [
             (SCALARS, 5),
             (INTEGERS, 8),
-            (STRINGS, 7),
+            (STRINGS, 8),
             (ARRAYS, 7),
-            (MAPS, 9),
+            (MAPS, 13),
             (ATOMICS, 10),
             (CELLS, 4),
             (CHANNELS, 4),

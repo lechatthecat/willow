@@ -254,6 +254,9 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::Question
             }
+            b'b' if self.bytes.get(self.pos + 1) == Some(&b'\'') => {
+                return self.lex_byte().map(Some);
+            }
             b'0'..=b'9' => return self.lex_number().map(Some),
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_ident_or_keyword(),
             c => {
@@ -294,6 +297,58 @@ impl<'a> Lexer<'a> {
             "unterminated string literal",
         )
         .with_label(Label::primary(span, "string starts here but never ends"))
+    }
+
+    /// Byte literals use the existing i64 representation (0..=255).
+    /// Scan once, retaining only offsets even for malformed long literals.
+    fn lex_byte(&mut self) -> Result<TokenKind, Diagnostic> {
+        let start = self.pos;
+        let line = self.line;
+        let col = self.col;
+        self.advance(); // b
+        self.advance(); // opening quote
+        let body_start = self.pos;
+        while let Some(b) = self.peek() {
+            if b == b'\n' || b == b'\r' {
+                break;
+            }
+            if b == b'\'' {
+                let end = self.pos;
+                self.advance();
+                let body = &self.bytes[body_start..end];
+                let value = match body {
+                    [b] if (b' '..=b'~').contains(b) && *b != b'\\' => Some(*b),
+                    [b'\\', b'n'] => Some(b'\n'),
+                    [b'\\', b'r'] => Some(b'\r'),
+                    [b'\\', b't'] => Some(b'\t'),
+                    [b'\\', b'e'] => Some(0x1b),
+                    [b'\\', b'0'] => Some(0),
+                    [b'\\', b @ (b'\\' | b'\'' | b'"')] => Some(*b),
+                    [b'\\', b'x', hi, lo] => (*hi as char)
+                        .to_digit(16)
+                        .zip((*lo as char).to_digit(16))
+                        .map(|(hi, lo)| (hi * 16 + lo) as u8),
+                    _ => None,
+                };
+                return value
+                    .map(|b| TokenKind::Integer(i64::from(b)))
+                    .ok_or_else(|| self.err_byte_literal(start, line, col));
+            }
+            self.advance_char();
+            if b == b'\\' && !matches!(self.peek(), None | Some(b'\n' | b'\r')) {
+                self.advance_char();
+            }
+        }
+        Err(self.err_byte_literal(start, line, col))
+    }
+
+    fn err_byte_literal(&self, start: usize, line: usize, col: usize) -> Diagnostic {
+        Diagnostic::new(Severity::Error, ErrorCode::E0050, "invalid byte literal").with_label(
+            Label::primary(
+                self.span_at(start, self.pos, line, col),
+                r#"expected one ASCII character or escape (\n, \r, \t, \e, \0, \\, \', \", \xHH)"#,
+            ),
+        )
     }
 
     fn lex_string(&mut self) -> Result<TokenKind, Diagnostic> {
@@ -1822,5 +1877,74 @@ mod tests {
             floats("0e0 0.0e-5 0e99999999999999999999"),
             vec![0.0, 0.0, 0.0]
         );
+    }
+}
+
+#[cfg(test)]
+mod byte_literal_tests {
+    use super::*;
+
+    #[test]
+    fn byte_literals_values_and_spans() {
+        for (source, value) in [
+            ("b'a'", 97),
+            ("b' '", 32),
+            ("b'~'", 126),
+            (r"b'\0'", 0),
+            (r"b'\n'", 10),
+            (r"b'\r'", 13),
+            (r"b'\t'", 9),
+            (r"b'\e'", 27),
+            (r"b'\\'", 92),
+            (r"b'\''", 39),
+            (r#"b'\"'"#, 34),
+            (r#"b'"'"#, 34),
+            (r"b'\x00'", 0),
+            (r"b'\xff'", 255),
+            (r"b'\xAf'", 175),
+        ] {
+            let tokens = Lexer::new(source).tokenize().unwrap();
+            assert_eq!(tokens[0].kind, TokenKind::Integer(value), "{source}");
+            assert_eq!(tokens[0].span.start, 0);
+            assert_eq!(tokens[0].span.end, source.len());
+        }
+    }
+
+    #[test]
+    fn byte_literals_reject_malformed_and_non_ascii() {
+        for source in [
+            "b''",
+            "b'ab'",
+            "b'é'",
+            "b'🌲'",
+            "b'",
+            "b'a",
+            "b'\n'",
+            "b'\r'",
+            "b'\t'",
+            r"b'\q'",
+            r"b'\x1'",
+            r"b'\xGG'",
+            r"b'\x100'",
+            r"b'\u{41}'",
+            r"b'\",
+            r"b'\''x'",
+        ] {
+            let err = Lexer::new(source).tokenize().unwrap_err();
+            assert_eq!(err.diagnostics[0].code, ErrorCode::E0050, "{source}");
+        }
+    }
+
+    #[test]
+    fn byte_literals_recover_at_newline_and_preserve_identifiers() {
+        let mut lexer = Lexer::new("b'bad\n42");
+        assert!(lexer.next_token().is_err());
+        lexer.skip_whitespace_and_comments().unwrap();
+        assert_eq!(lexer.next_token().unwrap(), Some(TokenKind::Integer(42)));
+        let tokens = Lexer::new("b byte b'a'+1").tokenize().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Ident("b".into()));
+        assert_eq!(tokens[1].kind, TokenKind::Ident("byte".into()));
+        assert_eq!(tokens[2].kind, TokenKind::Integer(97));
+        assert_eq!(tokens[3].kind, TokenKind::Plus);
     }
 }

@@ -7727,6 +7727,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_value_runtime_call("willow_string_concat_array", &[receiver])
             }
             StringLen => self.emit_string_length(receiver),
+            StringByteAt => {
+                self.emit_value_runtime_call("willow_string_byte_at", &[receiver, args[0]])
+            }
             StringSubstring => self
                 .emit_value_runtime_call("willow_string_substring", &[receiver, args[0], args[1]]),
             StringSplit => {

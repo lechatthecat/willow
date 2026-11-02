@@ -341,3 +341,158 @@ fn string_find_sentinel_diagnostic_is_rendered() {
     assert!(stderr.contains("-1 means not found"), "{stderr}");
     assert!(stderr.contains("index >= 0"), "{stderr}");
 }
+
+#[test]
+fn string_bytes_literals_and_access() {
+    // Perspectives 1–24: boundaries, UTF-8 widths, NUL, escapes, composition.
+    let cases = [
+        r#""abc".byte_at(0) == b'a'"#,
+        r#""abc".byte_at(2) == b'c'"#,
+        r#""é".byte_at(0) == b'\xc3'"#,
+        r#""é".byte_at(1) == b'\xa9'"#,
+        r#""水".byte_at(0) == b'\xe6'"#,
+        r#""水".byte_at(2) == b'\xb4'"#,
+        r#""🌲".byte_at(0) == b'\xf0'"#,
+        r#""🌲".byte_at(3) == b'\xb2'"#,
+        r#""a\0b".byte_at(1) == b'\0'"#,
+        r#""a\0b".byte_at(2) == b'b'"#,
+        r#"b'\n' == 10"#,
+        r#"b'\r' == 13"#,
+        r#"b'\t' == 9"#,
+        r#"b'\e' == 27"#,
+        r#"b'\\' == 92"#,
+        r#"b'\'' == 39"#,
+        r#"b'\"' == 34"#,
+        r#"b'"' == 34"#,
+        r#"b' ' == 32"#,
+        r#"b'\xFF' == 255"#,
+        r#"b'9' - b'0' == 9"#,
+        r#"("a" + "b").byte_at(1) == b'b'"#,
+        r#"" x ".trim().byte_at(0) == b'x'"#,
+        r#""é".byte_at(1) == 204"#,
+    ];
+    let body: String = cases
+        .iter()
+        .map(|expr| format!("println({expr});\n"))
+        .collect();
+    let source = format!("fn main() {{ {body} }}");
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(&source);
+        assert!(ok, "{out}");
+        assert_eq!(out, "true\n".repeat(cases.len()));
+    }
+}
+
+#[test]
+fn string_bytes_invalid_arguments() {
+    for expr in [
+        r#""x".byte_at()"#,
+        r#""x".byte_at(0, 1)"#,
+        r#""x".byte_at(true)"#,
+        r#""x".byte_at("0")"#,
+        r#""x".byte_at(0.0)"#,
+        "1.byte_at(0)",
+    ] {
+        let source = format!("fn main() {{ println({expr}); }}");
+        assert!(compile_error_stderr(&source).contains("E0201"), "{source}");
+    }
+    assert!(compile_error_stderr(r#"fn main() { let i = 0; "x".byte_at(&i); }"#).contains("E1703"));
+}
+
+#[test]
+fn string_bytes_recover_bounds() {
+    let cases = [
+        r#""".byte_at(0)"#,
+        r#""a".byte_at(-1)"#,
+        r#""a".byte_at(1)"#,
+        r#""a".byte_at(9223372036854775807)"#,
+        r#""a".byte_at(-9223372036854775807 - 1)"#,
+    ];
+    let body: String = cases
+        .iter()
+        .map(|expr| {
+            format!(
+                r#"
+        if true {{
+            defer match recover() {{
+                Some(info) => println(info.message.contains("String.byte_at requires")),
+                None => {{}}
+            }}
+            println(1 + {expr});
+            println("unreachable");
+        }}
+    "#
+            )
+        })
+        .collect();
+    let source = format!("fn main() {{ {body} }}");
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(&source);
+        assert!(ok, "{out}");
+        assert_eq!(out, "true\n".repeat(cases.len()));
+    }
+}
+
+#[test]
+fn string_bytes_example_and_dynamic_gc() {
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(include_str!("../../../example/string_bytes.wi"));
+        assert!(ok, "{out}");
+        assert_eq!(out, "123\n42\ntrue\n");
+        let (out, ok) = run(r#"
+fn receiver() -> String { println("receiver"); return "é".repeat(2); }
+fn index() -> i64 { gc_collect(); println("index"); return 3; }
+async fn read(s: String) -> i64 {
+    await sleep(1);
+    gc_collect();
+    return s.byte_at(s.len() - 1);
+}
+async fn main() {
+    println(receiver().byte_at(index()) == b'\xa9');
+    println(await read("🌲".repeat(32)) == b'\xb2');
+    let empty = "";
+    let mut sum = 0;
+    for i in 0..empty.len() { sum += empty.byte_at(i); }
+    println(sum);
+    let values = [b'a', b'b'];
+    println(values[1] == b'b');
+    match b'a' { 97 => println("match"), _ => println("bad") }
+}
+"#);
+        assert!(ok, "{out}");
+        assert_eq!(out, "receiver\nindex\ntrue\ntrue\n0\ntrue\nmatch\n");
+    }
+}
+
+#[test]
+fn string_bytes_generated_calls_scale_with_callsites() {
+    for count in [1, 8, 32] {
+        for bytes in [1, 1024] {
+            let source = format!(
+                "fn main() {{ let s = \"{}\"; {} }}",
+                "a".repeat(bytes),
+                "s.byte_at(0);".repeat(count)
+            );
+            let symbols = compile_and_collect_relocation_targets_all(&source, &[]);
+            assert_eq!(
+                symbols
+                    .iter()
+                    .filter(|s| *s == "willow_string_byte_at")
+                    .count(),
+                count
+            );
+        }
+    }
+}

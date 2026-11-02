@@ -85,6 +85,28 @@ pub extern "C" fn willow_string_substring(value: *mut u8, start: i64, end: i64) 
     copy_range(value, start as usize, end as usize)
 }
 
+/// Read one UTF-8 byte in constant time; invalid offsets raise a language panic.
+/// Successful reads allocate nothing and never scan or decode the receiver.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_byte_at(value: *const u8, index: i64) -> i64 {
+    let (bytes, len) = unsafe { ws_as_bytes(value) };
+    if index < 0 || index as usize >= len {
+        fail(&format!(
+            "String.byte_at requires an in-bounds byte offset (index={index}, len={len})"
+        ));
+        return 0;
+    }
+    #[cfg(test)]
+    BYTE_READS.with(|reads| reads.set(reads.get() + 1));
+    unsafe { i64::from(*bytes.add(index as usize)) }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BYTE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// First byte offset, or -1 when absent. Empty needles match at zero.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -279,6 +301,28 @@ mod tests {
     use super::*;
     use crate::gc::{GcRootHandle, willow_pop_roots, willow_push_root};
     use crate::string::{willow_string_as_str, willow_string_from_str};
+
+    #[test]
+    fn string_bytes_measured_constant_access_and_linear_iteration() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        for count in [1, 8, 64, 512, 4096] {
+            let input = "é\0🌲".repeat(count);
+            let string = willow_string_from_str(&input);
+            let allocated = crate::gc::willow_gc_total_allocated_bytes();
+            BYTE_READS.with(|reads| reads.set(0));
+            // Reverse traversal is an adverse shape for prefix-decoding access.
+            for (i, expected) in input.bytes().enumerate().rev() {
+                assert_eq!(willow_string_byte_at(string, i as i64), i64::from(expected));
+            }
+            assert_eq!(BYTE_READS.with(|reads| reads.get()), input.len());
+            for _ in 0..count {
+                assert_eq!(willow_string_byte_at(string, (input.len() - 1) as i64), 178);
+            }
+            assert_eq!(BYTE_READS.with(|reads| reads.get()), input.len() + count);
+            assert_eq!(crate::gc::willow_gc_total_allocated_bytes(), allocated);
+        }
+    }
 
     #[test]
     fn array_join_measured_linear_work() {
