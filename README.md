@@ -16,7 +16,7 @@ Its premise is simple: **when an AI agent changes a program, the compiler should
 
 ### E2604: no suspension or blocking wait while holding a Willow lock
 
-Consider this Willow program:
+This deliberately invalid program demonstrates the compile-time diagnostic:
 
 ```willow
 fn receive(ch: Channel<i64>) -> i64 {
@@ -60,6 +60,57 @@ The compiler is enforcing a **semantic constraint**, not looking for the literal
 
 The implementation and regression tests are in [`src/semantic/effects.rs`](src/semantic/effects.rs), [`src/compiler_db/effects.rs`](src/compiler_db/effects.rs), and [`tests/integration/concurrency/lock_restrictions.rs`](tests/integration/concurrency/lock_restrictions.rs). See the runnable [scheduler-aware lock example](example/scheduler_aware_lock.wi).
 
+### Exact rename: change a symbol, preserve unrelated names
+
+Save this standalone program as `main.wi`:
+
+```willow
+fn deposit(amount: i64) -> i64 { return amount + 1; }
+fn unrelated() -> i64 {
+    let deposit = 7;
+    return deposit;
+}
+fn main() {
+    println(deposit(4)); // 5
+    println(unrelated()); // 7
+}
+```
+
+Preview the symbol-resolved edit, apply it, then run the program:
+
+```sh
+willow rename main::deposit credit --source main.wi --dry-run --diff
+willow rename main::deposit credit --source main.wi
+willow run main.wi
+```
+
+The declaration and call become `credit`; the unrelated local binding named
+`deposit` stays unchanged. Exact rename uses resolved symbol identity rather
+than spelling, checks collisions, and validates the candidate before applying
+source changes. The guarantee is scoped to supported symbols in the loaded
+project: it does not update text in strings, external consumers, or undiscovered
+source trees. Ambiguous selectors, detected collisions, and candidates that fail validation
+are rejected. See the [rename regression tests](tests/semantic_rename.rs).
+
+### What an agent can trust
+
+An agent can use these compiler results without independently reconstructing
+the same analysis. It still needs tests and review for behavior outside their
+stated scope.
+
+| Result | Compiler-backed information | Unknowns or assumptions |
+| --- | --- | --- |
+| Accepted lexical lock body | No blocking/suspending effect under the compiler's modeled lock rules | Not a proof of global deadlock freedom or arbitrary native-code behavior |
+| Successful exact rename | Resolved occurrences of the selected symbol are edited and the candidate passes validation | Limited to the loaded project and supported symbols; not a proof of application correctness |
+| Effect `MAY` (`may` in JSON) | A source or known-callee witness supports the capability | It may not occur on every runtime path; uncertainty can coexist in `unknown_reasons` |
+| Effect `UNKNOWN` (`unknown` in JSON) | A conservative capability is retained without a supporting witness | Indirect/unresolved calls, missing bodies, incomplete flow, or external interop require assumptions; this is not evidence that the effect occurs or is absent |
+| Effect `NONE` (`none` in JSON) | Neither a witness nor an uncertainty reason remains for that capability in the modeled analysis | Scoped to available compiler knowledge, not a guarantee about unmodeled behavior |
+
+The `willow.effects.v2` output keeps `witness` and `unknown_reasons` separate.
+Missing evidence is not purity. Safety checks retain conservative capability
+bounds even when the explanatory query reports `UNKNOWN`; a query does not
+waive E2604. See the [effect-state example](example/effect_states.wi).
+
 ### The analysis follows the program, not just the local syntax
 
 Willow computes effect summaries over the compiler's call graph using a monotone fixed point. Important cases include:
@@ -89,6 +140,11 @@ async fn deposit(balance: Mutex<i64>, amount: i64) {
     lock balance as mut value {
         value = value + amount;
     }
+}
+async fn main() {
+    let balance = Mutex::new(100);
+    await deposit(balance, 5);
+    lock balance as value { println(value); } // 105
 }
 ```
 
@@ -270,6 +326,21 @@ These illustrate the interface; use selectors and source paths from your own pro
 This is not the claim that an agent is always correct. Rather, **some mistakes can be turned into deterministic compiler failures with actionable evidence** instead of being left to prompts, tests, or code review alone.
 
 See the [AI toolchain protocol](protocol/ai_toolchain/README.md) and [example effect explanations](example/effect_explanations.wi).
+
+## What needs language semantics, and what LSP/MCP can provide
+
+Symbol navigation, checked types, references, and exact rename can be exposed
+through LSP or MCP for any static language with suitable compiler tooling.
+Willow's rename example demonstrates that useful tooling contract; it is not
+unique to a new language. LSP and MCP are interfaces, not sources of semantic
+guarantees themselves.
+
+E2604 needs a definition of waiting effects, their propagation through calls,
+and a language rule connecting those effects to lexical lock scopes. Enforcing
+that rule also depends on compiler lowering, cleanup, and runtime behavior.
+An LSP/MCP server can expose such a rule where a language or analyzer implements
+it; adding the protocol alone does not establish it. Willow puts this specific
+contract in normal compilation and exposes the same knowledge through its CLI.
 
 ## How this relates to other approaches
 
