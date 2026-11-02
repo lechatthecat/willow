@@ -292,6 +292,8 @@ pub struct InterfaceDecl {
 /// A built-in negative effect contract on a callable declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EffectContractKind {
+    /// A compiler-only body constraint, checked separately from waiting effects.
+    Pure,
     NoWait,
     NoBlock,
     NoSuspend,
@@ -300,6 +302,7 @@ pub enum EffectContractKind {
 impl EffectContractKind {
     pub fn name(self) -> &'static str {
         match self {
+            Self::Pure => "pure",
             Self::NoWait => "no_wait",
             Self::NoBlock => "no_block",
             Self::NoSuspend => "no_suspend",
@@ -309,6 +312,7 @@ impl EffectContractKind {
     pub fn forbidden(self) -> willow_abi::RuntimeEffects {
         use willow_abi::RuntimeEffects as E;
         match self {
+            Self::Pure => E::NONE,
             Self::NoWait => E::MAY_BLOCK.union(E::MAY_SUSPEND),
             Self::NoBlock => E::MAY_BLOCK,
             Self::NoSuspend => E::MAY_SUSPEND,

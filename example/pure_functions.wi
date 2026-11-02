@@ -1,0 +1,19 @@
+@pure
+fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+@pure
+fn sum_squares(n: i64) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < n {
+        total = total + square(i);
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() {
+    println(sum_squares(5));
+}

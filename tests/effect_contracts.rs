@@ -29,6 +29,270 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn purity_driver_try_propagation() {
+    for (declarations, params, args, result, body, main, output_line) in [
+        (
+            "",
+            "x:Option<i64>",
+            "x",
+            "Option<i64>",
+            "let n = x?; return x;",
+            "f(None);",
+            None,
+        ),
+        (
+            "class Dest {} class Source implements Into<Dest> { pub dest:Dest; pub fn into(self)->Dest { println(97); return self.dest; } }",
+            "x:Result<i64,Source>, y:Result<i64,Dest>",
+            "x,y",
+            "Result<i64,Dest>",
+            "let n = x?; return y;",
+            "f(Err(new Source(new Dest())), Ok(7));",
+            Some("97"),
+        ),
+    ] {
+        for transitive in [false, true] {
+            let functions = if transitive {
+                format!(
+                    "@pure fn f({params})->{result} {{ return helper({args}); }} fn helper({params})->{result} {{ {body} }}"
+                )
+            } else {
+                format!("@pure fn f({params})->{result} {{ {body} }}")
+            };
+            let source = format!("{declarations} {functions} fn main() {{ {main} }}");
+            let fixture = Fixture::new(&source);
+            for command in ["check", "build", "check"] {
+                let output = fixture.command(command);
+                let text = String::from_utf8_lossy(&output.stderr);
+                assert!(!output.status.success(), "{command}: {source}: {text}");
+                assert!(text.contains("E2620") && text.contains("UNKNOWN"), "{text}");
+                if transitive {
+                    assert!(text.contains("f -> helper"), "{text}");
+                }
+            }
+            fs::write(fixture.0.join("main.wi"), source.replace("@pure ", "")).unwrap();
+            for command in ["check", "run"] {
+                let output = fixture.command(command);
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if command == "run"
+                    && let Some(line) = output_line
+                {
+                    assert!(
+                        String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .any(|s| s == line),
+                        "{:?}",
+                        output
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn purity_driver_string_and_enum_allocations() {
+    for (declarations, result, body) in [
+        ("", "String", "return a + b;"),
+        (
+            "enum Pair { Values(i64,i64) }",
+            "Pair",
+            "return Pair::Values(1,2);",
+        ),
+        (
+            "enum Pair { Values(i64,i64) }",
+            "Pair",
+            "return Values(1,2);",
+        ),
+    ] {
+        for transitive in [false, true] {
+            let functions = if transitive {
+                format!(
+                    "@pure fn f(a:String,b:String)->{result} {{ return helper(a,b); }} fn helper(a:String,b:String)->{result} {{ {body} }}"
+                )
+            } else {
+                format!("@pure fn f(a:String,b:String)->{result} {{ {body} }}")
+            };
+            let source = format!("{declarations} {functions} fn main() {{}}");
+            let fixture = Fixture::new(&source);
+            for command in ["check", "build", "check"] {
+                let output = fixture.command(command);
+                let text = String::from_utf8_lossy(&output.stderr);
+                assert!(!output.status.success(), "{command}: {source}: {text}");
+                assert!(text.contains("E2620") && text.contains("UNKNOWN"), "{text}");
+                if transitive {
+                    assert!(text.contains("f -> helper"), "{text}");
+                }
+            }
+            fs::write(fixture.0.join("main.wi"), source.replace("@pure ", "")).unwrap();
+            for command in ["check", "build"] {
+                let output = fixture.command(command);
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn purity_driver_closure_allocation() {
+    for (body, accepted) in [
+        ("let g = || x;", false),
+        ("let g: closure() -> i64 = || 1;", false),
+        ("let g = || 1;", true),
+        ("let g: fn() -> i64 = || { println(1); return 1; };", true),
+    ] {
+        for transitive in [false, true] {
+            let functions = if transitive {
+                format!("@pure fn f(x:i64) {{ helper(x); }} fn helper(x:i64) {{ {body} }}")
+            } else {
+                format!("@pure fn f(x:i64) {{ {body} }}")
+            };
+            let fixture = Fixture::new(&format!("{functions} fn main() {{}}"));
+            for command in ["check", "build", "check"] {
+                let output = fixture.command(command);
+                let text = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    output.status.success(),
+                    accepted,
+                    "{command}: {functions}: {text}"
+                );
+                if !accepted {
+                    assert!(text.contains("E2620") && text.contains("UNKNOWN"), "{text}");
+                    if transitive {
+                        assert!(text.contains("f -> helper"), "{text}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn purity_driver_array_allocation_rejected() {
+    for functions in [
+        "@pure fn f() { let xs = [1, 2]; }",
+        "@pure fn f() { helper(); } fn helper() { let xs = [1, 2]; }",
+    ] {
+        let fixture = Fixture::new(&format!(
+            "import std::collections::Array; {functions} fn main() {{}}"
+        ));
+        for command in ["check", "build", "check"] {
+            let output = fixture.command(command);
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{command}: {text}");
+            assert!(
+                text.contains("E2620") && text.contains("UNKNOWN"),
+                "{command}: {text}"
+            );
+            if functions.contains("helper") {
+                assert!(text.contains("f -> helper"), "{command}: {text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn purity_driver_module_revisions() {
+    let fixture =
+        Fixture::new("import worker; @pure fn f()->i64 { return worker::value(); } fn main() {}");
+    for (body, accepted) in [
+        ("@pure pub fn value()->i64 { return 7; }", true),
+        ("pub fn value()->i64 { println(7); return 7; }", false),
+        ("pub fn value()->i64 { return 7; }", true),
+    ] {
+        fs::write(fixture.0.join("worker.wi"), body).unwrap();
+        for _ in 0..2 {
+            let output = fixture.command("check");
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), accepted, "{text}");
+            if !accepted {
+                assert!(text.contains("E2620"), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn purity_driver_templates_and_foreign() {
+    for (source, accepted, code) in [
+        (
+            "import std::time; @pure fn f()->i64 { return time::now_ns(); } fn main() {}",
+            false,
+            "E2620",
+        ),
+        (
+            "@pure fn f()->i64 { return identity(3); } @pure fn identity<T>(x:T)->T { return x; } fn main() {}",
+            true,
+            "",
+        ),
+        (
+            "@pure fn identity<T>(x:T)->T { return x; } fn main() {}",
+            true,
+            "",
+        ),
+        (
+            "@pure fn identity<T>(x:T)->T { return x; } fn main() { println(identity(3)); }",
+            true,
+            "",
+        ),
+        (
+            "@pure fn bad<T>(x:T) { println(1); } fn main() {}",
+            false,
+            "E2620",
+        ),
+        (
+            "extern rust { fn foreign(); } @pure fn f() { foreign(); } fn main() {}",
+            false,
+            "E2620",
+        ),
+        (
+            "extern rust { @pure fn foreign(); } fn main() {}",
+            false,
+            "E0105",
+        ),
+        (
+            "interface I { @pure fn f(self); } class C implements I { pub fn f(self) { println(1); } } fn main() {}",
+            false,
+            "E2620",
+        ),
+        ("@pure fn f() { println(1); } fn main() {}", false, "E2620"),
+    ] {
+        let fixture = Fixture::new(source);
+        for command in ["check", "check"] {
+            let output = fixture.command(command);
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), accepted, "{source}: {text}");
+            if !accepted {
+                assert!(text.contains(code), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn purity_driver_example_runs() {
+    let fixture = Fixture::new(include_str!("../example/pure_functions.wi"));
+    let output = fixture.command("run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|s| s == "30")
+    );
+}
+
+#[test]
 fn effect_contract_check_and_build_reject_and_recheck() {
     let fixture = Fixture::new(
         "fn helper(c: BlockingCell<i64>) { c.get(); } @effects(no_wait) fn guarded(c: BlockingCell<i64>) { helper(c); } fn main() {}",

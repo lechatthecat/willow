@@ -323,7 +323,7 @@ impl TypeChecker {
         templates: bool,
     ) -> Vec<(FunctionId, EffectContract)> {
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
-        let mut obligations: HashMap<String, HashMap<String, [Option<EffectContract>; 3]>> =
+        let mut obligations: HashMap<String, HashMap<String, [Option<EffectContract>; 4]>> =
             HashMap::new();
         let mut queue = VecDeque::new();
         let mut types = HashSet::new();
@@ -397,6 +397,7 @@ impl TypeChecker {
             #[cfg(test)]
             OBLIGATION_WORK.with(|n| n.set(n.get() + 1));
             let index = match contract.kind {
+                EffectContractKind::Pure => 3,
                 EffectContractKind::NoWait => 0,
                 EffectContractKind::NoBlock => 1,
                 EffectContractKind::NoSuspend => 2,
@@ -518,7 +519,9 @@ impl TypeChecker {
         facts: &EffectFacts<EffectWitness>,
         templates: bool,
     ) {
-        let declarations = self.contract_obligations(program, templates);
+        let mut declarations = self.contract_obligations(program, templates);
+        self.report_purity(program, graph, &declarations, templates);
+        declarations.retain(|(_, c)| c.kind != EffectContractKind::Pure);
         let (graph, contract_facts) =
             self.solve_contracts(graph, facts, declarations.iter().map(|(id, _)| *id));
         let contract_facts = std::sync::Arc::new(contract_facts);

@@ -237,6 +237,7 @@ error_codes! {
     E2605, // nested `lock` acquisition is not supported in V1
     E2610, // declared effect contract violated
     E2611, // inherited effect contract weakened
+    E2620, // declared purity constraint violated or cannot be proven
     E2612, // effect contract cannot be proven
     E2606, // `lock` inside a `match` arm has no frame-backed resume shape
 }

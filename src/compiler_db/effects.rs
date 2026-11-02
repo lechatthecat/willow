@@ -243,6 +243,11 @@ impl EffectRootLocation {
 }
 
 pub(crate) struct EffectQueries {
+    /// Body-derived purity for this checking session; external declarations and
+    /// persistent runtime-effect summaries cannot supply these proofs.
+    pub(crate) purity_facts: std::cell::RefCell<
+        HashMap<UnitId, HashMap<FunctionId, crate::semantic::type_checker::purity::PuritySummary>>,
+    >,
     /// Verified contract proofs for this checking session only. Never restored
     /// from persistent runtime summaries or copied across source revisions.
     pub(crate) contract_facts: std::cell::RefCell<HashMap<UnitId, Arc<EffectFacts<EffectWitness>>>>,
@@ -288,6 +293,7 @@ pub(crate) struct EffectQueries {
 impl Default for EffectQueries {
     fn default() -> Self {
         Self {
+            purity_facts: Default::default(),
             contract_facts: Default::default(),
             static_initializers: Default::default(),
             root_locations: Default::default(),

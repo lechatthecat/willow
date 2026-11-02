@@ -139,10 +139,18 @@ impl Parser {
         let mut contracts = Vec::new();
         while self.eat(TokenKind::At) {
             let start = self.previous_span();
-            if self.expect_ident()? != "effects" {
+            let attribute = self.expect_ident()?;
+            if attribute == "pure" {
+                contracts.push(EffectContract {
+                    kind: EffectContractKind::Pure,
+                    span: start.to(self.previous_span()),
+                });
+                continue;
+            }
+            if attribute != "effects" {
                 return Err(self.err(
                     ErrorCode::E0102,
-                    "unknown declaration attribute; expected `effects`",
+                    "unknown declaration attribute; expected `effects` or `pure`",
                 ));
             }
             self.expect(TokenKind::LParen)?;
