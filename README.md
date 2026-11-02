@@ -312,20 +312,6 @@ The `willow` CLI offers:
 | `willow rename SELECTOR NEW_NAME` | Project-wide rename with collision checks; preview with `--dry-run --diff` |
 | `willow overview` | Bounded project outline |
 
-At a function or method call's name token, `willow type` reports the callee
-signature, for both source declarations and builtins. Generic receiver arguments
-are substituted into member signatures; builtins without a source declaration
-report a signature specialized to the checked argument and result types (including
-`print` and `println`). The receiver is not included among method parameters.
-For example, the `split` token in `text.split(" ")` reports
-`fn(String) -> Array<String>`. Static builtins follow the same rule: `parse` in
-`i64::parse("+42")` reports `fn(String) -> Result<i64, ParseIntError>`.
-Contextually inferred constructors use their final types: `new` in
-`let m: Map<String, i64> = Map::new();` reports `fn() -> Map<String, i64>`.
-This rule applies only within the name token; other positions retain ordinary
-expression inference (or `unknown` where no expression is indexed).
-Argument and receiver tokens retain their own types.
-
 For example:
 
 ```sh
