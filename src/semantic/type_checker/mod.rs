@@ -142,6 +142,8 @@ pub struct ResolutionContext {
 }
 
 pub struct TypeChecker {
+    /// Contract comparison runs proof checking once with its shared cache.
+    pub(crate) defer_static_verification: bool,
     pub(crate) generics: generics::Generics,
     // Declaration-epoch caches: cleared before registering each program.
     marker_contracts: ObservedMap<String, Option<send_sync::Marker>>,
@@ -371,6 +373,7 @@ impl TypeChecker {
 
     fn empty(resolution: std::rc::Rc<ResolutionContext>, symbols: SymbolTable) -> Self {
         Self {
+            defer_static_verification: false,
             generics: generics::Generics::default(),
             marker_contracts: ObservedMap::new("resolution.marker_contracts"),
             marker_contract_proven: ObservedSet::new("resolution.marker_contract_proven"),

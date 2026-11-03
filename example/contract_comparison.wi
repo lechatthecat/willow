@@ -1,0 +1,14 @@
+// Keep the guarantee while changing the implementation, then compare with
+// willow verify-edit --schema v2 --base BASE --protected-base COMMIT --format json.
+@pure
+@verified
+fn nonnegative(x: i64) -> i64
+    requires x >= 0
+    ensures result >= 0
+{
+    return x;
+}
+
+fn main() {
+    println(nonnegative(7));
+}

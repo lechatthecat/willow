@@ -1,6 +1,10 @@
 use super::*;
+use willow_compiler::ai::verify::semantic_diff::contracts::{self, Policy};
 use willow_compiler::ai::verify::semantic_diff::{Options, SemanticDiff, resolve_base, verify};
-fn parse(args: &[String]) -> Result<(Options, bool, bool)> {
+fn parse(args: &[String]) -> Result<(Options, bool, bool, Option<Policy>)> {
+    let mut policy = Policy::default();
+    let mut v2 = false;
+    let mut policy_seen = false;
     let mut options = Options {
         root: PathBuf::from("."),
         entry: None,
@@ -14,6 +18,11 @@ fn parse(args: &[String]) -> Result<(Options, bool, bool)> {
     let mut args = args.iter();
     while let Some(key) = args.next() {
         anyhow::ensure!(seen.insert(key), "duplicate option: {key}");
+        if key == "--write-contracts-lock" {
+            policy.write_lock = true;
+            policy_seen = true;
+            continue;
+        }
         if key == "--explain" {
             explain = true;
             continue;
@@ -24,6 +33,25 @@ fn parse(args: &[String]) -> Result<(Options, bool, bool)> {
         }
         let value = args.next().context("missing option value")?;
         match key.as_str() {
+            "--schema" => {
+                anyhow::ensure!(
+                    matches!(value.as_str(), "v1" | "v2"),
+                    "schema must be v1 or v2"
+                );
+                v2 = value == "v2";
+            }
+            "--protected-base" => {
+                policy.protected_base = Some(value.clone());
+                policy_seen = true;
+            }
+            "--approval-evidence" => {
+                policy.approval_evidence = Some(value.into());
+                policy_seen = true;
+            }
+            "--approval-verifier" => {
+                policy.approval_verifier = Some(value.into());
+                policy_seen = true;
+            }
             "--base" => options.base.clone_from(value),
             "--root" => options.root = value.into(),
             "--entry" => {
@@ -54,27 +82,44 @@ fn parse(args: &[String]) -> Result<(Options, bool, bool)> {
         );
     }
     options.base = resolve_base(&options.root, &options.base).context("invalid base revision")?;
-    Ok((options, json, explain))
+    anyhow::ensure!(
+        !policy_seen || v2,
+        "contract policy options require --schema v2"
+    );
+    anyhow::ensure!(
+        policy.approval_evidence.is_some() == policy.approval_verifier.is_some(),
+        "approval evidence and verifier must be supplied together"
+    );
+    Ok((options, json, explain, v2.then_some(policy)))
 }
 pub(super) fn run(args: &[String]) -> Result<i32> {
     if args == ["--help"] || args == ["-h"] {
         println!(
-            "Usage: willow verify-edit --base REV [--root DIR] [--entry FILE] [--project] [--format json|text] [--explain] [--fail-on effect-growth]"
+            "Usage: willow verify-edit --base REV [--root DIR] [--entry FILE] [--project] [--format json|text] [--explain] [--fail-on effect-growth] [--schema v1|v2] [--protected-base COMMIT] [--approval-evidence FILE --approval-verifier EXTERNAL_EXECUTABLE] [--write-contracts-lock]"
         );
         return Ok(0);
     }
-    let (options, json, explain) = match parse(args) {
+    let (options, json, explain, policy) = match parse(args) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("verify-edit: {error:#}");
             return Ok(2);
         }
     };
-    let report =
-        verify(&options).unwrap_or_else(|error| SemanticDiff::incomplete(format!("{error:#}")));
+    let report = if let Some(policy) = policy {
+        contracts::verify(&options, &policy).unwrap_or_else(|error| {
+            let mut r = SemanticDiff::incomplete(format!("{error:#}"));
+            r.schema = "willow.semantic-diff.v2";
+            r
+        })
+    } else {
+        verify(&options).unwrap_or_else(|error| SemanticDiff::incomplete(format!("{error:#}")))
+    };
     use std::io::Write;
     let output = if json {
         format!("{}\n", serde_json::to_string(&report)?)
+    } else if report.schema == "willow.semantic-diff.v2" {
+        format!("{}\n", serde_json::to_string_pretty(&report)?)
     } else {
         report.human(explain)
     };

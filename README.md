@@ -327,6 +327,28 @@ This is not the claim that an agent is always correct. Rather, **some mistakes c
 
 See the [AI toolchain protocol](protocol/ai_toolchain/README.md) and [example effect explanations](example/effect_explanations.wi).
 
+### Compare scalar contracts across an edit
+
+`willow verify-edit --base BASE --schema v2 --protected-base FULL_COMMIT --format json`
+adds purity, `requires`/`ensures`, and proof-dependency comparisons. The default remains
+v1. `contract_preserved` does not imply `implementation_verified` or behavioral
+equivalence; behavioral equivalence is unsupported. Unsupported inputs and missing
+proof evidence return exit 3; contract or approval-policy violations return exit 1.
+The current comparison supports standalone top-level i64/bool contracts; unsupported
+imports and contract calls produce incomplete evidence.
+
+`--write-contracts-lock` writes normalized contract and semantic digests to
+`contracts.lock`. Editing that file never grants approval. A trusted CI wrapper must
+supply the protected commit and, when approval is needed, `--approval-evidence FILE
+--approval-verifier EXTERNAL_EXECUTABLE`. Keep that verifier and its configuration
+outside the editable checkout and enforce reviewers with CODEOWNERS/branch protection.
+The verifier receives the evidence path and a JSON binding as its two arguments;
+it must independently authenticate approval for the protected commit, target tree,
+and contract digests, then return
+`{"schema":"willow.contract-approval.v1","approved":true,"binding":<exact binding>}`.
+Only that successful CI handoff yields `APPROVED_BY_POLICY`; `CI=true` alone is
+insufficient. See [the runnable contract example](example/contract_comparison.wi).
+
 ## What needs language semantics, and what LSP/MCP can provide
 
 Symbol navigation, checked types, references, and exact rename can be exposed

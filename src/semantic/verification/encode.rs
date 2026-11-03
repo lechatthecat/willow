@@ -498,3 +498,73 @@ pub(super) fn edges(f: &FunctionDecl, names: &HashMap<&str, usize>) -> BTreeSet<
         })
         .collect()
 }
+
+/// Contract-only predicates use arbitrary inputs and return, never the edited body.
+pub(super) fn contract_predicates(
+    id: usize,
+    functions: &[&FunctionDecl],
+    names: &HashMap<&str, usize>,
+) -> Result<String, String> {
+    let f = functions[id];
+    if !f.type_params.is_empty() || f.is_async || f.rust_bridge.is_some() {
+        return Err("unsupported contract signature".into());
+    }
+    let mut params = Vec::new();
+    let mut env = im::HashMap::new();
+    for (i, p) in f.params.iter().enumerate() {
+        if p.mode != ParamMode::Value {
+            return Err("reference contract parameter".into());
+        }
+        let ty = sort(&p.ty)?;
+        params.push(format!("(p{i} {ty})"));
+        env.insert(
+            p.name.clone(),
+            Value::literal(format!("p{i}"), ty == "Bool"),
+        );
+    }
+    let ret = sort(&f.return_type)?;
+    let mut state = State {
+        env,
+        alive: Value::literal("true", true),
+        result: Value::literal("returned", ret == "Bool"),
+    };
+    let mut e = Encoder {
+        functions,
+        names,
+        nodes: Vec::new(),
+        safety: Vec::new(),
+        assumptions: Vec::new(),
+        dependencies: BTreeSet::new(),
+        depth: 0,
+    };
+    let pre = e.clauses(&f.requires, &state)?;
+    let safety = e.safety();
+    let mut out = e.definition(&format!("c{id}_pre"), &params.join(" "), "Bool", &pre.text);
+    out += &e.definition(
+        &format!("c{id}_pre_safe"),
+        &params.join(" "),
+        "Bool",
+        &safety,
+    );
+    e.nodes.clear();
+    state.env.insert("result".into(), state.result.clone());
+    params.push(format!("(returned {ret})"));
+    let post = e.clauses(&f.ensures, &state)?;
+    let safety = e.safety();
+    out += &e.definition(
+        &format!("c{id}_post"),
+        &params.join(" "),
+        "Bool",
+        &post.text,
+    );
+    out += &e.definition(
+        &format!("c{id}_post_safe"),
+        &params.join(" "),
+        "Bool",
+        &safety,
+    );
+    if !e.dependencies.is_empty() {
+        return Err("contract calls require additional comparison summaries".into());
+    }
+    Ok(out)
+}

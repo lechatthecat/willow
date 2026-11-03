@@ -1,5 +1,7 @@
 //! Git revision semantic verification, independent of legacy edit JSON.
 use super::*;
+#[path = "semantic_diff_contracts.rs"]
+pub mod contracts;
 #[path = "semantic_diff_tree.rs"]
 mod tree;
 pub use tree::resolve_base;

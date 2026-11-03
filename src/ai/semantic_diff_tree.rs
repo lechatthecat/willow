@@ -37,7 +37,10 @@ pub fn resolve_base(root: &Path, revision: &str) -> Result<String> {
     );
     Ok(object)
 }
-fn relevant(path: &str) -> bool {
+fn relevant(path: &str, lock: bool) -> bool {
+    if lock && path == "contracts.lock" {
+        return true;
+    }
     path.ends_with(".wi")
         || path
             .rsplit('/')
@@ -64,6 +67,9 @@ fn insert(tree: &mut Tree, total: &mut usize, path: String, bytes: Vec<u8>) -> R
     Ok(())
 }
 pub(super) fn base(root: &Path, object: &str) -> Result<Tree> {
+    base_inputs(root, object, false)
+}
+pub(super) fn base_inputs(root: &Path, object: &str, lock: bool) -> Result<Tree> {
     let prefix = String::from_utf8(git(root, &["rev-parse", "--show-prefix"])?)?;
     let prefix = prefix.trim_end_matches('\n');
     let listing = git(root, &["ls-tree", "-rz", "--full-tree", object])?;
@@ -74,7 +80,7 @@ pub(super) fn base(root: &Path, object: &str) -> Result<Tree> {
         let Some(path) = path.strip_prefix(prefix) else {
             continue;
         };
-        if !relevant(path) {
+        if !relevant(path, lock) {
             continue;
         }
         let parts: Vec<_> = header.split_whitespace().collect();
@@ -131,6 +137,9 @@ pub(super) fn base(root: &Path, object: &str) -> Result<Tree> {
     result
 }
 pub(super) fn target(root: &Path) -> Result<Tree> {
+    target_inputs(root, false)
+}
+pub(super) fn target_inputs(root: &Path, lock: bool) -> Result<Tree> {
     let listing = git(
         root,
         &[
@@ -141,15 +150,24 @@ pub(super) fn target(root: &Path) -> Result<Tree> {
             "--exclude-standard",
         ],
     )?;
-    let paths: BTreeSet<_> = listing
+    let mut paths: BTreeSet<_> = listing
         .split(|b| *b == 0)
         .filter(|p| !p.is_empty())
         .map(std::str::from_utf8)
         .collect::<std::result::Result<_, _>>()?;
+    if lock {
+        match fs::symlink_metadata(root.join("contracts.lock")) {
+            Ok(_) => {
+                paths.insert("contracts.lock");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
     let mut tree = Tree::new();
     let mut total = 0;
     for path in paths {
-        if !relevant(path) {
+        if !relevant(path, lock) {
             continue;
         }
         ensure!(safe(path), "invalid input path");
@@ -209,4 +227,25 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+pub(super) fn protected_commit(root: &Path, commit: &str) -> Result<String> {
+    ensure!(
+        matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+        "protected base must be a full immutable commit ID"
+    );
+    let resolved = String::from_utf8(git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{commit}^{{commit}}"),
+        ],
+    )?)?;
+    ensure!(
+        resolved.trim() == commit,
+        "protected base must identify a commit directly"
+    );
+    Ok(commit.to_owned())
 }

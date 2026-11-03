@@ -135,6 +135,10 @@ pub struct Snapshot {
     pub semantic: SemanticFacts,
 }
 
+pub(crate) fn compiler_identity() -> String {
+    storage::compiler_stamp()
+}
+
 pub(crate) fn hash(bytes: impl AsRef<[u8]>) -> String {
     format!("{:x}", crate::hex::Hex(&Sha256::digest(bytes.as_ref())))
 }

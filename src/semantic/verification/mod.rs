@@ -1,7 +1,10 @@
 //! Fail-closed, bounded i64/bool static verification over checked declarations.
 //! Mathematical integers model values; every finite-width operation has a
 //! separate safety obligation. Summaries share helper bodies across call sites.
+mod cache;
+pub mod comparison;
 mod encode;
+pub use cache::ProofCache;
 mod solver;
 #[cfg(test)]
 mod tests;
@@ -23,7 +26,7 @@ pub enum Status {
     Unknown,
     RuntimeChecked,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Obligation {
     pub kind: String,
     pub solver_result: String,
@@ -78,6 +81,10 @@ impl Default for Options {
             ),
         }
     }
+}
+fn valid_budget(options: &Options) -> bool {
+    (1..=60_000).contains(&options.timeout_ms)
+        && (1..=1_000_000_000).contains(&options.resource_limit)
 }
 fn budget(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -210,6 +217,15 @@ fn diagnostic(code: ErrorCode, span: Span, message: &str) -> Diagnostic {
 /// Caller must complete type and purity checking first. `prior_error` prevents
 /// ill-typed or impure declarations from acquiring a successful proof report.
 pub fn verify(program: &Program, options: &Options, prior_error: bool) -> Verification {
+    verify_cached(program, options, prior_error, &mut ProofCache::default())
+}
+
+pub fn verify_cached(
+    program: &Program,
+    options: &Options,
+    prior_error: bool,
+    cache: &mut ProofCache,
+) -> Verification {
     let functions: Vec<_> = program
         .items
         .iter()
@@ -270,9 +286,7 @@ pub fn verify(program: &Program, options: &Options, prior_error: bool) -> Verifi
     let mut semantic_digests = vec![String::new(); functions.len()];
     let mut valid = vec![false; functions.len()];
     let mut failures: Vec<Option<String>> = vec![None; functions.len()];
-    let mut engine = if !(1..=60_000).contains(&options.timeout_ms)
-        || !(1..=1_000_000_000).contains(&options.resource_limit)
-    {
+    let mut engine = if !valid_budget(options) {
         Err("invalid verification timeout/resource budget".into())
     } else if roots.is_empty() || prior_error {
         Err("type or purity checking failed".into())
@@ -332,6 +346,8 @@ pub fn verify(program: &Program, options: &Options, prior_error: bool) -> Verifi
             if !verified {
                 return Ok(());
             }
+            let cache_key = cache::identity(&summary, &r.dependency_digests, f, options);
+            let cached = cache.get(&cache_key);
             let mut args = Vec::new();
             let mut domain = vec!["true".to_string()];
             for (i, p) in f.params.iter().enumerate() {
@@ -346,71 +362,81 @@ pub fn verify(program: &Program, options: &Options, prior_error: bool) -> Verifi
             }
             let domain = format!("(and {})", domain.join(" "));
             let call = |suffix: &str| application(&format!("f{id}_{suffix}"), &args);
-            for (kind, formula, want) in [
-                (
-                    "requires safety",
-                    format!("(and {domain} (not {}))", call("pre_safe")),
-                    "unsat",
-                ),
-                (
-                    "requires satisfiability",
-                    format!("(and {domain} {})", call("pre")),
-                    "sat",
-                ),
-                (
-                    "body safety and termination",
-                    format!(
-                        "(and {domain} {} {} (not {}))",
-                        call("pre"),
-                        call("assume"),
-                        call("safe")
+            if let Some(obligations) = cached {
+                // Probe the live solver before reuse: missing, poisoned or exhausted
+                // sessions cannot be turned into a successful old result.
+                if s.query("false", &[])?.0 != "unsat" {
+                    cache.remove(&cache_key);
+                    return Err("solver unavailable for cached proof".into());
+                }
+                r.obligations = obligations;
+            } else {
+                for (kind, formula, want) in [
+                    (
+                        "requires safety",
+                        format!("(and {domain} (not {}))", call("pre_safe")),
+                        "unsat",
                     ),
-                    "unsat",
-                ),
-                (
-                    "ensures safety",
-                    format!(
-                        "(and {domain} {} {} (not {}))",
-                        call("pre"),
-                        call("assume"),
-                        call("post_safe")
+                    (
+                        "requires satisfiability",
+                        format!("(and {domain} {})", call("pre")),
+                        "sat",
                     ),
-                    "unsat",
-                ),
-                (
-                    "ensures truth",
-                    format!(
-                        "(and {domain} {} {} (not {}))",
-                        call("pre"),
-                        call("assume"),
-                        call("post")
+                    (
+                        "body safety and termination",
+                        format!(
+                            "(and {domain} {} {} (not {}))",
+                            call("pre"),
+                            call("assume"),
+                            call("safe")
+                        ),
+                        "unsat",
                     ),
-                    "unsat",
-                ),
-            ] {
-                let (answer, model) =
-                    s.query(&formula, if want == "unsat" { &args } else { &[] })?;
-                r.obligations.push(Obligation {
-                    kind: kind.into(),
-                    solver_result: answer.clone(),
-                    counterexample_candidate: if answer != want { model } else { None },
-                });
-                if answer != want {
-                    r.status = if answer == "unknown" {
-                        Status::Unknown
-                    } else if want == "sat" {
-                        Status::VacuousPrecondition
-                    } else {
-                        Status::Counterexample
-                    };
-                    if answer != "unknown" {
-                        r.diagnostic_code = ErrorCode::E2630;
-                    }
-                    return Err(if answer == "unknown" {
-                        "solver returned UNKNOWN (timeout or incomplete theory)".into()
-                    } else {
-                        format!("failed {kind}")
+                    (
+                        "ensures safety",
+                        format!(
+                            "(and {domain} {} {} (not {}))",
+                            call("pre"),
+                            call("assume"),
+                            call("post_safe")
+                        ),
+                        "unsat",
+                    ),
+                    (
+                        "ensures truth",
+                        format!(
+                            "(and {domain} {} {} (not {}))",
+                            call("pre"),
+                            call("assume"),
+                            call("post")
+                        ),
+                        "unsat",
+                    ),
+                ] {
+                    let (answer, model) =
+                        s.query(&formula, if want == "unsat" { &args } else { &[] })?;
+                    r.obligations.push(Obligation {
+                        kind: kind.into(),
+                        solver_result: answer.clone(),
+                        counterexample_candidate: if answer != want { model } else { None },
                     });
+                    if answer != want {
+                        r.status = if answer == "unknown" {
+                            Status::Unknown
+                        } else if want == "sat" {
+                            Status::VacuousPrecondition
+                        } else {
+                            Status::Counterexample
+                        };
+                        if answer != "unknown" {
+                            r.diagnostic_code = ErrorCode::E2630;
+                        }
+                        return Err(if answer == "unknown" {
+                            "solver returned UNKNOWN (timeout or incomplete theory)".into()
+                        } else {
+                            format!("failed {kind}")
+                        });
+                    }
                 }
             }
             // Only proved dependencies get an abstract return function. The
@@ -426,11 +452,13 @@ pub fn verify(program: &Program, options: &Options, prior_error: bool) -> Verifi
                 sort(&f.return_type)?
             ))?;
             r.status = Status::Proven;
+            cache.insert(cache_key, r.obligations.clone());
             Ok(())
         })();
         match result {
             Ok(()) => valid[id] = true,
             Err(error) => {
+                cache.invalidate();
                 failures[id] = Some(error.clone());
                 if r.status == Status::Unknown {
                     r.unknown_reasons.push(error);
