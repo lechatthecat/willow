@@ -1,5 +1,4 @@
-// Waiting is excluded from these synchronous helpers, including allocation.
-@effects(no_wait)
+// An arbitrary callback may wait, so this helper has no no_wait contract.
 fn twice<T>(value: T, combine: fn(T, T) -> T) -> T {
     return combine(value, value);
 }

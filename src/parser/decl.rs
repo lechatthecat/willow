@@ -3,6 +3,33 @@ use super::ast::*;
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::token::TokenKind;
 
+const EFFECT_CONTRACT_NAMES: [&str; 3] = ["no_wait", "no_block", "no_suspend"];
+
+// Candidates are fixed ASCII names, so the DP row is bounded independently of
+// the invalid identifier's length. Ties follow the documented candidate order.
+fn closest_effect_contract(name: &str) -> &'static str {
+    EFFECT_CONTRACT_NAMES
+        .into_iter()
+        .min_by_key(|candidate| {
+            let mut row: Vec<usize> = (0..=candidate.len()).collect();
+            for (i, ch) in name.chars().enumerate() {
+                let mut diagonal = row[0];
+                row[0] = i + 1;
+                for (j, byte) in candidate.bytes().enumerate() {
+                    #[cfg(test)]
+                    effect_contract_diagnostic_tests::EDIT_CELLS.with(|n| n.set(n.get() + 1));
+                    let above = row[j + 1];
+                    row[j + 1] = (row[j] + 1)
+                        .min(above + 1)
+                        .min(diagonal + usize::from(ch != char::from(byte)));
+                    diagonal = above;
+                }
+            }
+            row[candidate.len()]
+        })
+        .unwrap()
+}
+
 #[willow_continuations::parser]
 impl Parser {
     pub(super) fn parse_module_decl(&mut self) -> Result<ModuleDecl, Diagnostic> {
@@ -165,10 +192,17 @@ impl Parser {
                     "no_block" => EffectContractKind::NoBlock,
                     "no_suspend" => EffectContractKind::NoSuspend,
                     _ => {
-                        return Err(self.err(
-                            ErrorCode::E0102,
-                            format!("unknown effect contract `{name}`"),
-                        ));
+                        return Err(self
+                            .err_at(
+                                ErrorCode::E0102,
+                                format!("unknown effect contract `{name}`"),
+                                self.previous_span(),
+                            )
+                            .with_help(format!(
+                                "valid effect contracts: {}; did you mean `{}`?",
+                                EFFECT_CONTRACT_NAMES.join(", "),
+                                closest_effect_contract(&name),
+                            )));
                     }
                 };
                 contracts.push(EffectContract {
@@ -1472,6 +1506,104 @@ mod const_diagnostic_tests {
             assert_eq!(errors.len(), count);
             assert!(errors.iter().all(|error| error.code == ErrorCode::E0109));
             assert_eq!(program.items.len(), count);
+        }
+    }
+}
+
+#[cfg(test)]
+mod effect_contract_diagnostic_tests {
+    use super::*;
+    use crate::diagnostics::FileId;
+    use crate::lexer::Lexer;
+
+    thread_local! {
+        pub(super) static EDIT_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn effect_contract_unknown_names_have_precise_spans_and_help() {
+        // Substitution, deletion, insertion, case, distant name and stable tie.
+        for (name, closest) in [
+            ("no_wai", "no_wait"),
+            ("no_waitt", "no_wait"),
+            ("no_wxit", "no_wait"),
+            ("NO_WAIT", "no_wait"),
+            ("no_bloc", "no_block"),
+            ("no_blockk", "no_block"),
+            ("no_blook", "no_block"),
+            ("no_alloc", "no_block"),
+            ("no_suspen", "no_suspend"),
+            ("no_suspendd", "no_suspend"),
+            ("no_suspond", "no_suspend"),
+            ("no_", "no_wait"),
+        ] {
+            for source in [
+                format!("@effects({name}) fn f() {{}}"),
+                format!("@effects(no_wait, {name}, no_block) fn f() {{}}"),
+                format!("@effects(no_wait)\n@effects({name}) fn f() {{}}"),
+                format!("class C {{ @effects({name}) fn f(self) {{}} }}"),
+                format!("interface I {{ @effects({name}) fn f(self); }}"),
+                format!("// offset\n@effects(  {name}  ) fn f() {{}}"),
+            ] {
+                let tokens = Lexer::with_file_id(&source, FileId(7)).tokenize().unwrap();
+                let (_, errors) = Parser::new(tokens).parse();
+                let error = errors
+                    .iter()
+                    .find(|e| e.message.contains("unknown effect contract"))
+                    .unwrap();
+                assert_eq!(error.code, ErrorCode::E0102);
+                let span = error.labels[0].span;
+                assert_eq!(span.file_id, FileId(7));
+                assert_eq!(&source[span.start..span.end], name, "{source}");
+                assert_eq!(
+                    error.helps,
+                    [format!(
+                        "valid effect contracts: no_wait, no_block, no_suspend; did you mean `{closest}`?"
+                    )]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn effect_contract_valid_names_and_syntax_errors_are_preserved() {
+        for attribute in [
+            "@effects(no_wait)",
+            "@effects(no_block)",
+            "@effects(no_suspend)",
+            "@effects(no_wait, no_block, no_suspend)",
+            "@pure",
+            "@verified",
+        ] {
+            let source = format!("{attribute} fn f() {{}}");
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            assert!(Parser::new(tokens).parse().1.is_empty(), "{source}");
+        }
+        for attribute in [
+            "@effects()",
+            "@effects(1)",
+            "@effects(no_wait,)",
+            "@effects(no_wait",
+            "@unknown",
+        ] {
+            let source = format!("{attribute} fn f() {{}}");
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            let errors = Parser::new(tokens).parse().1;
+            assert!(!errors.is_empty(), "{source}");
+            assert!(
+                errors
+                    .iter()
+                    .all(|e| e.helps.iter().all(|h| !h.contains("did you mean")))
+            );
+        }
+    }
+
+    #[test]
+    fn effect_contract_suggestion_work_is_linear_in_name_length() {
+        for length in [16, 256, 4096] {
+            EDIT_CELLS.with(|n| n.set(0));
+            closest_effect_contract(&"x".repeat(length));
+            EDIT_CELLS.with(|n| assert_eq!(n.get(), 25 * length));
         }
     }
 }
