@@ -630,3 +630,34 @@ fn string_transforms_generated_calls_scale_with_callsites() {
         }
     }
 }
+
+#[test]
+fn string_bytes_recover_keeps_live_values_across_panic_gc() {
+    let source = r#"
+fn keep(prefix: String, suffix: String) {
+    let saved = prefix + suffix;
+    if true {
+        defer match recover() {
+            Some(info) => {
+                gc_collect();
+                println(saved);
+                println(info.message.contains("String.byte_at requires"));
+            },
+            None => {}
+        }
+        "".byte_at(-1);
+    }
+    println(saved);
+}
+fn main() { keep("still-", "alive"); }
+"#;
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(source);
+        assert!(ok, "{out}");
+        assert_eq!(out, "still-alive\ntrue\nstill-alive\n");
+    }
+}

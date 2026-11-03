@@ -215,6 +215,9 @@ impl TypeNames {
                 display.push_str(&binder);
             }
         }
+        if symbol.details.is_async && matches!(ty, Type::Fn(..)) {
+            display.insert_str(0, "async ");
+        }
         display
     }
 
@@ -293,6 +296,16 @@ mod tests {
             );
             assert_eq!(value["ty"], serde_json::to_value(&ty).unwrap());
             assert_eq!(symbol.ty.as_ref(), Some(&ty));
+            let mut asynchronous = symbol.clone();
+            asynchronous.details.is_async = true;
+            TYPE_VISITS.with(|count| count.set(0));
+            let async_value = names().symbol(&asynchronous);
+            assert_eq!(TYPE_VISITS.with(|count| count.get()), n + 2);
+            assert_eq!(
+                async_value["type_display"],
+                format!("async {}", value["type_display"].as_str().unwrap())
+            );
+            assert_eq!(async_value["ty"], value["ty"]);
         }
     }
 

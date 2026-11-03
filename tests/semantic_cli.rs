@@ -6657,3 +6657,186 @@ fn discarded_task_check_warns_for_direct_and_imported_calls() {
         "{stderr}"
     );
 }
+
+#[test]
+fn async_declaration_type_preserves_callable_marker() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "async fn serve(n: i64) { await sleep(n); }\nfn sync(n: i64) {}\nasync fn main() { await serve(1); }\n",
+    )
+    .unwrap();
+    for (selector, expected) in [
+        ("serve", "async fn(i64) -> void"),
+        ("main.wi:1:10", "async fn(i64) -> void"),
+        ("main.wi:3:25", "async fn(i64) -> void"),
+        ("sync", "fn(i64) -> void"),
+    ] {
+        for command in ["type", "symbol"] {
+            let output = f.run(&[command, "--source", "src/main.wi", selector]);
+            assert!(output.status.success(), "{:?}", output);
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.contains(&format!("Type: {expected}\n")), "{text}");
+        }
+    }
+}
+
+#[test]
+fn string_builtin_paths_preserve_conservative_bounds() {
+    let f = Fixture::new();
+    let cases = [
+        (
+            "bounded",
+            "let mut h = 0; for i in 0..s.len() { h += s.byte_at(i); } return h;",
+        ),
+        ("unknown", "return s.byte_at(n);"),
+        ("negative", "return s.byte_at(-1);"),
+        ("at_end", "return s.byte_at(s.len());"),
+        (
+            "shifted",
+            "for i in 0..s.len() { return s.byte_at(i + 1); } return 0;",
+        ),
+        (
+            "different_receiver",
+            "for i in 0..s.len() { return t.byte_at(i); } return 0;",
+        ),
+        (
+            "mixed",
+            "for i in 0..s.len() { s.byte_at(i); } return s.byte_at(n);",
+        ),
+        (
+            "nested",
+            "for i in 0..s.len() { for j in 0..t.len() { s.byte_at(i); t.byte_at(j); } } return 0;",
+        ),
+        (
+            "branch",
+            "for i in 0..s.len() { if n == i { return s.byte_at(i); } } return 0;",
+        ),
+        (
+            "deferred",
+            "for i in 0..s.len() { defer { s.byte_at(i); } } return 0;",
+        ),
+        (
+            "local",
+            "let text = s; for i in 0..text.len() { return text.byte_at(i); } return 0;",
+        ),
+        (
+            "shadow",
+            "for i in 0..s.len() { let s = t; s.byte_at(i); } return 0;",
+        ),
+    ];
+    let mut source = String::new();
+    for (name, body) in cases {
+        source.push_str(&format!(
+            "fn {name}(s: String, t: String, n: i64) -> i64 {{ {body} }}\n"
+        ));
+    }
+    for (name, ret, method) in [
+        ("length", "i64", "len()"),
+        ("contains", "bool", "contains(t)"),
+        ("find", "i64", "find(t)"),
+        ("starts", "bool", "starts_with(t)"),
+        ("ends", "bool", "ends_with(t)"),
+    ] {
+        source.push_str(&format!(
+            "fn {name}(s: String, t: String) -> {ret} {{ return s.{method}; }}\n"
+        ));
+    }
+    source.push_str("fn main() {}\n");
+    fs::write(f.0.join("src/main.wi"), source).unwrap();
+    for (name, byte) in cases.iter().map(|(n, _)| (*n, true)).chain([
+        ("length", false),
+        ("contains", false),
+        ("find", false),
+        ("starts", false),
+        ("ends", false),
+    ]) {
+        let value = f.json(
+            &["effects", "--source", "src/main.wi", name, "--explain"],
+            0,
+        );
+        assert_eq!(
+            value["result"]["effects"][0]["state"],
+            if byte { "may" } else { "none" },
+            "{name}: {value}"
+        );
+        assert_eq!(
+            value["result"]["bounds"]["runtime"].as_u64().unwrap() & 1,
+            u64::from(byte),
+            "{value}"
+        );
+        let paths: Vec<_> = value["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("paths"))
+            .filter(|p| !byte || p["operation"] == "String.byte_at")
+            .collect();
+        assert!(!paths.is_empty(), "{name}: {value}");
+        for path in paths {
+            assert_eq!(path["normal"]["may_allocate"], "none");
+            assert_eq!(
+                path["panic"]["may_allocate"],
+                if byte { "may" } else { "none" }
+            );
+            assert!(path["location"].is_object(), "{path}");
+        }
+    }
+    for explain in [false, true] {
+        let mut args = vec!["effects", "--source", "src/main.wi", "bounded"];
+        if explain {
+            args.push("--explain");
+        }
+        let out = f.run(&args);
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            text.contains("normal may-allocate: none; panic may-allocate: may"),
+            "{text}"
+        );
+        assert!(text.lines().any(|l| l == "may-allocate: may"), "{text}");
+    }
+    // Concise JSON also retains path metadata when verbose witness data is removed.
+    let value = f.json(&["effects", "--source", "src/main.wi", "unknown"], 0);
+    assert!(
+        value["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["paths"]["operation"] == "String.byte_at"
+                && e["paths"]["panic"]["may_allocate"] == "may"),
+        "{value}"
+    );
+}
+
+#[test]
+fn string_builtin_paths_propagate_without_narrowing_imported_calls() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/order.wi"), "module order;\npub fn scan(s: String) -> i64 { let mut h = 0; for i in 0..s.len() { h += s.byte_at(i); } return h; }\n").unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import order;\nfn relay(s: String) -> i64 { return order::scan(s); }\nfn main() {}\n",
+    )
+    .unwrap();
+    for standalone in [false, true] {
+        let mut args = vec!["effects", "relay", "--explain"];
+        if standalone {
+            args.extend(["--source", "src/main.wi"]);
+        }
+        let value = f.json(&args, 0);
+        assert_eq!(value["result"]["effects"][0]["state"], "may", "{value}");
+        assert_eq!(
+            value["result"]["bounds"]["runtime"].as_u64().unwrap() & 1,
+            1
+        );
+        assert!(
+            value["result"]["effect_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["paths"]["operation"] == "String.byte_at"
+                    && e["paths"]["panic"]["may_allocate"] == "may"),
+            "{value}"
+        );
+    }
+}

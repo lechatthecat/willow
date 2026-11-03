@@ -93,6 +93,7 @@ pub(super) struct Captured {
     pub compiler_effects: HashMap<FunctionId, u8>,
     // Keep operation sites separate so capability replacement scans stay bounded.
     suspension_sites: HashMap<FunctionId, Vec<Value>>,
+    builtin_sites: HashMap<FunctionId, Vec<Value>>,
 }
 #[path = "flow.rs"]
 mod flow;
@@ -126,6 +127,26 @@ impl Captured {
                 }
             }
         }
+    }
+    pub fn builtin_effect_paths(
+        &mut self,
+        function: FunctionId,
+        span: Span,
+        method: &str,
+        may_panic: bool,
+    ) {
+        // Zero bits keep presentation facts out of effect-state propagation.
+        // RuntimeEffects retain the union, including panic-path allocation.
+        self.builtin_sites.entry(function).or_default().push(json!({
+            "effect": 0,
+            "paths": {"normal":{"may_allocate":"none"},
+                "panic":{"may_allocate":if may_panic {"may"} else {"none"}},
+                "scope":"builtin operation only; argument evaluation and recovered continuation excluded"},
+            "witness": {"kind":"builtin-effect-paths", "cause":{"span":span,
+                "operation":format!("String.{method}")},
+                "reason": if may_panic { "Normal byte access allocates nothing; an invalid offset allocates a panic message and payload. The conservative allocation bound is retained, including for GC rooting across recover()." }
+                    else { "Scalar String builtin allocates neither on its normal path nor on a panic path." }}
+        }));
     }
     pub fn channel_site(&mut self, function: FunctionId, span: Span, operation: &str) {
         self.suspension_sites.entry(function).or_default().push(json!({
@@ -374,6 +395,7 @@ pub(super) fn finish(
             .witnesses
             .iter()
             .chain(&captures[&unit].semantic.suspension_sites)
+            .chain(&captures[&unit].semantic.builtin_sites)
         {
             let function = &functions[&resolve(unit, *id)].id;
             let mut local_witnesses = Vec::with_capacity(witnesses.len());
@@ -905,7 +927,11 @@ impl QuerySession {
                     self.names.declaration(first, ty)
                 } else {
                     let module = first.identity.as_ref().map(|i| i.module.as_str());
-                    self.names.render(ty, module)
+                    let mut display = self.names.render(ty, module);
+                    if first.details.is_async && matches!(ty, Type::Fn(..)) {
+                        display.insert_str(0, "async ");
+                    }
+                    display
                 };
                 let mut result = json!({"status":"ok","type":first.ty,"type_display":display,"location":first.location});
                 if let [only] = typed[..] {
@@ -1282,6 +1308,7 @@ impl QuerySession {
                     let mut evidence = BTreeMap::new();
                     let mut unknown_causes = Vec::new();
                     let mut suspension_sites = Vec::new();
+                    let mut builtin_sites = Vec::new();
                     loop {
                         let (j, via) = if let Some(next) = queue.pop_front() {
                             next
@@ -1352,6 +1379,20 @@ impl QuerySession {
                                 let Some(effect) = fact["effect"].as_u64() else {
                                     continue;
                                 };
+                                if effect == 0 && fact["witness"]["kind"] == "builtin-effect-paths"
+                                {
+                                    let mut paths = fact["paths"].clone();
+                                    paths["operation"] =
+                                        fact["witness"]["cause"]["operation"].clone();
+                                    paths["location"] =
+                                        fact["witness"]["cause"]["location"].clone();
+                                    builtin_sites.push(json!({"effect":0,
+                                        "paths":paths,
+                                        "status":evidence_status(&fact["witness"]),
+                                        "via_function":self.snapshot.functions[j].id,
+                                        "witness":fact["witness"]}));
+                                    continue;
+                                }
                                 let (fact, via_function) = match origin {
                                     None => (fact, j),
                                     Some(origin) => {
@@ -1503,6 +1544,7 @@ impl QuerySession {
                     }
                     let mut evidence: Vec<_> = evidence.into_values().collect();
                     evidence.extend(suspension_sites);
+                    evidence.extend(builtin_sites);
                     deduplicate_evidence(&mut evidence);
                     self.present_lock_types(&mut evidence);
                     // The traversal is a parent-before-child spanning tree. Share
@@ -2490,6 +2532,89 @@ mod tests {
             function: "absent".into(),
         });
         assert_eq!(result["result"]["status"], "unknown");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn builtin_path_display_preserves_bits_and_scales_after_roundtrip() {
+        let directory =
+            std::env::temp_dir().join(format!("willow-string-paths-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("main.wi");
+        let abi = crate::semantic::intrinsics::builtin_target_effects(
+            &Intrinsic::StringByteAt.function_id(),
+        )
+        .unwrap();
+        assert!(abi.contains(RuntimeEffects::MAY_ALLOCATE));
+        assert!(abi.contains(RuntimeEffects::MAY_PANIC));
+        for n in [8, 32, 128] {
+            let source = format!(
+                "fn scan(s: String) {{ for i in 0..s.len() {{ {} }} }}\nfn relay(s: String) {{ scan(s); scan(s); }}\nfn main() {{}}",
+                "s.byte_at(i);".repeat(n)
+            );
+            std::fs::write(&path, source).unwrap();
+            let snapshot = crate::CompilerSession::new(
+                path.to_str().unwrap(),
+                "",
+                &crate::CompilerOptions::debug(),
+                None,
+            )
+            .analysis_with_emitter(&mut crate::diagnostics::HumanEmitter)
+            .unwrap();
+            let mut baseline = snapshot.clone();
+            // Presentation facts must have no influence on ANY internal bit or
+            // effect-state propagation. Compare with those facts removed.
+            for facts in baseline.semantic.witnesses.values_mut() {
+                facts.retain(|f| f.get("paths").is_none());
+            }
+            let function = snapshot
+                .functions
+                .iter()
+                .find(|f| f.name == "relay")
+                .unwrap()
+                .id
+                .clone();
+            let revision = snapshot.revision.clone();
+            let snapshot: Snapshot =
+                serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
+            let mut session = QuerySession::new(snapshot).unwrap();
+            baseline.revision = baseline.digest().unwrap();
+            let baseline_revision = baseline.revision.clone();
+            let mut baseline = QuerySession::new(baseline).unwrap();
+            let value = session.query(QueryRequest::Effects {
+                revision,
+                function: function.clone(),
+            });
+            let previous = baseline.query(QueryRequest::Effects {
+                revision: baseline_revision,
+                function,
+            });
+            assert_eq!(value["result"]["bounds"], previous["result"]["bounds"]);
+            assert_eq!(value["result"]["effects"], previous["result"]["effects"]);
+            assert_eq!(
+                value["result"]["bounds"]["runtime"].as_u64().unwrap() & 1,
+                1
+            );
+            let paths: Vec<_> = value["result"]["effect_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|e| e.get("paths"))
+                .collect();
+            assert_eq!(paths.len(), n + 1);
+            assert_eq!(session.effect_edge_visits, 1);
+            assert!(
+                paths
+                    .iter()
+                    .filter(|p| p["operation"] == "String.byte_at")
+                    .all(|p| p["normal"]["may_allocate"] == "none"
+                        && p["panic"]["may_allocate"] == "may")
+            );
+            println!(
+                "reads={n}, emitted path facts={}, graph edge visits={}",
+                paths.len(),
+                session.effect_edge_visits
+            );
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

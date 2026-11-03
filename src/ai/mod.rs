@@ -425,6 +425,29 @@ pub(crate) fn capture(
                                 .push((id, e.span(), *target, operation));
                         }
                     }
+                    if let Expr::MethodCall(call) = e
+                        && let Some(intrinsic) = calls
+                            .get(&e.id())
+                            .and_then(|t| t.as_ref())
+                            .and_then(Intrinsic::from_function_id)
+                        && matches!(
+                            intrinsic,
+                            Intrinsic::StringLen
+                                | Intrinsic::StringByteAt
+                                | Intrinsic::StringContains
+                                | Intrinsic::StringFind
+                                | Intrinsic::StringStartsWith
+                                | Intrinsic::StringEndsWith
+                        )
+                    {
+                        // Presentation only: never narrow the ABI/call-graph mask.
+                        result.semantic.builtin_effect_paths(
+                            id,
+                            e.span(),
+                            &call.method,
+                            intrinsic == Intrinsic::StringByteAt,
+                        );
+                    }
                     if matches!(e, Expr::String(..)) {
                         // Literal slots can allocate on first use, but a static
                         // literal is not evidence of a per-evaluation allocation.

@@ -321,6 +321,8 @@ willow rename account::deposit credit --dry-run --diff
 willow check src/main.wi --format ndjson
 ```
 
+For scalar String builtins, `effects` separates normal-path and panic-path allocation evidence. For example, `String.byte_at` shows normal `may-allocate: none` and panic `may-allocate: may`; the aggregate bound still includes panic allocation, even for an in-range loop. JSON exposes these per-operation details in `effect_evidence[].paths`. Argument evaluation and code after `recover()` are outside that per-operation description. This display does not change compiler/GC effect bounds or `@effects` contracts.
+
 These illustrate the interface; use selectors and source paths from your own program. Semantic queries support JSON and bounded output, while machine-mode check/build provide structured diagnostics. `willow init` generates `AGENTS.md` and `CLAUDE.md` so coding agents can discover the tooling; `willow agent sync` can update Willow-managed instructions.
 
 This is not the claim that an agent is always correct. Rather, **some mistakes can be turned into deterministic compiler failures with actionable evidence** instead of being left to prompts, tests, or code review alone.

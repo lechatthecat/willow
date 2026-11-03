@@ -707,6 +707,37 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
     let target = result["selected"]["selector"]
         .as_str()
         .unwrap_or("selected function");
+    let paths: Vec<_> = result["effect_evidence"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|fact| fact.get("paths"))
+        .collect();
+    if !paths.is_empty() {
+        lines.push(
+            "Builtin allocation paths (operation only; aggregate bounds include panic):".into(),
+        );
+        let shown = if all {
+            paths.len()
+        } else {
+            paths.len().min(50)
+        };
+        for path in &paths[..shown] {
+            lines.push(format!(
+                "  {} at {}: normal may-allocate: {}; panic may-allocate: {}",
+                path["operation"].as_str().unwrap_or("builtin"),
+                location(&path["location"]),
+                path["normal"]["may_allocate"].as_str().unwrap_or("unknown"),
+                path["panic"]["may_allocate"].as_str().unwrap_or("unknown")
+            ));
+        }
+        if shown < paths.len() {
+            lines.push(format!(
+                "  {} builtin paths omitted; use --all",
+                paths.len() - shown
+            ));
+        }
+    }
     if !explain {
         compact_effect_evidence(result, target, all, lines);
         return;
@@ -718,7 +749,12 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
             "compiler_witnesses",
         ),
     ] {
-        let evidence = result[key].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let evidence: Vec<_> = result[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|fact| fact.get("paths").is_none())
+            .collect();
         lines.push(format!("{label} for {target}: {}", evidence.len()));
         let shown = if all {
             evidence.len()
@@ -853,6 +889,9 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
         .into_iter()
         .flat_map(|key| result[key].as_array().into_iter().flatten())
     {
+        if fact.get("paths").is_some() {
+            continue; // Displayed in the explicitly separated builtin paths section.
+        }
         let witness = &fact["witness"];
         if witness["kind"] == "unavailable"
             && fact["effect"]

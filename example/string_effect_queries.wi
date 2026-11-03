@@ -1,0 +1,12 @@
+// `willow effects --source example/string_effect_queries.wi bytes`
+// separates allocation-free normal reads from allocating panic paths.
+fn bytes(s: String) -> i64 {
+    let mut h = 0;
+    for i in 0..s.len() { h += s.byte_at(i); }
+    return h;
+}
+
+// Unknown offsets retain the possible allocation on the recoverable panic path.
+fn unchecked_byte(s: String, i: i64) -> i64 { return s.byte_at(i); }
+fn contains(s: String, needle: String) -> bool { return s.contains(needle); }
+fn main() { println(bytes("ABC")); }
