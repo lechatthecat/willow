@@ -91,6 +91,7 @@ pub mod observability;
 pub mod panic;
 pub mod panic_context;
 pub mod parallel;
+pub mod plugin;
 pub mod preempt;
 pub mod print;
 pub mod reference_debug;
