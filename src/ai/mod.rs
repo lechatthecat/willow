@@ -418,6 +418,9 @@ pub(crate) fn capture(
                                 })
                                 .is_some()
                         });
+                        if builtin && let Some(target) = target {
+                            result.semantic.builtin_calls.push((id, e.span(), *target));
+                        }
                         if !builtin && let Some(operation) = operation {
                             result
                                 .semantic

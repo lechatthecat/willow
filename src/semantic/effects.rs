@@ -170,6 +170,18 @@ impl<W: Clone + Ord> EffectSummary<W> {
     }
 }
 
+/// Bits the solver propagates along call edges: every runtime effect plus the
+/// compiler-internal checked-panic bit. That bit has no witness slot, so its
+/// pass only joins reachability; checker verdicts read it transitively.
+fn propagated_bits() -> impl Iterator<Item = (u32, RuntimeEffects)> {
+    (0..RuntimeEffects::BIT_COUNT)
+        .map(|bit| (bit, RuntimeEffects::from_bit(bit)))
+        .chain(std::iter::once((
+            RuntimeEffects::BIT_COUNT,
+            RuntimeEffects::MAY_CHECKED_PANIC,
+        )))
+}
+
 /// One effect-propagation problem, ready to [`EffectProblem::solve`].
 ///
 /// Construct with [`EffectProblem::new`], which starts fail-closed, then relax
@@ -312,8 +324,7 @@ impl<W: Clone + Ord> EffectProblem<W> {
                 }
             }
         }
-        for bit_index in 0..RuntimeEffects::BIT_COUNT {
-            let bit = RuntimeEffects::from_bit(bit_index);
+        for (bit_index, bit) in propagated_bits() {
             let mut roots: Vec<_> = summaries
                 .iter()
                 .enumerate()
@@ -615,8 +626,7 @@ impl<W: Clone + Ord> EffectSolution<W> {
                 }
             }
         }
-        for bit_index in 0..RuntimeEffects::BIT_COUNT {
-            let bit = RuntimeEffects::from_bit(bit_index);
+        for (bit_index, bit) in propagated_bits() {
             let mut roots: Vec<_> = summaries
                 .iter()
                 .enumerate()

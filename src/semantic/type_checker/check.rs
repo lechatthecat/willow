@@ -369,6 +369,7 @@ impl TypeChecker {
             Item::Class(c) if !c.type_params.is_empty() => Some(c.span.file_id),
             Item::Interface(i)
                 if !i.type_params.is_empty()
+                    && !i.template_checked
                     && (!i.extends.is_empty()
                         || i.methods.iter().any(|m| !m.effect_contracts.is_empty())) =>
             {

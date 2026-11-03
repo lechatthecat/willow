@@ -2,6 +2,7 @@ use super::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::symbols::VarInfo;
 
+#[willow_continuations::checker]
 impl TypeChecker {
     fn contract_error(&mut self, span: Span, message: &str) {
         self.push(

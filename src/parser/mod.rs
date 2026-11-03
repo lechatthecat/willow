@@ -3526,6 +3526,7 @@ class ProtectedCtor { prot init(self) {} }
         source.push_str(" else { } }");
         let tokens = Lexer::new(&source).tokenize().unwrap();
         let depth = std::thread::Builder::new()
+            .name("else-if ladder on 256 KiB".into())
             .stack_size(256 * 1024)
             .spawn(move || {
                 let (program, errors) = Parser::new(tokens).parse();

@@ -155,11 +155,24 @@ impl TypeChecker {
         // interface (the written instantiation for a generic interface's
         // instance) and reaches its methods. Each receiver's copy lowers it
         // as its own class (willow-dnia).
-        let previous_self = self.local.self_interface.replace(
-            decl.instance_of
-                .clone()
-                .unwrap_or_else(|| Type::Named(iface_name.to_string())),
-        );
+        // An abstract check of a generic template has no instance: `self`
+        // is then the interface at its own type parameters (`Meter<T>`).
+        let previous_self =
+            self.local
+                .self_interface
+                .replace(decl.instance_of.clone().unwrap_or_else(|| {
+                    if decl.type_params.is_empty() {
+                        Type::Named(iface_name.to_string())
+                    } else {
+                        Type::Generic(
+                            iface_name.into(),
+                            decl.type_params
+                                .iter()
+                                .map(|param| Type::Named(param.clone()))
+                                .collect(),
+                        )
+                    }
+                }));
         self.local.current_async_context = false;
         self.local.in_static_method = false;
         self.symbols.push_scope();

@@ -16,7 +16,7 @@ pub fn emit(diag: &Diagnostic, map: &SourceMap) {
 fn emit_single(diag: &Diagnostic, map: &SourceMap, writer: &mut dyn Write) -> io::Result<()> {
     emit_header(diag, writer)?;
     if let Some(labels) = group_labels(&diag.labels).get(&map.file_id) {
-        render_file_labels(map, &map.path, labels, writer)?;
+        render_file_labels(map, map.shown_path(), labels, writer)?;
     }
     render_footer(
         diag,
@@ -52,7 +52,7 @@ pub fn emit_with(
         {
             render_file_labels(
                 map,
-                maps.display_path(file_id).unwrap_or(&map.path),
+                maps.display_path(file_id).unwrap_or(map.shown_path()),
                 &labels,
                 writer,
             )?;

@@ -4609,11 +4609,11 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
     }
 
-    // 31. an out-of-slice construct (`for` over a Map) is reported, not
-    // panicked on.
+    // 31. an out-of-slice construct (`for` over a non-iterable String) is
+    // reported, not panicked on. Map iteration lowers through `entries()`.
     #[test]
     fn p31_unsupported_construct_reports_diagnostic() {
-        let (_, diags) = lower_src("fn f(m: Map<String, i64>) { for v in m { print(v); } }");
+        let (_, diags) = lower_src("fn f(s: String) { for v in s { print(v); } }");
         assert!(
             diags
                 .iter()

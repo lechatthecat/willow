@@ -82,6 +82,14 @@ fn increasing_graphs_and_repeated_queries_retain_no_query_history() {
         let snapshot_heap_bytes = LIVE.load(Ordering::Relaxed) - heap_before;
         let before = LIVE.load(Ordering::Relaxed);
         let mut session = QuerySession::new(owned).unwrap();
+        // The witness-effect index is built once, on the first effects query;
+        // it belongs to the session index, not to per-query history.
+        let visits_before_index = session.effect_edge_visits;
+        drop(session.query(QueryRequest::Effects {
+            revision: revision.clone(),
+            function: id.clone(),
+        }));
+        assert_eq!(session.effect_edge_visits - visits_before_index, n - 1);
         let index_bytes = LIVE.load(Ordering::Relaxed) - before;
         for queries in [1, 10, 1000] {
             let comparisons_before = session.position_comparisons;

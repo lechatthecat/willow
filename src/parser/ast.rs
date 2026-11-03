@@ -286,6 +286,11 @@ pub struct InterfaceDecl {
     /// instantiation it stands for (`Get<i64>`): `self` in its defaults has
     /// that type (willow-rktm). `None` for a declared interface.
     pub instance_of: Option<Type>,
+    /// Set by generic expansion on a generic template it keeps as a
+    /// declaration: its defaults were abstract-checked against the
+    /// pre-expansion templates, which the expanded program no longer has.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub template_checked: bool,
     pub span: Span,
 }
 

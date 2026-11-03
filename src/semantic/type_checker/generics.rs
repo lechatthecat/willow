@@ -2836,6 +2836,7 @@ impl TypeChecker {
                     .map(|p| Type::Named(p.clone()))
                     .collect(),
             )),
+            template_checked: false,
             span: template.span,
         };
         let mut item = Item::Interface(instance);
@@ -2957,6 +2958,7 @@ impl TypeChecker {
             }
             Item::Interface(i) => {
                 !i.type_params.is_empty()
+                    && !i.template_checked
                     && (!i.extends.is_empty()
                         || i.methods.iter().any(|m| !m.effect_contracts.is_empty()))
             }
@@ -3047,6 +3049,7 @@ impl TypeChecker {
         for interface in program.items.iter().filter_map(|item| match item {
             Item::Interface(i)
                 if !i.type_params.is_empty()
+                    && !i.template_checked
                     && i.span.file_id == file
                     && (!i.extends.is_empty()
                         || i.methods.iter().any(|m| {
@@ -3265,6 +3268,15 @@ impl TypeChecker {
             Item::Class(c) => c.type_params.is_empty(),
             _ => true,
         });
+        // Generic interfaces stay as declarations, but the templates their
+        // defaults call are gone: their abstract check already ran.
+        for item in &mut program.items {
+            if let Item::Interface(i) = item
+                && !i.type_params.is_empty()
+            {
+                i.template_checked = true;
+            }
+        }
         // A signature item precedes its body fragments in the work queue.
         // Merge once with an index, never scan all classes for each method.
         let mut classes = HashMap::new();

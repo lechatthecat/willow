@@ -464,6 +464,11 @@ mod alloc_effects_tests {
     /// builds a GC object means adding it here too; `a18` fails otherwise.
     const ALLOCATING: &[&str] = &[
         "willow_pow_negative_exponent",
+        "willow_i64_abs",
+        "willow_i64_clamp",
+        "willow_f64_clamp",
+        "willow_contract_i64",
+        "willow_contract_check",
         "willow_f64_to_string",
         "willow_i64_to_string",
         "willow_bool_to_string",
@@ -484,6 +489,11 @@ mod alloc_effects_tests {
         "willow_string_substring",
         "willow_string_byte_at",
         "willow_string_trim",
+        "willow_string_trim_start",
+        "willow_string_trim_end",
+        "willow_string_to_lower",
+        "willow_string_to_upper",
+        "willow_string_replace",
         "willow_runtime_arg",
         "willow_runtime_program_name",
         "willow_runtime_args_array",

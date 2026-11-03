@@ -270,6 +270,7 @@ mod tests {
     }
     fn check_on_small_stack(source: String) {
         std::thread::Builder::new()
+            .name("tuple check on 256 KiB".into())
             .stack_size(256 * 1024)
             .spawn(move || {
                 // Include parsing, checking and dropping both trees. Merely

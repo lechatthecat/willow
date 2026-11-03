@@ -24,7 +24,7 @@ fn parse_cascade_regressions() {
         "fn broken() { if (true { return; } let a = 1; println(a); } fn main() {}",
         "fn broken() { if true {{ println(1); } } fn main() {}",
         "fn broken() { println(1);",
-        "class Missing { fn open(self) {} } async fn main() { let x: Missing = new Missing(); }",
+        "class Missing { fn while(self) {} } async fn main() { let x: Missing = new Missing(); }",
         "fn broken(x: Task<i64) {} async fn main() {}",
         "fn broken() { let x = 1 +; println(absent); } fn main() {}",
         "fn broken() { let x = ; } async fn main() { let x: Unit = absent; }",
@@ -67,7 +67,7 @@ fn parse_cascade_regressions() {
     }
     // Imported lexer errors and parser codes outside E01 must also stop semantics.
     for (source, code) in [
-        ("pub fn broken() { @ }", ErrorCode::E0050),
+        ("pub fn broken() { $ }", ErrorCode::E0050),
         ("module broken; module broken;", ErrorCode::E2009),
     ] {
         fs::write(root.join("broken.wi"), source).unwrap();

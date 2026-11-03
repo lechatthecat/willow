@@ -57,10 +57,10 @@ fn main() {
         (
             r#"
 fn main() {
-    let @x = 1;
+    let $x = 1;
 }
 "#,
-            &["error[E0050]", "invalid character `@`"],
+            &["error[E0050]", "invalid character `$`"],
         ),
         (
             r#"
@@ -300,17 +300,17 @@ fn test_diagnostic_invalid_character_is_source_aware() {
     let stderr = compile_error_stderr(
         r#"
 fn main() {
-    let @x = 1;
+    let $x = 1;
 }
 "#,
     );
     let temp_diag_prefix = format!(" --> {}", temp_path("willow_diag_"));
     for part in [
         "error[E0050]",
-        "invalid character `@`",
+        "invalid character `$`",
         temp_diag_prefix.as_str(),
         ":3:9",
-        "3 |     let @x = 1;",
+        "3 |     let $x = 1;",
         "        ^ invalid character",
     ] {
         assert!(
@@ -472,7 +472,7 @@ fn test_error_invalid_char() {
     assert!(expect_compile_error(
         r#"
 fn main() {
-    let @x = 1;
+    let $x = 1;
 }
 "#
     ));
@@ -802,7 +802,7 @@ fn test_multiple_parse_errors_all_reported() {
     let stderr = compile_error_stderr(
         r#"
 fn a() -> i64 {
-    return @
+    return $
 
 fn b() -> i64 {
     return #

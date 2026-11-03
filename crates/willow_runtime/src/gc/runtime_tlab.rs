@@ -291,8 +291,15 @@ pub(crate) fn alloc_string_payload_slow(payload_size: usize) -> *mut u8 {
     let Some(total) = object_size(payload_size) else {
         crate::failure::resource_exhausted(format_args!("string allocation size overflow"));
     };
-    let payload = (total - GC_HEADER_SIZE) as i64;
-    alloc_young_slow(GcObjectKind::String, 0, payload, 0)
+    // A TLAB-sized object uses the aligned payload of its fast-path
+    // descriptor. Larger objects go to the old heap, which keeps the exact
+    // payload size, matching old allocation from threads without a TLAB.
+    let payload = if total <= GC_TLAB_MAX_OBJECT_SIZE {
+        total - GC_HEADER_SIZE
+    } else {
+        payload_size
+    };
+    alloc_young_slow(GcObjectKind::String, 0, payload as i64, 0)
 }
 
 /// Allocation miss path for [`try_alloc_young`] of one object, with the same

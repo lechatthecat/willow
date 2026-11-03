@@ -496,8 +496,11 @@ impl<'a> CompilerSession<'a> {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let map =
+        let mut map =
             diagnostics::SourceMap::new(src_path.to_str().context("non UTF-8 path")?, &source);
+        if map.path != self.src {
+            map.display = Some(self.src.to_string());
+        }
 
         let mut inputs =
             compiler_db::inputs::CompilerInputs::native(self.opts.clone(), root.clone())
@@ -2920,9 +2923,12 @@ fn run_backend(
     let entry_artifact = {
         let body = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
         if emit_debug_metadata {
-            let mut text =
-                diagnostics::DebugSourceMap::from_program(&map.path, map.total_lines(), &body)
-                    .to_text();
+            let mut text = diagnostics::DebugSourceMap::from_program(
+                map.shown_path(),
+                map.total_lines(),
+                &body,
+            )
+            .to_text();
             for module in module_debug_metadata.drain(..) {
                 text.push_str("\n---\n");
                 text.push_str(&module);
@@ -3832,7 +3838,7 @@ mod frontend_phase_tests {
     #[test]
     fn lex_phase_separates_success_from_diagnostics() {
         assert!(lex_phase("fn main() {}").is_ok());
-        assert!(lex_phase("fn main() { @ }").is_err());
+        assert!(lex_phase("fn main() { $ }").is_err());
     }
 
     #[test]

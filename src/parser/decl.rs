@@ -611,6 +611,7 @@ impl Parser {
             extends,
             methods,
             instance_of: None,
+            template_checked: false,
             span,
         })
     }

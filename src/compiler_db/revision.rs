@@ -2032,6 +2032,7 @@ mod tests {
         let mut peak_edges = 0;
         let mut peak_artifacts = 0;
         let mut peak_query_bytes = 0;
+        let mut first_artifacts = None;
         for step in 0..200 {
             f.write("main.wi", &format!("fn renamed_{step}() -> i64 {{ return {step}; }} fn main() {{ println(renamed_{step}()); }}"));
             assert!(f.compare(&mut warm));
@@ -2051,7 +2052,15 @@ mod tests {
             );
             assert!(nodes < 100, "edit {step}: {nodes} nodes");
             assert!(edges < 300, "edit {step}: {edges} edges");
-            assert!(warm.retained_artifact_bytes < 100_000);
+            // The first revision retains the std/prelude artifacts; later
+            // edits must not accumulate stale artifacts on top of them.
+            let first = *first_artifacts.get_or_insert(warm.retained_artifact_bytes);
+            assert!(first < 400_000, "baseline artifacts: {first} bytes");
+            assert!(
+                warm.retained_artifact_bytes < first + 10_000,
+                "edit {step}: {} artifact bytes after a {first}-byte baseline",
+                warm.retained_artifact_bytes
+            );
             assert!(
                 query_bytes < 2_000_000,
                 "edit {step}: {query_bytes} query bytes"

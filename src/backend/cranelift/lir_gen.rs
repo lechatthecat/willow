@@ -11359,13 +11359,14 @@ fn main() {
         assert!(eligible_checked(qualified, "f", &["f"]));
     }
 
-    // 23. an ordering operator on strings is not emitted, so it is rejected
-    // even though both operand types are supported.
+    // 23. lexicographic string ordering lowers to `willow_string_cmp`, so
+    // every ordering operator on two strings is eligible.
     #[test]
-    fn e23_string_ordering_ineligible() {
-        let src = "fn f(a: String, b: String) -> bool { return a < b; }";
-        // The checker may reject this outright; if it lowers, we must not claim it.
-        assert!(!eligible_lenient(src, "f", &["f"]));
+    fn e23_string_ordering_eligible() {
+        for op in ["<", "<=", ">", ">="] {
+            let src = format!("fn f(a: String, b: String) -> bool {{ return a {op} b; }}");
+            assert!(eligible_checked(&src, "f", &["f"]), "{op}");
+        }
     }
 
     // 24. (updated by willow-0g8j.4) arrays of strings are now eligible

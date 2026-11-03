@@ -836,9 +836,11 @@ fn locked_label(cause: &Value) -> Value {
     Value::from(label)
 }
 
+// A one-function chain only repeats `via=`; show chains that cross a call.
 fn effect_call_chain(fact: &Value) -> Value {
     fact["call_chain"]
         .as_array()
+        .filter(|chain| chain.len() > 1)
         .map(|chain| {
             Value::from(
                 chain

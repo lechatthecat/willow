@@ -1254,6 +1254,50 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/semantic_facts/main.wi", "42\n"),
         ("example/semantic_facts/references.wi", "1\n2\n9\n9\n"),
+        (
+            "example/array_card_remembering.wi",
+            "true\ntrue\n-4030\ntrue\n-4000\n9096\n8383500\n8033426\n",
+        ),
+        ("example/async_task_values.wi", "42\n"),
+        ("example/builtin_callee_type_queries.wi", "1a b\n"),
+        ("example/contextual_new.wi", "3\n3\n3\n3\n"),
+        ("example/contract_comparison.wi", "7\n"),
+        ("example/contract_repair.wi", "0\n7\n"),
+        ("example/effect_contract_dispatch.wi", "42\n"),
+        ("example/effect_contracts.wi", "42\n"),
+        ("example/effect_inventory_editor/m2.wi", "ok\n"),
+        ("example/effect_states.wi", "7\n"),
+        ("example/imported_enum_stack.wi", "2\nsaved\n42\ntrue\n"),
+        ("example/inherited_method_effects.wi", "1\n"),
+        (
+            "example/integer_division.wi",
+            "-3\n-1\n-3\n1\ninteger overflow: `i64::MIN / -1`\ninteger overflow: `i64::MIN % -1`\nafter\n",
+        ),
+        ("example/lock_await_effects.wi", "3\n"),
+        ("example/math_helpers.wi", "math helpers ok\n"),
+        ("example/numeric_conversions.wi", "4.5\n-4\n"),
+        ("example/open_method_effect_queries.wi", "3\n2\n3\n"),
+        (
+            "example/option_method_handling.wi",
+            "true\n6\nfallback\nWILLOW\n",
+        ),
+        ("example/pure_functions.wi", "30\n"),
+        ("example/reachable_generic_methods.wi", "42\nhello\n0\n"),
+        ("example/rename_semantic_verification.wi", "5\n"),
+        (
+            "example/runtime_contracts.wi",
+            "90\ncontract violation: requires\nrecovered\n",
+        ),
+        ("example/select_arm_blocks.wi", "7\n7\n"),
+        ("example/semantic_edit_preview.wi", "42\n"),
+        ("example/semantic_verification.wi", "42\n"),
+        ("example/static_verification.wi", "9\n-3\n-1\n"),
+        ("example/string_effect_queries.wi", "198\n"),
+        (
+            "example/string_transforms.wi",
+            "true\ntwo two\ntrue\ntrue\nwillow É日本\nWILLOW é日本\n|é|😀|\n",
+        ),
+        ("example/verified_loops.wi", "0\n0\n7\n"),
     ]
 }
 
@@ -2013,6 +2057,50 @@ fn test_october_ci_catalog_additions() {
             assert!(ok, "{path}: {out}");
             assert_eq!(out, expected, "{path}");
         }
+    }
+}
+
+#[test]
+fn test_november_ci_catalog_additions() {
+    let added = [
+        "example/array_card_remembering.wi",
+        "example/async_task_values.wi",
+        "example/builtin_callee_type_queries.wi",
+        "example/contextual_new.wi",
+        "example/contract_comparison.wi",
+        "example/contract_repair.wi",
+        "example/effect_contract_dispatch.wi",
+        "example/effect_contracts.wi",
+        "example/effect_inventory_editor/m2.wi",
+        "example/effect_states.wi",
+        "example/imported_enum_stack.wi",
+        "example/inherited_method_effects.wi",
+        "example/integer_division.wi",
+        "example/lock_await_effects.wi",
+        "example/math_helpers.wi",
+        "example/numeric_conversions.wi",
+        "example/open_method_effect_queries.wi",
+        "example/option_method_handling.wi",
+        "example/pure_functions.wi",
+        "example/reachable_generic_methods.wi",
+        "example/rename_semantic_verification.wi",
+        "example/runtime_contracts.wi",
+        "example/select_arm_blocks.wi",
+        "example/semantic_edit_preview.wi",
+        "example/semantic_verification.wi",
+        "example/static_verification.wi",
+        "example/string_effect_queries.wi",
+        "example/string_transforms.wi",
+        "example/verified_loops.wi",
+    ];
+    for path in added {
+        let (_, expected) = runnable_example_cases()
+            .iter()
+            .find(|(entry, _)| *entry == path)
+            .expect("example must be cataloged");
+        let (out, ok) = compile_file_and_run(path);
+        assert!(ok, "{path}: {out}");
+        assert_eq!(out, *expected, "{path}");
     }
 }
 

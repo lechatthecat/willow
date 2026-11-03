@@ -3296,8 +3296,16 @@ fn effect_witness_precision_literals_scheduler_and_unknown_origins() {
         assert_eq!(panic["witness"]["cause"]["location"]["line"], 16, "{value}");
         let output = f.run(&["effects", &format!("main::{name}")]);
         let text = String::from_utf8(output.stdout).unwrap();
+        // Wrappers name the call chain that reaches the indirect call.
+        let chain = match name {
+            "apply" => "",
+            "relay" => "chain=main::relay -> main::apply; ",
+            _ => "chain=main::dispatch -> main::Child::run -> main::apply; ",
+        };
         assert!(
-            text.contains("operation=indirect-call; at src/main.wi:16:45"),
+            text.contains(&format!(
+                "operation=indirect-call; {chain}at src/main.wi:16:45"
+            )),
             "{text}"
         );
         assert!(!text.contains("Incomplete effect summary"), "{text}");

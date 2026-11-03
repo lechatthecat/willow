@@ -1010,6 +1010,7 @@ pub(crate) fn capture_incremental(
                         extends: interface.extends.clone(),
                         methods: vec![method.clone()],
                         instance_of: interface.instance_of.clone(),
+                        template_checked: false,
                         span: interface.span,
                     };
                     (block, method.span, Item::Interface(selected_interface))

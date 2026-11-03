@@ -89,6 +89,9 @@ pub(super) struct Captured {
     pub async_functions: std::collections::HashSet<FunctionId>,
     bodies: Vec<Body>,
     pub call_sites: Vec<(FunctionId, Span, Option<FunctionId>, String)>,
+    // Builtin calls stay out of `call_sites`, but their compiler boundary
+    // witnesses still need the owning call span.
+    pub builtin_calls: Vec<(FunctionId, Span, FunctionId)>,
     pub witnesses: HashMap<FunctionId, Vec<Value>>,
     pub compiler_effects: HashMap<FunctionId, u8>,
     // Keep operation sites separate so capability replacement scans stay bounded.
@@ -293,18 +296,28 @@ pub(super) fn finish(
     // Retain one span per caller/target pair without rescanning call sites.
     let mut boundary_sites = HashMap::new();
     for (&unit, capture) in captures {
-        for (caller, span, target, _) in &capture.semantic.call_sites {
-            if let Some(target) = target {
-                boundary_sites
-                    .entry((resolve(unit, *caller), resolve(unit, *target)))
-                    .and_modify(|previous: &mut Span| {
-                        let key = |s: Span| (s.file_id.0, s.start, s.end);
-                        if key(*span) < key(*previous) {
-                            *previous = *span;
-                        }
-                    })
-                    .or_insert(*span);
-            }
+        let calls = capture
+            .semantic
+            .call_sites
+            .iter()
+            .filter_map(|(caller, span, target, _)| {
+                target.as_ref().map(|target| (caller, span, target))
+            });
+        let builtins = capture
+            .semantic
+            .builtin_calls
+            .iter()
+            .map(|(caller, span, target)| (caller, span, target));
+        for (caller, span, target) in calls.chain(builtins) {
+            boundary_sites
+                .entry((resolve(unit, *caller), resolve(unit, *target)))
+                .and_modify(|previous: &mut Span| {
+                    let key = |s: Span| (s.file_id.0, s.start, s.end);
+                    if key(*span) < key(*previous) {
+                        *previous = *span;
+                    }
+                })
+                .or_insert(*span);
         }
     }
     let async_functions = captures

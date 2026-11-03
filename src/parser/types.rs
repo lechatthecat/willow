@@ -322,6 +322,11 @@ mod tests {
                     source
                 };
                 let errors = check(&source);
+                if ty.starts_with("Map<") {
+                    // Mutable maps iterate over an entry snapshot.
+                    assert!(errors.is_empty(), "{source}: {errors:?}");
+                    continue;
+                }
                 assert_eq!(errors.len(), 1, "{errors:?}");
                 assert!(errors[0].message.contains("cannot iterate"));
                 assert!(errors[0].helps[0].contains("keep keys in an array"));

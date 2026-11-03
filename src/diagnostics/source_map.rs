@@ -13,7 +13,7 @@ pub trait SourceLookup {
 
     /// Display spelling only; source identity and debug paths remain unchanged.
     fn display_path(&self, file_id: FileId) -> Option<&str> {
-        self.get(file_id).map(|source| source.path.as_str())
+        self.get(file_id).map(SourceMap::shown_path)
     }
 }
 
@@ -33,7 +33,11 @@ impl SourceLookup for SourceMaps {
 #[derive(Clone)]
 pub struct SourceMap {
     pub file_id: FileId,
+    /// Source identity: cache keys, revisions and module roots.
     pub path: String,
+    /// The caller's spelling of `path` when it differs (a relative or
+    /// symlinked CLI argument); shown in diagnostics and debug metadata.
+    pub display: Option<String>,
     pub source: String,
     line_offsets: Vec<usize>,
 }
@@ -58,9 +62,15 @@ impl SourceMap {
         Self {
             file_id,
             path: path.into(),
+            display: None,
             source,
             line_offsets: offsets,
         }
+    }
+
+    /// The path as the caller spelled it.
+    pub fn shown_path(&self) -> &str {
+        self.display.as_deref().unwrap_or(&self.path)
     }
 
     /// Returns the text of line `line` (1-indexed). Empty string if out of range.

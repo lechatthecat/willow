@@ -742,9 +742,38 @@ fn compiler_db_queries_never_emit_diagnostics() {
     let mut files = Vec::new();
     rust_files(&root, &mut files);
     assert!(!files.is_empty(), "no sources under {}", root.display());
+    // A `#[cfg(test)] #[path = "x_tests.rs"] mod tests;` file is test code as
+    // a whole, like an inline `#[cfg(test)] mod tests { ... }`.
+    let sources: Vec<_> = files
+        .into_iter()
+        .map(|file| {
+            let source = std::fs::read_to_string(&file).unwrap();
+            (file, source)
+        })
+        .collect();
+    let mut test_modules = std::collections::HashSet::new();
+    for (file, source) in &sources {
+        // Attributes are found outside comments and strings; the path string
+        // itself is read from the same offset of the comment-free text.
+        let (uncommented, structural) = rust_scan_masks(source);
+        let mut cursor = 0;
+        while let Some(offset) = structural[cursor..].find("#[cfg(test)]") {
+            cursor += offset + "#[cfg(test)]".len();
+            let rest = uncommented[cursor..].trim_start();
+            if let Some((path, _)) = rest
+                .strip_prefix("#[path = \"")
+                .and_then(|tail| tail.split_once('"'))
+            {
+                test_modules.insert(file.parent().unwrap().join(path));
+            }
+        }
+    }
     let mut violations = Vec::new();
-    for file in files {
-        let code = non_test_code(&std::fs::read_to_string(&file).unwrap());
+    for (file, source) in sources {
+        if test_modules.contains(&file) {
+            continue;
+        }
+        let code = non_test_code(&source);
         for needle in FORBIDDEN_IN_QUERIES {
             if code.contains(needle) {
                 violations.push(format!("{}: {needle}", file.display()));

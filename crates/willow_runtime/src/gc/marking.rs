@@ -906,6 +906,12 @@ impl ConcurrentCycle {
                 )
             } else if let Some(work) = worker.next_work() {
                 (work, None)
+            } else if !batch.branch_children.is_empty() {
+                // The shared queue ran dry while this drain still holds a
+                // partial branch batch. Publish it and keep draining, so an
+                // unbounded drain never returns with its own discoveries queued.
+                batch.publish_branches();
+                continue;
             } else {
                 break;
             };

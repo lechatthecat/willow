@@ -1070,43 +1070,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parser_nested_grammar_uses_one_mib_stack() {
+    /// Parse and drop one source on its own 1 MiB thread. The thread name
+    /// carries the nesting shape, so a stack overflow names its grammar edge.
+    fn parse_on_one_mib(shape: &str, source: String) {
         std::thread::Builder::new()
+            .name(format!("nested grammar `{shape}`"))
             .stack_size(1024 * 1024)
-            .spawn(|| {
-                for (prefix, suffix) in [
-                    ("(", ")"),
-                    ("f(", ")"),
-                    ("[", "]"),
-                    ("new C(", ")"),
-                    ("x.m(", ")"),
-                    ("match x { _ => ", " }"),
-                    ("|| { return ", "; }"),
-                    ("true ? 1 : ", ""),
-                ] {
-                    let expression = format!("{}1{}", prefix.repeat(5_000), suffix.repeat(5_000));
-                    drop(parse(&format!("fn main() {{ let x = {expression}; }}")));
-                }
-                // willow-w1tl: every statement block nesting shape, including
-                // `if let` scrutinees that recurse through parse_let_head.
-                for (prefix, suffix) in [
-                    ("if true {", "}"),
-                    ("if true {} else {", "}"),
-                    ("if let x = 1 {", "}"),
-                    ("while let x = 1 {", "}"),
-                    ("if let x = match 1 { _ => { ", "} } {}"),
-                ] {
-                    let body = format!("{}return;{}", prefix.repeat(5_000), suffix.repeat(5_000));
-                    drop(parse(&format!("fn main() {{{body}}}")));
-                }
-                for (prefix, suffix) in [("Array<", ">"), ("fn() -> ", ""), ("closure(", ")")] {
-                    let ty = format!("{}i64{}", prefix.repeat(10_000), suffix.repeat(10_000));
-                    drop(parse(&format!("fn f(x: {ty}) {{}}")));
-                }
-            })
+            .spawn(move || drop(parse(&source)))
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn parser_nested_grammar_uses_one_mib_stack() {
+        for (prefix, suffix) in [
+            ("(", ")"),
+            ("f(", ")"),
+            ("[", "]"),
+            ("new C(", ")"),
+            ("x.m(", ")"),
+            ("match x { _ => ", " }"),
+            ("|| { return ", "; }"),
+            ("true ? 1 : ", ""),
+        ] {
+            let expression = format!("{}1{}", prefix.repeat(5_000), suffix.repeat(5_000));
+            parse_on_one_mib(prefix, format!("fn main() {{ let x = {expression}; }}"));
+        }
+        // Every statement block nesting shape, including `if let`
+        // scrutinees that recurse through parse_let_head.
+        for (prefix, suffix) in [
+            ("if true {", "}"),
+            ("if true {} else {", "}"),
+            ("if let x = 1 {", "}"),
+            ("while let x = 1 {", "}"),
+            ("if let x = match 1 { _ => { ", "} } {}"),
+        ] {
+            let body = format!("{}return;{}", prefix.repeat(5_000), suffix.repeat(5_000));
+            parse_on_one_mib(prefix, format!("fn main() {{{body}}}"));
+        }
+        for (prefix, suffix) in [("Array<", ">"), ("fn() -> ", ""), ("closure(", ")")] {
+            let ty = format!("{}i64{}", prefix.repeat(10_000), suffix.repeat(10_000));
+            parse_on_one_mib(prefix, format!("fn f(x: {ty}) {{}}"));
+        }
     }
 }

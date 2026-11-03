@@ -541,13 +541,15 @@ mod tests {
 
     #[test]
     fn source_array_helper_loops_are_shared_across_calls() {
+        // Generic source methods are instantiated on demand, so only the
+        // reached `fill` helper contributes its single loop, once.
         for calls in [1, 8, 32] {
             let source = format!(
                 "fn main() {{ let xs = [1]; {} }}",
-                "xs.push(2);".repeat(calls)
+                "xs.fill(2);".repeat(calls)
             );
             let (modules, entry) = compiled_function_scopes(&source);
-            assert_eq!(modules.iter().flat_map(loop_shapes).count(), 3);
+            assert_eq!(modules.iter().flat_map(loop_shapes).count(), 1);
             assert_eq!(entry.iter().flat_map(loop_shapes).count(), 0);
         }
     }

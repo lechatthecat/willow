@@ -306,14 +306,20 @@ fn array_join_generated_calls_scale_with_callsites() {
                 count,
                 "{symbols:?}"
             );
-            // Both source rendering and joining share one linear string assembly
-            // operation each, independent of user callsite count or input bytes.
+            // Joining shares one linear string assembly operation, independent
+            // of user callsite count or input bytes. Unused source methods such
+            // as `toString` are not instantiated, so they add no second one.
             assert_eq!(
                 symbols
                     .iter()
                     .filter(|s| *s == "willow_string_concat_array")
                     .count(),
-                2
+                1,
+                "{symbols:?}"
+            );
+            assert!(
+                !symbols.iter().any(|s| s.ends_with(".toString")),
+                "{symbols:?}"
             );
         }
     }
