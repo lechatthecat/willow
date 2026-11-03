@@ -43,6 +43,13 @@ jobs:
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
       - name: Select native toolchain
         run: rustup override set 1.96.0-${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned verification solver
+        run: |
+          python -m pip install z3-solver==4.15.4.0
+          python -c "import os,pathlib,sys; p=pathlib.Path(sys.prefix)/'bin'/('z3.exe' if os.name=='nt' else 'z3'); assert p.is_file(), p; open(os.environ['GITHUB_ENV'],'a').write('WILLOW_Z3='+str(p)+'\n')"
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Clippy

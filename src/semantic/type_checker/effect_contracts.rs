@@ -315,7 +315,7 @@ impl TypeChecker {
         (normalized, facts)
     }
 
-    /// Propagate each of the three contract kinds once per (type, method).
+    /// Propagate each declaration contract kind once per (type, method).
     /// In particular, a deep chain never rescans all its ancestors per method.
     fn contract_obligations(
         &mut self,
@@ -323,7 +323,7 @@ impl TypeChecker {
         templates: bool,
     ) -> Vec<(FunctionId, EffectContract)> {
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
-        let mut obligations: HashMap<String, HashMap<String, [Option<EffectContract>; 4]>> =
+        let mut obligations: HashMap<String, HashMap<String, [Option<EffectContract>; 5]>> =
             HashMap::new();
         let mut queue = VecDeque::new();
         let mut types = HashSet::new();
@@ -398,6 +398,7 @@ impl TypeChecker {
             OBLIGATION_WORK.with(|n| n.set(n.get() + 1));
             let index = match contract.kind {
                 EffectContractKind::Pure => 3,
+                EffectContractKind::Verified => 4,
                 EffectContractKind::NoWait => 0,
                 EffectContractKind::NoBlock => 1,
                 EffectContractKind::NoSuspend => 2,
@@ -506,9 +507,8 @@ impl TypeChecker {
         for diagnostic in diagnostics {
             self.push(diagnostic);
         }
-        declarations
-            .sort_by_key(|(id, c)| (*id, c.kind.forbidden().bits(), c.span.file_id, c.span.start));
-        declarations.dedup_by_key(|(id, c)| (*id, c.kind.forbidden().bits()));
+        declarations.sort_by_key(|(id, c)| (*id, c.kind.name(), c.span.file_id, c.span.start));
+        declarations.dedup_by_key(|(id, c)| (*id, c.kind.name()));
         declarations
     }
 
@@ -521,7 +521,12 @@ impl TypeChecker {
     ) {
         let mut declarations = self.contract_obligations(program, templates);
         self.report_purity(program, graph, &declarations, templates);
-        declarations.retain(|(_, c)| c.kind != EffectContractKind::Pure);
+        declarations.retain(|(_, c)| {
+            !matches!(
+                c.kind,
+                EffectContractKind::Pure | EffectContractKind::Verified
+            )
+        });
         let (graph, contract_facts) =
             self.solve_contracts(graph, facts, declarations.iter().map(|(id, _)| *id));
         let contract_facts = std::sync::Arc::new(contract_facts);

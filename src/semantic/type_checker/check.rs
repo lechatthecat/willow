@@ -379,6 +379,12 @@ impl TypeChecker {
             self.validate_generic_templates(file, program);
         }
         self.finish_effect_analysis(program);
+        if self.effect_graph_only.is_none() {
+            let diagnostics = crate::semantic::verification::check(program, &self.errors);
+            for diagnostic in diagnostics {
+                self.push(diagnostic);
+            }
+        }
         self.warn_unused_imports(program);
     }
 

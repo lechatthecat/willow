@@ -19,3 +19,5 @@ pub(crate) mod indirect_lock;
 pub(crate) mod scopes;
 
 pub(crate) mod generic_inference;
+
+pub mod verification;

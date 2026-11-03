@@ -140,9 +140,13 @@ impl Parser {
         while self.eat(TokenKind::At) {
             let start = self.previous_span();
             let attribute = self.expect_ident()?;
-            if attribute == "pure" {
+            if attribute == "pure" || attribute == "verified" {
                 contracts.push(EffectContract {
-                    kind: EffectContractKind::Pure,
+                    kind: if attribute == "pure" {
+                        EffectContractKind::Pure
+                    } else {
+                        EffectContractKind::Verified
+                    },
                     span: start.to(self.previous_span()),
                 });
                 continue;
@@ -150,7 +154,7 @@ impl Parser {
             if attribute != "effects" {
                 return Err(self.err(
                     ErrorCode::E0102,
-                    "unknown declaration attribute; expected `effects` or `pure`",
+                    "unknown declaration attribute; expected `effects`, `pure`, or `verified`",
                 ));
             }
             self.expect(TokenKind::LParen)?;

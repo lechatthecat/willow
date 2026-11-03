@@ -294,6 +294,7 @@ pub struct InterfaceDecl {
 pub enum EffectContractKind {
     /// A compiler-only body constraint, checked separately from waiting effects.
     Pure,
+    Verified,
     NoWait,
     NoBlock,
     NoSuspend,
@@ -303,6 +304,7 @@ impl EffectContractKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Pure => "pure",
+            Self::Verified => "verified",
             Self::NoWait => "no_wait",
             Self::NoBlock => "no_block",
             Self::NoSuspend => "no_suspend",
@@ -312,7 +314,7 @@ impl EffectContractKind {
     pub fn forbidden(self) -> willow_abi::RuntimeEffects {
         use willow_abi::RuntimeEffects as E;
         match self {
-            Self::Pure => E::NONE,
+            Self::Pure | Self::Verified => E::NONE,
             Self::NoWait => E::MAY_BLOCK.union(E::MAY_SUSPEND),
             Self::NoBlock => E::MAY_BLOCK,
             Self::NoSuspend => E::MAY_SUSPEND,

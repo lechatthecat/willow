@@ -399,3 +399,6 @@ mod contextual_new;
 
 #[path = "integration/runtime_contracts.rs"]
 mod runtime_contracts;
+
+#[path = "integration/static_verification.rs"]
+mod static_verification;

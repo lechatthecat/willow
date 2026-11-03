@@ -238,6 +238,10 @@ error_codes! {
     E2610, // declared effect contract violated
     E2611, // inherited effect contract weakened
     E2620, // declared purity constraint violated or cannot be proven
+    // Static verification: separate from type/operator diagnostics.
+    E2630, // verification counterexample or unsatisfiable precondition
+    E2631, // unsupported verification or missing declaration/body prerequisite
+    E2632, // solver UNKNOWN/failure, invalid budget, internal or artifact I/O failure
     E2612, // effect contract cannot be proven
     E2606, // `lock` inside a `match` arm has no frame-backed resume shape
 }
