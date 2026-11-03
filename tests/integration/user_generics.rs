@@ -1715,13 +1715,6 @@ fn imported_enum_stack_diagnostics_use_source_types() {
 }
 
 #[test]
-fn imported_enum_stack_example_runs() {
-    let (output, ok) = compile_file_and_run("example/imported_enum_stack.wi");
-    assert!(ok, "{output}");
-    assert_eq!(output, "2\nsaved\n42\ntrue\n");
-}
-
-#[test]
 fn imported_enum_stack_repeated_calls_share_specialization() {
     for count in [1, 16, 64] {
         let calls = "s.push(Op::A(1));".repeat(count);

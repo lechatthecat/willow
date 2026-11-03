@@ -21,8 +21,8 @@
 //!   10 `new` of a class extending into a ring adds no E0845 next to E0426
 
 use super::support::{
-    assert_compile_error_contains, compile_error_stderr, compile_file_and_run,
-    compile_temp_project_and_run, compile_temp_project_error_stderr,
+    assert_compile_error_contains, compile_error_stderr, compile_temp_project_and_run,
+    compile_temp_project_error_stderr,
 };
 
 const RING: &str =
@@ -140,14 +140,6 @@ fn main() { let l = new Leaf(); println(l.tag() + l.more()); }\n";
         compile_temp_project_and_run(&[("shapes.wi", shapes), ("main.wi", main)], "main.wi");
     assert!(ok, "expected the cross-module chain to compile");
     assert_eq!(out, "3\n");
-}
-
-// 09. The example that documents the rule is a runnable program.
-#[test]
-fn class_cycle_09_example_program_runs() {
-    let (out, ok) = compile_file_and_run("example/class_inheritance_cycle_rejected.wi");
-    assert!(ok, "example failed:\n{out}");
-    assert_eq!(out, "Leaf: 1 2 3\nsum: 6\n");
 }
 
 // 10. A class outside the ring that extends into it: constructing it with

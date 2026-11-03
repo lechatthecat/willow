@@ -1,13 +1,6 @@
 use super::support::*;
 
 #[test]
-fn contextual_constructors_and_match_arms_execute() {
-    let (out, ok) = compile_file_and_run("example/buildgraph_regressions.wi");
-    assert!(ok, "{out}");
-    assert_eq!(out, "1\n0\n0\n0\n0\n0\n2\nsafe\nsafe\n3\n");
-}
-
-#[test]
 fn contextual_match_perspectives() {
     let mut source = String::from("import std::collections::Array; fn main() {\n");
     let cases = [

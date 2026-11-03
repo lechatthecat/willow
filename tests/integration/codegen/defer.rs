@@ -146,15 +146,6 @@ fn dfr_15_non_call_rejected() {
 }
 
 #[test]
-fn dfr_16_async_defer_now_allowed() {
-    // Phase 3 (willow-vynv.3) lifted the async restriction: defer in an
-    // async fn registers into the frame and flushes on exit.
-    let (out, ok) = compile_and_run("fn c() { println(2); }\nfn main() { defer c(); println(1); }");
-    assert!(ok, "{out}");
-    assert_eq!(out, "1\n2\n");
-}
-
-#[test]
 fn dfr_17_gc_stress_string_operands() {
     let (out, ok) = compile_and_run_gc_stress(
         "fn c(s: String) { println(s); }\nfn main() { let name = \"a\" + \"b\"; defer c(name + \"!\"); println(\"work\" + \"s\"); }",

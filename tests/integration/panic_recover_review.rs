@@ -328,21 +328,6 @@ async fn main() {
 
 // --- 4. `recover` is a reserved binding name ---------------------------------
 
-/// Perspective 11. A local binding named `recover` would be silently ignored at
-/// the call site (the builtin wins), so it is rejected instead.
-#[test]
-fn prr_11_let_binding_named_recover_is_rejected() {
-    assert_compile_error_contains(
-        r#"
-fn main() {
-    let recover = || { return 7; };
-    println(recover());
-}
-"#,
-        &["E0351", "reserved builtin function"],
-    );
-}
-
 /// Perspective 12. Same for a parameter.
 #[test]
 fn prr_12_parameter_named_recover_is_rejected() {

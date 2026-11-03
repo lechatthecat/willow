@@ -1427,10 +1427,3 @@ fn imported_array_identity_rejects_different_declarations_and_covariance() {
         assert!(errors.contains("E0201"), "{errors}");
     }
 }
-
-#[test]
-fn language_gaps_runnable_example() {
-    let (out, ok) = super::support::compile_file_and_run("example/language_gaps/main.wi");
-    assert!(ok, "{out}");
-    assert_eq!(out, "idle\n6\n9\n");
-}

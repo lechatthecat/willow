@@ -549,17 +549,6 @@ fn the_release_build_answers_the_same() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "7\ncell:2\n");
 }
 
-// 20. The runnable example: two modules declare `Point`, the entry imports one.
-#[test]
-fn the_module_class_visibility_example_runs() {
-    let (out, ok) = compile_file_and_run("example/module_class_visibility/main.wi");
-    assert!(
-        ok,
-        "example/module_class_visibility/main.wi failed to compile or run"
-    );
-    assert_eq!(out, "7\n23\ncell:2,5\n7\n");
-}
-
 // 21. ... and every body in that example is lowered, which is the property this
 //     change is about.
 #[test]

@@ -224,13 +224,6 @@ perspective!(
     "131\n137\n"
 );
 
-#[test]
-fn pair_41_runnable_example() {
-    let (out, ok) = super::support::compile_file_and_run("example/scalar_adt_pairs.wi");
-    assert!(ok, "{out}");
-    assert_eq!(out, "42\ntrue\n43\ntrue\n44\n45\n");
-}
-
 perspective!(
     pair_42_frozen_array_snapshot_survives_borrow_mutation,
     "import std::collections::Array; fn replace(value: &mut Option<i64>) { value = Some(103); } fn main() { let mut values: Array<Option<i64>> = [Some(1), Some(2)]; let snapshot = values.freeze(); replace(&values[0]); gc_collect(); println(snapshot[0].unwrap()); println(values[0].unwrap()); }",

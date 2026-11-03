@@ -5,13 +5,6 @@ const CLASSES: &str = include_str!("../../example/memberwise_owner/secrets.wi");
 const MAIN: &str = include_str!("../../example/memberwise_owner/main.wi");
 
 #[test]
-fn memberwise_owner_project_example() {
-    let (out, ok) = compile_file_and_run("example/memberwise_owner/main.wi");
-    assert!(ok, "{out}");
-    assert_eq!(out, "1\n2\nkept\n");
-}
-
-#[test]
 fn memberwise_owner_single_file() {
     let source = format!(
         "{}\n{}",
@@ -101,11 +94,4 @@ fn memberwise_owner_manifest_project() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n2\nkept\n");
-}
-
-#[test]
-fn class_private_scope_example_runs() {
-    let (out, ok) = compile_file_and_run("example/class_private_scope.wi");
-    assert!(ok, "class-private public API example failed: {out}");
-    assert_eq!(out, "true\n");
 }

@@ -1026,17 +1026,6 @@ const EXAMPLE: &[(&str, &str)] = &[
 const EXAMPLE_OUTPUT: &str =
     "high[]\nlow[]\nloud{}\n-{}\nfar()\n.low.low.low.low\n11\n10\nloud/ok\ntrue\nlow\nloud\n";
 
-// 24. The example runs.
-#[test]
-fn p24_the_module_enum_tables_example_runs() {
-    let (out, ok) = compile_file_and_run("example/module_enum_tables/main.wi");
-    assert!(
-        ok,
-        "example/module_enum_tables/main.wi failed to compile or run"
-    );
-    assert_eq!(out, EXAMPLE_OUTPUT);
-}
-
 // 25. ... every body in it is lowered ...
 #[test]
 fn p25_the_module_enum_tables_example_is_fully_lowered() {

@@ -1527,13 +1527,6 @@ fn abi_handshake_covers_empty_async_and_static_entry_paths() {
 }
 
 #[test]
-fn abi_handshake_example_runs() {
-    let (output, ok) = compile_file_and_run("example/abi_handshake.wi");
-    assert!(ok, "{output}");
-    assert_eq!(output, "42\n");
-}
-
-#[test]
 fn test_runtime_direct_call_operations() {
     let source = include_str!("../../example/runtime_direct_calls.wi").replace("10000", "100");
     for run in [
@@ -1545,13 +1538,6 @@ fn test_runtime_direct_call_operations() {
         assert!(success, "{output}");
         assert_eq!(output, "190\n100\n99\nruntime direct calls\n");
     }
-}
-
-#[test]
-fn test_import_recursive_types_shared_model_runs() {
-    let (output, ok) = compile_file_and_run("example/recursive_type_modules/main.wi");
-    assert!(ok, "shared recursive model failed to compile or run");
-    assert_eq!(output, "0\n0\n");
 }
 
 #[test]

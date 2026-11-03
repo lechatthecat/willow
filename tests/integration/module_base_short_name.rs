@@ -48,8 +48,7 @@
 //! The walk's own guard has unit tests in `src/ir/lower.rs`.
 
 use super::support::{
-    TestProject, compile_file_and_run, compile_temp_project_and_run,
-    compile_temp_project_error_stderr,
+    TestProject, compile_temp_project_and_run, compile_temp_project_error_stderr,
 };
 
 /// The module root every perspective extends as `shapes::Sized`.
@@ -326,13 +325,4 @@ fn short_name_21_same_named_subclass_builds_in_release_mode() {
     let run = project.run();
     assert!(run.status.success(), "binary failed");
     assert_eq!(String::from_utf8_lossy(&run.stdout), "30\n");
-}
-
-// 22: the exact output is also pinned by the runnable-examples table in
-// `runtime.rs`.
-#[test]
-fn short_name_22_the_example_program_runs() {
-    let (out, ok) = compile_file_and_run("example/module_base_short_name/main.wi");
-    assert!(ok, "example failed: {out}");
-    assert_eq!(out, "3\n12\n7\n5\n20\n50\n3\n12\n42\n1\n0\n");
 }

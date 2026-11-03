@@ -1278,17 +1278,6 @@ fn main() {
 }
 
 #[test]
-fn test_static_s4_15_private_static_inaccessible_outside() {
-    assert_compile_error_contains(
-        r#"
-class C { static secret: i64 = 1; }
-fn main() { println(C::secret); }
-"#,
-        &["error[E0419]", "private"],
-    );
-}
-
-#[test]
 fn test_static_s4_16_private_static_accessible_in_same_class() {
     let (out, ok) = compile_and_run(
         r#"

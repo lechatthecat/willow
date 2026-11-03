@@ -1,5 +1,5 @@
 //! Cross-module specialization-origin regression coverage (willow-jz15.63).
-use super::support::{TestProject, compile_file_and_run};
+use super::support::TestProject;
 
 const BOXES: &str = r#"
 module boxes;
@@ -224,13 +224,6 @@ fn p23_private_members_stay_private() {
             "{stderr}"
         );
     }
-}
-
-#[test]
-fn p24_example() {
-    let (out, ok) = compile_file_and_run("example/module_generic_members/main.wi");
-    assert!(ok, "{out}");
-    assert_eq!(out, "5\n5\n7\n7\nkept\n");
 }
 
 #[test]

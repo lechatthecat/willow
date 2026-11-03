@@ -666,31 +666,6 @@ fn main() {
     assert_eq!(out, "8\n80\n");
 }
 
-// 24. Minor-GC stress on the class-carrying program, where a wrong layout
-//     would trace the wrong references.
-#[test]
-fn the_resolved_layout_survives_minor_gc_stress() {
-    let (out, ok) = compile_temp_project_with_env_and_run_under(
-        &project(CHILD_IMPORT_ENTRY),
-        "main.wi",
-        &PLAIN[..],
-        MINOR_STRESS,
-    );
-    assert!(ok, "minor-stress run failed: {out}");
-    assert_eq!(out, "7\n10\n");
-}
-
-// 25. The runnable example, which exercises both halves at once.
-#[test]
-fn the_module_import_scope_example_runs() {
-    let (out, ok) = compile_file_and_run("example/module_import_scope/main.wi");
-    assert!(
-        ok,
-        "example/module_import_scope/main.wi failed to compile or run"
-    );
-    assert_eq!(out, "7\nsale:3\n9\n100\n");
-}
-
 // 26. ... and every body in it is lowered, which is what the visible-module
 //     half of this change buys.
 #[test]

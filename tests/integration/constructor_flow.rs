@@ -26,13 +26,6 @@ fn constructor_flow_rejects_partial_branch_and_early_exit() {
 }
 
 #[test]
-fn constructor_flow_example_runs() {
-    let (out, ok) = compile_file_and_run("example/constructor_flow.wi");
-    assert!(ok, "{out}");
-    assert_eq!(out, "zero\n0\none\n1\nmany\n2\n");
-}
-
-#[test]
 fn constructor_flow_branch_values_survive_gc() {
     let source = include_str!("../../example/constructor_flow.wi");
     let (out, ok) = compile_and_run_gc_stress(source);

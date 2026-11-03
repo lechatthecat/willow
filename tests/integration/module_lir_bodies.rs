@@ -715,17 +715,3 @@ fn main() {
     assert!(ok, "default build failed: {out}");
     assert_eq!(out, "42\n");
 }
-
-// 24. The runnable example, end to end.
-#[test]
-fn module_lir_bodies_example_runs() {
-    let (out, ok) = compile_file_and_run("example/module_lir_bodies/main.wi");
-    assert!(
-        ok,
-        "example/module_lir_bodies/main.wi failed to compile or run"
-    );
-    assert_eq!(
-        out,
-        "12\n10\n7\nwin:rect\n1\n9\n30\n90\n12\n12\n12\n20\n13\n"
-    );
-}

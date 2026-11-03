@@ -195,14 +195,6 @@ fn p10_private_generic_enum_is_rejected_with_arguments_too() {
     );
 }
 
-// 11. The corrected program: every type argument in place, both backends.
-#[test]
-fn p11_the_example_builds_and_runs() {
-    let (out, ok) = compile_file_and_run("example/type_argument_arity/main.wi");
-    assert!(ok, "example failed to build or run: {out}");
-    assert_eq!(out, "5\n0\n7\nempty\nnone\n2\n42\nmaybe\n1\n12\n");
-}
-
 // 12. The rendered diagnostic carries its code, label and help.
 #[test]
 fn p12_rendered_diagnostic_has_code_label_and_help() {
@@ -459,11 +451,4 @@ fn missing_task_arguments_render_actionable_help_without_cascade() {
         !stderr.contains("did you mean") && !stderr.contains("E0350") && !stderr.contains(NO_ICE),
         "{stderr}"
     );
-}
-
-#[test]
-fn missing_task_arguments_corrected_example_runs() {
-    let (output, success) = compile_file_and_run("example/void_tasks_frozen_iteration.wi");
-    assert!(success, "{output}");
-    assert_eq!(output, "2\n60\n");
 }

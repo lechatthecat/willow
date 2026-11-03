@@ -841,17 +841,6 @@ const EXAMPLE: &[(&str, &str)] = &[
 
 const EXAMPLE_OUTPUT: &str = "1\n42\n200\n8\nink\n2\n20\n";
 
-// 25. It runs.
-#[test]
-fn p25_the_imported_enum_match_example_runs() {
-    let (out, ok) = compile_file_and_run("example/imported_enum_match/main.wi");
-    assert!(
-        ok,
-        "example/imported_enum_match/main.wi failed to compile or run"
-    );
-    assert_eq!(out, EXAMPLE_OUTPUT);
-}
-
 // 26. ... and every body in it is lowered, which is what this change buys.
 #[test]
 fn p26_the_imported_enum_match_example_is_fully_lowered() {

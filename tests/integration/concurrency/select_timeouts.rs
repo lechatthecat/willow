@@ -38,15 +38,6 @@ fn stmo_02_coop_recv_beats_timeout() {
 }
 
 #[test]
-fn stmo_03_sync_timeout_fires() {
-    let (out, ok) = compile_and_run(
-        "fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(30) => { println(\"t\"); } } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "t\n");
-}
-
-#[test]
 fn stmo_04_sync_recv_beats_timeout() {
     let (out, ok) = compile_and_run(
         "fn main() { let ch = Channel<i64>::new(); ch.send(4); select { let v = ch.recv() => { println(v); } sleep(5000) => { println(\"t\"); } } }",

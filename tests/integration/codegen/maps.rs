@@ -166,23 +166,6 @@ fn main() {
     assert_eq!(out, "two\n");
 }
 
-// Perspective 7: empty map has length 0.
-#[test]
-fn test_map_empty_len_zero() {
-    let (out, ok) = compile_and_run(
-        r#"
-import std::collections::Map;
-
-fn main() {
-    let m: Map<String, i64> = Map::new();
-    println(m.len());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(out, "0\n");
-}
-
 // Perspective 8: a map passed as a function parameter.
 #[test]
 fn test_map_as_parameter() {

@@ -27,6 +27,96 @@ pub struct HostToolchain {
     target: TargetOptions,
     #[cfg(not(feature = "packaged"))]
     runtime_lock: std::cell::RefCell<Option<std::fs::File>>,
+    #[cfg(not(feature = "packaged"))]
+    runtime_snapshot: std::cell::RefCell<Option<RuntimeSnapshot>>,
+}
+
+/// Process-private hard link to the runtime archive, removed on drop. On Unix,
+/// Cargo replaces the shared alias by unlinking it, which leaves this link's
+/// inode intact, so a linker can read it without holding the runtime lock.
+/// Windows share modes span hard links: a linker holding this file open could
+/// make Cargo's unlink of the alias fail, so it is not used there.
+#[cfg(not(feature = "packaged"))]
+struct RuntimeSnapshot {
+    /// The shared alias this link was taken from, for messages that outlive it.
+    source: PathBuf,
+    path: PathBuf,
+    /// Locked for this snapshot's lifetime. The OS releases it even after
+    /// SIGKILL, which is how a later compiler recognizes an abandoned link.
+    owner: PathBuf,
+    _owner_lock: std::fs::File,
+}
+
+#[cfg(not(feature = "packaged"))]
+impl RuntimeSnapshot {
+    const OWNER_SUFFIX: &str = ".owner";
+
+    /// The caller must hold the runtime lock: it orders creation against the
+    /// sweep, so a new owner file is never observed before it is locked.
+    fn create(runtime: &Path) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let directory = runtime
+            .parent()
+            .expect("runtime profile directory")
+            .join(".willow-runtime-links");
+        std::fs::create_dir_all(&directory)?;
+        Self::remove_abandoned(&directory)?;
+        let name = runtime.file_name().expect("runtime library name");
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut file_name = std::ffi::OsString::from(format!("{}-{unique}-", std::process::id()));
+        file_name.push(name);
+        let path = directory.join(file_name);
+        let owner = Self::owner_path(&path);
+        let owner_lock = std::fs::File::create(&owner)?;
+        owner_lock.lock()?;
+        if let Err(error) = std::fs::hard_link(runtime, &path) {
+            let _ = std::fs::remove_file(&owner);
+            return Err(error);
+        }
+        Ok(Self {
+            source: runtime.to_path_buf(),
+            path,
+            owner,
+            _owner_lock: owner_lock,
+        })
+    }
+
+    fn owner_path(path: &Path) -> PathBuf {
+        let mut owner = path.as_os_str().to_owned();
+        owner.push(Self::OWNER_SUFFIX);
+        PathBuf::from(owner)
+    }
+
+    /// Each abandoned link can pin a whole superseded archive on disk.
+    fn remove_abandoned(directory: &Path) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let owner = entry?.path();
+            let Some(link) = owner
+                .to_str()
+                .and_then(|path| path.strip_suffix(Self::OWNER_SUFFIX))
+            else {
+                continue;
+            };
+            let Ok(file) = std::fs::File::open(&owner) else {
+                continue;
+            };
+            if file.try_lock().is_ok() {
+                let _ = std::fs::remove_file(link);
+                let _ = std::fs::remove_file(&owner);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "packaged"))]
+impl Drop for RuntimeSnapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&self.owner);
+    }
 }
 
 impl HostToolchain {
@@ -35,7 +125,19 @@ impl HostToolchain {
             target: target.clone(),
             #[cfg(not(feature = "packaged"))]
             runtime_lock: std::cell::RefCell::new(None),
+            #[cfg(not(feature = "packaged"))]
+            runtime_snapshot: std::cell::RefCell::new(None),
         }
+    }
+
+    /// The stable archive behind `resolved`, for messages that outlive this
+    /// toolchain: a snapshot path disappears when the toolchain is dropped.
+    pub fn runtime_library_origin(&self, resolved: &Path) -> PathBuf {
+        #[cfg(not(feature = "packaged"))]
+        if let Some(snapshot) = self.runtime_snapshot.borrow().as_ref() {
+            return snapshot.source.clone();
+        }
+        resolved.to_path_buf()
     }
 
     fn object_path(&self, output: &str) -> PathBuf {
@@ -177,10 +279,16 @@ impl Toolchain for HostToolchain {
         );
         #[cfg(not(feature = "packaged"))]
         {
+            if let Some(snapshot) = self.runtime_snapshot.borrow().as_ref() {
+                return Ok(snapshot.path.clone());
+            }
             let path = self.default_runtime_library_path();
             // Cargo may replace the un-hashed staticlib alias even for a fresh
-            // build. Hold a process-shared lock through linking so another Willow
-            // compiler cannot remove that alias while the linker is opening it.
+            // build, so only one compiler may run it at a time. On Unix, linking
+            // reads a private hard link instead of the alias, which lets
+            // concurrent compilers link in parallel. Elsewhere, or without hard
+            // links, the lock stays held through linking so the alias cannot
+            // be replaced while the linker has it open.
             if self.runtime_lock.borrow().is_none() {
                 let directory = path.parent().expect("runtime profile directory");
                 std::fs::create_dir_all(directory)?;
@@ -194,7 +302,17 @@ impl Toolchain for HostToolchain {
                 *self.runtime_lock.borrow_mut() = Some(lock);
             }
             self.build_default_runtime_library()?;
-            validate_runtime_library(path)
+            let path = validate_runtime_library(path)?;
+            if !cfg!(unix) {
+                return Ok(path);
+            }
+            let Ok(snapshot) = RuntimeSnapshot::create(&path) else {
+                return Ok(path);
+            };
+            let linked = snapshot.path.clone();
+            *self.runtime_snapshot.borrow_mut() = Some(snapshot);
+            self.runtime_lock.borrow_mut().take();
+            Ok(linked)
         }
     }
 
@@ -530,6 +648,82 @@ mod tests {
         );
         assert!(host.runtime_library_help().contains("WILLOW_RUNTIME_LIB"));
         assert!(host.runtime_library_help().contains("--runtime-lib"));
+    }
+
+    #[cfg(all(unix, not(feature = "packaged")))]
+    fn snapshot_fixture(name: &str) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!("willow_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let alias = directory.join("libwillow_runtime.a");
+        std::fs::write(&alias, b"first").unwrap();
+        (directory, alias)
+    }
+
+    #[test]
+    #[cfg(all(unix, not(feature = "packaged")))]
+    fn runtime_snapshot_survives_alias_replacement_and_is_removed_on_drop() {
+        let (directory, alias) = snapshot_fixture("snapshot_replace");
+
+        let first = RuntimeSnapshot::create(&alias).unwrap();
+        let second = RuntimeSnapshot::create(&alias).unwrap();
+        assert_ne!(first.path, second.path);
+        assert_eq!(
+            first.path.extension(),
+            alias.extension(),
+            "linkers select the archive handling from the extension"
+        );
+
+        // Cargo replaces the alias by unlinking it and creating a new file.
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::write(&alias, b"second").unwrap();
+        assert_eq!(std::fs::read(&first.path).unwrap(), b"first");
+
+        let (path, owner) = (first.path.clone(), first.owner.clone());
+        drop(first);
+        assert!(!path.exists());
+        assert!(!owner.exists());
+        assert_eq!(std::fs::read(&second.path).unwrap(), b"first");
+        drop(second);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(all(unix, not(feature = "packaged")))]
+    fn abandoned_runtime_links_are_removed_but_live_ones_are_kept() {
+        let (directory, alias) = snapshot_fixture("snapshot_sweep");
+        let live = RuntimeSnapshot::create(&alias).unwrap();
+
+        // An unlocked owner file is what a killed compiler leaves behind.
+        let links = live.path.parent().unwrap().to_path_buf();
+        let abandoned = links.join("1-0-libwillow_runtime.a");
+        std::fs::hard_link(&alias, &abandoned).unwrap();
+        let abandoned_owner = RuntimeSnapshot::owner_path(&abandoned);
+        std::fs::write(&abandoned_owner, b"").unwrap();
+
+        let next = RuntimeSnapshot::create(&alias).unwrap();
+        assert!(!abandoned.exists());
+        assert!(!abandoned_owner.exists());
+        assert!(live.path.exists());
+        assert!(live.owner.exists());
+        drop((live, next));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(all(unix, not(feature = "packaged")))]
+    fn runtime_origin_names_the_alias_rather_than_the_snapshot() {
+        let (directory, alias) = snapshot_fixture("snapshot_origin");
+        let host = HostToolchain::new(&crate::CompilerOptions::debug().target);
+        let unrelated = Path::new("explicit-runtime");
+        assert_eq!(host.runtime_library_origin(unrelated), unrelated);
+
+        let snapshot = RuntimeSnapshot::create(&alias).unwrap();
+        let resolved = snapshot.path.clone();
+        *host.runtime_snapshot.borrow_mut() = Some(snapshot);
+        assert_eq!(host.runtime_library_origin(&resolved), alias);
+        drop(host);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

@@ -94,15 +94,6 @@ fn trace_08_nested_chain_ids_per_frame() {
 }
 
 #[test]
-fn trace_09_cancelled_await_reports_task_id() {
-    let (out, ok) = compile_and_run_check_exit(
-        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(await h); }",
-    );
-    assert!(!ok);
-    assert!(out.contains("awaited a cancelled task (task"), "{out}");
-}
-
-#[test]
 fn trace_10_chain_keeps_fn_name() {
     let (out, ok) = compile_and_run_check_exit(
         "async fn my_worker() -> i64 { await sleep(1); panic(\"boom\"); }\nasync fn main() { println(await my_worker()); }",

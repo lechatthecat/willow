@@ -3247,7 +3247,7 @@ fn run_backend(
         )
         .with_help(format!(
             "check that {} exports the required Willow runtime ABI symbols",
-            runtime_lib.display()
+            toolchain.runtime_library_origin(&runtime_lib).display()
         ));
         emitter.emit(&d, map)?;
         anyhow::bail!(if rust_bridge.is_some() {

@@ -103,13 +103,6 @@ fn module_downcast_payload_scope_matrix() {
 }
 
 #[test]
-fn module_downcast_payload_example() {
-    let (out, ok) = compile_file_and_run("example/module_downcast_payload/main.wi");
-    assert!(ok, "example failed: {out}");
-    assert_eq!(out, "2\n2\n2\n");
-}
-
-#[test]
 fn module_downcast_payload_aliases_and_class_identity() {
     let files = [
         ("shapes.wi", SHAPES),

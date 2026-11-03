@@ -505,20 +505,3 @@ fn main() { println(f(tree::leaf(4))); println(f(tree::square(5))); }
     );
     assert_eq!(out, "12\n25\n");
 }
-
-// ---------------------------------------------------------------------------
-// The runnable example.
-// ---------------------------------------------------------------------------
-
-const EXAMPLE_OUTPUT: &str = "3\n14\n25\n2\n3\nhi!\n25\nhi\nhi!\n42\n25\n";
-
-// 24. It runs.
-#[test]
-fn p24_the_imported_enum_payload_example_runs() {
-    let (out, ok) = compile_file_and_run("example/imported_enum_payload/main.wi");
-    assert!(
-        ok,
-        "example/imported_enum_payload/main.wi failed to compile or run"
-    );
-    assert_eq!(out, EXAMPLE_OUTPUT);
-}

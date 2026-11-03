@@ -366,13 +366,6 @@ fn jz15_80_generic_unknown_has_source_name_and_call_span() {
 }
 
 #[test]
-fn jz15_80_imported_generic_example_runs() {
-    let (out, ok) = compile_file_and_run("example/imported_generic_preemption.wi");
-    assert!(ok, "{out}");
-    assert_eq!(out, "4\nkept\n");
-}
-
-#[test]
 fn jz15_80_proven_indirect_call_does_not_hide_failing_generic() {
     let project = TestProject::new(
         "jz15_80_safe_indirect",
