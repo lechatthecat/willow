@@ -133,10 +133,25 @@ fn string_methods_abi_signatures() {
     assert_schema("willow_string_trim", &[Ptr], Some(Ptr));
     for (name, function) in [
         (
+            "willow_string_trim_start",
+            string::willow_string_trim_start as extern "C" fn(*mut u8) -> *mut u8,
+        ),
+        ("willow_string_trim_end", string::willow_string_trim_end),
+        ("willow_string_to_lower", string::willow_string_to_lower),
+        ("willow_string_to_upper", string::willow_string_to_upper),
+    ] {
+        let _: extern "C" fn(*mut u8) -> *mut u8 = function;
+        assert_schema(name, &[Ptr], Some(Ptr));
+    }
+    let _: extern "C" fn(*mut u8, *mut u8, *mut u8) -> *mut u8 = string::willow_string_replace;
+    assert_schema("willow_string_replace", &[Ptr, Ptr, Ptr], Some(Ptr));
+    for (name, function) in [
+        (
             "willow_string_contains",
             string::willow_string_contains as extern "C" fn(*const u8, *const u8) -> i64,
         ),
         ("willow_string_find", string::willow_string_find),
+        ("willow_string_ends_with", string::willow_string_ends_with),
         (
             "willow_string_starts_with",
             string::willow_string_starts_with,

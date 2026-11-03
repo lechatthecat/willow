@@ -130,6 +130,119 @@ pub extern "C" fn willow_string_starts_with(value: *const u8, prefix: *const u8)
     unsafe { i64::from(text(value).starts_with(text(prefix))) }
 }
 
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_ends_with(value: *const u8, suffix: *const u8) -> i64 {
+    unsafe { i64::from(text(value).ends_with(text(suffix))) }
+}
+
+/// Replace literal, non-overlapping matches. Empty needles match at every
+/// Unicode scalar boundary, including both ends. Two search passes, one exact
+/// allocation; only lengths survive the allocation and all inputs are rooted.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_replace(
+    value: *mut u8,
+    needle: *mut u8,
+    replacement: *mut u8,
+) -> *mut u8 {
+    let source = unsafe { text(value) };
+    let pattern = unsafe { text(needle) };
+    let replacement_len = unsafe { text(replacement).len() };
+    let count = source.match_indices(pattern).count();
+    let Some(total) = count
+        .checked_mul(replacement_len)
+        .and_then(|added| (source.len() - count * pattern.len()).checked_add(added))
+    else {
+        return fail("String.replace size overflow");
+    };
+    let Some(size) = string_payload_size(total) else {
+        return fail("String.replace size overflow");
+    };
+    let mut roots = [value, needle, replacement];
+    let result = alloc_string_payload_rooted(size as usize, &mut roots);
+    if result.is_null() {
+        return result;
+    }
+    unsafe {
+        let source = text(roots[0]);
+        let pattern = text(roots[1]);
+        let replacement = text(roots[2]);
+        *(result.add(LEN_OFFSET as usize) as *mut i64) = total as i64;
+        let mut previous = 0;
+        let mut offset = 0;
+        for (index, matched) in source.match_indices(pattern) {
+            let length = index - previous;
+            copy_bytes(
+                source.as_ptr().add(previous),
+                result.add(DATA_OFFSET + offset),
+                length,
+            );
+            offset += length;
+            copy_bytes(
+                replacement.as_ptr(),
+                result.add(DATA_OFFSET + offset),
+                replacement.len(),
+            );
+            offset += replacement.len();
+            previous = index + matched.len();
+        }
+        copy_bytes(
+            source.as_ptr().add(previous),
+            result.add(DATA_OFFSET + offset),
+            source.len() - previous,
+        );
+        *result.add(DATA_OFFSET + total) = 0;
+    }
+    result
+}
+
+/// Remove Unicode White_Space from the start only.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_trim_start(value: *mut u8) -> *mut u8 {
+    let s = unsafe { text(value) };
+    let trimmed = s.trim_start();
+    let start = trimmed.as_ptr() as usize - s.as_ptr() as usize;
+    copy_range(value, start, start + trimmed.len())
+}
+
+/// Remove Unicode White_Space from the end only.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_trim_end(value: *mut u8) -> *mut u8 {
+    let s = unsafe { text(value) };
+    let trimmed = s.trim_end();
+    let start = trimmed.as_ptr() as usize - s.as_ptr() as usize;
+    copy_range(value, start, start + trimmed.len())
+}
+
+/// ASCII-only case conversion; non-ASCII UTF-8 bytes remain unchanged.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_to_lower(value: *mut u8) -> *mut u8 {
+    let len = unsafe { ws_as_bytes(value).1 };
+    let result = copy_range(value, 0, len);
+    if !result.is_null() {
+        unsafe { std::slice::from_raw_parts_mut(result.add(DATA_OFFSET), len) }
+            .make_ascii_lowercase();
+    }
+    result
+}
+
+/// ASCII-only case conversion; non-ASCII UTF-8 bytes remain unchanged.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_string_to_upper(value: *mut u8) -> *mut u8 {
+    let len = unsafe { ws_as_bytes(value).1 };
+    let result = copy_range(value, 0, len);
+    if !result.is_null() {
+        unsafe { std::slice::from_raw_parts_mut(result.add(DATA_OFFSET), len) }
+            .make_ascii_uppercase();
+    }
+    result
+}
+
 /// Remove Unicode White_Space from both ends; interior whitespace is preserved.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -301,6 +414,62 @@ mod tests {
     use super::*;
     use crate::gc::{GcRootHandle, willow_pop_roots, willow_push_root};
     use crate::string::{willow_string_as_str, willow_string_from_str};
+
+    #[test]
+    fn string_transforms_copy_counts_and_aliases() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        for count in [1, 8, 64, 512, 4096] {
+            let input = "aé\0".repeat(count);
+            let value = GcRootHandle::new(willow_string_from_str(&input));
+            for pattern in ["a", "", "absent", "aé\0", "é\0aé"] {
+                let needle = GcRootHandle::new(willow_string_from_str(pattern));
+                for replacement in ["", "Z", "日本"] {
+                    let replacement_ptr = GcRootHandle::new(willow_string_from_str(replacement));
+                    COPIED_BYTES.set(0);
+                    let result =
+                        willow_string_replace(value.load(), needle.load(), replacement_ptr.load());
+                    let expected = input.replace(pattern, replacement);
+                    assert_eq!(unsafe { willow_string_as_str(result) }, expected);
+                    assert_eq!(COPIED_BYTES.get(), expected.len());
+                    assert_eq!(unsafe { *result.add(DATA_OFFSET + expected.len()) }, 0);
+                }
+            }
+            COPIED_BYTES.set(0);
+            let result = willow_string_replace(value.load(), value.load(), value.load());
+            assert_eq!(unsafe { willow_string_as_str(result) }, input);
+            assert_eq!(COPIED_BYTES.get(), input.len());
+            for transform in [
+                willow_string_trim_start,
+                willow_string_trim_end,
+                willow_string_to_lower,
+                willow_string_to_upper,
+            ] {
+                COPIED_BYTES.set(0);
+                let result = transform(value.load());
+                assert_eq!(unsafe { willow_string_as_str(result) }.len(), input.len());
+                assert_eq!(COPIED_BYTES.get(), input.len());
+            }
+            println!(
+                "repetitions={count} input_bytes={} exact_output_copy=true",
+                input.len()
+            );
+        }
+        let nil = std::ptr::null_mut();
+        assert_eq!(willow_string_ends_with(nil, nil), 1);
+        assert_eq!(
+            unsafe { willow_string_as_str(willow_string_replace(nil, nil, nil)) },
+            ""
+        );
+        for transform in [
+            willow_string_trim_start,
+            willow_string_trim_end,
+            willow_string_to_lower,
+            willow_string_to_upper,
+        ] {
+            assert_eq!(unsafe { willow_string_as_str(transform(nil)) }, "");
+        }
+    }
 
     #[test]
     fn string_bytes_measured_constant_access_and_linear_iteration() {

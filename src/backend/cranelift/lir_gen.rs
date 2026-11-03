@@ -7776,10 +7776,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             StringRepeat => {
                 self.emit_value_runtime_call("willow_string_repeat", &[receiver, args[0]])
             }
+            StringReplace => {
+                self.emit_value_runtime_call("willow_string_replace", &[receiver, args[0], args[1]])
+            }
+            StringTrimStart => {
+                self.emit_value_runtime_call("willow_string_trim_start", &[receiver])
+            }
+            StringTrimEnd => self.emit_value_runtime_call("willow_string_trim_end", &[receiver]),
+            StringToLower => self.emit_value_runtime_call("willow_string_to_lower", &[receiver]),
+            StringToUpper => self.emit_value_runtime_call("willow_string_to_upper", &[receiver]),
             StringTrim => self.emit_value_runtime_call("willow_string_trim", &[receiver]),
-            StringContains | StringStartsWith => {
+            StringContains | StringStartsWith | StringEndsWith => {
                 let symbol = if intrinsic == StringContains {
                     "willow_string_contains"
+                } else if intrinsic == StringEndsWith {
+                    "willow_string_ends_with"
                 } else {
                     "willow_string_starts_with"
                 };

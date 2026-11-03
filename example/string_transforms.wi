@@ -1,0 +1,14 @@
+// ends_with is a literal suffix test (the empty suffix always matches).
+// replace replaces all non-overlapping literal matches, without rescanning output.
+// An empty needle inserts at every Unicode scalar boundary, including both ends.
+// trim_start/trim_end remove Unicode whitespace from just the named end.
+// to_lower/to_upper change only ASCII A-Z/a-z; non-ASCII text is preserved.
+fn main() {
+    println("notes.txt".ends_with(".txt"));
+    println("one one".replace("one", "two"));
+    println("  keep spaces  ".trim_start() == "keep spaces  ");
+    println("  keep spaces  ".trim_end() == "  keep spaces");
+    println("Willow É日本".to_lower());
+    println("Willow é日本".to_upper());
+    println("é😀".replace("", "|"));
+}

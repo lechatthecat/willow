@@ -1622,10 +1622,13 @@ impl TypeChecker {
         }
         if *obj_ty == Type::String {
             let params: Option<&[Type]> = match method_name {
-                "len" | "trim" => Some(&[]),
+                "len" | "trim" | "trim_start" | "trim_end" | "to_lower" | "to_upper" => Some(&[]),
                 "substring" | "slice" => Some(&[Type::I64, Type::I64]),
                 "repeat" | "byte_at" => Some(&[Type::I64]),
-                "split" | "contains" | "find" | "starts_with" => Some(&[Type::String]),
+                "replace" => Some(&[Type::String, Type::String]),
+                "split" | "contains" | "find" | "starts_with" | "ends_with" => {
+                    Some(&[Type::String])
+                }
                 _ => None,
             };
             if let Some(params) = params {
@@ -1724,7 +1727,7 @@ impl TypeChecker {
                 .with_label(Label::primary(span, "unknown method"));
                 let methods = match obj_ty {
                     Type::String => {
-                        "len, byte_at, trim, substring, slice, repeat, split, contains, find, starts_with, toString"
+                        "len, byte_at, trim, substring, slice, repeat, split, contains, find, starts_with, ends_with, replace, trim_start, trim_end, to_lower, to_upper, toString"
                     }
                     Type::I64 => {
                         "wrapping_add, wrapping_sub, wrapping_mul, wrapping_neg, checked_add, checked_sub, checked_mul, checked_neg, toString"

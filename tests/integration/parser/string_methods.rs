@@ -496,3 +496,137 @@ fn string_bytes_generated_calls_scale_with_callsites() {
         }
     }
 }
+
+#[test]
+fn string_transforms_semantics() {
+    let cases = [
+        r#""abc".ends_with("bc")"#,
+        r#"!"abc".ends_with("ab")"#,
+        r#"!"a".ends_with("aa")"#,
+        r#""".ends_with("")"#,
+        r#""日本😀".ends_with("😀")"#,
+        r#""aaaaa".replace("aa", "b") == "bba""#,
+        r#""aaa".replace("a", "aa") == "aaaaaa""#,
+        r#""abc".replace("z", "x") == "abc""#,
+        r#""abc".replace("abc", "") == """#,
+        r#""".replace("", "x") == "x""#,
+        r#""é😀".replace("", "|") == "|é|😀|""#,
+        r#""日本日本".replace("日本", "語") == "語語""#,
+        r#""a.b".replace(".", "-") == "a-b""#,
+        r#""".replace("x", "y") == """#,
+        r#""  a b  ".trim_start() == "a b  ""#,
+        r#""  a b  ".trim_end() == "  a b""#,
+        r#""　日本　".trim_start() == "日本　""#,
+        r#""　日本　".trim_end() == "　日本""#,
+        r#""   ".trim_start() == """#,
+        r#""   ".trim_end() == """#,
+        r#""".trim_start().trim_end() == """#,
+        r#""AbZ 09 ÉΣ日本".to_lower() == "abz 09 ÉΣ日本""#,
+        r#""aBz 09 éß日本".to_upper() == "ABZ 09 éß日本""#,
+        r#""".to_upper().to_lower() == """#,
+        r#"" ABC ".trim_start().trim_end().to_lower().replace("b", "z").ends_with("zc")"#,
+        r#""a\0b".replace("\0", "X") == "aXb""#,
+        r#""A\0z".to_lower() == "a\0z""#,
+        r#""a\0z".to_upper() == "A\0Z""#,
+        r#""a\0".ends_with("\0")"#,
+    ];
+    let body: String = cases
+        .iter()
+        .map(|expr| format!("println({expr});\n"))
+        .collect();
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(&format!("fn main() {{ {body} }}"));
+        assert!(ok, "{out}");
+        assert_eq!(out, "true\n".repeat(cases.len()));
+    }
+}
+
+#[test]
+fn string_transforms_invalid_arguments() {
+    for expr in [
+        r#""x".ends_with()"#,
+        r#""x".ends_with(1)"#,
+        r#""x".ends_with("x", "y")"#,
+        r#""x".replace("x")"#,
+        r#""x".replace(1, "y")"#,
+        r#""x".replace("x", 1)"#,
+        r#""x".replace("x", "y", "z")"#,
+        r#""x".trim_start(1)"#,
+        r#""x".trim_end(1)"#,
+        r#""x".to_lower(1)"#,
+        r#""x".to_upper(1)"#,
+    ] {
+        assert!(
+            compile_error_stderr(&format!("fn main() {{ {expr}; }}")).contains("E0201"),
+            "{expr}"
+        );
+    }
+}
+
+#[test]
+fn string_transforms_example_and_dynamic_gc() {
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(include_str!("../../../example/string_transforms.wi"));
+        assert!(ok, "{out}");
+        assert_eq!(
+            out,
+            "true\ntwo two\ntrue\ntrue\nwillow É日本\nWILLOW é日本\n|é|😀|\n"
+        );
+        let (out, ok) = run(r#"
+fn pattern() -> String { gc_collect(); return "Ab".repeat(1); }
+fn replacement() -> String { gc_collect(); return "éZ".repeat(1); }
+async fn transform(s: String) -> String {
+    await sleep(1);
+    return s.replace(pattern(), replacement()).trim_start().trim_end().to_lower().to_upper();
+}
+async fn main() {
+    let original = " Ab ".repeat(1024);
+    let result = await transform(original);
+    gc_collect();
+    println(result.ends_with("éZ"));
+    println(original.ends_with("Ab "));
+    println(result.len());
+}
+"#);
+        assert!(ok, "{out}");
+        assert_eq!(out, "true\ntrue\n5118\n");
+    }
+}
+
+#[test]
+fn string_transforms_generated_calls_scale_with_callsites() {
+    for count in [1, 8, 32] {
+        for bytes in [1, 1024] {
+            for (expr, symbol) in [
+                ("s.ends_with(s)", "ends_with"),
+                ("s.replace(s, s)", "replace"),
+                ("s.trim_start()", "trim_start"),
+                ("s.trim_end()", "trim_end"),
+                ("s.to_lower()", "to_lower"),
+                ("s.to_upper()", "to_upper"),
+            ] {
+                let source = format!(
+                    "fn main() {{ let s = \"{}\"; {} }}",
+                    "x".repeat(bytes),
+                    format!("{expr};").repeat(count)
+                );
+                let symbols = compile_and_collect_relocation_targets_all(&source, &[]);
+                assert_eq!(
+                    symbols
+                        .iter()
+                        .filter(|s| *s == &format!("willow_string_{symbol}"))
+                        .count(),
+                    count
+                );
+            }
+        }
+    }
+}

@@ -86,6 +86,12 @@ pub enum Intrinsic {
     StringSplit,
     StringContains,
     StringFind,
+    StringEndsWith,
+    StringReplace,
+    StringTrimStart,
+    StringTrimEnd,
+    StringToLower,
+    StringToUpper,
     StringTrim,
     StringRepeat,
     StringStartsWith,
@@ -265,6 +271,12 @@ impl Intrinsic {
         Intrinsic::StringSplit,
         Intrinsic::StringContains,
         Intrinsic::StringFind,
+        Intrinsic::StringEndsWith,
+        Intrinsic::StringReplace,
+        Intrinsic::StringTrimStart,
+        Intrinsic::StringTrimEnd,
+        Intrinsic::StringToLower,
+        Intrinsic::StringToUpper,
         Intrinsic::StringTrim,
         Intrinsic::StringRepeat,
         Intrinsic::StringStartsWith,
@@ -351,6 +363,12 @@ impl Intrinsic {
             StringSplit => &["willow_string_split"],
             StringContains => &["willow_string_contains"],
             StringFind => &["willow_string_find"],
+            StringEndsWith => &["willow_string_ends_with"],
+            StringReplace => &["willow_string_replace"],
+            StringTrimStart => &["willow_string_trim_start"],
+            StringTrimEnd => &["willow_string_trim_end"],
+            StringToLower => &["willow_string_to_lower"],
+            StringToUpper => &["willow_string_to_upper"],
             StringTrim => &["willow_string_trim"],
             StringRepeat => &["willow_string_repeat"],
             StringStartsWith => &["willow_string_starts_with"],
@@ -619,6 +637,12 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
             ("split", 1) => Some((Intrinsic::StringSplit, Type::Array(Box::new(Type::String)))),
             ("contains", 1) => Some((Intrinsic::StringContains, Type::Bool)),
             ("find", 1) => Some((Intrinsic::StringFind, Type::I64)),
+            ("ends_with", 1) => Some((Intrinsic::StringEndsWith, Type::Bool)),
+            ("replace", 2) => Some((Intrinsic::StringReplace, Type::String)),
+            ("trim_start", 0) => Some((Intrinsic::StringTrimStart, Type::String)),
+            ("trim_end", 0) => Some((Intrinsic::StringTrimEnd, Type::String)),
+            ("to_lower", 0) => Some((Intrinsic::StringToLower, Type::String)),
+            ("to_upper", 0) => Some((Intrinsic::StringToUpper, Type::String)),
             ("trim", 0) => Some((Intrinsic::StringTrim, Type::String)),
             ("repeat", 1) => Some((Intrinsic::StringRepeat, Type::String)),
             ("starts_with", 1) => Some((Intrinsic::StringStartsWith, Type::Bool)),
@@ -886,6 +910,12 @@ mod tests {
             ("split", 1, Type::Array(Box::new(Type::String)), true, false),
             ("contains", 1, Type::Bool, false, false),
             ("find", 1, Type::I64, false, false),
+            ("ends_with", 1, Type::Bool, false, false),
+            ("replace", 2, Type::String, true, true),
+            ("trim_start", 0, Type::String, true, false),
+            ("trim_end", 0, Type::String, true, false),
+            ("to_lower", 0, Type::String, true, false),
+            ("to_upper", 0, Type::String, true, false),
             ("trim", 0, Type::String, true, false),
             ("repeat", 1, Type::String, true, true),
             ("starts_with", 1, Type::Bool, false, false),
@@ -1465,6 +1495,12 @@ mod tests {
             "find",
             "trim",
             "repeat",
+            "ends_with",
+            "replace",
+            "trim_start",
+            "trim_end",
+            "to_lower",
+            "to_upper",
             "starts_with",
             "toString",
             "len",
@@ -1534,7 +1570,7 @@ mod tests {
         assert_eq!(unique.len(), Intrinsic::ALL.len(), "duplicate in ALL");
         assert_eq!(
             Intrinsic::ALL.len(),
-            66,
+            72,
             "Intrinsic::ALL must list every variant; update the count when adding one"
         );
     }
@@ -1737,6 +1773,12 @@ fn f(s: String) {
     let trimmed = s.trim();
     let repeated = s.repeat(2);
     let starts = s.starts_with("a");
+    let ends = s.ends_with("a");
+    let replaced = s.replace("a", "b");
+    let left = s.trim_start();
+    let right = s.trim_end();
+    let lower = s.to_lower();
+    let upper = s.to_upper();
 }
 "#;
 
@@ -2073,7 +2115,7 @@ fn f() {
         for (src, expected) in [
             (SCALARS, 5),
             (INTEGERS, 8),
-            (STRINGS, 8),
+            (STRINGS, 14),
             (ARRAYS, 7),
             (MAPS, 13),
             (ATOMICS, 10),
