@@ -2061,50 +2061,6 @@ fn test_october_ci_catalog_additions() {
 }
 
 #[test]
-fn test_november_ci_catalog_additions() {
-    let added = [
-        "example/array_card_remembering.wi",
-        "example/async_task_values.wi",
-        "example/builtin_callee_type_queries.wi",
-        "example/contextual_new.wi",
-        "example/contract_comparison.wi",
-        "example/contract_repair.wi",
-        "example/effect_contract_dispatch.wi",
-        "example/effect_contracts.wi",
-        "example/effect_inventory_editor/m2.wi",
-        "example/effect_states.wi",
-        "example/imported_enum_stack.wi",
-        "example/inherited_method_effects.wi",
-        "example/integer_division.wi",
-        "example/lock_await_effects.wi",
-        "example/math_helpers.wi",
-        "example/numeric_conversions.wi",
-        "example/open_method_effect_queries.wi",
-        "example/option_method_handling.wi",
-        "example/pure_functions.wi",
-        "example/reachable_generic_methods.wi",
-        "example/rename_semantic_verification.wi",
-        "example/runtime_contracts.wi",
-        "example/select_arm_blocks.wi",
-        "example/semantic_edit_preview.wi",
-        "example/semantic_verification.wi",
-        "example/static_verification.wi",
-        "example/string_effect_queries.wi",
-        "example/string_transforms.wi",
-        "example/verified_loops.wi",
-    ];
-    for path in added {
-        let (_, expected) = runnable_example_cases()
-            .iter()
-            .find(|(entry, _)| *entry == path)
-            .expect("example must be cataloged");
-        let (out, ok) = compile_file_and_run(path);
-        assert!(ok, "{path}: {out}");
-        assert_eq!(out, *expected, "{path}");
-    }
-}
-
-#[test]
 fn test_parse_cascade_recovery_example() {
     let (output, ok) = compile_file_and_run("example/parse_cascade_recovery.wi");
     assert!(ok);
