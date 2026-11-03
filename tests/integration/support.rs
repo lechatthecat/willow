@@ -40,7 +40,15 @@ pub(super) fn contains_path_fragment(haystack: &str, slash_fragment: &str) -> bo
 
 pub(super) struct RuntimeStaticlib {
     path: PathBuf,
-    _toolchain: willow_compiler::toolchain::HostToolchain,
+    toolchain: willow_compiler::toolchain::HostToolchain,
+}
+
+impl RuntimeStaticlib {
+    /// The name a bundle must use: `path` may be a process-private link.
+    pub(super) fn archive_name(&self) -> std::ffi::OsString {
+        let origin = self.toolchain.runtime_library_origin(&self.path);
+        origin.file_name().unwrap().to_owned()
+    }
 }
 
 impl std::ops::Deref for RuntimeStaticlib {
@@ -68,10 +76,7 @@ pub(super) fn build_runtime_staticlib(release: bool) -> RuntimeStaticlib {
     let path = toolchain
         .resolve_runtime_library()
         .expect("runtime build failed");
-    RuntimeStaticlib {
-        path,
-        _toolchain: toolchain,
-    }
+    RuntimeStaticlib { path, toolchain }
 }
 
 pub(super) fn collect_wi_files(root: &str) -> Vec<String> {

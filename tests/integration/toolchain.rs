@@ -766,11 +766,7 @@ fn test_runtime_lib_relocatable_bundle() {
     .unwrap();
     {
         let runtime = build_runtime_staticlib(false);
-        fs::copy(
-            &*runtime,
-            original.join("lib").join(runtime.file_name().unwrap()),
-        )
-        .unwrap();
+        fs::copy(&*runtime, original.join("lib").join(runtime.archive_name())).unwrap();
     }
     let relocated = root.join("relocated");
     fs::rename(&original, &relocated).unwrap();
