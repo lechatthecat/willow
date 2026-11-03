@@ -131,6 +131,61 @@ Calling an `async fn` creates a Task; it does not by itself suspend its caller. 
 
 See [shared effect fixpoint](example/shared_effect_fixpoint.wi), [virtual dispatch example](example/shared_call_graph.wi), and [indirect calls example](example/lock_function_values.wi).
 
+### Effect contracts: declare the property on any function
+
+E2604 applies the waiting analysis to lock bodies. `@effects(...)` applies the
+same solved effects to a declaration, so a function can promise the property to
+its callers whether or not it runs under a lock:
+
+| Contract | Forbids | Still allowed |
+| --- | --- | --- |
+| `no_block` | Blocking waits such as stdout writes or `BlockingCell` reads | `await` and other suspension |
+| `no_suspend` | Suspension such as `await`, `select` and waiting channel operations | Blocking waits |
+| `no_wait` | Both | Creating a Task without awaiting it |
+
+```willow
+fn helper() { println(1); }
+
+@effects(no_wait)
+fn guard() { helper(); }
+```
+
+```text
+error[E2610]: effect contract `no_wait` violated by `guard`
+1 | fn helper() { println(1); }
+  |               ^^^^^^^ root operation `$output::println`
+2 | @effects(no_wait)
+  | ---------------- effect contract declared here
+3 | fn guard() { helper(); }
+  |              ------ `guard` calls `helper`
+note: certainty: compiler-proven; call chain: guard -> helper -> $output::println
+```
+
+Contracts are checked fail-closed:
+
+- **E2610**: a proven witness violates the contract, transitively through helpers, dispatch and imported modules.
+- **E2611**: an override weakens an inherited contract. Overrides that declare nothing inherit the base contract and are checked against it.
+- **E2612**: the property cannot be proven, for example when the function calls an arbitrary function-value parameter. Missing evidence is not treated as success.
+
+See [effect contracts](example/effect_contracts.wi) and [contracts across interface dispatch](example/effect_contract_dispatch.wi).
+
+### Purity and value contracts
+
+Effect contracts describe waiting. Value-level properties use separate annotations:
+
+- **`@pure`** requires a function to have no observable interaction outside its
+  arguments and result. Output, field and index writes, heap reads,
+  nondeterminism and unknown callees are rejected with E2620. Undeclared callees
+  are analyzed, so they do not need their own `@pure`.
+  See [pure functions](example/pure_functions.wi).
+- **`requires` / `ensures`** clauses are checked at run time in both debug and
+  release builds. A violation is a recoverable panic such as
+  `contract violation: ensures`. See [runtime contracts](example/runtime_contracts.wi).
+- **`@verified`** (which requires `@pure`) proves i64/bool contracts statically with Z3. Failures
+  are reported as E2630 (counterexample), E2631 (unsupported construct) and
+  E2632 (solver unknown or failure). An unproved contract fails the build. Setup
+  is under [Try Willow](#try-willow).
+
 ## Locks designed together with the compiler and scheduler
 
 Willow does not expose an ordinary mutex guard whose destructor must release the lock. Instead, it gives the compiler ownership of a **lexical critical section**:
