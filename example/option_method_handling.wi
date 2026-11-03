@@ -1,0 +1,12 @@
+// Handle absence before calling methods on the payload.
+fn main() {
+    let text: Option<String> = Some("willow");
+    println(text.is_some());
+    println(text.unwrap().len());
+    let empty: Option<String> = None;
+    println(empty.unwrap_or("fallback"));
+    match text {
+        Some(value) => println(value.to_upper()),
+        None => println("missing"),
+    }
+}

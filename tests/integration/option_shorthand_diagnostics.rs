@@ -236,3 +236,58 @@ fn option_short_24_nested_bare_variants_keep_both_absence_levels() {
         "true\ntrue\n"
     );
 }
+
+#[test]
+fn option_method_diagnostics_cli_unknown_and_generic_types() {
+    for source in [
+        r#"fn f() -> Result<i64, String> { let o: Option<i64> = Some(1); let v = o.ok_or("none")?; return Ok(v); } fn main() { println(f().unwrap()); }"#,
+        "fn bad<T>(o: Option<T>) { o.ok_or(); } fn main() { let o: Option<i64> = Some(1); bad(o); }",
+        "class Value {} fn bad<T>(o: Option<T>) { o.ok_or(); } fn main() { let o: Option<Value> = None; bad(o); }",
+        "class Box<T> { pub value: T; } fn bad<T>(o: Option<T>) { o.ok_or(); } fn main() { let o: Option<Box<i64>> = None; bad(o); }",
+    ] {
+        let stderr = compile_error_stderr(source);
+        assert!(
+            stderr.contains("no method `ok_or` on type `Option<"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("handling absence"), "{stderr}");
+        assert!(!stderr.contains("$type"), "{stderr}");
+        assert!(!stderr.contains("$mono$"), "{stderr}");
+    }
+}
+
+#[test]
+fn option_method_diagnostics_cli_suggests_existing_method() {
+    let stderr = compile_error_stderr("fn main() { let o: Option<i64> = Some(1); o.unwra(); }");
+    assert!(
+        stderr.contains("no method `unwra` on type `Option<i64>`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("similar name: `unwrap`"), "{stderr}");
+    assert!(!stderr.contains("handling absence"), "{stderr}");
+}
+
+#[test]
+fn option_method_diagnostics_cli_collection_payloads() {
+    for (payload, method, absence) in [
+        ("Array<i64>", "len", true),
+        ("Array<i64>", "missing", false),
+        ("Map<String, i64>", "len", true),
+        ("Map<String, i64>", "missing", false),
+        ("FrozenArray<i64>", "len", true),
+        ("FrozenArray<i64>", "missing", false),
+    ] {
+        let source = format!(
+            "import std::collections::{{Array, Map, FrozenArray}}; fn bad(o: Option<{payload}>) {{ o.{method}(); }} fn main() {{}}"
+        );
+        let stderr = compile_error_stderr(&source);
+        assert_eq!(
+            stderr.contains("without handling absence"),
+            absence,
+            "{source}: {stderr}"
+        );
+        if !absence {
+            assert!(stderr.contains("no method `missing`"), "{stderr}");
+        }
+    }
+}

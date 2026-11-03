@@ -1603,6 +1603,43 @@ impl TypeChecker {
         }
     }
 
+    /// Inspect method declarations only: never check the receiver/arguments again
+    /// or request a generic body merely to choose an error message.
+    fn option_payload_has_method(&self, ty: &Type, method: &str) -> bool {
+        use crate::semantic::intrinsics;
+
+        if method.starts_with("__abi_") || method == "init" {
+            return false;
+        }
+        if intrinsics::adt_method_target(ty, method).is_some()
+            || intrinsics::adt_callback(ty, method)
+        {
+            return true;
+        }
+        // Intrinsic source signatures currently have zero, one, or two arguments.
+        // Existence is independent of the erroneous call's argument count.
+        if (0..=2).any(|arity| intrinsics::resolve(ty, method, arity).is_some()) {
+            return true;
+        }
+        let name = match ty {
+            Type::Named(name) | Type::Generic(name, _) => name.as_str(),
+            Type::Array(_) | Type::FixedArray(..) => {
+                if let Some(owner) = self.array_class(ty) {
+                    return self.resolved_method_class(owner, method).is_some();
+                }
+                "$std::collections::Array"
+            }
+            _ => return false,
+        };
+        if let Some(interface) = self.symbols.lookup_interface(name) {
+            return interface.methods.contains_key(method);
+        }
+        if self.resolved_method_class(name, method).is_some() {
+            return true;
+        }
+        self.template_has_instance_method(name, method)
+    }
+
     pub(super) fn resolve_method(
         &mut self,
         obj_ty: &Type,
@@ -1662,13 +1699,11 @@ impl TypeChecker {
             }
             return Type::String;
         }
-        if crate::semantic::builtin_types::unary_arg(
+        if let Some(inner) = crate::semantic::builtin_types::unary_arg(
             obj_ty,
             crate::semantic::builtin_types::BuiltinTypeId::Option,
-        )
-        .is_some()
-        {
-            self.push(
+        ) {
+            let mut diagnostic = if self.option_payload_has_method(inner, method_name) {
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0201,
@@ -1678,9 +1713,40 @@ impl TypeChecker {
                     ),
                 )
                 .with_label(Label::primary(span, "this Option may be `None`"))
-                .with_help("use `match`, `.unwrap()`, or `.expect(...)` to obtain the inner value"),
-            );
-            return Type::Void;
+                .with_help("use `match`, `.unwrap()`, or `.expect(...)` to obtain the inner value")
+            } else {
+                let mut diagnostic = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "no method `{method_name}` on type `{}`",
+                        self.diagnostic_type_name(obj_ty)
+                    ),
+                )
+                .with_label(Label::primary(span, "unknown method"));
+                let methods = [
+                    "unwrap",
+                    "expect",
+                    "unwrap_or",
+                    "is_some",
+                    "is_none",
+                    "map",
+                    "and_then",
+                    "or_else",
+                ];
+                if let Some(suggestion) = suggest_similar_name(method_name, methods.iter()) {
+                    diagnostic = diagnostic.with_help(format!(
+                        "there is a method with a similar name: `{suggestion}`"
+                    ));
+                }
+                diagnostic
+            };
+            self.label_receiver_call_origin(&mut diagnostic, receiver, obj_ty);
+            self.push(diagnostic);
+            for arg in args {
+                self.check_expr(&arg.expr);
+            }
+            return Self::error_type();
         }
         // A receiver typed as a generic interface instantiation (`Box<String>`):
         // resolve against the interface with its type parameters substituted, so

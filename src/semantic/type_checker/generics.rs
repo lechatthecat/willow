@@ -2223,9 +2223,27 @@ impl TypeChecker {
             .insert(symbol.to_owned(), format!("{source}<{args}>"));
     }
 
-    /// Resolve nominal instantiation aliases only in type slots of diagnostics.
+    /// Query the shared declaration index without scanning or instantiating a body.
+    pub(super) fn template_has_instance_method(&self, name: &str, method: &str) -> bool {
+        let Some(template) = self.generics.classes.get(name) else {
+            return false;
+        };
+        self.generics
+            .registry
+            .borrow()
+            .method_templates
+            .get(&(
+                template.span.file_id,
+                template.name.clone(),
+                method.to_owned(),
+            ))
+            .is_some_and(|declaration| !declaration.is_static)
+    }
+
+    /// Restore source types and nominal aliases only in type slots of diagnostics.
     pub(super) fn diagnostic_type_name(&self, ty: &Type) -> String {
-        type_name_with(ty, |name| {
+        let logical = ty.substitute_names(|name| self.generics.logical_types.get(name).cloned());
+        type_name_with(&logical, |name| {
             self.generics.nominal_aliases.get(name).unwrap_or(name)
         })
     }

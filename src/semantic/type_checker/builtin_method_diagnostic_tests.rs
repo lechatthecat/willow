@@ -163,3 +163,150 @@ fn generic_parameter_method_diagnostics_specialization_counts() {
         );
     }
 }
+
+#[test]
+fn option_method_diagnostics_unknown_payloads_and_suggestions() {
+    // Twenty-four unknown-name cases, including opaque and concrete generic types.
+    for payload in ["i64", "String", "bool", "Node", "T", "Box<i64>"] {
+        for (method, suggestion) in [
+            ("ok_or", None),
+            ("unwra", Some("unwrap")),
+            ("is_som", Some("is_some")),
+            ("and_thn", Some("and_then")),
+        ] {
+            let source = format!(
+                "class Node {{}} class Box<T> {{}} fn bad<T>(x: Option<{payload}>) {{ x.{method}(); }}"
+            );
+            let diagnostics = check_source(&source);
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+            let d = &diagnostics[0];
+            assert_eq!(
+                d.message,
+                format!("no method `{method}` on type `Option<{payload}>`")
+            );
+            assert!(!format!("{d:?}").contains("$type"));
+            assert!(!format!("{d:?}").contains("handling absence"));
+            if let Some(suggestion) = suggestion {
+                assert!(
+                    d.helps
+                        .iter()
+                        .any(|h| h.contains(&format!("`{suggestion}`"))),
+                    "{d:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn option_method_diagnostics_existing_payload_methods() {
+    for (prefix, payload, method, args) in [
+        ("", "String", "len", ""),
+        ("", "String", "substring", "0, 1"),
+        ("", "String", "substring", ""),
+        ("", "i64", "checked_add", "1"),
+        ("", "i64", "wrapping_neg", ""),
+        ("", "f64", "toString", ""),
+        ("", "bool", "toString", ""),
+        (
+            "class Node { pub fn get(self) -> i64 { return 1; } }",
+            "Node",
+            "get",
+            "",
+        ),
+        (
+            "open class Base { pub fn get(self) -> i64 { return 1; } } class Node extends Base {}",
+            "Node",
+            "get",
+            "",
+        ),
+        (
+            "interface Value { fn get(self) -> i64; }",
+            "Value",
+            "get",
+            "",
+        ),
+        (
+            "interface Value<T> { fn get(self) -> T; }",
+            "Value<i64>",
+            "get",
+            "",
+        ),
+        ("", "Result<i64, String>", "unwrap_err", ""),
+        (
+            "class Box<T> { pub fn get(self) -> i64 { return 1; } }",
+            "Box<i64>",
+            "get",
+            "",
+        ),
+        (
+            "class Box<T> { pub fn get(self) -> i64 { return 1; } }",
+            "Box<String>",
+            "get",
+            "",
+        ),
+    ] {
+        let source = format!("{prefix} fn bad(x: Option<{payload}>) {{ x.{method}({args}); }}");
+        let diagnostics = check_source(&source);
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            format!(
+                "cannot call method `{method}` on `Option<{payload}>` without handling absence"
+            )
+        );
+    }
+}
+
+#[test]
+fn option_method_diagnostics_recovery_and_linear_counts() {
+    use super::diagnostics::EDIT_CELLS;
+    let mut unit_cells = 0;
+    for count in [1, 8, 64, 256] {
+        EDIT_CELLS.with(|cells| cells.set(0));
+        let source = format!(
+            "fn bad(x: Option<i64>) {{ {} }}",
+            "x.ok_or().again();".repeat(count)
+        );
+        let diagnostics = check_source(&source);
+        assert_eq!(diagnostics.len(), count, "{diagnostics:?}");
+        let cells = EDIT_CELLS.with(|cells| cells.get());
+        if count == 1 {
+            unit_cells = cells;
+        }
+        assert!(unit_cells > 0);
+        assert_eq!(cells, unit_cells * count);
+        println!(
+            "Option calls={count}: diagnostics={}, edit cells={cells}",
+            diagnostics.len()
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.message == "no method `ok_or` on type `Option<i64>`")
+        );
+    }
+    let diagnostics = check_source("fn bad(x: Option<i64>) { x.ok_or(unknown); }");
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+    assert!(diagnostics.iter().any(|d| d.message.contains("unknown")));
+}
+
+#[test]
+fn option_method_diagnostics_call_origin_and_nested_option() {
+    let diagnostics = check_source(
+        "fn make(x: Option<i64>) -> Option<i64> { return x; } fn bad(x: Option<i64>) { make(x).ok_or(); }",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert!(
+        diagnostics[0]
+            .labels
+            .iter()
+            .any(|l| l.message == "this call returns `Option<i64>`, the receiver type")
+    );
+    let diagnostics = check_source("fn bad(x: Option<Option<String>>) { x.len(); }");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "no method `len` on type `Option<Option<String>>`"
+    );
+}
