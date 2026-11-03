@@ -152,3 +152,34 @@ fn contract_repair_example_runs() {
     assert!(ok, "{output}");
     assert_eq!(output, "0\n7\n");
 }
+
+#[test]
+fn verified_loop_example_both_modes() {
+    let source = include_str!("../../example/verified_loops.wi");
+    for (output, ok) in [compile_and_run(source), compile_and_run_release(source)] {
+        assert!(ok, "{output}");
+        assert_eq!(output, "0\n0\n7\n");
+    }
+}
+
+#[test]
+fn verified_loop_rejections_reach_build_gate() {
+    for (annotations, body, reason) in [
+        ("invariant x>=0 variant 1", "x=x-1;", "COUNTEREXAMPLE"),
+        ("invariant x>0 variant x", "x=x-1;", "COUNTEREXAMPLE"),
+        ("invariant x>=0 variant x", "x=x-2;", "COUNTEREXAMPLE"),
+        ("invariant x>=0 variant -x", "x=x-1;", "COUNTEREXAMPLE"),
+        ("invariant x>=0", "x=x-1;", "UNKNOWN"),
+        ("variant x", "x=x-1;", "UNKNOWN"),
+        ("", "x=x-1;", "UNKNOWN"),
+        ("invariant x>=0 variant true", "x=x-1;", "loop variant"),
+        ("invariant 1 variant x", "x=x-1;", "loop invariant"),
+    ] {
+        assert_compile_error_contains(
+            &format!(
+                "@pure @verified fn f(n:i64)->i64 requires n>=0 {{let mut x=n;while x>0 {annotations} {{{body}}}return x;}} fn main() {{}}"
+            ),
+            &[reason],
+        );
+    }
+}

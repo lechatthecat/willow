@@ -39,6 +39,7 @@ pub(super) struct Summary {
     pub contract_definitions: String,
     pub nodes: usize,
     pub dependencies: BTreeSet<usize>,
+    pub loop_symbols: std::collections::BTreeMap<String, String>,
 }
 // Every assignment and return carries its reachability guard. Branches can
 // update one symbolic environment sequentially without copying or re-merging
@@ -48,6 +49,7 @@ struct State {
     env: im::HashMap<String, Value>,
     alive: Value,
     result: Value,
+    returned: Value,
 }
 struct Encoder<'a> {
     functions: &'a [&'a FunctionDecl],
@@ -57,6 +59,11 @@ struct Encoder<'a> {
     assumptions: Vec<String>,
     dependencies: BTreeSet<usize>,
     depth: usize,
+    function_id: usize,
+    havoc: Vec<Value>,
+    loop_symbols: std::collections::BTreeMap<String, String>,
+    loop_writes: HashMap<BodyId, BTreeSet<String>>,
+    verified: bool,
 }
 impl Encoder<'_> {
     fn node(&mut self, expr: String, boolean: bool) -> Result<Value, String> {
@@ -292,6 +299,7 @@ impl Encoder<'_> {
                         true,
                     )?;
                 }
+                Stmt::While(s) => self.while_loop(s, state, depth + 1)?,
                 Stmt::Return(s) => {
                     let v = self.expr(
                         s.value.as_ref().ok_or("void return outside V1")?,
@@ -308,6 +316,10 @@ impl Encoder<'_> {
                         ),
                         v.boolean,
                     )?;
+                    state.returned = self.node(
+                        format!("(or {} {})", state.returned.text, state.alive.text),
+                        true,
+                    )?;
                     state.alive = Value::literal("false", true);
                 }
                 Stmt::Expr(s) => {
@@ -315,7 +327,7 @@ impl Encoder<'_> {
                 }
                 _ => {
                     return Err(
-                        "unsupported statement: V1 rejects loops, defer and heap operations".into(),
+                        "unsupported statement: verification rejects for, break, continue, defer and heap operations".into(),
                     );
                 }
             }
@@ -329,6 +341,97 @@ impl Encoder<'_> {
         }
         Ok(())
     }
+    fn loop_invariant(
+        &mut self,
+        s: &WhileStmt,
+        state: &State,
+        gate: &Value,
+    ) -> Result<Value, String> {
+        let mut result = gate.clone();
+        for expr in &s.invariants {
+            let value = self.expr(expr, state, &result)?;
+            if !value.boolean {
+                return Err("loop invariant must have type bool".into());
+            }
+            result = self.and(&result, &value)?;
+        }
+        Ok(result)
+    }
+
+    fn while_loop(&mut self, s: &WhileStmt, state: &mut State, depth: usize) -> Result<(), String> {
+        if !self.verified {
+            return Err("a helper containing loops must itself be @verified".into());
+        }
+        let variant = s
+            .variant
+            .as_ref()
+            .filter(|_| !s.invariants.is_empty())
+            .ok_or("while verification requires both invariant and variant")?;
+        let incoming = state.alive.clone();
+        let entry = self.loop_invariant(s, state, &incoming)?;
+        self.guard(&incoming, entry.text)?;
+
+        // One arbitrary loop head represents every iteration. Only writes to
+        // bindings visible at the head are forgotten; lexical locals stay local.
+        let mut head = state.clone();
+        let writes = self.loop_writes.remove(&s.body.id).unwrap_or_default();
+        for name in writes {
+            let Some(old) = head.env.get(&name) else {
+                continue;
+            };
+            let value = Value::literal(
+                format!("h{}_{}", self.function_id, self.havoc.len()),
+                old.boolean,
+            );
+            self.loop_symbols.insert(
+                value.text.clone(),
+                format!("loop@{}:{}::{name}", s.span.line, s.span.col),
+            );
+            self.havoc.push(value.clone());
+            if !value.boolean {
+                let domain = self.node(bounds(&value.text), true)?;
+                head.alive = self.and(&head.alive, &domain)?;
+            }
+            let previous = head.env.get(&name).unwrap();
+            let merged = self.node(
+                format!("(ite {} {} {})", incoming.text, value.text, previous.text),
+                value.boolean,
+            )?;
+            head.env.insert(name, merged);
+        }
+        head.alive = self.loop_invariant(s, &head, &head.alive.clone())?;
+        let condition = self.expr(&s.cond, &head, &head.alive.clone())?;
+        if !condition.boolean {
+            return Err("non-boolean loop condition".into());
+        }
+        let mut body = head.clone();
+        body.alive = self.and(&head.alive, &condition)?;
+        let rank = self.expr(variant, &head, &body.alive.clone())?;
+        if rank.boolean {
+            return Err("loop variant must have type i64".into());
+        }
+        self.guard(&body.alive, format!("(<= 0 {})", rank.text))?;
+        self.block(&s.body, &mut body, depth)?;
+        let preserved = self.loop_invariant(s, &body, &body.alive.clone())?;
+        self.guard(&body.alive, preserved.text)?;
+        let next = self.expr(variant, &body, &body.alive.clone())?;
+        if next.boolean {
+            return Err("loop variant must have type i64".into());
+        }
+        self.guard(&body.alive, format!("(< {} {})", next.text, rank.text))?;
+
+        // Backedges end the induction step, not the function. Only the false
+        // condition continues after the loop; returns in the body remain exits.
+        head.alive = self.node(
+            format!("(and {} (not {}))", head.alive.text, condition.text),
+            true,
+        )?;
+        head.result = body.result;
+        head.returned = body.returned;
+        *state = head;
+        Ok(())
+    }
+
     fn clauses(&mut self, clauses: &[Expr], state: &State) -> Result<Value, String> {
         let mut gate = Value::literal("true", true);
         for expr in clauses {
@@ -393,6 +496,7 @@ pub(super) fn encode(
         env,
         alive: Value::literal("true", true),
         result: Value::literal(if ret == "Bool" { "false" } else { "0" }, ret == "Bool"),
+        returned: Value::literal("false", true),
     };
     let initial = state.clone();
     let mut e = Encoder {
@@ -403,6 +507,11 @@ pub(super) fn encode(
         assumptions: Vec::new(),
         dependencies: BTreeSet::new(),
         depth: 0,
+        function_id: id,
+        havoc: Vec::new(),
+        loop_symbols: std::collections::BTreeMap::new(),
+        loop_writes: HashMap::new(),
+        verified: has(f, EffectContractKind::Verified),
     };
     let pre = e.clauses(&f.requires, &state)?;
     let pre_safe = e.safety();
@@ -414,7 +523,15 @@ pub(super) fn encode(
         &pre_safe,
     );
     let mut contract_definitions = definitions.clone();
+    index_loop_writes(&f.body, &mut e.loop_writes, 0)?;
     e.block(&f.body, &mut state, 0)?;
+    for h in &e.havoc {
+        definitions += &format!(
+            "(declare-const {} {})\n",
+            h.text,
+            if h.boolean { "Bool" } else { "Int" }
+        );
+    }
     e.guard(
         &Value::literal("true", true),
         format!("(not {})", state.alive.text),
@@ -440,7 +557,17 @@ pub(super) fn encode(
     definitions += &e.definition(&format!("f{id}_safe"), &params.join(" "), "Bool", &safety);
     let mut post_state = initial.clone();
     post_state.env.insert("result".into(), state.result);
-    let post = e.clauses(&f.ensures, &post_state)?;
+    // Arbitrary heads outside an invariant describe no execution. Check the
+    // postcondition only on paths that actually returned, including loop returns.
+    let mut post = state.returned.clone();
+    for clause in &f.ensures {
+        let value = e.expr(clause, &post_state, &post)?;
+        if !value.boolean {
+            return Err("non-boolean contract".into());
+        }
+        post = e.and(&post, &value)?;
+    }
+    let post = e.node(format!("(=> {} {})", state.returned.text, post.text), true)?;
     let post_safe = e.safety();
     definitions += &e.definition(
         &format!("f{id}_post"),
@@ -463,6 +590,11 @@ pub(super) fn encode(
         assumptions: Vec::new(),
         dependencies: BTreeSet::new(),
         depth: 0,
+        function_id: id,
+        havoc: Vec::new(),
+        loop_symbols: std::collections::BTreeMap::new(),
+        loop_writes: HashMap::new(),
+        verified: has(f, EffectContractKind::Verified),
     };
     let mut cs = initial;
     cs.env
@@ -487,8 +619,61 @@ pub(super) fn encode(
         definitions,
         nodes: e.nodes.len() + c.nodes.len(),
         dependencies: e.dependencies,
+        loop_symbols: e.loop_symbols,
     })
 }
+// Summarize lexical writes once, bottom-up. Nested loops reuse their summary;
+// no enclosing loop rescans a nested body. Set merging is small-to-large.
+fn index_loop_writes(
+    block: &Block,
+    index: &mut HashMap<BodyId, BTreeSet<String>>,
+    depth: usize,
+) -> Result<BTreeSet<String>, String> {
+    if depth > 256 {
+        return Err("block depth budget exceeded".into());
+    }
+    let mut writes = BTreeSet::new();
+    let mut locals = BTreeSet::new();
+    for stmt in &block.stmts {
+        let mut child = match stmt {
+            Stmt::Let(s) => {
+                locals.insert(s.name.clone());
+                BTreeSet::new()
+            }
+            Stmt::Assign(s) => BTreeSet::from([s.name.clone()]),
+            Stmt::If(s) => {
+                let mut names = index_loop_writes(&s.then_block, index, depth + 1)?;
+                if let Some(b) = &s.else_block {
+                    let mut other = index_loop_writes(b, index, depth + 1)?;
+                    if names.len() < other.len() {
+                        std::mem::swap(&mut names, &mut other);
+                    }
+                    names.extend(other);
+                }
+                names
+            }
+            Stmt::While(s) => {
+                let names = index_loop_writes(&s.body, index, depth + 1)?;
+                index.insert(s.body.id, names.clone());
+                names
+            }
+            _ => BTreeSet::new(),
+        };
+        if locals.len() < child.len() {
+            for local in &locals {
+                child.remove(local);
+            }
+        } else {
+            child.retain(|name| !locals.contains(name));
+        }
+        if writes.len() < child.len() {
+            std::mem::swap(&mut writes, &mut child);
+        }
+        writes.extend(child);
+    }
+    Ok(writes)
+}
+
 // Scan call edges once, including unreachable statements: recursion is not V1.
 pub(super) fn edges(f: &FunctionDecl, names: &HashMap<&str, usize>) -> BTreeSet<usize> {
     AstWalk::new(AstEvent::Block(&f.body))
@@ -527,6 +712,7 @@ pub(super) fn contract_predicates(
         env,
         alive: Value::literal("true", true),
         result: Value::literal("returned", ret == "Bool"),
+        returned: Value::literal("true", true),
     };
     let mut e = Encoder {
         functions,
@@ -536,6 +722,11 @@ pub(super) fn contract_predicates(
         assumptions: Vec::new(),
         dependencies: BTreeSet::new(),
         depth: 0,
+        function_id: id,
+        havoc: Vec::new(),
+        loop_symbols: std::collections::BTreeMap::new(),
+        loop_writes: HashMap::new(),
+        verified: has(f, EffectContractKind::Verified),
     };
     let pre = e.clauses(&f.requires, &state)?;
     let safety = e.safety();

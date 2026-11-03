@@ -431,6 +431,11 @@ Examples live in [`example/`](example/); [`RELEASE_README.md`](RELEASE_README.md
 For optional static contract checking, install Z3 4.15.4 (`python -m pip install
 z3-solver==4.15.4.0`) and keep `z3` on PATH, or set `WILLOW_Z3` to its executable.
 Run `willow run example/static_verification.wi` for a `@pure @verified` example.
+For `while` proofs, add boolean `invariant` clauses and one i64 `variant` before
+the body; see [`example/verified_loops.wi`](example/verified_loops.wi). The verifier
+checks entry, preservation, and a nonnegative, strictly decreasing rank on
+iterations. Annotations are proof-only. Loops without both annotations, `for`,
+`break`, and `continue` remain unsupported in verified functions.
 Unproved contracts fail the build. Verification JSON and replayable SMT files
 are saved under `target/willow-verification` (override with `WILLOW_VERIFICATION_DIR`).
 

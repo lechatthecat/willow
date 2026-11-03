@@ -10,6 +10,52 @@ impl TypeChecker {
         );
     }
 
+    pub(super) fn check_loop_contracts(&mut self, loop_: &WhileStmt) {
+        for (expr, expected) in loop_
+            .invariants
+            .iter()
+            .map(|e| (e, Type::Bool))
+            .chain(loop_.variant.iter().map(|e| (e, Type::I64)))
+        {
+            let mut walk = AstWalk::new(AstEvent::Expr(expr));
+            while let Some(event) = walk.next() {
+                let AstEvent::Expr(e) = event else { continue };
+                let allowed = match e {
+                    Expr::Integer(..)
+                    | Expr::Bool(..)
+                    | Expr::Binary(_)
+                    | Expr::Unary(_)
+                    | Expr::Ternary(_) => true,
+                    Expr::Var(name, ..) => {
+                        self.symbols
+                            .lookup_var(name)
+                            .is_some_and(|v| matches!(v.ty, Type::I64 | Type::Bool))
+                            || self.symbols.lookup_func(name).is_some_and(|f| {
+                                f.constant.is_some()
+                                    && matches!(f.return_type, Type::I64 | Type::Bool)
+                            })
+                    }
+                    _ => false,
+                };
+                if !allowed {
+                    self.contract_error(e.span(), "loop annotations allow only i64/bool bindings, constants and pure operators");
+                    walk.skip_children();
+                }
+            }
+            let ty = self.check_expr(expr);
+            if ty != expected {
+                self.contract_error(
+                    expr.span(),
+                    if expected == Type::Bool {
+                        "loop invariant must have type bool"
+                    } else {
+                        "loop variant must have type i64"
+                    },
+                );
+            }
+        }
+    }
+
     pub(super) fn check_contracts(&mut self, f: &FunctionDecl, return_type: &Type) {
         if f.requires.is_empty() && f.ensures.is_empty() {
             return;

@@ -2005,6 +2005,7 @@ impl TypeChecker {
                 }
             }
             Stmt::While(s) => {
+                self.check_loop_contracts(s);
                 let errors_before = self.error_generation;
                 let cond_ty = self.check_expr(&s.cond);
                 if cond_ty != Type::Bool

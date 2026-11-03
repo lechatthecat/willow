@@ -599,6 +599,8 @@ impl Parser {
                 Self::let_match(MatchSource::WhileLet, whole, pattern, scrutinee, body, exit);
             return Ok(Stmt::While(WhileStmt {
                 cond: Expr::Bool(true, span, ExprId::fresh()),
+                invariants: Vec::new(),
+                variant: None,
                 body: Block {
                     id: crate::parser::ast::BodyId::fresh(),
                     stmts: vec![matched],
@@ -608,8 +610,37 @@ impl Parser {
             }));
         }
         let cond = self.parse_control_head()?;
+        let mut invariants = Vec::new();
+        let mut variant = None;
+        while let TokenKind::Ident(keyword) = self.peek_kind() {
+            let rank = match keyword.as_str() {
+                "invariant" => false,
+                "variant" => true,
+                _ => break,
+            };
+            if rank && variant.is_some() {
+                return Err(self.err_at(
+                    ErrorCode::E0103,
+                    "a while loop may have only one variant",
+                    self.current_span(),
+                ));
+            }
+            self.advance();
+            let expression = self.parse_control_head()?;
+            if rank {
+                variant = Some(expression);
+            } else {
+                invariants.push(expression);
+            }
+        }
         let body = self.parse_block()?;
-        Ok(Stmt::While(WhileStmt { cond, body, span }))
+        Ok(Stmt::While(WhileStmt {
+            cond,
+            invariants,
+            variant,
+            body,
+            span,
+        }))
     }
 
     /// `P = e` after `if let` / `while let`. The scrutinee is a control head,

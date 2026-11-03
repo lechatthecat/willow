@@ -123,8 +123,8 @@ fn report(f: &FunctionDecl, options: &Options) -> Report {
         location: f.span,
         status: Status::Unknown,
         model: "checked-i64",
-        verified_scope: "i64/bool V1",
-        analyzer_version: "1",
+        verified_scope: "i64/bool with annotated while loops",
+        analyzer_version: "2",
         solver_version: solver::VERSION,
         solver_timeout_ms: options.timeout_ms,
         approval_status: "UNVERIFIED",
@@ -363,6 +363,9 @@ pub fn verify_cached(
                 r.input_symbols.insert(name.clone(), p.name.clone());
                 args.push(name);
             }
+            let mut model_symbols = args.clone();
+            model_symbols.extend(summary.loop_symbols.keys().cloned());
+            r.input_symbols.extend(summary.loop_symbols.clone());
             let domain = format!("(and {})", domain.join(" "));
             let call = |suffix: &str| application(&format!("f{id}_{suffix}"), &args);
             if let Some(obligations) = cached {
@@ -417,7 +420,7 @@ pub fn verify_cached(
                     ),
                 ] {
                     let (answer, model) =
-                        s.query(&formula, if want == "unsat" { &args } else { &[] })?;
+                        s.query(&formula, if want == "unsat" { &model_symbols } else { &[] })?;
                     r.obligations.push(Obligation {
                         kind: kind.into(),
                         solver_result: answer.clone(),
@@ -560,3 +563,6 @@ fn contract_text(expr: &Expr) -> String {
     }
     output
 }
+
+#[cfg(test)]
+mod loop_tests;

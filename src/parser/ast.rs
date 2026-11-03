@@ -854,6 +854,10 @@ impl DeferBody {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WhileStmt {
     pub cond: Expr,
+    #[serde(default)]
+    pub invariants: Vec<Expr>,
+    #[serde(default)]
+    pub variant: Option<Expr>,
     pub body: Block,
     pub span: Span,
 }

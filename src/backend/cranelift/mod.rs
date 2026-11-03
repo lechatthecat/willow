@@ -3467,6 +3467,8 @@ mod tests {
                     span: Span::new(2, 2, 2, 1),
                 }),
                 Stmt::While(WhileStmt {
+                    invariants: Vec::new(),
+                    variant: None,
                     cond: Expr::Bool(true, Span::dummy(), ExprId::fresh()),
                     body: Block {
                         id: crate::parser::ast::BodyId::fresh(),

@@ -130,6 +130,9 @@ pub fn walk_stmt<V: AstVisitor + ?Sized>(visitor: &mut V, stmt: &Stmt) {
         }
         Stmt::While(stmt) => {
             visitor.visit_expr(&stmt.cond);
+            for e in stmt.invariants.iter().chain(stmt.variant.iter()) {
+                visitor.visit_expr(e);
+            }
             visitor.visit_block(&stmt.body);
         }
         Stmt::Break(_) | Stmt::Continue(_) => {}

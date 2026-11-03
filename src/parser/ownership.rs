@@ -153,6 +153,9 @@ fn stmt_children<'a>(node: &'a Stmt, visit: &mut impl FnMut(NodeRef<'a>)) {
         }
         Stmt::While(v) => {
             visit(NodeRef::Expr(&v.cond));
+            for e in v.invariants.iter().chain(v.variant.iter()) {
+                visit(NodeRef::Expr(e));
+            }
             for st in &v.body.stmts {
                 visit(NodeRef::Stmt(st));
             }
@@ -333,6 +336,9 @@ fn stmt_children_mut<'a>(node: &'a mut Stmt, visit: &mut impl FnMut(NodeMut<'a>)
         }
         Stmt::While(v) => {
             visit(NodeMut::Expr(&mut v.cond));
+            for e in v.invariants.iter_mut().chain(v.variant.iter_mut()) {
+                visit(NodeMut::Expr(e));
+            }
             for st in &mut v.body.stmts {
                 visit(NodeMut::Stmt(st));
             }
@@ -525,7 +531,7 @@ clone_shell_struct!(IfStmt {
 });
 clone_shell_struct!(WhileStmt {
     metadata: [span],
-    syntax: [cond, body]
+    syntax: [cond, invariants, variant, body]
 });
 clone_shell_struct!(DeferStmt {
     metadata: [span],
@@ -992,6 +998,8 @@ mod tests {
                 let mut stmt = Stmt::Break(span);
                 for _ in 0..50_000 {
                     stmt = Stmt::While(WhileStmt {
+                        invariants: Vec::new(),
+                        variant: None,
                         cond: placeholder_expr(),
                         body: Block {
                             id: crate::parser::ast::BodyId::fresh(),

@@ -107,6 +107,12 @@ fn push_stmt<'a>(pending: &mut Vec<AstEvent<'a>>, stmt: &'a Stmt) {
         }
         Stmt::While(stmt) => {
             pending.push(AstEvent::Expr(&stmt.cond));
+            pending.extend(
+                stmt.invariants
+                    .iter()
+                    .chain(stmt.variant.iter())
+                    .map(AstEvent::Expr),
+            );
             pending.push(AstEvent::Block(&stmt.body));
         }
         Stmt::Break(_) | Stmt::Continue(_) => {}

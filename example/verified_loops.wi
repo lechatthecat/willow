@@ -1,0 +1,37 @@
+// Loop annotations are proof-only; check/build reject a failed proof.
+@pure @verified
+fn countdown(n: i64) -> i64
+    requires n >= 0
+    ensures result == 0
+{
+    let mut remaining = n;
+    while remaining > 0
+        invariant remaining >= 0
+        invariant remaining <= n
+        variant remaining
+    {
+        remaining = remaining - 1;
+    }
+    return remaining;
+}
+
+@pure @verified
+fn count_to(limit: i64) -> i64
+    requires limit >= 0
+    ensures result == limit
+{
+    let mut count = 0;
+    while count < limit
+        invariant count >= 0 && count <= limit
+        variant limit - count
+    {
+        count = count + 1;
+    }
+    return count;
+}
+
+fn main() {
+    println(countdown(0));
+    println(countdown(12));
+    println(count_to(7));
+}
