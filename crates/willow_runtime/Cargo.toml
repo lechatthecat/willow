@@ -22,6 +22,8 @@ name = "gc_acceptance"
 required-features = ["gc-acceptance-faults"]
 
 [dependencies]
+sha2 = "0.11.0"
+serde_json = "1.0.152"
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }
 crossbeam-deque = "0.8.8"
 libc = "0.2.190"

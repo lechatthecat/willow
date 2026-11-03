@@ -32,6 +32,8 @@ pub struct ProjectManifest {
     #[serde(rename = "rust-dependencies", default)]
     pub rust_dependencies: BTreeMap<String, RustDependencySpec>,
     pub rust: Option<RustSection>,
+    #[serde(default)]
+    pub native: Option<crate::toolchain::native::NativeManifest>,
 }
 
 #[derive(Debug, Deserialize)]

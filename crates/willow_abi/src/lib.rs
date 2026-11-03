@@ -15,6 +15,7 @@ pub mod unwind_reason {
 
 pub mod ffi;
 pub mod fingerprint;
+pub mod native;
 pub mod runtime_type_ids;
 pub mod schema;
 pub use schema::RUNTIME_ABI;

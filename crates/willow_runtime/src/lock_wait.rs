@@ -1294,7 +1294,7 @@ mod tests {
         drop_task_record(vanished);
 
         assert_eq!(state.handoff_to_next_waiter(), Some((live, live_token)));
-        assert_eq!(state.queued_waiters(), Vec::new());
+        assert!(state.queued_waiters().is_empty());
     }
 
     // 17

@@ -2384,6 +2384,7 @@ mod tests {
                         },
                     };
                     let graph = PackageGraph {
+                        native: None,
                         root: PackageId(0),
                         packages: vec![package],
                         stats: Default::default(),

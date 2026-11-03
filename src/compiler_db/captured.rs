@@ -286,6 +286,7 @@ mod tests {
                 vec![package("a", 0, 1), package("b", 1, 1)]
             };
             let mut graph = PackageGraph {
+                native: None,
                 root: PackageId(u32::from(reverse)),
                 packages,
                 stats: Default::default(),

@@ -52,6 +52,7 @@ pub fn resolve_path_packages(root: &Path) -> Result<PackageGraph, PackageError> 
 
 pub(super) fn resolve_path_source(root: PathSource) -> Result<PackageGraph, PackageError> {
     let mut graph = PackageGraph {
+        native: None,
         root: PackageId(0),
         packages: Vec::new(),
         stats: ResolutionStats::default(),

@@ -255,6 +255,7 @@ mod tests {
     fn packages(edges: &[Vec<(&str, u32)>]) -> crate::package::PackageGraph {
         use crate::package::*;
         PackageGraph {
+            native: None,
             root: PackageId(0),
             packages: edges
                 .iter()

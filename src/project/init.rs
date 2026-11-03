@@ -29,6 +29,7 @@ pub fn manifest(name: &str) -> Result<String> {
         }),
         rust_dependencies: BTreeMap::new(),
         rust: None,
+        native: None,
     }
     .validate()
     .context("help: use --name with a valid project name")?;

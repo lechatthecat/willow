@@ -1,5 +1,6 @@
 //! Host object-file, runtime-library, linker, and sidecar artifact handling.
 
+pub mod native;
 pub mod rust_bridge;
 
 use std::path::{Path, PathBuf};
@@ -198,7 +199,7 @@ impl Toolchain for HostToolchain {
     }
 
     fn link(&self, object: &Path, runtime: &Path, output: &str) -> Result<ExitStatus> {
-        self.link_with_bridge(object, runtime, output, None)
+        self.link_native(object, runtime, output, None, &[])
     }
 
     fn update_source_map(&self, output: &str, contents: Option<&str>) -> Result<()> {
@@ -263,16 +264,20 @@ impl HostToolchain {
         bridge: &rust_bridge::BridgeBuild,
     ) -> Result<ExitStatus> {
         bridge.ensure_target(&target_lexicon::Triple::host().to_string())?;
-        self.link_with_bridge(object, runtime, output, Some(bridge))
+        self.link_native(object, runtime, output, Some(bridge), &[])
             .context("rust_bridge_link_error")
     }
-    fn link_with_bridge(
+    pub fn link_native(
         &self,
         object: &Path,
         runtime: &Path,
         output: &str,
         bridge: Option<&rust_bridge::BridgeBuild>,
+        native_args: &[String],
     ) -> Result<ExitStatus> {
+        if let Some(bridge) = bridge {
+            bridge.ensure_target(&target_lexicon::HOST.to_string())?;
+        }
         #[cfg(all(windows, target_env = "msvc"))]
         {
             let target = if cfg!(target_arch = "x86_64") {
@@ -299,6 +304,7 @@ impl HostToolchain {
             command
                 .arg(runtime)
                 .arg("/link")
+                .args(native_args)
                 .args(dead_strip_args("windows", "msvc"))
                 .arg(format!("/OUT:{output}"))
                 .arg("/SUBSYSTEM:CONSOLE")
@@ -340,6 +346,7 @@ impl HostToolchain {
                         .context("rust_bridge_link_error: missing archive")?,
                 );
             }
+            command.args(native_args);
             command.arg(runtime).arg("-o").arg(output);
             command.args(dead_strip_args(std::env::consts::OS, ""));
             if let Some(bridge) = bridge {

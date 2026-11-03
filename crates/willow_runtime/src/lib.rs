@@ -70,6 +70,7 @@ pub mod lock_wait;
 pub mod map;
 pub mod math;
 pub(crate) mod native_frame;
+pub mod native_library;
 #[cfg(any(
     all(
         target_os = "linux",

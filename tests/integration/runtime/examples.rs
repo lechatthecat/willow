@@ -1413,6 +1413,195 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
+fn prepare_native_library_example(shared: bool) -> PathBuf {
+    let copy = PathBuf::from(temp_path(format!(
+        "willow_native_example_{}",
+        unique_test_id()
+    )));
+    let mut prepare = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    prepare.arg("example/native_library/prepare.py").arg(&copy);
+    if shared {
+        prepare.arg("--shared");
+    }
+    #[cfg(all(windows, target_env = "msvc"))]
+    {
+        let compiler = cc::windows_registry::find_tool(&target_lexicon::HOST.to_string(), "cl.exe")
+            .expect("native example requires MSVC");
+        prepare.env("CC", compiler.path());
+        for (key, value) in compiler.get_envs() {
+            prepare.env(key, value);
+        }
+    }
+    let output = prepare
+        .output()
+        .expect("native example requires Python and a C toolchain");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    copy
+}
+
+fn run_native_library_example() {
+    for shared in [false, true] {
+        let copy = prepare_native_library_example(shared);
+        for frozen in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
+            command.arg("run").arg(&copy);
+            if frozen {
+                command.arg("--frozen");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+        }
+        fs::remove_dir_all(copy).unwrap();
+    }
+}
+
+#[test]
+fn test_native_library_project_example() {
+    run_native_library_example();
+}
+
+#[test]
+fn test_native_shared_library_distribution_and_negotiation() {
+    let project = prepare_native_library_example(true);
+    // Two aliases share a source. Validate it once; publish distinct policy
+    // names in dependency-first order, without flattening the native graph.
+    let manifest_path = project.join("project.toml");
+    let manifest = willow_compiler::project::ProjectManifest::load(&manifest_path).unwrap();
+    let mut native = manifest.native.unwrap();
+    let mut support = native.libraries["addition"].clone();
+    support.name = "support".into();
+    let target = target_lexicon::HOST.to_string();
+    let loader = support
+        .targets
+        .get_mut(&target)
+        .unwrap()
+        .loader
+        .as_mut()
+        .unwrap();
+    loader.distribution_name = format!("support-{}", loader.distribution_name);
+    native
+        .libraries
+        .get_mut("addition")
+        .unwrap()
+        .dependencies
+        .push("support".into());
+    native.libraries.insert("support".into(), support);
+    let plan =
+        willow_compiler::toolchain::native::resolve(&project, &native, &target, true).unwrap();
+    assert_eq!(plan.work.payloads, 1);
+    assert_eq!(
+        plan.shared
+            .iter()
+            .map(|a| a.library.name.as_str())
+            .collect::<Vec<_>>(),
+        ["support", "addition"]
+    );
+    let mut document: toml::Table =
+        toml::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    document.insert("native".into(), toml::Value::try_from(native).unwrap());
+    fs::write(&manifest_path, toml::to_string(&document).unwrap()).unwrap();
+    let output = project.join(if cfg!(windows) { "app.exe" } else { "app" });
+    let build = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .arg("build")
+        .arg(&project)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let relocated = project.join("relocated");
+    fs::create_dir(&relocated).unwrap();
+    let executable = relocated.join(output.file_name().unwrap());
+    fs::copy(&output, &executable).unwrap();
+    let distribution = willow_abi::native::directory(&executable).unwrap();
+    copy_dir(
+        &willow_abi::native::directory(&output).unwrap(),
+        &distribution,
+    );
+    // Prove loading uses the copied distribution, not source/build paths.
+    fs::remove_dir_all(project.join("artifacts")).unwrap();
+    let run = || {
+        Command::new(&executable)
+            .current_dir(&relocated)
+            .output()
+            .unwrap()
+    };
+    let success = run();
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    assert_eq!(success.stdout, b"42\n");
+    let policy_path = distribution.join(willow_abi::native::POLICY_FILE);
+    let original = fs::read(&policy_path).unwrap();
+    let policy: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let index = policy["libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|l| l["name"] == "addition")
+        .unwrap();
+    for (field, value, expected) in [
+        ("version", serde_json::json!(2), "native_abi_mismatch"),
+        (
+            "abi-symbol",
+            serde_json::json!("absent_negotiation"),
+            "native_symbol_missing",
+        ),
+        (
+            "symbols",
+            serde_json::json!(["absent_export"]),
+            "native_symbol_missing",
+        ),
+        (
+            "symbols",
+            serde_json::json!(["native_negotiate"]),
+            "native_symbol_not_permitted",
+        ),
+    ] {
+        let mut changed = policy.clone();
+        changed["libraries"][index]["policy"][field] = value;
+        fs::write(&policy_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        let failure = run();
+        assert!(!failure.status.success());
+        assert!(
+            String::from_utf8_lossy(&failure.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&failure.stderr)
+        );
+    }
+    let mut changed = policy.clone();
+    changed["libraries"][index]["name"] = serde_json::json!("different");
+    fs::write(&policy_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+    let failure = run();
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("native_symbol_not_permitted"));
+    fs::write(&policy_path, &original).unwrap();
+    let payload = distribution.join(
+        policy["libraries"][index]["policy"]["distribution-name"]
+            .as_str()
+            .unwrap(),
+    );
+    fs::write(payload, b"tampered library").unwrap();
+    let failure = run();
+    assert!(!failure.status.success());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("native_digest_mismatch"));
+    fs::remove_dir_all(project).unwrap();
+}
+
 #[test]
 fn test_runnable_example_catalog_is_complete() {
     let mut expected_paths = runnable_example_cases()
@@ -1429,6 +1618,7 @@ fn test_runnable_example_catalog_is_complete() {
                 .map(|(_, entry, _)| entry.to_string()),
         )
         .collect::<Vec<_>>();
+    expected_paths.push("example/native_library/src/main.wi".into());
     expected_paths.sort();
     let actual_paths = collect_runnable_example_entries();
     assert_eq!(
@@ -1560,6 +1750,7 @@ fn test_constructor_flow_example() {
 #[test]
 fn test_runnable_example_files_compile_and_run() {
     run_rust_project_examples();
+    run_native_library_example();
     for &(path, expected) in runnable_example_cases() {
         let (out, ok) = if matches!(
             path,

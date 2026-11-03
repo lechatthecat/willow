@@ -816,6 +816,10 @@ dependencies = [
 [[package]]
 name = "willow_abi"
 version = "0.1.8"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "willow_continuations"
@@ -835,6 +839,8 @@ dependencies = [
  "hashbrown 0.17.1",
  "libc",
  "ryu",
+ "serde_json",
+ "sha2",
  "socket2",
  "willow_abi",
  "willow_runtime_macros",

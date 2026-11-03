@@ -19,6 +19,8 @@ struct Lock {
     packages: Vec<Package>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rust: Option<RustLock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native: Option<crate::toolchain::native::NativeLock>,
 }
 /// Cargo remains authoritative; only fingerprints and direct versions live here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +90,7 @@ pub(crate) fn candidate_rust_lock(
     super::PackageImports::new(&graph)?;
     let mut lock = Lock::from_graph(&graph)?;
     lock.rust = rust;
+    lock.native = resolve_native_lock(root, offline)?;
     lock.canonical_text()
 }
 
@@ -307,6 +310,7 @@ impl Lock {
             },
             packages,
             rust: None,
+            native: graph.native.as_ref().map(|plan| plan.lock.clone()),
         })
     }
 }
@@ -351,7 +355,9 @@ pub(crate) fn resolve_project_analysis(
         transaction.ensure_no_ai_edit()?;
     }
     let source = PathSource::open(root, false)?;
-    let package_mode = source.manifest.willow.is_some() || !source.manifest.dependencies.is_empty();
+    let package_mode = source.manifest.willow.is_some()
+        || !source.manifest.dependencies.is_empty()
+        || source.manifest.native.is_some();
     let graph = resolve_source(source, locked, offline, publish_lock)?;
     Ok(package_mode.then_some(graph))
 }
@@ -361,7 +367,7 @@ pub(super) fn update(root: &Path) -> Result<PackageGraph> {
     transaction.ensure_no_ai_edit()?;
     let graph = super::resolve_packages(root)?;
     let path = graph.get(graph.root).unwrap().root.join("project.lock");
-    atomic_write(&path, command_lock(&graph)?.as_bytes(), || Ok(()))?;
+    atomic_write(&path, command_lock(&graph, false)?.as_bytes(), || Ok(()))?;
     Ok(graph)
 }
 
@@ -371,6 +377,19 @@ fn resolve_source(
     offline: bool,
     publish_lock: bool,
 ) -> Result<PackageGraph> {
+    let native = source
+        .manifest
+        .native
+        .as_ref()
+        .map(|manifest| {
+            crate::toolchain::native::resolve(
+                &source.root,
+                manifest,
+                &target_lexicon::HOST.to_string(),
+                offline,
+            )
+        })
+        .transpose()?;
     let has_rust_dependencies = !source.manifest.rust_dependencies.is_empty();
     let path = source.root.join("project.lock");
     let previous = match std::fs::read_to_string(&path) {
@@ -402,7 +421,7 @@ fn resolve_source(
             }
         }
     }
-    let graph = match super::solve::resolve_source(source, pins, checksums, offline, !locked) {
+    let mut graph = match super::solve::resolve_source(source, pins, checksums, offline, !locked) {
         Ok(graph) => graph,
         Err(
             error @ (super::PackageError::CacheMissingOffline(_)
@@ -418,6 +437,7 @@ fn resolve_source(
         }
         Err(error) => return Err(error.into()),
     };
+    graph.native = native;
     let mut expected = Lock::from_graph(&graph)?;
     expected.rust = current.as_ref().and_then(|lock| lock.rust.clone());
     if !has_rust_dependencies && current.as_ref().is_some_and(|lock| lock.rust.is_some()) {
@@ -427,10 +447,11 @@ fn resolve_source(
         );
         expected.rust = None;
     }
-    if !current
-        .as_ref()
-        .is_some_and(|current| current.matches(&expected) && current.rust == expected.rust)
-    {
+    if !current.as_ref().is_some_and(|current| {
+        current.matches(&expected)
+            && current.rust == expected.rust
+            && current.native == expected.native
+    }) {
         if locked {
             return Err(
                 super::CommandError::new("lockfile_stale", path.display().to_string())
@@ -580,9 +601,13 @@ pub(super) fn command_pins(
     Ok((pins, checksums))
 }
 
-pub(super) fn command_lock(graph: &PackageGraph) -> Result<String> {
+/// Preview candidates may verify existing native cache entries, but must not
+/// fetch or materialize artifacts (even when resolution ultimately fails).
+pub(super) fn command_lock(graph: &PackageGraph, cache_only: bool) -> Result<String> {
     let mut lock = Lock::from_graph(graph)?;
-    lock.rust = read_rust_lock(&graph.get(graph.root).context("invalid root package")?.root)?;
+    let root = &graph.get(graph.root).context("invalid root package")?.root;
+    lock.rust = read_rust_lock(root)?;
+    lock.native = resolve_native_lock(root, cache_only)?;
     lock.canonical_text()
 }
 
@@ -654,4 +679,24 @@ pub(super) fn previous_identities(
             .collect(),
         direct,
     ))
+}
+
+fn resolve_native_lock(
+    root: &Path,
+    offline: bool,
+) -> Result<Option<crate::toolchain::native::NativeLock>> {
+    let manifest = crate::project::ProjectManifest::load(&root.join("project.toml"))?;
+    manifest
+        .native
+        .as_ref()
+        .map(|native| {
+            crate::toolchain::native::resolve(
+                root,
+                native,
+                &target_lexicon::HOST.to_string(),
+                offline,
+            )
+            .map(|plan| plan.lock)
+        })
+        .transpose()
 }

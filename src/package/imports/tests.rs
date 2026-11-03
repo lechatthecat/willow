@@ -45,6 +45,7 @@ impl Fixture {
     }
     fn graph(&self) -> PackageGraph {
         PackageGraph {
+            native: None,
             root: PackageId(0),
             packages: vec![
                 self.package(0, &[("a", 1), ("same", 1), ("b", 2)]),
@@ -477,6 +478,7 @@ fn indexed_routing_work_scales_with_requests_not_package_or_alias_count() {
     for size in [16, 64, 256, 1024] {
         let fixture = Fixture::new();
         let mut graph = PackageGraph {
+            native: None,
             root: PackageId(0),
             packages: vec![fixture.package(0, &[])],
             stats: Default::default(),

@@ -280,7 +280,7 @@ pub fn mutate_packages_report(
                 }
             })?;
     super::PackageImports::new(&graph)?;
-    let lock_after = super::lock::command_lock(&graph)?;
+    let lock_after = super::lock::command_lock(&graph, dry_run)?;
     let (previous, previous_direct) = super::lock::previous_identities(
         lock_before.as_deref(),
         &graph.get(graph.root).unwrap().root,

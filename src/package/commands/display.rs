@@ -130,6 +130,7 @@ mod tests {
     };
     fn graph(n: usize) -> PackageGraph {
         PackageGraph {
+            native: None,
             root: PackageId(0),
             stats: Default::default(),
             packages: (0..n)

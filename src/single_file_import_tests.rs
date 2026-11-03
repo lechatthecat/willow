@@ -384,6 +384,7 @@ fn package_entry_binding_work_scales_with_imports_not_module_product() {
     use crate::package::*;
     for size in [16, 64, 256, 1024] {
         let packages = PackageGraph {
+            native: None,
             root: PackageId(0),
             packages: (0..2)
                 .map(|id| ResolvedPackage {

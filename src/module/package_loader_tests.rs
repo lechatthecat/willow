@@ -27,6 +27,7 @@ impl Fixture {
     }
     fn graph(&self, edges: &[&[(&str, u32)]]) -> Arc<PackageGraph> {
         Arc::new(PackageGraph {
+            native: None,
             root: PackageId(0),
             packages: edges
                 .iter()

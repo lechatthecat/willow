@@ -875,3 +875,164 @@ fn outdated_without_lock_reports_resolved_baseline_without_creating_lock() {
     assert_eq!(row["breaking"], "2.0.0");
     assert_eq!(before, snapshot(&f.0.join("app")));
 }
+
+/// A real child-process sentinel makes an accidental curl invocation observable
+/// on every host, without any network access or process-global environment edits.
+fn native_preview_fixture(warm: bool) -> Fixture {
+    use object::write::{Object, Symbol, SymbolSection};
+    let f = Fixture::new();
+    f.package("lib", "base", "1.0.0", "");
+    f.package("extra", "extra", "1.0.0", "");
+    f.package(
+        "app",
+        "app",
+        "1.0.0",
+        "[dependencies]\nbase={path='../lib'}\n",
+    );
+    let target = target_lexicon::HOST.to_string();
+    let (format, abi) = if target.ends_with("windows-msvc") {
+        (object::BinaryFormat::Coff, "c-msvc")
+    } else if target.ends_with("apple-darwin") {
+        (object::BinaryFormat::MachO, "c-darwin")
+    } else {
+        (object::BinaryFormat::Elf, "c-sysv")
+    };
+    let arch_name = target_lexicon::HOST.architecture.to_string();
+    let arch = if arch_name == "aarch64" {
+        object::Architecture::Aarch64
+    } else {
+        object::Architecture::X86_64
+    };
+    let mut object = Object::new(format, arch, object::Endianness::Little);
+    let section = object.section_id(object::write::StandardSection::Text);
+    object.append_section_data(section, &[0xc3], 1);
+    object.add_symbol(Symbol {
+        name: b"native_preview_answer".to_vec(),
+        value: 0,
+        size: 1,
+        kind: object::SymbolKind::Text,
+        scope: object::SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(section),
+        flags: object::SymbolFlags::None,
+    });
+    let bytes = object.write().unwrap();
+    let mut archive = format!(
+        "!<arch>\n{:<16}{:<12}{:<6}{:<6}{:<8o}{:<10}`\n",
+        "entry.o/",
+        0,
+        0,
+        0,
+        0o100644,
+        bytes.len()
+    )
+    .into_bytes();
+    archive.extend(&bytes);
+    if !bytes.len().is_multiple_of(2) {
+        archive.push(b'\n');
+    }
+    let payload = f.0.join("payload.a");
+    fs::write(&payload, &archive).unwrap();
+    let digest = willow_compiler::toolchain::native::digest_file(&payload).unwrap();
+    let native = format!(
+        r#"
+[native]
+roots = ["sample"]
+[native.libraries.sample]
+name = "sample"
+version = "1"
+license = "MIT"
+provenance = "test fixture"
+[native.libraries.sample.targets."{target}"]
+source = {{ kind = "artifact", url = "https://example.invalid/library.a" }}
+digest = "{digest}"
+architecture = "{arch_name}"
+abi = "{abi}"
+abi-version = "1"
+linkage = "static"
+inputs = [{{ kind = "file", value = "artifact" }}]
+"#
+    );
+    f.write("app/project.toml", &(f.read("app/project.toml") + &native));
+    if warm {
+        let directory = f.0.join("app/.willow/native").join(&digest);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("artifact"), archive).unwrap();
+        // Cover existing root lock preservation as well as missing-lock previews.
+        success(f.cli(&["fetch", "--offline"]));
+    }
+    f.write("bin/sentinel.rs", r#"fn main() {
+        std::fs::write(std::env::var_os("NATIVE_PREVIEW_CURL_MARKER").unwrap(), b"invoked").unwrap();
+        std::process::exit(97);
+    }"#);
+    let curl =
+        f.0.join("bin")
+            .join(if cfg!(windows) { "curl.exe" } else { "curl" });
+    success(
+        Command::new("rustc")
+            .args(["--edition=2024", "--crate-name=native_preview_curl"])
+            .arg(f.0.join("bin/sentinel.rs"))
+            .arg("-o")
+            .arg(curl)
+            .output()
+            .unwrap(),
+    );
+    f
+}
+fn assert_native_previews_read_only(f: &Fixture, expected_error: Option<&str>) {
+    let marker = f.0.join("curl-invoked");
+    let mut paths = vec![f.0.join("bin")];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).unwrap();
+    let before = snapshot(&f.0);
+    for args in [
+        vec!["add", "--path", "../extra", "--dry-run"],
+        vec!["remove", "base", "--dry-run"],
+        vec!["update", "--dry-run"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .current_dir(f.0.join("app"))
+            .env("WILLOW_HOME", f.0.join("cache"))
+            .env("PATH", &path)
+            .env("NATIVE_PREVIEW_CURL_MARKER", &marker)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!marker.exists(), "{args:?} invoked curl during a preview");
+        assert_eq!(
+            snapshot(&f.0),
+            before,
+            "{args:?} changed files, directories, contents or modification times"
+        );
+        match expected_error {
+            Some(error) => failure(output, error),
+            None => {
+                assert!(success(output).starts_with("Would "));
+            }
+        }
+    }
+}
+#[test]
+fn native_package_previews_cold_cache_have_no_network_or_filesystem_effects() {
+    let f = native_preview_fixture(false);
+    assert_native_previews_read_only(&f, Some("native_cache_missing_offline"));
+}
+#[test]
+fn native_package_previews_warm_cache_verify_without_writes_or_network() {
+    let f = native_preview_fixture(true);
+    assert_native_previews_read_only(&f, None);
+    // A cached payload is still verified; corrupt bytes cannot be accepted or
+    // replaced by fetching during a preview.
+    let cache = f.0.join("app/.willow/native");
+    let entry = fs::read_dir(&cache)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("artifact");
+    fs::write(entry, b"corrupt").unwrap();
+    assert_native_previews_read_only(&f, Some("native_digest_mismatch"));
+}

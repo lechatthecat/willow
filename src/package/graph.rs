@@ -72,6 +72,7 @@ impl ResolvedPackage {
 
 #[derive(Debug)]
 pub struct PackageGraph {
+    pub native: Option<crate::toolchain::native::NativePlan>,
     pub root: PackageId,
     pub packages: Vec<ResolvedPackage>,
     pub stats: super::ResolutionStats,

@@ -182,6 +182,7 @@ mod tests {
     use crate::package::{PackageId, PackageSourceIdentity, ResolvedDependency, ResolvedPackage};
     fn graph(n: usize, fanout: bool) -> PackageGraph {
         PackageGraph {
+            native: None,
             root: PackageId(0),
             stats: Default::default(),
             packages: (0..n)

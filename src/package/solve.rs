@@ -113,6 +113,7 @@ pub(super) fn resolve_prepared(
 ) -> Result<PackageGraph, PackageError> {
     let mut solver = Solver {
         graph: PackageGraph {
+            native: None,
             root: PackageId(0),
             packages: Vec::new(),
             stats: ResolutionStats {

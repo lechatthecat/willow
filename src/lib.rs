@@ -515,6 +515,15 @@ impl<'a> CompilerSession<'a> {
         let _query_stats = query_stats::Session::enter();
         let _node_ids = parser::ast::NodeIdSession::enter();
         let (frontend, source, map) = self.checked_frontend(emitter, !build)?;
+        if let Some(plan) = frontend
+            .db
+            .package_graph()
+            .and_then(|graph| graph.native.as_ref())
+        {
+            for notice in &plan.notices {
+                eprintln!("{notice}");
+            }
+        }
         let bound = frontend.db.rust_bridge_symbols.clone();
         let rust_bridge = if let Some(project_root) = &self.project_root {
             let manifest = project::ProjectManifest::load(&project_root.join("project.toml"))?;
@@ -2781,6 +2790,18 @@ fn run_backend(
     // The entry file's item imports are not carried here: the back end gets
     // them from `backend_unit_imports` below, the same way every module's are.
     let _symbols = frontend.db.enter_symbols();
+    let native_shared = frontend
+        .db
+        .package_graph()
+        .and_then(|graph| graph.native.as_ref())
+        .map(|plan| plan.shared.clone())
+        .unwrap_or_default();
+    let native_args = frontend
+        .db
+        .package_graph()
+        .and_then(|graph| graph.native.as_ref())
+        .map(|plan| plan.args.clone())
+        .unwrap_or_default();
     let Frontend {
         program,
         mut module_graph,
@@ -3201,11 +3222,14 @@ fn run_backend(
         }
     })?;
 
-    let link_result = if let Some((bridge, _)) = rust_bridge {
-        toolchain.link_rust_bridge(&obj_path, &runtime_lib, out, bridge)
-    } else {
-        toolchain.link(&obj_path, &runtime_lib, out)
-    };
+    let distribution = toolchain::native::distribution::prepare(Path::new(out), &native_shared)?;
+    let link_result = toolchain.link_native(
+        &obj_path,
+        &runtime_lib,
+        out,
+        rust_bridge.map(|(bridge, _)| bridge),
+        &native_args,
+    );
     discard_object(&obj_path);
     let status = link_result?;
 
@@ -3227,6 +3251,7 @@ fn run_backend(
         });
     }
 
+    distribution.publish()?;
     toolchain.update_source_map(
         out,
         opts.target
