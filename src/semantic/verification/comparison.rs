@@ -65,6 +65,9 @@ impl Lock {
         digest(&serde_json::to_string(self).expect("lock serialization"))
     }
 }
+pub(super) fn contract_digest(f: &FunctionDecl) -> String {
+    digest(&canonical(json!({"schema":"willow.typed-contract.v1","signature":signature(f),"attributes":f.effect_contracts,"requires":f.requires,"ensures":f.ensures})).to_string())
+}
 fn relevant(f: &FunctionDecl) -> bool {
     !f.requires.is_empty()
         || !f.ensures.is_empty()
@@ -161,7 +164,7 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
         let body = canonical(f).to_string();
         bytes += body.len();
         local.push(digest(&body));
-        contracts.push(digest(&canonical(json!({"schema":"willow.typed-contract.v1","signature":signature(f),"attributes":f.effect_contracts,"requires":f.requires,"ensures":f.ensures})).to_string()));
+        contracts.push(contract_digest(f));
         let mut deps = encode::edges(f, &names);
         for event in AstWalk::new(AstEvent::Block(&f.body)).chain(
             f.requires
@@ -347,6 +350,7 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
         let mut status = "UNKNOWN";
         let mut obligations = Vec::new();
         let mut reasons = Vec::new();
+        let mut input_symbols = BTreeMap::new();
         let fa = old.get(key);
         let fb = new.get(key);
         let pure_a = fa.is_some_and(|f| has(f, EffectContractKind::Pure));
@@ -377,6 +381,7 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
                         if ty == "Int" {
                             domain.push(bounds(&v));
                         }
+                        input_symbols.insert(v.clone(), p.name.clone());
                         args.push(v);
                     }
                     let ret = format!("cmp{i}_return");
@@ -389,6 +394,7 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
                     let pre_b = application(&format!("c{j}_pre"), &args);
                     let ps_a = application(&format!("c{i}_pre_safe"), &args);
                     let ps_b = application(&format!("c{j}_pre_safe"), &args);
+                    input_symbols.insert(ret.clone(), "result".to_owned());
                     args.push(ret);
                     let post_a = application(&format!("c{i}_post"), &args);
                     let post_b = application(&format!("c{j}_post"), &args);
@@ -415,8 +421,8 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
                         ),
                     ] {
                         comparison_queries += 1;
-                        let (answer, _) = s.query(&formula, &[])?;
-                        obligations.push(json!({"kind":kind,"result":answer}));
+                        let (answer, candidate) = s.query(&formula, &args)?;
+                        obligations.push(json!({"kind":kind,"result":answer,"expected_solver_result":"unsat","counterexample_candidate":candidate}));
                         if answer == "unknown" {
                             return Err("solver returned UNKNOWN".into());
                         }
@@ -460,7 +466,7 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
         }
         let da = a.lock.functions.get(key);
         let db = b.lock.functions.get(key);
-        changes.push(json!({"symbol":key,"contract_preserved":status,"implementation_verified":proof_b==Some(&Status::Proven),"behavior_equivalent":"UNSUPPORTED","purity":{"base_declared":pure_a,"target_declared":pure_b,"base_proven":pure_a && !a.purity_losses.contains(key) && a.errors.is_empty(),"target_proven":pure_b && !b.purity_losses.contains(key) && b.errors.is_empty()},"verification":{"base":proof_a,"target":proof_b,"declaration_changed":fa.is_some_and(|f|has(f,EffectContractKind::Verified))!=fb.is_some_and(|f|has(f,EffectContractKind::Verified))},"semantic_identity_changed":a.semantic_identities.get(key)!=b.semantic_identities.get(key),"proof_dependencies_changed":da.map(|d|&d.semantics)!=db.map(|d|&d.semantics),"proof_dependencies":{"base":reports_a.get(key).map(|r|json!({"functions":r.dependencies,"digests":r.dependency_digests})),"target":reports_b.get(key).map(|r|json!({"functions":r.dependencies,"digests":r.dependency_digests}))},"base":da,"target":db,"obligations":obligations,"unknown_reasons":reasons}));
+        changes.push(json!({"symbol":key,"contract_preserved":status,"implementation_verified":proof_b==Some(&Status::Proven),"behavior_equivalent":"UNSUPPORTED","purity":{"base_declared":pure_a,"target_declared":pure_b,"base_proven":pure_a && !a.purity_losses.contains(key) && a.errors.is_empty(),"target_proven":pure_b && !b.purity_losses.contains(key) && b.errors.is_empty()},"verification":{"base":proof_a,"target":proof_b,"declaration_changed":fa.is_some_and(|f|has(f,EffectContractKind::Verified))!=fb.is_some_and(|f|has(f,EffectContractKind::Verified))},"semantic_identity_changed":a.semantic_identities.get(key)!=b.semantic_identities.get(key),"proof_dependencies_changed":da.map(|d|&d.semantics)!=db.map(|d|&d.semantics),"proof_dependencies":{"base":reports_a.get(key).map(|r|json!({"functions":r.dependencies,"digests":r.dependency_digests})),"target":reports_b.get(key).map(|r|json!({"functions":r.dependencies,"digests":r.dependency_digests}))},"base":da,"target":db,"obligations":obligations,"input_symbols":input_symbols,"unknown_reasons":reasons}));
     }
     functions.clear();
     json!({"changes":changes,"contract_violations":violations,"uncertainty":unknown,"work":{"comparison_queries":comparison_queries,"predicate_bytes":predicate_bytes,"base_edges":a.dependency_edges,"target_edges":b.dependency_edges,"base_bytes":a.canonical_bytes,"target_bytes":b.canonical_bytes}})

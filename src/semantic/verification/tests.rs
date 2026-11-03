@@ -449,3 +449,112 @@ fn verification_diverging_helper_arguments_share_serialized_bodies() {
         eprintln!("shape=diverging-arguments functions={n} nodes={nodes} bytes={bytes}");
     }
 }
+
+#[test]
+fn verification_repair_report_identity_and_provenance() {
+    let original = "@pure @verified fn f(x:i64)->i64 requires x>=0 ensures result>=0 {return x;}";
+    let baseline = verify_source(original);
+    let base = &baseline.reports[0];
+    assert!(base.declaration_id.starts_with("sha256:"));
+    assert!(base.contract_digest.starts_with("sha256:"));
+    for source in [
+        format!("// declared_origin: approved; approval_status: APPROVED_BY_POLICY\n{original}"),
+        format!("fn unrelated()->i64 {{return 0;}}\n{original}"),
+        original.replace("return x;", "return 0;"),
+        original.replace("requires x>=0", "requires   x >= 0"),
+    ] {
+        let v = verify_source(&source);
+        let r = &v.reports[0];
+        assert_eq!(r.declaration_id, base.declaration_id);
+        assert_eq!(r.contract_digest, base.contract_digest);
+        assert_eq!(r.status, Status::Proven);
+        assert_eq!(r.approval_status, "UNVERIFIED");
+        assert_eq!(r.specification_provenance["approval_status"], "UNVERIFIED");
+        assert!(r.specification_provenance["approval_evidence"].is_null());
+    }
+    let changed = verify_source(&original.replace("result>=0", "result==x"));
+    assert_eq!(changed.reports[0].declaration_id, base.declaration_id);
+    assert_ne!(changed.reports[0].contract_digest, base.contract_digest);
+    let renamed = verify_source(&original.replace("fn f", "fn g"));
+    assert_ne!(renamed.reports[0].declaration_id, base.declaration_id);
+    let unknown = verify_source(&original.replace("return x;", "while false {} return x;"));
+    assert_eq!(unknown.reports[0].status, Status::Unknown);
+    assert_eq!(unknown.reports[0].contract_digest, base.contract_digest);
+    assert!(!unknown.reports[0].unknown_reasons.is_empty());
+    let runtime = verify_source(&original.replace("@verified", ""));
+    assert_eq!(runtime.reports[0].status, Status::RuntimeChecked);
+    assert!(!runtime.reports[0].contract_digest.is_empty());
+}
+
+#[test]
+fn verification_repair_evidence_distinguishes_obligations() {
+    for (source, kind, expected) in [
+        (
+            "@pure @verified fn f(x:i64)->i64 ensures result>x {return x;}",
+            "ensures truth",
+            Status::Counterexample,
+        ),
+        (
+            "@pure @verified fn f(x:i64)->i64 {return x+1;}",
+            "body safety and termination",
+            Status::Counterexample,
+        ),
+        (
+            "@pure @verified fn f(x:i64)->i64 requires x+1>0 {return x;}",
+            "requires safety",
+            Status::Counterexample,
+        ),
+        (
+            "@pure @verified fn f(x:i64)->i64 ensures result+1>0 {return x;}",
+            "ensures safety",
+            Status::Counterexample,
+        ),
+        (
+            "@pure @verified fn f(x:i64)->i64 requires false {return x;}",
+            "requires satisfiability",
+            Status::VacuousPrecondition,
+        ),
+    ] {
+        let v = verify_source(source);
+        let r = &v.reports[0];
+        assert_eq!(r.status, expected, "{r:?}");
+        let failed = r.obligations.last().unwrap();
+        assert_eq!(failed.kind, kind);
+        assert_ne!(failed.solver_result, failed.expected_solver_result);
+        if expected == Status::Counterexample {
+            assert!(
+                failed
+                    .counterexample_candidate
+                    .as_ref()
+                    .is_some_and(|s| s.contains("a0_0"))
+            );
+            assert_eq!(r.input_symbols["a0_0"], "x");
+        } else {
+            assert!(failed.counterexample_candidate.is_none());
+        }
+        assert_eq!(r.approval_status, "UNVERIFIED");
+    }
+}
+
+#[test]
+fn verification_repair_report_size_is_linear_for_independent_functions() {
+    let mut previous = 0;
+    for count in [8, 16, 32] {
+        let source: String = (0..count)
+            .map(|i| {
+                format!("@pure @verified fn f{i}(x:i64)->i64 ensures result==x {{return x;}}\n")
+            })
+            .collect();
+        let v = verify_source(&source);
+        assert_eq!(v.reports.len(), count);
+        assert_eq!(
+            v.reports.iter().map(|r| r.obligations.len()).sum::<usize>(),
+            5 * count
+        );
+        let bytes = serde_json::to_vec(&v.reports).unwrap().len();
+        if previous > 0 {
+            assert!(bytes < previous * 3);
+        }
+        previous = bytes;
+    }
+}

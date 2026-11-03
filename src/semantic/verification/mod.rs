@@ -30,6 +30,7 @@ pub enum Status {
 pub struct Obligation {
     pub kind: String,
     pub solver_result: String,
+    pub expected_solver_result: String,
     pub counterexample_candidate: Option<String>,
 }
 #[derive(Debug, Serialize)]
@@ -44,6 +45,8 @@ pub struct Report {
     pub dependency_digests: Vec<String>,
     pub schema: &'static str,
     pub function: String,
+    /// Signature identity within the analyzed source; pair with its source path.
+    pub declaration_id: String,
     pub location: Span,
     pub status: Status,
     pub model: &'static str,
@@ -116,6 +119,7 @@ fn report(f: &FunctionDecl, options: &Options) -> Report {
         dependency_digests: Vec::new(),
         schema: "willow.verification.v1",
         function: f.name.clone(),
+        declaration_id: digest(&comparison::signature(f).to_string()),
         location: f.span,
         status: Status::Unknown,
         model: "checked-i64",
@@ -124,7 +128,7 @@ fn report(f: &FunctionDecl, options: &Options) -> Report {
         solver_version: solver::VERSION,
         solver_timeout_ms: options.timeout_ms,
         approval_status: "UNVERIFIED",
-        contract_digest: String::new(),
+        contract_digest: comparison::contract_digest(f),
         dependencies: Vec::new(),
         input_symbols: std::collections::BTreeMap::new(),
         input_names: f.params.iter().map(|p| p.name.clone()).collect(),
@@ -330,7 +334,6 @@ pub fn verify_cached(
             }
             let summary = encode(id, &functions, &names)?;
             r.vc_nodes = summary.nodes;
-            r.contract_digest = digest(&summary.contract_definitions);
             r.dependency_digests = edges[id]
                 .iter()
                 .map(|i| semantic_digests[*i].clone())
@@ -418,6 +421,7 @@ pub fn verify_cached(
                     r.obligations.push(Obligation {
                         kind: kind.into(),
                         solver_result: answer.clone(),
+                        expected_solver_result: want.into(),
                         counterexample_candidate: if answer != want { model } else { None },
                     });
                     if answer != want {

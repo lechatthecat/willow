@@ -337,6 +337,12 @@ proof evidence return exit 3; contract or approval-policy violations return exit
 The current comparison supports standalone top-level i64/bool contracts; unsupported
 imports and contract calls produce incomplete evidence.
 
+For failed edits, inspect `summary.verification.target` for proof obligations,
+`counterexample_candidate`, `input_symbols` and `unknown_reasons`.
+`summary.verification.source_path` scopes report locations and declaration IDs. Correct the implementation and rerun
+`check`, `verify-edit` and focused tests; see [the repair example](example/contract_repair.wi).
+A successful proof does not approve a changed contract: obtain independent review.
+
 `--write-contracts-lock` writes normalized contract and semantic digests to
 `contracts.lock`. Editing that file never grants approval. A trusted CI wrapper must
 supply the protected commit and, when approval is needed, `--approval-evidence FILE

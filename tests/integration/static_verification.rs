@@ -144,3 +144,11 @@ fn verified_diagnostic_codes_preserve_integer_exponent_error() {
         assert_compile_error_contains(&format!("{source} fn main() {{}}"), &[code]);
     }
 }
+
+#[test]
+fn contract_repair_example_runs() {
+    let source = include_str!("../../example/contract_repair.wi");
+    let (output, ok) = compile_and_run(source);
+    assert!(ok, "{output}");
+    assert_eq!(output, "0\n7\n");
+}

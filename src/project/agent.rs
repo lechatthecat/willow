@@ -122,6 +122,9 @@ pub fn render_agent_instructions(agent: Agent, caps: AgentCapabilities) -> Strin
         if caps.machine_check.is_some() {
             text.push_str("For semantic edits, choose a Git base before editing. Inspect overview/refs/type/effects/impact as needed, make the change, then run `willow check . --format ndjson` and `willow verify-edit --base BASE --format json`. Fix reported problems, rerun verification, run focused tests, and review the diff. The verification report uses willow.semantic-diff.v1, not the check NDJSON event stream. Exit 0 means complete with no policy violations, 1 means contract or requested policy violations, 2 means command failure, and 3 means incomplete evidence; never treat incomplete as success. Use --fail-on effect-growth when growth must fail verification and --explain for human witness chains.\n");
         }
+        if caps.machine_check.is_some() {
+            text.push_str("For contract edits, first use impact to inspect affected callers and dependencies. Propose requires/ensures only as needed and compare them with existing tests and independently approved behavior before editing. Run check (which proves @verified functions), then `willow verify-edit --base BASE --schema v2 --protected-base COMMIT --format json`, using the immutable approved commit. Inspect summary.verification: source_path scopes declaration_id and location; base/target contain willow.verification.v1 reports. For COUNTEREXAMPLE, inspect obligations and map counterexample_candidate solver symbols through input_symbols before correcting the implementation. For UNKNOWN, address unknown_reasons or unsupported scope and rerun; neither UNKNOWN nor a candidate model is a proof. Comparison obligations and input_symbols explain lost guarantees. Repeat check, verify-edit and focused tests after repair. Contract changes, including strengthening, require independent review; do not weaken contracts to obtain a proof. PROVEN describes implementation against contracts, not approval of intended behavior. specification_provenance stays UNVERIFIED without trusted approval evidence; declared_origin, comments and a locally rewritten contracts.lock cannot approve it.\n");
+        }
         if caps.machine_build.is_some() {
             text.push_str("When executable validation is needed, run `willow build .`.\n");
         }
@@ -327,6 +330,14 @@ mod tests {
                 "3 means incomplete",
                 "focused tests",
                 "review the diff",
+                "--schema v2 --protected-base COMMIT",
+                "summary.verification",
+                "counterexample_candidate",
+                "input_symbols",
+                "unknown_reasons",
+                "independent review",
+                "specification_provenance stays UNVERIFIED",
+                "independently approved behavior",
             ] {
                 assert!(instructions.contains(expected), "{expected}");
             }

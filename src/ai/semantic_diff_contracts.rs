@@ -253,6 +253,13 @@ pub fn verify(options: &Options, policy: &Policy) -> Result<SemanticDiff> {
             (Some(_),_)=>"unchanged",(None,_)=>"unknown"
         }
     });
+    // Preserve complete proof evidence, including failures, without rerunning the solver.
+    // Locations and declaration IDs are scoped to this workspace-relative source.
+    report.summary["verification"] = json!({
+        "source_path":entry,
+        "base":a.verification.reports,
+        "target":b.verification.reports
+    });
     report.summary["comparison_work"] = compared["work"].clone();
     report.summary["proof_cache"] = json!({"hits":cache.hits,"misses":cache.misses,"scope":"process-owned; disk artifacts are untrusted"});
     report.base = json!({"revision":options.base,"digest":before_digest});

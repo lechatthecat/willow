@@ -1,0 +1,13 @@
+// A repair exercise: replacing the body with `return x;` violates the contract.
+// Restore the negative-input branch after inspecting the counterexample.
+@pure
+@verified
+fn nonnegative(x: i64) -> i64 ensures result >= 0 {
+    if x < 0 { return 0; }
+    return x;
+}
+
+fn main() {
+    println(nonnegative(-7));
+    println(nonnegative(7));
+}

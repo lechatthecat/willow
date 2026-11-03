@@ -175,3 +175,145 @@ fn contract_comparison_cli_protected_manifest_and_semantic_status() {
         assert_eq!(report["changes"][0]["contract_preserved"], "PROVEN");
     }
 }
+
+#[test]
+fn contract_repair_cli_exposes_evidence_and_rechecks_fixed_source() {
+    let root = std::env::temp_dir().join(format!("willow-contract-repair-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.name", "Fixture"]);
+    git(&root, &["config", "user.email", "fixture@example.invalid"]);
+    let source = include_str!("../example/contract_repair.wi");
+    fs::write(root.join("main.wi"), source).unwrap();
+    git(&root, &["add", "main.wi"]);
+    git(&root, &["commit", "-qm", "Initial fixture"]);
+    let commit = git(&root, &["rev-parse", "HEAD"]);
+    let check = |expected: bool| {
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .args(["check"])
+            .arg(root.join("main.wi"))
+            .env("WILLOW_VERIFICATION_DIR", root.join("artifacts"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            expected,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let run = |expected: i32, missing_solver: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
+        command
+            .args(["verify-edit", "--root"])
+            .arg(&root)
+            .args([
+                "--base",
+                &commit,
+                "--schema",
+                "v2",
+                "--protected-base",
+                &commit,
+                "--format",
+                "json",
+            ])
+            .env("WILLOW_VERIFICATION_DIR", root.join("artifacts"));
+        if missing_solver {
+            command.env("WILLOW_Z3", root.join("missing-solver"));
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    check(true);
+    let initial = run(0, false);
+    let base = &initial["summary"]["verification"]["target"][0];
+    assert_eq!(base["status"], "PROVEN");
+    assert_eq!(initial["summary"]["verification"]["source_path"], "main.wi");
+    fs::write(
+        root.join("main.wi"),
+        source.replace("if x < 0 { return 0; }", ""),
+    )
+    .unwrap();
+    check(false);
+    let broken = run(1, false);
+    let evidence = &broken["summary"]["verification"]["target"][0];
+    assert_eq!(evidence["schema"], "willow.verification.v1");
+    assert_eq!(evidence["status"], "COUNTEREXAMPLE");
+    assert_eq!(evidence["declaration_id"], base["declaration_id"]);
+    assert_eq!(evidence["contract_digest"], base["contract_digest"]);
+    assert_eq!(evidence["input_symbols"]["a0_0"], "x");
+    let obligation = evidence["obligations"].as_array().unwrap().last().unwrap();
+    assert_eq!(obligation["kind"], "ensures truth");
+    assert!(
+        obligation["counterexample_candidate"]
+            .as_str()
+            .unwrap()
+            .contains("a0_0")
+    );
+    assert_eq!(
+        evidence["specification_provenance"]["approval_status"],
+        "UNVERIFIED"
+    );
+    for field in [
+        "location",
+        "analyzer_version",
+        "solver_version",
+        "verified_scope",
+        "dependencies",
+        "contract",
+    ] {
+        assert!(!evidence[field].is_null(), "{field}");
+    }
+    let unknown = run(3, true);
+    let evidence = &unknown["summary"]["verification"]["target"][0];
+    assert_eq!(evidence["status"], "UNKNOWN");
+    assert!(!evidence["unknown_reasons"].as_array().unwrap().is_empty());
+    assert_eq!(evidence["declaration_id"], base["declaration_id"]);
+    fs::write(root.join("main.wi"), source).unwrap();
+    check(true);
+    assert_eq!(run(0, false)["changes"][0]["implementation_verified"], true);
+    // A replacement contract can prove the faulty body but still needs independent approval.
+    fs::write(
+        root.join("main.wi"),
+        source
+            .replace("if x < 0 { return 0; }", "")
+            .replace("result >= 0", "result == x"),
+    )
+    .unwrap();
+    check(true);
+    let changed = run(1, false);
+    assert_eq!(
+        changed["summary"]["approval"]["approval_status"],
+        "approval_required"
+    );
+    assert_eq!(
+        changed["summary"]["approval"]["specification_provenance"],
+        "UNVERIFIED"
+    );
+    assert_eq!(changed["changes"][0]["contract_preserved"], "NOT_PRESERVED");
+    assert_eq!(
+        changed["changes"][0]["input_symbols"]["cmp0_return"],
+        "result"
+    );
+    assert!(
+        changed["changes"][0]["obligations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["counterexample_candidate"].is_string())
+    );
+}
