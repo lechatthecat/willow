@@ -352,3 +352,133 @@ fn block_arm_control_conditional_context_restores_on_failure() {
         );
     }
 }
+
+#[test]
+fn match_arm_reports_assignment_and_break_together() {
+    let source = r#"fn main() {
+        let xs: Array<Result<i64, String>> = [Ok(1), Err("x")];
+        let mut n = 0;
+        for r in xs {
+            match r { Ok(v) => n = n + v, Err(_) => break, }
+        }
+        println(n);
+    }"#;
+    let diagnostics = errors(source);
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "assignment in a match arm requires a block"
+    );
+    assert_eq!(
+        diagnostics[1].message,
+        "`break` in a match arm requires a block"
+    );
+}
+
+#[test]
+fn match_arm_recovery_preserves_later_diagnostics() {
+    // Operators, lvalue shapes, nested delimiters and optional arm commas.
+    for body in [
+        "n = v",
+        "n += v",
+        "n -= v",
+        "n *= v",
+        "n /= v",
+        "n %= v",
+        "n &= v",
+        "n |= v",
+        "n ^= v",
+        "n <<= v",
+        "n >>= v",
+        "obj.field = v",
+        "a[i] = v",
+        "C::field = v",
+        "n = f(1, 2)",
+        "n = [1, 2]",
+        "n = (1, 2)",
+        "n = if true { 1 } else { 2 }",
+        "n = match true { true => 1, false => 2 }",
+        "break",
+        "continue",
+    ] {
+        for separator in [",", ""] {
+            let source = format!(
+                "fn main() {{ match true {{ true => {body}{separator} false => break }} }}"
+            );
+            let diagnostics = errors(&source);
+            assert_eq!(diagnostics.len(), 2, "{source}: {diagnostics:?}");
+            assert!(diagnostics[0].message.contains("requires a block"));
+            assert_eq!(
+                diagnostics[1].message,
+                "`break` in a match arm requires a block"
+            );
+        }
+    }
+    for (arms, expected) in [
+        ("true => break, false => n = 1", 2),
+        (
+            "true => n = match false { _ => continue }, false => break",
+            3,
+        ),
+        ("true => { 1 }, false => break", 2),
+        ("true => break, false => { 1 }", 2),
+        ("true => n = 1, false => {}", 1),
+        ("true => {}, false => break,", 1),
+    ] {
+        let source = format!("fn main() {{ match true {{ {arms} }} }} fn next() {{}}");
+        let (program, diagnostics) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert_eq!(diagnostics.len(), expected, "{source}: {diagnostics:?}");
+        assert_eq!(program.items.len(), 2, "recovery lost a function");
+    }
+    for source in [
+        "fn main() { match true { _ => n = } }",
+        "fn main() { match true { _ => break",
+        "fn main() { match true { _ => n = f(1,",
+    ] {
+        assert!(!errors(source).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn match_arm_recovery_work_scales_linearly() {
+    for shape in ["wide", "rhs", "deep"] {
+        let mut samples = Vec::new();
+        for n in [8, 16, 32, 64] {
+            let (body, count) = match shape {
+                "wide" => (
+                    format!(
+                        "match true {{ {} }}",
+                        "_ => n = f(1, 2), _ => break,".repeat(n)
+                    ),
+                    2 * n,
+                ),
+                "rhs" => (
+                    format!(
+                        "match true {{ _ => n = f({}), _ => break }}",
+                        vec!["1"; n].join(",")
+                    ),
+                    2,
+                ),
+                _ => (
+                    format!(
+                        "{}0{}",
+                        "match true { _ => n = ".repeat(n),
+                        ", _ => break }".repeat(n)
+                    ),
+                    2 * n,
+                ),
+            };
+            let source = format!("fn main() {{ {body} }}");
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            PARSER_TOKEN_READS.with(|c| c.set(0));
+            let (_, diagnostics) = Parser::new(tokens).parse();
+            assert_eq!(diagnostics.len(), count, "{diagnostics:?}");
+            samples.push((n, PARSER_TOKEN_READS.with(|c| c.get())));
+        }
+        let slope = (samples[1].1 - samples[0].1) / 8;
+        for pair in samples.windows(2) {
+            assert_eq!(pair[1].1 - pair[0].1, slope * (pair[1].0 - pair[0].0));
+        }
+        eprintln!("recovery {shape}: {samples:?}");
+    }
+}

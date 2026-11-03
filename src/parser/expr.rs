@@ -1403,26 +1403,44 @@ impl Parser {
                 })
             } else if matches!(self.peek_kind(), TokenKind::Break | TokenKind::Continue) {
                 let keyword = self.peek_kind().keyword_name().unwrap();
-                return Err(self
+                let error = self
                     .err_at(
                         ErrorCode::E0102,
                         format!("`{keyword}` in a match arm requires a block"),
                         self.current_span(),
                     )
-                    .with_help(format!("use a block: `{{ {keyword}; }}`")));
+                    .with_help(format!("use a block: `{{ {keyword}; }}`"));
+                self.recovered_errors.push(error);
+                self.advance();
+                self.default_import_usage.restore(scope);
+                self.eat(TokenKind::Comma);
+                continue;
             } else {
                 let expr = self.parse_expr()?;
                 if matches!(self.peek_kind(), TokenKind::Eq)
                     || super::stmt::compound_assignment_op(self.peek_kind()).is_some()
                     || self.shift_assign_op().is_some()
                 {
-                    return Err(self
+                    let error = self
                         .err_at(
                             ErrorCode::E0102,
                             "assignment in a match arm requires a block",
                             self.current_span(),
                         )
-                        .with_help("use a block, for example `{ n += v; }` or `{ n = v; }`"));
+                        .with_help("use a block, for example `{ n += v; }` or `{ n = v; }`");
+                    self.recovered_errors.push(error);
+                    // Parse the RHS once so nested commas and matches retain
+                    // their normal boundaries and diagnostics. Omit the invalid
+                    // arm from the partial AST; parsing still fails overall.
+                    if self.shift_assign_op().is_some() {
+                        self.advance();
+                    }
+                    self.advance();
+                    let result = self.parse_expr();
+                    self.default_import_usage.restore(scope);
+                    result?;
+                    self.eat(TokenKind::Comma);
+                    continue;
                 }
                 MatchBody::Expr(Box::new(expr))
             };

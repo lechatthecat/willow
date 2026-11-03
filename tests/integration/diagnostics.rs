@@ -1504,3 +1504,35 @@ fn ticket_69_supported_example_runs() {
     assert!(success, "{output}");
     assert_eq!(output, "7\n42\n2.5\n");
 }
+
+#[test]
+fn match_arm_multiple_errors_in_one_check() {
+    let source = r#"fn main() {
+        let xs: Array<Result<i64, String>> = [Ok(1), Err("x")];
+        let mut n = 0;
+        for r in xs {
+            match r { Ok(v) => n = n + v, Err(_) => break, }
+        }
+        println(n);
+    }"#;
+    let path = temp_path(format!("match_arm_recovery_{}.wi", unique_test_id()));
+    fs::write(&path, source).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .arg("check")
+        .arg(&path)
+        .output()
+        .unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("error[E0102]").count(), 2, "{stderr}");
+    assert!(
+        stderr.contains("assignment in a match arm requires a block"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`break` in a match arm requires a block"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("{ break; }"), "{stderr}");
+}
