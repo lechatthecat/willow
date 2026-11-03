@@ -2,7 +2,10 @@
 //! owns parsing, import identity, type checking and concurrency checks.
 use std::{collections::BTreeMap, path::Path, process::Command, sync::Arc};
 
-use super::{PackageError, PathSource, source::contained_path};
+use super::{
+    PackageError, PathSource,
+    source::{canonical_root, contained_path, contained_path_in},
+};
 use crate::diagnostics::{Diagnostic, DiagnosticEmitter, Severity, source_map::SourceLookup};
 use serde::Serialize;
 
@@ -243,6 +246,18 @@ fn discover_sources_with_aliases(
     src: &Path,
     deduplicate_aliases: bool,
 ) -> Result<BTreeMap<String, std::path::PathBuf>, VerificationError> {
+    // Callers may spell the project root and its source root differently
+    // (one resolved, one through a symlinked location such as macOS `/var`).
+    // Resolve both once; the walk then compares one spelling throughout.
+    let resolved_root = canonical_root(root).map_err(package_error)?;
+    let lexical_root = if src.starts_with(root) {
+        root
+    } else {
+        &resolved_root
+    };
+    let resolved_src =
+        contained_path_in(lexical_root, &resolved_root, src).map_err(package_error)?;
+    let (root, src) = (resolved_root.as_path(), resolved_src.as_path());
     let mut stack = vec![src.to_path_buf()];
     let mut directories = std::collections::HashSet::new();
     let mut modules = BTreeMap::new();
@@ -389,6 +404,51 @@ fn check_tags(source: &PathSource) -> Result<(), VerificationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A project reached through a symlinked location (macOS temp dirs live
+    /// under `/var -> /private/var`) is still contained in its own root, while
+    /// a symlink inside it that leaves the root is still an escape.
+    #[cfg(unix)]
+    #[test]
+    fn source_discovery_accepts_symlinked_project_location() {
+        let base = std::env::temp_dir().join(format!(
+            "willow-discovery-symlinked-root-{}",
+            std::process::id()
+        ));
+        let real = base.join("real");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(real.join("src/nested")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(real.join("src/main.wi"), "fn main() {}").unwrap();
+        std::fs::write(real.join("src/nested/util.wi"), "fn util() {}").unwrap();
+        std::fs::write(outside.join("leak.wi"), "fn leak() {}").unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        for aliases in [false, true] {
+            let modules =
+                discover_sources_with_aliases(&alias, &alias.join("src"), aliases).unwrap();
+            assert_eq!(
+                modules.keys().collect::<Vec<_>>(),
+                ["main", "nested::util"],
+                "{modules:?}"
+            );
+            // Module paths are resolved, as for any other project location.
+            let resolved = std::fs::canonicalize(&real).unwrap();
+            assert!(modules.values().all(|path| path.starts_with(&resolved)));
+            // A package graph may hand over a resolved source root alongside
+            // the caller's spelling of the project root.
+            let mixed =
+                discover_sources_with_aliases(&alias, &resolved.join("src"), aliases).unwrap();
+            assert_eq!(mixed, modules);
+        }
+        std::os::unix::fs::symlink(&outside, real.join("src/escape")).unwrap();
+        for aliases in [false, true] {
+            let error =
+                discover_sources_with_aliases(&alias, &alias.join("src"), aliases).unwrap_err();
+            assert_eq!(error.kind, "package_path_escape", "{error:?}");
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn source_discovery_excludes_nested_edit_candidates() {
         for n in [1, 8, 32] {

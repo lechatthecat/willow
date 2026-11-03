@@ -2454,8 +2454,17 @@ impl TypeChecker {
                 // this statement branch.
                 // Generic prechecking revisits these bodies in the final pass;
                 // emit this advisory only with the final resolved types.
+                // `scope.add(task)` hands the task to the scope, whose
+                // `finish()` joins it; its returned handle is optional.
+                let scope_owned = matches!(&s.expr, Expr::MethodCall(call)
+                    if call.method == "add"
+                        && self
+                            .expr_types
+                            .get(&call.object.id())
+                            .is_some_and(|ty| builtin_types::is(ty, B::TaskScope)));
                 if !self.template_precheck
                     && self.error_generation == errors_before
+                    && !scope_owned
                     && (is_task_handle_type(&ty) || builtin_types::is(&ty, B::TaskResult))
                 {
                     self.push(

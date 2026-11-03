@@ -14,6 +14,8 @@ fn discarded_task_warning_cases() {
         "true ? work() : work();",
         "work(); work();",
         "let task = work(); task.result();",
+        "let s = TaskScope::new(); let t = s.add(work()); t; await s.finish();",
+        "let s = TaskScope::new(); s.finish();",
     ] {
         let source = format!("async fn work() -> i64 {{ return 1; }} async fn main() {{ {body} }}");
         let diagnostics = check_source(&source);
@@ -58,6 +60,9 @@ fn discarded_task_consumed_values_are_quiet() {
         "let value = 1; value;",
         "if true { await work(); }",
         "while false { await work(); }",
+        "let s = TaskScope::new(); s.add(work()); await s.finish();",
+        "let s = TaskScope::new(); let c = s.child(); c.add(work()); await s.finish();",
+        "let s = TaskScope::new(); if true { s.add(work()); } await s.finish();",
     ] {
         let source = format!(
             "fn plain() -> i64 {{ return 1; }} async fn work() -> i64 {{ return 1; }} async fn main() {{ {body} }}"

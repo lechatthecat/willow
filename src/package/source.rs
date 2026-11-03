@@ -95,9 +95,20 @@ pub(crate) fn canonical_root(path: &Path) -> Result<PathBuf, PackageError> {
 }
 
 pub(crate) fn contained_path(root: &Path, path: &Path) -> Result<PathBuf, PackageError> {
+    contained_path_in(root, root, path)
+}
+
+/// [`contained_path`] for a `path` spelled under `lexical_root`, an unresolved
+/// spelling of `canonical_root` (for example a symlinked project location).
+pub(crate) fn contained_path_in(
+    lexical_root: &Path,
+    canonical_root: &Path,
+    path: &Path,
+) -> Result<PathBuf, PackageError> {
+    let root = canonical_root;
     // Reject lexical escapes even when the target does not exist yet.
     let relative = path
-        .strip_prefix(root)
+        .strip_prefix(lexical_root)
         .map_err(|_| PackageError::PathEscape {
             root: root.into(),
             path: path.into(),

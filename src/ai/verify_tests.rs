@@ -10,7 +10,9 @@ impl Fixture {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
-        Self(path)
+        // `EditManifest::check` requires the resolved root its callers pass;
+        // the temp dir itself may be a symlink (macOS `/var`).
+        Self(fs::canonicalize(path).unwrap())
     }
     fn capture(&self, source: &str) -> Baseline {
         fs::write(self.0.join("main.wi"), source).unwrap();
