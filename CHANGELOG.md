@@ -4,6 +4,8 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
 
 ## Unreleased
 
+## 0.1.9 - 2026-11-04
+
 ### Breaking
 
 - **`i64` overflow now panics in debug builds.** `+`, `-`, `*`, `**` and
