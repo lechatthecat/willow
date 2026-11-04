@@ -78,7 +78,7 @@ jobs:
         run: |
           # Runner images put Cargo in different directories (~/.cargo/bin,
           # Homebrew's rustup), so drop every PATH entry that provides it.
-          PATH=$(printf '%s' "$PATH" | tr ':' '\n' | while IFS= read -r dir; do [ -x "$dir/cargo" ] || printf '%s\n' "$dir"; done | paste -sd: -)
+          PATH=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r dir; do [ -x "$dir/cargo" ] || printf '%s\n' "$dir"; done | paste -sd: -)
           if command -v cargo; then echo "cargo still on PATH"; exit 1; fi
           test "$("$PACKAGE/bin/willow" --version)" = "willow $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1) (commit $GITHUB_SHA)"
           printf 'fn main() {\n    print("hello");\n}\n' > "$RUNNER_TEMP/hello.wi"
