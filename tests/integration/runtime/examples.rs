@@ -1004,7 +1004,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/defer_result_handling.wi",
             "ignored body\nhandled body\ncleanup failed\nblock body\nblock: cleanup failed\n",
         ),
-        ("example/string_compare.wi", "true\ntrue\ntrue\ntrue\n"),
+        (
+            "example/string_compare.wi",
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        ),
         ("example/task_cancel.wi", "10\ntrue\n"),
         // fib_task(10), fib_task(15), then fib_task(20) = 6765 clamped to 1000.
         // The recursive helpers the example documents are deliberately not
