@@ -608,7 +608,7 @@ fn main() {
 fn prr_25_cancelled_await_fault_records_a_source_location() {
     let source = r#"
 async fn slow() -> i64 {
-    await sleep(50);
+    await sleep(600000);
     return 1;
 }
 

@@ -1437,9 +1437,9 @@ fn async_lir_65_select_join_over_task_result_binds_the_wrapped_type() {
     // wrapper's representation, and for a scalar `T` the collector would then
     // trace the integer as a pointer.
     let source = r#"
-async fn worker(n: i64) -> i64 { await sleep(1); return n * 2; }
+async fn worker(n: i64, ms: i64) -> i64 { await sleep(ms); return n * 2; }
 async fn main() {
-    let good = worker(21);
+    let good = worker(21, 1);
     select {
         let r = await good.result() => {
             match r {
@@ -1449,7 +1449,9 @@ async fn main() {
         }
         sleep(5000) => { println("timeout"); }
     }
-    let stopped = worker(3);
+    // Sleeps past the select timeout, so a preempted main cannot lose the
+    // race to the task finishing before `cancel` runs.
+    let stopped = worker(3, 60000);
     stopped.cancel();
     select {
         let r = await stopped.result() => {
