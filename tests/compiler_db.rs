@@ -55,9 +55,13 @@ impl Project {
             .env("WILLOW_PANIC_EFFECTS_LOG", "1")
             .output()
             .unwrap();
+        // Imported modules report the resolved path, which can spell the temp
+        // directory differently (Windows 8.3 names, macOS `/var`).
+        let resolved = std::fs::canonicalize(&self.0).unwrap();
         let normalize = |bytes: Vec<u8>| {
             let mut text = String::from_utf8(bytes)
                 .unwrap()
+                .replace(resolved.to_str().unwrap(), "<project>")
                 .replace(self.0.to_str().unwrap(), "<project>")
                 .lines()
                 // The runtime auto-build's cargo status line carries a
