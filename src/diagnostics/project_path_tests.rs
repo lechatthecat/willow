@@ -45,6 +45,55 @@ fn project_paths_borrow_sources_and_preserve_external_and_virtual_names() {
     }
 }
 
+/// Module discovery reports the resolved root, while the caller may have
+/// spelled the project through a symlinked location.
+#[cfg(unix)]
+#[test]
+fn project_paths_are_relative_to_the_resolved_root_spelling() {
+    struct Inspect(&'static str);
+    impl DiagnosticEmitter for Inspect {
+        fn emit(&mut self, _: &Diagnostic, sources: &dyn SourceLookup) -> std::io::Result<()> {
+            assert_eq!(sources.display_path(FileId::ENTRY), Some(self.0));
+            Ok(())
+        }
+    }
+    let base =
+        std::env::temp_dir().join(format!("willow-project-path-alias-{}", std::process::id()));
+    let real = base.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let alias = base.join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let resolved = std::fs::canonicalize(&real).unwrap().join("leaf.wi");
+    let outside = std::fs::canonicalize(&base).unwrap().join("other.wi");
+    for (path, expected) in [
+        (resolved.to_str().unwrap(), "leaf.wi"),
+        (alias.join("leaf.wi").to_str().unwrap(), "leaf.wi"),
+    ] {
+        let map = SourceMap::new(path, "x");
+        ProjectEmitter {
+            root: &alias,
+            inner: &mut Inspect(expected),
+        }
+        .emit(
+            &Diagnostic::new(Severity::Error, ErrorCode::E0001, "example"),
+            &map,
+        )
+        .unwrap();
+    }
+    let map = SourceMap::new(outside.to_str().unwrap(), "x");
+    let shown: &'static str = outside.to_str().unwrap().to_owned().leak();
+    ProjectEmitter {
+        root: &alias,
+        inner: &mut Inspect(shown),
+    }
+    .emit(
+        &Diagnostic::new(Severity::Error, ErrorCode::E0001, "example"),
+        &map,
+    )
+    .unwrap();
+    std::fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn project_path_lookup_counts_and_write_failure() {
     struct Counted {

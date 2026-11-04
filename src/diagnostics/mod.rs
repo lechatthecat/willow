@@ -49,13 +49,14 @@ impl DiagnosticEmitter for ProjectEmitter<'_> {
 
             fn display_path(&self, file_id: FileId) -> Option<&str> {
                 let path = self.sources.display_path(file_id)?;
-                Some(
-                    std::path::Path::new(path)
-                        .strip_prefix(self.root)
-                        .ok()
-                        .and_then(|relative| relative.to_str())
-                        .unwrap_or(path),
-                )
+                let file = std::path::Path::new(path);
+                // Discovered modules carry the resolved root, which can be
+                // spelled differently: macOS `/var`, Windows `\\?\` prefixes.
+                let relative = file.strip_prefix(self.root).ok().or_else(|| {
+                    let resolved = std::fs::canonicalize(self.root).ok()?;
+                    file.strip_prefix(resolved).ok()
+                });
+                Some(relative.and_then(std::path::Path::to_str).unwrap_or(path))
             }
         }
         self.inner.emit(

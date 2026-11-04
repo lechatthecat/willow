@@ -45,7 +45,8 @@ pub fn add(a: i64, b: i64) -> i64 {
 elif host.endswith("windows-msvc"):
     obj = root / "add.obj"
     subprocess.run([os.environ.get("CC", "cl"), "/nologo", "/c", str(source / "add.c"), "/Fo" + str(obj)], check=True)
-    subprocess.run(["lib", "/nologo", "/OUT:" + str(artifact / "add.lib"), str(obj)], check=True)
+    # lib.exe records member names as given; archives must not name absolute paths.
+    subprocess.run(["lib", "/nologo", "/OUT:" + str(artifact / "add.lib"), obj.name], cwd=root, check=True)
     abi, archive = "c-msvc", "add.lib"
     obj.unlink()
 else:
