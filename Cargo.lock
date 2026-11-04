@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "willow"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "cc",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "willow_abi"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "willow_continuations"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -974,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "willow_runtime"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "corosensei",
  "crossbeam-deque",
@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "willow_runtime_macros"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "quote",
  "syn",

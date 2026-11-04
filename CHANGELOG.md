@@ -4,6 +4,11 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
 
 ## Unreleased
 
+## 0.1.10 - 2026-11-05
+
+The 0.1.9 release build failed, so 0.1.9 was never published. This release
+contains the 0.1.9 changes below.
+
 ## 0.1.9 - 2026-11-04
 
 ### Breaking
