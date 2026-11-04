@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use super::rust_bridge;
+
 pub mod distribution;
 mod graph;
 mod payload;
@@ -147,8 +149,9 @@ fn relative(path: &str) -> Result<()> {
 }
 fn rooted(root: &Path, path: &str) -> Result<PathBuf> {
     relative(path)?;
-    let root = root.canonicalize()?;
-    let joined = root.join(path).canonicalize()?;
+    // These paths become linker arguments, which cannot be verbatim paths.
+    let root = rust_bridge::canonicalize(root)?;
+    let joined = rust_bridge::canonicalize(&root.join(path))?;
     ensure!(joined.starts_with(root), "native_path_escape: {path}");
     Ok(joined)
 }

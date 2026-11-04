@@ -44,7 +44,7 @@ pub(super) fn fetch_with(
         url.starts_with("https://"),
         "native_unpinned_source: HTTPS and digest required"
     );
-    let mut directory = root.canonicalize()?;
+    let mut directory = rust_bridge::canonicalize(root)?;
     for part in [".willow", "native", expected] {
         directory.push(part);
         match std::fs::symlink_metadata(&directory) {

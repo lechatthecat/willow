@@ -835,7 +835,7 @@ fn hash(bytes: &[u8]) -> String {
 /// `fs::canonicalize` without the Windows `\\?\` verbatim prefix. MSVC's
 /// `cl.exe` cannot open a verbatim archive path (LNK1104), and Cargo echoes
 /// the `--target-dir` spelling into its artifact paths.
-fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+pub(super) fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     let path = fs::canonicalize(path)?;
     #[cfg(windows)]
     {

@@ -920,3 +920,17 @@ fn native_comdat_symbol_index_scales_in_one_pass() {
         println!("COMDAT groups={count} symbol_index_visits={visits}");
     }
 }
+
+#[test]
+fn resolved_inputs_are_paths_the_linker_can_open() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("add.lib"), b"archive").unwrap();
+    let path = rooted(&fixture.0, "add.lib").unwrap();
+    assert!(path.is_absolute(), "{}", path.display());
+    assert!(
+        !path.to_string_lossy().starts_with(r"\\?\"),
+        "{}",
+        path.display()
+    );
+    assert_eq!(fs::read(path).unwrap(), b"archive");
+}
