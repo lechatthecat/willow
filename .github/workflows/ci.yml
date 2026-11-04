@@ -19,9 +19,10 @@ jobs:
   workspace:
     name: ${{ matrix.os }} / ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    # Ubuntu runners spend ~53 min in the integration binary alone; the
-    # remaining workspace tests, stress steps and example audit exceed 90.
-    timeout-minutes: 180
+    # Ubuntu runners spend ~73 min in the integration binary alone, and macOS
+    # and Windows runners vary by about 1.7x between runs. A full job can pass
+    # 180 min on a slow runner, so this limit only guards against hangs.
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
