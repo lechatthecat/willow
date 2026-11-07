@@ -198,6 +198,38 @@ pub(crate) unsafe fn discard_parked_roots(token: u64) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
+    add_address_root(object, |_| true);
+}
+
+/// Register a task frame the caller still owns exclusively. A registration only
+/// queues the children already stored in its owner, and every later frame store
+/// passes the write barrier, so a frame whose reference slots are all null owes
+/// the next minor nothing. Such frames skip the queue: otherwise each spawn costs
+/// one remembered-owner scan in the serial stop, whether or not the task has
+/// already finished.
+pub(crate) fn add_task_frame_root(frame: *mut u8) {
+    add_address_root(frame, frame_has_initial_references);
+}
+
+/// Type id of frames from `willow_async_frame_alloc`; no trace hook can claim it.
+const ASYNC_FRAME_TYPE_ID: u32 = 0;
+
+/// Inline-traced frames are decided from their reference mask. Bitmap and
+/// runtime-traced layouts keep the conservative scan obligation.
+fn frame_has_initial_references(frame: *mut u8) -> bool {
+    let Some(payload) = GcPayload::from_raw(frame) else {
+        return false;
+    };
+    let object = HeapObject::from_payload(payload);
+    let metadata = object.trace_metadata();
+    metadata.type_id != ASYNC_FRAME_TYPE_ID
+        || inline_reference_slots(object, metadata)
+            // SAFETY: the mask bounds each slot within the live frame payload,
+            // and this thread wrote them before any other thread can see it.
+            .any(|slot| !unsafe { *slot }.is_null())
+}
+
+fn add_address_root(object: *mut u8, owes_initial_scan: impl FnOnce(*mut u8) -> bool) {
     if object.is_null() {
         return;
     }
@@ -216,7 +248,7 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
     if marking && let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref() {
         cycle.enqueue(object);
     }
-    if runtime().tlab_ever_allocated.load(Ordering::Acquire) {
+    if runtime().tlab_ever_allocated.load(Ordering::Acquire) && owes_initial_scan(object) {
         runtime().runtime_roots.add_pending(object);
     } else {
         runtime().runtime_roots.add(object);

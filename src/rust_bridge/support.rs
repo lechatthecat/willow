@@ -41,10 +41,13 @@ impl BridgeFrame {
         unsafe { &*value }
     }
     fn release_handles(&mut self) {
-        // Release native borrows before allocating Willow output objects. A
-        // user destructor may itself call into the collector.
+        // Release native borrows before allocating Willow output objects. The
+        // last lease runs a user destructor, which can block like any body.
         let leases = std::mem::take(self.handles.get_mut());
-        drop(leases);
+        if !leases.is_empty() {
+            let _region = BridgeRegion::enter();
+            drop(leases);
+        }
     }
     fn root(&self, object: u64) {
         unsafe { willow_rust_bridge_root(self.raw, object) }
@@ -112,7 +115,7 @@ impl Drop for BridgeFrame {
     fn drop(&mut self) {
         // User destructors run while outputs remain rooted and inside the
         // generated catch_unwind boundary.
-        self.handles.get_mut().clear();
+        self.release_handles();
         unsafe { willow_rust_bridge_frame_drop(self.raw) }
     }
 }

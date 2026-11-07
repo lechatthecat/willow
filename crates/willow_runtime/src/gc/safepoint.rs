@@ -79,16 +79,52 @@ pub(crate) fn set_relocation_safe(value: bool) -> bool {
 #[derive(Default)]
 pub(super) struct PublishedRoots {
     pub(super) slots: Vec<usize>,
+    /// Context whose slots the next stop reads into `slots`. Entering a safe
+    /// region stays independent of root depth, and a region no stop reaches
+    /// never walks its roots.
+    deferred: Option<QuiescentContext>,
     pub(super) relocatable: bool,
     pub(super) satb_buffer: Option<Arc<satb::MutatorBuffer>>,
 }
+
+/// Active context of a thread inside a safe region.
+struct QuiescentContext(*const crate::generated_context::Context);
+
+// SAFETY: only a stopped collector dereferences this, under the coordination
+// lock, while the owner stays in its region. Leaving the region clears it.
+unsafe impl Send for QuiescentContext {}
 
 impl PublishedRoots {
     pub(super) fn current(slots: Vec<usize>) -> Self {
         Self {
             slots,
+            deferred: None,
             relocatable: relocation_safe(),
             satb_buffer: current_satb_buffer(),
+        }
+    }
+
+    /// Publication for a safe region: O(1), whatever the root depth.
+    fn deferred() -> Self {
+        Self {
+            slots: Vec::new(),
+            deferred: Some(QuiescentContext(crate::generated_context::active())),
+            relocatable: relocation_safe(),
+            satb_buffer: current_satb_buffer(),
+        }
+    }
+
+    /// Read deferred slots once; later stops of the same region reuse them.
+    fn materialize(&mut self) {
+        let Some(QuiescentContext(context)) = self.deferred.take() else {
+            return;
+        };
+        // SAFETY: the world is stopped and the owner cannot leave its region
+        // without the coordination lock this collector holds.
+        unsafe {
+            crate::generated_context::visit_quiescent_roots(context, |slots| {
+                append_live_root_slots(slots, &mut self.slots);
+            });
         }
     }
 
@@ -111,16 +147,18 @@ impl PublishedRoots {
 /// dead local. The owning stack cannot mutate until STW ends.
 pub(super) fn snapshot_local_root_slots() -> Vec<usize> {
     let mut result = Vec::new();
-    crate::generated_context::visit_roots(|slots| {
-        result.extend(
-            slots
-                .iter()
-                .copied()
-                .filter(|&slot| RootSlot::from_raw(slot).and_then(RootSlot::load).is_some())
-                .map(|slot| slot as usize),
-        );
-    });
+    crate::generated_context::visit_roots(|slots| append_live_root_slots(slots, &mut result));
     result
+}
+
+fn append_live_root_slots(slots: &[*mut *mut u8], result: &mut Vec<usize>) {
+    result.extend(
+        slots
+            .iter()
+            .copied()
+            .filter(|&slot| RootSlot::from_raw(slot).and_then(RootSlot::load).is_some())
+            .map(|slot| slot as usize),
+    );
 }
 
 /// Registered mutators each legitimately own their own thread-local root stack;
@@ -444,9 +482,10 @@ pub extern "C" fn willow_gc_safepoint() {
     coord.parked.remove(&id);
 }
 
-/// Keeps a scheduler waiter visible to collectors without waking it for every
-/// stop. The owner publishes slots once; stopped collectors can use them until
-/// Drop takes the same coordination lock and observes the world running again.
+/// Keeps a waiting thread visible to collectors without waking it for every
+/// stop. The owner publishes its context in O(1); the first stop reads the
+/// slots, and later stops reuse them until Drop takes the same coordination
+/// lock and observes the world running again.
 pub(crate) struct IdleMutator {
     registered: bool,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
@@ -456,7 +495,7 @@ impl IdleMutator {
     /// # Safety
     /// Until this guard is dropped, the caller must not access managed objects,
     /// root slots, TLAB state, or SATB buffers, or call back into managed code.
-    /// It may only wait on native scheduler synchronization. Relocation safety
+    /// It may only wait on native synchronization or OS calls. Relocation safety
     /// is inherited from the caller; raw runtime references remain pinned.
     pub(crate) unsafe fn enter() -> Self {
         let registered = current_thread_is_registered();
@@ -466,17 +505,32 @@ impl IdleMutator {
             let (lock, cv) = &runtime().coord;
             let mut coord = lock.lock().unwrap();
             let id = std::thread::current().id();
-            let roots = PublishedRoots::current(snapshot_local_root_slots());
             *coord
                 .mutators
                 .get_mut(&id)
-                .expect("registered idle mutator") = roots;
+                .expect("registered idle mutator") = PublishedRoots::deferred();
             assert!(coord.parked.insert(id), "nested idle mutator guard");
             coord.stw_pending.remove(&id);
             if coord.stop_requested && coord.stw_pending.is_empty() {
                 cv.notify_all();
             }
         }
+        Self {
+            registered,
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    /// Hand the region to a caller across an ABI boundary.
+    pub(crate) fn into_raw(self) -> bool {
+        let registered = self.registered;
+        std::mem::forget(self);
+        registered
+    }
+
+    /// # Safety
+    /// `registered` must come from `into_raw` on this thread, exactly once.
+    pub(crate) unsafe fn from_raw(registered: bool) -> Self {
         Self {
             registered,
             _thread: std::marker::PhantomData,
@@ -489,12 +543,60 @@ impl Drop for IdleMutator {
         if !self.registered {
             return;
         }
+        // This also runs while foreign code unwinds; a second panic would abort.
         let (lock, cv) = &runtime().coord;
-        let mut coord = lock.lock().unwrap();
+        let mut coord = lock.lock().unwrap_or_else(|poison| poison.into_inner());
         while coord.stop_requested {
-            coord = cv.wait(coord).unwrap();
+            coord = cv.wait(coord).unwrap_or_else(|poison| poison.into_inner());
         }
-        coord.parked.remove(&std::thread::current().id());
+        let id = std::thread::current().id();
+        if let Some(published) = coord.mutators.get_mut(&id) {
+            published.deferred = None;
+        }
+        coord.parked.remove(&id);
+    }
+}
+
+/// Run `work` in a GC safe region: collections proceed without this thread,
+/// which parks on return if a stop is still active.
+///
+/// # Safety
+/// `work` must meet the [`IdleMutator::enter`] contract. Callers must not read
+/// a raw managed pointer after this returns unless a pin keeps it in place.
+pub(crate) unsafe fn run_blocking<T>(work: impl FnOnce() -> T) -> T {
+    let _idle = unsafe { IdleMutator::enter() };
+    work()
+}
+
+/// Foreign code inside a region can still request a collection. It runs as an
+/// ordinary mutator, since parking there would otherwise end the region, then
+/// the region resumes for whatever the foreign code does next.
+pub(super) struct RegionReentry(bool);
+
+impl RegionReentry {
+    pub(super) fn enter() -> Self {
+        let id = std::thread::current().id();
+        let coord = runtime()
+            .coord
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let inside = coord.parked.contains(&id);
+        drop(coord);
+        if inside {
+            // SAFETY: a running thread is parked only by its own region.
+            drop(unsafe { IdleMutator::from_raw(true) });
+        }
+        Self(inside)
+    }
+}
+
+impl Drop for RegionReentry {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: the foreign caller already holds the region contract.
+            unsafe { IdleMutator::enter() }.into_raw();
+        }
     }
 }
 
@@ -542,6 +644,9 @@ pub(super) fn with_stw<R>(
         let _interval = crate::gc_telemetry::observations::Span::new(
             crate::gc_telemetry::observations::Kind::Collector,
         );
+        for published in coord.mutators.values_mut() {
+            published.materialize();
+        }
         collect(&coord, measurement.work())
     }));
     let collector_end = crate::gc_telemetry::timestamp_ns();

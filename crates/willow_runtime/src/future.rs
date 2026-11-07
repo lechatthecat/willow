@@ -310,7 +310,9 @@ impl WillowFutureVoid {
             }
             let remaining = deadline.checked_duration_since(Instant::now());
             if let Some(remaining) = remaining {
-                std::thread::sleep(remaining);
+                // SAFETY: the sleep touches no runtime state, and neither this
+                // frame nor its callers keep a managed pointer across the wait.
+                unsafe { crate::gc::run_blocking(|| std::thread::sleep(remaining)) };
             }
         }
         true

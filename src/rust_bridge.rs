@@ -134,6 +134,7 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
         "#[cfg(panic = \"abort\")] compile_error!(\"Rust bridge requires panic=unwind\");\n",
     );
     source.push_str(include_str!("rust_bridge/panic.rs"));
+    source.push_str(include_str!("rust_bridge/region.rs"));
     source.push_str("#[allow(dead_code)] mod handles {\n");
     source.push_str(include_str!(
         "../crates/willow_runtime/src/rust_bridge/handles.rs"
@@ -182,7 +183,7 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
         }
         write!(
             source,
-            ") -> {} = bridge::r#{target};\nadapter(",
+            ") -> {} = bridge::r#{target};\nlet _region = BridgeRegion::enter();\nadapter(",
             symbol.output_type.rust()
         )
         .unwrap();

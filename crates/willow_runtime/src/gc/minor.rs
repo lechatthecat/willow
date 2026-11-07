@@ -1433,10 +1433,12 @@ fn minor_collect_with_roots(
             .survivor_bytes
             .saturating_sub(copied_before);
     state.tenuring.complete(young_before, survived);
+    let allocators = std::mem::take(&mut state.young_allocators);
     state.nursery_threshold_bytes = state.nursery_policy.next(
         state.nursery_threshold_bytes,
         young_before,
         survived,
+        allocators,
         state.memory_limit_bytes,
     );
     if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()

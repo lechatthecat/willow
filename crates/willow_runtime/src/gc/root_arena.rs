@@ -1,6 +1,6 @@
 use super::*;
 
-/// Stable mutable GC-reference slot owned by a [`GcRootArena`].
+/// Stable mutable GC-reference slot, alone or in a [`GcRootArena`] chunk.
 ///
 /// The collector receives the address of `value` and may rewrite it when a
 /// young object moves. `Arc` ownership makes that address independent of arena
@@ -35,8 +35,23 @@ impl GcRootCell {
 /// the physical slot until owner finalization, preserving trace-slot lifetimes.
 #[must_use = "retain the handle while its GC reference must remain rooted"]
 pub(crate) struct GcRootHandle {
-    cell: Arc<GcRootCell>,
-    registered: bool,
+    cell: CellOwner,
+}
+
+enum CellOwner {
+    /// Listed in the runtime root registry until the handle drops.
+    Registered(Arc<GcRootCell>),
+    /// Traced through its arena, which also keeps the chunk.
+    Arena { chunk: Arc<ArenaChunk>, slot: u8 },
+}
+
+impl CellOwner {
+    fn cell(&self) -> &GcRootCell {
+        match self {
+            Self::Registered(cell) => cell,
+            Self::Arena { chunk, slot } => &chunk[*slot as usize],
+        }
+    }
 }
 
 impl GcRootHandle {
@@ -46,19 +61,22 @@ impl GcRootHandle {
         let cell = Arc::new(GcRootCell(std::sync::atomic::AtomicPtr::new(value)));
         willow_gc_add_runtime_root_slot(cell.0.as_ptr());
         Self {
-            cell,
-            registered: true,
+            cell: CellOwner::Registered(cell),
         }
+    }
+
+    fn slot(&self) -> *mut *mut u8 {
+        self.cell.cell().0.as_ptr()
     }
 
     pub(crate) fn load(&self) -> *mut u8 {
         // SAFETY: see `GcRootCell`'s synchronization contract.
-        self.cell.0.load(Ordering::Acquire)
+        self.cell.cell().0.load(Ordering::Acquire)
     }
 
     pub(crate) fn store(&self, value: *mut u8) {
         let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-        self.cell.replace(value, |old| {
+        self.cell.cell().replace(value, |old| {
             willow_gc_write_barrier(
                 std::ptr::null_mut(),
                 old,
@@ -78,8 +96,8 @@ impl GcRootHandle {
 impl Drop for GcRootHandle {
     fn drop(&mut self) {
         self.release();
-        if self.registered {
-            willow_gc_remove_runtime_root_slot(self.cell.0.as_ptr());
+        if matches!(self.cell, CellOwner::Registered(_)) {
+            willow_gc_remove_runtime_root_slot(self.slot());
         }
     }
 }
@@ -132,7 +150,7 @@ impl<T> PinLease<T> {
     pub(crate) fn new(value: *mut u8) -> Self {
         let _no_preempt = crate::preempt::NoPreemptGuard::enter();
         let root = GcRootHandle::new(value);
-        runtime().pin_lease_slots.add(root.cell.0.as_ptr().cast());
+        runtime().pin_lease_slots.add(root.slot().cast());
         Self {
             root,
             kind: std::marker::PhantomData,
@@ -148,9 +166,7 @@ impl<T> PinLease<T> {
 impl<T> Drop for PinLease<T> {
     fn drop(&mut self) {
         let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-        runtime()
-            .pin_lease_slots
-            .remove(self.root.cell.0.as_ptr().cast());
+        runtime().pin_lease_slots.remove(self.root.slot().cast());
         // The handle's Drop performs the deletion barrier and unregisters.
     }
 }
@@ -162,12 +178,30 @@ impl<T> Drop for PinLease<T> {
 /// storage. Logical release nulls the slot immediately and task metadata may be
 /// reclaimed; physical slot reclamation is synchronized with owner finalization.
 pub(crate) struct GcRootArena {
-    cells: Mutex<Vec<Arc<GcRootCell>>>,
+    cells: Mutex<ArenaCells>,
+}
+
+/// Each spawned scope member takes one slot, so slots are allocated in chunks
+/// rather than one heap allocation per member.
+const ARENA_CHUNK_SLOTS: usize = 8;
+type ArenaChunk = [GcRootCell; ARENA_CHUNK_SLOTS];
+
+#[derive(Default)]
+struct ArenaCells {
+    chunks: Vec<Arc<ArenaChunk>>,
+    /// Slots handed out; only the last chunk may have unused slots.
+    len: usize,
+}
+
+impl ArenaCells {
+    fn cell(&self, index: usize) -> &GcRootCell {
+        &self.chunks[index / ARENA_CHUNK_SLOTS][index % ARENA_CHUNK_SLOTS]
+    }
 }
 
 impl Default for GcRootArena {
     fn default() -> Self {
-        let cells = Mutex::new(Vec::new());
+        let cells = Mutex::new(ArenaCells::default());
         // Some platforms lazily allocate native mutex storage on first use,
         // including try_lock(). Pay that cost before publishing the arena so
         // even its first, empty snapshot remains allocation-free.
@@ -178,20 +212,41 @@ impl Default for GcRootArena {
 
 impl GcRootArena {
     pub(crate) fn insert(&self, owner: *mut u8, value: *mut u8) -> GcRootHandle {
-        willow_gc_write_barrier(
-            owner,
-            std::ptr::null_mut(),
-            value,
-            GcStoreDestination::ContainerInternal as i64,
-        );
-        let cell = Arc::new(GcRootCell(std::sync::atomic::AtomicPtr::new(value)));
-        self.cells
+        if owner.is_null() {
+            willow_gc_write_barrier(
+                owner,
+                std::ptr::null_mut(),
+                value,
+                GcStoreDestination::ContainerInternal as i64,
+            );
+        } else {
+            // Owners are object payload starts and so are their values, which
+            // lets an old value skip the heap lock while marking is inactive.
+            write_barrier_object_owner(
+                owner,
+                std::ptr::null_mut(),
+                value,
+                GcStoreDestination::ContainerInternal as i64,
+            );
+        }
+        let mut cells = self
+            .cells
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(Arc::clone(&cell));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = cells.len % ARENA_CHUNK_SLOTS;
+        if slot == 0 {
+            cells.chunks.push(Arc::new(std::array::from_fn(|_| {
+                GcRootCell(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+            })));
+        }
+        let chunk = Arc::clone(cells.chunks.last().expect("chunk was just ensured"));
+        chunk[slot].0.store(value, Ordering::Release);
+        cells.len += 1;
         GcRootHandle {
-            cell,
-            registered: false,
+            cell: CellOwner::Arena {
+                chunk,
+                slot: slot as u8,
+            },
         }
     }
 
@@ -200,7 +255,7 @@ impl GcRootArena {
             .cells
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        slots.extend(cells.iter().map(|cell| cell.0.as_ptr()));
+        slots.extend((0..cells.len).map(|index| cells.cell(index).0.as_ptr()));
     }
 
     /// Copy a bounded prefix of stable cells without waiting on an arena writer.
@@ -217,12 +272,10 @@ impl GcRootArena {
             Err(std::sync::TryLockError::WouldBlock) => return None,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
         };
-        let bound = bound.min(cells.len());
+        let bound = bound.min(cells.len);
         let end = cursor.saturating_add(limit).min(bound);
         children.extend(
-            cells[cursor.min(bound)..end]
-                .iter()
-                .map(|cell| cell.0.load(Ordering::Acquire)),
+            (cursor.min(bound)..end).map(|index| cells.cell(index).0.load(Ordering::Acquire)),
         );
         Some((end, bound))
     }
@@ -232,7 +285,7 @@ impl GcRootArena {
         self.cells
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+            .len
     }
 }
 

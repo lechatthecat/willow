@@ -245,6 +245,12 @@ struct LocalRunQueue {
     inbox: Injector<RuntimeTaskId>,
     owner: Mutex<Option<Worker<RuntimeTaskId>>>,
     stealer: Stealer<RuntimeTaskId>,
+    /// Tasks spawned by this worker's polls, newest first. A spawn tree then
+    /// runs depth-first, so its live tasks stay near its depth times fan-out
+    /// instead of its size, while thieves take the oldest (largest) subtrees.
+    /// Wakes, yields and preemptions stay on the FIFO deque above.
+    spawned_owner: Mutex<Option<Worker<RuntimeTaskId>>>,
+    spawned_stealer: Stealer<RuntimeTaskId>,
     len: AtomicUsize,
     prefer_global: AtomicBool,
 }
@@ -253,10 +259,14 @@ impl LocalRunQueue {
     fn new() -> Self {
         let owner = Worker::new_fifo();
         let stealer = owner.stealer();
+        let spawned = Worker::new_lifo();
+        let spawned_stealer = spawned.stealer();
         Self {
             inbox: Injector::new(),
             owner: Mutex::new(Some(owner)),
             stealer,
+            spawned_owner: Mutex::new(Some(spawned)),
+            spawned_stealer,
             len: AtomicUsize::new(0),
             prefer_global: AtomicBool::new(false),
         }
@@ -289,12 +299,59 @@ impl LocalRunQueue {
         backlog
     }
 
+    /// Publish a task spawned by the current poll. False when this thread does
+    /// not own the queue; the caller then uses the global queue.
+    fn publish_spawned(&self, id: RuntimeTaskId) -> bool {
+        LOCAL_QUEUE_OWNER.with(|slot| {
+            let slot = slot.borrow();
+            let Some(owner) = slot
+                .as_ref()
+                .filter(|owner| owner.queue == self as *const _ as usize)
+            else {
+                return false;
+            };
+            // Count before publication, as in `publish`.
+            self.len.fetch_add(1, Ordering::AcqRel);
+            owner.spawned.push(id);
+            true
+        })
+    }
+
     fn steal(&self) -> Option<RuntimeTaskId> {
-        let id = steal_retry(&self.stealer).or_else(|| steal_retry(&self.inbox));
+        let id = self.steal_without_count();
         if id.is_some() {
             self.len.fetch_sub(1, Ordering::AcqRel);
         }
         id
+    }
+
+    /// Steal for the worker that owns `thief`. Half of the victim's oldest
+    /// spawns move at once: the leaves of a spawn tree last a microsecond each,
+    /// so a thief taking one at a time would idle and park after every task.
+    fn steal_into(&self, thief: &Self) -> Option<RuntimeTaskId> {
+        let batched = LOCAL_QUEUE_OWNER.with(|slot| {
+            let slot = slot.borrow();
+            let owner = slot
+                .as_ref()
+                .filter(|owner| owner.queue == thief as *const _ as usize)?;
+            let id = loop {
+                match self.spawned_stealer.steal_batch_and_pop(&owner.stolen) {
+                    Steal::Success(id) => break id,
+                    Steal::Empty => return None,
+                    Steal::Retry => std::hint::spin_loop(),
+                }
+            };
+            // Count at the thief before the victim gives its count up, so an
+            // idle-stop snapshot cannot miss a task in flight between them.
+            let moved = owner.stolen.len();
+            thief.len.fetch_add(moved, Ordering::AcqRel);
+            while let Some(stolen) = owner.stolen.pop() {
+                owner.spawned.push(stolen);
+            }
+            self.len.fetch_sub(moved + 1, Ordering::AcqRel);
+            Some(id)
+        });
+        batched.or_else(|| self.steal())
     }
 
     fn pop(&self) -> Option<RuntimeTaskId> {
@@ -303,10 +360,24 @@ impl LocalRunQueue {
             let owner = slot
                 .as_ref()
                 .filter(|context| context.queue == self as *const _ as usize)?;
-            owner
-                .worker
-                .pop()
-                .or_else(|| steal_retry_batch(&self.inbox, &owner.worker))
+            let fifo = || {
+                owner
+                    .worker
+                    .pop()
+                    .or_else(|| steal_retry_batch(&self.inbox, &owner.worker))
+            };
+            let oldest_spawned = || steal_retry(&self.spawned_stealer);
+            let turn = owner.pops.get().wrapping_add(1);
+            owner.pops.set(turn);
+            // Newest-first alone could starve older spawns and the FIFO deque
+            // behind an endless spawn chain, so each gets a bounded turn.
+            if turn % OLDEST_SPAWN_TURN == 0 {
+                oldest_spawned().or_else(fifo)
+            } else if turn % 2 == 0 {
+                fifo().or_else(|| owner.spawned.pop())
+            } else {
+                owner.spawned.pop().or_else(fifo)
+            }
         });
         let id = from_owner.or_else(|| self.steal_without_count());
         if id.is_some() {
@@ -316,9 +387,16 @@ impl LocalRunQueue {
     }
 
     fn steal_without_count(&self) -> Option<RuntimeTaskId> {
-        steal_retry(&self.stealer).or_else(|| steal_retry(&self.inbox))
+        steal_retry(&self.spawned_stealer)
+            .or_else(|| steal_retry(&self.stealer))
+            .or_else(|| steal_retry(&self.inbox))
     }
 }
+
+/// Every this many owner pops the oldest spawned task goes first. It bounds
+/// starvation inside the lane; each such turn starts a subtree out of depth
+/// order, so frequent turns would give up the bounded live set.
+const OLDEST_SPAWN_TURN: u32 = 1024;
 
 fn steal_retry_batch<T>(inbox: &Injector<T>, owner: &Worker<T>) -> Option<T> {
     #[cfg(test)]
@@ -370,6 +448,11 @@ impl<T> FnSteal<T> for Stealer<T> {
 struct LocalOwner {
     queue: usize,
     worker: Worker<RuntimeTaskId>,
+    spawned: Worker<RuntimeTaskId>,
+    /// Private landing buffer that counts a batch steal exactly before the
+    /// batch becomes visible to other thieves; empty between steals.
+    stolen: Worker<RuntimeTaskId>,
+    pops: Cell<u32>,
 }
 thread_local! {
     static LOCAL_QUEUE_OWNER: RefCell<Option<LocalOwner>> = const { RefCell::new(None) };
@@ -386,6 +469,11 @@ impl Drop for LocalOwnerGuard<'_> {
             let owner =
                 LOCAL_QUEUE_OWNER.with(|slot| slot.borrow_mut().take().expect("owner missing"));
             *self.queue.owner.lock().unwrap_or_else(|e| e.into_inner()) = Some(owner.worker);
+            *self
+                .queue
+                .spawned_owner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(owner.spawned);
         }
     }
 }
@@ -429,10 +517,19 @@ impl RunQueues {
         }
         let taken = queue.owner.lock().unwrap_or_else(|e| e.into_inner()).take();
         let Some(owner) = taken else { return f() };
+        let spawned = queue
+            .spawned_owner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("the spawn lane travels with the queue owner");
         LOCAL_QUEUE_OWNER.with(|slot| {
             *slot.borrow_mut() = Some(LocalOwner {
                 queue: queue as *const _ as usize,
                 worker: owner,
+                spawned,
+                stolen: Worker::new_lifo(),
+                pops: Cell::new(0),
             });
         });
         let _guard = LocalOwnerGuard {
@@ -462,6 +559,18 @@ impl RunQueues {
 
     fn push_spawned(&self, id: RuntimeTaskId) {
         let defer = SCHED_RUN_DEPTH.with(|depth| depth.get() > 0);
+        if defer {
+            let worker = current_worker();
+            if let Some(queue) = self.locals.get(worker)
+                && queue.publish_spawned(id)
+            {
+                SPAWN_NOTIFICATION_PENDING.with(|pending| pending.set(true));
+                self.worker_metrics[worker]
+                    .local_pushes
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
         self.publish_global_batch(std::slice::from_ref(&id), !defer);
         if defer {
             SPAWN_NOTIFICATION_PENDING.with(|pending| pending.set(true));
@@ -689,7 +798,7 @@ impl RunQueues {
             if queue.looks_empty() {
                 continue;
             }
-            if let Some(id) = queue.steal() {
+            if let Some(id) = queue.steal_into(&self.locals[worker % self.locals.len()]) {
                 metrics.steal_successes.fetch_add(1, Ordering::Relaxed);
                 return Some(id);
             }
@@ -834,6 +943,15 @@ impl RunQueues {
                     worker.push(id);
                 }
             };
+            // Popping a LIFO deque and pushing back would see one entry forever.
+            let inspect_spawned = |worker: &Worker<RuntimeTaskId>, ids: &mut Vec<RuntimeTaskId>| {
+                let newest_first: Vec<_> = std::iter::from_fn(|| worker.pop()).collect();
+                ids.extend(newest_first.iter().copied());
+                newest_first
+                    .into_iter()
+                    .rev()
+                    .for_each(|id| worker.push(id));
+            };
             LOCAL_QUEUE_OWNER.with(|slot| {
                 let local = slot.borrow();
                 if let Some(owner) = local
@@ -841,12 +959,20 @@ impl RunQueues {
                     .filter(|owner| owner.queue == queue as *const _ as usize)
                 {
                     inspect_owner(&owner.worker, &mut ids);
+                    inspect_spawned(&owner.spawned, &mut ids);
                 } else {
                     let owner = queue.owner.lock().unwrap_or_else(|e| e.into_inner());
                     let worker = owner
                         .as_ref()
                         .expect("snapshot requires inactive or current-thread owners");
                     inspect_owner(worker, &mut ids);
+                    let spawned = queue
+                        .spawned_owner
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(spawned) = spawned.as_ref() {
+                        inspect_spawned(spawned, &mut ids);
+                    }
                 }
             });
             inspect(&queue.inbox, &queue.inbox, queue.inbox.len(), &mut ids);
@@ -1050,26 +1176,40 @@ impl ShardedTaskTable {
     /// `after_transition` is normally a no-op. Tests use it to hold the exact
     /// historical race point (Terminal state with a still-Pending frame) and
     /// prove that an await slow path cannot pass the shard lock there.
-    fn finish_terminal_and_publish(
+    /// Publish the terminal state and remove the record under one shard lock.
+    /// Returns the record only when this call made the transition.
+    fn finish_terminal_and_remove(
+        &self,
+        id: RuntimeTaskId,
+        terminal_status: i64,
+    ) -> Option<RuntimeTask> {
+        self.finish_terminal_and_remove_after(id, terminal_status, || {})
+    }
+
+    /// `after_transition` runs between the state change and the frame status
+    /// publication, still under the shard lock.
+    fn finish_terminal_and_remove_after(
         &self,
         id: RuntimeTaskId,
         terminal_status: i64,
         after_transition: impl FnOnce(),
-    ) -> Option<bool> {
-        let transitioned = self.with(id, |task| {
-            let before = task.state.lifecycle();
-            let transitioned = task.state.finish_terminal();
-            if transitioned {
-                after_transition();
-                crate::async_frame::frame_publish_terminal(task.frame, terminal_status);
-            }
-            self.reconcile_blocked_transition(before, task.state.lifecycle());
-            transitioned
-        });
-        if transitioned == Some(true) {
-            self.advance_terminal_epoch();
+    ) -> Option<RuntimeTask> {
+        let mut shard = self.lock_shard(self.shard_index(id));
+        let task = shard.get(&id)?;
+        let before = task.state.lifecycle();
+        let transitioned = task.state.finish_terminal();
+        if transitioned {
+            after_transition();
+            crate::async_frame::frame_publish_terminal(task.frame, terminal_status);
         }
-        transitioned
+        self.reconcile_blocked_transition(before, task.state.lifecycle());
+        if !transitioned {
+            return None;
+        }
+        let task = shard.remove(&id);
+        drop(shard);
+        self.advance_terminal_epoch();
+        task
     }
 }
 
@@ -1124,8 +1264,11 @@ fn unregister_waiter_sharded(
     });
 }
 
+#[path = "scheduler_terminal.rs"]
+mod terminal;
 #[path = "scheduler_wake_batch.rs"]
 mod wake_batch;
+use terminal::{TerminalRetirements, TerminalTarget};
 pub(crate) use wake_batch::{WakeBatchScratch, wake_channel_owners};
 /// Publish one wake against a task table + run queues, with no scheduler
 /// metadata mutex involved.
@@ -1238,26 +1381,9 @@ pub struct RuntimeScheduler {
     /// drains its local queue, then the global queue, then steals from the back
     /// of another worker's local queue.
     run_queues: Arc<RunQueues>,
-    /// Terminal tasks whose channel/netpoll registrations must be purged
-    /// OUTSIDE the scheduler lock. Channel addresses are captured before the
-    /// heavy task record is removed (willow-ezs.1.4).
-    pending_terminal_cleanups: Vec<TerminalCleanup>,
-    /// Set whenever `pending_terminal_cleanups` may be non-empty. Written only
-    /// under the scheduler mutex, read without it, so the run loop's
-    /// per-iteration drain skips `GLOBAL_SCHEDULER` when nothing is pending
-    /// (willow-8hq4.19).
-    terminal_cleanups_pending: Arc<AtomicBool>,
-    /// Frame runtime roots retired by terminal tasks, in retirement order with
-    /// their [`crate::frame_reclaim`] tags. The heavy task record is removed
-    /// immediately, but each root remains until every execution unit that
-    /// began before its retirement has ended (willow-vjaf).
-    pending_frame_unroots: VecDeque<RetiredFrame>,
-    /// Pending length at which a retirement requests the next release scan.
-    /// Doubling over the frames a scan had to keep amortizes the O(threads)
-    /// scan to O(1) per retirement while bounding retained frames by
-    /// `max(FRAME_RELEASE_MIN_BATCH, 2 x frames retired under a still-running
-    /// unit)`.
-    frame_release_scan_at: usize,
+    /// Retired frames and external cleanups of terminal tasks, shared with
+    /// [`SchedulerComponents`] so completions need no scheduler lock.
+    retirements: Arc<TerminalRetirements>,
     /// Total frame roots currently owned by the scheduler: active task frames
     /// plus terminal frames still inside their grace period. Atomic and shared
     /// with [`SchedulerComponents`] because global spawns publish without
@@ -1294,10 +1420,7 @@ impl RuntimeScheduler {
             tasks: Arc::clone(&components.tasks),
             run_queues: Arc::clone(&components.run_queues),
             timers: Arc::clone(&components.timers),
-            pending_terminal_cleanups: Vec::new(),
-            terminal_cleanups_pending: Arc::clone(&components.terminal_cleanups_pending),
-            pending_frame_unroots: VecDeque::new(),
-            frame_release_scan_at: FRAME_RELEASE_MIN_BATCH,
+            retirements: Arc::clone(&components.retirements),
             frame_roots: Arc::clone(&components.frame_roots),
         }
     }
@@ -1515,78 +1638,13 @@ impl RuntimeScheduler {
     /// [`RuntimeTask`]. Channel/netpoll cleanup and actual frame unrooting are
     /// deliberately left to the two lock-free phases.
     fn finish_terminal(&mut self, id: RuntimeTaskId, state: RuntimeTaskState) -> bool {
-        let Some(terminal_status) = terminal_frame_status(state) else {
-            debug_assert!(false, "finish_terminal requires a terminal state");
-            return false;
-        };
         self.prepare_placeholder_terminal_owner(id);
-        let tasks = Arc::clone(&self.tasks);
-        let transitioned = tasks
-            .finish_terminal_and_publish(id, terminal_status, || {})
-            .unwrap_or(false);
-        if !transitioned {
-            return false;
+        TerminalTarget {
+            tasks: &self.tasks,
+            run_queues: &self.run_queues,
+            retirements: &self.retirements,
         }
-        let Some(mut task) = self.tasks.remove(id) else {
-            return false;
-        };
-
-        // Both directions are detached in O(registrations), not O(all tasks):
-        // `waiters` pops live entries in registration order and `awaiting` is a
-        // set, so neither side rescans a vector per relation (willow-ezs.2).
-        let waiters = task.take_waiters();
-        let awaiting = task.take_awaiting();
-        let channel_waits = task.take_wait_channels();
-        let lock_wait = task.take_lock_wait();
-
-        for awaitee in awaiting {
-            self.tasks.with_mut(awaitee, |task| {
-                task.remove_waiter(id);
-            });
-        }
-        for waiter in waiters {
-            self.tasks.with_mut(waiter, |task| {
-                task.remove_awaiting(id);
-            });
-            self.wake(waiter);
-        }
-
-        if task.frame_rooted && !task.frame.is_null() {
-            task.frame_rooted = false;
-            let tag = crate::frame_reclaim::retire_tag();
-            crate::frame_lifetime::record(
-                crate::frame_lifetime::FrameEventKind::Terminal,
-                task.frame as usize,
-                tag,
-                0,
-            );
-            self.pending_frame_unroots.push_back(RetiredFrame {
-                frame: task.frame as usize,
-                tag,
-            });
-            if self.pending_frame_unroots.len() >= self.frame_release_scan_at {
-                FRAME_RELEASE_DUE.store(true, Ordering::Release);
-            }
-        }
-        // A bookkeeping-only placeholder cannot register with netpoll, and an
-        // empty channel list means it has no external cleanup at all. Avoid
-        // retaining one cleanup record per completed test/helper task.
-        if task.poll.is_some() || !channel_waits.is_empty() || lock_wait.is_some() {
-            self.pending_terminal_cleanups.push(TerminalCleanup {
-                task_id: id,
-                channel_waits,
-                lock_wait,
-            });
-            self.terminal_cleanups_pending
-                .store(true, Ordering::Release);
-        }
-
-        // `RuntimeTask::roots` and all diagnostic/wait metadata are active-task
-        // ownership. They may be dropped now that the poll has returned and
-        // terminal status is published. The result frame keeps its independent
-        // runtime root until its grace period ends.
-        drop(task);
-        true
+        .finish(id, state)
     }
 
     /// Bookkeeping-only placeholders have no poll function and therefore no
@@ -1628,46 +1686,22 @@ impl RuntimeScheduler {
         });
     }
 
+    #[cfg(test)]
     fn take_pending_terminal_cleanups(&mut self) -> Vec<TerminalCleanup> {
-        self.terminal_cleanups_pending
-            .store(false, Ordering::Relaxed);
-        std::mem::take(&mut self.pending_terminal_cleanups)
+        self.retirements.take_cleanups()
     }
 
-    /// Take the retired frames whose tag is below `bound` (see
-    /// [`crate::frame_reclaim::release_bound`]). Tags are monotonic in queue
-    /// order, so this pops a prefix: O(frames released + 1).
+    #[cfg(test)]
     fn take_quiescent_frame_unroots(&mut self, bound: u64) -> Vec<RetiredFrame> {
-        let mut frames = Vec::new();
-        while let Some(retired) = self.pending_frame_unroots.front()
-            && retired.tag < bound
-        {
-            crate::frame_lifetime::record(
-                crate::frame_lifetime::FrameEventKind::Quiescent,
-                retired.frame,
-                retired.tag,
-                0,
-            );
-            frames.push(*retired);
-            self.pending_frame_unroots.pop_front();
-        }
-        if !frames.is_empty() {
-            self.frame_roots
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |roots| {
-                    roots.checked_sub(frames.len())
-                })
-                .expect("scheduler frame-root counter underflow");
-        }
-        self.frame_release_scan_at =
-            FRAME_RELEASE_MIN_BATCH.max(self.pending_frame_unroots.len() * 2);
-        frames
+        self.retirements
+            .take_quiescent_frames(bound, &self.frame_roots)
     }
 
     pub fn metadata_snapshot(&self) -> SchedulerMetadataSnapshot {
         SchedulerMetadataSnapshot {
             heavy_tasks: self.tasks.len(),
             queue_entries: self.ready_total(),
-            pending_cleanups: self.pending_terminal_cleanups.len(),
+            pending_cleanups: self.retirements.pending_cleanups(),
             frame_roots: self.frame_roots.load(Ordering::Relaxed),
             blocked_syscalls: self.blocked_syscall_count(),
         }
@@ -2041,7 +2075,7 @@ struct SchedulerComponents {
     run_queues: Arc<RunQueues>,
     tasks: Arc<ShardedTaskTable>,
     timers: Arc<TimerQueue>,
-    terminal_cleanups_pending: Arc<AtomicBool>,
+    retirements: Arc<TerminalRetirements>,
     next_task_id: Arc<AtomicU64>,
     frame_roots: Arc<AtomicUsize>,
 }
@@ -2058,7 +2092,7 @@ impl SchedulerComponents {
             run_queues,
             tasks: Arc::new(ShardedTaskTable::new()),
             timers: Arc::new(TimerQueue::new()),
-            terminal_cleanups_pending: Arc::new(AtomicBool::new(false)),
+            retirements: Arc::new(TerminalRetirements::new()),
             next_task_id: Arc::new(AtomicU64::new(1)),
             frame_roots: Arc::new(AtomicUsize::new(0)),
         }
@@ -2070,6 +2104,14 @@ impl SchedulerComponents {
             tasks: &self.tasks,
             run_queues: &self.run_queues,
             frame_roots: &self.frame_roots,
+        }
+    }
+
+    fn terminal_target(&self) -> TerminalTarget<'_> {
+        TerminalTarget {
+            tasks: &self.tasks,
+            run_queues: &self.run_queues,
+            retirements: &self.retirements,
         }
     }
 
@@ -2386,6 +2428,14 @@ fn global_next_timer_deadline() -> Option<(RuntimeTaskId, Instant)> {
 /// process-global mutex acquisition (willow-9ha4). Missing a just-pushed timer
 /// here is harmless: the idle path re-reads the heap under its lock before it
 /// can conclude that the scheduler has nothing to do.
+fn wake_global_due_timers_now() -> usize {
+    if global_timers().maybe_armed() {
+        wake_global_due_timers(Instant::now())
+    } else {
+        0
+    }
+}
+
 fn wake_global_due_timers(now: Instant) -> usize {
     let timers = global_timers();
     if !timers.maybe_due(now) {
@@ -2616,7 +2666,7 @@ struct PendingSpawnRoot {
 
 impl PendingSpawnRoot {
     fn new(frame: *mut u8) -> Self {
-        crate::gc::willow_gc_add_runtime_root(frame);
+        crate::gc::add_task_frame_root(frame);
         Self {
             frame,
             published: false,
@@ -3061,6 +3111,12 @@ pub(crate) fn set_current_execution_site(frame: crate::stack_trace::RuntimeFrame
     }
 }
 
+/// Record that `id` holds a netpoll registration, so its terminal transition
+/// schedules the purge. Tasks that never touch netpoll skip that lock.
+pub(crate) fn note_netpoll_registration(id: RuntimeTaskId) {
+    global_task_table().with_mut(id, |task| task.netpoll_registered = true);
+}
+
 pub(crate) fn current_task() -> Option<RuntimeTaskId> {
     current_task_id()
 }
@@ -3275,7 +3331,9 @@ pub extern "C" fn willow_monotonic_millis() -> i64 {
 pub extern "C" fn willow_sleep_until_monotonic(deadline_ms: i64) {
     let now = willow_monotonic_millis();
     if deadline_ms > now {
-        std::thread::sleep(Duration::from_millis((deadline_ms - now) as u64));
+        let remaining = Duration::from_millis((deadline_ms - now) as u64);
+        // SAFETY: the sleep touches no managed state.
+        unsafe { crate::gc::run_blocking(|| std::thread::sleep(remaining)) };
     }
 }
 
@@ -3566,7 +3624,8 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
 /// so a stop decision that follows the loser's poll sees the drain as a claim
 /// in flight, or its epoch advance, and refuses.
 fn drain_terminal_cleanups() {
-    let pending = &global_components().terminal_cleanups_pending;
+    let retirements = &global_components().retirements;
+    let pending = &retirements.cleanups_pending;
     if !pending.load(Ordering::Acquire) {
         return;
     }
@@ -3575,7 +3634,7 @@ fn drain_terminal_cleanups() {
         return;
     }
     in_flight.popped();
-    let cleanups = with_global(|sched| sched.take_pending_terminal_cleanups());
+    let cleanups = retirements.take_cleanups();
     for cleanup in cleanups {
         crate::netpoll::purge_task(cleanup.task_id);
         crate::channel::purge_task_from_tokens(cleanup.task_id, cleanup.channel_waits);
@@ -3600,7 +3659,10 @@ pub(crate) fn release_quiescent_frame_roots(force: bool) {
         return;
     }
     let bound = crate::frame_reclaim::release_bound();
-    let frames = with_global(|sched| sched.take_quiescent_frame_unroots(bound));
+    let components = global_components();
+    let frames = components
+        .retirements
+        .take_quiescent_frames(bound, &components.frame_roots);
     for retired in frames {
         crate::gc::willow_gc_remove_runtime_root(retired.frame as *mut u8);
         crate::frame_lifetime::record(
@@ -4303,11 +4365,14 @@ fn task_should_spread(
         && shared.is_some_and(|state| {
             // The claiming worker has not begun its poll, so at most `workers
             // - 1 - active polls` peers are idle.
-            let free = queues
-                .worker_count()
-                .saturating_sub(state.active_polls().saturating_add(1));
+            // Test the per-worker lengths first: a busy pool answers there
+            // without reading every accounting word.
             let waiting = queues.global_len.load(Ordering::Relaxed);
-            waiting < free && queues.idle_peers_exceed(worker, waiting)
+            queues.idle_peers_exceed(worker, waiting)
+                && waiting
+                    < queues
+                        .worker_count()
+                        .saturating_sub(state.active_polls().saturating_add(1))
         })
 }
 
@@ -4645,7 +4710,7 @@ fn scheduler_run_loop(
         // every worker on every iteration, so it must stay cheap when no timer
         // exists: `wake_global_due_timers` answers that case with one atomic
         // load and takes no lock at all (willow-9ha4).
-        let woken_timers = wake_global_due_timers(Instant::now());
+        let woken_timers = wake_global_due_timers_now();
         let next = if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             None
         } else {
@@ -4928,13 +4993,17 @@ fn scheduler_run_loop(
         let fatal_chain = matches!(outcome, PollOutcome::Panicked | PollOutcome::Invalid(_))
             .then(async_chain_text);
         match outcome {
-            PollOutcome::Ready => with_global(|sched| {
-                if native_cancelled {
-                    sched.finalize_cancelled(id);
-                } else {
-                    sched.complete(id);
-                }
-            }),
+            PollOutcome::Ready if native_cancelled => {
+                with_global(|sched| sched.finalize_cancelled(id));
+            }
+            PollOutcome::Ready => {
+                // An executable task owns its frame here, so the placeholder
+                // preparation of `RuntimeScheduler::complete` does not apply.
+                let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+                global_components()
+                    .terminal_target()
+                    .finish(id, RuntimeTaskState::Completed);
+            }
             PollOutcome::Yield | PollOutcome::Preempted => {
                 // Runnable outcome (spec §7): gave up the worker but is not
                 // waiting on an event. This hot boundary stays off the global
@@ -5045,10 +5114,7 @@ pub fn reset_global_scheduler_for_test() {
     // slot reservations too (task ids restart and would alias them).
     crate::blocking::reset_slot_waiters_for_test();
     let frames = with_global(|sched| {
-        let mut frames: Vec<usize> = std::mem::take(&mut sched.pending_frame_unroots)
-            .into_iter()
-            .map(|retired| retired.frame)
-            .collect();
+        let mut frames = sched.retirements.take_all_frames();
         frames.extend(sched.tasks.drain().into_iter().filter_map(|mut task| {
             if task.frame_rooted && !task.frame.is_null() {
                 task.frame_rooted = false;

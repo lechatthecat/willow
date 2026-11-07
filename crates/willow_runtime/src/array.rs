@@ -541,8 +541,19 @@ pub extern "C" fn willow_array_resize(arr: *mut u8, length: i64, pair_mask: i64)
         raise_with("invalid array storage resize");
         return;
     }
-    let root = crate::gc::GcRootHandle::new(arr);
-    while willow_array_len(root.load()) < length {
+    // `Array.push` lowers here once per element: a stack root keeps that path
+    // free of the root registry and of a heap-allocated handle.
+    let mut root = arr;
+    crate::gc::willow_push_root(&mut root);
+    resize_rooted(&root, length, pair_mask);
+    crate::gc::willow_pop_roots(1);
+}
+
+/// `root` is a registered slot that a collection may rewrite, so it is read
+/// again after every call that can reach a GC point.
+fn resize_rooted(root: &*mut u8, length: i64, pair_mask: i64) {
+    let arr = || unsafe { std::ptr::read_volatile(root) };
+    while willow_array_len(arr()) < length {
         let value = if pair_mask < 0 {
             0
         } else {
@@ -552,18 +563,18 @@ pub extern "C" fn willow_array_resize(arr: *mut u8, length: i64, pair_mask: i64)
             }
             pair as i64
         };
-        let previous = willow_array_len(root.load());
-        array_push(root.load(), value, pair_mask >= 0, true);
-        if willow_array_len(root.load()) == previous {
+        let previous = willow_array_len(arr());
+        array_push(arr(), value, pair_mask >= 0, true);
+        if willow_array_len(arr()) == previous {
             return;
         }
     }
-    while willow_array_len(root.load()) > length {
+    while willow_array_len(arr()) > length {
         if pair_mask < 0 {
-            willow_array_pop(root.load());
+            willow_array_pop(arr());
         } else {
             let mut words = [0_i64; 2];
-            willow_array_pop_scalar_pair_into(root.load(), words.as_mut_ptr());
+            willow_array_pop_scalar_pair_into(arr(), words.as_mut_ptr());
         }
     }
 }

@@ -283,6 +283,8 @@ pub struct RuntimeTask {
     /// spread: a later Ready claim resumes an unpinned task that thieves can
     /// already take (willow-xere).
     pub(crate) started: bool,
+    /// Set by the first netpoll registration; its terminal cleanup must purge.
+    pub(crate) netpoll_registered: bool,
     /// Wait relationships, allocated on the first registration and released
     /// with the last (willow-ezs.3). Private so every mutation goes through the
     /// accessors that maintain that invariant.
@@ -330,6 +332,7 @@ impl RuntimeTask {
             yield_requested: false,
             spread_hops: 0,
             started: false,
+            netpoll_registered: false,
             wait: None,
             debug: None,
             panic_context: Arc::new(crate::panic_context::PanicContext::new(id)),

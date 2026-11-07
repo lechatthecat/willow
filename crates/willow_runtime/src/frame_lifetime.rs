@@ -40,11 +40,27 @@ static CAPTURE: AtomicBool = AtomicBool::new(false);
 static EVENTS: Mutex<VecDeque<FrameEvent>> = Mutex::new(VecDeque::new());
 
 macro_rules! counters {
-    ($($field:ident),+ $(,)?) => {
+    (striped: [$($hot:ident),+ $(,)?], global: [$($field:ident),+ $(,)?] $(,)?) => {
         $(static $field: AtomicU64 = AtomicU64::new(0);)+
+        /// Per-Task events run on every worker, so each thread adds to its own
+        /// stripe and snapshots pay for the sum.
+        #[repr(align(128))]
+        struct CounterShard {
+            entered: AtomicU64,
+            exited: AtomicU64,
+            $($hot: AtomicU64,)+
+        }
+        static COUNTER_SHARDS: [CounterShard; COUNTER_SHARD_COUNT] = [const {
+            CounterShard {
+                entered: AtomicU64::new(0),
+                exited: AtomicU64::new(0),
+                $($hot: AtomicU64::new(0),)+
+            }
+        }; COUNTER_SHARD_COUNT];
         #[derive(Debug, Clone, Copy, Default)]
         #[repr(C)]
         pub struct FrameLifetimeSnapshot {
+            $(pub $hot: u64,)+
             $(pub $field: u64,)+
             pub task_frames_running: u64,
             pub poll_exits: u64,
@@ -56,6 +72,10 @@ macro_rules! counters {
         /// Exact accounting assertions must take snapshots at a rendezvous.
         pub fn snapshot() -> FrameLifetimeSnapshot {
             let mut s = FrameLifetimeSnapshot {
+                $($hot: COUNTER_SHARDS
+                    .iter()
+                    .map(|shard| shard.$hot.load(Ordering::Acquire))
+                    .sum(),)+
                 $($field: $field.load(Ordering::Acquire),)+
                 ..Default::default()
             };
@@ -71,6 +91,7 @@ macro_rules! counters {
         #[test]
         fn maximum_counter_diagnostic_is_bounded() {
             let counters = FrameLifetimeSnapshot {
+                $($hot: u64::MAX,)+
                 $($field: u64::MAX,)+
                 task_frames_running: u64::MAX,
                 poll_exits: u64::MAX,
@@ -87,9 +108,10 @@ macro_rules! counters {
         #[cfg(test)]
         pub(crate) fn reset() {
             $($field.store(0, Ordering::Release);)+
-            for shard in &POLL_SHARDS {
+            for shard in &COUNTER_SHARDS {
                 shard.entered.store(0, Ordering::Release);
                 shard.exited.store(0, Ordering::Release);
+                $(shard.$hot.store(0, Ordering::Release);)+
             }
             EVENTS.lock().unwrap_or_else(|p| p.into_inner()).clear();
             CAPTURE.store(false, Ordering::Release);
@@ -97,53 +119,22 @@ macro_rules! counters {
     };
 }
 
-/// Poll entry/exit counts run on every task poll of every worker, so they are
-/// striped per thread instead of contending on two process-global words
-/// (willow-a6o0). Snapshots sum the stripes: running = entered - exited.
-const POLL_SHARD_COUNT: usize = 64;
-
-#[repr(align(128))]
-struct PollShard {
-    entered: AtomicU64,
-    exited: AtomicU64,
-}
-
-static POLL_SHARDS: [PollShard; POLL_SHARD_COUNT] = [const {
-    PollShard {
-        entered: AtomicU64::new(0),
-        exited: AtomicU64::new(0),
-    }
-}; POLL_SHARD_COUNT];
-static NEXT_POLL_SHARD: AtomicUsize = AtomicUsize::new(0);
+const COUNTER_SHARD_COUNT: usize = 64;
+static NEXT_COUNTER_SHARD: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
-    static POLL_SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+    static COUNTER_SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
-fn poll_shard() -> &'static PollShard {
-    let index = POLL_SHARD.with(|slot| {
+fn counter_shard_index() -> usize {
+    COUNTER_SHARD.with(|slot| {
         let mut index = slot.get();
         if index == usize::MAX {
-            index = NEXT_POLL_SHARD.fetch_add(1, Ordering::Relaxed) % POLL_SHARD_COUNT;
+            index = NEXT_COUNTER_SHARD.fetch_add(1, Ordering::Relaxed) % COUNTER_SHARD_COUNT;
             slot.set(index);
         }
         index
-    });
-    &POLL_SHARDS[index]
-}
-
-/// Sum exits before entries: an exit is counted only after its entry, so a
-/// concurrent snapshot never observes more exits than entries.
-fn poll_totals() -> (u64, u64) {
-    let exited = POLL_SHARDS
-        .iter()
-        .map(|shard| shard.exited.load(Ordering::Acquire))
-        .sum::<u64>();
-    let entered = POLL_SHARDS
-        .iter()
-        .map(|shard| shard.entered.load(Ordering::Acquire))
-        .sum::<u64>();
-    (entered, exited)
+    })
 }
 
 // Lowercase names deliberately match the public snapshot fields.
@@ -151,35 +142,57 @@ fn poll_totals() -> (u64, u64) {
 mod counts {
     use super::*;
     counters! {
-        frames_created, allocated_frame_bytes,
-        terminal_events, terminal_frames_reclaimed,
-        scheduler_roots_added, scheduler_roots_released,
-        quiescent_events, scope_owner_releases,
-        metadata_removed_frames, metadata_removed_bytes,
-        quarantined_frames, quarantined_bytes, pending_drops,
-        task_frames_reclaimed, reclaimed_frame_bytes, sweep_completions,
-        quarantined_terminal_frames,
+        striped: [
+            frames_created, allocated_frame_bytes,
+            terminal_events,
+            scheduler_roots_added, scheduler_roots_released,
+            quiescent_events, scope_owner_releases,
+        ],
+        global: [
+            terminal_frames_reclaimed,
+            metadata_removed_frames, metadata_removed_bytes,
+            quarantined_frames, quarantined_bytes, pending_drops,
+            task_frames_reclaimed, reclaimed_frame_bytes, sweep_completions,
+            quarantined_terminal_frames,
+        ],
+    }
+    /// Sum exits before entries: an exit is counted only after its entry, so a
+    /// concurrent snapshot never observes more exits than entries.
+    fn poll_totals() -> (u64, u64) {
+        let exited = COUNTER_SHARDS
+            .iter()
+            .map(|shard| shard.exited.load(Ordering::Acquire))
+            .sum::<u64>();
+        let entered = COUNTER_SHARDS
+            .iter()
+            .map(|shard| shard.entered.load(Ordering::Acquire))
+            .sum::<u64>();
+        (entered, exited)
     }
     pub(super) fn record(kind: FrameEventKind, bytes: u64) {
+        let shard = || &COUNTER_SHARDS[counter_shard_index()];
         let increment = |counter: &AtomicU64| {
             counter.fetch_add(1, Ordering::AcqRel);
         };
         match kind {
             FrameEventKind::Created => {
-                increment(&frames_created);
-                allocated_frame_bytes.fetch_add(bytes, Ordering::AcqRel);
+                let shard = shard();
+                increment(&shard.frames_created);
+                shard
+                    .allocated_frame_bytes
+                    .fetch_add(bytes, Ordering::AcqRel);
             }
-            FrameEventKind::SchedulerRootAdded => increment(&scheduler_roots_added),
+            FrameEventKind::SchedulerRootAdded => increment(&shard().scheduler_roots_added),
             FrameEventKind::PollEntered => {
-                poll_shard().entered.fetch_add(1, Ordering::Release);
+                shard().entered.fetch_add(1, Ordering::Release);
             }
             FrameEventKind::PollExited => {
-                poll_shard().exited.fetch_add(1, Ordering::Release);
+                shard().exited.fetch_add(1, Ordering::Release);
             }
-            FrameEventKind::Terminal => increment(&terminal_events),
-            FrameEventKind::Quiescent => increment(&quiescent_events),
-            FrameEventKind::SchedulerRootReleased => increment(&scheduler_roots_released),
-            FrameEventKind::ScopeOwnerReleased => increment(&scope_owner_releases),
+            FrameEventKind::Terminal => increment(&shard().terminal_events),
+            FrameEventKind::Quiescent => increment(&shard().quiescent_events),
+            FrameEventKind::SchedulerRootReleased => increment(&shard().scheduler_roots_released),
+            FrameEventKind::ScopeOwnerReleased => increment(&shard().scope_owner_releases),
             FrameEventKind::LogicallyDead => {}
             FrameEventKind::DropPending => increment(&pending_drops),
             FrameEventKind::MetadataRemoved => {

@@ -159,12 +159,14 @@ struct ScopedTask {
 // scheduler roots; completed frames are traced from the TaskScope handle.
 unsafe impl Send for ScopedTask {}
 
+const SCOPE_INITIAL_TASKS: usize = 14;
+
 #[derive(Default)]
 struct ScopeState {
     tasks: Vec<ScopedTask>,
     // Keep insertion order and stable roots in tasks; index only membership.
     #[cfg(not(test))]
-    task_ids: HashSet<u64>,
+    task_ids: crate::id_hash::IdSet<u64>,
     #[cfg(test)]
     task_ids: HashSet<u64, tests::CountingBuildHasher>,
     children: Vec<Arc<ScopeCore>>,
@@ -236,6 +238,12 @@ impl ScopeCore {
             if self.cancelled.load(Ordering::Acquire) || state.closing || state.finished {
                 true
             } else {
+                if state.tasks.is_empty() {
+                    // A scope that spawns usually spawns several: skip the
+                    // smallest table and vector sizes and their rehash copies.
+                    state.task_ids.reserve(SCOPE_INITIAL_TASKS);
+                    state.tasks.reserve(SCOPE_INITIAL_TASKS);
+                }
                 if state.task_ids.insert(id) {
                     state.tasks.push(ScopedTask {
                         id,

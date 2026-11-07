@@ -256,6 +256,15 @@ pub(super) fn retire_all_tlabs_unindexed_for_mark(state: &mut GcState) {
 }
 
 fn retire_all_tlab_cursors(state: &mut GcState) {
+    // Retirement empties every cursor, so a live chunk here means its owner
+    // allocated since the last retirement. Non-minor stops also retire; the
+    // maximum keeps their evidence until the next minor consumes it.
+    let allocators = state
+        .tlab_states
+        .values()
+        .filter(|record| record.current_chunk.is_some())
+        .count();
+    state.young_allocators = state.young_allocators.max(allocators);
     let addresses: Vec<usize> = state.tlab_states.keys().copied().collect();
     for address in addresses {
         retire_tlab_locked(state, address);

@@ -376,7 +376,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_channel_try_send_ptr" => ([Ptr, Ptr] -> Some(I32));
     NONE; "willow_select_rotation" => ([] -> Some(I64));
     NONE; "willow_monotonic_millis" => ([] -> Some(I64));
-    NONE; "willow_sleep_until_monotonic" => ([I64] -> None);
+    BLOCK; "willow_sleep_until_monotonic" => ([I64] -> None);
     NONE; "willow_sched_unregister_task_waiter" => ([I64] -> None);
     // --- GC roots ---
     NONE; "willow_reserve_roots" => ([I64] -> None);
@@ -477,6 +477,8 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // Scalar Rust bridge entry gate and contained-panic termination.
     BLOCK; "willow_native_symbol_v1" => ([Ptr, Ptr] -> Some(Ptr));
     NONE; "willow_rust_bridge_enter" => ([I32] -> None);
+    NONE; "willow_rust_bridge_region_enter" => ([] -> Some(I32));
+    BLOCK; "willow_rust_bridge_region_exit" => ([I32] -> None);
     NONE; "willow_rust_bridge_panic" => ([] -> None);
     NONE; "willow_rust_bridge_handle_error" => ([I32, I64] -> None);
     NONE; "willow_rust_bridge_panic_message" => ([Ptr, I64] -> None);

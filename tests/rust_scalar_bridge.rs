@@ -279,6 +279,8 @@ fn adapter_counts_scale_once_per_declaration() {
         assert_eq!(source.matches("#[unsafe(no_mangle)]").count(), count);
         assert_eq!(source.matches("let adapter:").count(), count);
         assert_eq!(source.matches("std::panic::catch_unwind").count(), count);
+        assert_eq!(source.matches("BridgeRegion::enter()").count(), count);
+        assert_eq!(source.matches("struct BridgeRegion").count(), 1);
         let empty_len = wrappers(&[], Path::new("ffi.rs"), 1).len();
         let bytes_per_wrapper = (source.len() - empty_len) / count;
         assert_eq!(source.len(), empty_len + bytes_per_wrapper * count);
@@ -984,6 +986,16 @@ fn aggregate_wrapper_emission_is_linear_and_shared_per_declaration() {
         assert_eq!(source.matches("let adapter:").count(), count);
         assert_eq!(source.matches("struct BridgeFrame").count(), 1);
         assert_eq!(source.matches("catch_unwind(").count(), count);
+        // One per wrapper, plus the handle release shared by every wrapper.
+        assert_eq!(source.matches("BridgeRegion::enter()").count(), count + 1);
+        // The region holds only the foreign body: decoding reads managed
+        // objects before it, and encoding allocates them after it.
+        let body = source.find("let adapter:").unwrap();
+        let region = source[body..].find("BridgeRegion::enter()").unwrap();
+        let handles = source[body..].find("frame.release_handles()").unwrap();
+        let decoded = source[..body].rfind("frame.bytes(").unwrap();
+        let encoded = source[body..].find("frame.output_").unwrap();
+        assert!(decoded < body && region < handles && handles < encoded);
         if let Some(prior) = previous {
             assert_eq!(per, prior);
         }
@@ -1278,6 +1290,75 @@ fn opaque_wrapper_counts_share_table_and_nominal_tags() {
             source.len()
         );
         previous = Some((count, source.len()));
+    }
+}
+
+/// Holds a foreign frame open until a second mutator finishes a collection.
+/// That collection stops every registered thread, so it can only finish if
+/// this frame already counts as stopped. `main` is not registered by default.
+const WAIT_FOR_COLLECTION: &str = r#"
+    unsafe extern "C" {
+        fn willow_gc_register_mutator();
+        fn willow_gc_unregister_mutator();
+        fn willow_gc_collect();
+    }
+    fn wait_for_collection() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = done.clone();
+        std::thread::spawn(move || {
+            unsafe {
+                willow_gc_register_mutator();
+                willow_gc_collect();
+                willow_gc_unregister_mutator();
+            }
+            finished.store(true, Ordering::SeqCst);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline {
+                eprintln!("COLLECTION_STALLED");
+                std::process::abort();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+"#;
+
+#[test]
+fn blocking_destructors_leave_collections_running() {
+    let input = "pub struct Input; pub struct Output; impl Drop for Input { fn drop(&mut self) { wait_for_collection(); } } pub fn make() -> Box<Input> { unsafe { willow_gc_register_mutator(); } Box::new(Input) }";
+    let close_input = "crate::handles::close((1u64 << 32) | 1, std::any::TypeId::of::<crate::opaque_tags::Input>()).unwrap();";
+    let convert = "extern rust { opaque Input; opaque Output; fn make() -> Input; fn convert(h: Input) -> Output; } fn main() { let h = make(); let output = convert(h); Output_close(output); println(1); }";
+    // Explicit close, the last lease released after the body, and the same
+    // lease released while the body unwinds.
+    for (willow, rust, succeeds) in [
+        (
+            "extern rust { opaque Input; fn make() -> Input; } fn main() { let h = make(); Input_close(h); println(1); }",
+            String::new(),
+            true,
+        ),
+        (
+            convert,
+            format!(
+                "pub fn convert(_: &Input) -> Box<Output> {{ {close_input} Box::new(Output) }}"
+            ),
+            true,
+        ),
+        (
+            convert,
+            format!(
+                "pub fn convert(_: &Input) -> Box<Output> {{ {close_input} panic!(\"unwinding body\") }}"
+            ),
+            false,
+        ),
+    ] {
+        let f = Fixture::new();
+        f.sources(willow, &format!("{WAIT_FOR_COLLECTION} {input} {rust}"));
+        let output = f.command(&["run", "--offline"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("COLLECTION_STALLED"), "{stderr}");
+        assert_eq!(output.status.success(), succeeds, "{stderr}");
     }
 }
 

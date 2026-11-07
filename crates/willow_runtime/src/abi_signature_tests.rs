@@ -588,6 +588,14 @@ fn scalar_bridge_runtime_abi_matches_schema() {
     let panic = willow_abi::runtime_symbol("willow_rust_bridge_panic").unwrap();
     assert!(panic.params.is_empty());
     assert_eq!(panic.ret, None);
+    let _: extern "C" fn() -> u32 = crate::rust_bridge::willow_rust_bridge_region_enter;
+    let _: extern "C" fn(u32) = crate::rust_bridge::willow_rust_bridge_region_exit;
+    let enter = willow_abi::runtime_symbol("willow_rust_bridge_region_enter").unwrap();
+    assert!(enter.params.is_empty());
+    assert_eq!(enter.ret, Some(willow_abi::AbiTy::I32));
+    let exit = willow_abi::runtime_symbol("willow_rust_bridge_region_exit").unwrap();
+    assert_eq!(exit.params, &[willow_abi::AbiTy::I32]);
+    assert_eq!(exit.ret, None);
 }
 
 #[test]

@@ -307,6 +307,36 @@ pub(crate) fn run_owned<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'st
     }
 }
 
+/// Run a synchronous runtime call's OS wait without holding up collections. On
+/// a native task stack the pool runs it and the worker stays free; elsewhere
+/// this thread runs it inside a GC safe region. `None` means the task was
+/// cancelled and the result is gone.
+///
+/// `work` owns native copies only, and the caller must not reuse a raw managed
+/// pointer afterwards: referents can move or die while it waits.
+pub(crate) fn run_sync_call<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    if crate::native_stack::is_active() {
+        return run_owned(work);
+    }
+    // SAFETY: `work` is `'static + Send`, so it holds no thread-owned runtime
+    // state, and its contract above excludes managed objects.
+    Some(unsafe { crate::gc::run_blocking(work) })
+}
+
 /// Queue `work` if the bounded queue has a slot that no waiting Task holds a
 /// reservation on; otherwise hand it back so the caller's Task can keep it and
 /// wait via [`try_submit_or_wait`]. Never blocks the calling thread.

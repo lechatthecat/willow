@@ -2598,14 +2598,16 @@ fn t8hq4_18_task_id_hash_spreads_ids_of_one_shard() {
 
 fn terminal_cleanups_pending() -> bool {
     global_components()
-        .terminal_cleanups_pending
+        .retirements
+        .cleanups_pending
         .load(Ordering::Acquire)
 }
 
 /// Complete an executable task directly, so its terminal cleanup record is
-/// queued but not yet drained. Executable tasks always queue one.
+/// queued but not yet drained. The netpoll mark is what requires the record.
 fn complete_executable_without_drain() -> RuntimeTaskId {
     let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    note_netpoll_registration(id);
     with_global_for_test(|sched| {
         sched.set_running(id);
         sched.complete(id);
@@ -2701,13 +2703,22 @@ fn t8hq4_19_a_private_scheduler_does_not_touch_the_global_flag() {
     reset_global_scheduler_for_test();
     let mut scheduler = RuntimeScheduler::with_worker_count(TEST_WORKERS);
     let id = scheduler.spawn_task(poll_ready_now, std::ptr::null_mut());
+    scheduler
+        .tasks
+        .with_mut(id, |task| task.netpoll_registered = true);
     scheduler.set_running(id);
     scheduler.complete(id);
     scheduler.clear_running();
-    assert!(scheduler.terminal_cleanups_pending.load(Ordering::Acquire));
+    let private_flag = |scheduler: &RuntimeScheduler| {
+        scheduler
+            .retirements
+            .cleanups_pending
+            .load(Ordering::Acquire)
+    };
+    assert!(private_flag(&scheduler));
     assert!(!terminal_cleanups_pending());
     assert_eq!(scheduler.take_pending_terminal_cleanups().len(), 1);
-    assert!(!scheduler.terminal_cleanups_pending.load(Ordering::Acquire));
+    assert!(!private_flag(&scheduler));
 }
 
 #[test]
@@ -4357,7 +4368,7 @@ fn fst_16_terminal_transition_holds_shard_through_frame_publication() {
     let publisher_tasks = Arc::clone(&tasks);
     let publisher = std::thread::spawn(move || {
         publisher_tasks
-            .finish_terminal_and_publish(
+            .finish_terminal_and_remove_after(
                 awaitee,
                 crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED,
                 || {
@@ -4365,7 +4376,7 @@ fn fst_16_terminal_transition_holds_shard_through_frame_publication() {
                     release_rx.recv().unwrap();
                 },
             )
-            .unwrap()
+            .is_some()
     });
 
     transitioned_rx.recv().unwrap();
@@ -5507,7 +5518,7 @@ fn vjaf_08_release_pops_only_the_prefix_below_the_bound() {
     reset_stress_fixture();
     let mut s = RuntimeScheduler::with_worker_count(1);
     let frames = vjaf_retire(&mut s, 3);
-    let tags: Vec<u64> = s.pending_frame_unroots.iter().map(|r| r.tag).collect();
+    let tags = s.retirements.pending_tags();
     assert!(tags.windows(2).all(|pair| pair[0] < pair[1]));
     assert_eq!(s.metadata_snapshot().frame_roots, 3);
     assert!(s.take_quiescent_frame_unroots(tags[0]).is_empty());
@@ -5546,9 +5557,9 @@ fn vjaf_09_release_threshold_doubles_over_kept_frames() {
     );
     // A scan blocked by a unit keeps everything: the next scan waits for
     // twice as many pending frames.
-    let first_tag = s.pending_frame_unroots[0].tag;
+    let first_tag = s.retirements.pending_tags()[0];
     assert!(s.take_quiescent_frame_unroots(first_tag).is_empty());
-    assert_eq!(s.frame_release_scan_at, 2 * FRAME_RELEASE_MIN_BATCH);
+    assert_eq!(s.retirements.scan_threshold(0), 2 * FRAME_RELEASE_MIN_BATCH);
     vjaf_retire(&mut s, FRAME_RELEASE_MIN_BATCH - 1);
     assert!(!FRAME_RELEASE_DUE.load(Ordering::SeqCst));
     vjaf_retire(&mut s, 1);
@@ -5557,7 +5568,7 @@ fn vjaf_09_release_threshold_doubles_over_kept_frames() {
         s.take_quiescent_frame_unroots(u64::MAX).len(),
         2 * FRAME_RELEASE_MIN_BATCH
     );
-    assert_eq!(s.frame_release_scan_at, FRAME_RELEASE_MIN_BATCH);
+    assert_eq!(s.retirements.scan_threshold(0), FRAME_RELEASE_MIN_BATCH);
     drop(s);
     reset_stress_fixture();
 }
@@ -5584,7 +5595,7 @@ fn vjaf_11_reset_drops_queued_retired_frames() {
         assert_eq!(sched.claim_ready_for_worker(0), Some(id));
         sched.complete(id);
         sched.clear_running();
-        assert_eq!(sched.pending_frame_unroots.len(), 1);
+        assert_eq!(sched.retirements.pending_tags().len(), 1);
     });
     reset_stress_fixture();
     willow_gc_collect();

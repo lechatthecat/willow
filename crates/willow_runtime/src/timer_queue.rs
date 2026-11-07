@@ -178,6 +178,12 @@ impl TimerQueue {
         self.publish_hint(&heap.entries);
     }
 
+    /// Lock-free hint: can any timer be armed? Lets a caller with no timer skip
+    /// reading the clock, under the same imprecision contract as [`Self::maybe_due`].
+    pub(crate) fn maybe_armed(&self) -> bool {
+        self.earliest_nanos.load(Ordering::Acquire) != NO_DEADLINE
+    }
+
     /// Lock-free hint: is it worth taking the lock to look for a due timer at
     /// `now`? See the module docs for exactly how imprecise this is allowed to
     /// be.

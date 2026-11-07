@@ -2,6 +2,9 @@
 
 const FLOOR: usize = 256 * 1024;
 const CAP: usize = 64 * 1024 * 1024;
+/// Allocators beyond this count do not raise the floor: 4 MiB already spreads
+/// a stop over enough allocation, and RSS must stay bounded on wide machines.
+const MAX_FLOOR_ALLOCATORS: usize = 16;
 
 /// Preserve the compact synchronous startup nursery.
 pub(super) fn initial_budget() -> usize {
@@ -71,6 +74,7 @@ impl Policy {
         current: usize,
         young_before: usize,
         promoted: u64,
+        allocators: usize,
         memory_limit: Option<usize>,
     ) -> usize {
         if self.fixed.is_some() {
@@ -96,7 +100,11 @@ impl Policy {
         } else {
             current
         };
-        self.bound(target.max(FLOOR), memory_limit)
+        // Every thread that allocated pays the rendezvous and resume of each
+        // stop whatever its survivors, so the floor is per measured allocator:
+        // otherwise each of them gets only one TLAB chunk between stops.
+        let floor = FLOOR * allocators.clamp(1, MAX_FLOOR_ALLOCATORS);
+        self.bound(target.max(floor), memory_limit)
     }
 }
 
@@ -247,17 +255,17 @@ mod tests {
         let mut threshold = FLOOR;
         for _ in 0..20 {
             // Survival at the 1/16 boundary grows; 32x of it stays below 2x.
-            let next = policy.next(threshold, 1024, 64, None);
+            let next = policy.next(threshold, 1024, 64, 1, None);
             assert_eq!(next, threshold.saturating_mul(2).min(CAP));
             threshold = next;
         }
         assert_eq!(threshold, CAP);
         // Both band edges are exclusive: neither grows nor shrinks.
-        assert_eq!(policy.next(threshold, 1024, 63, None), threshold);
-        assert_eq!(policy.next(threshold, 1024, 17, None), threshold);
-        assert_eq!(policy.next(threshold, 0, 0, None), threshold);
+        assert_eq!(policy.next(threshold, 1024, 63, 1, None), threshold);
+        assert_eq!(policy.next(threshold, 1024, 17, 1, None), threshold);
+        assert_eq!(policy.next(threshold, 0, 0, 1, None), threshold);
         for _ in 0..20 {
-            let next = policy.next(threshold, 1024, 16, None);
+            let next = policy.next(threshold, 1024, 16, 1, None);
             assert_eq!(next, (threshold / 2).max(FLOOR));
             threshold = next;
         }
@@ -270,13 +278,19 @@ mod tests {
         // instead of doubling once per cycle, bounded by the cap and limit.
         let policy = Policy::default();
         let mib = 1024 * 1024;
-        assert_eq!(policy.next(FLOOR, mib, mib as u64, None), 32 * mib);
+        assert_eq!(policy.next(FLOOR, mib, mib as u64, 1, None), 32 * mib);
         // Not rounded: 32 x 300 KiB is below the next power of two.
-        assert_eq!(policy.next(FLOOR, mib, 300 * 1024, None), 300 * 32 * 1024);
+        assert_eq!(
+            policy.next(FLOOR, mib, 300 * 1024, 1, None),
+            300 * 32 * 1024
+        );
         // Doubling still wins when it exceeds the survivor goal.
-        assert_eq!(policy.next(16 * mib, mib, 64 * 1024, None), 32 * mib);
-        assert_eq!(policy.next(FLOOR, mib, 4 * mib as u64, None), CAP);
-        assert_eq!(policy.next(FLOOR, mib, mib as u64, Some(3 * mib)), 3 * mib);
+        assert_eq!(policy.next(16 * mib, mib, 64 * 1024, 1, None), 32 * mib);
+        assert_eq!(policy.next(FLOOR, mib, 4 * mib as u64, 1, None), CAP);
+        assert_eq!(
+            policy.next(FLOOR, mib, mib as u64, 1, Some(3 * mib)),
+            3 * mib
+        );
     }
 
     #[test]
@@ -290,7 +304,7 @@ mod tests {
                 for current in [1, FLOOR, CAP, usize::MAX] {
                     for young in [0, 1, 1024, usize::MAX] {
                         for promoted in [0, 1, u64::MAX] {
-                            let next = policy.next(current, young, promoted, limit);
+                            let next = policy.next(current, young, promoted, 1, limit);
                             assert!(next > 0 && next <= CAP);
                             assert!(next <= limit.unwrap_or(usize::MAX));
                             if fixed.is_some() {
@@ -317,8 +331,8 @@ fn startup_runway_is_worker_bounded_and_respects_limits() {
     let fixed = Policy { fixed: Some(8192) };
     assert_eq!(fixed.initial(None), 8192);
     assert_eq!(fixed.initial(Some(1024)), 1024);
-    assert_eq!(policy.next(8 * FLOOR, 1024, 0, None), 4 * FLOOR);
-    assert_eq!(policy.next(FLOOR, 1024, 0, None), FLOOR);
+    assert_eq!(policy.next(8 * FLOOR, 1024, 0, 1, None), 4 * FLOOR);
+    assert_eq!(policy.next(FLOOR, 1024, 0, 1, None), FLOOR);
 }
 
 #[cfg(test)]
@@ -390,7 +404,7 @@ fn scheduler_capacity_preserves_compact_nursery_and_overrides() {
                 assert_eq!(state.nursery_threshold_bytes, initial);
                 // Startup must not disable the measured-survival feedback.
                 assert_eq!(
-                    state.nursery_policy.next(initial, 1024, 0, limit),
+                    state.nursery_policy.next(initial, 1024, 0, 1, limit),
                     state
                         .nursery_policy
                         .bound(fixed.unwrap_or((initial / 2).max(FLOOR)), limit)

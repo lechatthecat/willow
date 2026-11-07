@@ -205,7 +205,7 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
         let Scalar::Opaque(name) = &symbol.input_types[0] else {
             unreachable!()
         };
-        writeln!(source, "let id = frame.payload(a0, false).low;\nhandles::close(id, std::any::TypeId::of::<opaque_tags::r#{name}>()).unwrap_or_else(|error| std::panic::panic_any((error, id)));\nunsafe {{ *output = BridgeValue::default(); }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}}").unwrap();
+        writeln!(source, "let id = frame.payload(a0, false).low;\n{{ let _region = BridgeRegion::enter(); handles::close(id, std::any::TypeId::of::<opaque_tags::r#{name}>()).unwrap_or_else(|error| std::panic::panic_any((error, id))); }}\nunsafe {{ *output = BridgeValue::default(); }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}}").unwrap();
         return;
     }
     let mut serial = 0;
@@ -219,7 +219,7 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
     }
     writeln!(
         source,
-        ") -> {} = bridge::r#{target};\nlet result = adapter({});\nframe.release_handles();",
+        ") -> {} = bridge::r#{target};\nlet result = {{ let _region = BridgeRegion::enter(); adapter({}) }};\nframe.release_handles();",
         symbol.output_type.rust_type(false),
         arguments.join(",")
     )

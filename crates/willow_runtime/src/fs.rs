@@ -88,13 +88,29 @@ pub extern "C" fn willow_fs_temp_path(prefix: *const u8) -> *mut u8 {
     willow_string_from_str(&path.to_string_lossy())
 }
 
+/// Error for a sync call whose Task was cancelled while the OS call ran. The
+/// operation may still finish; the Task stops at its next poll.
+const CANCELLED: &str = "file operation cancelled";
+
+/// Build the `Result<void, IoError>` of a sync file call.
+fn unit_result(result: Option<Result<(), String>>) -> *mut u8 {
+    match result {
+        Some(Ok(())) => alloc_ok(0, false),
+        Some(Err(message)) => alloc_io_err(&message),
+        None => alloc_io_err(CANCELLED),
+    }
+}
+
 /// `fs::read_to_string(path) -> Result<String, IoError>`.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_read_to_string(path: *const u8) -> *mut u8 {
-    let path = unsafe { willow_string_as_str(path) };
-    match std::fs::read_to_string(path) {
-        Ok(contents) => {
+    let path = unsafe { willow_string_as_str(path) }.to_string();
+    let result = crate::blocking::run_sync_call(move || {
+        std::fs::read_to_string(&path).map_err(|error| format!("{path}: {error}"))
+    });
+    match result {
+        Some(Ok(contents)) => {
             let s = willow_string_from_str(&contents);
             let mut slot = s;
             willow_push_root(&mut slot as *mut *mut u8);
@@ -102,7 +118,8 @@ pub extern "C" fn willow_fs_read_to_string(path: *const u8) -> *mut u8 {
             willow_pop_roots(1);
             out
         }
-        Err(e) => alloc_io_err(&format!("{path}: {e}")),
+        Some(Err(message)) => alloc_io_err(&message),
+        None => alloc_io_err(CANCELLED),
     }
 }
 
@@ -110,31 +127,30 @@ pub extern "C" fn willow_fs_read_to_string(path: *const u8) -> *mut u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_write_string(path: *const u8, contents: *const u8) -> *mut u8 {
-    let path = unsafe { willow_string_as_str(path) };
-    let contents = unsafe { willow_string_as_str(contents) };
-    match std::fs::write(path, contents) {
-        Ok(()) => alloc_ok(0, false),
-        Err(e) => alloc_io_err(&format!("{path}: {e}")),
-    }
+    let path = unsafe { willow_string_as_str(path) }.to_string();
+    let contents = unsafe { willow_string_as_str(contents) }.to_string();
+    unit_result(crate::blocking::run_sync_call(move || {
+        std::fs::write(&path, contents).map_err(|error| format!("{path}: {error}"))
+    }))
 }
 
 /// `fs::exists(path) -> bool` (1/0).
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_exists(path: *const u8) -> i64 {
-    let path = unsafe { willow_string_as_str(path) };
-    i64::from(std::path::Path::new(path).exists())
+    let path = unsafe { willow_string_as_str(path) }.to_string();
+    let exists = crate::blocking::run_sync_call(move || std::path::Path::new(&path).exists());
+    i64::from(exists.unwrap_or(false))
 }
 
 /// `fs::remove_file(path) -> Result<void, IoError>`.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_remove_file(path: *const u8) -> *mut u8 {
-    let path = unsafe { willow_string_as_str(path) };
-    match std::fs::remove_file(path) {
-        Ok(()) => alloc_ok(0, false),
-        Err(e) => alloc_io_err(&format!("{path}: {e}")),
-    }
+    let path = unsafe { willow_string_as_str(path) }.to_string();
+    unit_result(crate::blocking::run_sync_call(move || {
+        std::fs::remove_file(&path).map_err(|error| format!("{path}: {error}"))
+    }))
 }
 
 enum BlockingFsResult {
@@ -425,6 +441,62 @@ mod tests {
 
     fn read_tag(ptr: *mut u8) -> i64 {
         unsafe { *(ptr as *const i64) }
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn native_stack_sync_read_frees_the_worker_and_cancels() {
+        use crate::scheduler::*;
+        use crate::task::RUNTIME_POLL_READY;
+        static PATH: Mutex<String> = Mutex::new(String::new());
+        static TAG: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+        unsafe extern "C" fn blocked(_: *mut c_void) -> i32 {
+            let path = PATH.lock().unwrap().clone();
+            let result = willow_fs_read_to_string(willow_string_from_str(&path));
+            TAG.store(read_tag(result), Ordering::SeqCst);
+            RUNTIME_POLL_READY
+        }
+        let _guard = runtime_test_guard();
+        for cancel in [false, true] {
+            reset_global_scheduler_for_test();
+            let path = std::env::temp_dir()
+                .join(format!("willow_sync_read_{}_{cancel}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            *PATH.lock().unwrap() = path.to_str().unwrap().to_string();
+            TAG.store(-1, Ordering::SeqCst);
+            let task = willow_sched_spawn(blocked, std::ptr::null_mut());
+            willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
+            assert_eq!(willow_sched_task_state(task), 7);
+            if cancel {
+                willow_sched_cancel(task);
+                willow_sched_run_until(task);
+                assert_eq!(TAG.load(Ordering::SeqCst), 1);
+            }
+            // The cancelled job still owns its copies and ends with the writer.
+            std::fs::write(&path, "payload").unwrap();
+            if !cancel {
+                willow_sched_run_until(task);
+                assert_eq!(TAG.load(Ordering::SeqCst), 0);
+            }
+            crate::blocking::test_support::wait_until("file job completes", || {
+                crate::blocking::willow_blocking_active_jobs() == 0
+                    && crate::blocking::willow_blocking_queued_jobs() == 0
+            });
+            std::fs::remove_file(&path).unwrap();
+        }
+        reset_global_scheduler_for_test();
     }
 
     #[test]

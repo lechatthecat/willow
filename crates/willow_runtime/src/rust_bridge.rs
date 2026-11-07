@@ -14,6 +14,24 @@ pub extern "C" fn willow_rust_bridge_enter(revision: u32) {
         );
     }
 }
+/// Enter the GC safe region around user Rust code, which can block for any
+/// length of time. Adapters decode arguments first and encode results after:
+/// the foreign body sees only native values, pinned strings and handle leases.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_rust_bridge_region_enter() -> u32 {
+    // SAFETY: the adapter contract above keeps managed state out of the region.
+    u32::from(unsafe { crate::gc::IdleMutator::enter() }.into_raw())
+}
+
+/// Leave the region; parks here while a stop is active, including on unwind.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_rust_bridge_region_exit(region: u32) {
+    // SAFETY: `region` is the value this thread's matching enter returned.
+    drop(unsafe { crate::gc::IdleMutator::from_raw(region != 0) });
+}
+
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_rust_bridge_panic() -> ! {

@@ -6,7 +6,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// Storage belongs to the execution context, never to a worker TLS address.
-/// Only the running owner mutates it. Collectors consume parked snapshots.
+/// Only the running owner mutates it. Collectors consume parked snapshots, or
+/// read it through `visit_quiescent_roots` while the owner is in a safe region.
 #[repr(C)]
 pub(crate) struct ShadowRoots {
     base: Cell<*mut *mut *mut u8>,
@@ -95,6 +96,30 @@ pub(crate) fn visit_roots(mut visit: impl FnMut(&[*mut *mut u8])) {
     while !context.is_null() {
         let current = unsafe { &*context };
         visit(&current.roots.borrow());
+        context = current.parent.get();
+    }
+}
+
+/// Visit the root slots of `context` and its parents from another thread,
+/// without the owner's cooperation. Reads only: the owner's `RefCell` and
+/// published length stay untouched.
+///
+/// # Safety
+/// `context` must be the active context of a thread that stays inside a GC safe
+/// region for the whole visit, and the region's entry must happen before this
+/// call. A context outlives its owner's safe region.
+pub(crate) unsafe fn visit_quiescent_roots(
+    mut context: *const Context,
+    mut visit: impl FnMut(&[*mut *mut u8]),
+) {
+    while !context.is_null() {
+        let current = unsafe { &*context };
+        let top = current.roots.top.get();
+        if top != 0 {
+            // Every length change republishes `base`, and generated pushes stay
+            // below the capacity that `base` covers.
+            visit(unsafe { std::slice::from_raw_parts(current.roots.base.get(), top) });
+        }
         context = current.parent.get();
     }
 }

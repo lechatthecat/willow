@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -830,13 +831,19 @@ impl RuntimeNetPoll {
 static GLOBAL_NETPOLL: LazyLock<Mutex<RuntimeNetPoll>> =
     LazyLock::new(|| Mutex::new(RuntimeNetPoll::new()));
 
+/// Mirrors `GLOBAL_NETPOLL.has_waiters()`, written under its lock, so idle
+/// workers and the run loop ask without taking that lock.
+static HAS_WAITERS: AtomicBool = AtomicBool::new(false);
+
 fn with_global<R>(f: impl FnOnce(&mut RuntimeNetPoll) -> R) -> R {
     let mut guard = GLOBAL_NETPOLL.lock().expect("netpoll mutex poisoned");
-    f(&mut guard)
+    let result = f(&mut guard);
+    HAS_WAITERS.store(guard.has_waiters(), Ordering::Release);
+    result
 }
 
 pub(crate) fn has_waiters() -> bool {
-    with_global(|poll| poll.has_waiters())
+    HAS_WAITERS.load(Ordering::Acquire)
 }
 
 /// Purge every registration owned by a cancelled task (willow-vynv.1). Safe
@@ -1157,6 +1164,7 @@ pub extern "C" fn willow_netpoll_register(fd: i64, interest: i32) -> i32 {
     let current = crate::scheduler::willow_sched_current_task();
     let result = with_global(|poll| poll.register_fd(fd, current, interest));
     if result == 0 {
+        crate::scheduler::note_netpoll_registration(current);
         crate::observability::record(
             crate::observability::RuntimeEventKind::NetpollWait,
             None,
@@ -1179,6 +1187,7 @@ pub extern "C" fn willow_netpoll_reregister(fd: i64, interest: i32) -> i32 {
     let current = crate::scheduler::willow_sched_current_task();
     let result = with_global(|poll| poll.reregister_fd(fd, current, interest));
     if result == 0 {
+        crate::scheduler::note_netpoll_registration(current);
         crate::observability::record(
             crate::observability::RuntimeEventKind::NetpollWait,
             None,

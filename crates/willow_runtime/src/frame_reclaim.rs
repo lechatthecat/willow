@@ -128,8 +128,8 @@ pub(crate) fn current_epoch() -> u64 {
     RETIRE_EPOCH.load(Ordering::Acquire)
 }
 
-/// Tag for a frame retired now. Callers retire under the scheduler lock, so
-/// tags are monotonic in retirement order.
+/// Tag for a frame retired now. Callers retire under their queue's lock, so
+/// each queue stays ordered by tag.
 pub(crate) fn retire_tag() -> u64 {
     RETIRE_EPOCH.fetch_add(1, Ordering::AcqRel)
 }

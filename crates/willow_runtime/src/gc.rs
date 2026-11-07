@@ -401,6 +401,8 @@ struct GcState {
     young_allocated_bytes: usize,
     /// Trigger a minor collection at the next TLAB refill after this threshold.
     nursery_threshold_bytes: usize,
+    /// Most threads seen allocating young objects at once since the last minor.
+    young_allocators: usize,
     scheduler_runway_initialized: bool,
     /// Saturating young-mutator byte clock. Reclamation and copying never alter it.
     young_allocation_clock: u64,
@@ -962,6 +964,7 @@ impl Default for GcState {
             pacer_trigger: 1024 * 1024,
             young_allocated_bytes: 0,
             nursery_threshold_bytes: nursery_policy.initial(memory_limit_bytes),
+            young_allocators: 0,
             scheduler_runway_initialized: false,
             young_allocation_clock: 0,
             minor_deferral_budget_bytes: 0,
@@ -2030,6 +2033,7 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_collect() {
+    let _reentry = safepoint::RegionReentry::enter();
     // An explicit collection must not depend on a later batch of task completions.
     // Active execution units still protect every covered retirement.
     crate::scheduler::release_quiescent_frame_roots(true);
@@ -2048,6 +2052,7 @@ pub extern "C" fn willow_gc_collect() {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_minor_collect() {
+    let _reentry = safepoint::RegionReentry::enter();
     let _relocation = RelocationSafeScope::enter();
     minor_collect_internal();
 }
@@ -2670,6 +2675,7 @@ fn reset_internal() {
     state.nursery_policy = nursery::Policy::from_env();
     state.tenuring = Default::default();
     state.nursery_threshold_bytes = state.nursery_policy.initial(state.memory_limit_bytes);
+    state.young_allocators = 0;
     state.minor_deferral_start_bytes = None;
     state.minor_retry_bytes = 0;
     state.total_allocs = 0;
