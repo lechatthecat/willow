@@ -15,6 +15,8 @@ fn main() {
     let major_before = gc_major_collections();
     let promoted_before = gc_promoted_objects();
     let moved_before = gc_moved_objects();
+    let pause_count_before = gc_pause_count();
+    let pause_total_before = gc_pause_total_ns();
     let fast_before = gc_tlab_fast_allocations();
     let refills_before = gc_tlab_refills();
     let mut sum: i64 = 0;
@@ -46,4 +48,12 @@ fn main() {
     println(gc_promoted_objects() - promoted_before);
     println("WILLOW_MOVED_OBJECTS");
     println(gc_moved_objects() - moved_before);
+    println("WILLOW_GC_PAUSES_BEFORE_START");
+    println(pause_count_before);
+    println("WILLOW_GC_PAUSE_COUNT");
+    println(gc_pause_count() - pause_count_before);
+    println("WILLOW_GC_PAUSE_TOTAL_NS");
+    println(gc_pause_total_ns() - pause_total_before);
+    println("WILLOW_GC_MAX_PAUSE_NS");
+    println(gc_pause_max_ns());
 }

@@ -1,0 +1,79 @@
+// GC pause measurement from inside a program.
+//
+// Three zero-argument reads report the collector's global stops, measured from
+// the moment a stop is requested until the world is released:
+//
+//   gc_pause_count()     stops completed so far, of every cause
+//   gc_pause_total_ns()  their cumulative duration
+//   gc_pause_max_ns()    the longest single stop since the process started
+//
+// Count and total are cumulative, so subtracting two reads gives the figure for
+// the phase between them. The maximum is not: it can only be attributed to a
+// phase if no stop happened before that phase began.
+//
+// Durations depend on the machine and the collection schedule, so this program
+// prints only relations that hold everywhere.
+
+class Node {
+    pub value: i64;
+}
+
+fn minor_stop_is_a_pause() -> bool {
+    let before: i64 = gc_pause_count();
+    gc_minor_collect();
+    return gc_pause_count() > before;
+}
+
+fn major_cycle_is_a_pause() -> bool {
+    let before: i64 = gc_pause_count();
+    gc_collect();
+    return gc_pause_count() > before;
+}
+
+fn longest_fits_inside_total() -> bool {
+    gc_minor_collect();
+    let count: i64 = gc_pause_count();
+    let total: i64 = gc_pause_total_ns();
+    let longest: i64 = gc_pause_max_ns();
+    return longest <= total && longest * count >= total;
+}
+
+fn reading_is_not_a_stop() -> bool {
+    let count: i64 = gc_pause_count();
+    let total: i64 = gc_pause_total_ns();
+    let longest: i64 = gc_pause_max_ns();
+    return gc_pause_count() == count
+        && gc_pause_total_ns() == total
+        && gc_pause_max_ns() == longest;
+}
+
+// Allocation pressure stops the world by itself; nothing here asks for it.
+fn churn(objects: i64) -> i64 {
+    let mut kept: Node = new Node(0);
+    let mut i: i64 = 0;
+    while i < objects {
+        kept = new Node(kept.value + 1);
+        i = i + 1;
+    }
+    return kept.value;
+}
+
+fn phase_delta_covers_allocation_pressure() -> bool {
+    let minors: i64 = gc_minor_collections();
+    let count: i64 = gc_pause_count();
+    let total: i64 = gc_pause_total_ns();
+    let done: i64 = churn(2000000);
+    let collected: i64 = gc_minor_collections() - minors;
+    return done == 2000000
+        && collected > 0
+        && gc_pause_count() - count >= collected
+        && gc_pause_total_ns() >= total;
+}
+
+fn main() {
+    println(minor_stop_is_a_pause());
+    println(major_cycle_is_a_pause());
+    println(longest_fits_inside_total());
+    println(reading_is_not_a_stop());
+    println(phase_delta_covers_allocation_pressure());
+}

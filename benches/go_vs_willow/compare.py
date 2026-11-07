@@ -22,6 +22,7 @@ import subprocess
 import sys
 
 from javatool import java_version
+from run import server_case
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +42,13 @@ SCHEDULER_CASES: tuple[tuple[str, list[int]], ...] = (
     ("gc_scheduler", [10_000, 100]),
     ("channel_select_fan_in", [1_000_000]),
     ("spawn_join_tree", [10, 5]),
+)
+
+# The integrated case at three connection counts, one million requests each.
+SERVER_CASES: tuple[tuple[str, list[int]], ...] = (
+    ("server_sim", [100, 10_000]),
+    ("server_sim", [1_000, 1_000]),
+    ("server_sim", [10_000, 100]),
 )
 
 SYNC_CASES = (
@@ -72,6 +80,10 @@ WORK = {
     "gc_scheduler": "10,000 tasks × 100 alloc/yield rounds",
     "channel_select_fan_in": "1,000,000 select receives from 4 producers + cancel",
     "spawn_join_tree": "fanout 10 × depth 5: 111,110 spawn+join",
+    **{
+        server_case(values): f"{values[0]:,} connections × {values[1]:,} requests"
+        for _, values in SERVER_CASES
+    },
     "leibniz_pow": "100,000,001 terms, sign via pow (base -1: pow shortcut)",
     "leibniz_pow_nonunit": "100,000,001 terms, pow with base -1.0000001",
     "leibniz_reduced": "100,000,001 terms, sign flip",
@@ -95,9 +107,11 @@ GC_CASES = (
     ("gc_scheduler", "GC plus scheduler"),
     ("object_churn", "GC under allocation churn"),
     ("array_literal_churn", "GC under array-literal churn"),
+    *((server_case(values), "GC under the integrated server case") for _, values in SERVER_CASES),
 )
 
-ORDER = [name for name, _ in SCHEDULER_CASES] + list(SYNC_CASES)
+SERVER_ORDER = [server_case(values) for _, values in SERVER_CASES]
+ORDER = [name for name, _ in SCHEDULER_CASES] + SERVER_ORDER + list(SYNC_CASES)
 Row = dict[str, object]
 
 
@@ -125,6 +139,7 @@ def split_environment(records: list[Row]) -> tuple[dict[str, str] | None, list[R
 
 def run_suites(args: argparse.Namespace) -> list[Row]:
     rows: list[Row] = []
+    cases: list[tuple[str, list[int]]] = []
     if not args.no_build and "willow" in args.languages:
         subprocess.run(["cargo", "build", "--release", "--bin", "willow"], cwd=ROOT, check=True)
     common = [
@@ -137,8 +152,12 @@ def run_suites(args: argparse.Namespace) -> list[Row]:
         print("+", " ".join(cmd), file=sys.stderr, flush=True)
         rows.extend(json_lines(sh(cmd, cwd=ROOT)))
     if args.suite in ("all", "scheduler"):
+        cases.extend(SCHEDULER_CASES)
+    if args.suite in ("all", "server"):
+        cases.extend(SERVER_CASES)
+    if cases:
         built = args.no_build
-        for name, values in SCHEDULER_CASES:
+        for name, values in cases:
             cmd = [sys.executable, str(RUN_SCHED), name, *map(str, values), *common]
             if built:
                 cmd.append("--no-build")
@@ -161,7 +180,7 @@ def metric_median(rows: list[Row], key: str) -> float | None:
 def group(rows: list[Row]) -> dict[tuple[str, str], list[Row]]:
     out: dict[tuple[str, str], list[Row]] = {}
     for r in rows:
-        out.setdefault((str(r["benchmark"]), str(r["language"])), []).append(r)
+        out.setdefault((str(r.get("case", r["benchmark"])), str(r["language"])), []).append(r)
     return out
 
 
@@ -217,6 +236,17 @@ def environment() -> dict[str, str]:
 def languages_in(rows: list[Row]) -> list[str]:
     seen = {str(r["language"]) for r in rows}
     return [language for language in LANGUAGES if language in seen]
+
+
+def suite_argument(rows: list[Row]) -> str:
+    """The --suite flag that reruns exactly these rows, empty for the whole suite."""
+    present = {str(row.get("case", row["benchmark"])) for row in rows}
+    suites = (
+        ("sync", set(SYNC_CASES)),
+        ("scheduler", {name for name, _ in SCHEDULER_CASES}),
+        ("server", set(SERVER_ORDER)),
+    )
+    return next((f" --suite {name}" for name, cases in suites if present <= cases), "")
 
 
 def render(
@@ -319,6 +349,29 @@ def render(
             out.append(line)
         out.append("")
 
+    server = [c for c in SERVER_ORDER if c in present]
+    if server:
+        out.append("## Integrated server case (server_sim)\n")
+        out.append(
+            "Each connection is a client and a handler task exchanging one request and one response "
+            "per round over capacity-1 channels, allocating a request, an eight-element body and a "
+            "response, and updating one shared Mutex. Clients are closed-loop, so latency includes "
+            "queueing behind the other connections. Percentiles are upper bounds of log-linear "
+            "buckets (under 1.6% error); the maximum is exact.\n"
+        )
+        header = "| Connections | Metric | " + " | ".join(names) + " |"
+        out += [header, "|---|---|" + "---:|" * len(langs)]
+        for c in server:
+            connections = c.removeprefix("server_sim_c")
+            for label_, value in (
+                ("Requests/s", lambda l: fmt(med(c, l, "operations_per_second"), 0)),
+                ("p50 latency (µs)", lambda l: fmt(_us(metric_median(g.get((c, l), []), "LATENCY_P50_NS")), 1)),
+                ("p99 latency (µs)", lambda l: fmt(_us(metric_median(g.get((c, l), []), "LATENCY_P99_NS")), 1)),
+                ("Max latency (µs)", lambda l: fmt(_us(metric_median(g.get((c, l), []), "LATENCY_MAX_NS")), 1)),
+            ):
+                out.append(f"| {connections} | {label_} | " + " | ".join(value(l) for l in langs) + " |")
+        out.append("")
+
     if "idle_spawn" in present:
         out.append("## Task footprint (idle_spawn)\n")
         out.append("Willow reports occupied GC heap bytes; Go `TotalAlloc` and JVM thread-allocated bytes are cumulative allocation counters. These are separate metrics.\n")
@@ -352,8 +405,10 @@ def render(
         jr = g.get((gc_case, "java"), [])
         out.append(f"## {title} ({gc_case})\n")
         out.append(
-            "Counters are not equivalent across runtimes: Willow exposes no pause time, Go reports "
-            "stop-the-world pauses, and the JVM reports cumulative collector time at 1 ms resolution.\n"
+            "Counters are not equivalent across runtimes: Willow reports its global stops from request "
+            "to release (its maximum is process-lifetime, so it covers this phase only when no stop "
+            "preceded it; see the row below), Go reports stop-the-world pauses, and the JVM reports "
+            "cumulative collector time at 1 ms resolution.\n"
         )
         out.append("| Metric | " + " | ".join(names) + " |")
         out.append("|---|" + "---:|" * len(langs))
@@ -383,10 +438,17 @@ def render(
             "java": fmt(metric_median(jr, "JAVA_HEAP_USED_BYTES"), 0),
         })
         row("GC pause / collector time total (µs)", {
+            "willow": fmt(_us(metric_median(wr, "WILLOW_GC_PAUSE_TOTAL_NS"))),
             "go": fmt(_us(metric_median(gr, "GO_GC_PAUSE_TOTAL_NS"))),
             "java": fmt(_us(metric_median(jr, "JAVA_GC_TIME_TOTAL_NS")), 0),
         })
-        row("Max GC pause (µs)", {"go": fmt(_us(metric_median(gr, "GO_GC_MAX_PAUSE_NS")))})
+        row("Max GC pause (µs)", {
+            "willow": fmt(_us(metric_median(wr, "WILLOW_GC_MAX_PAUSE_NS"))),
+            "go": fmt(_us(metric_median(gr, "GO_GC_MAX_PAUSE_NS"))),
+        })
+        row("GC pauses in phase / before phase", {
+            "willow": f"{fmt(metric_median(wr, 'WILLOW_GC_PAUSE_COUNT'), 0)} / {fmt(metric_median(wr, 'WILLOW_GC_PAUSES_BEFORE_START'), 0)}",
+        })
         out.append("")
 
     sync = [c for c in present if c in SYNC_CASES]
@@ -404,8 +466,8 @@ def render(
     out.append("## Reproduce\n")
     out.append("```sh")
     out.append(
-        f"python3 benches/go_vs_willow/compare.py run --label {label} --trials {max(trials) if trials else 5} "
-        f"--workers {workers} --languages {','.join(langs)}"
+        f"python3 benches/go_vs_willow/compare.py run --label {label}{suite_argument(rows)} "
+        f"--trials {max(trials) if trials else 5} --workers {workers} --languages {','.join(langs)}"
     )
     out.append("```\n")
     return "\n".join(out)
@@ -427,7 +489,7 @@ def main() -> None:
     run.add_argument("--label", default=dt.date.today().isoformat())
     run.add_argument("--trials", type=int, default=5)
     run.add_argument("--workers", type=int, default=8)
-    run.add_argument("--suite", choices=("all", "sync", "scheduler"), default="all")
+    run.add_argument("--suite", choices=("all", "sync", "scheduler", "server"), default="all")
     run.add_argument("--no-build", action="store_true")
     run.add_argument(
         "--languages",

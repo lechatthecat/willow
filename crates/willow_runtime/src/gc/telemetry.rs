@@ -287,6 +287,32 @@ pub extern "C" fn willow_gc_moved_objects() -> i64 {
     runtime().heap.lock().unwrap().moved_objects as i64
 }
 
+/// Completed global stops, including aborted ones: the world stopped either way.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_gc_pause_count() -> i64 {
+    saturating_i64(crate::gc_telemetry::stops::snapshot_pauses().count)
+}
+
+/// Cumulative request-to-release time of every completed global stop.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_gc_pause_total_ns() -> i64 {
+    saturating_i64(crate::gc_telemetry::stops::snapshot_pauses().total_ns)
+}
+
+/// Longest single global stop since process start. Unlike the count and total
+/// this cannot be turned into a per-phase figure by subtracting two reads.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_gc_pause_max_ns() -> i64 {
+    saturating_i64(crate::gc_telemetry::stops::snapshot_pauses().max_ns)
+}
+
+fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_remembered_set_size() -> i64 {

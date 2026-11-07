@@ -27,7 +27,19 @@ LANGUAGES = ("willow", "go", "java")
 DEFAULT_LANGUAGES = ("willow", "go")
 METRIC_PREFIXES = ("GO_", "WILLOW_", "JAVA_")
 # Result-count lines each benchmark prints after END (followed by an integer line).
-RESULT_METRICS = frozenset({"KEPT_OBJECTS", "RECEIVED", "CANCELLED", "LEAVES"})
+RESULT_METRICS = frozenset(
+    {
+        "KEPT_OBJECTS",
+        "RECEIVED",
+        "CANCELLED",
+        "LEAVES",
+        "REQUESTS",
+        "CHECKSUM",
+        "LATENCY_P50_NS",
+        "LATENCY_P99_NS",
+        "LATENCY_MAX_NS",
+    }
+)
 
 
 def build(languages: tuple[str, ...] = DEFAULT_LANGUAGES) -> None:
@@ -180,14 +192,36 @@ def summarize(
                 metrics[name] = int(output[index + 1])
         if metrics:
             result["metrics"] = metrics
+        if benchmark == "server_sim":
+            validate_server_sim(language, values, metrics)
+            result["case"] = server_case(values)
     if len(values) > 1:
         result["rounds"] = values[1]
     return result
 
 
+def server_case(values: list[int]) -> str:
+    """Report key: one benchmark measured at several connection counts."""
+    return f"server_sim_c{values[0]}"
+
+
+def validate_server_sim(language: str, values: list[int], metrics: dict[str, int]) -> None:
+    """Every request must have been served and answered with its own response."""
+    connections, rounds = values[0], values[1]
+    requests = connections * rounds
+    # Each response adds seq + conn + 3 to the client's checksum.
+    checksum = (
+        connections * (rounds * (rounds - 1) // 2)
+        + rounds * (connections * (connections - 1) // 2)
+        + 3 * requests
+    )
+    if metrics.get("REQUESTS") != requests or metrics.get("CHECKSUM") != checksum:
+        raise RuntimeError(f"{language} server_sim {values}: wrong result {metrics}")
+
+
 def benchmark_operations(benchmark: str, values: list[int]) -> int:
     """Units of work inside START/END: tasks spawned+joined, or messages/switches."""
-    if benchmark in {"yield_switch", "gc_scheduler"}:
+    if benchmark in {"yield_switch", "gc_scheduler", "server_sim"}:
         return values[0] * values[1]
     if benchmark == "spawn_join_tree":
         # values = [fanout, depth]: every non-root node is one spawn + one join.
@@ -204,6 +238,7 @@ BENCHMARKS = [
     "gc_scheduler",
     "channel_select_fan_in",
     "spawn_join_tree",
+    "server_sim",
 ]
 
 

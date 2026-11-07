@@ -10,6 +10,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Scheduler microbenchmarks equivalent to go/main.go and willow/*.wi, using
@@ -258,8 +259,12 @@ public final class Bench {
         }
         marker("END");
         long allocatedAfter = totalAllocatedBytes();
-        MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
         metric("KEPT_OBJECTS", kept);
+        gcMetrics(allocatedBefore, allocatedAfter, gcCountBefore, gcTimeBefore);
+    }
+
+    private static void gcMetrics(long allocatedBefore, long allocatedAfter, long gcCountBefore, long gcTimeBefore) {
+        MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
         metric("JAVA_TOTAL_ALLOC_BYTES", allocatedBefore < 0 ? -1 : allocatedAfter - allocatedBefore);
         metric("JAVA_HEAP_USED_BYTES", memory.getHeapMemoryUsage().getUsed());
         metric("JAVA_GC_CYCLES", gcCount() - gcCountBefore);
@@ -267,11 +272,152 @@ public final class Bench {
         metric("JAVA_GC_TIME_TOTAL_NS", (gcTimeMillis() - gcTimeBefore) * 1_000_000L);
     }
 
+    private record ServerRequest(long conn, long seq) {}
+
+    private record ServerResponse(long[] body) {}
+
+    /** The growable unboxed list a Go slice or Willow Array&lt;i64&gt; provides. */
+    private static final class Latencies {
+        long[] values = new long[0];
+        int size;
+
+        void add(long value) {
+            if (size == values.length) {
+                values = java.util.Arrays.copyOf(values, Math.max(4, size * 2));
+            }
+            values[size++] = value;
+        }
+    }
+
+    private static final class ServerStats {
+        final ReentrantLock lock = new ReentrantLock();
+        long served;
+    }
+
+    /**
+     * One simulated connection: a client and a handler virtual thread exchanging
+     * a request and a response per round over a pair of capacity-1 queues, with a
+     * short-lived object graph per request and one shared lock update.
+     */
+    private static void serverHandler(
+            BlockingQueue<ServerRequest> requests,
+            BlockingQueue<ServerResponse> responses,
+            int rounds,
+            ServerStats stats) throws InterruptedException {
+        for (int i = 0; i < rounds; i++) {
+            ServerRequest request = requests.take();
+            long seq = request.seq();
+            long conn = request.conn();
+            long[] body = {seq, conn, seq + 1, conn + 1, seq + 2, conn + 2, seq + 3, conn + 3};
+            stats.lock.lock();
+            try {
+                stats.served++;
+            } finally {
+                stats.lock.unlock();
+            }
+            responses.put(new ServerResponse(body));
+        }
+    }
+
+    private static long serverClient(
+            long conn,
+            BlockingQueue<ServerRequest> requests,
+            BlockingQueue<ServerResponse> responses,
+            int rounds,
+            Latencies latencies) throws InterruptedException {
+        long checksum = 0;
+        for (int seq = 0; seq < rounds; seq++) {
+            long sent = System.nanoTime();
+            requests.put(new ServerRequest(conn, seq));
+            ServerResponse response = responses.take();
+            latencies.add(System.nanoTime() - sent);
+            checksum += response.body()[0] + response.body()[7];
+        }
+        return checksum;
+    }
+
+    /** Log-linear bucket: 64 sub-buckets per power of two, under 1.6% relative error. */
+    private static int bucketIndex(long value) {
+        int shift = 0;
+        while (value >= 128) {
+            value /= 2;
+            shift++;
+        }
+        return shift * 128 + (int) value;
+    }
+
+    private static long bucketUpper(int index) {
+        long upper = index % 128 + 1;
+        for (int shift = index / 128; shift > 0; shift--) {
+            upper *= 2;
+        }
+        return upper - 1;
+    }
+
+    private static long percentile(long[] histogram, long total, long percent) {
+        long rank = (total * percent + 99) / 100;
+        long seen = 0;
+        for (int i = 0; i < histogram.length; i++) {
+            seen += histogram[i];
+            if (seen >= rank) {
+                return bucketUpper(i);
+            }
+        }
+        return -1;
+    }
+
+    private static void serverSim(int connections, int rounds) throws InterruptedException {
+        ServerStats stats = new ServerStats();
+        long[] checksums = new long[connections];
+        Latencies[] latencies = new Latencies[connections];
+        long allocatedBefore = totalAllocatedBytes();
+        long gcCountBefore = gcCount();
+        long gcTimeBefore = gcTimeMillis();
+
+        marker("START");
+        Thread[] threads = new Thread[2 * connections];
+        for (int i = 0; i < connections; i++) {
+            int slot = i;
+            BlockingQueue<ServerRequest> requests = new ArrayBlockingQueue<>(1);
+            BlockingQueue<ServerResponse> responses = new ArrayBlockingQueue<>(1);
+            latencies[slot] = new Latencies();
+            threads[2 * slot] = Thread.startVirtualThread(() -> run(
+                () -> serverHandler(requests, responses, rounds, stats)));
+            threads[2 * slot + 1] = Thread.startVirtualThread(() -> run(
+                () -> checksums[slot] = serverClient(slot, requests, responses, rounds, latencies[slot])));
+        }
+        for (Thread thread : threads) {
+            thread.join();
+        }
+        marker("END");
+        long allocatedAfter = totalAllocatedBytes();
+
+        long[] histogram = new long[128 * 48];
+        long checksum = 0;
+        long longest = 0;
+        long samples = 0;
+        for (int i = 0; i < connections; i++) {
+            checksum += checksums[i];
+            for (int j = 0; j < latencies[i].size; j++) {
+                long latency = latencies[i].values[j];
+                histogram[bucketIndex(latency)]++;
+                longest = Math.max(longest, latency);
+                samples++;
+            }
+        }
+        metric("REQUESTS", stats.served);
+        metric("CHECKSUM", checksum);
+        metric("LATENCY_P50_NS", percentile(histogram, samples, 50));
+        metric("LATENCY_P99_NS", percentile(histogram, samples, 99));
+        metric("LATENCY_MAX_NS", longest);
+        gcMetrics(allocatedBefore, allocatedAfter, gcCountBefore, gcTimeBefore);
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
             throw new IllegalArgumentException(
                 "usage: Bench <idle_spawn|wake_fanout|yield_switch|ping_pong|gc_scheduler"
-                    + "|channel_select_fan_in|spawn_join_tree> <count> [rounds]");
+                    + "|channel_select_fan_in|spawn_join_tree|server_sim> <count> [rounds]");
         }
         int count = integerArg(args, 1);
         Runnable body = switch (args[0]) {
@@ -290,6 +436,10 @@ public final class Bench {
             case "spawn_join_tree" -> {
                 int depth = integerArg(args, 2);
                 yield () -> run(() -> spawnJoinTree(count, depth));
+            }
+            case "server_sim" -> {
+                int rounds = integerArg(args, 2);
+                yield () -> run(() -> serverSim(count, rounds));
             }
             default -> throw new IllegalArgumentException("unknown benchmark: " + args[0]);
         };

@@ -202,6 +202,8 @@ const WORD_PINS: &[(&str, &[AbiTy], Option<AbiTy>)] = &[
     ("willow_async_mutex_new", &[Word, I64], Some(Ptr)),
     ("willow_async_mutex_load", &[Ptr, I64], Some(Word)),
     ("willow_async_mutex_commit", &[Ptr, I64, Word], Some(I32)),
+    ("willow_lock_group_load", &[Ptr, I64], Some(Word)),
+    ("willow_lock_group_commit", &[Ptr, I64, Word], Some(I32)),
     (
         "willow_async_mutex_commit_release",
         &[Ptr, I64, Word],
@@ -237,6 +239,9 @@ fn word_carrying_rows_keep_i64_payload_types_in_rust() {
     let _: extern "C" fn(*mut c_void, i64, i64) -> i32 = async_mutex::willow_async_mutex_commit;
     let _: extern "C" fn(*mut c_void, i64, i64) -> i32 =
         async_mutex::willow_async_mutex_commit_release;
+    let _: extern "C" fn(*mut c_void, i64) -> i64 = crate::lock_group::willow_lock_group_load;
+    let _: extern "C" fn(*mut c_void, i64, i64) -> i32 =
+        crate::lock_group::willow_lock_group_commit;
     let _: extern "C" fn(i64, i64) -> *mut c_void = async_rwlock::willow_async_rwlock_new;
     let _: extern "C" fn(*mut c_void, i64) -> i64 = async_rwlock::willow_async_rwlock_load;
     let _: extern "C" fn(*mut c_void, i64, i64) -> i32 = async_rwlock::willow_async_rwlock_commit;

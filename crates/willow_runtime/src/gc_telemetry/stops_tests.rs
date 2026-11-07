@@ -35,6 +35,59 @@ fn stop_reasons_separate_rendezvous_work_and_aborts() {
 }
 
 #[test]
+fn pauses_span_request_to_release_across_every_cause_and_abort() {
+    let mut t = StopTelemetry::default();
+    for (start, reason, aborted) in [
+        (100, StopReason::InitialMark, false),
+        (200, StopReason::Remark, false),
+        (300, StopReason::Minor, false),
+        (400, StopReason::Recovery, true),
+    ] {
+        complete(&mut t, reason, start, aborted);
+    }
+    assert_eq!(t.pauses.count, 4);
+    assert_eq!(t.pauses.total_ns, 4 * 30);
+    assert_eq!(t.pauses.max_ns, 30);
+}
+
+#[test]
+fn longest_pause_is_one_interval_not_the_sum_of_component_maxima() {
+    let mut t = StopTelemetry::default();
+    for (rendezvous, stopped) in [(90, 10), (10, 90)] {
+        let mut e = t.request(StopReason::Minor, 1000);
+        e.stopped_ns = 1000 + rendezvous;
+        e.released_ns = e.stopped_ns + stopped;
+        t.complete(e);
+    }
+    assert_eq!(t.pauses.max_ns, 100);
+    assert_eq!(t.pauses.total_ns, 200);
+}
+
+#[test]
+fn an_open_stop_is_not_a_pause_until_it_completes() {
+    let mut t = StopTelemetry::default();
+    let mut e = t.request(StopReason::Minor, 5);
+    assert_eq!(t.pauses.count, 0);
+    e.stopped_ns = 6;
+    e.released_ns = 8;
+    t.complete(e);
+    assert_eq!(t.pauses.count, 1);
+    assert_eq!(t.pauses.total_ns, 3);
+}
+
+#[test]
+fn pause_totals_survive_event_history_overflow() {
+    let mut t = StopTelemetry::default();
+    let stops = EVENT_CAPACITY as u64 * 2;
+    for i in 0..stops {
+        complete(&mut t, StopReason::Minor, i * 40, false);
+    }
+    assert_eq!(t.pauses.count, stops);
+    assert_eq!(t.pauses.total_ns, 30 * stops);
+    assert_ne!(t.stats.flags & STOP_EVENTS_LOST, 0);
+}
+
+#[test]
 fn active_overlapping_and_malformed_intervals_cannot_look_complete() {
     let mut t = StopTelemetry::default();
     let first = t.request(StopReason::Minor, 5);

@@ -851,6 +851,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
              {1: \"one\", 2: \"two\", 3: \"three\"}\n3\nfalse\n4\n3\nabtail\n2\n4\n",
         ),
         (
+            "example/gc_pause_stats.wi",
+            "true\ntrue\ntrue\ntrue\ntrue\n",
+        ),
+        (
             "example/lir_gc_stats.wi",
             "true\ntrue\ntrue\ntrue\ntrue\n3\ntrue\nheap: ok\n",
         ),

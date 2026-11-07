@@ -1,0 +1,198 @@
+import std::collections::Array;
+import std::time;
+
+// One simulated connection: a client task and a handler task exchanging a
+// request and a response per round over a pair of capacity-1 channels, with a
+// short-lived object graph per request and one shared Mutex update.
+
+class Request {
+    pub conn: i64;
+    pub seq: i64;
+}
+
+class Response {
+    pub body: Array<i64>;
+}
+
+class ClientResult {
+    pub checksum: i64;
+    pub latencies: Array<i64>;
+}
+
+async fn handler(requests: Channel<Request>, responses: Channel<Response>, rounds: i64, served: Mutex<i64>) {
+    let mut i = 0;
+    while i < rounds {
+        let request = requests.recv();
+        let seq = request.seq;
+        let conn = request.conn;
+        let body: Array<i64> = [seq, conn, seq + 1, conn + 1, seq + 2, conn + 2, seq + 3, conn + 3];
+        lock served as mut count {
+            count = count + 1;
+        }
+        responses.send(new Response(body));
+        i = i + 1;
+    }
+}
+
+async fn client(conn: i64, requests: Channel<Request>, responses: Channel<Response>, rounds: i64) -> ClientResult {
+    let latencies: Array<i64> = [];
+    let mut checksum = 0;
+    let mut seq = 0;
+    while seq < rounds {
+        let sent = time::now_ns();
+        requests.send(new Request(conn, seq));
+        let response = responses.recv();
+        latencies.push(time::now_ns() - sent);
+        checksum = checksum + response.body[0] + response.body[7];
+        seq = seq + 1;
+    }
+    return new ClientResult(checksum, latencies);
+}
+
+// Log-linear bucket: 64 sub-buckets per power of two, under 1.6% relative error.
+fn bucket_index(value: i64) -> i64 {
+    let mut v = value;
+    let mut shift = 0;
+    while v >= 128 {
+        v = v / 2;
+        shift = shift + 1;
+    }
+    return shift * 128 + v;
+}
+
+fn bucket_upper(index: i64) -> i64 {
+    let mut upper = index % 128 + 1;
+    let mut shift = index / 128;
+    while shift > 0 {
+        upper = upper * 2;
+        shift = shift - 1;
+    }
+    return upper - 1;
+}
+
+fn percentile(histogram: Array<i64>, total: i64, percent: i64) -> i64 {
+    let rank = (total * percent + 99) / 100;
+    let mut seen = 0;
+    let mut i = 0;
+    while i < histogram.len() {
+        seen = seen + histogram[i];
+        if seen >= rank {
+            return bucket_upper(i);
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+async fn main() {
+    let connections = i64::parse(env::arg(0).unwrap()).unwrap();
+    let rounds = i64::parse(env::arg(1).unwrap()).unwrap();
+    let served: Mutex<i64> = Mutex::new(0);
+    let minor_before = gc_minor_collections();
+    let major_before = gc_major_collections();
+    let promoted_before = gc_promoted_objects();
+    let moved_before = gc_moved_objects();
+    let fast_before = gc_tlab_fast_allocations();
+    let refills_before = gc_tlab_refills();
+    let pause_count_before = gc_pause_count();
+    let pause_total_before = gc_pause_total_ns();
+
+    println("START");
+    let allocated_before = gc_total_allocated_bytes();
+    let clients: Array<Task<ClientResult>> = [];
+    let handlers: Array<Task<void>> = [];
+    let mut i = 0;
+    while i < connections {
+        let requests = Channel<Request>::with_capacity(1);
+        let responses = Channel<Response>::with_capacity(1);
+        handlers.push(handler(requests, responses, rounds, served));
+        clients.push(client(i, requests, responses, rounds));
+        i = i + 1;
+    }
+    let results: Array<ClientResult> = [];
+    i = 0;
+    while i < connections {
+        results.push(await clients[i]);
+        await handlers[i];
+        i = i + 1;
+    }
+    let allocated_after = gc_total_allocated_bytes();
+    println("END");
+
+    let pause_count = gc_pause_count() - pause_count_before;
+    let pause_total = gc_pause_total_ns() - pause_total_before;
+    let pause_max = gc_pause_max_ns();
+    let minor = gc_minor_collections() - minor_before;
+    let major = gc_major_collections() - major_before;
+    let promoted = gc_promoted_objects() - promoted_before;
+    let moved = gc_moved_objects() - moved_before;
+    let fast = gc_tlab_fast_allocations() - fast_before;
+    let refills = gc_tlab_refills() - refills_before;
+    let live = gc_allocated_bytes();
+
+    let histogram: Array<i64> = [];
+    i = 0;
+    while i < 128 * 48 {
+        histogram.push(0);
+        i = i + 1;
+    }
+    let mut checksum = 0;
+    let mut longest = 0;
+    let mut samples = 0;
+    i = 0;
+    while i < connections {
+        let result = results[i];
+        checksum = checksum + result.checksum;
+        let mut j = 0;
+        while j < result.latencies.len() {
+            let latency = result.latencies[j];
+            let index = bucket_index(latency);
+            histogram[index] = histogram[index] + 1;
+            if latency > longest {
+                longest = latency;
+            }
+            samples = samples + 1;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    let mut requests_served = 0;
+    lock served as count {
+        requests_served = count;
+    }
+
+    println("REQUESTS");
+    println(requests_served);
+    println("CHECKSUM");
+    println(checksum);
+    println("LATENCY_P50_NS");
+    println(percentile(histogram, samples, 50));
+    println("LATENCY_P99_NS");
+    println(percentile(histogram, samples, 99));
+    println("LATENCY_MAX_NS");
+    println(longest);
+    println("WILLOW_TOTAL_ALLOC_BYTES");
+    println(allocated_after - allocated_before);
+    println("WILLOW_LIVE_BYTES");
+    println(live);
+    println("WILLOW_TLAB_FAST_ALLOCATIONS");
+    println(fast);
+    println("WILLOW_TLAB_REFILLS");
+    println(refills);
+    println("WILLOW_MINOR_COLLECTIONS");
+    println(minor);
+    println("WILLOW_MAJOR_COLLECTIONS");
+    println(major);
+    println("WILLOW_PROMOTED_OBJECTS");
+    println(promoted);
+    println("WILLOW_MOVED_OBJECTS");
+    println(moved);
+    println("WILLOW_GC_PAUSES_BEFORE_START");
+    println(pause_count_before);
+    println("WILLOW_GC_PAUSE_COUNT");
+    println(pause_count);
+    println("WILLOW_GC_PAUSE_TOTAL_NS");
+    println(pause_total);
+    println("WILLOW_GC_MAX_PAUSE_NS");
+    println(pause_max);
+}

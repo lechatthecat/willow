@@ -57,6 +57,8 @@ mod frozen_map_gc;
 mod gc_enum_payload_roots;
 #[path = "integration/gc_mutator_registration.rs"]
 mod gc_mutator_registration;
+#[path = "integration/gc_pause_stats.rs"]
+mod gc_pause_stats;
 #[path = "integration/generic_interface_default_self.rs"]
 mod generic_interface_default_self;
 #[path = "integration/imported_enum_match.rs"]

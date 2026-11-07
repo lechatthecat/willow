@@ -43,7 +43,7 @@ const PLAIN: [(&str, &str); 0] = [];
 const LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 
 /// Every counter the language exposes, in declaration order.
-const COUNTERS: [&str; 30] = [
+const COUNTERS: [&str; 33] = [
     "gc_allocated_bytes",
     "gc_total_allocated_bytes",
     "gc_tlab_fast_allocations",
@@ -54,6 +54,9 @@ const COUNTERS: [&str; 30] = [
     "gc_minor_collections",
     "gc_promoted_objects",
     "gc_moved_objects",
+    "gc_pause_count",
+    "gc_pause_total_ns",
+    "gc_pause_max_ns",
     "gc_survivor_copies",
     "gc_survivor_bytes",
     "gc_tenured_objects",

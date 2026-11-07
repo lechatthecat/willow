@@ -12,7 +12,8 @@ python3 benches/go_vs_willow/compare.py run \
 ```
 
 `compare.py run` builds the release compiler and the Go/Java benchmark programs,
-runs `run_sync.py` (all cases) and `run.py` (the seven standard scheduler cases)
+runs `run_sync.py` (all cases) and `run.py` (the seven standard scheduler cases
+and the integrated `server_sim` case at three connection counts)
 for the selected languages, writes `MEASUREMENT_<label>.jsonl` with every trial
 record, and renders `MEASUREMENT_<label>.md` with median tables, Willow/other
 ratios and optional deltas against a baseline JSONL. `compare.py report <jsonl>`
@@ -65,8 +66,11 @@ The priority cases are:
 - `ping_pong`: one million channel round trips between two tasks/goroutines.
 - `gc_scheduler`: N workers allocate one object, keep it live across a yield,
   and repeat R times. Willow reports its public allocation/collection counters;
-  Go reports `runtime.MemStats`, including pause time. Willow currently exposes
-  neither GC pause duration nor GC CPU percentage through its language ABI.
+  Go reports `runtime.MemStats`, including pause time. Willow reports its global
+  stops through `gc_pause_count()`, `gc_pause_total_ns()` and
+  `gc_pause_max_ns()`, measured from stop request to release; the maximum is
+  process-lifetime, so the benchmarks also print how many stops preceded `START`.
+  Willow does not expose a GC CPU percentage through its language ABI.
 - `channel_select_fan_in`: four producers each send tokens on their own
   capacity-1 channel; the consumer `select`s across all four until it has taken
   N tokens, then cancels the producers and joins them inside the timed phase
@@ -79,6 +83,17 @@ The priority cases are:
   `newVirtualThreadPerTaskExecutor()` per node); `10 5` spawns 111,110 tasks
   and prints the 100,000 leaves.
 
+- `server_sim`: arguments are `connections requests`. Each connection is a client
+  and a handler task (goroutines, virtual threads) created inside the timed phase.
+  Per request the client allocates a request object, sends it over a capacity-1
+  channel and waits for the response on a second one; the handler allocates an
+  eight-element body and a response object and updates one shared Mutex.
+  Reports requests/s, p50/p99/max request latency and GC pauses, and checks that
+  every request was served and answered with its own response. `compare.py` runs
+  100, 1,000 and 10,000 connections at one million requests each; `--suite server`
+  runs only those. Clients are closed-loop, so latency includes queueing behind
+  the other connections, and there is no socket I/O.
+
 Build and run, for example:
 
 ```sh
@@ -89,6 +104,7 @@ python3 benches/go_vs_willow/run.py ping_pong 1000000 --trials 5 --no-build
 python3 benches/go_vs_willow/run.py gc_scheduler 10000 100 --trials 5 --no-build
 python3 benches/go_vs_willow/run.py channel_select_fan_in 1000000 --trials 5 --no-build
 python3 benches/go_vs_willow/run.py spawn_join_tree 10 5 --trials 5 --no-build
+python3 benches/go_vs_willow/run.py server_sim 1000 1000 --trials 5 --no-build
 ```
 
 Do not run the 1M-task case until the 100k-task RSS result confirms that it is

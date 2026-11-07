@@ -190,6 +190,13 @@ func gcScheduler(count, rounds int) {
 	fmt.Println("END")
 	var after runtime.MemStats
 	runtime.ReadMemStats(&after)
+	fmt.Println("KEPT_OBJECTS")
+	fmt.Println(kept)
+	printGcMetrics(&before, &after)
+}
+
+// MemStats keeps the last 256 pauses, so the maximum covers at most those.
+func printGcMetrics(before, after *runtime.MemStats) {
 	maxPause := uint64(0)
 	for cycle := before.NumGC + 1; cycle <= after.NumGC; cycle++ {
 		pause := after.PauseNs[(cycle+255)%256]
@@ -197,8 +204,6 @@ func gcScheduler(count, rounds int) {
 			maxPause = pause
 		}
 	}
-	fmt.Println("KEPT_OBJECTS")
-	fmt.Println(kept)
 	fmt.Println("GO_TOTAL_ALLOC_BYTES")
 	fmt.Println(after.TotalAlloc - before.TotalAlloc)
 	fmt.Println("GO_MALLOCS")
@@ -213,9 +218,130 @@ func gcScheduler(count, rounds int) {
 	fmt.Println(maxPause)
 }
 
+type serverRequest struct {
+	conn int64
+	seq  int64
+}
+
+type serverResponse struct {
+	body []int64
+}
+
+// One simulated connection: a client goroutine and a handler goroutine
+// exchanging a request and a response per round over a pair of capacity-1
+// channels, with a short-lived object graph per request and one shared Mutex
+// update. Everything sent through a channel escapes to the heap.
+func serverHandler(requests chan *serverRequest, responses chan *serverResponse, rounds int, lock *sync.Mutex, served *int64) {
+	for i := 0; i < rounds; i++ {
+		request := <-requests
+		seq, conn := request.seq, request.conn
+		body := []int64{seq, conn, seq + 1, conn + 1, seq + 2, conn + 2, seq + 3, conn + 3}
+		lock.Lock()
+		*served++
+		lock.Unlock()
+		responses <- &serverResponse{body: body}
+	}
+}
+
+func serverClient(conn int64, requests chan *serverRequest, responses chan *serverResponse, rounds int) (int64, []int64) {
+	var latencies []int64
+	var checksum int64
+	for seq := 0; seq < rounds; seq++ {
+		sent := time.Now()
+		requests <- &serverRequest{conn: conn, seq: int64(seq)}
+		response := <-responses
+		latencies = append(latencies, int64(time.Since(sent)))
+		checksum += response.body[0] + response.body[7]
+	}
+	return checksum, latencies
+}
+
+// Log-linear bucket: 64 sub-buckets per power of two, under 1.6% relative error.
+func bucketIndex(value int64) int64 {
+	shift := int64(0)
+	for value >= 128 {
+		value /= 2
+		shift++
+	}
+	return shift*128 + value
+}
+
+func bucketUpper(index int64) int64 {
+	upper := index%128 + 1
+	for shift := index / 128; shift > 0; shift-- {
+		upper *= 2
+	}
+	return upper - 1
+}
+
+func percentile(histogram []int64, total, percent int64) int64 {
+	rank := (total*percent + 99) / 100
+	seen := int64(0)
+	for index, count := range histogram {
+		seen += count
+		if seen >= rank {
+			return bucketUpper(int64(index))
+		}
+	}
+	return -1
+}
+
+func serverSim(connections, rounds int) {
+	var lock sync.Mutex
+	var served int64
+	checksums := make([]int64, connections)
+	latencies := make([][]int64, connections)
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	fmt.Println("START")
+	var wg sync.WaitGroup
+	wg.Add(2 * connections)
+	for i := 0; i < connections; i++ {
+		requests := make(chan *serverRequest, 1)
+		responses := make(chan *serverResponse, 1)
+		go func() {
+			defer wg.Done()
+			serverHandler(requests, responses, rounds, &lock, &served)
+		}()
+		go func(slot int) {
+			defer wg.Done()
+			checksums[slot], latencies[slot] = serverClient(int64(slot), requests, responses, rounds)
+		}(i)
+	}
+	wg.Wait()
+	fmt.Println("END")
+
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	histogram := make([]int64, 128*48)
+	var checksum, longest, samples int64
+	for i := range latencies {
+		checksum += checksums[i]
+		for _, latency := range latencies[i] {
+			histogram[bucketIndex(latency)]++
+			if latency > longest {
+				longest = latency
+			}
+			samples++
+		}
+	}
+	fmt.Println("REQUESTS")
+	fmt.Println(served)
+	fmt.Println("CHECKSUM")
+	fmt.Println(checksum)
+	fmt.Println("LATENCY_P50_NS")
+	fmt.Println(percentile(histogram, samples, 50))
+	fmt.Println("LATENCY_P99_NS")
+	fmt.Println(percentile(histogram, samples, 99))
+	fmt.Println("LATENCY_MAX_NS")
+	fmt.Println(longest)
+	printGcMetrics(&before, &after)
+}
+
 func main() {
 	if len(os.Args) < 3 {
-		panic("usage: go-bench <idle_spawn|wake_fanout|yield_switch|ping_pong|gc_scheduler|channel_select_fan_in|spawn_join_tree> <count> [rounds]")
+		panic("usage: go-bench <idle_spawn|wake_fanout|yield_switch|ping_pong|gc_scheduler|channel_select_fan_in|spawn_join_tree|server_sim> <count> [rounds]")
 	}
 	switch os.Args[1] {
 	case "idle_spawn":
@@ -232,6 +358,8 @@ func main() {
 		channelSelectFanIn(integerArg(2))
 	case "spawn_join_tree":
 		spawnJoinTree(integerArg(2), integerArg(3))
+	case "server_sim":
+		serverSim(integerArg(2), integerArg(3))
 	default:
 		panic("unknown benchmark")
 	}

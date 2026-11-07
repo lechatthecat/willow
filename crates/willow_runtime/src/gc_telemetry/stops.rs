@@ -105,8 +105,33 @@ pub struct WillowGcStatsV2 {
     pub workers: super::workers::MarkWorkerStatsV2,
 }
 
+/// Exactly one cache line. `STOPS` is a static, so its size sets the cache-line
+/// phase of the runtime statics linked after it, and a shift of half a line
+/// measurably slows spawn-heavy programs that never reach a stop.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PauseTotals {
+    pub(crate) count: u64,
+    pub(crate) total_ns: u64,
+    pub(crate) max_ns: u64,
+    _line_fill: [u64; 5],
+}
+
+const _: () = assert!(std::mem::size_of::<PauseTotals>() == 64);
+
+impl PauseTotals {
+    fn record(&mut self, ns: u64) {
+        self.count = self.count.saturating_add(1);
+        self.total_ns = self.total_ns.saturating_add(ns);
+        self.max_ns = self.max_ns.max(ns);
+    }
+}
+
 struct StopTelemetry {
     stats: StopStatsV2,
+    /// Whole request-to-release intervals of all causes. The per-reason
+    /// rendezvous and stopped histograms cannot yield this: the longest stop
+    /// need not hold either maximum. Kept out of the V2 layout, which is ABI.
+    pauses: PauseTotals,
     pending: VecDeque<StopEventV2>,
     capacity: usize,
 }
@@ -129,6 +154,7 @@ impl StopTelemetry {
                     },
                 ..Default::default()
             },
+            pauses: PauseTotals::default(),
             pending: VecDeque::with_capacity(capacity),
             capacity,
         }
@@ -196,6 +222,7 @@ impl StopTelemetry {
             }
             histogram.record(ns);
         }
+        self.pauses.record(rendezvous.saturating_add(stopped));
         add(
             &mut totals.work.metadata_objects,
             event.work.metadata_objects,
@@ -300,6 +327,11 @@ pub fn transport_capacity() -> usize {
 
 pub fn snapshot_stops() -> StopStatsV2 {
     STOPS.lock().unwrap_or_else(|p| p.into_inner()).stats
+}
+
+/// Every completed stop, whatever its cause, measured from request to release.
+pub(crate) fn snapshot_pauses() -> PauseTotals {
+    STOPS.lock().unwrap_or_else(|p| p.into_inner()).pauses
 }
 
 /// Drain under a short telemetry-only lock. Formatting and I/O occur after the
