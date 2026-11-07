@@ -526,9 +526,9 @@ fn ordered_locks_type_parameter_has_no_type_class() {
 async fn f<T>(a: Mutex<T>, b: Mutex<i64>) {
     lock a as x { lock b as y { println(y); } }
 }
-async fn main() { await f(Mutex::new(1), Mutex::new(2)); }
+async fn main() { await f(Mutex::new("x"), Mutex::new(2)); }
 "#,
-        &["E2605"],
+        &["E2605", "lock identity or ordering is unknown"],
     );
 }
 
