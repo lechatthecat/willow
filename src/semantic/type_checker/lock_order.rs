@@ -166,25 +166,27 @@ impl Graph {
                 ErrorCode::E2605,
                 "lock acquisition order contains a cycle",
             );
-            let mut spans = HashSet::new();
+            let mut spans = Vec::new();
             for &node in group {
                 for &(to, span) in &self.edges[node] {
                     #[cfg(test)]
                     {
                         self.operations += 1;
                     }
-                    if components[to] == id && span != Span::dummy() && spans.insert(span) {
-                        let label = if diagnostic.labels.is_empty() {
-                            Label::primary(
-                                span,
-                                "acquisition participates in this lock-order cycle",
-                            )
-                        } else {
-                            Label::secondary(span, "another acquisition or call in the cycle")
-                        };
-                        diagnostic = diagnostic.with_label(label);
+                    if components[to] == id && span != Span::dummy() {
+                        spans.push(span);
                     }
                 }
+            }
+            // Report by source position, so node and edge order cannot show.
+            spans.sort_unstable();
+            spans.dedup();
+            for (index, &span) in spans.iter().enumerate() {
+                diagnostic = diagnostic.with_label(if index == 0 {
+                    Label::primary(span, "acquisition participates in this lock-order cycle")
+                } else {
+                    Label::secondary(span, "another acquisition or call in the cycle")
+                });
             }
             let present = group
                 .iter()
@@ -221,6 +223,14 @@ impl Graph {
                 }
             });
         }
+        diagnostics.sort_unstable_by(|left, right| {
+            left.labels
+                .iter()
+                .map(|label| label.span)
+                .cmp(right.labels.iter().map(|label| label.span))
+                .then_with(|| left.notes.cmp(&right.notes))
+                .then_with(|| left.helps.cmp(&right.helps))
+        });
         diagnostics
     }
 }
@@ -716,33 +726,18 @@ pub(crate) fn analyze_all(
         }
     }
     let roots = collapse_groups(&mut graph, &class_aliases);
-    let mut stand_ins = typed_nodes
-        .into_iter()
-        .filter_map(|(key, nodes)| {
-            let class = *equal_classes.get(&Class::Type(key))?;
-            Some((
-                roots[class],
-                nodes.into_iter().map(|node| roots[node]).collect(),
-            ))
-        })
-        .collect();
-    order_stand_ins(&mut stand_ins);
     let mut type_classes = TypeClasses::default();
-    for (class, nodes) in stand_ins {
-        graph.stand_for(class, nodes.into_iter(), &mut type_classes);
+    for (key, nodes) in typed_nodes {
+        if let Some(&class) = equal_classes.get(&Class::Type(key)) {
+            graph.stand_for(
+                roots[class],
+                nodes.into_iter().map(|node| roots[node]),
+                &mut type_classes,
+            );
+        }
     }
     diagnostics.extend(graph.diagnostics(&type_classes));
     diagnostics
-}
-
-// Map iteration order must not reach the graph: edge order decides which
-// acquisition a diagnostic reports first. O(L log L) for L typed locks.
-fn order_stand_ins(stand_ins: &mut Vec<(usize, Vec<usize>)>) {
-    stand_ins.sort_unstable_by_key(|&(class, _)| class);
-    for (_, nodes) in stand_ins {
-        nodes.sort_unstable();
-        nodes.dedup();
-    }
 }
 
 // Merge source-identical classes shared by more than one unit snapshot.
@@ -924,13 +919,33 @@ mod tests {
         assert!(graph.diagnostics(&TypeClasses::default()).is_empty());
     }
     #[test]
-    fn lock_order_stand_ins_ignore_map_iteration_order() {
-        let mut first = vec![(7, vec![9, 3, 9]), (2, vec![5, 4])];
-        let mut second = vec![(2, vec![4, 5, 4]), (7, vec![3, 9])];
-        order_stand_ins(&mut first);
-        order_stand_ins(&mut second);
-        assert_eq!(first, vec![(2, vec![4, 5]), (7, vec![3, 9])]);
-        assert_eq!(first, second);
+    fn lock_order_reports_cycles_by_source_position() {
+        let at = |start| Span::new(start, start + 1, 1, start);
+        // The same two cycles, built with nodes and edges in opposite orders.
+        let cycles = [[(0, 1, 40), (1, 0, 30)], [(2, 3, 20), (3, 2, 10)]];
+        let reports = [false, true].map(|reverse| {
+            let mut graph = Graph::default();
+            for _ in 0..4 {
+                graph.node(true);
+            }
+            let mut edges = cycles.concat();
+            if reverse {
+                edges.reverse();
+            }
+            for (from, to, start) in edges {
+                graph.edge(from, to, at(start));
+            }
+            graph.diagnostics(&TypeClasses::default())
+        });
+        assert_eq!(reports[0], reports[1]);
+        let starts = reports[0]
+            .iter()
+            .map(|diagnostic| {
+                let labels = diagnostic.labels.iter();
+                labels.map(|label| label.span.start).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(starts, [[10, 20], [30, 40]]);
     }
     #[test]
     fn lock_order_27_call_under_opaque_lock_is_accepted() {
