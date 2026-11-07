@@ -266,10 +266,13 @@ Taking them in the opposite order elsewhere is reported as a cycle. Nesting two
 locks that cannot be told apart is rejected, because they may be the same lock:
 two parameters of one type, two locks from one factory function, collection
 elements, or a recursive type such as `Mutex<Node>` reached through a `Node`
-field. Use group syntax for the first three; hand-over-hand traversal of a
-recursive type is not supported. A lock of unknown origin may be any lock of its
-type, so its order applies to each known lock of that type, while known locks
-stay distinct from one another. Generic `Mutex<T>` values have no type order, and
+field. Two `Mutex<i64>` parameters are the common case; use group syntax for the
+first three. Holding one node while locking the next (hand-over-hand traversal)
+is not supported for a recursive type. A loop that locks one node at a time works,
+as `example/parent_child_locks.wi` shows, but another task can change the list
+between two steps. A lock of unknown origin may be any lock of its type, so its
+order applies to each known lock of that type, while known locks stay distinct
+from one another. Generic `Mutex<T>` values have no type order, and
 nesting inside a generic function or class stays conservative: use group syntax
 there. Awaiting an async helper inside a lock is
 still E2604: compute awaited values before entering the critical section, or

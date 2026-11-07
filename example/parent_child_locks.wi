@@ -1,6 +1,9 @@
 // Parent and child locks: the child lock is only known once the parent is
 // held, so it cannot join a group. Each lock of unknown origin is ordered by
 // its value type, which puts every parent before every child.
+//
+// A recursive type has one lock type at every level, so its nodes cannot nest.
+// `total` walks a list with one node locked at a time instead.
 
 class Account {
     pub balance: Mutex<i64>;
@@ -36,6 +39,29 @@ async fn read_account(slot: Mutex<Account>) -> i64 {
     }
 }
 
+class Node {
+    pub value: i64;
+    pub next: Option<Mutex<Node>>;
+
+    pub init(self, value: i64, next: Option<Mutex<Node>>) {
+        self.value = value;
+        self.next = next;
+    }
+}
+
+// Nesting two `Mutex<Node>` is rejected, so walk with one node locked at a time.
+async fn total(head: Mutex<Node>) -> i64 {
+    let mut sum = 0;
+    let mut current: Option<Mutex<Node>> = Option::Some(head);
+    while let Some(cell) = current {
+        lock cell as node {
+            sum = sum + node.value;
+            current = node.next;
+        }
+    }
+    return sum;
+}
+
 async fn main() {
     let slot = Mutex::new(Mutex::new(1));
     println(await deposit(slot, 2));
@@ -43,4 +69,6 @@ async fn main() {
     println(await replace_then_read(slot));
     println(await deposit(slot, 1));
     println(await read_account(Mutex::new(new Account(7))));
+    let tail = Mutex::new(new Node(2, Option::None));
+    println(await total(Mutex::new(new Node(1, Option::Some(tail)))));
 }

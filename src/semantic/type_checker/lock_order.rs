@@ -40,18 +40,36 @@ struct Graph {
     operations: usize,
 }
 
+/// Which nodes act for a type class. Built on the final merged graph, so the
+/// node numbers stay valid.
+#[derive(Default)]
+struct TypeClasses {
+    /// A class node and its `after` node, each mapped to the class.
+    sides: HashMap<usize, usize>,
+    /// A known lock mapped to the class that may alias it.
+    known: HashMap<usize, usize>,
+}
+
 impl Graph {
     /// Let `class` stand for each of `locks` in O(locks), with no edge product:
     /// `class` keeps its incoming edges, a new node takes its outgoing ones, and
     /// every member sits between the two. Members stay unordered between
     /// themselves, so code that never meets the class is unaffected.
-    fn stand_for(&mut self, class: usize, locks: impl Iterator<Item = usize>) {
+    fn stand_for(
+        &mut self,
+        class: usize,
+        locks: impl Iterator<Item = usize>,
+        classes: &mut TypeClasses,
+    ) {
         let after = self.node(false);
+        classes.sides.insert(class, class);
+        classes.sides.insert(after, class);
         self.edges[after] = std::mem::take(&mut self.edges[class]);
         self.edge(class, after, Span::dummy());
         for lock in locks.filter(|&lock| lock != class) {
             self.edge(class, lock, Span::dummy());
             self.edge(lock, after, Span::dummy());
+            classes.known.insert(lock, class);
         }
     }
 
@@ -67,7 +85,7 @@ impl Graph {
     }
 
     /// Iterative Kosaraju, O(V + E) time and storage, without native recursion.
-    fn diagnostics(&mut self) -> Vec<Diagnostic> {
+    fn diagnostics(&mut self, classes: &TypeClasses) -> Vec<Diagnostic> {
         let n = self.edges.len();
         let mut reverse = vec![Vec::new(); n];
         for (from, targets) in self.edges.iter().enumerate() {
@@ -168,12 +186,40 @@ impl Graph {
                     }
                 }
             }
-            let one_class = group.iter().filter(|&&node| self.locks[node]).count() == 1;
-            diagnostics.push(diagnostic.with_help(if one_class {
-                "these locks cannot be told apart: they were created at the same place, such as one factory function, or share a type and their origin is unknown; if both are available before either is held and they are different locks, acquire them together: `lock first as a, second as b { ... }`; a lock reached only through another held lock, or the same lock taken twice, cannot be written this way"
+            let present = group
+                .iter()
+                .filter_map(|node| classes.sides.get(node))
+                .collect::<HashSet<_>>();
+            let (aliased, separate): (Vec<&usize>, Vec<&usize>) = group
+                .iter()
+                .filter(|&&node| self.locks[node] && !classes.sides.contains_key(&node))
+                .partition(|node| {
+                    classes
+                        .known
+                        .get(node)
+                        .is_some_and(|class| present.contains(class))
+                });
+            // A class in the cycle covers the known locks it may alias, so only
+            // the classes and the remaining locks are certainly different.
+            diagnostics.push(if present.len() + separate.len() == 1 {
+                let diagnostic = diagnostic
+                    .with_note("these locks cannot be told apart, so they may be the same lock: they were created at the same place, such as one factory function, or one has an unknown origin and shares the other's type")
+                    .with_note("a lock reached only through another held lock, or the same lock taken twice, cannot be acquired together")
+                    .with_help("if both locks are available before either is held, acquire them together: `lock first as a, second as b { ... }`");
+                // Known locks can also be reversed against each other here.
+                if aliased.len() > 1 {
+                    diagnostic.with_help("if these locks also nest in opposite orders, use one consistent nesting order")
+                } else {
+                    diagnostic
+                }
             } else {
-                "use one consistent nesting order, or acquire the locks together in one `lock` statement; a lock of unknown origin may be any lock of its type"
-            }));
+                let diagnostic = diagnostic.with_help("use one consistent nesting order, or acquire the locks together in one `lock` statement");
+                if present.is_empty() {
+                    diagnostic
+                } else {
+                    diagnostic.with_note("a lock of unknown origin may be any lock of its type")
+                }
+            });
         }
         diagnostics
     }
@@ -670,12 +716,17 @@ pub(crate) fn analyze_all(
         }
     }
     let roots = collapse_groups(&mut graph, &class_aliases);
+    let mut type_classes = TypeClasses::default();
     for (key, nodes) in typed_nodes {
         if let Some(&class) = equal_classes.get(&Class::Type(key)) {
-            graph.stand_for(roots[class], nodes.into_iter().map(|node| roots[node]));
+            graph.stand_for(
+                roots[class],
+                nodes.into_iter().map(|node| roots[node]),
+                &mut type_classes,
+            );
         }
     }
-    diagnostics.extend(graph.diagnostics());
+    diagnostics.extend(graph.diagnostics(&type_classes));
     diagnostics
 }
 
@@ -855,7 +906,7 @@ mod tests {
         let b = graph.node(false);
         graph.edge(a, b, Span::dummy());
         graph.edge(b, a, Span::dummy());
-        assert!(graph.diagnostics().is_empty());
+        assert!(graph.diagnostics(&TypeClasses::default()).is_empty());
     }
     #[test]
     fn lock_order_27_call_under_opaque_lock_is_accepted() {
@@ -934,9 +985,10 @@ mod tests {
                 graph.edge(pair[0], pair[1], Span::new(1, 2, 1, 1));
             }
             graph.edge(class, class, Span::new(3, 4, 1, 3));
-            graph.stand_for(class, locks.into_iter());
+            let mut classes = TypeClasses::default();
+            graph.stand_for(class, locks.into_iter(), &mut classes);
             let edges = (n - 1) + 2 + 2 * n;
-            let errors = graph.diagnostics();
+            let errors = graph.diagnostics(&classes);
             assert_eq!(errors.len(), 1);
             assert!(graph.operations <= 3 * (n + 2) + 4 * edges);
             println!("type class locks={n} operations={}", graph.operations);
@@ -952,7 +1004,7 @@ mod tests {
         graph.edge(a, helper, Span::new(1, 2, 1, 1));
         graph.edge(helper, b, Span::new(3, 4, 1, 3));
         graph.edge(b, a, Span::new(5, 6, 1, 5));
-        let errors = graph.diagnostics();
+        let errors = graph.diagnostics(&TypeClasses::default());
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].labels.len(), 3);
     }
@@ -971,7 +1023,7 @@ mod tests {
                     graph.edge(n - 1, 0, Span::dummy());
                 }
                 let edges = n - 1 + usize::from(cycle);
-                let errors = graph.diagnostics();
+                let errors = graph.diagnostics(&TypeClasses::default());
                 assert_eq!(errors.len(), usize::from(cycle));
                 assert!(graph.operations <= 3 * n + 4 * edges);
                 println!(
@@ -992,7 +1044,7 @@ mod tests {
                 graph.edge(0, child, Span::dummy());
                 graph.edge(0, child, Span::dummy());
             }
-            assert!(graph.diagnostics().is_empty());
+            assert!(graph.diagnostics(&TypeClasses::default()).is_empty());
             assert!(graph.operations <= 3 * n + 4 * (2 * (n - 1)));
         }
     }

@@ -348,6 +348,113 @@ async fn main() {
 }
 
 #[test]
+fn ordered_locks_known_and_unknown_locks_of_one_type_get_the_group_help() {
+    for nest in [
+        "lock a as x { lock own as y { println(x + y); } }",
+        "lock own as y { lock a as x { println(x + y); } }",
+    ] {
+        assert_compile_error_contains(
+            &format!(
+                "async fn f(a: Mutex<i64>) {{ let own = Mutex::new(1); {nest} }} \
+                 async fn main() {{ await f(Mutex::new(2)); }}"
+            ),
+            &[
+                "E2605",
+                "cannot be told apart",
+                "lock first as a, second as b",
+            ],
+        );
+    }
+}
+
+#[test]
+fn ordered_locks_two_known_locks_under_an_unknown_lock_get_the_group_help() {
+    for body in [
+        "lock u as x { lock a as y { println(x + y); } } \
+         lock u as x { lock b as z { println(x + z); } }",
+        "lock a as y { lock b as z { println(y + z); } } \
+         lock u as x { lock a as y { println(x + y); } }",
+    ] {
+        assert_compile_error_contains(
+            &format!(
+                "async fn f(u: Mutex<i64>) {{ \
+                 let a = Mutex::new(1); let b = Mutex::new(2); {body} }} \
+                 async fn main() {{ await f(Mutex::new(3)); }}"
+            ),
+            &[
+                "E2605",
+                "cannot be told apart",
+                "lock first as a, second as b",
+            ],
+        );
+    }
+}
+
+#[test]
+fn ordered_locks_reverse_known_locks_beside_an_unknown_lock_get_both_helps() {
+    assert_compile_error_contains(
+        r#"
+async fn f(u: Mutex<i64>) {
+    let a = Mutex::new(1);
+    let b = Mutex::new(2);
+    lock a as x { lock b as y { println(x + y); } }
+    lock b as y { lock a as x { println(x + y); } }
+    lock a as x { lock u as y { println(x + y); } }
+}
+async fn main() { await f(Mutex::new(3)); }
+"#,
+        &[
+            "E2605",
+            "cannot be told apart",
+            "lock first as a, second as b",
+            "use one consistent nesting order",
+        ],
+    );
+}
+
+#[test]
+fn ordered_locks_reverse_known_locks_keep_the_order_help() {
+    let stderr = compile_error_stderr(
+        r#"
+async fn typed(x: Mutex<i64>) { lock x as v { println(v); } }
+async fn main() {
+    let a = Mutex::new(1);
+    let b = Mutex::new(2);
+    lock a as x { lock b as y { println(x + y); } }
+    lock b as y { lock a as x { println(x + y); } }
+    await typed(a);
+}
+"#,
+    );
+    assert!(stderr.contains("E2605"), "{stderr}");
+    assert!(
+        stderr.contains("use one consistent nesting order"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("cannot be told apart"), "{stderr}");
+    assert!(!stderr.contains("unknown origin"), "{stderr}");
+}
+
+#[test]
+fn ordered_locks_reverse_type_classes_keep_the_unknown_origin_note() {
+    let stderr = compile_error_stderr(
+        r#"
+async fn f(a: Mutex<i64>, b: Mutex<bool>) {
+    lock a as x { lock b as y { println(x); println(y); } }
+    lock b as y { lock a as x { println(x); println(y); } }
+}
+async fn main() { await f(Mutex::new(1), Mutex::new(true)); }
+"#,
+    );
+    assert!(
+        stderr.contains("use one consistent nesting order"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("unknown origin"), "{stderr}");
+    assert!(!stderr.contains("cannot be told apart"), "{stderr}");
+}
+
+#[test]
 fn ordered_locks_parent_and_child_allocation_nest() {
     assert_ordered_run(
         r#"
@@ -502,6 +609,14 @@ async fn walk(head: Mutex<Node>) {
 async fn main() { }
 "#,
         &["E2605", "reached only through another held lock"],
+    );
+}
+
+#[test]
+fn ordered_locks_parent_child_example_runs_with_its_list_walk() {
+    assert_ordered_run(
+        include_str!("../../../example/parent_child_locks.wi"),
+        "3\n6\n100\n101\n7\n3\n",
     );
 }
 
