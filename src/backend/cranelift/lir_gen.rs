@@ -5597,9 +5597,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // the poll function entirely.
                 let offsets = self.lir_lock_offsets(slots);
                 self.emit_lir_lock_acquire(
-                    slots.mode,
+                    slots,
                     offsets,
-                    &slots.value_ty,
+                    &self.lir_lock_group_members(slots),
                     *span,
                     suspends,
                     frame,
@@ -6209,7 +6209,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // nothing to do.
                 LirInst::ReleaseLock(slots) => {
                     let offsets = self.lir_lock_offsets(slots);
-                    self.emit_lock_frame_cleanup(slots.mode, offsets, &slots.value_ty, false);
+                    self.emit_lock_frame_cleanup(
+                        slots.mode,
+                        offsets,
+                        &slots.value_ty,
+                        &self.lir_lock_group_members(slots),
+                        false,
+                    );
                 }
                 LirInst::Let {
                     local, ty, value, ..
@@ -6342,6 +6348,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ///
     /// Every one is frame-backed by construction — the acquisition reports them
     /// to LIR liveness, which is what gives a local a slot (willow-0g8j.2.13).
+    pub(super) fn lir_lock_group_members(
+        &self,
+        slots: &LirLockSlots,
+    ) -> Vec<super::LockGroupMember> {
+        slots
+            .members
+            .iter()
+            .map(|member| super::LockGroupMember {
+                mode: member.mode,
+                handle_offset: self.lir_frame_offsets[&member.handle],
+                value_offset: self.lir_frame_offsets[&member.binding],
+                value_ty: member.value_ty.clone(),
+            })
+            .collect()
+    }
+
     fn lir_lock_offsets(&self, slots: &LirLockSlots) -> [i32; 4] {
         slots.locals().map(|local| self.lir_frame_offsets[&local])
     }

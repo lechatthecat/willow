@@ -80,6 +80,7 @@ fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
             }
         },
         HirStmt::Lock {
+            additional,
             mode,
             target,
             binding,
@@ -89,10 +90,24 @@ fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
         } => {
             let mutability = if *mutable { "mut " } else { "" };
             out.push_str(&format!(
-                "{} {} as {mutability}{binding} {{\n",
+                "{} {} as {mutability}{binding}",
                 mode.keyword(),
                 format_expr(target)
             ));
+            for member in additional {
+                let prefix = match member.mode {
+                    crate::parser::ast::LockMode::Read => "read ",
+                    crate::parser::ast::LockMode::Write => "write ",
+                    _ => "",
+                };
+                let mutable = if member.mutable { "mut " } else { "" };
+                out.push_str(&format!(
+                    ", {prefix}{} as {mutable}{}",
+                    format_expr(&member.target),
+                    member.binding
+                ));
+            }
+            out.push_str(" {\n");
             for stmt in body {
                 format_stmt(stmt, level + 1, out);
             }

@@ -259,6 +259,9 @@ pub(super) fn analyze(
             }
             AstEvent::Stmt(Stmt::Lock(s)) => {
                 graph.names.temporary(&s.target);
+                for member in &s.additional {
+                    graph.names.temporary(&member.target);
+                }
             }
             AstEvent::Expr(Expr::Match(m)) => {
                 graph.names.temporary(&m.scrutinee);
@@ -747,15 +750,27 @@ impl<'a> Graph<'a> {
                         self.nodes[release]
                             .reads
                             .push(self.names.temporaries[&s.target.id()]);
+                        for member in &s.additional {
+                            self.nodes[release]
+                                .reads
+                                .push(self.names.temporaries[&member.target.id()]);
+                        }
                         let body = self.schedule(Input::Block(&s.body), release, flow);
-                        let binding = self.binding(&s.binding, body);
+                        let mut binding = self.binding(&s.binding, body);
+                        for member in s.additional.iter().rev() {
+                            binding = self.binding(&member.binding, binding);
+                        }
                         let wait = self.node(binding);
                         self.nodes[wait].suspend = Some(s.span);
                         let cleanup = self.exit(flow.cleanup, 0, 0);
                         self.nodes[wait].edges.push(cleanup);
                         let unwind = self.exit(flow.cleanup, 0, 1);
                         self.nodes[wait].edges.push(unwind);
-                        self.schedule(Input::Expr(&s.target), wait, flow)
+                        let mut entry = wait;
+                        for member in s.additional.iter().rev() {
+                            entry = self.schedule(Input::Expr(&member.target), entry, flow);
+                        }
+                        self.schedule(Input::Expr(&s.target), entry, flow)
                     }
                     Stmt::Defer(d) => match &d.body {
                         DeferBody::Block(_) | DeferBody::Expr(Expr::Match(_)) => next,

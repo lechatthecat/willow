@@ -87,6 +87,11 @@ pub(crate) struct CapturedEffect {
 }
 
 type EffectRootInventory = im::HashMap<BodyId, Arc<Vec<FunctionId>>>;
+/// One unit's lock-order facts and the import map that resolves its external calls.
+type LockOrderFacts = (
+    crate::semantic::type_checker::lock_order::Inputs,
+    Arc<HashMap<String, String>>,
+);
 
 #[derive(Clone)]
 pub(crate) struct UnitEffects {
@@ -252,6 +257,7 @@ pub(crate) struct EffectQueries {
     /// from persistent runtime summaries or copied across source revisions.
     pub(crate) contract_facts: std::cell::RefCell<HashMap<UnitId, Arc<EffectFacts<EffectWitness>>>>,
     pub(crate) static_initializers: super::static_init::StaticInitQueries,
+    pub(crate) lock_orders: std::cell::RefCell<HashMap<UnitId, LockOrderFacts>>,
     root_locations: std::cell::RefCell<HashMap<(UnitId, BodyId), EffectRootLocation>>,
     unseen_roots: std::cell::RefCell<HashMap<UnitId, EffectRootInventory>>,
     active_unit: std::cell::Cell<Option<UnitId>>,
@@ -296,6 +302,7 @@ impl Default for EffectQueries {
             purity_facts: Default::default(),
             contract_facts: Default::default(),
             static_initializers: Default::default(),
+            lock_orders: Default::default(),
             root_locations: Default::default(),
             unseen_roots: Default::default(),
             active_unit: Default::default(),

@@ -331,6 +331,7 @@ fn shallow_stmt(source: &HirStmt) -> HirStmt {
             span: *span,
         },
         HirStmt::Lock {
+            additional,
             mode,
             target: _,
             binding,
@@ -338,6 +339,15 @@ fn shallow_stmt(source: &HirStmt) -> HirStmt {
             body,
             span,
         } => HirStmt::Lock {
+            additional: additional
+                .iter()
+                .map(|m| HirLockTarget {
+                    mode: m.mode,
+                    target: empty_expr(),
+                    binding: m.binding.clone(),
+                    mutable: m.mutable,
+                })
+                .collect(),
             mode: *mode,
             target: empty_expr(),
             binding: binding.clone(),
@@ -633,8 +643,18 @@ fn stmt_children_mut(source: &mut HirStmt) -> Vec<NodeMut<'_>> {
             HirDeferBody::Expr(e) => out.push(NodeMut::Expr(e)),
             HirDeferBody::Block(body) => out.extend(body.iter_mut().map(NodeMut::Stmt)),
         },
-        HirStmt::Lock { target, body, .. } => {
+        HirStmt::Lock {
+            target,
+            additional,
+            body,
+            ..
+        } => {
             out.push(NodeMut::Expr(target));
+            out.extend(
+                additional
+                    .iter_mut()
+                    .map(|member| NodeMut::Expr(&mut member.target)),
+            );
             out.extend(body.iter_mut().map(NodeMut::Stmt));
         }
         HirStmt::For { iterable, body, .. } => {
@@ -700,8 +720,18 @@ fn stmt_children(source: &HirStmt) -> Vec<NodeRef<'_>> {
             HirDeferBody::Expr(e) => out.push(NodeRef::Expr(e)),
             HirDeferBody::Block(body) => out.extend(body.iter().map(NodeRef::Stmt)),
         },
-        HirStmt::Lock { target, body, .. } => {
+        HirStmt::Lock {
+            target,
+            additional,
+            body,
+            ..
+        } => {
             out.push(NodeRef::Expr(target));
+            out.extend(
+                additional
+                    .iter()
+                    .map(|member| NodeRef::Expr(&member.target)),
+            );
             out.extend(body.iter().map(NodeRef::Stmt));
         }
         HirStmt::For { iterable, body, .. } => {

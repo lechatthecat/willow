@@ -1555,18 +1555,34 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         // gap explicit.
         Stmt::Lock(l) => {
             let target = lower_expr(&l.target, ctx)?;
-            let binding_ty = match &target.ty {
-                Type::Generic(_, args) if args.len() == 1 => args[0].clone(),
-                _ => return Err(unsupported(l.span, "lock target type")),
+            let mut additional = Vec::with_capacity(l.additional.len());
+            for member in &l.additional {
+                additional.push(super::typed_ast::HirLockTarget {
+                    mode: member.mode,
+                    target: lower_expr(&member.target, ctx)?,
+                    binding: member.binding.clone(),
+                    mutable: member.mutable,
+                });
+            }
+            let value_type = |target: &HirExpr| match &target.ty {
+                Type::Generic(_, args) if args.len() == 1 => Ok(args[0].clone()),
+                _ => Err(unsupported(l.span, "lock target type")),
             };
             ctx.push_scope();
-            let binding = ctx.bind(l.binding.clone(), (binding_ty).to_source());
+            let binding = ctx.bind(l.binding.clone(), value_type(&target)?.to_source());
+            for member in &mut additional {
+                member.binding = ctx.bind(
+                    member.binding.clone(),
+                    value_type(&member.target)?.to_source(),
+                );
+            }
             let mut body = Vec::with_capacity(l.body.stmts.len());
             for stmt in &l.body.stmts {
                 body.push(lower_stmt(stmt, ctx)?);
             }
             ctx.pop_scope();
             Ok(HirStmt::Lock {
+                additional,
                 mode: l.mode,
                 target,
                 binding,

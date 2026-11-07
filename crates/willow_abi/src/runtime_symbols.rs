@@ -319,6 +319,15 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // code (1 acquired, 0 pending, -1 recursive, -2 lost, -3 cancelled) and publish the
     // registration token through the out-parameter, so a parked acquire can
     // re-identify its own generation after a wake.
+    // Native group records own rooted handles; they never move on the GC heap.
+    NONE; "willow_lock_group_new" => ([] -> Some(Ptr));
+    NONE; "willow_lock_group_add" => ([Ptr, Ptr, I32] -> None);
+    SUSPEND; "willow_lock_group_acquire" => ([Ptr, Ptr] -> Some(I32));
+    SUSPEND; "willow_lock_group_poll" => ([Ptr, I64] -> Some(I32));
+    NONE; "willow_lock_group_load" => ([Ptr, I64] -> Some(Word));
+    NONE; "willow_lock_group_commit" => ([Ptr, I64, Word] -> Some(I32));
+    NONE; "willow_lock_group_release" => ([Ptr, I64] -> Some(I32));
+    NONE; "willow_lock_group_cancel" => ([Ptr] -> None);
     ALLOC; "willow_async_mutex_new" => ([Word, I64] -> Some(Ptr));
     SUSPEND; "willow_async_mutex_acquire" => ([Ptr, Ptr] -> Some(I32));
     SUSPEND; "willow_async_mutex_acquire_load" => ([Ptr, Ptr, Ptr] -> Some(I32));

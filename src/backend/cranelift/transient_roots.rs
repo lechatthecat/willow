@@ -285,9 +285,9 @@ pub(super) fn inst_locals(inst: &LirInst) -> Vec<LirLocalId> {
             out.extend(value.locals());
         }
         LirInst::EnterDeferScope { lock, .. } => {
-            out.extend(lock.iter().flat_map(|slots| slots.locals()));
+            out.extend(lock.iter().flat_map(|slots| slots.all_locals()));
         }
-        LirInst::ReleaseLock(slots) => out.extend(slots.locals()),
+        LirInst::ReleaseLock(slots) => out.extend(slots.all_locals()),
         LirInst::Defer { body, .. } => out.extend(body.captures.iter().copied()),
         LirInst::SelectInit { operations } | LirInst::SelectProbe { operations, .. } => {
             for op in operations {

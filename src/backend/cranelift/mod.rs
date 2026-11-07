@@ -1315,7 +1315,16 @@ pub(super) struct PanicScope {
 /// lock is held for exactly the CFG paths that leave the section, so release is
 /// driven from the same unwinding the `defer` machinery already performs.
 #[derive(Clone)]
+pub(super) struct LockGroupMember {
+    mode: LockMode,
+    handle_offset: i32,
+    value_offset: i32,
+    value_ty: Type,
+}
+
+#[derive(Clone)]
 pub(super) struct CoopLockScope {
+    members: Vec<LockGroupMember>,
     /// Mutex/read/write selects the runtime state machine and whether cleanup
     /// commits the frame-backed binding before release.
     mode: LockMode,
@@ -1352,6 +1361,7 @@ pub(super) struct CoopLockScope {
 /// it has to work from.
 #[derive(Clone)]
 pub(super) struct AsyncLockSite {
+    members: Vec<LockGroupMember>,
     mode: LockMode,
     handle_offset: i32,
     token_offset: i32,

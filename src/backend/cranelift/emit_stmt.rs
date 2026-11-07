@@ -183,6 +183,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 scope.value_offset,
             ],
             &scope.value_ty,
+            &scope.members,
             false,
         );
     }
@@ -201,8 +202,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         mode: LockMode,
         frame_offsets: [i32; 4],
         value_ty: &Type,
+        members: &[super::LockGroupMember],
         cancel_wait: bool,
     ) {
+        if mode == LockMode::Group {
+            self.emit_lock_group_frame_cleanup(frame_offsets, members, cancel_wait);
+            return;
+        }
         let [handle_offset, token_offset, phase_offset, value_offset] = frame_offsets;
         let frame = self
             .async_frame
@@ -230,6 +236,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let cancel = match mode {
                 LockMode::Mutex => "willow_async_mutex_cancel",
                 LockMode::Read | LockMode::Write => "willow_async_rwlock_cancel",
+                LockMode::Group => unreachable!("group cleanup dispatched separately"),
             };
             self.emit_value_runtime_call(cancel, &[]);
         }
@@ -275,6 +282,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // still emits it structurally. Point it at the ownership-checking
             // RwLock ABI; it is unreachable at run time and cannot publish.
             LockMode::Read | LockMode::Write => "willow_async_rwlock_commit",
+            LockMode::Group => unreachable!("group cleanup dispatched separately"),
         };
         self.emit_value_runtime_call(commit, &[handle, token, word]);
         self.builder.ins().jump(
@@ -291,6 +299,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let release = match mode {
             LockMode::Mutex => "willow_async_mutex_release",
             LockMode::Read | LockMode::Write => "willow_async_rwlock_release",
+            LockMode::Group => unreachable!("group cleanup dispatched separately"),
         };
         let handle = self.builder.ins().load(
             reference_type(self.module.target_config()),
@@ -315,6 +324,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             match mode {
                 LockMode::Mutex => "Mutex",
                 LockMode::Read | LockMode::Write => "RwLock",
+                LockMode::Group => unreachable!("group cleanup dispatched separately"),
             }
             .to_string()
             .into(),
@@ -344,6 +354,138 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
         self.builder.ins().jump(done_b, &[]);
 
+        self.builder.switch_to_block(done_b);
+        self.builder.seal_block(done_b);
+    }
+
+    /// A group owns a native descriptor and GC-rooted member handles. Only
+    /// phase 1 has initialized protected bindings; a partial acquisition must
+    /// cancel even on an ordinary unwind so its descriptor and waiters retire.
+    fn emit_lock_group_frame_cleanup(
+        &mut self,
+        frame_offsets: [i32; 4],
+        members: &[super::LockGroupMember],
+        cancel_wait: bool,
+    ) {
+        let [handle_offset, token_offset, phase_offset, _] = frame_offsets;
+        let frame = self
+            .async_frame
+            .expect("lock group cleanup requires its async frame");
+        let group = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        let active_b = self.builder.create_block();
+        let done_b = self.builder.create_block();
+        self.builder.ins().brif(group, active_b, &[], done_b, &[]);
+        self.builder.switch_to_block(active_b);
+        self.builder.seal_block(active_b);
+
+        let phase = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, phase_offset);
+        let initialized = self.builder.ins().icmp_imm_s(IntCC::Equal, phase, 1);
+        let commit_b = self.builder.create_block();
+        let cancel_b = self.builder.create_block();
+        let cleared_b = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(initialized, commit_b, &[], cancel_b, &[]);
+
+        self.builder.switch_to_block(commit_b);
+        self.builder.seal_block(commit_b);
+        for (index, member) in members.iter().enumerate() {
+            if member.mode == LockMode::Read {
+                continue;
+            }
+            assert_ne!(member.mode, LockMode::Group, "nested group member");
+            let value_type = self.clif_type(&member.value_ty);
+            let value = self.builder.ins().load(
+                value_type,
+                MemFlagsData::new(),
+                frame,
+                member.value_offset,
+            );
+            let word = self.emit_to_storage_word(value, &member.value_ty);
+            // Boxing can collect. The descriptor is native and its members
+            // remain rooted by both the runtime descriptor and the frame.
+            let group =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+            let index = self.builder.ins().iconst(types::I64, index as i64);
+            self.emit_value_runtime_call("willow_lock_group_commit", &[group, index, word]);
+        }
+        if cancel_wait {
+            self.builder.ins().jump(cancel_b, &[]);
+        } else {
+            let group =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+            let token =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), frame, token_offset);
+            self.emit_value_runtime_call("willow_lock_group_release", &[group, token]);
+            self.builder.ins().jump(cleared_b, &[]);
+        }
+
+        self.builder.switch_to_block(cancel_b);
+        self.builder.seal_block(cancel_b);
+        let group = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        self.emit_void_runtime_call("willow_lock_group_cancel", &[group]);
+        self.builder.ins().jump(cleared_b, &[]);
+
+        self.builder.switch_to_block(cleared_b);
+        self.builder.seal_block(cleared_b);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        // Retire the native pointer before any GC barriers. It is never a GC
+        // object and must not be passed to emit_gc_heap_store as a reference.
+        for offset in [handle_offset, token_offset, phase_offset] {
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), zero, frame, offset);
+        }
+        for member in members {
+            let handle_ty = Type::Generic(
+                match member.mode {
+                    LockMode::Mutex => "Mutex",
+                    LockMode::Read | LockMode::Write => "RwLock",
+                    LockMode::Group => unreachable!("nested group member"),
+                }
+                .to_string()
+                .into(),
+                vec![member.value_ty.clone()],
+            );
+            let null_handle = self
+                .builder
+                .ins()
+                .iconst(reference_type(self.module.target_config()), 0);
+            self.emit_gc_heap_store(
+                frame,
+                member.handle_offset,
+                null_handle,
+                &handle_ty,
+                GcStoreDestination::AsyncFrameSlot,
+            );
+            let zero_value = match self.clif_type(&member.value_ty) {
+                types::F64 => self.builder.ins().f64const(0.0),
+                ty => self.emit_zero(ty),
+            };
+            self.emit_gc_heap_store(
+                frame,
+                member.value_offset,
+                zero_value,
+                &member.value_ty,
+                GcStoreDestination::AsyncFrameSlot,
+            );
+        }
+        self.builder.ins().jump(done_b, &[]);
         self.builder.switch_to_block(done_b);
         self.builder.seal_block(done_b);
     }

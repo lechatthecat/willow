@@ -277,6 +277,43 @@ impl Parser {
         let keyword_span = self.current_span();
         self.advance(); // `lock`
 
+        let first = self.parse_lock_target()?;
+        let mut additional = Vec::new();
+        while self.eat(TokenKind::Comma) {
+            additional.push(self.parse_lock_target()?);
+        }
+        let LockTarget {
+            mode,
+            target,
+            target_span,
+            binding,
+            binding_span,
+            mutable,
+        } = first;
+        let scope = self.default_import_usage.scope();
+        self.default_import_usage.bind(&binding);
+        for member in &additional {
+            self.default_import_usage.bind(&member.binding);
+        }
+        let result = self.parse_block();
+        self.default_import_usage.restore(scope);
+        let body = result?;
+        let span = keyword_span.to(body.span);
+
+        Ok(Stmt::Lock(LockStmt {
+            additional,
+            mode,
+            target,
+            target_span,
+            binding,
+            binding_span,
+            mutable,
+            body,
+            span,
+        }))
+    }
+
+    fn parse_lock_target(&mut self) -> Result<LockTarget, Diagnostic> {
         // `read` / `write` are contextual keywords, and only in this one
         // position. `lock read as v { ... }` therefore still locks a variable
         // NAMED `read`: a following `as` means the word was the target.
@@ -317,23 +354,14 @@ impl Parser {
 
         let binding_span = self.current_span();
         let binding = self.expect_ident()?;
-        let scope = self.default_import_usage.scope();
-        self.default_import_usage.bind(&binding);
-        let result = self.parse_block();
-        self.default_import_usage.restore(scope);
-        let body = result?;
-        let span = keyword_span.to(body.span);
-
-        Ok(Stmt::Lock(LockStmt {
+        Ok(LockTarget {
             mode,
             target,
             target_span,
             binding,
             binding_span,
             mutable,
-            body,
-            span,
-        }))
+        })
     }
 
     pub(super) fn is_super_init_ahead(&self) -> bool {

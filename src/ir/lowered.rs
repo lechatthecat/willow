@@ -400,7 +400,7 @@ impl SuspendOp {
                 insert(*value);
             }
             SuspendOp::LockAcquire { slots, .. } => {
-                for local in slots.locals() {
+                for local in slots.all_locals() {
                     insert(local);
                 }
             }
@@ -438,6 +438,8 @@ pub(crate) struct SourceDeferBody {
 /// consumer that gets them from one of the three is looking at the same lock.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LirLockSlots {
+    /// Source-order members of one runtime-ordered acquisition group.
+    pub members: Vec<LirLockSlots>,
     /// Which state machine the runtime calls — `Mutex` and `RwLock` have
     /// separate acquire/poll/load/release entry points.
     pub mode: LockMode,
@@ -460,6 +462,11 @@ impl LirLockSlots {
     /// The four locals, in the order the runtime hooks take them.
     pub fn locals(&self) -> [LirLocalId; 4] {
         [self.handle, self.token, self.phase, self.binding]
+    }
+    pub fn all_locals(&self) -> impl Iterator<Item = LirLocalId> + '_ {
+        self.locals()
+            .into_iter()
+            .chain(self.members.iter().flat_map(|m| m.locals()))
     }
 }
 
@@ -1245,15 +1252,12 @@ struct Builder {
     /// in `async_liveness`; without it two frame slots would silently alias.
     /// [`SourceFunction::assert_unique_local_names`] pins it.
     local_by_name: std::collections::HashMap<String, LirLocalId>,
-    /// The critical section currently being lowered, if any (willow-0g8j.2.13).
-    ///
-    /// At most one can be open: E2605 rejects a `lock` nested inside another
-    /// one. It is what tells an early exit whether it is leaving the section
-    /// and therefore has to release it.
-    active_lock: Option<ActiveLock>,
+    /// Open critical sections, outermost first. Early exits release every
+    /// section they leave after running that section's own deferred cleanup.
+    active_locks: Vec<ActiveLock>,
 }
 
-/// The critical section [`Builder::active_lock`] is inside.
+/// One critical section in [`Builder::active_locks`].
 #[derive(Clone)]
 struct ActiveLock {
     slots: LirLockSlots,
@@ -1529,7 +1533,7 @@ impl Builder {
             for_counter: 0,
             loop_stack: Vec::new(),
             defer_depth: 0,
-            active_lock: None,
+            active_locks: Vec::new(),
             defer_counter: 0,
             defer_scopes: Vec::new(),
             is_async,
@@ -4201,14 +4205,17 @@ impl Builder {
     /// order the AST unwinder produces by releasing as each defer frame
     /// finishes.
     fn flush_defers_down_to(&mut self, depth: usize) {
-        match self.active_lock.clone() {
-            Some(lock) if lock.defer_depth >= depth => {
-                self.flush_defer_scopes(lock.defer_depth, self.defer_scopes.len());
-                self.push(SourceInst::ReleaseLock(lock.slots));
-                self.flush_defer_scopes(depth, lock.defer_depth);
+        let mut scope_end = self.defer_scopes.len();
+        for index in (0..self.active_locks.len()).rev() {
+            let lock = self.active_locks[index].clone();
+            if lock.defer_depth < depth {
+                break;
             }
-            _ => self.flush_defer_scopes(depth, self.defer_scopes.len()),
+            self.flush_defer_scopes(lock.defer_depth, scope_end);
+            self.push(SourceInst::ReleaseLock(lock.slots));
+            scope_end = lock.defer_depth;
         }
+        self.flush_defer_scopes(depth, scope_end);
     }
 
     /// Register one `FlushDefers` for the scopes in `from..to`, newest last.
@@ -4553,13 +4560,14 @@ impl Builder {
                 span,
             } => self.lower_for(name, iterable, body, *span),
             HirStmt::Lock {
+                additional,
                 mode,
                 target,
                 binding,
                 body,
                 span,
                 ..
-            } => self.lower_lock(*mode, target, binding, body, *span),
+            } => self.lower_lock(*mode, target, binding, additional, body, *span),
         }
     }
 
@@ -4589,14 +4597,13 @@ impl Builder {
     /// [`SourceInst::ReleaseLock`]: the fallthrough one is emitted here, and
     /// `return`/`break`/`continue` get theirs from
     /// [`Self::flush_defers_down_to`].
-    fn lower_lock(
+    fn prepare_lock(
         &mut self,
         mode: LockMode,
         target: &HirExpr,
         binding: &str,
-        body: &[HirStmt],
         span: Span,
-    ) {
+    ) -> LirLockSlots {
         let value_ty = match &target.ty {
             Type::Generic(_, args) if args.len() == 1 => args[0].clone(),
             // The checker rejects any other lock target, so this only has to
@@ -4610,12 +4617,6 @@ impl Builder {
             false,
             false,
         );
-        if !self.is_async {
-            // E2603 has already rejected this program; lower the body anyway so
-            // the graph stays well formed for the diagnostics that follow.
-            self.lower_scope(body);
-            return;
-        }
 
         let handle_name = self.synthetic_name("lock_handle");
         let handle = self.declare_local(handle_name.clone(), target.ty.clone(), None, true, false);
@@ -4637,13 +4638,56 @@ impl Builder {
         let phase_name = self.synthetic_name("lock_phase");
         let phase = self.declare_local(phase_name, Type::I64, None, true, false);
 
-        let slots = LirLockSlots {
+        LirLockSlots {
+            members: Vec::new(),
             mode,
             handle,
             token,
             phase,
             binding: binding_local,
             value_ty,
+        }
+    }
+
+    fn lower_lock(
+        &mut self,
+        mode: LockMode,
+        target: &HirExpr,
+        binding: &str,
+        additional: &[super::typed_ast::HirLockTarget],
+        body: &[HirStmt],
+        span: Span,
+    ) {
+        if !self.is_async {
+            self.lower_scope(body);
+            return;
+        }
+        let first = self.prepare_lock(mode, target, binding, span);
+        let slots = if additional.is_empty() {
+            first
+        } else {
+            let mut members = vec![first];
+            for member in additional {
+                members.push(self.prepare_lock(
+                    member.mode,
+                    &member.target,
+                    &member.binding,
+                    member.target.span,
+                ));
+            }
+            let mut local = |suffix: &str| {
+                let name = self.synthetic_name(suffix);
+                self.declare_local(name, Type::I64, None, true, false)
+            };
+            LirLockSlots {
+                members,
+                mode: LockMode::Group,
+                handle: local("lock_group"),
+                token: local("lock_group_token"),
+                phase: local("lock_group_phase"),
+                binding: local("lock_group_value"),
+                value_ty: Type::I64,
+            }
         };
 
         let entry = self.new_block();
@@ -4656,12 +4700,12 @@ impl Builder {
         });
         self.switch_to(entry);
 
-        let outer = self.active_lock.replace(ActiveLock {
+        self.active_locks.push(ActiveLock {
             slots: slots.clone(),
             defer_depth: self.defer_depth,
         });
         self.lower_scope_inner(body, Some(slots.clone()));
-        self.active_lock = outer;
+        self.active_locks.pop();
         self.push(SourceInst::ReleaseLock(slots));
     }
 
@@ -6722,6 +6766,91 @@ async fn peek(m: Mutex<i64>) -> i64 {
             "the section writes `got` in bb{writes} and binds it in bb{binds}; \
              the binding is no longer the later block"
         );
+    }
+
+    fn lock_exit_events(function: &SourceFunction, block: &SourceBlock) -> Vec<String> {
+        block
+            .instrs
+            .iter()
+            .filter_map(|inst| match inst {
+                SourceInst::FlushDefers { scopes, .. } => Some(format!("flush:{scopes}")),
+                SourceInst::ReleaseLock(slots) => Some(format!(
+                    "release:{}",
+                    function.locals[slots.binding.0 as usize].name
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nested_lock_return_releases_all_sections_inside_out() {
+        let program = lir(r#"
+async fn nested(a: Mutex<i64>, b: Mutex<i64>, c: Mutex<i64>) -> i64 {
+    defer println(0);
+    lock a as outer {
+        defer println(1);
+        lock b as middle {
+            defer println(2);
+            lock c as inner {
+                defer println(3);
+                return inner;
+            }
+        }
+    }
+}
+"#);
+        let function = func(&program, "nested");
+        let returning = function
+            .blocks
+            .iter()
+            .find(|block| matches!(block.terminator, SourceTerminator::Return(Some(_))))
+            .expect("explicit return");
+        assert_eq!(
+            lock_exit_events(function, returning),
+            [
+                "flush:1",
+                "release:inner",
+                "flush:1",
+                "release:middle",
+                "flush:1",
+                "release:outer",
+                "flush:1",
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_lock_loop_exits_release_only_departing_sections() {
+        for exit in ["break", "continue"] {
+            let program = lir(&format!(
+                r#"
+async fn nested(a: Mutex<i64>, b: Mutex<i64>, c: Mutex<i64>) {{
+    lock a as outer {{
+        while true {{
+            lock b as middle {{
+                lock c as inner {{ {exit}; }}
+            }}
+        }}
+    }}
+}}
+"#
+            ));
+            let function = func(&program, "nested");
+            let exiting = function
+                .blocks
+                .iter()
+                .find(|block| {
+                    let events = lock_exit_events(function, block);
+                    events.iter().any(|event| event == "release:inner")
+                })
+                .expect("loop exit cleanup");
+            assert_eq!(
+                lock_exit_events(function, exiting),
+                ["flush:1", "release:inner", "flush:1", "release:middle"],
+                "{exit} must retain the enclosing critical section"
+            );
+        }
     }
 
     // 38. the same in a synchronous body: `if/else` lowers the merge block

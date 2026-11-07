@@ -66,6 +66,7 @@ pub mod gc_telemetry;
 mod generated_context;
 pub(crate) mod id_hash;
 pub mod lock;
+pub mod lock_group;
 pub mod lock_wait;
 pub mod map;
 pub mod math;

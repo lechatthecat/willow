@@ -1762,6 +1762,7 @@ impl UnitCodegenContext<'_> {
                             site.value_offset,
                         ],
                         &site.value_ty,
+                        &site.members,
                         true,
                     );
                     continue;
@@ -2221,13 +2222,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// phase, protected value.
     pub(super) fn emit_lir_lock_acquire(
         &mut self,
-        mode: LockMode,
+        slots: &crate::ir::lowered::LirLockSlots,
         offsets: [i32; 4],
-        value_ty: &Type,
+        members: &[super::LockGroupMember],
         header: crate::diagnostics::Span,
         suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) {
+        let mode = slots.mode;
+        let value_ty = &slots.value_ty;
         let [handle_offset, token_offset, phase_offset, value_offset] = offsets;
         // I64/F64 output can go straight to the existing 64-bit frame slot:
         // it needs no GC barrier and remains inactive until phase=Held. Bool
@@ -2235,6 +2238,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Reuse avoids O(number of lock sites) additional native stack slots.
         let fused_scalar = mode == LockMode::Mutex && matches!(value_ty, Type::I64 | Type::F64);
         let (acquire_fn, poll_fn, load_fn, recursive_fn, invalid_fn) = match mode {
+            LockMode::Group => (
+                "willow_lock_group_acquire",
+                "willow_lock_group_poll",
+                "willow_lock_group_load",
+                "willow_async_mutex_recursive_panic",
+                "willow_async_mutex_invalid_status",
+            ),
             LockMode::Mutex => (
                 if fused_scalar {
                     "willow_async_mutex_acquire_load"
@@ -2258,6 +2268,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 "willow_async_rwlock_invalid_status",
             ),
         };
+        if mode == LockMode::Group {
+            let group = self.emit_value_runtime_call("willow_lock_group_new", &[]);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), group, frame, handle_offset);
+            for member in members {
+                let handle = self.builder.ins().load(
+                    reference_type(self.module.target_config()),
+                    MemFlagsData::new(),
+                    frame,
+                    member.handle_offset,
+                );
+                let access = self.builder.ins().iconst(
+                    types::I32,
+                    match member.mode {
+                        LockMode::Mutex => 0,
+                        LockMode::Read => 1,
+                        LockMode::Write => 2,
+                        LockMode::Group => unreachable!(),
+                    },
+                );
+                self.emit_void_runtime_call("willow_lock_group_add", &[group, handle, access]);
+            }
+        }
         let phase_idle = self.builder.ins().iconst(types::I64, 0);
         self.builder
             .ins()
@@ -2280,7 +2314,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             handle_offset,
         );
         let token_ptr = self.builder.ins().iadd_imm_s(frame, token_offset as i64);
-        let status = if mode == LockMode::Mutex {
+        let status = if matches!(mode, LockMode::Mutex | LockMode::Group) {
             if fused_scalar {
                 let value_ptr = self.builder.ins().iadd_imm_s(frame, value_offset as i64);
                 self.emit_value_runtime_call(acquire_fn, &[handle, token_ptr, value_ptr])
@@ -2293,7 +2327,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 match mode {
                     LockMode::Read => 1,
                     LockMode::Write => 2,
-                    LockMode::Mutex => unreachable!(),
+                    LockMode::Mutex | LockMode::Group => unreachable!(),
                 },
             );
             self.emit_value_runtime_call(acquire_fn, &[handle, mode_value, token_ptr])
@@ -2359,6 +2393,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // --- reentrancy fault ------------------------------------------
         self.builder.switch_to_block(recursive_b);
+        if mode == LockMode::Group {
+            let group = self.builder.ins().load(
+                reference_type(self.module.target_config()),
+                MemFlagsData::new(),
+                frame,
+                handle_offset,
+            );
+            self.emit_void_runtime_call("willow_lock_group_cancel", &[group]);
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), zero, frame, handle_offset);
+        }
         let source_file = self.source_file.to_string();
         let file_ptr = self.emit_string_literal(&source_file);
         let line = self.builder.ins().iconst(types::I32, header.line as i64);
@@ -2456,7 +2503,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // --- owned --------------------------------------------------------
         self.builder.switch_to_block(owned_b);
         self.terminated = false;
-        if !fused_scalar {
+        if !fused_scalar && mode != LockMode::Group {
             let handle = self.builder.ins().load(
                 reference_type(self.module.target_config()),
                 MemFlagsData::new(),
@@ -2474,6 +2521,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 value_offset,
                 value,
                 value_ty,
+                GcStoreDestination::AsyncFrameSlot,
+            );
+        }
+        for (index, member) in members.iter().enumerate() {
+            let group = self.builder.ins().load(
+                reference_type(self.module.target_config()),
+                MemFlagsData::new(),
+                frame,
+                handle_offset,
+            );
+            let index = self.builder.ins().iconst(types::I64, index as i64);
+            let word = self.emit_value_runtime_call("willow_lock_group_load", &[group, index]);
+            let value = self.emit_from_storage_word(word, &member.value_ty);
+            self.emit_gc_heap_store(
+                frame,
+                member.value_offset,
+                value,
+                &member.value_ty,
                 GcStoreDestination::AsyncFrameSlot,
             );
         }

@@ -106,6 +106,7 @@ impl FuncGen<'_, '_> {
             let lock = lock.as_ref().map(|slots| {
                 let offsets = self.lir_lock_offsets(slots);
                 super::super::CoopLockScope {
+                    members: self.lir_lock_group_members(slots),
                     mode: slots.mode,
                     handle_offset: offsets[0],
                     token_offset: offsets[1],
@@ -146,6 +147,7 @@ impl FuncGen<'_, '_> {
                     if let Some(lock) = &scope_locks[id.0] {
                         let order = self.next_cleanup_order();
                         self.collected_lock_sites.push(super::super::AsyncLockSite {
+                            members: lock.members.clone(),
                             mode: lock.mode,
                             handle_offset: lock.handle_offset,
                             token_offset: lock.token_offset,

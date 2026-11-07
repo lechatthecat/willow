@@ -1390,6 +1390,22 @@ fn run_frontend_revision_cached(
             db.inputs().target.sync_stack_preemption,
         );
         diagnostics.extend(db.effects.static_initializers.solve(&order, &db.effects));
+        let lock_facts = db.effects.lock_orders.borrow();
+        diagnostics.extend(semantic::type_checker::lock_order::analyze_all(
+            order
+                .iter()
+                .filter_map(|unit| {
+                    lock_facts
+                        .get(unit)
+                        .map(|(facts, _)| (*unit, facts.clone()))
+                })
+                .collect(),
+            |unit, target| {
+                lock_facts
+                    .get(&unit)
+                    .and_then(|(_, imports)| db.effects.external_target(unit, &target, imports))
+            },
+        ));
         error_count += diagnostic_error_count(&diagnostics);
         emit_frontend_diagnostics(&diagnostics, map, &graph, &diagnostic_modules, emitter)?;
     }

@@ -404,7 +404,7 @@ pub(crate) fn instruction_use_def(
         | SourceInst::EnterDeferScope {
             lock: Some(slots), ..
         } => {
-            for local in slots.locals() {
+            for local in slots.all_locals() {
                 if !defs.contains(&local) {
                     uses.insert(local);
                 }

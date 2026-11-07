@@ -84,7 +84,7 @@ fn clear_function(function: &mut SourceFunction) -> Liveness {
             lock: Some(slots), ..
         } = instruction
         {
-            captured.extend([slots.handle, slots.token, slots.phase, slots.binding]);
+            captured.extend(slots.all_locals());
         }
     }
     let mut clearable = vec![0u64; function.locals.len().div_ceil(64)];

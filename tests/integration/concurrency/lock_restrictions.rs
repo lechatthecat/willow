@@ -30,14 +30,12 @@ fn lock_lower_29_await_in_body_rejected() {
     );
 }
 
-/// Perspective 30: E2605 — no lock-order analysis exists, so lexical nesting is
-/// refused outright rather than risking a deadlock cycle.
+/// Cyclic nesting is rejected with acquisition witnesses.
 #[test]
-fn lock_lower_30_nested_acquisition_rejected() {
+fn lock_lower_30_cyclic_acquisition_rejected() {
     assert_compile_error_contains(
-        "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); \
-         lock a as x { lock b as y { println(x + y); } } }\n",
-        &["error[E2605]", "nested lock acquisition"],
+        "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); lock a as x { lock b as y {} } lock b as y { lock a as x {} } }",
+        &["error[E2605]", "cycle"],
     );
 }
 

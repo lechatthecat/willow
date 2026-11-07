@@ -1,0 +1,19 @@
+// A group keeps source-order bindings while acquiring in runtime identity order.
+async fn transfer(from: Mutex<i64>, to: Mutex<i64>, amount: i64) {
+    lock from as mut debit, to as mut credit {
+        debit = debit - amount;
+        credit = credit + amount;
+    }
+}
+
+async fn main() {
+    let first = Mutex::new(100);
+    let second = Mutex::new(20);
+    await transfer(second, first, 5);
+    lock first as a {
+        lock second as b {
+            println(a);
+            println(b);
+        }
+    }
+}

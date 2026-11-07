@@ -664,6 +664,8 @@ pub enum LockMode {
     Read,
     /// `lock write r as [mut] v { ... }` — exclusive access to an `RwLock<T>`.
     Write,
+    /// Compiler-internal simultaneous acquisition; never a source keyword.
+    Group,
 }
 
 impl LockMode {
@@ -673,6 +675,7 @@ impl LockMode {
             Self::Mutex => "lock",
             Self::Read => "lock read",
             Self::Write => "lock write",
+            Self::Group => "lock group",
         }
     }
 
@@ -681,6 +684,7 @@ impl LockMode {
         match self {
             Self::Mutex => "Mutex",
             Self::Read | Self::Write => "RwLock",
+            Self::Group => "<lock group>",
         }
     }
 
@@ -694,10 +698,21 @@ impl LockMode {
 /// acquisition and release the compiler owns end to end (willow-38w.1).
 ///
 /// `target` is evaluated exactly once, never re-evaluated when a contended
-/// acquisition resumes. V1 allows the statement only inside an `async fn`, and
-/// forbids both an `await` and a nested `lock` inside `body`.
+/// acquisition resumes. The statement is allowed only inside an `async fn`,
+/// `body` cannot `await`, and nested `lock`s must be provably ordered.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LockTarget {
+    pub mode: LockMode,
+    pub target: Expr,
+    pub target_span: Span,
+    pub binding: String,
+    pub binding_span: Span,
+    pub mutable: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LockStmt {
+    pub additional: Vec<LockTarget>,
     pub mode: LockMode,
     pub target: Expr,
     /// Source range of the whole target, from its first token through the

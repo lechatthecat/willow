@@ -389,6 +389,9 @@ pub(crate) fn normalize_std_collection_stmt(stmt: &mut Stmt, imports: &StdCollec
         }
         Stmt::Lock(s) => {
             normalize_std_collection_expr(&mut s.target, imports);
+            for member in &mut s.additional {
+                normalize_std_collection_expr(&mut member.target, imports);
+            }
             normalize_std_collection_block(&mut s.body, imports);
         }
         Stmt::Return(s) => {

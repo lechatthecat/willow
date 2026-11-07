@@ -2,6 +2,7 @@ mod contracts;
 #[cfg(test)]
 mod contracts_tests;
 mod effect_contracts;
+pub(crate) mod lock_order;
 pub(crate) mod purity;
 // Conditional advice also covers stored results without tracking value provenance.
 const STRING_FIND_SENTINEL_HELP: &str = "if this i64 came from String.find(needle), it is a byte offset, not an Option: -1 means not found; test `index >= 0` before using it, or use `contains(needle)` for a bool";
@@ -7440,29 +7441,18 @@ async fn f() {
         );
     }
 
-    // Perspective 19: a nested acquisition is E2605 — V1 has no lock ordering,
-    // so it refuses the shape that would need one.
+    // Distinct allocations with a consistent acquisition order are safe.
     #[test]
-    fn lock_check_19_nested_lock_rejected() {
-        let source = "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); \
-                      lock a as x { lock b as y { println(x + y); } } }";
-        assert_lock_error_count(source, ErrorCode::E2605, 1);
-        let errors = lock_errors_ignoring_gate(source);
-        let e = errors.iter().find(|e| e.code == ErrorCode::E2605).unwrap();
-        assert!(
-            e.helps.iter().any(|h| h.contains("one after another")),
-            "{e:?}"
+    fn lock_check_19_nested_distinct_locks_accepted() {
+        assert_lock_accepted(
+            "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); lock a as x { lock b as y { println(x + y); } } }",
         );
     }
 
-    // Perspective 20: nesting through an intervening block still nests.
     #[test]
     fn lock_check_20_nested_lock_through_control_flow() {
-        assert_lock_error_count(
-            "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); \
-             lock a as x { if x > 0 { lock b as y { println(y); } } } }",
-            ErrorCode::E2605,
-            1,
+        assert_lock_accepted(
+            "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); lock a as x { if x > 0 { lock b as y { println(y); } } } }",
         );
     }
 

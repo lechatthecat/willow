@@ -206,7 +206,7 @@ async fn main() {
 - **Task-aware acquisition:** a contended `Mutex<T>` or `RwLock<T>` acquisition parks the Willow task rather than blocking its scheduler worker.
 - **Compiler-managed exit:** the lock is released across supported exits, including fallthrough, early `return`, `break`, `continue`, `?` propagation, and panic unwinding; cancellation also uses the compiler's cleanup path.
 - **No wait inside:** E2604 rejects suspension/blocking waits within the critical section.
-- **No nested acquisition in V1:** E2605 rejects nested lexical `lock` statements; Willow does not currently perform general lock-order analysis.
+- **Checked nesting:** E2605 rejects cyclic acquisition order, same-lock reacquisition (including read-read), and nesting whose identities cannot be proved safe. Distinct allocation classes with consistent ordering may nest.
 - **Read/write modes:** `lock read` and `lock write` provide lexical access to `RwLock<T>`.
 
 These features belong together: the parser, effect checker, async lowering, cleanup logic, and runtime cooperate to enforce a restricted locking discipline. Willow uses a GC rather than a borrow checker or general destructor-based ownership system; the compiler-owned lock scope is part of its design.
@@ -215,138 +215,39 @@ These features belong together: the parser, effect checker, async lowering, clea
 
 See [Mutex example](example/scheduler_aware_lock.wi), [RwLock example](example/scheduler_aware_rwlock.wi), and [concurrency regression tests](tests/integration/concurrency/).
 
-### Working within E2605: three practical rewrites
+### Acquiring multiple locks
 
-V1 rejects lexical nesting even for different locks and even if the programmer
-always acquires them in the same order. These are design constraints, not a
-promise that every multi-lock algorithm has an equivalent rewrite. Each block
-below is a standalone program; the rejected blocks deliberately fail compilation.
-Use `willow build snippet.wi -o snippet` (the current compiler CLI) to compile a
-saved block, and run the resulting executable for the accepted examples.
-
-**1. Transfer between two shared balances.** Taking both account locks directly
-is rejected with E2605:
+Use one statement when lock handles come from parameters, fields, or collections
+and their relative order cannot be proved statically:
 
 ```willow
-async fn main() {
-    let debit = Mutex::new(100);
-    let credit = Mutex::new(0);
-    lock debit as mut a {
-        lock credit as mut b {
-            a = a - 10;
-            b = b + 10;
-        }
+async fn transfer(from: Mutex<i64>, to: Mutex<i64>, amount: i64) {
+    lock from as mut debit, to as mut credit {
+        debit = debit - amount;
+        credit = credit + amount;
     }
 }
 ```
 
-If the invariant is “both balances change together”, put the pair behind one
-lock. All readers and writers of the balances must use that same lock; do not
-retain and mutate an unprotected alias to the pair.
+Targets are evaluated once, left to right, before any binding is introduced.
+The runtime acquires them in internal identity order while keeping bindings in
+source order. Duplicate handles are rejected, including two read acquisitions
+of the same RwLock. Each member may specify its own mode, for example
+`lock account as mut value, read rates as rate { ... }`.
 
-```willow
-class Balances {
-    pub debit: i64;
-    pub credit: i64;
-}
-async fn main() {
-    let ledger = Mutex::new(new Balances(100, 0));
-    lock ledger as mut pair {
-        pair.debit = pair.debit - 10;
-        pair.credit = pair.credit + 10;
-    }
-    lock ledger as pair {
-        println(pair.debit);  // 90
-        println(pair.credit); // 10
-    }
-}
-```
+A contended group releases its acquired prefix before parking and retries after
+waking. Scope exits, panic and cancellation release acquired locks in reverse
+order; writes already made are committed, not rolled back. This provides mutual
+exclusion, not transactional rollback.
 
-This serializes otherwise independent account operations: a larger ledger trades
-concurrency for a single consistency boundary. It provides mutual exclusion, not
-transactional rollback on panic or durable financial transactions. Debiting,
-releasing, then crediting two separate locks is **not** an atomic transfer:
-observers can see the intermediate state, and interruption can leave it incomplete.
+Ordinary nested locks require provably distinct identities and an acyclic
+acquisition order. E2605 reports the acquisition sites involved in a cycle;
+unknown aliases remain conservative. Awaiting an async helper inside a lock is
+still E2604: compute awaited values before entering the critical section, or
+acquire the required locks together. Merely creating an async task does not
+execute its body on the caller's stack.
 
-**2. Calling a helper that needs another lock.** Moving an acquisition into an
-async helper does not make awaiting it inside a critical section legal. This
-form is rejected with **E2604** (the `await`), rather than lexical E2605:
-
-```willow
-async fn read_fee(fees: Mutex<i64>) -> i64 {
-    lock fees as value { return value; }
-}
-async fn main() {
-    let balance = Mutex::new(100);
-    let fees = Mutex::new(3);
-    lock balance as mut value {
-        value = value - await read_fee(fees);
-    }
-}
-```
-
-Read the fee before acquiring the balance lock, and pass the scalar snapshot into
-the critical section:
-
-```willow
-async fn read_fee(fees: Mutex<i64>) -> i64 {
-    lock fees as value { return value; }
-}
-async fn main() {
-    let balance = Mutex::new(100);
-    let fees = Mutex::new(3);
-    let fee = await read_fee(fees);
-    lock balance as mut value { value = value - fee; }
-    lock balance as value { println(value); } // 97
-}
-```
-
-The balance read-modify-write remains protected, but the fee can change between
-the two sections. This is appropriate only when charging a previously sampled
-fee is allowed. If fee and balance must be consistent at one instant, combine
-them under one lock as in the first rewrite. Merely creating an async Task is
-not the same as awaiting its result; dropping `await` is not this rewrite.
-
-**3. Parent/child locks, including a locked collection of locked elements.**
-Holding a parent lock while acquiring the selected child's lock is also E2605:
-
-```willow
-async fn main() {
-    let parent = Mutex::new(Mutex::new(7));
-    lock parent as child {
-        lock child as value { println(value); }
-    }
-}
-```
-
-Copy the child handle under the parent lock, release the parent, then operate on
-that child. A helper can return the handle without leaking a held lock:
-
-```willow
-async fn selected_child(parent: Mutex<Mutex<i64>>) -> Mutex<i64> {
-    lock parent as child { return child; }
-}
-async fn main() {
-    let parent = Mutex::new(Mutex::new(7));
-    let child = await selected_child(parent);
-    lock child as mut value { value = value + 1; }
-    lock child as value { println(value); } // 8
-}
-```
-
-Copying a handle does not copy its mutable payload or freeze the parent-child
-relationship. Another task can replace the selected child after the first
-section; this updates the **previously selected** child, not necessarily the
-current one. The same issue applies to removing an element from a collection.
-If membership and element updates must be atomic together, use one lock for the
-combined state and route all access through it. For workloads organized around
-messages, a single owner task is another architectural option, with queuing,
-reply, cancellation, and backpressure policies to design explicitly.
-
-**Future relaxation:** the current implementation has no general lock-order
-proof. These examples rely only on V1 behavior; no commitment to a lock-ordering
-feature or delivery date is made here. Do not design a V1 application assuming
-nested acquisition will become available.
+See [ordered locks](example/ordered_locks.wi) for a runnable example.
 
 ## The same semantic knowledge is available to AI agents
 
@@ -502,7 +403,7 @@ Willow is an experimental language and compiler, **not yet suitable for producti
 
 - E2604 prevents modeled blocking/suspending behavior in Willow lexical lock bodies; it does not prove arbitrary programs deadlock-free.
 - Conservative dynamic/indirect-call analysis may reject code that is actually safe. Unavailable evidence is not treated as proof of purity.
-- Nested lexical locks are rejected in V1 (E2605), rather than checked with a general lock-order proof.
+- Lock-order analysis conservatively rejects uncertain identities and acquisition cycles (E2605); simultaneous acquisition handles runtime ordering of distinct objects in the same class.
 - Native/foreign boundaries, compiler defects, and runtime defects are outside the guarantee of a static effect check.
 - The runtime benchmarks and agent-token experiment measure limited, published workloads.
 

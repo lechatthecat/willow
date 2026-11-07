@@ -3044,7 +3044,7 @@ class ProtectedCtor { prot init(self) {} }
     }
 
     // Perspective 19: locks nest syntactically (the type checker, not the
-    // parser, is what rejects a nested acquisition in V1).
+    // parser, is what rejects an unordered nested acquisition).
     #[test]
     fn lock_parse_19_nested_locks_parse() {
         let outer = first_stmt_lock("async fn main() { lock a as x { lock b as y { } } }");

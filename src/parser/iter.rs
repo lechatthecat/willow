@@ -122,8 +122,18 @@ fn push_stmt<'a>(pending: &mut Vec<AstEvent<'a>>, stmt: &'a Stmt) {
         },
         Stmt::Lock(stmt) => {
             pending.push(AstEvent::Expr(&stmt.target));
+            pending.extend(
+                stmt.additional
+                    .iter()
+                    .map(|member| AstEvent::Expr(&member.target)),
+            );
             pending.push(AstEvent::EnterScope);
             pending.push(AstEvent::Bind(&stmt.binding));
+            pending.extend(
+                stmt.additional
+                    .iter()
+                    .map(|member| AstEvent::Bind(&member.binding)),
+            );
             pending.push(AstEvent::Block(&stmt.body));
             pending.push(AstEvent::ExitScope);
         }

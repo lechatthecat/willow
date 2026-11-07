@@ -170,6 +170,9 @@ fn stmt_children<'a>(node: &'a Stmt, visit: &mut impl FnMut(NodeRef<'a>)) {
         },
         Stmt::Lock(v) => {
             visit(NodeRef::Expr(&v.target));
+            for member in &v.additional {
+                visit(NodeRef::Expr(&member.target));
+            }
             for st in &v.body.stmts {
                 visit(NodeRef::Stmt(st));
             }
@@ -353,6 +356,9 @@ fn stmt_children_mut<'a>(node: &'a mut Stmt, visit: &mut impl FnMut(NodeMut<'a>)
         },
         Stmt::Lock(v) => {
             visit(NodeMut::Expr(&mut v.target));
+            for member in &mut v.additional {
+                visit(NodeMut::Expr(&mut member.target));
+            }
             for st in &mut v.body.stmts {
                 visit(NodeMut::Stmt(st));
             }
@@ -537,9 +543,13 @@ clone_shell_struct!(DeferStmt {
     metadata: [span],
     syntax: [body]
 });
+clone_shell_struct!(LockTarget {
+    metadata: [mode, target_span, binding, binding_span, mutable],
+    syntax: [target]
+});
 clone_shell_struct!(LockStmt {
     metadata: [mode, target_span, binding, binding_span, mutable, span],
-    syntax: [target, body]
+    syntax: [target, additional, body]
 });
 clone_shell_struct!(ForStmt {
     metadata: [name, name_span, span],

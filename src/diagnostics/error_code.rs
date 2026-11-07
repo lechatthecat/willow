@@ -234,7 +234,7 @@ error_codes! {
     E2602, // `lock` target is not the lock type the statement's mode requires
     E2603, // scheduler-aware `lock` is only allowed inside an `async fn`
     E2604, // cannot suspend (`await`/`select`) while holding a Willow lock
-    E2605, // nested `lock` acquisition is not supported in V1
+    E2605, // cyclic lock order, same-lock reacquisition, or nesting of unknown identity
     E2610, // declared effect contract violated
     E2611, // inherited effect contract weakened
     E2620, // declared purity constraint violated or cannot be proven

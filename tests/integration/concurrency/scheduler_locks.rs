@@ -333,8 +333,7 @@ async fn main() {
     assert_eq!(out, "cleanup\n1\ncleanup\n2\n");
 }
 
-/// Perspective 15: sequential critical sections in one function are fine — only
-/// NESTING is refused (E2605). Two different mutexes, one after the other.
+/// Perspective 15: sequential critical sections on different mutexes are fine.
 #[test]
 fn lock_lower_15_sequential_sections_on_distinct_mutexes() {
     let (out, ok) = compile_and_run(

@@ -142,8 +142,14 @@ pub fn walk_stmt<V: AstVisitor + ?Sized>(visitor: &mut V, stmt: &Stmt) {
         },
         Stmt::Lock(stmt) => {
             visitor.visit_expr(&stmt.target);
+            for member in &stmt.additional {
+                visitor.visit_expr(&member.target);
+            }
             visitor.enter_scope();
             visitor.bind(&stmt.binding);
+            for member in &stmt.additional {
+                visitor.bind(&member.binding);
+            }
             visitor.visit_block(&stmt.body);
             visitor.exit_scope();
         }

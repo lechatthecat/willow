@@ -1093,6 +1093,20 @@ impl TypeChecker {
         }
         let imports = std::sync::Arc::clone(&self.effect_index.imports);
         if let Some((queries, unit)) = &self.effect_queries {
+            queries.lock_orders.borrow_mut().insert(
+                *unit,
+                (
+                    super::lock_order::collect(program, &self.expr_types, &graph),
+                    std::sync::Arc::clone(&imports),
+                ),
+            );
+        } else {
+            for diagnostic in super::lock_order::analyze(program, &self.expr_types, &graph) {
+                self.push(diagnostic);
+            }
+        }
+
+        if let Some((queries, unit)) = &self.effect_queries {
             queries.static_initializers.record(
                 *unit,
                 program,
@@ -1445,7 +1459,7 @@ impl TypeChecker {
     ///   * the target must be the lock type the mode requires (E2602),
     ///   * the statement is legal only inside an `async fn` (E2603),
     ///   * no user-visible suspension inside the critical section (E2604),
-    ///   * no nested `lock` inside another critical section (E2605).
+    ///   * nested acquisitions must be provably distinct and ordered (E2605).
     ///
     /// A statement that breaks none of those lowers through
     /// `emit_coop_lock` (willow-38w.1.4). Only `lock read` / `lock write` on an
@@ -1460,7 +1474,7 @@ impl TypeChecker {
         let protected = if target_is_broken {
             Some(Self::error_type())
         } else {
-            self.lock_protected_type(s, &target_ty)
+            self.lock_target_type(s.mode, &s.target, &target_ty)
         };
 
         // The lock statement parks the task on contention, so it needs an async
@@ -1483,22 +1497,33 @@ impl TypeChecker {
             );
         }
 
-        let outermost = self.local.lock_depth == 0;
-        if !outermost {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E2605,
-                    "nested lock acquisition is not supported in V1",
-                )
-                .with_label(Label::primary(
-                    s.header_span(),
-                    "this lock is acquired inside another critical section",
-                ))
-                .with_help(
-                    "acquire the locks one after another instead of nesting their critical sections",
-                ),
-            );
+        // Evaluate every target in the outer scope, before introducing any
+        // protected-value bindings or acquiring any member of the group.
+        let mut additional_types = Vec::with_capacity(s.additional.len());
+        for member in &s.additional {
+            let errors = self.error_count();
+            let ty = self.check_expr(&member.target);
+            let value_ty = if self.error_count() > errors {
+                Self::error_type()
+            } else {
+                self.lock_target_type(member.mode, &member.target, &ty)
+                    .unwrap_or(Type::Never)
+            };
+            if self.local.current_async_context {
+                self.record_async_local(
+                    value_ty.clone(),
+                    &member.binding,
+                    member.binding_span,
+                    super::async_retention::Key::binding(&member.binding),
+                );
+                self.record_async_local(
+                    ty,
+                    "lock handle",
+                    member.target_span,
+                    super::async_retention::Key::Value(member.target.id()),
+                );
+            }
+            additional_types.push(value_ty);
         }
 
         let binding_ty = protected.unwrap_or(Type::Never);
@@ -1534,6 +1559,31 @@ impl TypeChecker {
                 declaration_span: s.binding_span,
             },
         );
+        let mut bindings = std::collections::HashSet::from([s.binding.as_str()]);
+        for (member, ty) in s.additional.iter().zip(additional_types) {
+            if !bindings.insert(&member.binding) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E2601,
+                        "duplicate binding in simultaneous lock acquisition",
+                    )
+                    .with_label(Label::primary(
+                        member.binding_span,
+                        "binding already declared in this group",
+                    )),
+                );
+            }
+            self.define_var(
+                member.binding.clone(),
+                VarInfo {
+                    ty,
+                    mutable: member.mutable,
+                    is_param: false,
+                    declaration_span: member.binding_span,
+                },
+            );
+        }
         self.local.lock_depth += 1;
         self.local.lexical_block_depth += 1;
         for stmt in &s.body.stmts {
@@ -1549,8 +1599,13 @@ impl TypeChecker {
 
     /// The protected value type `T` when `target_ty` is the lock type `s.mode`
     /// requires, reporting E2602 and returning `None` when it is not.
-    fn lock_protected_type(&mut self, s: &LockStmt, target_ty: &Type) -> Option<Type> {
-        let required = s.mode.lock_type_name();
+    fn lock_target_type(
+        &mut self,
+        mode: LockMode,
+        target: &Expr,
+        target_ty: &Type,
+    ) -> Option<Type> {
+        let required = mode.lock_type_name();
         if let Type::Generic(name, args) = target_ty
             && name == required
             && args.len() == 1
@@ -1570,12 +1625,12 @@ impl TypeChecker {
             ErrorCode::E2602,
             format!(
                 "`{}` requires `{required}<T>`, found `{}`",
-                s.mode.keyword(),
+                mode.keyword(),
                 self.diagnostic_type_name(target_ty)
             ),
         )
         .with_label(Label::primary(
-            s.target.span(),
+            target.span(),
             format!("expected `{required}<T>`"),
         ));
         // The most likely mistake is reaching for the wrong statement form.

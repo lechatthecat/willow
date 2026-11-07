@@ -21,7 +21,11 @@
 //
 //   * only inside an `async fn`               (E2603 — a park needs a frame)
 //   * no `await`/`select`/channel op in the body (E2604 — see below)
-//   * no nested acquisition                   (E2605 — no lock-order analysis)
+//   * nesting must be provably ordered        (E2605 — see below)
+//
+// E2605 rejects cyclic acquisition order, reacquiring the same lock, and nesting
+// a lock whose identity is unknown. Distinct locks in a consistent order may
+// nest; acquire possibly aliasing locks together with `lock a as x, b as y`.
 //
 // E2604 is what makes the section short and deadlock-free: the ACQUISITION is
 // the suspension point, and nothing inside the body may suspend again. Do the

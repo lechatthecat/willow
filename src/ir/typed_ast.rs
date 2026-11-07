@@ -186,6 +186,14 @@ pub enum HirDeferBody {
 
 /// A statement in typed HIR. Control flow keeps its high-level shape here; the
 /// basic-block lowering happens in a later slice.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirLockTarget {
+    pub mode: LockMode,
+    pub target: HirExpr,
+    pub binding: String,
+    pub mutable: bool,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum HirStmt {
     /// `let [mut] name: ty = value;` — `ty` is the type the name is *bound*
@@ -233,6 +241,7 @@ pub enum HirStmt {
         span: Span,
     },
     Lock {
+        additional: Vec<HirLockTarget>,
         mode: LockMode,
         target: HirExpr,
         binding: String,
@@ -483,8 +492,14 @@ impl HirStmt {
                     pending.push(Child::Expr(iterable));
                     pending.extend(body.iter().map(Child::Stmt));
                 }
-                HirStmt::Lock { target, body, .. } => {
+                HirStmt::Lock {
+                    target,
+                    additional,
+                    body,
+                    ..
+                } => {
                     pending.push(Child::Expr(target));
+                    pending.extend(additional.iter().map(|member| Child::Expr(&member.target)));
                     pending.extend(body.iter().map(Child::Stmt));
                 }
                 HirStmt::Return { value, .. } => pending.extend(value.iter().map(Child::Expr)),

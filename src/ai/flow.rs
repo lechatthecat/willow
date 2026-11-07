@@ -303,7 +303,11 @@ impl Body {
                         Some("wait:lock".into()),
                         acquire,
                     ));
-                    self.expr(jobs, &s.target, acquire, exits)
+                    let mut entry = acquire;
+                    for member in s.additional.iter().rev() {
+                        entry = self.expr(jobs, &member.target, entry, exits);
+                    }
+                    self.expr(jobs, &s.target, entry, exits)
                 }
                 Stmt::Defer(d) => match &d.body {
                     DeferBody::Expr(e) if !matches!(e, Expr::Match(_)) => {

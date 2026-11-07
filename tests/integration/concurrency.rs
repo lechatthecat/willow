@@ -285,3 +285,6 @@ mod interface_contracts;
 
 #[path = "concurrency/async_retention.rs"]
 mod async_retention;
+
+#[path = "concurrency/ordered_locks.rs"]
+mod ordered_locks;
