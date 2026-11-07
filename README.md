@@ -269,8 +269,9 @@ elements, or a recursive type such as `Mutex<Node>` reached through a `Node`
 field. Use group syntax for the first three; hand-over-hand traversal of a
 recursive type is not supported. A lock of unknown origin may be any lock of its
 type, so its order applies to each known lock of that type, while known locks
-stay distinct from one another. Generic `Mutex<T>` values have no type order and
-stay conservative. Awaiting an async helper inside a lock is
+stay distinct from one another. Generic `Mutex<T>` values have no type order, and
+nesting inside a generic function or class stays conservative: use group syntax
+there. Awaiting an async helper inside a lock is
 still E2604: compute awaited values before entering the critical section, or
 acquire the required locks together. Merely creating an async task does not
 execute its body on the caller's stack.

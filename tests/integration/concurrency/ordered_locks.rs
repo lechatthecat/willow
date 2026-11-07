@@ -533,6 +533,45 @@ async fn main() { await f(Mutex::new("x"), Mutex::new(2)); }
 }
 
 #[test]
+fn ordered_locks_known_locks_in_generic_bodies_stay_conservative() {
+    assert_compile_error_contains(
+        r#"
+async fn typed(x: Mutex<String>, y: Mutex<i64>) {
+    lock x as s { lock y as v { println(v); } }
+}
+class Holder<T> {
+    pub v: i64;
+    pub init(self) { self.v = 1; }
+    pub async fn run(self) {
+        let n = Mutex::new(1);
+        let s = Mutex::new("one");
+        lock n as a { lock s as b { println(a); } }
+        await typed(s, n);
+    }
+}
+async fn main() { let holder = new Holder<i64>(); await holder.run(); }
+"#,
+        &["E2605", "lock identity or ordering is unknown"],
+    );
+    assert_ordered_run(
+        r#"
+class Holder<T> {
+    pub v: i64;
+    pub init(self) { self.v = 1; }
+    pub async fn run(self) {
+        let n = Mutex::new(1);
+        let s = Mutex::new("one");
+        lock n as a, s as b { println(a); println(b); }
+        lock n as a { println(a); }
+    }
+}
+async fn main() { let holder = new Holder<i64>(); await holder.run(); }
+"#,
+        "1\none\n1\n",
+    );
+}
+
+#[test]
 fn ordered_locks_unnested_parameter_does_not_merge_known_locks() {
     assert_ordered_run(
         r#"

@@ -228,6 +228,11 @@ impl Analysis<'_> {
     ) -> (Identity, Option<Type>) {
         let mut identity = self.identity(target, locals);
         let Some(ty) = self.types.get(&target.id()) else {
+            // Generic templates are not typed here, so a known lock in one
+            // could not join its type's order.
+            if !generics.is_empty() {
+                identity.class = None;
+            }
             return (identity, None);
         };
         let key = type_key(ty, generics, self.identity);
