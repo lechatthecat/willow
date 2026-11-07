@@ -1,18 +1,123 @@
 # Willow
 
 [![Status: experimental](https://img.shields.io/badge/status-experimental-orange)](https://github.com/lechatthecat/willow)
+[![Release](https://img.shields.io/github/v/release/lechatthecat/willow)](https://github.com/lechatthecat/willow/releases/latest)
 [![CI](https://github.com/lechatthecat/willow/actions/workflows/ci.yml/badge.svg)](https://github.com/lechatthecat/willow/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**A native programming language with compiler-enforced concurrency rules and semantic tooling for AI coding agents.**
+**A native, garbage-collected language whose compiler enforces concurrency rules, proves function contracts, and explains program semantics to humans and AI coding agents.**
 
-Willow is a statically typed, garbage-collected language that compiles to native code using [Cranelift](https://cranelift.dev/). It includes its own async runtime, garbage collector, package manager, and incremental compiler infrastructure.
+Willow is statically typed and compiles to native code using [Cranelift](https://cranelift.dev/). It pairs Rust-style enums and pattern matching with classes, a garbage collector and lightweight async tasks, and includes its own async runtime, package manager, and incremental compiler infrastructure.
 
-Its premise is simple: **when an AI agent changes a program, the compiler should do more than check syntax and types. It should reject certain unsafe behaviors and explain the program's semantics in a form the agent can use.**
+Its premise is simple: **when a person or an AI agent changes a program, the compiler should do more than check syntax and types. It should reject certain unsafe behaviors and explain the program's semantics in a form the agent can use.**
+
+**Readable first, proven where it matters.** Willow code is meant to be read, by people and by AI agents alike. Its syntax is deliberately familiar, so anyone who knows Rust or Kotlin can follow it and agents can apply what they already know. Concurrency checks run in the compiler without adding concepts to everyday code, and proof is opt-in: mark the functions that matter with [`@verified`](#verified-prove-a-contract-with-z3) and leave the rest as ordinary code.
 
 **Status:** Experimental research/engineering project. **Not production-ready.** The guarantees below describe specific compiler-enforced properties, not a proof that arbitrary Willow programs are free of deadlocks, races, or other bugs.
 
-## Start with a guarantee, not a token count
+This README describes the current `main` branch. Some features are newer than the latest prebuilt release; see [Try Willow](#try-willow).
+
+**Contents:** [A taste of Willow](#a-taste-of-willow) · [Try Willow](#try-willow) · [Concurrency guarantees](#concurrency-the-compiler-follows-the-wait) · [Proven contracts](#contracts-from-run-time-checks-to-proofs) · [Locks](#locks-designed-together-with-the-compiler-and-scheduler) · [Semantic tooling](#semantic-tooling-for-people-and-ai-agents) · [Related approaches](#how-this-relates-to-other-approaches) · [Measurements](#measurements) · [Current boundaries](#current-boundaries)
+
+## A taste of Willow
+
+```willow
+import std::collections::Array;
+
+enum Shape {
+    Circle(f64),
+    Rectangle(f64, f64),
+}
+
+fn area(shape: Shape) -> f64 {
+    return match shape {
+        Shape::Circle(r) => 3.14 * r * r,
+        Shape::Rectangle(w, h) => w * h,
+    };
+}
+
+class User {
+    pub name: String;
+    pub age: i64;
+
+    pub fn birthday(self) -> User {
+        return new User(self.name, self.age + 1);
+    }
+}
+
+fn find_age(users: Array<User>, name: String) -> Option<i64> {
+    for user in users {
+        if user.name == name { return Some(user.age); }
+    }
+    return None;
+}
+
+async fn double_later(n: i64) -> i64 {
+    await sleep(1);
+    return n * 2;
+}
+
+async fn main() {
+    let users = [new User("Alice", 32).birthday()];
+    if let Some(age) = find_age(users, "Alice") {
+        println(age); // 33
+    }
+
+    println(area(Shape::Rectangle(2.0, 3.0))); // 6
+
+    let task = double_later(21); // creates the Task
+    println(await task); // 42
+}
+```
+
+A few things to notice:
+
+- **No ownership or lifetimes.** The garbage collector manages memory, so values can be shared freely.
+- **No null.** Absence is `Option<T>`, and `T?` is sugar for it. Recoverable errors use `Result<T, E>` and the `?` operator.
+- **Classes are closed by default.** Inheritance needs `open`, and replacing a method needs `override`. A class without an `init` constructor can be created with its fields in declaration order.
+- **`async fn` returns a Task.** Calling one creates the Task; `await` waits for its result.
+- **`i64` overflow is not silent in debug builds.** It raises a recoverable panic; `--release` wraps. Methods such as `wrapping_add` and `checked_add` behave the same in both modes.
+
+| Area | What is available | Examples |
+| --- | --- | --- |
+| Data | Classes, inheritance, interfaces, enums, generics | [classes](example/class_hierarchy.wi), [enums](example/enum_match.wi), [generic interfaces](example/generic_interfaces.wi) |
+| Control flow | `match`, guards, `if let`, `while let`, `for` | [guards](example/if_let_guards.wi), [loops](example/for_loops.wi) |
+| Errors | `Option`, `Result`, `?` with error conversion, recoverable panics | [Option and Result](example/option_result.wi), [conversion](example/error_conversion.wi) |
+| Functions | Closures and function values | [closures](example/function_closure_wrappers.wi) |
+| Concurrency | Tasks, channels, `select`, cancellation, `Mutex`, `RwLock` | [channels](example/bounded_channel.wi), [select](example/select.wi), [parallel map](example/parallel_map.wi) |
+| I/O | Files and TCP | [files](example/file_io.wi), [TCP echo](example/tcp_echo.wi) |
+| Packages | Modules and `willow add` dependencies | [imports](example/import_demo) |
+| Rust crates | `extern rust` adapters for `[rust-dependencies]` | [regex bridge](example/rust_regex), [bridge protocol](protocol/ai_toolchain/RUST_BRIDGE.md) |
+
+The [`example/`](example/) directory has hundreds of small programs, and [`example/README.md`](example/README.md) explains many language details.
+
+## Try Willow
+
+Download a [prebuilt release](https://github.com/lechatthecat/willow/releases/latest) for Linux x86_64, macOS arm64/x86_64, or Windows x86_64. Keep the distributed `bin/` and `lib/` directories together. The packaged compiler needs a system C toolchain for linking, but does not require Rust. The release includes checksums.
+
+```sh
+willow --version
+willow init hello
+cd hello
+willow run
+```
+
+The generated project includes `project.toml`, `src/main.wi`, `AGENTS.md`, and `CLAUDE.md`.
+
+Or build from source (Rust 1.96+):
+
+```sh
+git clone https://github.com/lechatthecat/willow.git
+cd willow
+cargo build --release
+./target/release/willow --version
+```
+
+**Release note:** v0.1.10, the latest prebuilt release, rejects all nested locks and has no group acquisition (`lock a as x, b as y`). Build from source to use the [lock rules below](#acquiring-multiple-locks).
+
+[`RELEASE_README.md`](RELEASE_README.md) covers installation, library layout, checksums and toolchain requirements.
+
+## Concurrency: the compiler follows the wait
 
 ### E2604: no suspension or blocking wait while holding a Willow lock
 
@@ -59,57 +164,6 @@ async fn main() {
 The compiler is enforcing a **semantic constraint**, not looking for the literal word `await`. That distinction matters when an AI agent edits a helper several calls away from the critical section.
 
 The implementation and regression tests are in [`src/semantic/effects.rs`](src/semantic/effects.rs), [`src/compiler_db/effects.rs`](src/compiler_db/effects.rs), and [`tests/integration/concurrency/lock_restrictions.rs`](tests/integration/concurrency/lock_restrictions.rs). See the runnable [scheduler-aware lock example](example/scheduler_aware_lock.wi).
-
-### Exact rename: change a symbol, preserve unrelated names
-
-Save this standalone program as `main.wi`:
-
-```willow
-fn deposit(amount: i64) -> i64 { return amount + 1; }
-fn unrelated() -> i64 {
-    let deposit = 7;
-    return deposit;
-}
-fn main() {
-    println(deposit(4)); // 5
-    println(unrelated()); // 7
-}
-```
-
-Preview the symbol-resolved edit, apply it, then run the program:
-
-```sh
-willow rename main::deposit credit --source main.wi --dry-run --diff
-willow rename main::deposit credit --source main.wi
-willow run main.wi
-```
-
-The declaration and call become `credit`; the unrelated local binding named
-`deposit` stays unchanged. Exact rename uses resolved symbol identity rather
-than spelling, checks collisions, and validates the candidate before applying
-source changes. The guarantee is scoped to supported symbols in the loaded
-project: it does not update text in strings, external consumers, or undiscovered
-source trees. Ambiguous selectors, detected collisions, and candidates that fail validation
-are rejected. See the [rename regression tests](tests/semantic_rename.rs).
-
-### What an agent can trust
-
-An agent can use these compiler results without independently reconstructing
-the same analysis. It still needs tests and review for behavior outside their
-stated scope.
-
-| Result | Compiler-backed information | Unknowns or assumptions |
-| --- | --- | --- |
-| Accepted lexical lock body | No blocking/suspending effect under the compiler's modeled lock rules | Not a proof of global deadlock freedom or arbitrary native-code behavior |
-| Successful exact rename | Resolved occurrences of the selected symbol are edited and the candidate passes validation | Limited to the loaded project and supported symbols; not a proof of application correctness |
-| Effect `MAY` (`may` in JSON) | A source or known-callee witness supports the capability | It may not occur on every runtime path; uncertainty can coexist in `unknown_reasons` |
-| Effect `UNKNOWN` (`unknown` in JSON) | A conservative capability is retained without a supporting witness | Indirect/unresolved calls, missing bodies, incomplete flow, or external interop require assumptions; this is not evidence that the effect occurs or is absent |
-| Effect `NONE` (`none` in JSON) | Neither a witness nor an uncertainty reason remains for that capability in the modeled analysis | Scoped to available compiler knowledge, not a guarantee about unmodeled behavior |
-
-The `willow.effects.v2` output keeps `witness` and `unknown_reasons` separate.
-Missing evidence is not purity. Safety checks retain conservative capability
-bounds even when the explanatory query reports `UNKNOWN`; a query does not
-waive E2604. See the [effect-state example](example/effect_states.wi).
 
 ### The analysis follows the program, not just the local syntax
 
@@ -169,9 +223,58 @@ Contracts are checked fail-closed:
 
 See [effect contracts](example/effect_contracts.wi) and [contracts across interface dispatch](example/effect_contract_dispatch.wi).
 
-### Purity and value contracts
+## Contracts: from run-time checks to proofs
 
-Effect contracts describe waiting. Value-level properties use separate annotations:
+Effect contracts describe waiting. Value-level properties use separate annotations, from run-time checks up to static proofs.
+
+### `@verified`: prove a contract with Z3
+
+```willow
+@pure
+@verified
+fn larger(a: i64, b: i64) -> i64
+    ensures result >= a
+    ensures result >= b
+    ensures result == a || result == b
+{
+    if a >= b { return a; }
+    return b;
+}
+
+fn main() {
+    println(larger(4, 9)); // 9
+}
+```
+
+These `ensures` clauses hold for every `i64` input, not only the inputs a test tries. A contract that cannot be proved fails the build, and a false one comes with a counterexample:
+
+```willow
+@pure
+@verified
+fn non_negative(x: i64) -> i64
+    ensures result >= 0
+{
+    return x;
+}
+
+fn main() {
+    println(non_negative(5));
+}
+```
+
+```text
+error[E2630]: @verified `non_negative`: COUNTEREXAMPLE: ensures truth: sat; candidate inputs ((a0_0 (- 1)))
+```
+
+Failures are reported as E2630 (counterexample), E2631 (unsupported construct) and E2632 (solver unknown or failure).
+
+**Scope:** `@verified` requires `@pure` and currently proves i64/bool contracts. It does not reason about arrays, objects, or other data structures. The proof also trusts Z3 and the Willow compiler.
+
+**Setup:** install Z3 4.15.4 (`python -m pip install z3-solver==4.15.4.0`) and keep `z3` on PATH, or set `WILLOW_Z3` to its executable. Verification JSON and replayable SMT files are saved under `target/willow-verification` (override with `WILLOW_VERIFICATION_DIR`). See [`example/static_verification.wi`](example/static_verification.wi).
+
+**Loops:** for `while` proofs, add boolean `invariant` clauses and one i64 `variant` before the body; see [`example/verified_loops.wi`](example/verified_loops.wi). The verifier checks entry, preservation, and a nonnegative, strictly decreasing rank on iterations. Annotations are proof-only. Loops without both annotations, `for`, `break`, and `continue` remain unsupported in verified functions.
+
+### `@pure` and run-time contracts
 
 - **`@pure`** requires a function to have no observable interaction outside its
   arguments and result. Output, field and index writes, heap reads,
@@ -181,10 +284,6 @@ Effect contracts describe waiting. Value-level properties use separate annotatio
 - **`requires` / `ensures`** clauses are checked at run time in both debug and
   release builds. A violation is a recoverable panic such as
   `contract violation: ensures`. See [runtime contracts](example/runtime_contracts.wi).
-- **`@verified`** (which requires `@pure`) proves i64/bool contracts statically with Z3. Failures
-  are reported as E2630 (counterexample), E2631 (unsupported construct) and
-  E2632 (solver unknown or failure). An unproved contract fails the build. Setup
-  is under [Try Willow](#try-willow).
 
 ## Locks designed together with the compiler and scheduler
 
@@ -281,7 +380,7 @@ execute its body on the caller's stack.
 
 See [ordered locks](example/ordered_locks.wi) and [parent and child locks](example/parent_child_locks.wi) for runnable examples.
 
-## The same semantic knowledge is available to AI agents
+## Semantic tooling for people and AI agents
 
 Many languages already offer navigation, refactoring, or LSP/MCP integration. **That alone is not a reason to invent a new language.** Willow's more interesting combination is:
 
@@ -317,6 +416,57 @@ This is not the claim that an agent is always correct. Rather, **some mistakes c
 
 See the [AI toolchain protocol](protocol/ai_toolchain/README.md) and [example effect explanations](example/effect_explanations.wi).
 
+### Exact rename: change a symbol, preserve unrelated names
+
+Save this standalone program as `main.wi`:
+
+```willow
+fn deposit(amount: i64) -> i64 { return amount + 1; }
+fn unrelated() -> i64 {
+    let deposit = 7;
+    return deposit;
+}
+fn main() {
+    println(deposit(4)); // 5
+    println(unrelated()); // 7
+}
+```
+
+Preview the symbol-resolved edit, apply it, then run the program:
+
+```sh
+willow rename main::deposit credit --source main.wi --dry-run --diff
+willow rename main::deposit credit --source main.wi
+willow run main.wi
+```
+
+The declaration and call become `credit`; the unrelated local binding named
+`deposit` stays unchanged. Exact rename uses resolved symbol identity rather
+than spelling, checks collisions, and validates the candidate before applying
+source changes. The guarantee is scoped to supported symbols in the loaded
+project: it does not update text in strings, external consumers, or undiscovered
+source trees. Ambiguous selectors, detected collisions, and candidates that fail validation
+are rejected. See the [rename regression tests](tests/semantic_rename.rs).
+
+### What an agent can trust
+
+An agent can use these compiler results without independently reconstructing
+the same analysis. It still needs tests and review for behavior outside their
+stated scope.
+
+| Result | Compiler-backed information | Unknowns or assumptions |
+| --- | --- | --- |
+| Accepted lexical lock body | No blocking/suspending effect under the compiler's modeled lock rules | Not a proof of global deadlock freedom or arbitrary native-code behavior |
+| Successful exact rename | Resolved occurrences of the selected symbol are edited and the candidate passes validation | Limited to the loaded project and supported symbols; not a proof of application correctness |
+| Effect `MAY` (`may` in JSON) | A source or known-callee witness supports the capability | It may not occur on every runtime path; uncertainty can coexist in `unknown_reasons` |
+| Effect `UNKNOWN` (`unknown` in JSON) | A conservative capability is retained without a supporting witness | Indirect/unresolved calls, missing bodies, incomplete flow, or external interop require assumptions; this is not evidence that the effect occurs or is absent |
+| Effect `NONE` (`none` in JSON) | Neither a witness nor an uncertainty reason remains for that capability in the modeled analysis | Scoped to available compiler knowledge, not a guarantee about unmodeled behavior |
+
+The `willow.effects.v2` output keeps `witness` and `unknown_reasons` separate.
+Missing evidence is not purity. Safety checks retain conservative capability
+bounds even when the explanatory query reports `UNKNOWN`; a query does not
+waive E2604. See the [effect-state example](example/effect_states.wi).
+
 ### Compare scalar contracts across an edit
 
 `willow verify-edit --base BASE --schema v2 --protected-base FULL_COMMIT --format json`
@@ -345,7 +495,7 @@ and contract digests, then return
 Only that successful CI handoff yields `APPROVED_BY_POLICY`; `CI=true` alone is
 insufficient. See [the runnable contract example](example/contract_comparison.wi).
 
-## What needs language semantics, and what LSP/MCP can provide
+### What needs language semantics, and what LSP/MCP can provide
 
 Symbol navigation, checked types, references, and exact rename can be exposed
 through LSP or MCP for any static language with suitable compiler tooling.
@@ -366,7 +516,9 @@ contract in normal compilation and exposes the same knowledge through its CLI.
 - [Rust Clippy's `await_holding_lock` lint](https://rust-lang.github.io/rust-clippy/master/index.html#await_holding_lock) warns about holding certain non-async-aware guards across `await`. Willow instead rejects waiting effects inside its own lexical lock construct, including transitive calls. The two systems have different scopes; this is not a claim that Willow is generally safer than Rust.
 - [Koka](https://github.com/koka-lang/koka) illustrates that effect systems are a well-established research direction. Willow is not claiming to have invented effect tracking. Its emphasis is **connecting concrete effect checks, the native runtime, and agent-readable evidence** in one toolchain.
 
-## Measured AI-agent efficiency (a secondary benefit)
+## Measurements
+
+### Measured AI-agent efficiency (a secondary benefit)
 
 The semantic CLI also reduced work in one small controlled benchmark. Five tasks were run three times per mode on an approximately 1,300-line, eight-module Willow chess engine, with Claude Code (Sonnet 5.5), on 2026-10-22.
 
@@ -379,7 +531,7 @@ The semantic CLI also reduced work in one small controlled benchmark. Five tasks
 
 All answers were correct in both modes. One task (interface-signature impact) used *more* input tokens with the semantic CLI. This is evidence for the tested tasks only, **not** a demonstrated general improvement on large repositories. Token savings are useful, but they are not Willow's primary safety argument.
 
-## Runtime performance: strengths and gaps
+### Runtime performance: strengths and gaps
 
 A separate, reproducible microbenchmark compared Willow, Go 1.27.0 and OpenJDK 26.0.2 (virtual threads) on an AMD Ryzen 7 7800X3D, with eight workers. The table shows the median of five trials on 2026-10-25 (commit `453fc6c`); **lower is better**.
 
@@ -393,41 +545,6 @@ A separate, reproducible microbenchmark compared Willow, Go 1.27.0 and OpenJDK 2
 | virtual_dispatch | 69.4 ms | **41.4 ms** | 58.1 ms |
 
 In the idle-spawn measurement, memory after parking 100,000 tasks was about **744 B/task** for Willow, compared with **2,743 B/task** for Go and **1,351 B/task** for Java. The [full report, methods, raw data, and reproducible harness](benches/go_vs_willow/MEASUREMENT_2026-10-25.md) include additional cases and limitations. These are workload-specific measurements, not a blanket claim of runtime superiority.
-
-## Try Willow
-
-Download a [prebuilt release](https://github.com/lechatthecat/willow/releases/latest) for Linux x86_64, macOS arm64/x86_64, or Windows x86_64. Keep the distributed `bin/` and `lib/` directories together. The packaged compiler needs a system C toolchain for linking, but does not require Rust. The release includes checksums.
-
-```sh
-willow --version
-willow init hello
-cd hello
-willow run
-```
-
-The generated project includes `project.toml`, `src/main.wi`, `AGENTS.md`, and `CLAUDE.md`.
-
-Or build from source (Rust 1.96+):
-
-```sh
-git clone https://github.com/lechatthecat/willow.git
-cd willow
-cargo build --release
-./target/release/willow --version
-```
-
-Examples live in [`example/`](example/); [`RELEASE_README.md`](RELEASE_README.md) covers installation, library layout, checksums and toolchain requirements.
-
-For optional static contract checking, install Z3 4.15.4 (`python -m pip install
-z3-solver==4.15.4.0`) and keep `z3` on PATH, or set `WILLOW_Z3` to its executable.
-Run `willow run example/static_verification.wi` for a `@pure @verified` example.
-For `while` proofs, add boolean `invariant` clauses and one i64 `variant` before
-the body; see [`example/verified_loops.wi`](example/verified_loops.wi). The verifier
-checks entry, preservation, and a nonnegative, strictly decreasing rank on
-iterations. Annotations are proof-only. Loops without both annotations, `for`,
-`break`, and `continue` remain unsupported in verified functions.
-Unproved contracts fail the build. Verification JSON and replayable SMT files
-are saved under `target/willow-verification` (override with `WILLOW_VERIFICATION_DIR`).
 
 ## Current boundaries
 
