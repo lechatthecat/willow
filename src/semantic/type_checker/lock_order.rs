@@ -716,18 +716,33 @@ pub(crate) fn analyze_all(
         }
     }
     let roots = collapse_groups(&mut graph, &class_aliases);
-    let mut type_classes = TypeClasses::default();
-    for (key, nodes) in typed_nodes {
-        if let Some(&class) = equal_classes.get(&Class::Type(key)) {
-            graph.stand_for(
+    let mut stand_ins = typed_nodes
+        .into_iter()
+        .filter_map(|(key, nodes)| {
+            let class = *equal_classes.get(&Class::Type(key))?;
+            Some((
                 roots[class],
-                nodes.into_iter().map(|node| roots[node]),
-                &mut type_classes,
-            );
-        }
+                nodes.into_iter().map(|node| roots[node]).collect(),
+            ))
+        })
+        .collect();
+    order_stand_ins(&mut stand_ins);
+    let mut type_classes = TypeClasses::default();
+    for (class, nodes) in stand_ins {
+        graph.stand_for(class, nodes.into_iter(), &mut type_classes);
     }
     diagnostics.extend(graph.diagnostics(&type_classes));
     diagnostics
+}
+
+// Map iteration order must not reach the graph: edge order decides which
+// acquisition a diagnostic reports first. O(L log L) for L typed locks.
+fn order_stand_ins(stand_ins: &mut Vec<(usize, Vec<usize>)>) {
+    stand_ins.sort_unstable_by_key(|&(class, _)| class);
+    for (_, nodes) in stand_ins {
+        nodes.sort_unstable();
+        nodes.dedup();
+    }
 }
 
 // Merge source-identical classes shared by more than one unit snapshot.
@@ -907,6 +922,15 @@ mod tests {
         graph.edge(a, b, Span::dummy());
         graph.edge(b, a, Span::dummy());
         assert!(graph.diagnostics(&TypeClasses::default()).is_empty());
+    }
+    #[test]
+    fn lock_order_stand_ins_ignore_map_iteration_order() {
+        let mut first = vec![(7, vec![9, 3, 9]), (2, vec![5, 4])];
+        let mut second = vec![(2, vec![4, 5, 4]), (7, vec![3, 9])];
+        order_stand_ins(&mut first);
+        order_stand_ins(&mut second);
+        assert_eq!(first, vec![(2, vec![4, 5]), (7, vec![3, 9])]);
+        assert_eq!(first, second);
     }
     #[test]
     fn lock_order_27_call_under_opaque_lock_is_accepted() {
