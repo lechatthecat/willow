@@ -1,0 +1,46 @@
+// Parent and child locks: the child lock is only known once the parent is
+// held, so it cannot join a group. Each lock of unknown origin is ordered by
+// its value type, which puts every parent before every child.
+
+class Account {
+    pub balance: Mutex<i64>;
+
+    pub init(self, balance: i64) {
+        self.balance = Mutex::new(balance);
+    }
+}
+
+async fn deposit(slot: Mutex<Mutex<i64>>, amount: i64) -> i64 {
+    lock slot as balance {
+        lock balance as mut value {
+            value = value + amount;
+            return value;
+        }
+    }
+}
+
+async fn replace_then_read(slot: Mutex<Mutex<i64>>) -> i64 {
+    lock slot as mut balance {
+        balance = Mutex::new(100);
+        lock balance as value {
+            return value;
+        }
+    }
+}
+
+async fn read_account(slot: Mutex<Account>) -> i64 {
+    lock slot as account {
+        lock account.balance as value {
+            return value;
+        }
+    }
+}
+
+async fn main() {
+    let slot = Mutex::new(Mutex::new(1));
+    println(await deposit(slot, 2));
+    println(await deposit(slot, 3));
+    println(await replace_then_read(slot));
+    println(await deposit(slot, 1));
+    println(await read_account(Mutex::new(new Account(7))));
+}

@@ -1096,12 +1096,23 @@ impl TypeChecker {
             queries.lock_orders.borrow_mut().insert(
                 *unit,
                 (
-                    super::lock_order::collect(program, &self.expr_types, &graph),
+                    super::lock_order::collect(
+                        program,
+                        &self.expr_types,
+                        &|name| self.declaration_name_key(name),
+                        &graph,
+                    ),
                     std::sync::Arc::clone(&imports),
                 ),
             );
         } else {
-            for diagnostic in super::lock_order::analyze(program, &self.expr_types, &graph) {
+            let diagnostics = super::lock_order::analyze(
+                program,
+                &self.expr_types,
+                &|name| self.declaration_name_key(name),
+                &graph,
+            );
+            for diagnostic in diagnostics {
                 self.push(diagnostic);
             }
         }

@@ -8,8 +8,7 @@ pub(super) struct BodyState {
     /// E0904. Reset to 0 inside a lambda body (a loop outside the lambda is
     /// not breakable from within it) (willow-kzka).
     pub(crate) loop_depth: u32,
-    /// Nesting depth of enclosing `lock` statements. V1 rejects a `lock` inside
-    /// another lock's critical section (E2605), and the depth also keeps the
+    /// Nesting depth of enclosing `lock` statements. The depth keeps the
     /// await scan from reporting the same `await` once per enclosing lock
     /// (willow-38w.1.1). Reset inside a lambda body, which only gets
     /// CONSTRUCTED in the section and holds nothing when it runs (willow-3kty).

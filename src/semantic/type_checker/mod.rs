@@ -808,40 +808,43 @@ impl TypeChecker {
     /// entries keep their canonical spelling instead of a declaration key.
     pub(super) fn array_class(&self, storage: &Type) -> Option<&String> {
         self.array_classes
-            .get(&self.array_storage_key(storage))
+            .get(&self.declaration_type_key(storage))
             .or_else(|| self.array_classes.get(storage))
     }
 
     /// Shared generic signatures use nominal aliases. Key storage dispatch by
     /// declaration identity so inferred local spellings and imported aliases agree.
-    pub(super) fn array_storage_key(&self, storage: &Type) -> Type {
-        storage.map_names(|name| {
-            let identity = self
-                .symbols
-                .lookup_class(name)
-                .map(|info| (&info.name, info.declaration_span))
-                .or_else(|| {
-                    self.symbols
-                        .lookup_enum(name)
-                        .map(|info| (&info.name, info.declaration_span))
-                })
-                .or_else(|| {
-                    self.symbols
-                        .lookup_interface(name)
-                        .map(|info| (&info.name, info.declaration_span))
-                });
-            identity.map_or_else(
-                || name.clone(),
-                |(identity, span)| {
-                    // Specializations share a declaration span but remain distinct.
-                    let specialization = identity.split_once("$mono$").map_or("", |(_, hash)| hash);
-                    format!(
-                        "$declaration${}:{}:{specialization}",
-                        span.file_id.0, span.start
-                    )
-                },
-            )
-        })
+    pub(super) fn declaration_type_key(&self, storage: &Type) -> Type {
+        storage.map_names(|name| self.declaration_name_key(name))
+    }
+
+    /// One type name's declaration identity, the same in every unit and spelling.
+    pub(super) fn declaration_name_key(&self, name: &str) -> String {
+        let identity = self
+            .symbols
+            .lookup_class(name)
+            .map(|info| (&info.name, info.declaration_span))
+            .or_else(|| {
+                self.symbols
+                    .lookup_enum(name)
+                    .map(|info| (&info.name, info.declaration_span))
+            })
+            .or_else(|| {
+                self.symbols
+                    .lookup_interface(name)
+                    .map(|info| (&info.name, info.declaration_span))
+            });
+        identity.map_or_else(
+            || name.to_owned(),
+            |(identity, span)| {
+                // Specializations share a declaration span but remain distinct.
+                let specialization = identity.split_once("$mono$").map_or("", |(_, hash)| hash);
+                format!(
+                    "$declaration${}:{}:{specialization}",
+                    span.file_id.0, span.start
+                )
+            },
+        )
     }
 
     fn class_info_from_decl(
@@ -852,7 +855,7 @@ impl TypeChecker {
     ) -> ClassInfo {
         if let Some(storage) = &class.abi_storage {
             let storage = self.normalize_decl_type(storage, class.span, module_prefix);
-            let key = self.array_storage_key(&storage);
+            let key = self.declaration_type_key(&storage);
             self.array_classes.insert(key, registered_name.to_owned());
             self.array_abi_files.insert(class.span.file_id);
             self.normalized_types

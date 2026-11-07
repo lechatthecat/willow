@@ -817,7 +817,7 @@ impl TypeChecker {
                         self.field_reassigned(field)
                     });
                     if let Some(storage) = storage {
-                        let key = self.array_storage_key(&storage);
+                        let key = self.declaration_type_key(&storage);
                         self.array_classes.insert(key, class_name.clone());
                         self.array_abi_files.insert(c.span.file_id);
                         self.normalized_types

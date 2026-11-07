@@ -1,12 +1,21 @@
 //! Ordered simultaneous acquisition of scheduler-aware locks.
 //!
 //! Entries stay in source order for constant-time binding access. A separate
-//! permutation is sorted once by the process-wide lock identity. Only its
-//! current entry can be pending; acquired entries are released in reverse.
-//! Before waiting, every acquired entry is released. A successful handoff is
-//! released before retrying the whole permutation, so group acquisition never
-//! holds its prefix while waiting for a lock acquired in a different lexical
+//! permutation is sorted once by the process-wide lock identity. One entry at
+//! most is pending; acquired entries are released in reverse.
+//! Before waiting, every acquired entry is released, so group acquisition never
+//! holds a member while waiting for a lock acquired in a different lexical
 //! order elsewhere. The caller's enclosing locks remain its responsibility.
+//!
+//! A handoff is kept while the other members are tried, because giving it back
+//! would rejoin that lock's FIFO queue at the tail and a steady stream of
+//! waiters on one member could then starve the group forever. A kept handoff
+//! may be out of identity order, so two groups could trade members in lockstep.
+//! After a kept handoff fails, the next one is therefore given back and the
+//! attempt restarts from the lowest identity, where one group must win. Every
+//! retry sleeps in a queue, so nothing spins and no backoff is needed. Groups
+//! are still not fair: other tasks can keep different members busy in turn,
+//! and retries have no upper bound because acquisition has no failure result.
 //! The compiler owns this native object until release/cancel and must keep its
 //! pointer in a non-GC frame slot. Each lock handle has its own relocatable root.
 
@@ -17,68 +26,12 @@ use crate::preempt::NoPreemptGuard;
 use crate::task::RuntimeTaskId;
 use std::ffi::c_void;
 
-#[derive(Default)]
-struct SortWork {
-    #[cfg(test)]
-    key_visits: usize,
-    #[cfg(test)]
-    bucket_visits: usize,
-}
-
-impl SortWork {
-    fn key(&mut self) {
-        #[cfg(test)]
-        {
-            self.key_visits += 1;
-        }
-    }
-
-    fn bucket(&mut self) {
-        #[cfg(test)]
-        {
-            self.bucket_visits += 1;
-        }
-    }
-}
-
-/// Stable least-significant-byte radix ordering. Identities have fixed width,
-/// so eight passes give O(n + 256) space and O(n + 256) time, including adverse
-/// permutations and duplicate identities. Counters disappear outside tests.
-fn radix_order(order: &mut Vec<usize>, identity: impl Fn(usize) -> u64) -> SortWork {
-    let mut work = SortWork::default();
-    if order.len() < 2 {
-        return work;
-    }
-    let mut scratch = vec![0; order.len()];
-    for shift in (0..64).step_by(8) {
-        let mut offsets = [0usize; 256];
-        for &index in order.iter() {
-            offsets[((identity(index) >> shift) & 255) as usize] += 1;
-            work.key();
-        }
-        let mut total = 0;
-        for offset in &mut offsets {
-            let count = *offset;
-            *offset = total;
-            total += count;
-            work.bucket();
-        }
-        for &index in order.iter() {
-            let bucket = ((identity(index) >> shift) & 255) as usize;
-            scratch[offsets[bucket]] = index;
-            offsets[bucket] += 1;
-            work.key();
-        }
-        std::mem::swap(order, &mut scratch);
-    }
-    work
-}
-
 struct Entry {
     handle: GcRootHandle,
     id: u64,
     mode: i32,
     token: i64,
+    held: bool,
 }
 
 impl Entry {
@@ -116,8 +69,11 @@ struct LockGroup {
     order: Vec<usize>,
     prepared: bool,
     duplicate: bool,
-    held: usize,
+    /// Entry indices in acquisition order; a handoff may precede lower ids.
+    acquired: Vec<usize>,
     pending: Option<usize>,
+    /// The last attempt kept a handoff and failed; give the next one back.
+    restart: bool,
     owner: Option<RuntimeTaskId>,
     generation: i64,
     #[cfg(test)]
@@ -131,8 +87,9 @@ impl LockGroup {
             order: Vec::new(),
             prepared: false,
             duplicate: false,
-            held: 0,
+            acquired: Vec::new(),
             pending: None,
+            restart: false,
             owner: None,
             generation: crate::lock_wait::next_lock_id() as i64,
             #[cfg(test)]
@@ -145,7 +102,10 @@ impl LockGroup {
             return;
         }
         self.order.extend(0..self.entries.len());
-        radix_order(&mut self.order, |i| self.entries[i].id);
+        // O(k log k) rather than an O(k) radix pass: k is the member count
+        // written in one `lock` statement, and eight 256-bucket passes cost
+        // more than this until k reaches thousands.
+        self.order.sort_unstable_by_key(|&i| self.entries[i].id);
         self.duplicate = self
             .order
             .windows(2)
@@ -158,15 +118,18 @@ impl LockGroup {
         if self.duplicate {
             return MUTEX_STATUS_RECURSIVE;
         }
+        let mut kept = false;
         if let Some(index) = self.pending {
-            debug_assert_eq!(self.held, 0);
-            let entry = &self.entries[index];
-            match entry.poll() {
+            debug_assert!(self.acquired.is_empty());
+            match self.entries[index].poll() {
                 MUTEX_STATUS_ACQUIRED => {
-                    // Handoff ownership is a notification to retry, not an
-                    // out-of-order member of a partially held permutation.
-                    entry.release();
                     self.pending = None;
+                    if self.restart {
+                        self.entries[index].release();
+                    } else {
+                        self.keep(index);
+                        kept = true;
+                    }
                 }
                 MUTEX_STATUS_LOST => {
                     self.pending = None;
@@ -175,19 +138,21 @@ impl LockGroup {
                 status => return status,
             }
         }
-        while self.held < self.order.len() {
-            let index = self.order[self.held];
+        for position in 0..self.order.len() {
+            let index = self.order[position];
+            if self.entries[index].held {
+                continue;
+            }
             match self.entries[index].acquire() {
-                MUTEX_STATUS_ACQUIRED => {
-                    self.held += 1;
-                }
+                MUTEX_STATUS_ACQUIRED => self.keep(index),
                 MUTEX_STATUS_PENDING => {
                     self.pending = Some(index);
-                    self.release_prefix();
+                    self.restart = kept;
+                    self.release_acquired();
                     return MUTEX_STATUS_PENDING;
                 }
                 status => {
-                    self.release_prefix();
+                    self.release_acquired();
                     return status;
                 }
             }
@@ -195,23 +160,32 @@ impl LockGroup {
         MUTEX_STATUS_ACQUIRED
     }
 
+    fn keep(&mut self, index: usize) {
+        self.entries[index].held = true;
+        self.acquired.push(index);
+    }
+
+    fn complete(&self) -> bool {
+        self.acquired.len() == self.entries.len()
+    }
+
     fn is_owner(&self) -> bool {
         self.owner.is_some() && self.owner == crate::scheduler::current_task()
     }
 
     fn cleanup(&mut self) {
-        // A pending handoff was never counted in `held`. Purge compensates it
+        // A pending handoff is not in `acquired` yet. Purge compensates it
         // exactly once, even when the scheduler already removed the link.
         if self.pending.take().is_some() {
             willow_async_mutex_cancel();
         }
-        self.release_prefix();
+        self.release_acquired();
     }
 
-    fn release_prefix(&mut self) {
-        while self.held > 0 {
-            self.held -= 1;
-            let entry = &self.entries[self.order[self.held]];
+    fn release_acquired(&mut self) {
+        while let Some(index) = self.acquired.pop() {
+            let entry = &mut self.entries[index];
+            entry.held = false;
             #[cfg(test)]
             self.released.push(entry.id);
             entry.release();
@@ -249,6 +223,7 @@ pub extern "C" fn willow_lock_group_add(group: *mut c_void, handle: *mut c_void,
         id,
         mode,
         token: 0,
+        held: false,
     });
 }
 
@@ -292,7 +267,7 @@ pub extern "C" fn willow_lock_group_load(group: *mut c_void, index: i64) -> i64 
     let Some(group) = (unsafe { group.cast::<LockGroup>().as_ref() }) else {
         return 0;
     };
-    if !group.is_owner() || group.held != group.entries.len() {
+    if !group.is_owner() || !group.complete() {
         return 0;
     }
     let Some(entry) = usize::try_from(index)
@@ -315,7 +290,7 @@ pub extern "C" fn willow_lock_group_commit(group: *mut c_void, index: i64, value
     let Some(group) = (unsafe { group.cast::<LockGroup>().as_ref() }) else {
         return 0;
     };
-    if !group.is_owner() || group.held != group.entries.len() {
+    if !group.is_owner() || !group.complete() {
         return 0;
     }
     let Some(entry) = usize::try_from(index)
@@ -385,46 +360,6 @@ mod tests {
     }
 
     #[test]
-    fn group_radix_order_has_linear_deterministic_work_for_adverse_shapes() {
-        for size in [16, 64, 256, 1024, 4096] {
-            let increasing: Vec<u64> = (0..size as u64).collect();
-            let reverse: Vec<u64> = increasing.iter().rev().copied().collect();
-            let mut seed = 0x7d5a_f329_18bc_046eu64;
-            let random: Vec<u64> = (0..size)
-                .map(|_| {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    seed
-                })
-                .collect();
-            for ids in [increasing, reverse, random] {
-                let mut order: Vec<_> = (0..size).collect();
-                let mut expected = order.clone();
-                expected.sort_by_key(|&i| ids[i]);
-                let work = radix_order(&mut order, |i| ids[i]);
-                assert_eq!(order, expected);
-                assert_eq!(work.key_visits, 16 * size);
-                assert_eq!(work.bucket_visits, 8 * 256);
-            }
-        }
-    }
-
-    #[test]
-    fn group_radix_order_is_stable_for_duplicates_and_full_width_ids() {
-        let ids = [u64::MAX, 1 << 63, 0, 1, u64::MAX, 0, 1 << 63, 256];
-        let mut order: Vec<_> = (0..ids.len()).collect();
-        radix_order(&mut order, |i| ids[i]);
-        assert_eq!(order, [2, 5, 3, 7, 1, 6, 0, 4]);
-        for size in [0, 1] {
-            let mut trivial = (0..size).collect();
-            let work = radix_order(&mut trivial, |_| 0);
-            assert_eq!(work.key_visits, 0);
-            assert_eq!(work.bucket_visits, 0);
-        }
-    }
-
-    #[test]
     fn group_source_bindings_follow_identity_order_and_reverse_release() {
         let _guard = runtime_test_guard();
         reset_global_scheduler_for_test();
@@ -482,7 +417,7 @@ mod tests {
                 willow_lock_group_acquire(raw, &mut token),
                 MUTEX_STATUS_RECURSIVE
             );
-            assert_eq!(unsafe { &*raw.cast::<LockGroup>() }.held, 0);
+            assert!(unsafe { &*raw.cast::<LockGroup>() }.acquired.is_empty());
             willow_lock_group_cancel(raw);
             assert!(unsafe { &*a.load().cast::<AsyncMutex>() }.owner().is_none());
         });
@@ -530,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn group_partial_wait_cancellation_releases_owned_prefix() {
+    fn group_partial_wait_cancellation_releases_acquired_members() {
         let _guard = runtime_test_guard();
         reset_global_scheduler_for_test();
         let a = mutex(10);
@@ -553,7 +488,7 @@ mod tests {
                 willow_lock_group_acquire(raw, &mut token),
                 MUTEX_STATUS_PENDING
             );
-            assert_eq!(unsafe { &*raw.cast::<LockGroup>() }.held, 0);
+            assert!(unsafe { &*raw.cast::<LockGroup>() }.acquired.is_empty());
             assert!(unsafe { &*a.load().cast::<AsyncMutex>() }.owner().is_none());
             assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_PENDING);
             willow_lock_group_cancel(raw);
@@ -653,7 +588,237 @@ mod tests {
     }
 
     #[test]
-    fn group_wait_releases_prefix_against_reverse_lexical_order() {
+    fn group_handoff_beats_a_steady_queue_on_any_member() {
+        for contended in 0..2 {
+            let _guard = runtime_test_guard();
+            reset_global_scheduler_for_test();
+            let locks = [mutex(10), mutex(20)];
+            let lock = locks[contended].load().cast();
+            let owner = task();
+            let grouped = task();
+            let successor = task();
+            let mut held = 0;
+            let mut token = 0;
+            let mut successor_token = 0;
+            let raw = willow_lock_group_new();
+            for handle in &locks {
+                willow_lock_group_add(raw, handle.load().cast(), 0);
+            }
+            with_current_task_for_test(owner, || {
+                assert_eq!(
+                    willow_async_mutex_acquire(lock, &mut held),
+                    MUTEX_STATUS_ACQUIRED
+                );
+            });
+            with_current_task_for_test(grouped, || {
+                assert_eq!(
+                    willow_lock_group_acquire(raw, &mut token),
+                    MUTEX_STATUS_PENDING
+                );
+            });
+            with_current_task_for_test(successor, || {
+                assert_eq!(
+                    willow_async_mutex_acquire(lock, &mut successor_token),
+                    MUTEX_STATUS_PENDING
+                );
+            });
+            with_current_task_for_test(owner, || {
+                assert_eq!(willow_async_mutex_release(lock, held), 1);
+            });
+            // Giving the handoff back would pass the lock to the successor and
+            // requeue the group behind it, for as long as waiters keep coming.
+            with_current_task_for_test(grouped, || {
+                assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_ACQUIRED);
+                assert_eq!(willow_lock_group_release(raw, token), 1);
+            });
+            with_current_task_for_test(successor, || {
+                assert_eq!(
+                    willow_async_mutex_poll(lock, successor_token),
+                    MUTEX_STATUS_ACQUIRED
+                );
+                assert_eq!(willow_async_mutex_release(lock, successor_token), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn group_kept_handoff_is_released_before_waiting_on_another_member() {
+        for first in 0..2 {
+            let _guard = runtime_test_guard();
+            reset_global_scheduler_for_test();
+            let locks = [mutex(10), mutex(20)];
+            let contended = locks[first].load().cast();
+            let busy = locks[1 - first].load().cast();
+            let owner = task();
+            let other = task();
+            let grouped = task();
+            let mut held = 0;
+            let mut busy_token = 0;
+            let mut token = 0;
+            let raw = willow_lock_group_new();
+            for handle in &locks {
+                willow_lock_group_add(raw, handle.load().cast(), 0);
+            }
+            with_current_task_for_test(owner, || {
+                assert_eq!(
+                    willow_async_mutex_acquire(contended, &mut held),
+                    MUTEX_STATUS_ACQUIRED
+                );
+            });
+            with_current_task_for_test(grouped, || {
+                assert_eq!(
+                    willow_lock_group_acquire(raw, &mut token),
+                    MUTEX_STATUS_PENDING
+                );
+            });
+            with_current_task_for_test(other, || {
+                assert_eq!(
+                    willow_async_mutex_acquire(busy, &mut busy_token),
+                    MUTEX_STATUS_ACQUIRED
+                );
+            });
+            with_current_task_for_test(owner, || {
+                assert_eq!(willow_async_mutex_release(contended, held), 1);
+            });
+            with_current_task_for_test(grouped, || {
+                assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_PENDING);
+                let group = unsafe { &*raw.cast::<LockGroup>() };
+                assert!(group.acquired.is_empty());
+                assert!(group.entries.iter().all(|entry| !entry.held));
+                assert_eq!(group.pending, Some(1 - first));
+            });
+            assert!(
+                unsafe { &*contended.cast::<AsyncMutex>() }
+                    .owner()
+                    .is_none()
+            );
+            with_current_task_for_test(other, || {
+                assert_eq!(willow_async_mutex_release(busy, busy_token), 1);
+            });
+            with_current_task_for_test(grouped, || {
+                assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_ACQUIRED);
+                assert_eq!(willow_lock_group_release(raw, token), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn group_kept_rwlock_and_mutex_handoffs_load_and_commit() {
+        for mode in [1, 2, 0] {
+            let _guard = runtime_test_guard();
+            reset_global_scheduler_for_test();
+            let contended = if mode == 0 { mutex(10) } else { rwlock(10) };
+            let other = mutex(20);
+            let lock = contended.load().cast();
+            let owner = task();
+            let grouped = task();
+            let mut held = 0;
+            let mut token = 0;
+            let raw = willow_lock_group_new();
+            willow_lock_group_add(raw, lock, mode);
+            willow_lock_group_add(raw, other.load().cast(), 0);
+            with_current_task_for_test(owner, || {
+                let status = if mode == 0 {
+                    willow_async_mutex_acquire(lock, &mut held)
+                } else {
+                    willow_async_rwlock_acquire(lock, 2, &mut held)
+                };
+                assert_eq!(status, MUTEX_STATUS_ACQUIRED);
+            });
+            with_current_task_for_test(grouped, || {
+                assert_eq!(
+                    willow_lock_group_acquire(raw, &mut token),
+                    MUTEX_STATUS_PENDING
+                );
+            });
+            with_current_task_for_test(owner, || {
+                let released = if mode == 0 {
+                    willow_async_mutex_release(lock, held)
+                } else {
+                    willow_async_rwlock_release(lock, held)
+                };
+                assert_eq!(released, 1);
+            });
+            with_current_task_for_test(grouped, || {
+                assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_ACQUIRED);
+                assert_eq!(willow_lock_group_load(raw, 0), 10);
+                assert_eq!(willow_lock_group_load(raw, 1), 20);
+                let writable = i32::from(mode != 1);
+                assert_eq!(willow_lock_group_commit(raw, 0, 11), writable);
+                assert_eq!(willow_lock_group_load(raw, 0), 10 + i64::from(writable));
+                assert_eq!(willow_lock_group_release(raw, token), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn group_failed_kept_handoff_restarts_from_lowest_identity() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let low = mutex(10);
+        let high = mutex(20);
+        let (low_lock, high_lock) = (low.load().cast(), high.load().cast());
+        let owner = task();
+        let grouped = task();
+        let mut held = 0;
+        let mut token = 0;
+        let raw = willow_lock_group_new();
+        willow_lock_group_add(raw, low_lock, 0);
+        willow_lock_group_add(raw, high_lock, 0);
+        let acquire = |lock, held: &mut i64| {
+            with_current_task_for_test(owner, || {
+                assert_eq!(
+                    willow_async_mutex_acquire(lock, held),
+                    MUTEX_STATUS_ACQUIRED
+                );
+            });
+        };
+        let release = |lock, held: i64| {
+            with_current_task_for_test(owner, || {
+                assert_eq!(willow_async_mutex_release(lock, held), 1);
+            });
+        };
+        acquire(high_lock, &mut held);
+        with_current_task_for_test(grouped, || {
+            assert_eq!(
+                willow_lock_group_acquire(raw, &mut token),
+                MUTEX_STATUS_PENDING
+            );
+            let group = unsafe { &*raw.cast::<LockGroup>() };
+            assert_eq!(group.pending, Some(1));
+            assert!(!group.restart);
+        });
+        // The high handoff is kept out of order, then the low member is busy.
+        let mut low_held = 0;
+        acquire(low_lock, &mut low_held);
+        release(high_lock, held);
+        with_current_task_for_test(grouped, || {
+            assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_PENDING);
+            let group = unsafe { &*raw.cast::<LockGroup>() };
+            assert_eq!(group.pending, Some(0));
+            assert!(group.restart);
+        });
+        // The next handoff is given back, so the attempt runs in identity order
+        // and, with the high member busy, cannot leave a member held.
+        let mut high_held = 0;
+        acquire(high_lock, &mut high_held);
+        release(low_lock, low_held);
+        with_current_task_for_test(grouped, || {
+            assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_PENDING);
+            let group = unsafe { &*raw.cast::<LockGroup>() };
+            assert_eq!(group.pending, Some(1));
+            assert!(group.acquired.is_empty());
+            assert!(!group.restart);
+        });
+        release(high_lock, high_held);
+        with_current_task_for_test(grouped, || {
+            assert_eq!(willow_lock_group_poll(raw, token), MUTEX_STATUS_ACQUIRED);
+            assert_eq!(willow_lock_group_release(raw, token), 1);
+        });
+    }
+
+    #[test]
+    fn group_wait_releases_acquired_members_against_reverse_lexical_order() {
         let _guard = runtime_test_guard();
         reset_global_scheduler_for_test();
         // IDs sort B before A; ordinary code instead acquires A then B.
@@ -681,7 +846,7 @@ mod tests {
             group.owner = Some(grouped);
             assert_eq!(group.order, [1, 0]);
             assert_eq!(group.entries[1].acquire(), MUTEX_STATUS_ACQUIRED);
-            group.held = 1;
+            group.keep(1);
         });
         with_current_task_for_test(ordinary, || {
             assert_eq!(
@@ -695,11 +860,11 @@ mod tests {
                 MUTEX_STATUS_PENDING
             );
             let group = unsafe { &*raw.cast::<LockGroup>() };
-            assert_eq!(group.held, 0);
+            assert!(group.acquired.is_empty());
             assert_eq!(group.pending, Some(0));
         });
         // B's handoff lets the ordinary A→B owner finish instead of forming
-        // the permanent A→B→A wait cycle of a retained group prefix.
+        // the permanent A→B→A wait cycle of a member held while waiting.
         with_current_task_for_test(ordinary, || {
             assert_eq!(
                 willow_async_mutex_poll(b.load().cast(), b_token),

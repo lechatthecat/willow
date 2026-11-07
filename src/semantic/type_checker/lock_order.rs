@@ -3,6 +3,13 @@
 //! Callable nodes retain sharing: a long helper chain does not materialize a
 //! transitive acquisition set at every caller. Only cycles containing a lock
 //! class are errors; ordinary recursive helper components are harmless here.
+//!
+//! A lock with no known allocation gets a class named by its value type: lock
+//! types are invariant, so it can only alias locks of that exact type. The class
+//! stands for each known lock of the type without merging them: anything held
+//! before it is ordered before each of them, and each of them is ordered before
+//! anything taken under it. Nesting two such locks of one type is then a cycle,
+//! while a parent reached before its differently typed child is ordered.
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
@@ -15,6 +22,7 @@ use crate::semantic::ids::{FunctionId, TypeId};
 enum Class {
     Allocation(ExprId),
     Global(Span),
+    Type(Type),
 }
 
 #[derive(Clone, Default)]
@@ -33,6 +41,20 @@ struct Graph {
 }
 
 impl Graph {
+    /// Let `class` stand for each of `locks` in O(locks), with no edge product:
+    /// `class` keeps its incoming edges, a new node takes its outgoing ones, and
+    /// every member sits between the two. Members stay unordered between
+    /// themselves, so code that never meets the class is unaffected.
+    fn stand_for(&mut self, class: usize, locks: impl Iterator<Item = usize>) {
+        let after = self.node(false);
+        self.edges[after] = std::mem::take(&mut self.edges[class]);
+        self.edge(class, after, Span::dummy());
+        for lock in locks.filter(|&lock| lock != class) {
+            self.edge(class, lock, Span::dummy());
+            self.edge(lock, after, Span::dummy());
+        }
+    }
+
     fn node(&mut self, lock: bool) -> usize {
         let result = self.edges.len();
         self.edges.push(Vec::new());
@@ -146,8 +168,12 @@ impl Graph {
                     }
                 }
             }
-            diagnostics.push(diagnostic.with_help(
-                "use one consistent nesting order, or acquire the locks together in one `lock` statement"));
+            let one_class = group.iter().filter(|&&node| self.locks[node]).count() == 1;
+            diagnostics.push(diagnostic.with_help(if one_class {
+                "these locks cannot be told apart: they were created at the same place, such as one factory function, or share a type and their origin is unknown; if both are available before either is held and they are different locks, acquire them together: `lock first as a, second as b { ... }`; a lock reached only through another held lock, or the same lock taken twice, cannot be written this way"
+            } else {
+                "use one consistent nesting order, or acquire the locks together in one `lock` statement; a lock of unknown origin may be any lock of its type"
+            }));
         }
         diagnostics
     }
@@ -155,6 +181,10 @@ impl Graph {
 
 struct Analysis<'a> {
     types: &'a HashMap<ExprId, Type>,
+    /// Declaration identity of a type, independent of import spelling.
+    identity: &'a dyn Fn(&str) -> String,
+    /// Lock class node to value-type key, for every class with a concrete type.
+    lock_types: HashMap<usize, Type>,
     graph: Graph,
     functions: HashMap<FunctionId, (usize, bool)>,
     dispatch: HashMap<FunctionId, usize>,
@@ -186,6 +216,29 @@ impl Analysis<'_> {
             // proof: two different fields may store the same lock handle.
             _ => Identity::default(),
         }
+    }
+
+    /// The target's identity and type key. A body's own type parameters can
+    /// instantiate to any lock type, so such a target has no provable class.
+    fn target_identity(
+        &self,
+        target: &Expr,
+        locals: &HashMap<String, Identity>,
+        generics: &HashSet<&str>,
+    ) -> (Identity, Option<Type>) {
+        let mut identity = self.identity(target, locals);
+        let Some(ty) = self.types.get(&target.id()) else {
+            return (identity, None);
+        };
+        let key = type_key(ty, generics, self.identity);
+        match &key {
+            None => identity.class = None,
+            Some(key) if identity.class.is_none() => {
+                identity.class = Some(Class::Type(key.clone()));
+            }
+            Some(_) => {}
+        }
+        (identity, key)
     }
 
     fn class_node(&mut self, class: Class) -> usize {
@@ -251,7 +304,7 @@ impl Analysis<'_> {
             .with_help("acquire possibly aliasing locks together; acquiring the same lock twice is never allowed"));
     }
 
-    fn body(&mut self, owner: usize, body: &Block, params: &[Param]) {
+    fn body(&mut self, owner: usize, body: &Block, params: &[Param], generics: &HashSet<&str>) {
         let mut locals = HashMap::new();
         for parameter in params {
             locals.insert(
@@ -337,10 +390,10 @@ impl Analysis<'_> {
                     }
                     let identities: Vec<_> = targets
                         .iter()
-                        .map(|(target, _)| self.identity(target, &locals))
+                        .map(|(target, _)| self.target_identity(target, &locals, generics))
                         .collect();
                     let mut duplicates = HashSet::new();
-                    for (identity, &(_, span)) in identities.iter().zip(&targets) {
+                    for ((identity, _), &(_, span)) in identities.iter().zip(&targets) {
                         if let Some(same) = identity.same
                             && !duplicates.insert(same)
                         {
@@ -351,9 +404,11 @@ impl Analysis<'_> {
                             );
                         }
                     }
-                    let unknown = identities.iter().any(|identity| identity.class.is_none());
+                    let unknown = identities
+                        .iter()
+                        .any(|(identity, _)| identity.class.is_none());
                     let mut nodes = Vec::new();
-                    for (identity, &(_, span)) in identities.into_iter().zip(&targets) {
+                    for ((identity, key), &(_, span)) in identities.into_iter().zip(&targets) {
                         let Some(class) = identity.class else {
                             self.graph.edge(owner, self.opaque, span);
                             continue;
@@ -361,6 +416,9 @@ impl Analysis<'_> {
                         let node = self.class_node(class);
                         self.graph.edge(owner, node, span);
                         nodes.push(node);
+                        if let Some(key) = key {
+                            self.lock_types.insert(node, key);
+                        }
                     }
                     if let Some((outer, outer_unknown, span)) = held.last().cloned() {
                         if unknown || outer_unknown {
@@ -372,7 +430,7 @@ impl Analysis<'_> {
                         }
                         // Adjacent scopes imply all outer-to-inner constraints
                         // transitively. Never repeat the entire held prefix.
-                        for from in outer {
+                        for &from in &outer {
                             for &to in &nodes {
                                 self.graph.edge(from, to, lock.header_span());
                             }
@@ -399,15 +457,34 @@ impl Analysis<'_> {
     }
 }
 
+/// Keys come from declaration identity, so one type has one key in every unit
+/// and under every spelling. Soundness depends on this: split keys would hide a
+/// real cycle. Type parameters have no key because they stand for any type.
+fn type_key(
+    ty: &Type,
+    generics: &HashSet<&str>,
+    identity: &dyn Fn(&str) -> String,
+) -> Option<Type> {
+    let mut generic = false;
+    let key = ty.map_names(|name| {
+        generic |= generics.contains(name.as_str());
+        identity(name)
+    });
+    (!generic).then_some(key)
+}
+
 pub(crate) fn collect(
     program: &Program,
     types: &HashMap<ExprId, Type>,
+    identity: &dyn Fn(&str) -> String,
     calls: &CallGraph,
 ) -> Inputs {
     let mut graph = Graph::default();
     let opaque = graph.node(false);
     let mut analysis = Analysis {
         types,
+        identity,
+        lock_types: HashMap::new(),
         graph,
         functions: HashMap::new(),
         dispatch: HashMap::new(),
@@ -425,6 +502,7 @@ pub(crate) fn collect(
                 function.is_async,
                 &function.body,
                 function.params.as_slice(),
+                function.type_params.iter().map(String::as_str).collect(),
             )),
             Item::Class(class) => {
                 for field in &class.fields {
@@ -440,6 +518,7 @@ pub(crate) fn collect(
                         method.is_async,
                         &method.body,
                         method.params.as_slice(),
+                        class.type_params.iter().map(String::as_str).collect(),
                     ));
                 }
                 for constructor in &class.constructors {
@@ -448,13 +527,14 @@ pub(crate) fn collect(
                         false,
                         &constructor.body,
                         constructor.params.as_slice(),
+                        class.type_params.iter().map(String::as_str).collect(),
                     ));
                 }
             }
             Item::Interface(_) | Item::Enum(_) => {}
         }
     }
-    for &(id, asynchronous, _, _) in &bodies {
+    for &(id, asynchronous, ..) in &bodies {
         analysis
             .functions
             .entry(id)
@@ -508,15 +588,16 @@ pub(crate) fn collect(
             );
         }
     }
-    for (id, _, body, params) in bodies {
+    for (id, _, body, params, generics) in bodies {
         let owner = analysis.functions[&id].0;
-        analysis.body(owner, body, params);
+        analysis.body(owner, body, params, &generics);
     }
     Inputs {
         graph: analysis.graph,
         functions: analysis.functions,
         classes: analysis.classes,
         external: analysis.external,
+        lock_types: analysis.lock_types,
         diagnostics: analysis.diagnostics,
     }
 }
@@ -528,6 +609,7 @@ pub(crate) struct Inputs {
     functions: HashMap<FunctionId, (usize, bool)>,
     classes: HashMap<Class, usize>,
     external: HashMap<FunctionId, usize>,
+    lock_types: HashMap<usize, Type>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -541,9 +623,9 @@ pub(crate) fn analyze_all(
     let mut functions = HashMap::new();
     let mut parts = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut class_nodes = Vec::new();
     let mut equal_classes: HashMap<Class, usize> = HashMap::new();
     let mut class_aliases = Vec::new();
+    let mut typed_nodes: HashMap<Type, Vec<usize>> = HashMap::new();
     for (unit, input) in units {
         let offset = graph.edges.len();
         for (&id, &(node, asynchronous)) in &input.functions {
@@ -555,8 +637,10 @@ pub(crate) fn analyze_all(
                 class_aliases.push(vec![prior, node]);
             } else {
                 equal_classes.insert(class, node);
-                class_nodes.push(node);
             }
+        }
+        for (node, key) in input.lock_types {
+            typed_nodes.entry(key).or_default().push(offset + node);
         }
         diagnostics.extend(input.diagnostics);
         graph.locks.extend(input.graph.locks);
@@ -580,14 +664,19 @@ pub(crate) fn analyze_all(
             }
         }
     }
-    collapse_groups(&mut graph, &class_aliases);
+    let roots = collapse_groups(&mut graph, &class_aliases);
+    for (key, nodes) in typed_nodes {
+        if let Some(&class) = equal_classes.get(&Class::Type(key)) {
+            graph.stand_for(roots[class], nodes.into_iter().map(|node| roots[node]));
+        }
+    }
     diagnostics.extend(graph.diagnostics());
     diagnostics
 }
 
 // Merge source-identical classes shared by more than one unit snapshot.
 // A star per class plus component traversal is O(V + memberships).
-fn collapse_groups(graph: &mut Graph, groups: &[Vec<usize>]) {
+fn collapse_groups(graph: &mut Graph, groups: &[Vec<usize>]) -> Vec<usize> {
     let mut adjacent = vec![Vec::new(); graph.edges.len()];
     for group in groups {
         if let Some((&first, rest)) = group.split_first() {
@@ -617,15 +706,20 @@ fn collapse_groups(graph: &mut Graph, groups: &[Vec<usize>]) {
     for (node, edges) in old.into_iter().enumerate() {
         graph.edges[roots[node]].extend(edges.into_iter().map(|(to, span)| (roots[to], span)));
     }
+    roots
 }
 
 pub(super) fn analyze(
     program: &Program,
     types: &HashMap<ExprId, Type>,
+    identity: &dyn Fn(&str) -> String,
     calls: &CallGraph,
 ) -> Vec<Diagnostic> {
     analyze_all(
-        vec![(crate::module::UnitId::ENTRY, collect(program, types, calls))],
+        vec![(
+            crate::module::UnitId::ENTRY,
+            collect(program, types, identity, calls),
+        )],
         |_, _| None,
     )
 }
@@ -639,7 +733,7 @@ mod tests {
         let (program, errors) = crate::parser::Parser::new(tokens).parse();
         assert!(errors.is_empty(), "{errors:?}");
         let calls = super::super::TypeChecker::resolved_effect_graph(&program);
-        analyze(&program, &HashMap::new(), &calls)
+        analyze(&program, &HashMap::new(), &str::to_owned, &calls)
     }
 
     fn local(body: &str) -> Vec<Diagnostic> {
@@ -825,6 +919,25 @@ mod tests {
             .is_empty()
         );
     }
+    #[test]
+    fn lock_order_34_type_class_expansion_stays_linear() {
+        for n in [32, 128, 512, 2048] {
+            let mut graph = Graph::default();
+            let class = graph.node(true);
+            let locks: Vec<_> = (0..n).map(|_| graph.node(true)).collect();
+            for pair in locks.windows(2) {
+                graph.edge(pair[0], pair[1], Span::new(1, 2, 1, 1));
+            }
+            graph.edge(class, class, Span::new(3, 4, 1, 3));
+            graph.stand_for(class, locks.into_iter());
+            let edges = (n - 1) + 2 + 2 * n;
+            let errors = graph.diagnostics();
+            assert_eq!(errors.len(), 1);
+            assert!(graph.operations <= 3 * (n + 2) + 4 * edges);
+            println!("type class locks={n} operations={}", graph.operations);
+        }
+    }
+
     #[test]
     fn lock_order_24_helper_chain_cycle_witness() {
         let mut graph = Graph::default();

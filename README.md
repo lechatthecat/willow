@@ -235,19 +235,47 @@ source order. Duplicate handles are rejected, including two read acquisitions
 of the same RwLock. Each member may specify its own mode, for example
 `lock account as mut value, read rates as rate { ... }`.
 
-A contended group releases its acquired prefix before parking and retries after
-waking. Scope exits, panic and cancellation release acquired locks in reverse
-order; writes already made are committed, not rolled back. This provides mutual
+A contended group releases everything it holds before parking in the busy
+lock's FIFO queue, and normally keeps that lock when its turn comes while it
+tries the other members. It never holds a member while waiting, so a group
+cannot deadlock with nested locks taken in another order. Retries sleep rather
+than spin, but group acquisition is **not fair** and has no retry limit: if other
+tasks keep different members busy in turn, one group can wait indefinitely. Avoid
+holding a member of a heavily contended group for long.
+
+Scope exits, panic and cancellation release acquired locks in reverse order;
+writes already made are committed, not rolled back. This provides mutual
 exclusion, not transactional rollback.
 
-Ordinary nested locks require provably distinct identities and an acyclic
-acquisition order. E2605 reports the acquisition sites involved in a cycle;
-unknown aliases remain conservative. Awaiting an async helper inside a lock is
+Ordinary nested locks require an acyclic acquisition order. E2605 reports the
+acquisition sites involved in a cycle. Locks are told apart by where they were
+created; a lock of unknown origin, such as a parameter or the value held by
+another lock, is identified by its value type instead. This makes parent and
+child locks work without group syntax, because the child is only known after
+the parent is held:
+
+```willow
+async fn bump(parent: Mutex<Mutex<i64>>) {
+    lock parent as child {
+        lock child as mut value { value = value + 1; }
+    }
+}
+```
+
+Taking them in the opposite order elsewhere is reported as a cycle. Nesting two
+locks that cannot be told apart is rejected, because they may be the same lock:
+two parameters of one type, two locks from one factory function, collection
+elements, or a recursive type such as `Mutex<Node>` reached through a `Node`
+field. Use group syntax for the first three; hand-over-hand traversal of a
+recursive type is not supported. A lock of unknown origin may be any lock of its
+type, so its order applies to each known lock of that type, while known locks
+stay distinct from one another. Generic `Mutex<T>` values have no type order and
+stay conservative. Awaiting an async helper inside a lock is
 still E2604: compute awaited values before entering the critical section, or
 acquire the required locks together. Merely creating an async task does not
 execute its body on the caller's stack.
 
-See [ordered locks](example/ordered_locks.wi) for a runnable example.
+See [ordered locks](example/ordered_locks.wi) and [parent and child locks](example/parent_child_locks.wi) for runnable examples.
 
 ## The same semantic knowledge is available to AI agents
 
