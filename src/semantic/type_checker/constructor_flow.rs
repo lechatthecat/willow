@@ -18,11 +18,29 @@
 //! Both construction and evaluation use explicit worklists, including deeply
 //! nested expressions. States share storage until a field actually changes;
 //! identity and uniform-state joins avoid scanning unchanged field sets.
+//!
+//! The same must-state also decides every use of `self`,
+//! checked against the state *before* the using node:
+//!
+//! * `self.f` reads require `f` to be assigned; an inherited field read
+//!   requires the body's `super.init(...)` to have run;
+//! * any other use of `self` (a method call on it, `super.m(...)`, passing,
+//!   binding, matching or returning it) requires every own field and the
+//!   base initializer, so no code can observe a partially built object;
+//! * a lambda or deferred body is checked where it is created/registered:
+//!   it can only run later, when the state has at most gained fields;
+//! * `super.init(...)` records whether own fields are still unassigned, so a
+//!   subclass whose base constructor lets `self` escape (it may dispatch to
+//!   an override reading subclass fields) can require them first.
+//!
+//! Every node is visited once, so a body's uses cost O(log F) each.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::diagnostics::Span;
 use crate::parser::ast::*;
+use crate::parser::iter::{AstEvent, AstWalk};
 
 const EXIT: usize = 0;
 const DEAD: usize = 1;
@@ -51,31 +69,153 @@ pub(super) fn every_call_may_panic(_: &Expr) -> bool {
     true
 }
 
+/// What may be observed before it is initialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Missing {
+    /// The own instance field at this declaration index.
+    Field(usize),
+    /// The base part, before `super.init(...)`.
+    Base,
+}
+
+/// One use of `self` that may observe an uninitialized part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Violation<'a> {
+    /// `self.field` read while `missing` may be unassigned.
+    Read {
+        field: &'a str,
+        missing: Missing,
+        span: Span,
+    },
+    /// `self` itself used while `missing` may be unassigned.
+    Escape { missing: Missing, span: Span },
+}
+
+impl Violation<'_> {
+    pub(super) fn span(&self) -> Span {
+        match self {
+            Self::Read { span, .. } | Self::Escape { span, .. } => *span,
+        }
+    }
+}
+
+/// Result of one constructor body analysis.
+#[derive(Debug, Default)]
+pub(super) struct ConstructorFlow<'a> {
+    /// Own fields possibly unassigned on a normal exit.
+    pub(super) missing: Vec<bool>,
+    /// The body's `super.init(...)` may be skipped on a normal exit.
+    pub(super) base_missing: bool,
+    /// Uses of `self` that may observe uninitialized state, in source order.
+    pub(super) violations: Vec<Violation<'a>>,
+    /// `super.init(...)` and the first own field possibly unassigned there.
+    pub(super) before_base_init: Option<(Span, usize)>,
+}
+
+impl ConstructorFlow<'_> {
+    /// Base-independent cache summary: one entry per own field, then the
+    /// base-exit, violation and before-base-init flags.
+    pub(super) fn summary(&self) -> Vec<bool> {
+        let mut summary = self.missing.clone();
+        summary.extend([
+            self.base_missing,
+            !self.violations.is_empty(),
+            self.before_base_init.is_some(),
+        ]);
+        summary
+    }
+
+    /// Whether a cached [`Self::summary`] needs diagnostics; the last flag
+    /// matters only when the base initializer lets `self` escape.
+    pub(super) fn summary_needs_report(summary: &[bool], base_init_escapes: bool) -> bool {
+        match summary.split_last() {
+            Some((&before_base_init, rest)) => {
+                rest.contains(&true) || (before_base_init && base_init_escapes)
+            }
+            None => false,
+        }
+    }
+}
+
+/// Analyze one constructor body. `fields` are the class's own instance
+/// fields in declaration order.
+pub(super) fn analyze<'a>(
+    body: &'a Block,
+    fields: impl Iterator<Item = &'a str>,
+    types: &HashMap<ExprId, Type>,
+    call_may_panic: CallMayPanic<'_>,
+) -> ConstructorFlow<'a> {
+    let fields: HashMap<_, _> = fields.enumerate().map(|(i, name)| (name, i)).collect();
+    let own = fields.len();
+    // Only a top-level `super.init(...)` is valid (E0848); it is the base
+    // pseudo-field, numbered after the own fields.
+    let base = body
+        .stmts
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::SuperInit(_)))
+        .then_some(own);
+    let mut graph = Graph::new(&fields, base, types, call_may_panic);
+    let entry = graph.schedule(Input::Block(&body.stmts), EXIT, Flow::ROOT);
+    graph.build();
+    let solution = graph.solve(entry);
+    let mut missing = vec![false; graph.width];
+    if let Some(state) = &solution.exit {
+        state.write_missing(&mut missing);
+    }
+    let base_missing = base.is_some() && missing.pop() == Some(true);
+    let mut violations = solution.violations;
+    violations.sort_by_key(|v| (v.span().file_id.0, v.span().start, v.span().end));
+    ConstructorFlow {
+        missing,
+        base_missing,
+        violations,
+        before_base_init: solution.before_base_init,
+    }
+}
+
+/// Own fields possibly unassigned on a normal exit.
+#[cfg(test)]
 pub(super) fn uninitialized_fields<'a>(
-    body: &Block,
+    body: &'a Block,
     fields: impl Iterator<Item = &'a str>,
     types: &HashMap<ExprId, Type>,
     call_may_panic: CallMayPanic<'_>,
 ) -> Vec<bool> {
-    let fields: HashMap<_, _> = fields.enumerate().map(|(i, name)| (name, i)).collect();
-    if fields.is_empty() {
-        return Vec::new();
-    }
-    let mut graph = Graph::new(&fields, types, call_may_panic);
-    let entry = graph.schedule(Input::Block(&body.stmts), EXIT, Flow::ROOT);
-    graph.build();
-    let (missing, _) = graph.solve(entry);
-    let mut result = vec![false; fields.len()];
-    if let Some(missing) = missing {
-        missing.write_missing(&mut result);
-    }
-    result
+    analyze(body, fields, types, call_may_panic).missing
+}
+
+/// A use of `self` checked against the state before its node.
+#[derive(Clone, Copy)]
+enum Event<'a> {
+    /// `self.name`, own or inherited.
+    Read(&'a str, Span),
+    /// Any other use of `self` (or the `super` receiver).
+    Escape(Span),
+    /// `super.init(...)`: records own fields still unassigned.
+    BaseInit(Span),
 }
 
 #[derive(Default)]
-struct Node {
+struct Node<'a> {
     assignment: Option<usize>,
+    event: Option<Event<'a>>,
     edges: Vec<usize>,
+}
+
+struct Solution<'a> {
+    exit: Option<State>,
+    violations: Vec<Violation<'a>>,
+    before_base_init: Option<(Span, usize)>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    counts: Counts,
+}
+
+fn is_self(expr: &Expr) -> bool {
+    matches!(expr, Expr::Var(name, ..) if name == "self")
+}
+
+fn is_self_or_super(expr: &Expr) -> bool {
+    matches!(expr, Expr::Var(name, ..) if name == "self" || name == "super")
 }
 
 #[derive(Clone, Copy)]
@@ -92,27 +232,67 @@ struct Work<'a> {
     flow: Flow,
 }
 
-struct Graph<'a> {
-    nodes: Vec<Node>,
+struct Graph<'a, 'f> {
+    nodes: Vec<Node<'a>>,
     work: Vec<Work<'a>>,
-    fields: &'a HashMap<&'a str, usize>,
-    types: &'a HashMap<ExprId, Type>,
-    call_may_panic: CallMayPanic<'a>,
+    fields: &'f HashMap<&'a str, usize>,
+    /// The base pseudo-field, when the body calls `super.init(...)`.
+    base: Option<usize>,
+    /// Own fields plus the base pseudo-field.
+    width: usize,
+    types: &'f HashMap<ExprId, Type>,
+    call_may_panic: CallMayPanic<'f>,
 }
 
-impl<'a> Graph<'a> {
+impl<'a, 'f> Graph<'a, 'f> {
     fn new(
-        fields: &'a HashMap<&'a str, usize>,
-        types: &'a HashMap<ExprId, Type>,
-        call_may_panic: CallMayPanic<'a>,
+        fields: &'f HashMap<&'a str, usize>,
+        base: Option<usize>,
+        types: &'f HashMap<ExprId, Type>,
+        call_may_panic: CallMayPanic<'f>,
     ) -> Self {
         Self {
             nodes: vec![Node::default(), Node::default()],
             work: Vec::new(),
             fields,
+            base,
+            width: fields.len() + usize::from(base.is_some()),
             types,
             call_may_panic,
         }
+    }
+
+    fn event(&mut self, event: Event<'a>, next: usize) -> usize {
+        let node = self.nodes.len();
+        self.nodes.push(Node {
+            assignment: None,
+            event: Some(event),
+            edges: vec![next],
+        });
+        node
+    }
+
+    /// Uses of `self` in a body that runs later (a lambda or a deferred
+    /// body), all checked where it is created. One linear walk.
+    fn later_uses(&mut self, root: AstEvent<'a>, mut next: usize) -> usize {
+        let mut walk = AstWalk::new(root);
+        while let Some(event) = walk.next() {
+            match event {
+                AstEvent::Stmt(Stmt::FieldAssign(assign)) if is_self(&assign.object) => {
+                    walk.skip_children();
+                    walk.push(AstEvent::Expr(&assign.value));
+                }
+                AstEvent::Expr(Expr::FieldAccess(object, name, span, _)) if is_self(object) => {
+                    walk.skip_children();
+                    next = self.event(Event::Read(name, *span), next);
+                }
+                AstEvent::Expr(expr) if is_self_or_super(expr) => {
+                    next = self.event(Event::Escape(expr.span()), next);
+                }
+                _ => {}
+            }
+        }
+        next
     }
 
     fn schedule(&mut self, input: Input<'a>, next: usize, flow: Flow) -> usize {
@@ -146,6 +326,7 @@ impl<'a> Graph<'a> {
         let node = self.nodes.len();
         self.nodes.push(Node {
             assignment: None,
+            event: None,
             edges,
         });
         node
@@ -219,20 +400,25 @@ impl<'a> Graph<'a> {
                     Stmt::Let(s) => self.expr(&s.init, next, flow),
                     Stmt::Assign(s) => self.expr(&s.value, next, flow),
                     Stmt::FieldAssign(s) => {
+                        let own = is_self(&s.object);
                         let assignment = self.nodes.len();
                         self.nodes.push(Node {
-                            assignment: if matches!(&s.object, Expr::Var(name, ..) if name == "self") {
+                            assignment: if own {
                                 self.fields.get(s.field.as_str()).copied()
-                            } else { None },
+                            } else {
+                                None
+                            },
+                            event: None,
                             edges: vec![next],
                         });
-                        let store = if matches!(&s.object, Expr::Var(name, ..) if name == "self") {
-                            assignment
+                        if own {
+                            // A store into `self` is not a use of it.
+                            self.expr(&s.value, assignment, flow)
                         } else {
-                            self.exit(assignment, flow)
-                        };
-                        let value = self.expr(&s.value, store, flow);
-                        self.expr(&s.object, value, flow)
+                            let store = self.exit(assignment, flow);
+                            let value = self.expr(&s.value, store, flow);
+                            self.expr(&s.object, value, flow)
+                        }
                     }
                     Stmt::StaticFieldAssign(s) => self.expr(&s.value, next, flow),
                     Stmt::IndexAssign(s) => {
@@ -242,7 +428,13 @@ impl<'a> Graph<'a> {
                         self.expr(&s.array, index, flow)
                     }
                     Stmt::SuperInit(s) => {
-                        let call = self.exit(next, flow);
+                        let after = self.exit(next, flow);
+                        let call = self.nodes.len();
+                        self.nodes.push(Node {
+                            assignment: self.base,
+                            event: Some(Event::BaseInit(s.span)),
+                            edges: vec![after],
+                        });
                         self.args(&s.args, call, flow)
                     }
                     Stmt::Expr(s) => self.expr(&s.expr, next, flow),
@@ -304,7 +496,8 @@ impl<'a> Graph<'a> {
                     }
                     Stmt::Defer(s) => {
                         // Only direct-call receivers/arguments run at registration.
-                        // Deferred matches/blocks and the call itself run later.
+                        // Deferred matches/blocks and the call itself run later;
+                        // their uses of `self` are checked at registration.
                         match &s.body {
                             DeferBody::Expr(Expr::Call(c)) => self.args(&c.args, next, flow),
                             DeferBody::Expr(Expr::StaticCall(c)) => self.args(&c.args, next, flow),
@@ -313,7 +506,10 @@ impl<'a> Graph<'a> {
                                 self.expr(&c.object, args, flow)
                             }
                             DeferBody::Expr(Expr::Print(e, ..)) => self.expr(e, next, flow),
-                            _ => next,
+                            DeferBody::Expr(expr) => self.later_uses(AstEvent::Expr(expr), next),
+                            DeferBody::Block(block) => {
+                                self.later_uses(AstEvent::Block(block), next)
+                            }
                         }
                     }
                 },
@@ -328,8 +524,13 @@ impl<'a> Graph<'a> {
                         next
                     };
                     match expr {
-                        Expr::Lambda(_)
-                        | Expr::Integer(..)
+                        Expr::FieldAccess(object, name, span, _) if is_self(object) => {
+                            self.event(Event::Read(name, *span), next)
+                        }
+                        _ if is_self_or_super(expr) => self.event(Event::Escape(expr.span()), next),
+                        // A lambda's body runs later; it is checked here.
+                        Expr::Lambda(_) => self.later_uses(AstEvent::Expr(expr), next),
+                        Expr::Integer(..)
                         | Expr::Float(..)
                         | Expr::Bool(..)
                         | Expr::String(..)
@@ -442,8 +643,14 @@ impl<'a> Graph<'a> {
         }
     }
 
-    fn solve(&self, entry: usize) -> (Option<State>, Counts) {
-        let mut counts = Counts::default();
+    fn solve(&self, entry: usize) -> Solution<'a> {
+        let mut solution = Solution {
+            exit: None,
+            violations: Vec::new(),
+            before_base_init: None,
+            counts: Counts::default(),
+        };
+        let counts = &mut solution.counts;
         let mut reachable = vec![false; self.nodes.len()];
         let mut incoming = vec![0; self.nodes.len()];
         let mut pending = vec![entry];
@@ -464,15 +671,27 @@ impl<'a> Graph<'a> {
         let mut states: Vec<Option<State>> = vec![None; self.nodes.len()];
         states[entry] = Some(State::Missing);
         pending.push(entry);
+        // Every reachable node is visited: uses on paths that never return
+        // (panics, loop iterations) are still checked.
         while let Some(id) = pending.pop() {
             let Some(mut state) = states[id].take() else {
                 continue;
             };
+            if let Some(event) = self.nodes[id].event {
+                self.check(
+                    event,
+                    &state,
+                    &mut solution.violations,
+                    &mut solution.before_base_init,
+                    counts,
+                );
+            }
             if let Some(field) = self.nodes[id].assignment {
-                state.assign(field, self.fields.len(), &mut counts);
+                state.assign(field, self.width, counts);
             }
             if id == EXIT {
-                return (Some(state), counts);
+                solution.exit = Some(state);
+                continue;
             }
             let edges = &self.nodes[id].edges;
             for &to in edges {
@@ -484,7 +703,7 @@ impl<'a> Graph<'a> {
                 // next node runs, leaving linear successors uniquely owned.
                 let outgoing = state.clone();
                 match &mut states[to] {
-                    Some(existing) => existing.join(outgoing, &mut counts),
+                    Some(existing) => existing.join(outgoing, counts),
                     slot @ None => *slot = Some(outgoing),
                 }
                 incoming[to] -= 1;
@@ -493,7 +712,56 @@ impl<'a> Graph<'a> {
                 }
             }
         }
-        (None, counts)
+        solution
+    }
+
+    /// Decide one use against the must-state before it: O(log F).
+    fn check(
+        &self,
+        event: Event<'a>,
+        state: &State,
+        violations: &mut Vec<Violation<'a>>,
+        before_base_init: &mut Option<(Span, usize)>,
+        counts: &mut Counts,
+    ) {
+        let missing = |index: usize| {
+            if Some(index) == self.base {
+                Missing::Base
+            } else {
+                Missing::Field(index)
+            }
+        };
+        match event {
+            Event::Read(field, span) => {
+                // The checker already resolved the name to a field; one that
+                // is not declared here is inherited and needs the base.
+                let Some(index) = self.fields.get(field).copied().or(self.base) else {
+                    return;
+                };
+                if !state.initialized(index, self.width, counts) {
+                    violations.push(Violation::Read {
+                        field,
+                        missing: missing(index),
+                        span,
+                    });
+                }
+            }
+            Event::Escape(span) => {
+                if let Some(index) = state.first_missing(self.width, counts) {
+                    violations.push(Violation::Escape {
+                        missing: missing(index),
+                        span,
+                    });
+                }
+            }
+            Event::BaseInit(span) => {
+                if let Some(index) = state.first_missing(self.width, counts)
+                    && index < self.fields.len()
+                {
+                    before_base_init.get_or_insert((span, index));
+                }
+            }
+        }
     }
 }
 
@@ -503,7 +771,7 @@ struct Cleanup {
     may_panic: bool,
 }
 
-impl Graph<'_> {
+impl Graph<'_, '_> {
     /// Local hazard classification. Calls ask the oracle, which is backed by
     /// checker-owned effect facts. Child operands are evaluated separately, so
     /// literals and mere variable references do not introduce spurious
@@ -606,6 +874,31 @@ impl State {
         }
     }
 
+    /// The lowest index that may be unassigned. Only `Split` nodes with a
+    /// non-`Initialized` child exist, so this is one root-to-leaf walk.
+    fn first_missing(&self, width: usize, counts: &mut Counts) -> Option<usize> {
+        let mut state = self;
+        let (mut offset, mut width) = (0, width);
+        loop {
+            counts.assignment_nodes += 1;
+            match state {
+                Self::Initialized => return None,
+                Self::Missing => return (width > 0).then_some(offset),
+                Self::Split(children) => {
+                    let middle = width / 2;
+                    if matches!(children[0], Self::Initialized) {
+                        state = &children[1];
+                        offset += middle;
+                        width -= middle;
+                    } else {
+                        state = &children[0];
+                        width = middle;
+                    }
+                }
+            }
+        }
+    }
+
     fn write_assignment(&mut self, field: usize, width: usize, counts: &mut Counts) {
         counts.assignment_nodes += 1;
         if matches!(self, Self::Initialized) {
@@ -683,5 +976,7 @@ struct Counts {
     allocated_nodes: usize,
 }
 
+#[cfg(test)]
+mod self_use_tests;
 #[cfg(test)]
 mod tests;

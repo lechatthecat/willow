@@ -75,6 +75,9 @@ pub struct FieldWrites {
     by_name: HashSet<String>,
     /// Resolved field declarations, including writes through other receivers.
     declarations: HashSet<Span>,
+    /// Declarations of classes whose base constructor chain may let `self`
+    /// escape (an unresolved base counts as escaping).
+    escaping_base_init: HashSet<Span>,
 }
 
 impl FieldWrites {
@@ -82,6 +85,15 @@ impl FieldWrites {
     /// reassigned after construction.
     pub fn is_reassigned(&self, name: &str, span: Span) -> bool {
         self.by_name.contains(name) || self.declarations.contains(&span)
+    }
+
+    /// Whether `super.init(…)` of the class declared at `class_span` may let
+    /// `self` escape: some constructor on its base chain uses `self` other
+    /// than as a direct `self.f` read or write. Such a subclass must assign
+    /// its own fields before `super.init(…)`, because the escaped object
+    /// (or a virtual call on it) can read them.
+    pub fn base_init_escapes(&self, class_span: Span) -> bool {
+        self.escaping_base_init.contains(&class_span)
     }
 
     /// Resolve against declarations and import identities without hydrating bodies.
@@ -236,6 +248,17 @@ impl<'a> Resolver<'a> {
             }
         }
         let mut summary = FieldWrites::default();
+        // Memoized chain walks: every class is resolved once.
+        for id in 0..self.classes.len() {
+            let escapes = match self.bases[id] {
+                None => false,
+                Some(Err(())) => true,
+                Some(Ok(base)) => self.chain_escapes(base),
+            };
+            if escapes {
+                summary.escaping_base_init.insert(self.classes[id].span);
+            }
+        }
         let mut by_owner = vec![Vec::new(); self.classes.len()];
         for write in writes {
             if write.kind == WriteKind::InitEscapes {
@@ -249,15 +272,10 @@ impl<'a> Resolver<'a> {
                 summary.by_name.insert(write.field.clone());
                 continue;
             };
-            if write.kind == WriteKind::AfterBaseInit {
-                let escapes = match self.bases[id] {
-                    None => false,
-                    Some(Err(())) => true,
-                    Some(Ok(base)) => self.chain_escapes(base),
-                };
-                if !escapes {
-                    continue;
-                }
+            if write.kind == WriteKind::AfterBaseInit
+                && !summary.escaping_base_init.contains(&self.classes[id].span)
+            {
+                continue;
             }
             by_owner[id].push(write);
         }
@@ -468,6 +486,10 @@ fn is_self(expr: &Expr) -> bool {
     matches!(expr, Expr::Var(name, ..) if name == "self")
 }
 
+fn is_super(expr: &Expr) -> bool {
+    matches!(expr, Expr::Var(name, ..) if name == "super")
+}
+
 impl Collector<'_> {
     fn nominal(&self, ty: &Type) -> Option<String> {
         match ty {
@@ -580,7 +602,8 @@ impl EscapeScan {
                 AstEvent::Expr(Expr::FieldAccess(object, ..)) if is_self(object) => {
                     walk.skip_children()
                 }
-                AstEvent::Expr(expr) if is_self(expr) => scan.escaped = true,
+                // `super.m(…)` runs a base method on `self`.
+                AstEvent::Expr(expr) if is_self(expr) || is_super(expr) => scan.escaped = true,
                 _ => {}
             }
         }

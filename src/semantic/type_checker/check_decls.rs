@@ -362,17 +362,21 @@ impl TypeChecker {
         // `in_constructor` is set.
         self.check_block(&ctor.body);
 
-        // E0842: every successful exit must initialize every instance field.
+        // E0842: every successful exit must initialize every instance field;
+        // E0852/E0853: no use of `self` may observe an unassigned part.
         // This cached pass treats every call as panicking; a constructor it
         // flags is decided with the unit's effect facts (willow-ssl7.19).
+        // The cached summary does not depend on the base chain, which is
+        // consulted below through the build-wide write summary.
         let fields: Vec<_> = c.fields.iter().filter(|field| !field.is_static).collect();
         let compute = || {
-            super::constructor_flow::uninitialized_fields(
+            super::constructor_flow::analyze(
                 &ctor.body,
                 fields.iter().map(|field| field.name.as_str()),
                 &self.expr_types,
                 &super::constructor_flow::every_call_may_panic,
             )
+            .summary()
         };
         let missing = match &self.body_queries {
             Some(queries) => {
@@ -386,7 +390,10 @@ impl TypeChecker {
             }
             None => std::sync::Arc::new(compute()),
         };
-        if missing.contains(&true) {
+        if super::constructor_flow::ConstructorFlow::summary_needs_report(
+            &missing,
+            self.base_init_escapes(c),
+        ) {
             self.pending_constructor_flow.push(ctor.body.id);
         }
 
@@ -415,13 +422,14 @@ impl TypeChecker {
                 .filter(|ctor| pending.contains(&ctor.body.id))
             {
                 let fields: Vec<_> = c.fields.iter().filter(|field| !field.is_static).collect();
-                let missing = super::constructor_flow::uninitialized_fields(
+                let flow = super::constructor_flow::analyze(
                     &ctor.body,
                     fields.iter().map(|field| field.name.as_str()),
                     &self.expr_types,
                     call_may_panic,
                 );
-                for (field, missing) in fields.iter().zip(missing) {
+                self.constructor_use_diagnostics(c, ctor, &fields, &flow, &mut diagnostics);
+                for (field, missing) in fields.iter().zip(flow.missing) {
                     if missing {
                         diagnostics.push(
                             Diagnostic::new(
@@ -448,6 +456,120 @@ impl TypeChecker {
         diagnostics
     }
 
+    /// Whether `super.init(...)` of `c` may let `self` escape, so `c` must
+    /// assign its own fields first. Without a build-wide write summary every
+    /// base is assumed to escape.
+    fn base_init_escapes(&self, c: &ClassDecl) -> bool {
+        c.base_class.is_some()
+            && self
+                .field_writes
+                .as_ref()
+                .is_none_or(|writes| writes.base_init_escapes(c.span))
+    }
+
+    /// E0848/E0852/E0853 from one refined constructor analysis.
+    fn constructor_use_diagnostics(
+        &self,
+        c: &ClassDecl,
+        ctor: &ConstructorDecl,
+        fields: &[&FieldDecl],
+        flow: &super::constructor_flow::ConstructorFlow<'_>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        use super::constructor_flow::{Missing, Violation};
+        let part = |missing: Missing| match missing {
+            Missing::Field(index) => format!("field `{}` is assigned", fields[index].name),
+            Missing::Base => "`super.init(...)` runs".to_string(),
+        };
+        for violation in &flow.violations {
+            diagnostics.push(match violation {
+                Violation::Read {
+                    field,
+                    missing,
+                    span,
+                } => {
+                    let (message, help) = match missing {
+                        Missing::Field(_) => (
+                            format!(
+                                "field `{field}` is read before it is assigned in constructor `{}::init`",
+                                c.name
+                            ),
+                            format!(
+                                "assign `self.{field} = ...` on every path before this read"
+                            ),
+                        ),
+                        Missing::Base => (
+                            format!(
+                                "inherited field `{field}` is read before `super.init(...)` in constructor `{}::init`",
+                                c.name
+                            ),
+                            "read inherited fields after `super.init(...)`".to_string(),
+                        ),
+                    };
+                    Diagnostic::new(Severity::Error, ErrorCode::E0852, message)
+                        .with_label(Label::primary(*span, "may read an unassigned field"))
+                        .with_help(help)
+                }
+                Violation::Escape { missing, span } => Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0853,
+                    format!(
+                        "`self` is used before {} in constructor `{}::init`",
+                        part(*missing),
+                        c.name
+                    ),
+                )
+                .with_label(Label::primary(*span, "partially initialized `self` used here"))
+                .with_help(
+                    "until every field is assigned and `super.init(...)` has run, `init` may only assign and read `self.field`; \
+                     calling a method on `self`, `super.method(...)`, passing, binding or capturing `self` comes after",
+                ),
+            });
+        }
+        if flow.base_missing {
+            diagnostics.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0848,
+                    format!(
+                        "constructor `{}::init` can return without calling `super.init(...)`",
+                        c.name
+                    ),
+                )
+                .with_label(Label::primary(
+                    ctor.span,
+                    "base left uninitialized on a normal exit",
+                ))
+                .with_help("call `super.init(...)` before any `return`"),
+            );
+        }
+        if let Some((span, index)) = flow.before_base_init
+            && self.base_init_escapes(c)
+        {
+            let base = c
+                .base_class
+                .as_ref()
+                .map(type_path_name)
+                .unwrap_or_default();
+            diagnostics.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0853,
+                    format!(
+                        "field `{}` must be assigned before `super.init(...)` in constructor `{}::init`",
+                        fields[index].name, c.name
+                    ),
+                )
+                .with_label(Label::primary(span, "base constructor may use `self` here"))
+                .with_note(format!(
+                    "the constructor of base class `{base}` or one of its bases uses `self` (it may call a method that `{}` overrides), so it can observe `{}` fields",
+                    c.name, c.name
+                ))
+                .with_help("assign every own field before `super.init(...)`; those assignments must not use `self`"),
+            );
+        }
+    }
+
     pub(super) fn check_constructor_inheritance_rules(&mut self, c: &ClassDecl) {
         let Some(base_name) = c.base_class.as_ref().map(type_path_name) else {
             return;
@@ -471,7 +593,7 @@ impl TypeChecker {
                     )
                     .with_label(Label::primary(c.span, "missing subclass constructor"))
                     .with_label(Label::secondary(init.declaration_span, "base constructor declared here"))
-                    .with_help("declare `init(self, ...)` and call `super.init(...)` as its first statement; constructors are not inherited"),
+                    .with_help("declare `init(self, ...)` and call `super.init(...)` in it; constructors are not inherited"),
                 );
             }
             return;
@@ -493,15 +615,20 @@ impl TypeChecker {
             }
 
             if let Some(span) = super_init_spans.first().copied() {
-                if !matches!(ctor.body.stmts.first(), Some(Stmt::SuperInit(_))) {
+                if !ctor
+                    .body
+                    .stmts
+                    .iter()
+                    .any(|stmt| matches!(stmt, Stmt::SuperInit(init) if init.span == span))
+                {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0848,
-                            "`super.init(...)` must be the first statement in a constructor",
+                            "`super.init(...)` must be a top-level statement of the constructor",
                         )
-                        .with_label(Label::primary(span, "move this call to the top"))
-                        .with_help("call `super.init(...)` before assigning fields or branching"),
+                        .with_label(Label::primary(span, "move this call out of the nested block"))
+                        .with_help("call `super.init(...)` directly in the constructor body, not inside a branch, loop or block"),
                     );
                 }
             } else if let Some(base) = self.base_class_requiring_initialization(&base_name) {
@@ -522,7 +649,7 @@ impl TypeChecker {
                         base.declaration_span,
                         "base class requires initialization",
                     ))
-                    .with_help("add `super.init(...)` as the first statement in this constructor"),
+                    .with_help("add a top-level `super.init(...)` call to this constructor"),
                 );
             }
         }

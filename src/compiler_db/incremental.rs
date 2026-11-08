@@ -1332,8 +1332,9 @@ impl SyntaxQueries {
 }
 
 // A compiler-version-bound derived wire; bump when its payload contract changes.
-// Semantic static targets are now total for checked static expressions.
-const DERIVED_WIRE_VERSION: u8 = 2;
+// Semantic static targets are now total for checked static expressions;
+// constructor summaries append base/self-use flags to the field bits.
+const DERIVED_WIRE_VERSION: u8 = 3;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct DerivedValue {

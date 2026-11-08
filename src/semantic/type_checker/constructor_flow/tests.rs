@@ -244,10 +244,14 @@ fn measure_with(
         .enumerate()
         .map(|(i, s)| (s.as_str(), i))
         .collect();
-    let mut graph = Graph::new(&fields, types, call_may_panic);
+    let mut graph = Graph::new(&fields, None, types, call_may_panic);
     let entry = graph.schedule(Input::Block(&body.stmts), EXIT, Flow::ROOT);
     graph.build();
-    let (state, counts) = graph.solve(entry);
+    let Solution {
+        exit: state,
+        counts,
+        ..
+    } = graph.solve(entry);
     let mut missing = vec![false; names.len()];
     if let Some(state) = state {
         state.write_missing(&mut missing);
@@ -644,6 +648,89 @@ fn constructor_flow_effect_query_counts() {
                 queries.get(),
                 c.nodes,
                 c.edges
+            );
+        }
+    }
+}
+
+/// Self-use checks add O(log F) walk steps per use, including uses that all
+/// fail (one violation each) and uses inside lambdas and defer bodies.
+#[test]
+fn constructor_self_use_scaling_counts() {
+    println!("shape,size,nodes,assignment_nodes,violations");
+    for size in [64_usize, 256, 1024] {
+        let names: Vec<_> = (0..size).map(|i| format!("field_{i}")).collect();
+        let declarations = names
+            .iter()
+            .map(|s| format!("{s}: i64;"))
+            .collect::<String>();
+        let assign_all = names
+            .iter()
+            .map(|s| format!("self.{s} = 1;"))
+            .collect::<String>();
+        for shape in ["reads", "escapes", "failing", "lambdas", "branchy"] {
+            let mut body = String::new();
+            let mut expected_violations = 0;
+            match shape {
+                "reads" => {
+                    for name in &names {
+                        body.push_str(&format!("self.{name} = 1; let a = self.{name};"));
+                    }
+                }
+                "escapes" => {
+                    body.push_str(&assign_all);
+                    for _ in 0..size {
+                        body.push_str("self.m();");
+                    }
+                }
+                "failing" => {
+                    for name in &names {
+                        body.push_str(&format!("self.m(); let b = self.{name};"));
+                    }
+                    body.push_str(&assign_all);
+                    expected_violations = 2 * size;
+                }
+                "lambdas" => {
+                    body.push_str(&assign_all);
+                    for name in &names {
+                        body.push_str(&format!("let f = || {{ self.m(); let c = self.{name}; }};"));
+                    }
+                }
+                "branchy" => {
+                    for name in &names {
+                        body.push_str(&format!(
+                            "if flag {{ self.{name} = 1; }} else {{ self.{name} = 2; }} self.m();"
+                        ));
+                    }
+                    // Every use but the last sees a missing later field.
+                    expected_violations = size - 1;
+                }
+                _ => unreachable!(),
+            }
+            let source = format!(
+                "class C {{ {declarations} init(self, flag: bool) {{ {body} }} fn m(self) {{}} }}"
+            );
+            let body = parse_body(&source);
+            let fields = names
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.as_str(), i))
+                .collect();
+            let types = HashMap::new();
+            let mut graph = Graph::new(&fields, None, &types, &every_call_may_panic);
+            let entry = graph.schedule(Input::Block(&body.stmts), EXIT, Flow::ROOT);
+            graph.build();
+            let solution = graph.solve(entry);
+            let c = solution.counts;
+            assert_eq!(solution.violations.len(), expected_violations, "{shape}");
+            let log = size.ilog2() as usize + 1;
+            assert!(c.nodes <= 40 * size + 10, "{shape}: {c:?}");
+            assert!(c.assignment_nodes <= 8 * size * log, "{shape}: {c:?}");
+            println!(
+                "{shape},{size},{},{},{}",
+                c.nodes,
+                c.assignment_nodes,
+                solution.violations.len()
             );
         }
     }

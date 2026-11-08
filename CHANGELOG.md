@@ -4,6 +4,20 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
 
 ## Unreleased
 
+### Breaking
+
+- **Constructors can no longer observe unassigned fields.** Reading
+  `self.f` before `f` is assigned on every path is error E0852. Using `self`
+  in any other way (a method call, `super.method(...)`, passing, binding or
+  capturing it) before every field is assigned and `super.init(...)` has run
+  is error E0853. Both used to compile and could crash at runtime or read a
+  null String/Array.
+- **`super.init(...)` may follow own field assignments.** It must still be a
+  top-level statement and run on every path that returns (E0848). When the
+  base constructor lets `self` escape (for example through an overridable
+  method), the subclass must assign its own fields before `super.init(...)`
+  (E0853).
+
 ## 0.1.10 - 2026-11-05
 
 The 0.1.9 release build failed, so 0.1.9 was never published. This release

@@ -21,6 +21,20 @@ Interactive or intentionally non-terminating examples should contain:
 
 Manual examples remain runnable, but the automated example catalog does not execute them.
 
+## Constructors and partially built objects
+
+Inside `init`, a field may be read only after it is assigned on every path
+(E0852), and `self` may be used for anything else (calling a method on it,
+`super.method(...)`, passing, binding, matching or capturing it) only after
+every field is assigned and `super.init(...)` has run (E0853). A lambda or
+`defer` body is checked where it is created, since it can only run later.
+`super.init(...)` must be a top-level statement of the constructor and run on
+every path that returns (E0848). It does not have to come first: own fields
+may be assigned before it. They must be, when the base constructor (or one of
+its bases) lets `self` escape, for example by calling an overridable method,
+because that method may read the subclass fields. See
+`constructor_self_use.wi`.
+
 ## Synchronous helpers in tasks
 
 A task can call an ordinary synchronous helper, including loops and recursion,

@@ -355,6 +355,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/constructor_lambdas.wi", "8\n402\n"),
         (
+            "example/constructor_self_use.wi",
+            "16\nshape:square(4)\n#box\n",
+        ),
+        (
             "example/map_float_keys.wi",
             "true\n1\n20\n20\n{0: 20}\ntrue\nfalse\nNaN cannot be used as a Map key\n1\n",
         ),
@@ -669,6 +673,8 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/nil_nullable.wi", "0\n10\n20\ntrue\n10\n"),
         ("example/nil_safe_chain.wi", "60\n3\n30\n-1\n120\n"),
         ("example/object_argument.wi", "42\n42\n99\n41\n"),
+        ("example/ordered_locks.wi", "105\n15\n"),
+        ("example/parent_child_locks.wi", "3\n6\n100\n101\n7\n3\n"),
         (
             "example/object_field_store.wi",
             "11\nfield-store\n36\n5\n9\n3\n200\nnone\n200\nsubclass\n42\n1999000\n",

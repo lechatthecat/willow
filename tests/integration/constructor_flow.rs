@@ -314,3 +314,106 @@ fn main() {{ println(new C().x); }}
         assert!(stderr.contains("E0842"), "{stderr}");
     }
 }
+
+/// Field reads and `self` uses before full initialization are compile errors,
+/// not null dereferences: the three crash shapes plus String/Array fields.
+#[test]
+fn constructor_self_use_crash_shapes_are_rejected() {
+    const INNER: &str = "class Inner { pub v: i64; pub init(self, v: i64) { self.v = v; } pub fn get(self) -> i64 { return self.v; } }";
+    let cases = [
+        (
+            format!(
+                "{INNER} class C {{ i: Inner; init(self) {{ println(self.i.get()); self.i = new Inner(1); }} }} fn main() {{ let c = new C(); }}"
+            ),
+            ["error[E0852]", "field `i` is read before it is assigned"],
+        ),
+        (
+            format!(
+                "{INNER} class C {{ i: Inner; init(self) {{ self.peek(); self.i = new Inner(1); }} fn peek(self) {{ println(self.i.get()); }} }} fn main() {{ let c = new C(); }}"
+            ),
+            ["error[E0853]", "`self` is used before field `i` is assigned"],
+        ),
+        (
+            format!(
+                "{INNER} open class Base {{ pub tag: i64; pub init(self) {{ self.tag = self.describe(); }} pub open fn describe(self) -> i64 {{ return 0; }} }} \
+                 class Sub extends Base {{ inner: Inner; pub init(self) {{ super.init(); self.inner = new Inner(7); }} \
+                 pub override fn describe(self) -> i64 {{ return self.inner.get(); }} }} fn main() {{ println(new Sub().tag); }}"
+            ),
+            ["error[E0853]", "field `inner` must be assigned before `super.init(...)`"],
+        ),
+        (
+            "class S { s: String; init(self) { println(self.s.len()); self.s = \"x\"; } } fn main() { let s = new S(); }".to_string(),
+            ["error[E0852]", "field `s` is read before"],
+        ),
+        (
+            "import std::collections::Array; class A { a: Array<i64>; init(self) { println(self.a[0]); self.a = [1]; } } fn main() { let a = new A(); }".to_string(),
+            ["error[E0852]", "field `a` is read before"],
+        ),
+    ];
+    for (source, expected) in cases {
+        assert_compile_error_contains(&source, &expected);
+    }
+}
+
+#[test]
+fn constructor_self_use_example_runs() {
+    let expected = "16\nshape:square(4)\n#box\n";
+    let (out, ok) = compile_file_and_run("example/constructor_self_use.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, expected);
+    let source = include_str!("../../example/constructor_self_use.wi");
+    let (out, ok) = compile_and_run_gc_stress(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, expected);
+    let (out, ok) = compile_and_run_release(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, expected);
+    // The example's subclass with its fields assigned after `super.init`.
+    let reordered = source.replace(
+        "        self.side = side;\n        self.name = \"square\";\n        super.init();",
+        "        super.init();\n        self.side = side;\n        self.name = \"square\";",
+    );
+    assert_ne!(reordered, source);
+    assert_compile_error_contains(
+        &reordered,
+        &[
+            "error[E0853]",
+            "field `side` must be assigned before `super.init(...)`",
+            "base class `Shape`",
+        ],
+    );
+}
+
+/// The escaping-base fact crosses modules: the imported base's constructor
+/// is summarized from its own file.
+#[test]
+fn constructor_self_use_imported_escaping_base_requires_fields_first() {
+    let base = "module shapes; pub open class Base { pub tag: i64; pub init(self) { self.tag = 0; self.tag = self.describe(); } pub open fn describe(self) -> i64 { return 0; } }";
+    let sub = |body: &str| {
+        format!(
+            "import shapes; class Sub extends shapes::Base {{ n: i64; pub init(self) {{ {body} }} \
+             pub override fn describe(self) -> i64 {{ return self.n; }} }} fn main() {{ println(new Sub().tag); }}"
+        )
+    };
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            ("shapes.wi", base),
+            ("main.wi", &sub("super.init(); self.n = 5;")),
+        ],
+        "main.wi",
+    );
+    assert!(stderr.contains("E0853"), "{stderr}");
+    assert!(
+        stderr.contains("field `n` must be assigned before"),
+        "{stderr}"
+    );
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            ("shapes.wi", base),
+            ("main.wi", &sub("self.n = 5; super.init();")),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n");
+}

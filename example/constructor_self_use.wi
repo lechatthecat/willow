@@ -1,0 +1,53 @@
+// A constructor may use `self` only once the object is fully built.
+//
+// `Shape`'s constructor calls the overridable `describe()`, so `self` escapes
+// from it. A subclass whose override reads its own fields must therefore
+// assign them before `super.init(...)`; assigning them afterwards (or calling
+// a method on `self` before every field is set) is a compile-time error
+// (E0852/E0853), never a read of an unassigned field.
+open class Shape {
+    pub label: String;
+    pub init(self) {
+        self.label = "";
+        self.label = "shape:" + self.describe();
+    }
+    pub open fn describe(self) -> String { return "?"; }
+}
+
+class Square extends Shape {
+    side: i64;
+    name: String;
+    pub init(self, side: i64) {
+        // Own fields first: the base constructor dispatches to `describe`.
+        self.side = side;
+        self.name = "square";
+        super.init();
+        // Fully initialized now: any use of `self` is allowed.
+        println(self.area());
+    }
+    pub override fn describe(self) -> String {
+        return self.name + "(" + self.side.toString() + ")";
+    }
+    fn area(self) -> i64 { return self.side * self.side; }
+}
+
+// A base that never lets `self` escape keeps the familiar order.
+open class Named {
+    pub name: String;
+    pub init(self, name: String) { self.name = name; }
+}
+
+class Tagged extends Named {
+    tag: String;
+    pub init(self, name: String) {
+        super.init(name);
+        self.tag = "#" + self.name;
+    }
+    pub fn show(self) -> String { return self.tag; }
+}
+
+fn main() {
+    let square = new Square(4);
+    println(square.label);
+    println(new Tagged("box").show());
+}

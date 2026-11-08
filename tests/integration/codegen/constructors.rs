@@ -546,21 +546,40 @@ fn main() {}
 }
 
 #[test]
-fn test_new_ctor_29_super_init_must_be_first_statement() {
+fn test_new_ctor_29_super_init_must_be_top_level_statement() {
     assert_compile_error_contains(
+        r#"
+open class Base { pub id: i64; }
+class Child extends Base {
+    pub name: String;
+    pub init(self, id: i64, name: String, flag: bool) {
+        self.name = name;
+        if flag { super.init(id); }
+    }
+}
+fn main() {}
+"#,
+        &["error[E0848]", "must be a top-level statement"],
+    );
+}
+
+#[test]
+fn test_new_ctor_29_own_fields_may_precede_super_init() {
+    let (out, ok) = compile_and_run(
         r#"
 open class Base { pub id: i64; }
 class Child extends Base {
     pub name: String;
     pub init(self, id: i64, name: String) {
         self.name = name;
-        super.init(id);
+        super.init(id + self.name.len());
     }
 }
-fn main() {}
+fn main() { let c = new Child(1, "ab"); println(c.id); println(c.name); }
 "#,
-        &["error[E0848]", "must be the first statement"],
     );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\nab\n");
 }
 
 #[test]
