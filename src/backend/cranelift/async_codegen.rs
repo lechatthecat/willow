@@ -5,6 +5,7 @@
 //! state.
 
 use crate::ir::lowered::{LirDeferId, LirFunction, LirInst, LirLocalId};
+use crate::qualified_name::QualifiedName;
 use anyhow::Result;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
@@ -793,7 +794,11 @@ impl UnitCodegenContext<'_> {
             .filter(|local| local.parameter)
             .map(|local| lir_offsets[&local.id])
             .collect();
-        self.record_async_frame_size_warning(&format!("{class_name}::{}", m.name), m.span, &layout);
+        self.record_async_frame_size_warning(
+            &QualifiedName::join(class_name, &m.name),
+            m.span,
+            &layout,
+        );
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
         let result_offset = async_frame_slot_offset(
@@ -971,10 +976,11 @@ impl UnitCodegenContext<'_> {
             effect_contracts: Vec::new(),
             return_type_span: None,
             type_params: Vec::new(),
-            name: format!(
-                "{}::{}",
-                class_name.strip_prefix("$local::").unwrap_or(class_name),
-                m.name
+            name: QualifiedName::join(
+                QualifiedName::new(class_name)
+                    .strip_qualifier(crate::semantic::ids::LOCAL_NAMESPACE)
+                    .unwrap_or(class_name),
+                &m.name,
             ),
             public: m.public,
             is_async: true,

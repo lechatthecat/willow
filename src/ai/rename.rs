@@ -1,6 +1,7 @@
 //! Live semantic rename relationships and indexed source patches.
 use super::*;
 use crate::lexer::{Lexer, token::TokenKind};
+use crate::qualified_name::QualifiedName;
 use crate::semantic::{analysis_symbols::Declaration, symbols::SymbolTable};
 use edit::{EditWork, Patch, Rejection, RejectionLocation};
 use std::collections::HashSet;
@@ -387,7 +388,7 @@ impl<'a> Index<'a> {
             result.symbols.insert(&symbol.id, symbol);
             for &(start, end) in result.scopes.get(&symbol.id).into_iter().flatten() {
                 by_start[start].push((
-                    symbol.name.rsplit("::").next().unwrap(),
+                    QualifiedName::new(&symbol.name).last_segment(),
                     end,
                     symbol.id.as_str(),
                 ));
@@ -502,7 +503,7 @@ impl<'a> Index<'a> {
         work: &mut EditWork,
     ) -> Result<()> {
         let selected = self.symbols[id];
-        let old = selected.name.rsplit("::").next().unwrap();
+        let old = QualifiedName::new(&selected.name).last_segment();
         validate_name(name)?;
         ensure!(name != old, "rename has no effect");
         ensure!(
@@ -613,12 +614,8 @@ impl<'a> Index<'a> {
                 .to_str()
                 .context("non UTF-8 source path")?;
             let owner = |symbol: &'a symbols::Symbol| {
-                symbol
-                    .source_name
-                    .as_deref()
-                    .unwrap_or(&symbol.name)
-                    .rsplit_once("::")
-                    .map(|(owner, _)| owner)
+                QualifiedName::new(symbol.source_name.as_deref().unwrap_or(&symbol.name))
+                    .qualifier()
             };
             let message = if selected.kind == "variant" {
                 format!(

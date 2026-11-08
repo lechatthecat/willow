@@ -1,5 +1,6 @@
 //! Serialization of compiler-owned declaration/reference evidence.
 use super::*;
+use crate::qualified_name::QualifiedName;
 use crate::semantic::analysis_symbols::{Declaration, Facts};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -164,14 +165,7 @@ pub(super) fn details_of<'a>(
                         extends: c
                             .base_class
                             .iter()
-                            .map(|base| {
-                                Type::Named(match base {
-                                    crate::parser::ast::TypePath::Local(name) => name.clone(),
-                                    crate::parser::ast::TypePath::Qualified(parts) => {
-                                        parts.join("::")
-                                    }
-                                })
-                            })
+                            .map(|base| Type::Named(base.spelling()))
                             .collect(),
                         implements: c
                             .implements
@@ -338,12 +332,15 @@ pub(super) fn owners_of<'a>(items: impl Iterator<Item = &'a Item>) -> Vec<(Span,
                 owners.push((c.span, c.name.clone()));
                 for m in &c.methods {
                     if c.span.contains(m.span) {
-                        owners.push((m.span, format!("{}::{}", c.name, m.name)));
+                        owners.push((m.span, QualifiedName::join(&c.name, &m.name)));
                     }
                 }
                 for (ordinal, init) in c.constructors.iter().enumerate() {
                     if c.span.contains(init.span) {
-                        owners.push((init.span, format!("{}::init#{ordinal}", c.name)));
+                        owners.push((
+                            init.span,
+                            QualifiedName::join(&c.name, format_args!("init#{ordinal}")),
+                        ));
                     }
                 }
             }
@@ -351,7 +348,7 @@ pub(super) fn owners_of<'a>(items: impl Iterator<Item = &'a Item>) -> Vec<(Span,
             Item::Interface(i) => {
                 owners.push((i.span, i.name.clone()));
                 for m in &i.methods {
-                    owners.push((m.span, format!("{}::{}", i.name, m.name)));
+                    owners.push((m.span, QualifiedName::join(&i.name, &m.name)));
                 }
             }
         }
@@ -481,7 +478,7 @@ pub(super) fn declarations_of<'a>(
             import
                 .alias
                 .as_deref()
-                .unwrap_or_else(|| import.path.rsplit("::").next().unwrap()),
+                .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment()),
             "import",
             import.span,
             None,
@@ -599,7 +596,7 @@ pub(super) fn select(
     paths: &HashMap<UnitId, String>,
 ) -> Option<Location> {
     let unit = crate::module::ModuleId(span.file_id.0);
-    let name = name.rsplit("::").next()?;
+    let name = QualifiedName::new(name).last_segment();
     let occurrences = names.get(&unit)?.get(name)?;
     let start = occurrences.partition_point(|&(start, _)| start < span.start);
     let end = occurrences.partition_point(|&(_, end)| end <= span.end);
@@ -646,7 +643,7 @@ pub(super) fn finish(
             d.span.start,
             d.span.end,
             d.kind.clone(),
-            d.name.rsplit("::").next().unwrap_or(&d.name).to_owned(),
+            QualifiedName::new(&d.name).last_segment().to_owned(),
         )
     };
     let declarations: HashMap<_, _> = captures
@@ -682,13 +679,13 @@ pub(super) fn finish(
         // into borrowed str. Skip the unused path and own the decoded name.
         let (_, owner_name): (serde::de::IgnoredAny, String) =
             serde_json::from_str(&owner).expect("compiler owner identity");
-        let name = d.name.rsplit("::").next().unwrap_or(&d.name);
+        let name = QualifiedName::new(&d.name).last_segment();
         let source_name = if matches!(
             d.kind.as_str(),
             "field" | "static-field" | "variant" | "parameter" | "binding" | "type-parameter"
         ) && owner_name != "module"
         {
-            format!("{owner_name}::{name}")
+            QualifiedName::join(&owner_name, name)
         } else if matches!(d.kind.as_str(), "method" | "constructor") && owner_name != "module" {
             owner_name
         } else {
@@ -698,7 +695,7 @@ pub(super) fn finish(
         let key = (
             owner,
             d.kind.clone(),
-            d.name.rsplit("::").next().unwrap_or(&d.name).to_owned(),
+            QualifiedName::new(&d.name).last_segment().to_owned(),
         );
         let ordinal = ordinals.entry(key.clone()).or_default();
         identities.insert(

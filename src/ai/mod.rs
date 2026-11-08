@@ -31,6 +31,7 @@ pub use semantic::{QueryRequest, QuerySession, SemanticFacts};
 pub(crate) use storage::check_size;
 pub use storage::{Difference, FunctionChange, compact_output_paths, expand_output_paths};
 
+use crate::qualified_name::QualifiedName;
 use crate::{
     diagnostics::Span,
     module::UnitId,
@@ -405,7 +406,7 @@ pub(crate) fn capture(
                         let operation = match e {
                             Expr::Call(c) => Some(c.callee.clone()),
                             Expr::MethodCall(c) => Some(c.method.clone()),
-                            Expr::StaticCall(c) => Some(format!("{}::{}", c.class, c.method)),
+                            Expr::StaticCall(c) => Some(QualifiedName::join(&c.class, &c.method)),
                             _ => None,
                         };
                         let builtin = target.as_ref().is_some_and(|target| {
@@ -901,7 +902,7 @@ fn snapshot_with_boundary(
                 let local = import
                     .alias
                     .as_deref()
-                    .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+                    .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
                 map.insert(local.to_owned(), (target, None));
                 map.insert(import.path.clone(), (target, None));
             }
@@ -915,7 +916,7 @@ fn snapshot_with_boundary(
             let local = import
                 .alias
                 .as_deref()
-                .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+                .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
             if let Some(target) = frontend.db.dependencies().unit_for_path(unit, &import.path) {
                 map.insert(local.to_string(), (target, None));
                 map.insert(import.path.clone(), (target, None));
@@ -936,7 +937,7 @@ fn snapshot_with_boundary(
                         false,
                     );
                 }
-            } else if let Some((module, item)) = import.path.rsplit_once("::")
+            } else if let Some((module, item)) = QualifiedName::new(&import.path).split_last()
                 && let Some(target) = frontend.db.dependencies().unit_for_path(unit, module)
             {
                 map.insert(local.to_string(), (target, Some(item.to_string())));
@@ -976,7 +977,7 @@ fn snapshot_with_boundary(
         if let (Some(ns), Some(owner)) = (id.namespace(), id.owner()) {
             // A qualified module function is represented as a static call:
             // the module's final path segment occupies the owner slot.
-            let module = format!("{ns}::{owner}");
+            let module = QualifiedName::join(&ns, &owner);
             if let Some(target) = namespaces.get(&module).copied().or_else(|| {
                 aliases[&unit]
                     .get(&module)
@@ -1263,7 +1264,8 @@ fn snapshot_with_boundary(
     // A dependency checker cannot see subclasses declared by its consumers.
     // Complete virtual dispatch from all checked declarations. Group identical
     // receiver/method queries and share each union, avoiding Q * D new edges.
-    let class_key = |unit: UnitId, owner: &str| format!("$unit{}::{owner}", unit.0);
+    let class_key =
+        |unit: UnitId, owner: &str| QualifiedName::join(format_args!("$unit{}", unit.0), owner);
     let mut classes = Vec::new();
     for (&unit, program) in &programs {
         if retained.is_some() {
@@ -1273,10 +1275,7 @@ fn snapshot_with_boundary(
             if let Item::Class(class) = item {
                 let key = class_key(unit, &class.name);
                 let base = class.base_class.as_ref().map(|base| {
-                    let spelling = match base {
-                        TypePath::Local(name) => name.clone(),
-                        TypePath::Qualified(parts) => parts.join("::"),
-                    };
+                    let spelling = base.spelling();
                     let (unit, id) = resolve(
                         unit,
                         FunctionId::method(TypeId::from_source_name(&spelling), "$dispatch"),
@@ -1404,8 +1403,10 @@ fn snapshot_with_boundary(
             for caller in callers {
                 let node = nodes.get_mut(&caller).unwrap();
                 node.unknown = true;
-                node.unresolved
-                    .push(format!("dispatch {}::{}", key.0, key.1));
+                node.unresolved.push(QualifiedName::join(
+                    format_args!("dispatch {}", key.0),
+                    &key.1,
+                ));
                 node.runtime_effects |= RuntimeEffects::ALL.bits();
             }
         }

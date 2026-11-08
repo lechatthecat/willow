@@ -5,6 +5,7 @@
 //! resolve through the owning session and return shared, owned strings.
 
 use crate::module::ModuleId;
+use crate::qualified_name::QualifiedName;
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -39,19 +40,26 @@ pub fn package_namespace(package: &crate::package::PackageIdentity) -> String {
 /// Compiler-only module prefixes cannot be spelled by a source import alias.
 /// Recognize both standalone and package origins when restoring source evidence.
 pub(crate) fn has_internal_module_prefix(name: &str) -> bool {
-    name.starts_with("$local::") || name.starts_with("$pkg")
+    QualifiedName::new(name).has_qualifier(LOCAL_NAMESPACE) || name.starts_with("$pkg")
 }
 
 /// Namespace that spells a receiving unit's unqualified type inside the scope
 /// of another unit whose interface defaults it copied (willow-nvi6). The
 /// entry file's classes keep bare identities (`A`), which the declaring
-/// unit's own `A` would shadow; source cannot spell this prefix.
+/// unit's own `A` would shadow; source cannot spell this namespace.
+pub(crate) const FOREIGN_RECEIVER_NAMESPACE: &str = "$receiver";
+
+/// [`FOREIGN_RECEIVER_NAMESPACE`] followed by the separator, for scanners that
+/// rewrite it inside rendered text.
 pub(crate) const FOREIGN_RECEIVER_PREFIX: &str = "$receiver::";
 
+/// Namespace of a standalone (package-less) module identity: `$local::a::b`.
+pub(crate) const LOCAL_NAMESPACE: &str = "$local";
+
 /// `name` as a foreign default's scope spells it: see
-/// [`FOREIGN_RECEIVER_PREFIX`].
+/// [`FOREIGN_RECEIVER_NAMESPACE`].
 pub(crate) fn foreign_receiver_name(name: &str) -> String {
-    format!("{FOREIGN_RECEIVER_PREFIX}{name}")
+    QualifiedName::join(FOREIGN_RECEIVER_NAMESPACE, name)
 }
 
 /// Session-owned module identity. Artifacts store package/path, never this handle.
@@ -60,7 +68,7 @@ pub struct SymbolModule(Handle);
 
 impl SymbolModule {
     pub fn new(package: crate::package::PackageIdentity, path: crate::module::ModulePath) -> Self {
-        let namespace = format!("{}::{}", package_namespace(&package), path.0);
+        let namespace = QualifiedName::join(package_namespace(&package), &path.0);
         let name = SymbolModuleName {
             package,
             path,
@@ -453,7 +461,7 @@ impl TypeId {
     /// The entry file's identity a [`FOREIGN_RECEIVER_PREFIX`] spelling
     /// names, in whichever scope it is resolved (willow-nvi6).
     pub(crate) fn foreign_receiver_target(&self) -> Option<Self> {
-        let prefix = FOREIGN_RECEIVER_PREFIX.trim_end_matches("::");
+        let prefix = FOREIGN_RECEIVER_NAMESPACE;
         let name = self.0.with_table(|table| {
             let spelling = &table.types[self.0.index as usize];
             (spelling.module.is_none() && spelling.namespace.as_deref() == Some(prefix))
@@ -463,7 +471,7 @@ impl TypeId {
         Some(Self::local(&*name))
     }
     pub fn from_source_name(name: &str) -> Self {
-        match name.rsplit_once("::") {
+        match QualifiedName::new(&name).split_last() {
             Some((namespace, name)) => Self::intern(Some(namespace), name),
             None => Self::local(name),
         }
@@ -605,7 +613,7 @@ impl FunctionId {
         Self::intern(None, None, name.as_ref())
     }
     pub fn free_from_source_name(name: &str) -> Self {
-        match name.rsplit_once("::") {
+        match QualifiedName::new(&name).split_last() {
             Some((namespace, name)) => Self::intern(Some(namespace), None, name),
             None => Self::free(name),
         }

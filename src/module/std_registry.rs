@@ -10,6 +10,7 @@
 //! later stages; here an import of a known item simply resolves without error.
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
+use crate::qualified_name::QualifiedName;
 use crate::stdlib_schema::{STDLIB_SCHEMA, StdModuleSchema};
 
 /// The reserved top-level standard-library namespace.
@@ -26,7 +27,7 @@ pub enum StdImport {
 
 /// Split an import path into segments. Import paths use `::` as the separator.
 pub fn import_segments(path: &str) -> Vec<&str> {
-    path.split("::").collect()
+    QualifiedName::new(path).segments().collect()
 }
 
 /// True if this import path targets the reserved `std` namespace.

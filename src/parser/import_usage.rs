@@ -2,6 +2,7 @@
 //! These defaults may never be type checked. Keep lexical bindings here rather
 //! than scheduling an extra body traversal just for unused-import diagnostics.
 use super::ast::{ImportDecl, Pattern};
+use crate::qualified_name::QualifiedName;
 use std::collections::{HashMap, HashSet};
 
 /// Bare callees/values and type/module heads have separate shadowing rules.
@@ -36,7 +37,7 @@ impl DefaultImportUsage {
             .map(|i| {
                 i.alias
                     .as_deref()
-                    .unwrap_or_else(|| i.path.rsplit("::").next().unwrap())
+                    .unwrap_or_else(|| QualifiedName::new(&i.path).last_segment())
                     .to_owned()
             })
             .collect();
@@ -124,7 +125,7 @@ impl DefaultImportUsage {
         if !self.active {
             return;
         }
-        let head = name.split("::").next().unwrap();
+        let head = QualifiedName::new(&name).first_segment();
         let local = if self.candidates.contains(head) {
             head
         } else if self.implicit_collections && matches!(head, "Array" | "Map") {

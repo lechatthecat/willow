@@ -4,6 +4,7 @@ use super::query::QueryTable;
 use crate::DEPENDENCY_WORK;
 use crate::module;
 use crate::module::artifacts::UnitArtifacts;
+use crate::qualified_name::QualifiedName;
 
 /// A borrowed consumer view: aliases never duplicate the target's module map.
 pub(crate) struct ModulePaths<'a> {
@@ -16,7 +17,9 @@ impl ModulePaths<'_> {
         if module::std_registry::is_std_path(path) {
             return None;
         }
-        let (first, rest) = path.split_once("::").unwrap_or((path, ""));
+        let (first, rest) = QualifiedName::new(&path)
+            .split_first()
+            .unwrap_or((path, ""));
         let (package, path) = match self
             .dependencies
             .aliases
@@ -180,7 +183,7 @@ impl ModuleDependencies {
                         .get(&import.path)
                         .map(|&id| (import.path.as_str(), id))
                         .or_else(|| {
-                            let (path, _) = import.path.rsplit_once("::")?;
+                            let (path, _) = QualifiedName::new(&import.path).split_last()?;
                             #[cfg(test)]
                             DEPENDENCY_WORK.with(|work| {
                                 let (lookups, visits) = work.get();

@@ -2,6 +2,7 @@
 //! semantic rebuilding; only changed bodies and their callers are projected.
 use super::*;
 use crate::compiler_db::{body::BodyQueries, effects::EffectQueries, ids::BodyOwner};
+use crate::qualified_name::QualifiedName;
 use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
@@ -1150,12 +1151,7 @@ pub(crate) fn capture_incremental(
                     } else if matches!(target.kind.as_str(), "class" | "interface" | "enum") {
                         captured.symbol_owners.push((
                             target.span,
-                            target
-                                .name
-                                .rsplit("::")
-                                .next()
-                                .unwrap_or(&target.name)
-                                .to_owned(),
+                            QualifiedName::new(&target.name).last_segment().to_owned(),
                         ));
                     }
                 }
@@ -1553,12 +1549,7 @@ pub(crate) fn incremental_snapshot(
                             .map(|import| {
                                 (
                                     import.alias.clone().unwrap_or_else(|| {
-                                        import
-                                            .path
-                                            .rsplit("::")
-                                            .next()
-                                            .unwrap_or(&import.path)
-                                            .to_owned()
+                                        QualifiedName::new(&import.path).last_segment().to_owned()
                                     }),
                                     import.clone(),
                                 )

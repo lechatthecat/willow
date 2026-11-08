@@ -2,6 +2,7 @@
 //! Iterative walkers that gather string literals, lambdas, runtime-checked
 //! names, and reference-debug strings from a `Program` before codegen.
 
+use crate::qualified_name::QualifiedName;
 use std::collections::HashSet;
 
 use crate::parser::ast::*;
@@ -34,13 +35,13 @@ pub(crate) fn collect_reference_debug_strings_in_program(program: &Program) -> V
             }
             Item::Class(c) => {
                 for method in &c.methods {
-                    out.insert(format!("{}::{}", c.name, method.name));
+                    out.insert(QualifiedName::join(&c.name, &method.name));
                     out.insert(method.name.clone());
                     collect_reference_debug_param_strings(&method.params, &mut out);
                     collect_reference_debug_strings_in_block(&method.body, &mut out);
                 }
                 for ctor in &c.constructors {
-                    out.insert(format!("{}::init", c.name));
+                    out.insert(QualifiedName::join(&c.name, "init"));
                     out.insert("init".to_string());
                     collect_reference_debug_param_strings(&ctor.params, &mut out);
                     collect_reference_debug_strings_in_block(&ctor.body, &mut out);
@@ -78,11 +79,13 @@ pub(crate) fn walk_reference_args_in_block(block: &Block, visit: &mut dyn FnMut(
                 Expr::Call(c) => visit_reference_args(&c.callee, &c.args, visit),
                 Expr::MethodCall(c) => visit_reference_args(&c.method, &c.args, visit),
                 Expr::StaticCall(c) => {
-                    visit_reference_args(&format!("{}::{}", c.class, c.method), &c.args, visit)
+                    visit_reference_args(&QualifiedName::join(&c.class, &c.method), &c.args, visit)
                 }
-                Expr::New(c) => {
-                    visit_reference_args(&format!("{}::init", c.class_name), &c.args, visit)
-                }
+                Expr::New(c) => visit_reference_args(
+                    &QualifiedName::join(&c.class_name, "init"),
+                    &c.args,
+                    visit,
+                ),
                 _ => unreachable!("argument event must identify a call"),
             },
             AstEvent::SuperArguments(s) => visit_reference_args("super.init", &s.args, visit),
@@ -249,7 +252,7 @@ pub(crate) fn collect_nil_check_names_in_block(block: &Block, out: &mut HashSet<
                 out.insert(m.method.clone());
             }
             AstEvent::Expr(Expr::StaticCall(s)) => {
-                out.insert(format!("{}::{}", s.class, s.method));
+                out.insert(QualifiedName::join(&s.class, &s.method));
             }
             _ => {}
         }

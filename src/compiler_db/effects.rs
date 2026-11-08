@@ -1,6 +1,7 @@
 //! One session-local helper/lock/panic fixpoint over typed callable identities.
 //! Imported facts use semantic names; linker spelling belongs to the backend.
 use super::query::QueryTable;
+use crate::qualified_name::QualifiedName;
 use crate::{
     module::UnitId,
     parser::{
@@ -1081,7 +1082,7 @@ impl EffectQueries {
         // Module-qualified free calls use StaticCall's owner slot. Resolve
         // the full module path before interpreting that slot as a class.
         if let (Some(namespace), Some(owner)) = (&namespace, &owner) {
-            let path = format!("{namespace}::{owner}");
+            let path = QualifiedName::join(namespace, owner);
             if let Some(unit) = self.resolve_module(consumer, &path) {
                 return Some((unit, FunctionId::free(target.name())));
             }
@@ -1101,7 +1102,7 @@ impl EffectQueries {
             let path = imports.get(owner).map(String::as_str).unwrap_or(owner);
             if self.resolve_module(consumer, path).is_some() {
                 (path, FunctionId::free(target.name()))
-            } else if let Some((module, item)) = path.rsplit_once("::") {
+            } else if let Some((module, item)) = QualifiedName::new(path).split_last() {
                 (
                     module,
                     FunctionId::method(TypeId::local(item), target.name()),
@@ -1110,7 +1111,7 @@ impl EffectQueries {
                 return None;
             }
         } else if let Some(path) = imports.get(target.name().as_ref()) {
-            let (module, item) = path.rsplit_once("::")?;
+            let (module, item) = QualifiedName::new(path).split_last()?;
             (module, FunctionId::free(item))
         } else {
             return None;
@@ -1337,14 +1338,10 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
         .iter()
         .map(|import| {
             (
-                import.alias.clone().unwrap_or_else(|| {
-                    import
-                        .path
-                        .rsplit("::")
-                        .next()
-                        .unwrap_or(&import.path)
-                        .to_owned()
-                }),
+                import
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment().to_owned()),
                 import.path.clone(),
             )
         })
@@ -2237,14 +2234,10 @@ fn solve_unit_delta<N: std::fmt::Display>(
         .iter()
         .map(|import| {
             (
-                import.alias.clone().unwrap_or_else(|| {
-                    import
-                        .path
-                        .rsplit("::")
-                        .next()
-                        .unwrap_or(&import.path)
-                        .to_owned()
-                }),
+                import
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment().to_owned()),
                 import.path.clone(),
             )
         })

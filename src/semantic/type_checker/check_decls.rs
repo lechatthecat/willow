@@ -1,5 +1,6 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
+use crate::qualified_name::QualifiedName;
 use crate::semantic::symbols::*;
 use std::collections::HashSet;
 
@@ -1551,7 +1552,7 @@ impl TypeChecker {
         ));
         // Members are canonical (`m::Circle` inside module `m`); spell the
         // ones declared in this module the way its source does.
-        let module_prefix = self.module_path.as_ref().map(|path| format!("{path}::"));
+        let module_prefix = self.module_path.as_ref().map(QualifiedName::prefix);
         let display = |member: &str| -> String {
             module_prefix
                 .as_deref()

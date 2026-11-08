@@ -7,6 +7,7 @@ pub(crate) mod purity;
 // Conditional advice also covers stored results without tracking value provenance.
 const STRING_FIND_SENTINEL_HELP: &str = "if this i64 came from String.find(needle), it is a byte offset, not an Option: -1 means not found; test `index >= 0` before using it, or use `contains(needle)` for a bool";
 
+use crate::qualified_name::QualifiedName;
 use crate::semantic::async_borrows::ReferenceArgMode;
 pub(crate) mod analysis;
 pub(crate) mod body;
@@ -524,7 +525,7 @@ impl TypeChecker {
     /// into an identity. Do not apply this to inferred types or hierarchy
     /// lookups: those must be able to use transitive signature metadata.
     fn check_source_type_name(&mut self, name: &str, span: Span) -> bool {
-        let Some((module, _)) = name.rsplit_once("::") else {
+        let Some((module, _)) = QualifiedName::new(&name).split_last() else {
             return true;
         };
         if self.signature_metadata
@@ -1441,7 +1442,7 @@ impl TypeChecker {
                         .map(|v| (&v.name, v.public)),
                 )
             {
-                if public && let Some((_, short)) = name.rsplit_once("::") {
+                if public && let Some((_, short)) = QualifiedName::new(&name).split_last() {
                     let names = hints.entry(short.to_owned()).or_default();
                     names.push(name.clone());
                     names.sort_unstable();
@@ -1818,7 +1819,8 @@ impl TypeChecker {
                     (Some(a), Some(b)) => {
                         a.name == b.name
                             || (a.declaration_span == b.declaration_span
-                                && a.name.rsplit("::").next() == b.name.rsplit("::").next())
+                                && QualifiedName::new(&a.name).last_segment()
+                                    == QualifiedName::new(&b.name).last_segment())
                     }
                     _ => false,
                 }
@@ -2212,10 +2214,7 @@ fn imported_class_info_from_decl(
             // this module's. A QUALIFIED one because the module wrote it in its
             // own spelling of that module -- `extends biz::Amount` -- which the
             // checker may have registered under another (willow-uvlp).
-            let written = match base {
-                TypePath::Local(name) => name.clone(),
-                TypePath::Qualified(parts) => parts.join("::"),
-            };
+            let written = base.spelling();
             match &qualify(&Type::Named(written)) {
                 Type::Named(qualified) => qualified.clone(),
                 other => type_name(other),

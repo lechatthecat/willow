@@ -1,5 +1,6 @@
 //! Consumer-local import routing. This does not load/parse modules or mutate the
 //! package graph; the module loader owns those operations.
+use crate::qualified_name::QualifiedName;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -99,7 +100,7 @@ impl<'a> PackageImports<'a> {
             .ok_or(PackageImportError::UnknownPackage(consumer))?;
         // Source imports cannot spell filesystem components. Validate here as
         // this API can also be called without passing through the parser.
-        if path.split("::").any(|segment| {
+        if QualifiedName::new(&path).segments().any(|segment| {
             segment.is_empty()
                 || segment
                     .chars()
@@ -110,7 +111,9 @@ impl<'a> PackageImports<'a> {
         if std_registry::is_std_path(path) {
             return Ok(PackageImport::Std);
         }
-        let (first, rest) = path.split_once("::").unwrap_or((path, ""));
+        let (first, rest) = QualifiedName::new(&path)
+            .split_first()
+            .unwrap_or((path, ""));
         #[cfg(test)]
         self.alias_lookups.set(self.alias_lookups.get() + 1);
         let (target, logical) = match self.aliases[consumer.0 as usize].get(first) {
@@ -138,7 +141,7 @@ impl<'a> PackageImports<'a> {
         }
         // Module-first precedence matches the legacy module loader. Stripping
         // the alias above prevents treating an alias itself as an item parent.
-        if let Some((parent, item)) = logical.rsplit_once("::")
+        if let Some((parent, item)) = QualifiedName::new(&logical).split_last()
             && let Some(file) = self.find_file(target, parent)?
         {
             return Ok(PackageImport::Module {
@@ -158,7 +161,7 @@ impl<'a> PackageImports<'a> {
         package: &super::ResolvedPackage,
         logical: &str,
     ) -> Result<Option<PathBuf>, PackageImportError> {
-        let relative: PathBuf = logical.split("::").collect();
+        let relative: PathBuf = QualifiedName::new(&logical).segments().collect();
         for candidate in [relative.with_extension("wi"), relative.join("mod.wi")] {
             if !crate::compiler_db::captured::source_is_visible(
                 &package.source_root().join(&candidate),

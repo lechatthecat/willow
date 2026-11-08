@@ -3,6 +3,7 @@
 use super::precheck_journal::{Map, Set};
 use super::*;
 use crate::parser::ownership::NodeMut;
+use crate::qualified_name::QualifiedName;
 use crate::semantic::symbols::{EnumInfo, FuncInfo, InstantiationType, InterfaceInfo};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -1192,7 +1193,7 @@ impl TypeChecker {
             .get(&span.file_id)
             .map_or_else(
                 || name.to_string(),
-                |module| format!("{module}::{}", name.rsplit("::").next().unwrap_or(name)),
+                |module| QualifiedName::join(module, QualifiedName::new(&name).last_segment()),
             )
     }
 
@@ -1320,9 +1321,11 @@ impl TypeChecker {
             if let Type::Generic(name, args) = node {
                 let template = self.generics.classes.get(name).or_else(|| {
                     let resolved = self.resolve_static_call_class_quiet(name)?;
-                    self.generics
-                        .classes
-                        .get(&format!("$std::collections::{resolved}"))
+                    self.generics.classes.get(&QualifiedName::from_segments([
+                        "$std",
+                        "collections",
+                        &resolved,
+                    ]))
                 });
                 if let Some(template) = template
                     && let Some(Type::Array(element)) = &template.abi_storage
@@ -2144,7 +2147,7 @@ impl TypeChecker {
             .collect();
         let key = (
             0,
-            format!("{}::{}", template.span.file_id.0, template.name),
+            QualifiedName::join(template.span.file_id.0, &template.name),
             identity_args.clone(),
         );
         let name = if let Some(name) = self.generics.instances.get(&key) {
@@ -2180,11 +2183,11 @@ impl TypeChecker {
         // resolves in the consumer's scope. Preserve its written prefix so
         // source-use diagnostics do not lose a used module import.
         let path = self.generics.function_paths.get(callee).map(|origin| {
-            callee
-                .rsplit_once("::")
-                .map_or(origin.as_str(), |(written, _)| written)
+            QualifiedName::new(callee)
+                .qualifier()
+                .unwrap_or(origin.as_str())
         });
-        let target = path.map_or(name.clone(), |path| format!("{path}::{name}"));
+        let target = path.map_or(name.clone(), |path| QualifiedName::join(path, &name));
         self.generics.calls.insert(id, target);
         Some(if template.is_async {
             Type::Generic("Task".into(), vec![result])
@@ -2264,7 +2267,7 @@ impl TypeChecker {
         // rather than this checker's import alias. Resolve by declaration file
         // and source name, without searching every template or import.
         if let Some(class) = self.symbols.lookup_class(name) {
-            let local = source.rsplit("::").next().unwrap_or(source);
+            let local = QualifiedName::new(&source).last_segment();
             let registry = self.generics.registry.borrow();
             if let Some(template) = registry
                 .classes
@@ -2288,12 +2291,7 @@ impl TypeChecker {
         if !info.methods.contains_key(method) {
             return;
         }
-        let local = info
-            .name
-            .rsplit("::")
-            .next()
-            .unwrap_or(&info.name)
-            .to_string();
+        let local = QualifiedName::new(&info.name).last_segment().to_string();
         let file = info.declaration_span.file_id;
         let deferred = self
             .generics
@@ -2455,7 +2453,7 @@ impl TypeChecker {
             .collect();
         let key = (
             1,
-            format!("{}::{}", template.span.file_id.0, template.name),
+            QualifiedName::join(template.span.file_id.0, &template.name),
             identity_args.clone(),
         );
         if let Some(name) = self.generics.instances.get(&key) {
@@ -2486,7 +2484,9 @@ impl TypeChecker {
             .generics
             .class_paths
             .get(name)
-            .map_or(local_name.clone(), |path| format!("{path}::{local_name}"));
+            .map_or(local_name.clone(), |path| {
+                QualifiedName::join(path, &local_name)
+            });
         self.generics.instances.insert(key.clone(), name.clone());
         self.generics.logical_types.insert(
             name.clone(),
@@ -2711,7 +2711,7 @@ impl TypeChecker {
             let Some(info) = self.symbols.lookup_interface(name) else {
                 continue;
             };
-            let local = info.name.rsplit("::").next().unwrap_or(&info.name);
+            let local = QualifiedName::new(&info.name).last_segment();
             let key = (info.declaration_span.file_id, local.to_string());
             let Some(template) = self
                 .generics
@@ -2793,7 +2793,7 @@ impl TypeChecker {
             .collect();
         let key = (
             2,
-            format!("{}::{}", template.span.file_id.0, template.name),
+            QualifiedName::join(template.span.file_id.0, &template.name),
             identity_args,
         );
         let cached = self
@@ -3145,7 +3145,7 @@ impl TypeChecker {
                 Item::Function(f) => (f.name.clone(), f.span.file_id, f.body.id),
                 Item::Class(c) => (
                     if instance.method_only {
-                        format!("{}::{}", c.name, c.methods[0].name)
+                        QualifiedName::join(&c.name, &c.methods[0].name)
                     } else {
                         c.name.clone()
                     },
@@ -3242,14 +3242,14 @@ impl TypeChecker {
             let local = import
                 .alias
                 .as_deref()
-                .unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path));
+                .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
             let path = self
                 .generics
                 .function_paths
                 .get(local)
                 .or_else(|| self.generics.class_paths.get(local));
             if let Some(path) = path
-                && let Some((module, _)) = import.path.rsplit_once("::")
+                && let Some((module, _)) = QualifiedName::new(&import.path).split_last()
             {
                 if modules.insert(path.clone()) {
                     imports.push(ImportDecl {
@@ -3335,7 +3335,9 @@ impl TypeChecker {
                     // check accepts it without an import, a bare name not.
                     let mut qualified = Vec::new();
                     ty.map_names(|name| {
-                        if let Some(item) = name.strip_prefix("std::collections::") {
+                        if let Some(item) =
+                            QualifiedName::new(name).strip_qualifier("std::collections")
+                        {
                             qualified.push((item.to_owned(), name.clone()));
                         }
                     });
@@ -3352,7 +3354,7 @@ impl TypeChecker {
                 &mut |expr| {
                     if let Some(name) = self.generics.calls.get(&expr.id()) {
                         if let Expr::Call(c) = expr {
-                            if let Some((class, method)) = name.rsplit_once("::") {
+                            if let Some((class, method)) = QualifiedName::new(&name).split_last() {
                                 *expr = Expr::StaticCall(Box::new(StaticCallExpr {
                                     id: c.id,
                                     class: class.into(),
@@ -3367,7 +3369,7 @@ impl TypeChecker {
                                 c.type_args.clear();
                             }
                         } else if let Expr::StaticCall(c) = expr
-                            && let Some((class, method)) = name.rsplit_once("::")
+                            && let Some((class, method)) = QualifiedName::new(&name).split_last()
                         {
                             c.class = class.into();
                             c.method = method.into();

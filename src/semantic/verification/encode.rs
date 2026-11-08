@@ -1,5 +1,6 @@
 use super::*;
 use crate::parser::iter::{AstEvent, AstWalk};
+use crate::qualified_name::QualifiedName;
 
 #[derive(Clone, Debug)]
 pub(super) struct Value {
@@ -385,7 +386,7 @@ impl Encoder<'_> {
             );
             self.loop_symbols.insert(
                 value.text.clone(),
-                format!("loop@{}:{}::{name}", s.span.line, s.span.col),
+                QualifiedName::join(format_args!("loop@{}:{}", s.span.line, s.span.col), &name),
             );
             self.havoc.push(value.clone());
             if !value.boolean {

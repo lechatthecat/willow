@@ -3,6 +3,7 @@
 //! the methods here operate only within that context.
 
 use crate::diagnostics::Span;
+use crate::qualified_name::QualifiedName;
 use anyhow::Result;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -648,7 +649,7 @@ impl UnitCodegenContext<'_> {
                 let target = info.name();
                 local_signature_type_names.contains(target)
                     || local_enum_names.contains(target)
-                    || !target.contains("::") && {
+                    || !QualifiedName::new(&target).is_qualified() && {
                         let id = TypeId::local(target);
                         matches!(info, crate::semantic::symbols::InstantiationType::Enum(_))
                             || self.type_scope.resolve(&id) != id
@@ -701,7 +702,8 @@ impl UnitCodegenContext<'_> {
                     _ => None,
                 };
                 if let Some(base) = module_local_base {
-                    qualified.base_class = Some(TypePath::Local(format!("{mod_name}::{base}")));
+                    qualified.base_class =
+                        Some(TypePath::Local(QualifiedName::join(mod_name, &base)));
                 }
                 Some((local_name, qualified))
             })
@@ -2925,7 +2927,7 @@ impl UnitCodegenContext<'_> {
         m: &MethodDecl,
         body: Option<crate::parser::ast::BodyId>,
     ) -> Result<()> {
-        let diagnostic_function = self.runtime_name(&format!("{class_name}::{}", m.name));
+        let diagnostic_function = self.runtime_name(&QualifiedName::join(class_name, &m.name));
         self.declare_string_literal(&diagnostic_function)?;
         let mangled = self.class_method_symbol(class_name, &m.name);
         // LIR-walking path for a method body (willow-0g8j.2.18). `lower_program`

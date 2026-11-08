@@ -2,6 +2,7 @@
 //!
 //! Keep helper nodes in the graph: materializing a transitive set of statics
 //! for every helper/initializer would turn a shared chain into quadratic work.
+use crate::qualified_name::QualifiedName;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -87,7 +88,9 @@ impl StaticInitQueries {
             let owner = TypeId::local(&class.name);
             let base = class.base_class.as_ref().map(|base| match base {
                 TypePath::Local(name) => TypeId::from_source_name(name),
-                TypePath::Qualified(parts) => TypeId::from_source_name(&parts.join("::")),
+                TypePath::Qualified(parts) => {
+                    TypeId::from_source_name(&QualifiedName::from_segments(parts))
+                }
             });
             dispatch_types.push(DispatchType {
                 is_interface: false,
@@ -131,7 +134,7 @@ impl StaticInitQueries {
                             index: field_index as u32,
                         }),
                     callable,
-                    name: format!("{}::{}", class.name, field.name),
+                    name: QualifiedName::join(&class.name, &field.name),
                     span: field.span,
                 });
             }

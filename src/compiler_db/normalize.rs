@@ -1,6 +1,7 @@
 //! Compiler-owned standard-library name normalization. Rewrites imported or
 //! aliased collection references and builtin module aliases before lowering.
 
+use crate::qualified_name::QualifiedName;
 use std::collections::{HashMap, HashSet};
 
 use crate::module::std_registry;
@@ -623,14 +624,14 @@ pub(crate) fn std_collection_item_name<'a>(
     if let Some(item) = imports.aliases.get(qualified_name) {
         return Some(item.as_str());
     }
-    if let Some((module, item)) = qualified_name
-        .strip_prefix("std::")
-        .and_then(|path| path.split_once("::"))
+    if let Some((module, item)) = QualifiedName::new(qualified_name)
+        .strip_qualifier("std")
+        .and_then(|path| QualifiedName::new(path).split_first())
         && let Some((_, builtin_name)) = stdlib_schema::type_item(module, item)
     {
         return Some(builtin_name);
     }
-    let (module, item) = qualified_name.split_once("::")?;
+    let (module, item) = QualifiedName::new(qualified_name).split_first()?;
     imports.modules.contains(module).then(|| {
         stdlib_schema::type_item("collections", item).map(|(_, builtin_name)| builtin_name)
     })?

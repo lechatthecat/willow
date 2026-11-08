@@ -2,6 +2,7 @@
 //! relevant classes (declarations + queried receivers) form a compressed tree.
 //! A query follows shared union edges; it never enumerates all descendants.
 use super::*;
+use crate::qualified_name::QualifiedName;
 
 #[derive(Clone)]
 pub(super) struct Class {
@@ -88,7 +89,8 @@ pub(super) fn complete(
                 stack.pop();
             }
             let inherited = own.or_else(|| stack.last().and_then(|(_, _, body)| *body));
-            let name = format!("$dispatch${}::{method}", classes[class].name);
+            let name =
+                QualifiedName::join(format_args!("$dispatch${}", classes[class].name), method);
             let module = classes[class].module.clone();
             let id = hash(serde_json::to_vec(&(&module, &name)).unwrap());
             let position = result.functions.len();

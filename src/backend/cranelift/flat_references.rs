@@ -1,6 +1,7 @@
 //! Storage addresses and debug metadata for flattened reference arguments.
 use super::*;
 use crate::ir::lowered::{LirFunction, LirOperand, LirPlace};
+use crate::qualified_name::QualifiedName;
 use cranelift_codegen::ir::{InstBuilder, StackSlotData, StackSlotKind, Value, types};
 use cranelift_module::Module;
 
@@ -180,7 +181,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 user_callee = if callee.name().as_ref() == "init" {
                     symbol.clone()
                 } else {
-                    format!("{}::{}", plan.static_class, callee.name())
+                    QualifiedName::join(&plan.static_class, callee.name())
                 };
             }
         }

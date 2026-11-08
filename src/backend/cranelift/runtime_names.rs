@@ -1,5 +1,6 @@
 //! Render diagnostic strings at compile time; linker identities stay unchanged.
 use super::{Codegen, UnitCodegenContext};
+use crate::qualified_name::QualifiedName;
 use std::collections::HashMap;
 
 impl Codegen {
@@ -21,9 +22,9 @@ thread_local! {
 
 fn render(name: &str, instances: &HashMap<String, String>) -> String {
     let mut result = String::with_capacity(name.len());
-    for (index, segment) in name.split("::").enumerate() {
+    for (index, segment) in QualifiedName::new(name).segments().enumerate() {
         if index != 0 {
-            result.push_str("::");
+            result.push_str(crate::qualified_name::SEPARATOR);
         }
         #[cfg(test)]
         LOOKUPS.with(|count| count.set(count.get() + 1));

@@ -5,6 +5,7 @@
 //! the new state, otherwise recovery restores old bytes unless a conflict is found.
 //! Non-cooperating writers have a check/replacement race; see STRUCTURED_EDITS.md.
 use super::{Snapshot, hash};
+use crate::qualified_name::QualifiedName;
 use crate::{
     CompilerOptions, CompilerSession,
     diagnostics::{Diagnostic, DiagnosticEmitter, FileId, SourceMap, source_map::SourceLookup},
@@ -1520,7 +1521,7 @@ fn structured_changes(
                         .semantic
                         .symbols
                         .iter()
-                        .filter(|s| s.name.rsplit("::").next() == Some(name.as_str()))
+                        .filter(|s| QualifiedName::new(&s.name).last_segment() == name.as_str())
                         .filter_map(|s| {
                             let l = s.location.as_ref()?;
                             let path = Path::new(&l.path).strip_prefix(root).ok()?;

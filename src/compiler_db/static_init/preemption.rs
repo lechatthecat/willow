@@ -3,6 +3,7 @@
 //! are available. This graph is separate from panic/lock effect equations.
 use super::*;
 use crate::compiler_db::effects::UnitEffects;
+use crate::qualified_name::QualifiedName;
 use crate::semantic::call_graph::UnsupportedInitialization;
 use crate::semantic::indirect_lock::IndirectInputs;
 
@@ -53,14 +54,16 @@ impl StaticInitQueries {
             .imports
             .iter()
             .filter_map(|i| {
-                i.path.strip_prefix("std::").map(|path| {
-                    (
-                        i.alias
-                            .clone()
-                            .unwrap_or_else(|| path.rsplit("::").next().unwrap().into()),
-                        path.into(),
-                    )
-                })
+                QualifiedName::new(&i.path)
+                    .strip_qualifier("std")
+                    .map(|path| {
+                        (
+                            i.alias
+                                .clone()
+                                .unwrap_or_else(|| QualifiedName::new(path).last_segment().into()),
+                            path.into(),
+                        )
+                    })
             })
             .collect();
         self.units

@@ -1,3 +1,4 @@
+use crate::qualified_name::QualifiedName;
 use anyhow::Result;
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, TrapCode, UserFuncName,
@@ -913,7 +914,7 @@ impl UnitCodegenContext<'_> {
         // Direct TYPE import (willow-64gs): alias the compiled tables of the
         // module-qualified type (`module::Item`) under the unqualified `local`
         // name, so the entry's use of `local` resolves to the module's symbols.
-        let qualified = format!("{module}::{item}");
+        let qualified = QualifiedName::join(module, item);
         if self.classes().is_class(&qualified)
             || self.enum_infos.contains_key(&qualified)
             || self.classes().is_interface(&qualified)
@@ -944,7 +945,7 @@ impl UnitCodegenContext<'_> {
         module: &str,
         item: &str,
     ) -> Vec<(String, String)> {
-        let qualified = format!("{module}::{item}");
+        let qualified = QualifiedName::join(module, item);
         if !self.classes().is_class(&qualified) {
             return Vec::new();
         }
@@ -1020,13 +1021,13 @@ impl UnitCodegenContext<'_> {
             for name in &spelling.types {
                 #[cfg(test)]
                 MODULE_ALIAS_TARGET_VISITS.with(|count| count.set(count.get() + 1));
-                let canonical = format!("{}::{name}", spelling.canonical_path);
+                let canonical = QualifiedName::join(&spelling.canonical_path, name);
                 let id = TypeId::from_source_name(&canonical);
                 if self.layout_queries.has_class(id)
                     || self.layout_queries.has_interface(id)
                     || self.enum_infos.get_canonical_id(&id).is_some()
                 {
-                    types.push((format!("{}::{name}", spelling.access), canonical));
+                    types.push((QualifiedName::join(&spelling.access, name), canonical));
                 }
             }
         }
@@ -1066,7 +1067,7 @@ impl UnitCodegenContext<'_> {
     /// declaration still wins over anything it imported under the same name.
     fn alias_item_import_types(&mut self, items: &[compile::ItemBinding]) {
         for item in items {
-            let qualified = format!("{}::{}", item.module, item.item);
+            let qualified = QualifiedName::join(&item.module, &item.item);
             if self.classes().is_interface(&qualified)
                 || self.classes().is_class(&qualified)
                 || self.enum_infos.contains_key(&qualified)
@@ -1098,7 +1099,7 @@ impl UnitCodegenContext<'_> {
                 continue;
             };
             let name = &interface.name;
-            let qualified = format!("{mod_name}::{name}");
+            let qualified = QualifiedName::join(mod_name, name);
             self.bind_type_alias(name, &qualified);
         }
     }
@@ -1131,10 +1132,7 @@ impl UnitCodegenContext<'_> {
                 // the key `declare_module` registered (`lib::Parcel`) (willow-b929).
                 // Resolved NOW, while this unit's own spellings are installed: the
                 // frozen edge is read again by every later unit (willow-kd1v).
-                let name = match path {
-                    TypePath::Local(name) => name.clone(),
-                    TypePath::Qualified(parts) => parts.join("::"),
-                };
+                let name = path.spelling();
                 self.type_scope.resolve(&TypeId::from_source_name(&name))
             })
         })?;

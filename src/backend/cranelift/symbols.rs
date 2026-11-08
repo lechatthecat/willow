@@ -34,6 +34,7 @@
 //! No component can contain either separator, so nothing is ambiguous.
 
 use super::ModuleSymbols;
+use crate::qualified_name::QualifiedName;
 
 use crate::parser::ast::*;
 
@@ -76,10 +77,15 @@ pub(crate) fn module_symbol_prefix(module_path: &str) -> String {
     // Standalone module identity is internal; preserve its public linker
     // spelling. A foreign default's respelled receiver names its own class
     // (willow-nvi6).
-    let module_path = (module_path.strip_prefix("$local::"))
-        .or_else(|| module_path.strip_prefix(crate::semantic::ids::FOREIGN_RECEIVER_PREFIX))
+    let name = QualifiedName::new(module_path);
+    let module_path = (name.strip_qualifier(crate::semantic::ids::LOCAL_NAMESPACE))
+        .or_else(|| name.strip_qualifier(crate::semantic::ids::FOREIGN_RECEIVER_NAMESPACE))
         .unwrap_or(module_path);
-    symbol_path(&module_path.split("::").collect::<Vec<_>>())
+    symbol_path(
+        &QualifiedName::new(module_path)
+            .segments()
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Make a `::`-qualified name safe for use inside a linker symbol.
@@ -224,9 +230,9 @@ pub(crate) fn class_method_symbol_name(
 ) -> String {
     // Probe only prefixes of this class, longest first. Work depends on the
     // qualification depth, not on the number of modules in the build.
-    for (offset, _) in class_name.rmatch_indices("::") {
-        if let Some(symbol_prefix) = known_modules.linker_prefix(&class_name[..offset]) {
-            let class_suffix = module_symbol_prefix(&class_name[offset + 2..]);
+    for (module, class) in QualifiedName::new(class_name).splits_from_last() {
+        if let Some(symbol_prefix) = known_modules.linker_prefix(module) {
+            let class_suffix = module_symbol_prefix(class);
             return class_member_symbol(
                 &module_item_symbol(symbol_prefix, &class_suffix),
                 method_name,
@@ -262,7 +268,7 @@ pub(crate) fn qualify_module_class_decl(
             .collect()
     };
     let mut qualified = class.clone();
-    qualified.name = format!("{module_name}::{}", class.name);
+    qualified.name = QualifiedName::join(module_name, &class.name);
     qualified.implements = class.implements.iter().map(qualify).collect();
     qualified.fields = class
         .fields
@@ -309,8 +315,11 @@ pub(crate) fn qualify_module_local_type(
     let qual = |n: &str| -> String {
         // Synthetic tuple declarations have a structural, module-independent identity.
         // Keep this aligned with the type checker's qualify_local_type.
-        if !n.contains("::") && local.contains(n) && !crate::parser::tuples::is_tuple(n) {
-            format!("{module_name}::{n}")
+        if !QualifiedName::new(&n).is_qualified()
+            && local.contains(n)
+            && !crate::parser::tuples::is_tuple(n)
+        {
+            QualifiedName::join(module_name, n)
         } else {
             n.to_string()
         }

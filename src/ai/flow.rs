@@ -1,5 +1,6 @@
 //! Structured compiler CFG. Worklists bound native stack; continuations are shared.
 use super::*;
+use crate::qualified_name::QualifiedName;
 type CapturedExpression = (
     Span,
     Option<Type>,
@@ -138,7 +139,10 @@ impl Body {
     fn capture(&mut self, e: &Expr, node: usize, types: &CaptureContext<'_>) {
         let operation = match e {
             Expr::Call(c) => Some(format!("call:{}", c.callee)),
-            Expr::StaticCall(c) => Some(format!("static:{}::{}", c.class, c.method)),
+            Expr::StaticCall(c) => Some(QualifiedName::join(
+                format_args!("static:{}", c.class),
+                &c.method,
+            )),
             Expr::MethodCall(c) => Some(format!("method:{}", c.method)),
             Expr::Print(..) => Some("io:print".into()),
             Expr::Await(_) => Some("wait:await".into()),

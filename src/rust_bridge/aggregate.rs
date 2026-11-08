@@ -1,5 +1,6 @@
 //! Generate conversion from the declaration IR, without Rust enum layout assumptions.
 use super::{RustBridgeSymbol, Scalar};
+use crate::qualified_name::QualifiedName;
 use std::fmt::Write;
 #[cfg(test)]
 thread_local! { static TYPE_NODE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
@@ -192,7 +193,7 @@ impl Scalar {
 }
 
 pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, revision: u32) {
-    let target = symbol.willow_function.rsplit("::").next().unwrap();
+    let target = QualifiedName::new(&symbol.willow_function).last_segment();
     let mutable = if symbol.close_handle { "" } else { "mut " };
     writeln!(source, "#[unsafe(no_mangle)] pub unsafe extern \"C\" fn {}(input: *const BridgeValue, output: *mut BridgeValue) {{\nunsafe {{ willow_rust_bridge_enter({revision}); }}\nlet outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\nlet {mutable}frame = BridgeFrame::new();",symbol.abi_symbol).unwrap();
     for (i, ty) in symbol.input_types.iter().enumerate() {

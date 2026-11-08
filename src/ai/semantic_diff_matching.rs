@@ -1,5 +1,18 @@
 //! Conservative, scope-local structural correspondence for verification reports.
 use super::*;
+use crate::qualified_name::{QualifiedName, SegmentRun};
+use std::sync::LazyLock;
+
+/// `::function::<lambda `: a lambda's key.
+static LAMBDA_RUN: LazyLock<SegmentRun> =
+    LazyLock::new(|| SegmentRun::new(["function"], "<lambda "));
+/// `::function::$dispatch$`: a dispatch summary's key.
+static DISPATCH_RUN: LazyLock<SegmentRun> =
+    LazyLock::new(|| SegmentRun::new(["function"], "$dispatch$"));
+/// `::function::`: a free function's key.
+static FUNCTION_RUN: LazyLock<SegmentRun> = LazyLock::new(|| SegmentRun::new(["function"], ""));
+/// `::method::`: a method's key.
+static METHOD_RUN: LazyLock<SegmentRun> = LazyLock::new(|| SegmentRun::new(["method"], ""));
 
 pub(super) fn update_shapes(
     shapes: &mut im::OrdMap<String, String>,
@@ -52,23 +65,31 @@ pub(super) fn update_shapes(
 }
 
 pub(super) fn scope(key: &str) -> Option<String> {
-    let (module, rest) = key.split_once("::")?;
-    let (kind, name) = rest.split_once("::")?;
+    let (module, rest) = QualifiedName::new(key).split_first()?;
+    let (kind, name) = QualifiedName::new(rest).split_first()?;
     if let Some(lambda) = name.strip_prefix("<lambda ") {
         let (owner, _) = lambda.rsplit_once('@')?;
-        return Some(format!("{module}::{kind}::lambda::{owner}"));
+        return Some(QualifiedName::from_segments([
+            module, kind, "lambda", owner,
+        ]));
     }
     if name.starts_with("<function-value candidates:") {
         // Synthetic candidate identities include compiler-local type IDs.
         // Only pair a unique candidate set; its edges are still compared.
-        return Some(format!("{module}::{kind}::function-value"));
+        return Some(QualifiedName::from_segments([
+            module,
+            kind,
+            "function-value",
+        ]));
     }
-    let owner = name.rsplit_once("::").map_or("", |(owner, _)| owner);
-    Some(format!("{module}::{kind}::{owner}"))
+    let owner = QualifiedName::new(name)
+        .split_last()
+        .map_or("", |(owner, _)| owner);
+    Some(QualifiedName::from_segments([module, kind, owner]))
 }
 
 pub(super) fn is_lambda(key: &str) -> bool {
-    key.contains("::function::<lambda ")
+    QualifiedName::new(key).contains_run(&LAMBDA_RUN)
 }
 
 type Pairs = BTreeMap<String, String>;
@@ -119,7 +140,9 @@ fn pairs_with_work(
                 }
                 continue;
             }
-            if other.baseline.facts.contains_key(key) || key.contains("::function::$dispatch$") {
+            if other.baseline.facts.contains_key(key)
+                || QualifiedName::new(key).contains_run(&DISPATCH_RUN)
+            {
                 continue;
             }
             let Some(fact) = capture.baseline.facts.get(key) else {
@@ -146,13 +169,15 @@ fn pairs_with_work(
     for (old, new) in &result {
         visits += 1;
         let owner = |key: &str| {
-            let (module, rest) = key.split_once("::")?;
-            let (kind, name) = rest.split_once("::")?;
+            let (module, rest) = QualifiedName::new(key).split_first()?;
+            let (kind, name) = QualifiedName::new(rest).split_first()?;
             if !matches!(kind, "function" | "method") {
                 return None;
             }
             let name = name.rsplit_once('#').map_or(name, |(name, _)| name);
-            Some(format!("{module}::function::lambda::{name}"))
+            Some(QualifiedName::from_segments([
+                module, "function", "lambda", name,
+            ]))
         };
         if let (Some(old), Some(new)) = (owner(old), owner(new)) {
             owners.extend([old.clone(), new.clone()]);
@@ -164,10 +189,10 @@ fn pairs_with_work(
     let mut inherited = Vec::new();
     for (old, new) in &result {
         visits += 1;
-        if old.contains("::method::") {
-            for prefix in ["::function::$dispatch$", "::function::"] {
-                let old = old.replace("::method::", prefix);
-                let new = new.replace("::method::", prefix);
+        if QualifiedName::new(old).contains_run(&METHOD_RUN) {
+            for prefix in [&*DISPATCH_RUN, &*FUNCTION_RUN] {
+                let old = QualifiedName::new(old).replace_run(&METHOD_RUN, prefix);
+                let new = QualifiedName::new(new).replace_run(&METHOD_RUN, prefix);
                 let old = old.rsplit_once('#').map_or(old.as_str(), |(stem, _)| stem);
                 let new = new.rsplit_once('#').map_or(new.as_str(), |(stem, _)| stem);
                 if before.baseline.facts.contains_key(old)

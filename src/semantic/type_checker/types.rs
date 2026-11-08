@@ -4,6 +4,7 @@
 //! existing `crate::semantic::type_checker::*` paths keep working.
 
 use crate::parser::ast::*;
+use crate::qualified_name::QualifiedName;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B, TypeName};
 use crate::semantic::symbols::*;
 
@@ -187,8 +188,8 @@ pub(crate) fn channel_element_type<N: TypeName + Clone>(ty: &Type<N>) -> Option<
 pub(crate) fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) -> Type {
     ty.map_names(|name| {
         module_prefix
-            .filter(|_| !name.contains("::"))
-            .map(|module| format!("{module}::{name}"))
+            .filter(|_| !QualifiedName::new(&name).is_qualified())
+            .map(|module| QualifiedName::join(module, name))
             .unwrap_or_else(|| name.clone())
     })
 }
@@ -242,8 +243,8 @@ pub(crate) fn interface_method_signature(
 pub(crate) fn qualified_type_path_name(path: &TypePath, module_prefix: Option<&str>) -> String {
     match path {
         TypePath::Local(name) => module_prefix
-            .map(|module| format!("{module}::{name}"))
+            .map(|module| QualifiedName::join(module, name))
             .unwrap_or_else(|| name.clone()),
-        TypePath::Qualified(parts) => parts.join("::"),
+        TypePath::Qualified(parts) => QualifiedName::from_segments(parts),
     }
 }

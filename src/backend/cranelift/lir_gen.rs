@@ -28,6 +28,7 @@ use super::class_view::ClassTables;
 use super::emit_option_result::ResultSide;
 use super::function_index::FunctionMap;
 use super::{FlatReferenceDebug, ModuleSymbols};
+use crate::qualified_name::QualifiedName;
 use crate::semantic::ids::SemanticType as Type;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -8313,7 +8314,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .iter()
                     .any(|mode| matches!(mode, ParamMode::Reference { .. }))
             });
-            let user_callee = format!("{class}::{method}");
+            let user_callee = QualifiedName::join(class, method);
             let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
             let fid = *self.func_ids.get(mangled.as_str()).unwrap_or_else(|| {
                 panic!("eligible LIR module call `{class}::{method}` has no declared function")

@@ -3,6 +3,7 @@ use crate::parser::ast::{
     Program, StaticCallExpr, Stmt, Type,
 };
 use crate::parser::iter::{AstEvent, AstWalk};
+use crate::qualified_name::QualifiedName;
 use std::collections::HashMap;
 
 use super::FileId;
@@ -380,7 +381,7 @@ impl DebugFunction {
         reference_signatures: &ReferenceSignatureMap,
     ) -> DebugFunction {
         DebugFunction {
-            name: format!("{class_name}::{}", method.name),
+            name: QualifiedName::join(class_name, &method.name),
             is_async: method.is_async,
             line: method.span.line,
             col: method.span.col,
@@ -425,7 +426,10 @@ fn build_reference_signature_map(program: &Program) -> ReferenceSignatureMap {
             Item::Class(class) => {
                 for method in &class.methods {
                     let params = param_signatures(&method.params);
-                    signatures.insert(format!("{}::{}", class.name, method.name), params.clone());
+                    signatures.insert(
+                        QualifiedName::join(&class.name, &method.name),
+                        params.clone(),
+                    );
                     unique_methods
                         .entry(method.name.clone())
                         .and_modify(|existing| *existing = None)
@@ -603,7 +607,7 @@ fn collect_static_reference_call_args(
     reference_signatures: &ReferenceSignatureMap,
     reference_calls: &mut Vec<DebugReferenceCall>,
 ) {
-    let callee = format!("{}::{}", call.class, call.method);
+    let callee = QualifiedName::join(&call.class, &call.method);
     collect_reference_call_args(&callee, &call.args, reference_signatures, reference_calls);
 }
 

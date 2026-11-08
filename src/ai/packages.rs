@@ -2,6 +2,7 @@
 //! or build scheduling takes place in semantic queries.
 use super::*;
 use crate::package::PackageIdentity;
+use crate::qualified_name::QualifiedName;
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 
@@ -70,14 +71,14 @@ pub(super) fn attach(
         .as_ref()
         .map(|m| m.path.clone())
         .unwrap_or_else(|| {
-            entry
-                .strip_prefix(root.source_root())
-                .unwrap_or(entry)
-                .with_extension("")
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("::")
+            QualifiedName::from_segments(
+                entry
+                    .strip_prefix(root.source_root())
+                    .unwrap_or(entry)
+                    .with_extension("")
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy()),
+            )
         });
     let mut units = HashMap::from([(UnitId::ENTRY, 0)]);
     semantic.modules.push(ModuleEvidence {
@@ -120,10 +121,9 @@ pub(super) fn attach(
                 .dependencies()
                 .unit_for_path(unit, &import.path)
                 .or_else(|| {
-                    import
-                        .path
-                        .rsplit_once("::")
-                        .and_then(|(m, _)| frontend.db.dependencies().unit_for_path(unit, m))
+                    QualifiedName::new(&import.path)
+                        .qualifier()
+                        .and_then(|m| frontend.db.dependencies().unit_for_path(unit, m))
                 });
             if let Some(target) = target.and_then(|u| units.get(&u)).copied()
                 && seen.insert(target)
@@ -168,19 +168,16 @@ pub(super) fn attach(
                     let name = match symbol.kind.as_str() {
                         // A source anchor distinguishes nested/sibling scopes and
                         // repeated bindings without encoding a whole scope chain.
-                        "parameter" | "binding" => format!(
-                            "{}::{}:{}@{}",
+                        "parameter" | "binding" => QualifiedName::join(
                             owner.unwrap_or("<module>"),
-                            symbol.kind,
-                            symbol.name,
-                            l.start
+                            format_args!("{}:{}@{}", symbol.kind, symbol.name, l.start),
                         ),
-                        "field" | "static-field" | "variant" | "type-parameter" => format!(
-                            "{}::{}:{}",
-                            owner.unwrap_or("<module>"),
-                            symbol.kind,
-                            symbol.name
-                        ),
+                        "field" | "static-field" | "variant" | "type-parameter" => {
+                            QualifiedName::join(
+                                owner.unwrap_or("<module>"),
+                                format_args!("{}:{}", symbol.kind, symbol.name),
+                            )
+                        }
                         "method" | "constructor" => owner.unwrap_or(&symbol.name).to_owned(),
                         _ => symbol.name.clone(),
                     };

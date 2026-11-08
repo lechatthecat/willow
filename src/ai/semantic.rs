@@ -1,5 +1,6 @@
 //! Compact compiler facts, structured control flow, and snapshot query adapter.
 use super::*;
+use crate::qualified_name::QualifiedName;
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1800,7 +1801,7 @@ impl RiskPaths {
             };
             let kind = if operation == "wait:timeout" { 1 }
                 else if (operation.starts_with("call:") || operation.starts_with("method:") || operation.starts_with("static:"))
-                    && e.ty.as_ref().is_some_and(|ty| matches!(ty, Type::Bool) || matches!(ty,Type::Generic(name,_) if name.rsplit("::").next()==Some("Result"))) { 2 }
+                    && e.ty.as_ref().is_some_and(|ty| matches!(ty, Type::Bool) || matches!(ty,Type::Generic(name,_) if QualifiedName::new(name).last_segment()=="Result")) { 2 }
                 else { 0 };
             for &node in &e.occurrences {
                 if memberships[e.flow][node] {

@@ -1,5 +1,6 @@
 //! Package verification owns presentation and discovery; the normal frontend
 //! owns parsing, import identity, type checking and concurrency checks.
+use crate::qualified_name::QualifiedName;
 use std::{collections::BTreeMap, path::Path, process::Command, sync::Arc};
 
 use super::{
@@ -310,7 +311,7 @@ fn discover_sources_with_aliases(
             if parts.len() > 1 && parts.last() == Some(&"mod") {
                 parts.pop();
             }
-            let logical = parts.join("::");
+            let logical = QualifiedName::from_segments(&parts);
             // Validate syntax before interpolating filesystem names into imports.
             let probe = format!("import {logical};");
             let tokens = crate::lexer::Lexer::new(&probe)
@@ -322,7 +323,7 @@ fn discover_sources_with_aliases(
                 || program.imports[0].path != logical
                 || !program.items.is_empty()
                 || logical == "std"
-                || logical.starts_with("std::")
+                || QualifiedName::new(&logical).has_qualifier("std")
             {
                 return Err(failure("source_layout_invalid", &logical));
             }

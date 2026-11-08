@@ -13,6 +13,7 @@
 //! [`backend_symbol`].
 
 use super::ModuleSymbols;
+use crate::qualified_name::QualifiedName;
 use std::collections::HashMap;
 
 use super::function_index::FunctionMap;
@@ -430,7 +431,7 @@ struct AnalysisContext<'a> {
 /// The `::`-qualified source spelling a [`FunctionId`] came from.
 fn source_name(id: &FunctionId) -> String {
     match id.namespace() {
-        Some(namespace) => format!("{namespace}::{}", id.name()),
+        Some(namespace) => QualifiedName::join(&namespace, id.name()),
         None => id.name().to_string(),
     }
 }
@@ -449,7 +450,7 @@ fn backend_symbol(id: &FunctionId, context: &AnalysisContext<'_>) -> String {
         return context.free_keys.get(&source).cloned().unwrap_or(source);
     };
     let class = match id.namespace() {
-        Some(namespace) => format!("{namespace}::{owner}"),
+        Some(namespace) => QualifiedName::join(&namespace, &owner),
         None => owner.to_string(),
     };
     if let Some(key) = context

@@ -1,4 +1,5 @@
 use crate::diagnostics::Span;
+use crate::qualified_name::QualifiedName;
 
 /// Syntax identity, independent of source coordinates. Cloning a checked node
 /// preserves its identity; newly constructed syntax always receives a fresh ID,
@@ -362,6 +363,15 @@ impl TypePath {
         match self {
             TypePath::Local(n) => n,
             TypePath::Qualified(parts) => parts.last().map(|s| s.as_str()).unwrap_or(""),
+        }
+    }
+
+    /// The source spelling: the local name, or the segments joined as a
+    /// qualified name.
+    pub fn spelling(&self) -> String {
+        match self {
+            TypePath::Local(name) => name.clone(),
+            TypePath::Qualified(parts) => QualifiedName::from_segments(parts),
         }
     }
 }

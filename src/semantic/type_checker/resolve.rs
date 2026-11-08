@@ -2,6 +2,7 @@
 //! conformance methods for the type checker (extracted from `mod.rs`). The
 //! `register_*` entry points stay `pub`; the rest are `pub(super)`.
 
+use crate::qualified_name::QualifiedName;
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
@@ -25,8 +26,11 @@ pub(crate) fn qualify_local_type(
     local: &std::collections::HashSet<String>,
 ) -> Type {
     ty.map_names(|name| {
-        if !name.contains("::") && local.contains(name) && !crate::parser::tuples::is_tuple(name) {
-            format!("{module}::{name}")
+        if !QualifiedName::new(&name).is_qualified()
+            && local.contains(name)
+            && !crate::parser::tuples::is_tuple(name)
+        {
+            QualifiedName::join(module, name)
         } else {
             name.clone()
         }
@@ -53,10 +57,10 @@ fn rename_imported_type(ty: &Type, renames: &HashMap<String, String>) -> Type {
 /// (willow-uvlp). Only the leading segment is rewritten: what follows it is the
 /// type's own name, which every unit spells the same way.
 fn rename_module_prefix(ty: &Type, prefixes: &HashMap<String, String>) -> Type {
-    ty.map_names(|name| match name.split_once("::") {
+    ty.map_names(|name| match QualifiedName::new(&name).split_first() {
         Some((module, item)) => prefixes
             .get(module)
-            .map(|registered| format!("{registered}::{item}"))
+            .map(|registered| QualifiedName::join(registered, item))
             .unwrap_or_else(|| name.clone()),
         None => name.clone(),
     })
@@ -122,7 +126,7 @@ fn imported_enum_info(
         name: if crate::parser::tuples::is_tuple(&decl.name) {
             decl.name.clone()
         } else {
-            format!("{canonical}::{}", decl.name)
+            QualifiedName::join(canonical, &decl.name)
         },
         public: decl.public,
         type_params: decl.type_params.clone(),
@@ -525,8 +529,8 @@ impl TypeChecker {
                         Item::Function(f) if !f.type_params.is_empty() => &f.name,
                         Item::Function(_) => continue,
                     };
-                    let from = format!("{registered}::{declared}");
-                    let to = format!("{spelling}::{declared}");
+                    let from = QualifiedName::join(registered, declared);
+                    let to = QualifiedName::join(spelling, declared);
                     match item {
                         Item::Function(f) if !f.type_params.is_empty() => {
                             if let Some(template) = self.generics.functions.get(&from) {
@@ -694,7 +698,7 @@ impl TypeChecker {
                     .is_none()
             })
             .filter_map(|import| {
-                let (module_path, item) = import.path.rsplit_once("::")?;
+                let (module_path, item) = QualifiedName::new(&import.path).split_last()?;
                 let local = import.alias.clone().unwrap_or_else(|| item.to_string());
                 if let Some(info) = self.symbols.lookup_enum(&import.path) {
                     return Some((local, info.name.clone()));
@@ -703,7 +707,7 @@ impl TypeChecker {
                     .registration_module_path(module_path)
                     .map(String::as_str)
                     .unwrap_or(module_path);
-                let registered = format!("{access}::{item}");
+                let registered = QualifiedName::join(access, item);
                 if let Some(info) = self.symbols.lookup_enum(&registered) {
                     return Some((local, info.name.clone()));
                 }
@@ -724,14 +728,10 @@ impl TypeChecker {
             .iter()
             .filter_map(|import| {
                 let registered = self.registration_module_path(import.path.as_str())?;
-                let access = import.alias.clone().unwrap_or_else(|| {
-                    import
-                        .path
-                        .rsplit("::")
-                        .next()
-                        .unwrap_or(import.path.as_str())
-                        .to_string()
-                });
+                let access = import
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment().to_string());
                 (access != *registered).then(|| (access, registered.clone()))
             })
             .collect();
@@ -778,7 +778,7 @@ impl TypeChecker {
             match item {
                 Item::Function(f) => {
                     if !f.type_params.is_empty() {
-                        let key = format!("{name}::{}", f.name);
+                        let key = QualifiedName::join(name, &f.name);
                         let template = self.generics.registry.borrow_mut().intern_function(f);
                         self.generics.functions.insert(key.clone(), template);
                         self.generics.function_paths.insert(key, name.to_string());
@@ -809,12 +809,12 @@ impl TypeChecker {
                 }
                 Item::Class(c) => {
                     if !c.type_params.is_empty() {
-                        let key = format!("{name}::{}", c.name);
+                        let key = QualifiedName::join(name, &c.name);
                         let template = self.generics.registry.borrow_mut().intern_class(c);
                         self.generics.classes.insert(key.clone(), template);
                         self.generics.class_paths.insert(key, name.to_string());
                     }
-                    let class_name = format!("{name}::{}", c.name);
+                    let class_name = QualifiedName::join(name, &c.name);
                     let storage = c.abi_storage.as_ref().map(&qualify);
                     let info = imported_class_info_from_decl(c, &class_name, &qualify, &|field| {
                         self.field_reassigned(field)
@@ -837,7 +837,7 @@ impl TypeChecker {
                             *ty = super::bundled_storage_spelling(&storage_templates, ty);
                         }
                     }
-                    let access = format!("{name}::{}", e.name);
+                    let access = QualifiedName::join(name, &e.name);
                     if access != info.name {
                         self.symbols.define_enum(info.name.clone(), info.clone());
                     }
@@ -897,7 +897,7 @@ impl TypeChecker {
     /// `local` resolves to the public function `item` of module `module`.
     pub fn register_item_import(&mut self, local: &str, module: &str, item: &str, span: Span) {
         self.imported_names.insert(local.to_string(), Some(span));
-        let key = format!("{module}::{item}");
+        let key = QualifiedName::join(module, item);
         if let Some(template) = self.generics.functions.get(&key).cloned() {
             let origin = self
                 .generics
@@ -943,7 +943,7 @@ impl TypeChecker {
         // Types (class / interface / enum) are registered under `module::Item`.
         // Bind them under the unqualified local name too (willow-64gs), with a
         // visibility check (E0419 for a private type).
-        let qualified = format!("{module}::{item}");
+        let qualified = QualifiedName::join(module, item);
         let private_type = |this: &mut Self| {
             this.push(
                 Diagnostic::new(
@@ -1073,9 +1073,9 @@ impl TypeChecker {
         qualified_name: &str,
         span: Span,
     ) -> Option<(String, String)> {
-        let (module_local, item) = qualified_name.split_once("::")?;
+        let (module_local, item) = QualifiedName::new(&qualified_name).split_first()?;
         let imported = self.imported_std_modules.get(module_local).cloned()?;
-        let path = format!("std::{}::{}", imported.module, item);
+        let path = QualifiedName::from_segments(["std", &imported.module, item]);
         match std_registry::resolve_std_import(&path, span) {
             Ok(std_registry::StdImport::Item { module, item }) => Some((module, item)),
             Ok(std_registry::StdImport::Module { .. }) => None,
@@ -1150,7 +1150,7 @@ impl TypeChecker {
     fn define_declared_enum(&mut self, decl: &EnumDecl, variants: Vec<EnumVariantInfo>) {
         let canonical = match self.module_path.as_deref() {
             Some(module) if !crate::parser::tuples::is_tuple(&decl.name) => {
-                format!("{module}::{}", decl.name)
+                QualifiedName::join(module, &decl.name)
             }
             _ => decl.name.clone(),
         };
@@ -1168,13 +1168,16 @@ impl TypeChecker {
     }
 
     pub(super) fn register_class(&mut self, c: &ClassDecl) {
-        let identity = if c.name.contains("::") {
+        let identity = if QualifiedName::new(&c.name).is_qualified() {
             c.name.clone()
         } else {
             self.class_module_path
                 .as_ref()
                 .or(self.module_path.as_ref())
-                .map_or_else(|| c.name.clone(), |module| format!("{module}::{}", c.name))
+                .map_or_else(
+                    || c.name.clone(),
+                    |module| QualifiedName::join(module, &c.name),
+                )
         };
         if let Some(storage) = &c.abi_storage {
             self.normalized_types
@@ -1193,7 +1196,7 @@ impl TypeChecker {
         let mut bound = decl.type_params.clone();
         bound.push("Self".to_string());
         let registered_name = match module_path {
-            Some(module) => format!("{module}::{}", decl.name),
+            Some(module) => QualifiedName::join(module, &decl.name),
             None => decl.name.clone(),
         };
         let mut methods = HashMap::new();
@@ -2428,7 +2431,7 @@ impl TypeChecker {
             "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell"
         ) && method_name == "new"
         {
-            self.reject_reference_args(&format!("{class_name}::new"), args);
+            self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
             if args.len() != 1 {
                 self.push(
                     Diagnostic::new(
@@ -2495,7 +2498,7 @@ impl TypeChecker {
         // Atomic primitives (willow-dgwo.3): `AtomicI64::new(i64)` /
         // `AtomicBool::new(bool)` return the (non-generic) atomic type.
         if (class_name == "AtomicI64" || class_name == "AtomicBool") && method_name == "new" {
-            self.reject_reference_args(&format!("{class_name}::new"), args);
+            self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
             let expected = if class_name == "AtomicI64" {
                 Type::I64
             } else {
@@ -2534,7 +2537,7 @@ impl TypeChecker {
         }
 
         if matches!(class_name, "CancellationToken" | "TaskScope") && method_name == "new" {
-            self.reject_reference_args(&format!("{class_name}::new"), args);
+            self.reject_reference_args(&QualifiedName::join(class_name, "new"), args);
             if !type_args.is_empty() || !args.is_empty() {
                 for arg in args {
                     self.check_expr(&arg.expr);
@@ -2769,7 +2772,7 @@ impl TypeChecker {
                     Type::Void
                 }
                 Some(fi) if fi.constant.is_some() => {
-                    let qualified = format!("{class_name}::{method_name}");
+                    let qualified = QualifiedName::join(class_name, method_name);
                     self.reject_constant_call(&qualified, &fi, args, span)
                 }
                 Some(fi) => {
@@ -2983,7 +2986,7 @@ impl TypeChecker {
         if class_name != "std::io" {
             return None;
         }
-        let path = format!("{class_name}::{method_name}");
+        let path = QualifiedName::join(class_name, method_name);
         match std_registry::resolve_std_import(&path, span) {
             Ok(std_registry::StdImport::Item { module, item }) if module == "io" => {
                 let Some(crate::stdlib_schema::StdItemSchema {
@@ -3057,7 +3060,7 @@ impl TypeChecker {
         let builtin_or_path = |module: &str, item: &str| {
             crate::stdlib_schema::type_item(module, item)
                 .map(|(_, builtin)| builtin.to_string())
-                .unwrap_or_else(|| format!("{module}::{item}"))
+                .unwrap_or_else(|| QualifiedName::join(module, item))
         };
         if std_registry::is_std_path(class_name)
             && let Ok(std_registry::StdImport::Item { module, item }) =
@@ -3065,11 +3068,11 @@ impl TypeChecker {
         {
             return Some(builtin_or_path(&module, &item));
         }
-        if let Some((module_local, item)) = class_name.split_once("::")
+        if let Some((module_local, item)) = QualifiedName::new(&class_name).split_first()
             && let Some(imported) = self.imported_std_modules.get(module_local)
             && let Ok(std_registry::StdImport::Item { module, item }) =
                 std_registry::resolve_std_import(
-                    &format!("std::{}::{item}", imported.module),
+                    &QualifiedName::from_segments(["std", &imported.module, item]),
                     Span::dummy(),
                 )
         {
@@ -3110,14 +3113,14 @@ impl TypeChecker {
                 return Some(
                     crate::stdlib_schema::type_item(&module, &item)
                         .map(|(_, builtin)| builtin.to_string())
-                        .unwrap_or_else(|| format!("{module}::{item}")),
+                        .unwrap_or_else(|| QualifiedName::join(&module, &item)),
                 );
             }
             if let Some((module, item)) = self.resolve_imported_std_module_item(class_name, span) {
                 return Some(
                     crate::stdlib_schema::type_item(&module, &item)
                         .map(|(_, builtin)| builtin.to_string())
-                        .unwrap_or_else(|| format!("{module}::{item}")),
+                        .unwrap_or_else(|| QualifiedName::join(&module, &item)),
                 );
             }
             // An enum an item import brought in (`import signal::Level;`, or

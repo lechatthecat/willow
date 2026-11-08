@@ -1,3 +1,4 @@
+use crate::qualified_name::QualifiedName;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -290,7 +291,12 @@ impl ModuleGraph {
             // A source import cannot spell `$local`, so aliases never shadow
             // standalone declaration IDs during later normalization or lowering.
             symbol_namespace: Some(symbol_module.map_or_else(
-                || std::sync::Arc::from(format!("$local::{}", key.path.0)),
+                || {
+                    std::sync::Arc::from(QualifiedName::join(
+                        crate::semantic::ids::LOCAL_NAMESPACE,
+                        &key.path.0,
+                    ))
+                },
                 |module| module.namespace(),
             )),
             symbol_module,

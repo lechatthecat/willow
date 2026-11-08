@@ -3,6 +3,7 @@
 //! edge once. Loading/capturing a baseline still costs its serialized input size.
 use super::*;
 use crate::diagnostics::{Diagnostic, DiagnosticEmitter, source_map::SourceLookup};
+use crate::qualified_name::QualifiedName;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -772,11 +773,11 @@ impl Baseline {
                 continue;
             }
             let name = s.source_name.as_deref().unwrap_or(&s.name);
-            let stem = format!(
-                "{}::{}::{name}",
-                relative(&location.path, &snapshot.workspace),
-                s.kind
-            );
+            let stem = QualifiedName::from_segments([
+                relative(&location.path, &snapshot.workspace).as_str(),
+                &s.kind,
+                name,
+            ]);
             let ordinal = ordinals.entry(stem.clone()).or_insert(0usize);
             let key = format!("{stem}#{ordinal}");
             *ordinal += 1;
@@ -803,11 +804,11 @@ impl Baseline {
         }
         for f in &snapshot.functions {
             ids.entry(f.id.clone()).or_insert_with(|| {
-                format!(
-                    "{}::function::{}",
-                    relative(&f.module, &snapshot.workspace),
-                    f.name
-                )
+                QualifiedName::from_segments([
+                    relative(&f.module, &snapshot.workspace).as_str(),
+                    "function",
+                    &f.name,
+                ])
             });
         }
         let mut callers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();

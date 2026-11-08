@@ -1,6 +1,7 @@
 //! Retained virtual unions. The declaration forest is immutable between nominal
 //! changes; body edits replace query memberships and repair only changed edges.
 use super::*;
+use crate::qualified_name::QualifiedName;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
@@ -111,8 +112,11 @@ impl Forest {
     fn id(&self, class: usize, method: &str) -> String {
         let class = &self.classes[class];
         hash(
-            serde_json::to_vec(&(&class.module, format!("$dispatch${}::{method}", class.name)))
-                .unwrap(),
+            serde_json::to_vec(&(
+                &class.module,
+                QualifiedName::join(format_args!("$dispatch${}", class.name), method),
+            ))
+            .unwrap(),
         )
     }
     fn function(&self, class: usize, method: &str, point: &Point, visits: &mut usize) -> Function {
@@ -137,7 +141,10 @@ impl Forest {
             rename_imports: vec![],
             id: self.id(class, method),
             module: self.classes[class].module.clone(),
-            name: format!("$dispatch${}::{method}", self.classes[class].name),
+            name: QualifiedName::join(
+                format_args!("$dispatch${}", self.classes[class].name),
+                method,
+            ),
             locations: vec![],
             synthetic: true,
             fingerprint: String::new(),

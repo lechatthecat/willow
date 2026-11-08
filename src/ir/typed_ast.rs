@@ -8,12 +8,13 @@
 
 use crate::diagnostics::Span;
 use crate::parser::ast::{BinOp, ExprId, LockMode, UnaryOp};
+use crate::qualified_name::QualifiedName;
 use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
 
 /// Compiler-owned function identity for one static property's initializer.
 /// `$` cannot occur in a source identifier.
 pub fn static_initializer_name(class: &str, field: &str) -> String {
-    format!("{class}::$static_init.{field}")
+    QualifiedName::join(class, format_args!("$static_init.{field}"))
 }
 
 /// A whole program lowered to typed HIR. Slice 1 only carries free functions.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::qualified_name::QualifiedName;
 use crate::semantic::analysis_symbols::Declaration;
 
 impl TypeChecker {
@@ -41,7 +42,7 @@ impl TypeChecker {
             let local = import
                 .alias
                 .as_deref()
-                .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+                .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
             if self.symbols.lookup_class(local).is_some()
                 || self.symbols.lookup_enum(local).is_some()
                 || self.symbols.lookup_interface(local).is_some()
@@ -52,7 +53,7 @@ impl TypeChecker {
                     import.span,
                 );
             } else if let Some(info) = self.symbols.lookup_func(local) {
-                let name = import.path.rsplit("::").next().unwrap();
+                let name = QualifiedName::new(&import.path).last_segment();
                 self.analysis_symbols.reference(
                     import.span,
                     name,
@@ -136,7 +137,7 @@ impl TypeChecker {
     pub(super) fn mark_import_used(&mut self, written: &str, span: Span) {
         #[cfg(test)]
         super::import_diagnostic_tests::IMPORT_PROBES.with(|count| count.set(count.get() + 1));
-        let first = written.split("::").next().unwrap_or(written);
+        let first = QualifiedName::new(&written).first_segment();
         if let Some(declaration) = self.imported_names.get(first) {
             if *declaration != Some(span) && !self.analysis_symbols.used_imports.contains(first) {
                 self.analysis_symbols.used_imports.insert(first.to_string());
@@ -172,7 +173,7 @@ impl TypeChecker {
             let local = import
                 .alias
                 .as_deref()
-                .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+                .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
             // Invalid std imports are diagnosed by the import phase and never
             // registered here. Do not warn about a declaration that failed.
             if crate::module::std_registry::is_std_path(&import.path)
@@ -198,7 +199,7 @@ impl TypeChecker {
     }
 
     fn record_import_use(&mut self, written: &str, span: Span) {
-        let first = written.split("::").next().unwrap_or(written);
+        let first = QualifiedName::new(&written).first_segment();
         if let Some(&Some(declaration)) = self.imported_names.get(first) {
             self.analysis_symbols.reference(
                 span,
@@ -522,7 +523,7 @@ impl TypeChecker {
                 if self.symbols.lookup_var(&call.callee).is_none() {
                     self.record_import_use(&call.callee, call.span);
                     if let Some(info) = self.symbols.lookup_func(&call.callee) {
-                        let name = call.callee.rsplit("::").next().unwrap_or(&call.callee);
+                        let name = QualifiedName::new(&call.callee).last_segment();
                         self.analysis_symbols.reference(
                             call.span,
                             name,

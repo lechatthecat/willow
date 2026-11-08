@@ -1,3 +1,4 @@
+use crate::qualified_name::QualifiedName;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -94,7 +95,7 @@ pub(crate) fn classify_unit_imports_with<'a>(
             });
             continue;
         }
-        if let Some((parent, item)) = import.path.rsplit_once("::")
+        if let Some((parent, item)) = QualifiedName::new(&import.path).split_last()
             && let Some(dependency) = find(parent)
         {
             out.items.push(ItemImport {
@@ -429,7 +430,7 @@ fn resolve_import(
         find_module_file(src_root, path)
             .map(|file| (ModuleKey::new(consumer, path), file, None))
             .or_else(|| {
-                let (parent, item) = path.rsplit_once("::")?;
+                let (parent, item) = QualifiedName::new(&path).split_last()?;
                 find_module_file(src_root, parent).map(|file| {
                     (
                         ModuleKey::new(consumer, parent),
@@ -462,7 +463,7 @@ fn resolve_import(
         // A missing qualified name can also be a misspelled local module.
         // Preserve the lookup diagnostic and explain the external-package case
         // without guessing an alias or discovering a manifest implicitly.
-        if !graph.project_mode && path.contains("::") {
+        if !graph.project_mode && QualifiedName::new(&path).is_qualified() {
             diagnostic = diagnostic.with_note(
                 "external dependency requires a project.toml; declare the dependency in a project and build that project",
             );
@@ -484,9 +485,9 @@ fn resolve_import(
     if let (Some(item), Some(sink)) = (item, item_sink) {
         sink.push(ItemImport {
             local: alias.unwrap_or(&item).to_string(),
-            access: path
-                .rsplit_once("::")
-                .map_or(path, |(parent, _)| parent)
+            access: QualifiedName::new(path)
+                .qualifier()
+                .unwrap_or(path)
                 .to_string(),
             canonical_module: key.path.0.clone(),
             package: key.package,
@@ -776,11 +777,11 @@ fn candidate_module_paths(src_root: &Path, path: &str) -> Vec<PathBuf> {
 }
 
 fn module_path_buf(path: &str) -> PathBuf {
-    path.split("::").collect()
+    QualifiedName::new(&path).segments().collect()
 }
 
 fn module_access_name(path: &str) -> &str {
-    path.rsplit("::").next().unwrap_or(path)
+    QualifiedName::new(path).last_segment()
 }
 
 fn std_import_bound_name(
@@ -796,7 +797,7 @@ fn std_import_bound_name(
     }
     alias
         .map(str::to_string)
-        .or_else(|| path.rsplit("::").next().map(str::to_string))
+        .or_else(|| Some(QualifiedName::new(path).last_segment().to_string()))
 }
 
 #[cfg(test)]

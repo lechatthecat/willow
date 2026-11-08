@@ -1,5 +1,6 @@
 //! AST-to-AST desugaring passes that run after module resolution.
 
+use crate::qualified_name::QualifiedName;
 use crate::{diagnostics, module, parser};
 
 #[cfg(test)]
@@ -41,18 +42,20 @@ impl DesugarPass {
                     let mut resolved = import.clone();
                     let (target, item) = if let Some(&target) = paths.get(&import.path) {
                         (Some(target), None)
-                    } else if let Some((parent, item)) = import.path.rsplit_once("::") {
+                    } else if let Some((parent, item)) =
+                        QualifiedName::new(&import.path).split_last()
+                    {
                         (paths.get(parent).copied(), Some(item))
                     } else {
                         (None, None)
                     };
                     if let Some(target) = target {
                         resolved.alias = Some(import.alias.clone().unwrap_or_else(|| {
-                            import.path.rsplit("::").next().unwrap().to_string()
+                            QualifiedName::new(&import.path).last_segment().to_string()
                         }));
                         resolved.path = match item {
                             Some(item) => {
-                                format!("{}::{item}", modules[target].registration_name())
+                                QualifiedName::join(modules[target].registration_name(), item)
                             }
                             None => modules[target].registration_name().to_string(),
                         };
@@ -87,7 +90,7 @@ impl DesugarPass {
             let paths = dependencies.paths_for(program);
             let roots = program.imports.iter().filter_map(|import| {
                 paths.get(&import.path).copied().or_else(|| {
-                    let (parent, _) = import.path.rsplit_once("::")?;
+                    let (parent, _) = QualifiedName::new(&import.path).split_last()?;
                     paths.get(parent).copied()
                 })
             });
@@ -527,13 +530,13 @@ fn build_module_iface_index_with_imports(
             .collect();
         for it in &m.program.items {
             if let Item::Interface(i) = it {
-                let qualified = format!("{}::{}", m.registration_name(), i.name);
+                let qualified = QualifiedName::join(m.registration_name(), &i.name);
                 let supers = i
                     .extends
                     .iter()
                     .map(|s| {
-                        if !s.contains("::") && local.contains(s.as_str()) {
-                            format!("{}::{}", m.registration_name(), s)
+                        if !QualifiedName::new(&s).is_qualified() && local.contains(s.as_str()) {
+                            QualifiedName::join(m.registration_name(), s)
                         } else {
                             qualify_imported_name(s, &import_names)
                         }
@@ -548,7 +551,7 @@ fn build_module_iface_index_with_imports(
                         if name == "Self" || bound.contains(name.as_str()) {
                             name.clone()
                         } else if local.contains(name.as_str()) && !parser::tuples::is_tuple(name) {
-                            format!("{}::{name}", m.registration_name())
+                            QualifiedName::join(m.registration_name(), name)
                         } else {
                             qualify_imported_name(name, &import_names)
                         }
@@ -573,7 +576,7 @@ fn group_module_names<V>(
 ) -> std::collections::HashMap<&str, Vec<&str>> {
     let mut groups = std::collections::HashMap::<_, Vec<_>>::new();
     for key in base.keys() {
-        if let Some((module, _)) = key.rsplit_once("::") {
+        if let Some((module, _)) = QualifiedName::new(key).split_last() {
             groups.entry(module).or_default().push(key.as_str());
         }
     }
@@ -601,7 +604,7 @@ fn augment_resolved_imports<V: Clone>(
         let access = import
             .alias
             .as_deref()
-            .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+            .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
         if !seen.insert((import.path.as_str(), access)) {
             continue;
         }
@@ -610,8 +613,8 @@ fn augment_resolved_imports<V: Clone>(
         }
         if package_aware && let Some(keys) = groups.get(import.path.as_str()) {
             for &key in keys {
-                let (_, item) = key.rsplit_once("::").unwrap();
-                out.insert(format!("{access}::{item}"), base[key].clone());
+                let (_, item) = QualifiedName::new(&key).split_last().unwrap();
+                out.insert(QualifiedName::join(access, item), base[key].clone());
             }
         }
     }
@@ -626,7 +629,7 @@ fn import_name_index(imports: &[parser::ast::ImportDecl]) -> std::collections::H
                 import
                     .alias
                     .as_deref()
-                    .unwrap_or_else(|| import.path.rsplit("::").next().unwrap()),
+                    .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment()),
                 import.path.as_str(),
             )
         })
@@ -634,11 +637,14 @@ fn import_name_index(imports: &[parser::ast::ImportDecl]) -> std::collections::H
 }
 
 fn qualify_imported_name(name: &str, imports: &std::collections::HashMap<&str, &str>) -> String {
-    let (head, tail) = name
-        .split_once("::")
+    let (head, tail) = QualifiedName::new(name)
+        .split_first()
         .map_or((name, None), |(head, tail)| (head, Some(tail)));
     match imports.get(head) {
-        Some(path) => tail.map_or_else(|| (*path).to_string(), |tail| format!("{path}::{tail}")),
+        Some(path) => tail.map_or_else(
+            || (*path).to_string(),
+            |tail| QualifiedName::join(path, tail),
+        ),
         None => name.to_string(),
     }
 }
@@ -663,7 +669,7 @@ fn resolve_interface_inheritance(
     external: &IfaceIndex,
     external_classes: &std::collections::HashMap<String, ClassShape>,
 ) -> Vec<diagnostics::Diagnostic> {
-    use parser::ast::{Item, Type, TypePath};
+    use parser::ast::{Item, Type};
     use std::collections::{HashMap, HashSet};
 
     // name -> (direct supers, own methods): this program's own interfaces (bare
@@ -710,10 +716,7 @@ fn resolve_interface_inheritance(
         .collect();
     class_info.extend(program.items.iter().filter_map(|it| match it {
         Item::Class(c) => {
-            let base = c.base_class.as_ref().map(|tp| match tp {
-                TypePath::Local(n) => n.clone(),
-                TypePath::Qualified(p) => p.join("::"),
-            });
+            let base = c.base_class.as_ref().map(|tp| tp.spelling());
             Some((c.name.clone(), (base, c.implements.clone())))
         }
         _ => None,
@@ -875,7 +878,7 @@ fn build_module_default_methods(
     for m in modules {
         for it in &m.program.items {
             if let Item::Interface(i) = it {
-                let qualified = format!("{}::{}", m.registration_name(), i.name);
+                let qualified = QualifiedName::join(m.registration_name(), &i.name);
                 let composed = composition.methods(
                     iface_index.get_key_value(&qualified).unwrap().0,
                     iface_index,
@@ -936,12 +939,14 @@ fn build_module_class_shapes_with_imports(
         let import_aliases: HashMap<String, String> = imports
             .iter()
             .filter_map(|import| {
-                import.path.rsplit_once("::").map(|(_, item)| {
-                    (
-                        import.alias.clone().unwrap_or_else(|| item.to_string()),
-                        import.path.clone(),
-                    )
-                })
+                QualifiedName::new(&import.path)
+                    .split_last()
+                    .map(|(_, item)| {
+                        (
+                            import.alias.clone().unwrap_or_else(|| item.to_string()),
+                            import.path.clone(),
+                        )
+                    })
             })
             .collect();
 
@@ -957,7 +962,7 @@ fn build_module_class_shapes_with_imports(
                 let qualified = match interface_ty {
                     Type::Named(name) => {
                         let name = if local_interfaces.contains(name.as_str()) {
-                            format!("{}::{name}", module.registration_name())
+                            QualifiedName::join(module.registration_name(), name)
                         } else {
                             import_aliases
                                 .get(name)
@@ -968,7 +973,7 @@ fn build_module_class_shapes_with_imports(
                     }
                     Type::Generic(name, args) => {
                         let name = if local_interfaces.contains(name.as_str()) {
-                            format!("{}::{name}", module.registration_name())
+                            QualifiedName::join(module.registration_name(), name)
                         } else {
                             import_aliases
                                 .get(name)
@@ -991,18 +996,18 @@ fn build_module_class_shapes_with_imports(
 
             let base = class.base_class.as_ref().map(|base| match base {
                 TypePath::Local(name) if local_classes.contains(name.as_str()) => {
-                    format!("{}::{name}", module.registration_name())
+                    QualifiedName::join(module.registration_name(), name)
                 }
                 TypePath::Local(name) => import_aliases
                     .get(name)
                     .cloned()
                     .unwrap_or_else(|| qualify_imported_name(name, &import_names)),
                 TypePath::Qualified(parts) => {
-                    qualify_imported_name(&parts.join("::"), &import_names)
+                    qualify_imported_name(&QualifiedName::from_segments(parts), &import_names)
                 }
             });
             out.insert(
-                format!("{}::{}", module.registration_name(), class.name),
+                QualifiedName::join(module.registration_name(), &class.name),
                 ClassShape {
                     base,
                     declared,
@@ -1032,7 +1037,7 @@ fn inject_default_interface_methods(
     external_class_shapes: &std::collections::HashMap<String, ClassShape>,
 ) -> Vec<diagnostics::Diagnostic> {
     use diagnostics::{Diagnostic, ErrorCode, Label, Severity};
-    use parser::ast::{Item, MethodDecl, Type, TypePath};
+    use parser::ast::{Item, MethodDecl, Type};
     use std::collections::{HashMap, HashSet};
 
     // interface name -> (type params, default methods): this program's own
@@ -1098,10 +1103,7 @@ fn inject_default_interface_methods(
         Item::Class(c) => Some((
             c.name.clone(),
             ClassShape {
-                base: c.base_class.as_ref().map(|tp| match tp {
-                    TypePath::Local(n) => n.clone(),
-                    TypePath::Qualified(p) => p.join("::"),
-                }),
+                base: c.base_class.as_ref().map(|tp| tp.spelling()),
                 declared: c.methods.iter().map(|m| m.name.clone()).collect(),
                 implements: c.implements.clone(),
             },

@@ -1,5 +1,6 @@
 //! Source-facing selectors over one immutable compiler query session.
 use super::*;
+use crate::qualified_name::QualifiedName;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -147,7 +148,7 @@ fn source_module(path: &str, workspace: &str) -> String {
     if parts.last().is_some_and(|p| p == "mod") {
         parts.pop();
     }
-    parts.join("::")
+    QualifiedName::from_segments(parts)
 }
 /// Presentation mode for direct rename. Boolean callers retain legacy previews.
 pub enum RenameMode {
@@ -186,7 +187,7 @@ impl DirectSession {
                     },
                 );
             }
-            if f.name.ends_with("::init") {
+            if QualifiedName::new(&f.name).has_item("init") {
                 callable_by_owner.insert((f.module.as_str(), f.name.as_str()), f.id.as_str());
             }
             let module = f
@@ -194,7 +195,7 @@ impl DirectSession {
                 .as_ref()
                 .map(|i| i.module.clone())
                 .unwrap_or_else(|| source_module(&f.module, &snapshot.workspace));
-            function_names.insert(f.id.clone(), format!("{module}::{}", f.name));
+            function_names.insert(f.id.clone(), QualifiedName::join(&module, &f.name));
         }
         let constructor_bodies = snapshot
             .semantic
@@ -456,23 +457,22 @@ impl DirectSession {
                 .as_ref()
                 .map(|i| i.module.clone())
                 .unwrap_or_else(|| source_module(&location.path, self.workspace()));
-            return format!("{module}::{name}");
+            return QualifiedName::join(&module, name);
         }
         if let Some(identity) = &symbol.identity {
-            let name = identity
-                .symbol
-                .split("::")
-                .map(|s| s.split_once(':').map_or(s, |(_, name)| name))
-                .collect::<Vec<_>>()
-                .join("::");
-            format!("{}::{name}", identity.module)
+            let name = QualifiedName::from_segments(
+                QualifiedName::new(&identity.symbol)
+                    .segments()
+                    .map(|s| s.split_once(':').map_or(s, |(_, name)| name)),
+            );
+            QualifiedName::join(&identity.module, &name)
         } else if let Some(name) = self.function_names.get(&symbol.id) {
             name.clone()
         } else if let Some(location) = &symbol.location {
             let module = source_module(&location.path, self.workspace());
-            format!(
-                "{module}::{}",
-                symbol.source_name.as_deref().unwrap_or(&symbol.name)
+            QualifiedName::join(
+                &module,
+                symbol.source_name.as_deref().unwrap_or(&symbol.name),
             )
         } else {
             symbol.name.clone()
@@ -610,10 +610,7 @@ impl DirectSession {
                     .rsplit_once('@')
                     .map_or(hint.selector.as_str(), |(name, _)| name);
                 [hint.selector.as_str(), plain].iter().any(|name| {
-                    *name == selector
-                        || name
-                            .strip_suffix(selector)
-                            .is_some_and(|p| p.ends_with("::"))
+                    *name == selector || QualifiedName::new(*name).strip_tail(selector).is_some()
                 })
             })
         {
@@ -622,17 +619,15 @@ impl DirectSession {
         // Selectors separate members only with `::`. A `Type.member` spelling
         // never resolves, but its suggestions rank the `Type::member` path.
         let suggestion_selector = if located.is_none() && selector.contains('.') {
-            std::borrow::Cow::Owned(selector.replace('.', "::"))
+            std::borrow::Cow::Owned(QualifiedName::from_segments(selector.split('.')))
         } else {
             std::borrow::Cow::Borrowed(selector)
         };
-        let segments: Vec<_> = suggestion_selector
-            .split("::")
+        let segments: Vec<_> = QualifiedName::new(&*suggestion_selector)
+            .segments()
             .map(|s| (s, s.chars().collect::<Vec<_>>()))
             .collect();
-        let selector_scope = suggestion_selector
-            .rsplit_once("::")
-            .map(|(scope, _)| scope);
+        let selector_scope = QualifiedName::new(&*suggestion_selector).qualifier();
         for symbol in self
             .session
             .snapshot
@@ -688,10 +683,7 @@ impl DirectSession {
             };
             let local_name = local_plain(&symbol.kind, &qualified);
             let matches_name = |name: &str| {
-                selector == name
-                    || name
-                        .strip_suffix(selector)
-                        .is_some_and(|p| p.ends_with("::"))
+                selector == name || QualifiedName::new(name).strip_tail(selector).is_some()
             };
             if located.is_some()
                 || matches_name(&qualified)
@@ -718,9 +710,9 @@ impl DirectSession {
                             .map(|loc| (loc.path.clone(), loc.start))
                     })
                     .flatten();
-                let (owner, _) = name.rsplit_once("::").unwrap_or(("", name));
+                let (owner, _) = QualifiedName::new(&name).split_last().unwrap_or(("", name));
                 let same_scope = selector_scope.is_none_or(|scope| {
-                    owner == scope || owner.strip_suffix(scope).is_some_and(|p| p.ends_with("::"))
+                    owner == scope || QualifiedName::new(owner).strip_tail(scope).is_some()
                 });
                 let score = selector_suggestion_score(name, &segments).or_else(|| {
                     // An exact declaration path under a different module is a
@@ -1487,16 +1479,16 @@ fn normalize_local_suggestions(suggestions: &mut [String], locals: impl Iterator
 
 /// Compare only the declaration suffix, without allocating or rescanning paths.
 fn wrong_module_suggestion(name: &str, module: &str, selector: &str) -> bool {
-    name.strip_prefix(module)
-        .filter(|suffix| suffix.starts_with("::"))
-        .and_then(|suffix| selector.strip_suffix(suffix))
+    QualifiedName::new(name)
+        .strip_qualifier(module)
+        .and_then(|item| QualifiedName::new(selector).strip_tail(item))
         .is_some_and(|prefix| !prefix.is_empty() && prefix != module)
 }
 
 /// Compare aligned path segments from the leaf, permitting the same omitted
 /// module prefix as exact resolution. Each segment is visited at most once.
 fn selector_suggestion_score(name: &str, segments: &[(&str, Vec<char>)]) -> Option<usize> {
-    let mut names = name.rsplit("::");
+    let mut names = QualifiedName::new(name).rev_segments();
     let mut score = 0;
     for (wanted, chars) in segments.iter().rev() {
         #[cfg(test)]

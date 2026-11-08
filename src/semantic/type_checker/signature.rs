@@ -3,6 +3,7 @@
 //! before this pass; ABI templates only substitute their storage representation.
 use super::*;
 use crate::compiler_db::checks::{CheckInput, CheckKind, CheckRecord, CheckValue, SignatureState};
+use crate::qualified_name::QualifiedName;
 use crate::semantic::symbols::{FuncInfo, SymbolReadCapture};
 use serde_json::{Value, json};
 
@@ -59,9 +60,11 @@ impl TypeChecker {
             CheckInput::SignatureSymbol(read) => self.symbols.symbol_value(read),
             CheckInput::SignatureType(name, file) => {
                 let template = self.generics.classes.get(name);
-                let module = name.rsplit_once("::").map(|(module, _)| module);
-                let std_module = name
-                    .split_once("::")
+                let module = QualifiedName::new(&name)
+                    .split_last()
+                    .map(|(module, _)| module);
+                let std_module = QualifiedName::new(name)
+                    .split_first()
                     .and_then(|(module, _)| self.imported_std_modules.get(module));
                 let collection = (name == "Array").then(|| {
                     json!([

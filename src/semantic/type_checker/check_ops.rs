@@ -1,5 +1,6 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
+use crate::qualified_name::QualifiedName;
 
 use super::*;
 
@@ -584,7 +585,7 @@ impl TypeChecker {
     /// or enum) from another module (willow-7ihl). A module-qualified name
     /// contains `::`; same-module references are unqualified and never checked.
     pub(super) fn check_type_visibility(&mut self, name: &str, span: Span) {
-        let Some((namespace, _)) = name.rsplit_once("::") else {
+        let Some((namespace, _)) = QualifiedName::new(&name).split_last() else {
             return;
         };
         // A module's own declarations carry its canonical identity now
@@ -604,7 +605,7 @@ impl TypeChecker {
             return;
         };
         if is_private {
-            let simple = name.rsplit("::").next().unwrap_or(name);
+            let simple = QualifiedName::new(&name).last_segment();
             self.push(
                 Diagnostic::new(
                     Severity::Error,

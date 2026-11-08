@@ -1,6 +1,7 @@
 //! Source-like type spellings for query results. The `ty` wire tree stays the
 //! compiler's exact value; `type_display` is a readable, canonical projection.
 use super::*;
+use crate::qualified_name::QualifiedName;
 
 /// Canonical names: `$pkg<hash>::m::T` of the root package becomes `m::T`,
 /// a dependency's becomes `<package>::m::T`, and a bare name that the context
@@ -31,10 +32,10 @@ impl TypeNames {
             .map(|m| &m.identity.package);
         let canonical = |identity: &SymbolIdentity| {
             if Some(&identity.package) == root {
-                format!("{}::{}", identity.module, identity.symbol)
+                QualifiedName::join(&identity.module, &identity.symbol)
             } else {
                 let package = &identity.package.name;
-                format!("{package}::{}::{}", identity.module, identity.symbol)
+                QualifiedName::from_segments([package.as_str(), &identity.module, &identity.symbol])
             }
         };
         let is_type =
@@ -96,20 +97,20 @@ impl TypeNames {
     }
 
     pub(super) fn name(&self, name: &str, module: Option<&str>) -> String {
-        if let Some(path) = name.strip_prefix("$local::") {
+        if let Some(path) = QualifiedName::new(name).strip_qualifier("$local") {
             return path.to_owned();
         }
         if let Some(rest) = name.strip_prefix("$pkg")
-            && let Some((hash, path)) = rest.split_once("::")
+            && let Some((hash, path)) = QualifiedName::new(rest).split_first()
         {
             return match self.packages.get(&format!("$pkg{hash}")) {
-                Some(Some(package)) => format!("{package}::{path}"),
+                Some(Some(package)) => QualifiedName::join(package, path),
                 Some(None) => path.to_owned(),
                 None => name.to_owned(),
             };
         }
         match module {
-            Some(module) if !name.contains("::") => self
+            Some(module) if !QualifiedName::new(&name).is_qualified() => self
                 .local
                 .get(&(module.to_owned(), name.to_owned()))
                 .cloned()

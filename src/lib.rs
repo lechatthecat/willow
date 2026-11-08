@@ -8,6 +8,7 @@ pub mod backend;
 pub mod compiler_db;
 pub mod rust_bridge;
 mod workspace_transaction;
+use crate::qualified_name::QualifiedName;
 use compiler_db::dependencies::ModuleDependencies;
 pub(crate) mod compiler_stack;
 pub mod desugar;
@@ -22,6 +23,7 @@ pub mod package;
 pub mod parser;
 pub mod prelude;
 pub mod project;
+pub(crate) mod qualified_name;
 mod query_stats;
 pub mod semantic;
 pub mod stdlib_schema;
@@ -1061,7 +1063,7 @@ fn run_frontend_revision_cached(
                 parser::ast::Item::Class(c) => (
                     c.span.file_id,
                     if item.method_only {
-                        format!("{}::{}", c.name, c.methods[0].name)
+                        QualifiedName::join(&c.name, &c.methods[0].name)
                     } else {
                         c.name.clone()
                     },
@@ -1156,7 +1158,7 @@ fn run_frontend_revision_cached(
         if components.last().is_some_and(|s| s == "mod") {
             components.pop();
         }
-        let path = components.join("::");
+        let path = QualifiedName::from_segments(components);
         artifacts.body_index_mut().set_symbol_module(
             module::UnitId::ENTRY,
             semantic::ids::SymbolModule::new(package.identity.clone(), module::ModulePath(path)),
@@ -1222,7 +1224,8 @@ fn run_frontend_revision_cached(
                 });
                 let mut symbol = symbol.clone();
                 if !namespace.is_empty() {
-                    symbol.willow_function = format!("{namespace}::{}", symbol.willow_function);
+                    symbol.willow_function =
+                        QualifiedName::join(&namespace, &symbol.willow_function);
                 }
                 db.rust_bridge_symbols
                     .push(((f.span.file_id.0, f.name.clone()), symbol.bind(identity)));
@@ -1693,7 +1696,7 @@ impl<'a> ModuleImportBindings<'a> {
                 let access = import
                     .alias
                     .as_deref()
-                    .unwrap_or_else(|| path.rsplit("::").next().unwrap_or(path));
+                    .unwrap_or_else(|| QualifiedName::new(path).last_segment());
                 if spellings_seen.insert((id, access)) {
                     imported.entry(id).or_default().push(access);
                 }
@@ -1702,7 +1705,7 @@ impl<'a> ModuleImportBindings<'a> {
             // Single item: `import math::add;`, `import math::add as plus;`. The
             // module also answers to the consumer's full path so the item
             // lookup can find it without losing the package alias.
-            let Some((module_path, item)) = path.rsplit_once("::") else {
+            let Some((module_path, item)) = QualifiedName::new(path).split_last() else {
                 continue;
             };
             #[cfg(test)]
@@ -1763,7 +1766,7 @@ fn prepare_module_registration(
                 checker.array_abi_files.insert(class.span.file_id);
                 checker.array_classes.insert(
                     storage.clone(),
-                    format!("{}::{}", module.identity_path(), class.name),
+                    QualifiedName::join(module.identity_path(), &class.name),
                 );
             }
         }
@@ -1862,16 +1865,13 @@ fn imported_nonpreemptible_method_owners(
         let (dependency, access, direct_item) = if let Some(dependency) =
             by_path.get(&import.path).map(|&index| &modules[index])
         {
-            let access = import.alias.as_deref().unwrap_or_else(|| {
-                import
-                    .path
-                    .rsplit("::")
-                    .next()
-                    .unwrap_or(import.path.as_str())
-            });
+            let access = import
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
             (dependency, access, None)
         } else {
-            let Some((module_path, item)) = import.path.rsplit_once("::") else {
+            let Some((module_path, item)) = QualifiedName::new(&import.path).split_last() else {
                 continue;
             };
             let Some(dependency) = by_path.get(module_path).map(|&index| &modules[index]) else {
@@ -1937,7 +1937,8 @@ fn check_unit_concurrency(
         for item in &modules[*id].program.items {
             if let parser::ast::Item::Class(class) = item {
                 for access in spellings {
-                    analyzer = analyzer.with_reference_class(format!("{access}::{}", class.name));
+                    analyzer =
+                        analyzer.with_reference_class(QualifiedName::join(access, &class.name));
                 }
             }
         }
@@ -2170,7 +2171,7 @@ impl DiagnosticModuleIndex {
                             if package.id == packages.root {
                                 String::new()
                             } else {
-                                format!("{}::", package.identity.name)
+                                QualifiedName::prefix(&package.identity.name)
                             },
                         )
                     })
@@ -2478,7 +2479,7 @@ impl<'p> ForeignDefaults<'p> {
                 _ => None,
             })
             .map(|name| normalized(name))
-            .filter(|name| !name.contains("::"))
+            .filter(|name| !QualifiedName::new(&name).is_qualified())
             .map(|name| semantic::ids::TypeId::from_source_name(&name))
             .collect();
         for (&provider, classes) in &self.providers {
@@ -2578,7 +2579,7 @@ impl ForeignBatch {
                 })
                 .chain(scope.imports.iter().map(|import| {
                     (import.alias.as_deref())
-                        .unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path))
+                        .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment())
                 }))
                 .collect();
             self.bare
@@ -2594,7 +2595,7 @@ impl ForeignBatch {
                     &semantic::ids::foreign_receiver_name(&name),
                 );
             }
-            match (name.strip_prefix(identity)).and_then(|name| name.strip_prefix("::")) {
+            match QualifiedName::new(&name).strip_qualifier(identity) {
                 Some(local) if interfaces.contains(local) => {
                     semantic::ids::TypeId::from_source_name(local)
                 }
@@ -2621,7 +2622,8 @@ impl ForeignBatch {
         }
         (self.classes.iter())
             .filter(|(id, _)| {
-                id.foreign_receiver_target().is_some() || !id.to_string().contains("::")
+                id.foreign_receiver_target().is_some()
+                    || !QualifiedName::new(&id.to_string()).is_qualified()
             })
             .flat_map(|(id, info)| info.methods.keys().map(|name| (*id, name.as_str())))
             .collect()
@@ -2763,9 +2765,8 @@ impl ForeignBatch {
             // A respelled receiver is compiled under its key: its bare name
             // could mean the declaring unit's own type here, `self` included
             // (willow-kptd). The symbols are the same either way.
-            let name = match receiver
-                .key
-                .starts_with(semantic::ids::FOREIGN_RECEIVER_PREFIX)
+            let name = match QualifiedName::new(&receiver.key)
+                .has_qualifier(semantic::ids::FOREIGN_RECEIVER_NAMESPACE)
             {
                 true => &receiver.key,
                 false => &receiver.name,
@@ -3522,8 +3523,8 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
             lowering_diagnostics.extend(gaps);
             for mut class in lowered.classes {
                 // A respelled receiver is shown with its class (willow-nvi6).
-                if let Some(bare) =
-                    (class.name.to_string()).strip_prefix(semantic::ids::FOREIGN_RECEIVER_PREFIX)
+                if let Some(bare) = QualifiedName::new(&class.name.to_string())
+                    .strip_qualifier(semantic::ids::FOREIGN_RECEIVER_NAMESPACE)
                 {
                     class.name = semantic::ids::TypeId::from_source_name(bare);
                 }

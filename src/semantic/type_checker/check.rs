@@ -2,6 +2,7 @@
 //! stays `pub` (the entry point); the rest are `pub(super)`. As a child module
 //! these reach `TypeChecker`'s private fields/methods.
 
+use crate::qualified_name::QualifiedName;
 use std::collections::HashMap;
 
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
@@ -415,12 +416,7 @@ impl TypeChecker {
             .map(|import| {
                 (
                     import.alias.clone().unwrap_or_else(|| {
-                        import
-                            .path
-                            .rsplit("::")
-                            .next()
-                            .unwrap_or(&import.path)
-                            .to_string()
+                        QualifiedName::new(&import.path).last_segment().to_string()
                     }),
                     import.path.clone(),
                 )
@@ -2691,7 +2687,7 @@ impl TypeChecker {
             );
             return result;
         }
-        let generic_name = format!("{}::{}", s.class, s.method);
+        let generic_name = QualifiedName::join(&s.class, &s.method);
         if self.generics.functions.contains_key(&generic_name)
             && let Some(ty) = self.check_generic_call_parts(
                 &generic_name,
@@ -3758,15 +3754,20 @@ impl TypeChecker {
                         .imported_std_modules
                         .get(&call.class)
                         .is_some_and(|module| module.module == "fs");
-                (is_fs && sync_method(&call.method))
-                    .then(|| format!("{}::{}_async", call.class, call.method))
+                (is_fs && sync_method(&call.method)).then(|| {
+                    QualifiedName::join(&call.class, format_args!("{}_async", call.method))
+                })
             }
             Expr::Call(call) => self
                 .imported_blocking_std_functions
                 .get(&call.callee)
-                .and_then(|operation| operation.rsplit_once("::").map(|(_, method)| method))
+                .and_then(|operation| {
+                    QualifiedName::new(operation)
+                        .split_last()
+                        .map(|(_, method)| method)
+                })
                 .filter(|method| sync_method(method))
-                .map(|method| format!("fs::{method}_async")),
+                .map(|method| QualifiedName::join("fs", format_args!("{method}_async"))),
             _ => None,
         }
     }

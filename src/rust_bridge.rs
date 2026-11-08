@@ -1,6 +1,7 @@
 //! Bridge type IR shared by declarations, adapters, and metadata.
 //! `Scalar` retains its R2 public name for API compatibility.
 use crate::parser::ast::Type;
+use crate::qualified_name::QualifiedName;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
@@ -116,7 +117,7 @@ impl RustBridgeSymbol {
         // digest of the full Willow name/signature, avoiding namespace and
         // signature collisions without lossy identifier escaping.
         let package_hash = Sha256::digest(identity.as_bytes());
-        let name = self.willow_function.rsplit("::").next().unwrap();
+        let name = QualifiedName::new(&self.willow_function).last_segment();
         bound.abi_symbol = format!(
             "__willow_rust_{:x}_{name}_{:x}",
             crate::hex::Hex(&package_hash),
@@ -167,7 +168,7 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
             aggregate_wrapper(&mut source, symbol, revision);
             continue;
         }
-        let target = symbol.willow_function.rsplit("::").next().unwrap();
+        let target = QualifiedName::new(&symbol.willow_function).last_segment();
         write!(
             source,
             "#[unsafe(no_mangle)]\npub extern \"C\" fn {}(",

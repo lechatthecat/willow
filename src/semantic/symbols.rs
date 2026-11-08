@@ -4,6 +4,7 @@ mod task_dispatch;
 use crate::diagnostics::Span;
 use crate::module::ModuleId;
 use crate::parser::ast::{ParamMode, Type};
+use crate::qualified_name::QualifiedName;
 use crate::semantic::ids::{FunctionId, FunctionMap, TypeId};
 use std::{collections::HashMap, rc::Rc};
 
@@ -68,7 +69,9 @@ fn nominal_key_into(span: Span, declared: &str, key: &mut String) {
     let base = declared
         .split_once("$mono$")
         .map_or(declared, |(base, _)| base);
-    let base = base.rsplit_once("::").map_or(base, |(_, name)| name);
+    let base = QualifiedName::new(&base)
+        .split_last()
+        .map_or(base, |(_, name)| name);
     let _ = write!(key, "@{}:{base}", span.file_id.0);
 }
 
@@ -726,7 +729,7 @@ impl SymbolTable {
                     // spelling the unit wrote.
                     .filter(|(alias, _)| {
                         let alias = alias.to_string();
-                        !alias.contains("::") && !alias.starts_with('$')
+                        !QualifiedName::new(&alias).is_qualified() && !alias.starts_with('$')
                     })
                     .map(|(_, info)| info.name.clone())
                     .collect()

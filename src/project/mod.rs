@@ -1,3 +1,4 @@
+use crate::qualified_name::QualifiedName;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -146,7 +147,7 @@ impl ProjectManifest {
 }
 
 fn is_reserved_package_name(name: &str) -> bool {
-    name == "std" || name.starts_with("std.") || name.starts_with("std::")
+    name == "std" || name.starts_with("std.") || QualifiedName::new(name).has_qualifier("std")
 }
 
 /// Locate a `project.toml` by walking up from `start_dir`.

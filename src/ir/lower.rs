@@ -21,6 +21,7 @@
 //! rather than silently dropping work, so later slices can extend coverage
 //! incrementally without changing behavior.
 
+use crate::qualified_name::QualifiedName;
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Severity, Span};
@@ -299,7 +300,7 @@ impl<'a> PartialCheckerTables<'a> {
         };
         let resolved = identity(name)?;
         let target = resolved.0;
-        if target == name || target.contains("::") || target.starts_with('$') {
+        if target == name || QualifiedName::new(&target).is_qualified() || target.starts_with('$') {
             return None;
         }
         (identity(target)? != resolved).then(|| crate::semantic::ids::foreign_receiver_name(target))
@@ -906,10 +907,7 @@ impl Classes {
     /// The key a class's `extends` target has in this table: a local name as
     /// written, a qualified path with its module kept (willow-ejg5).
     fn base_key(base: &TypePath) -> String {
-        match base {
-            TypePath::Local(name) => name.clone(),
-            TypePath::Qualified(parts) => parts.join("::"),
-        }
+        base.spelling()
     }
 
     /// Walk the base-class chain from `class`, returning the first member type
@@ -3661,7 +3659,7 @@ fn lower_resolution_partial(
             let access = import
                 .alias
                 .as_deref()
-                .unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path));
+                .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
             if !matches!(access, "f64" | "i64") {
                 out.namespaces.remove(&TypeId::local(access));
             }
@@ -3721,12 +3719,10 @@ fn lower_resolution_partial(
                         .iter()
                         .map(|ty| tables.normalize(ty).into())
                         .collect(),
-                    base: c.base_class.as_ref().map(|base| {
-                        canonical(&match base {
-                            crate::parser::ast::TypePath::Local(name) => name.clone(),
-                            crate::parser::ast::TypePath::Qualified(parts) => parts.join("::"),
-                        })
-                    }),
+                    base: c
+                        .base_class
+                        .as_ref()
+                        .map(|base| canonical(&base.spelling())),
                     ..HirClassInfo::default()
                 };
                 for field in &c.fields {

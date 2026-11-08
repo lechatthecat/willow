@@ -1,5 +1,6 @@
 //! Bounded source structure projected from a single compiler query session.
 use super::{direct::DirectSession, symbols::Symbol};
+use crate::qualified_name::QualifiedName;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -152,7 +153,7 @@ impl Overview {
                 .with_extension("");
             output.files.push(File {
                 path: display(Path::new(path)),
-                module: module.to_string_lossy().replace(['/', '\\'], "::"),
+                module: QualifiedName::from_segments(module.to_string_lossy().split(['/', '\\'])),
                 symbols: Vec::new(),
                 counts: Counts::default(),
             });
@@ -205,7 +206,7 @@ impl Overview {
             let owner = symbol
                 .source_name
                 .as_deref()
-                .and_then(|s| s.rsplit_once("::"))
+                .and_then(|s| QualifiedName::new(s).split_last())
                 .map(|(o, _)| o);
             if let Some(&index) = owner.and_then(|o| owners.get(&(file, o))) {
                 children[index].push(symbol);
@@ -359,12 +360,7 @@ fn entry(session: &DirectSession, symbol: &Symbol) -> Entry {
             .render(ty, symbol.identity.as_ref().map(|i| i.module.as_str()))
     };
     Entry {
-        name: symbol
-            .name
-            .rsplit("::")
-            .next()
-            .unwrap_or(&symbol.name)
-            .into(),
+        name: QualifiedName::new(&symbol.name).last_segment().into(),
         kind: symbol.kind.clone(),
         selector: session.selector(symbol),
         is_async: symbol.details.is_async,

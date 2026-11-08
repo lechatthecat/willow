@@ -2,6 +2,7 @@
 //! searches, and shares remote metadata across equivalent direct dependencies.
 use super::{CommandError, GitSource, PackageSource, PathSource, SystemGit, inspect_packages};
 use crate::project::{DependencySource, GitSelector};
+use crate::qualified_name::QualifiedName;
 use anyhow::Result;
 use serde::Serialize;
 use std::{
@@ -87,7 +88,7 @@ fn tidy_report(packages: &super::PackageGraph, graph: &crate::module::ModuleGrap
         }
         for import in &file.program.imports {
             imports += 1;
-            let first = import.path.split("::").next().unwrap();
+            let first = QualifiedName::new(&import.path).first_segment();
             if direct.contains(first) {
                 used.insert(first);
             }

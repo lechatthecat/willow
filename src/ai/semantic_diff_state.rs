@@ -1,6 +1,7 @@
 //! Retained semantic-report projections. Updates visit the changed owners and
 //! their reverse closure; immutable maps preserve the baseline for comparison.
 use super::*;
+use crate::qualified_name::QualifiedName;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -422,11 +423,15 @@ impl Capture {
                 .get(&symbol.id)
                 .cloned()
                 .unwrap_or_else(|| {
-                    format!(
-                        "{}::{}::{}#0",
-                        relative(&location.path, &patch.workspace),
-                        symbol.kind,
-                        symbol.source_name.as_deref().unwrap_or(&symbol.name)
+                    QualifiedName::join(
+                        QualifiedName::joined(
+                            relative(&location.path, &patch.workspace),
+                            &symbol.kind,
+                        ),
+                        format_args!(
+                            "{}#0",
+                            symbol.source_name.as_deref().unwrap_or(&symbol.name)
+                        ),
                     )
                 });
             next.retained.ids.insert(symbol.id.clone(), key.clone());
@@ -463,11 +468,11 @@ impl Capture {
         // Establish all new function identities before resolving their edges.
         for f in &patch.functions {
             if !next.retained.ids.contains_key(&f.id) {
-                let key = format!(
-                    "{}::function::{}",
-                    relative(&f.module, &patch.workspace),
-                    f.name
-                );
+                let key = QualifiedName::from_segments([
+                    relative(&f.module, &patch.workspace).as_str(),
+                    "function",
+                    &f.name,
+                ]);
                 next.retained.ids.insert(f.id.clone(), key.clone());
                 next.baseline.facts.insert(
                     key,

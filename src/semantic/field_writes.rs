@@ -28,6 +28,7 @@
 //! may be `&mut`. The analysis over-approximates writes (never misses one), so
 //! it can only make fewer classes `Sync`.
 
+use crate::qualified_name::QualifiedName;
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{FileId, Span};
@@ -111,7 +112,7 @@ impl FieldWrites {
                 let qualified = if namespace.is_empty() {
                     class.name.clone()
                 } else {
-                    format!("{namespace}::{}", class.name)
+                    QualifiedName::join(namespace, &class.name)
                 };
                 resolver.qualified.insert(qualified, id);
             }
@@ -119,7 +120,7 @@ impl FieldWrites {
                 let alias = import
                     .alias
                     .as_deref()
-                    .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+                    .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
                 resolver
                     .imports
                     .entry(import.span.file_id)
@@ -198,15 +199,16 @@ impl<'a> Resolver<'a> {
         if let Some(id) = self.local.get(&file).and_then(|classes| classes.get(name)) {
             return Some(*id);
         }
-        let (head, tail) = name
-            .split_once("::")
+        let (head, tail) = QualifiedName::new(name)
+            .split_first()
             .map_or((name, None), |(h, t)| (h, Some(t)));
         if let Some(path) = self
             .imports
             .get(&file)
             .and_then(|imports| imports.get(head))
         {
-            let qualified = tail.map_or_else(|| path.clone(), |tail| format!("{path}::{tail}"));
+            let qualified =
+                tail.map_or_else(|| path.clone(), |tail| QualifiedName::join(path, tail));
             return self.qualified_class(file, &qualified);
         }
         self.qualified_class(file, name)
@@ -216,7 +218,7 @@ impl<'a> Resolver<'a> {
         if let Some(id) = self.qualified.get(name) {
             return Some(*id);
         }
-        let (module, class) = name.rsplit_once("::")?;
+        let (module, class) = QualifiedName::new(&name).split_last()?;
         let unit = self
             .dependencies?
             .unit_for_path(crate::module::ModuleId(file.0), module)?;

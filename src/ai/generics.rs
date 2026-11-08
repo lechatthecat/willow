@@ -1,6 +1,7 @@
 //! Source declaration provenance retained across monomorphization for AI queries.
 use super::*;
 use crate::parser::ast::ImportDecl;
+use crate::qualified_name::QualifiedName;
 use crate::semantic::analysis_symbols::{Declaration, Facts};
 
 #[derive(Default)]
@@ -66,7 +67,7 @@ impl Source {
                     continue;
                 }
                 (item, item.span)
-            } else if let Some((owner, _)) = name.rsplit_once("::") {
+            } else if let Some((owner, _)) = QualifiedName::new(&name).split_last() {
                 let Some(class) = self.items.get(owner) else {
                     continue;
                 };
@@ -197,7 +198,8 @@ impl Source {
                 }
                 Item::Class(c) => {
                     for m in &c.methods {
-                        callables.insert(m.span, (format!("{}::{}", c.name, m.name), m.body.span));
+                        callables
+                            .insert(m.span, (QualifiedName::join(&c.name, &m.name), m.body.span));
                     }
                 }
                 _ => {}
@@ -251,9 +253,9 @@ pub(super) fn restore(
     for source in sources.values() {
         for (generated, ty) in &source.logical_types {
             let identity = match ty {
-                Type::Generic(name, _) => name
-                    .rsplit_once("::")
-                    .map(|(prefix, _)| format!("{prefix}::{generated}")),
+                Type::Generic(name, _) => QualifiedName::new(name)
+                    .qualifier()
+                    .map(|prefix| QualifiedName::join(prefix, generated)),
                 _ => None,
             };
             if let Some(identity) = identity {
@@ -284,7 +286,7 @@ pub(super) fn restore(
             let name = i
                 .alias
                 .as_deref()
-                .unwrap_or_else(|| i.path.rsplit("::").next().unwrap());
+                .unwrap_or_else(|| QualifiedName::new(&i.path).last_segment());
             (i.span, Declaration::new(name, "import", i.span, None))
         })
         .collect();
@@ -313,14 +315,11 @@ pub(super) fn restore(
                     .cloned()
             })
             .map_names(|name| {
-                name.split("::")
-                    .map(|segment| {
-                        segment
-                            .split_once("$mono$")
-                            .map_or(segment, |(source, _)| source)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("::")
+                QualifiedName::from_segments(QualifiedName::new(&name).segments().map(|segment| {
+                    segment
+                        .split_once("$mono$")
+                        .map_or(segment, |(source, _)| source)
+                }))
             })
         };
         let restore = |d: &mut Declaration| {
@@ -353,7 +352,7 @@ pub(super) fn restore(
                 && crate::semantic::ids::has_internal_module_prefix(&r.written)
                 && written
                     .get(&(r.span.file_id.0, r.span.start))
-                    .is_some_and(|source| !source.contains("::")))
+                    .is_some_and(|source| !QualifiedName::new(&source).is_qualified()))
         });
         for r in &mut capture.symbols.references {
             let generic_callable = matches!(r.target.kind.as_str(), "function" | "method")
@@ -406,7 +405,7 @@ pub(super) fn restore(
                 let name = import
                     .alias
                     .as_deref()
-                    .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+                    .unwrap_or_else(|| QualifiedName::new(&import.path).last_segment());
                 capture.symbols.declarations.push(Declaration::new(
                     name,
                     "import",
@@ -474,7 +473,7 @@ pub(super) fn restore(
 pub(super) const UNINSTANTIATED: &str = "uninstantiated-generic-template";
 
 fn callable(name: &str) -> FunctionId {
-    name.rsplit_once("::").map_or_else(
+    QualifiedName::new(&name).split_last().map_or_else(
         || FunctionId::free(name),
         |(owner, name)| FunctionId::method(TypeId::local(owner), name),
     )
@@ -487,11 +486,12 @@ pub(super) fn source_spelling(name: &str) -> String {
     {
         return format!("<lambda {}@{location}", source_spelling(owner));
     }
-    name.split("::")
-        .filter(|s| !s.starts_with("$pkg") && *s != "$local")
-        .map(|s| s.split_once("$mono$").map_or(s, |(source, _)| source))
-        .collect::<Vec<_>>()
-        .join("::")
+    QualifiedName::from_segments(
+        QualifiedName::new(name)
+            .segments()
+            .filter(|s| !s.starts_with("$pkg") && *s != "$local")
+            .map(|s| s.split_once("$mono$").map_or(s, |(source, _)| source)),
+    )
 }
 
 /// Merge instantiations into their source functions. Returns each original
