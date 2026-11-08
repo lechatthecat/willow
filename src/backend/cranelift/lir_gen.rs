@@ -25,6 +25,7 @@
 //! cleanup graphs are replayed with their captured locals and fresh region state.
 
 use super::class_view::ClassTables;
+use super::emit_option_result::ResultSide;
 use super::function_index::FunctionMap;
 use super::{FlatReferenceDebug, ModuleSymbols};
 use crate::semantic::ids::SemanticType as Type;
@@ -3203,8 +3204,8 @@ fn option_result_method(recv: &Type, method: &str, args: &[Type]) -> Option<Type
             // `Result::Ok(5)` written with nothing to infer `E` from records
             // `Result<i64, void>`, and requiring a non-void one here took the
             // whole enclosing function out of LIR for a receiver
-            // whose error type the emitter never reads
-            // (`emit_result_and_then` takes only the ok type) — willow-0g8j.3.
+            // whose error type `emit_result_chain_side` reads only to
+            // rewrap a pass-through `Err` whose representation changes.
             "and_then" => {
                 let produced = one_fn(&[payload(0)?])?;
                 let (ok, _) = builtin_types::binary_args(&produced, B::Result)?;
@@ -8127,22 +8128,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_option_or_else(recv, &ok_ty, f_val, &f_ty)
             }
             (B::Result, "map") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                let produced = fn_return_type(&f_ty);
-                self.emit_result_map(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
+                let (f_val, f_ty) = (args[0], &arg_types[0]);
+                self.emit_result_map_side(ResultSide::Ok, recv, &ok_ty, &err_ty, f_val, f_ty)
             }
             (B::Result, "map_err") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                let produced = fn_return_type(&f_ty);
-                self.emit_result_map_err(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
+                let (f_val, f_ty) = (args[0], &arg_types[0]);
+                self.emit_result_map_side(ResultSide::Err, recv, &ok_ty, &err_ty, f_val, f_ty)
             }
             (B::Result, "and_then") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                self.emit_result_and_then(recv, &ok_ty, &err_ty, f_val, &f_ty)
+                let (f_val, f_ty) = (args[0], &arg_types[0]);
+                self.emit_result_chain_side(ResultSide::Ok, recv, &ok_ty, &err_ty, f_val, f_ty)
             }
             (B::Result, "or_else") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                self.emit_result_or_else(recv, &ok_ty, &err_ty, f_val, &f_ty)
+                let (f_val, f_ty) = (args[0], &arg_types[0]);
+                self.emit_result_chain_side(ResultSide::Err, recv, &ok_ty, &err_ty, f_val, f_ty)
             }
             _ => unreachable!("unsupported `{method}` on an Option/Result passed eligibility"),
         };

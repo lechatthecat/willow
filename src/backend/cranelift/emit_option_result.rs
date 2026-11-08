@@ -345,21 +345,75 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.use_var(result_var)
     }
 
-    /// Emit Result<T,E>.map(f) where f: fn(T) -> U → Result<U, E>
-    pub(super) fn emit_result_map(
+    /// Emit `Result<T,E>.map(f)` (`side == Ok`, `f: fn(T) -> U`, giving
+    /// `Result<U, E>`) or `Result<T,E>.map_err(f)` (`side == Err`,
+    /// `f: fn(E) -> F`, giving `Result<T, F>`). The arm named by `side` calls
+    /// `f` and rewraps its result; the other arm rewraps its payload unchanged.
+    pub(super) fn emit_result_map_side(
         &mut self,
+        side: ResultSide,
         ptr: cranelift_codegen::ir::Value,
         ok_ty: &Type,
         err_ty: &Type,
-        ret_ty: &Type,
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let output_ty = Type::Generic(
-            "Result".to_string().into(),
-            vec![ret_ty.clone(), err_ty.clone()],
-        );
-        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
+        let ret_ty = &callback_return_type(f_ty);
+        let type_args = match side {
+            ResultSide::Ok => vec![ret_ty.clone(), err_ty.clone()],
+            ResultSide::Err => vec![ok_ty.clone(), ret_ty.clone()],
+        };
+        let output_ty = Type::Generic("Result".to_string().into(), type_args);
+        self.emit_result_arms(ptr, &output_ty, |this, arm| {
+            let arm_ty = arm.payload_ty(ok_ty, err_ty);
+            let payload = this.emit_result_arm_payload(ptr, arm_ty);
+            if arm == side {
+                let result = this.emit_indirect_call(f_val, f_ty, &[payload]);
+                this.emit_alloc_result_variant(&output_ty, arm.tag(), ret_ty, result)
+            } else {
+                this.emit_alloc_result_variant(&output_ty, arm.tag(), arm_ty, payload)
+            }
+        })
+    }
+
+    /// Emit `Result<T,E>.and_then(f)` (`side == Ok`, `f: fn(T) -> Result<U,E>`)
+    /// or `Result<T,E>.or_else(f)` (`side == Err`, `f: fn(E) -> Result<T,F>`).
+    /// The arm named by `side` returns `f`'s result; the other arm passes the
+    /// receiver through, rewrapping it only when the output representation
+    /// differs from the receiver's.
+    pub(super) fn emit_result_chain_side(
+        &mut self,
+        side: ResultSide,
+        ptr: cranelift_codegen::ir::Value,
+        ok_ty: &Type,
+        err_ty: &Type,
+        f_val: cranelift_codegen::ir::Value,
+        f_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let output_ty = callback_return_type(f_ty);
+        self.emit_result_arms(ptr, &output_ty, |this, arm| {
+            let arm_ty = arm.payload_ty(ok_ty, err_ty);
+            if arm == side {
+                let payload = this.emit_result_arm_payload(ptr, arm_ty);
+                this.emit_indirect_call(f_val, f_ty, &[payload])
+            } else if this.builder.func.dfg.value_type(ptr) == this.clif_type(&output_ty) {
+                ptr
+            } else {
+                let payload = this.emit_result_arm_payload(ptr, arm_ty);
+                this.emit_alloc_result_variant(&output_ty, arm.tag(), arm_ty, payload)
+            }
+        })
+    }
+
+    /// Branch on a `Result` receiver's tag, emit the `Ok` arm then the `Err`
+    /// arm with `emit_arm`, and merge their values into one `output_ty` value.
+    fn emit_result_arms(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        output_ty: &Type,
+        mut emit_arm: impl FnMut(&mut Self, ResultSide) -> cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let result_var = self.builder.declare_var(self.clif_type(output_ty));
         let tag = self.emit_load_enum_tag(ptr);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
@@ -371,174 +425,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .ins()
             .brif(is_ok, ok_block, &[], err_block, &[]);
 
-        self.builder.switch_to_block(ok_block);
-        self.builder.seal_block(ok_block);
-        let raw = self.emit_enum_payload_bits(ptr, ok_ty);
-        let payload = self.coerce_i64_to(raw, ok_ty);
-        let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
-        let new_ok = self.emit_alloc_result_variant(&output_ty, 0, ret_ty, result);
-        self.builder.def_var(result_var, new_ok);
-        self.builder.ins().jump(merge, &[]);
-
-        self.builder.switch_to_block(err_block);
-        self.builder.seal_block(err_block);
-        let err_raw = self.emit_enum_payload_bits(ptr, err_ty);
-        let payload = self.coerce_i64_to(err_raw, err_ty);
-        let new_err = self.emit_alloc_result_variant(&output_ty, 1, err_ty, payload);
-        self.builder.def_var(result_var, new_err);
-        self.builder.ins().jump(merge, &[]);
+        for (block, arm) in [(ok_block, ResultSide::Ok), (err_block, ResultSide::Err)] {
+            self.builder.switch_to_block(block);
+            self.builder.seal_block(block);
+            let value = emit_arm(self, arm);
+            self.builder.def_var(result_var, value);
+            self.builder.ins().jump(merge, &[]);
+        }
 
         self.builder.switch_to_block(merge);
         self.builder.seal_block(merge);
         self.builder.use_var(result_var)
     }
 
-    /// Emit Result<T,E>.map_err(f) where f: fn(E) -> F → Result<T, F>
-    pub(super) fn emit_result_map_err(
+    /// Read a `Result` arm's payload as a typed value.
+    fn emit_result_arm_payload(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
-        ok_ty: &Type,
-        err_ty: &Type,
-        ret_ty: &Type,
-        f_val: cranelift_codegen::ir::Value,
-        f_ty: &Type,
+        payload_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let output_ty = Type::Generic(
-            "Result".to_string().into(),
-            vec![ok_ty.clone(), ret_ty.clone()],
-        );
-        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
-        let tag = self.emit_load_enum_tag(ptr);
-        let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
-        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
-
-        let ok_block = self.builder.create_block();
-        let err_block = self.builder.create_block();
-        let merge = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(is_ok, ok_block, &[], err_block, &[]);
-
-        self.builder.switch_to_block(ok_block);
-        self.builder.seal_block(ok_block);
-        let ok_raw = self.emit_enum_payload_bits(ptr, ok_ty);
-        let payload = self.coerce_i64_to(ok_raw, ok_ty);
-        let new_ok = self.emit_alloc_result_variant(&output_ty, 0, ok_ty, payload);
-        self.builder.def_var(result_var, new_ok);
-        self.builder.ins().jump(merge, &[]);
-
-        self.builder.switch_to_block(err_block);
-        self.builder.seal_block(err_block);
-        let raw = self.emit_enum_payload_bits(ptr, err_ty);
-        let payload = self.coerce_i64_to(raw, err_ty);
-        let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
-        let new_err = self.emit_alloc_result_variant(&output_ty, 1, ret_ty, result);
-        self.builder.def_var(result_var, new_err);
-        self.builder.ins().jump(merge, &[]);
-
-        self.builder.switch_to_block(merge);
-        self.builder.seal_block(merge);
-        self.builder.use_var(result_var)
-    }
-
-    /// Emit Result<T,E>.and_then(f) where f: fn(T) -> Result<U,E>
-    pub(super) fn emit_result_and_then(
-        &mut self,
-        ptr: cranelift_codegen::ir::Value,
-        ok_ty: &Type,
-        err_ty: &Type,
-        f_val: cranelift_codegen::ir::Value,
-        f_ty: &Type,
-    ) -> cranelift_codegen::ir::Value {
-        let output_ty = match f_ty {
-            Type::Fn(_, ret) => (**ret).clone(),
-            _ => unreachable!("combinator callback must be a function"),
-        };
-        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
-        let tag = self.emit_load_enum_tag(ptr);
-        let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
-        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
-
-        let ok_block = self.builder.create_block();
-        let err_block = self.builder.create_block();
-        let merge = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(is_ok, ok_block, &[], err_block, &[]);
-
-        self.builder.switch_to_block(ok_block);
-        self.builder.seal_block(ok_block);
-        let raw = self.emit_enum_payload_bits(ptr, ok_ty);
-        let payload = self.coerce_i64_to(raw, ok_ty);
-        let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
-        self.builder.def_var(result_var, result);
-        self.builder.ins().jump(merge, &[]);
-
-        self.builder.switch_to_block(err_block);
-        self.builder.seal_block(err_block);
-        let unchanged = if self.builder.func.dfg.value_type(ptr) == self.clif_type(&output_ty) {
-            ptr
-        } else {
-            let raw = self.emit_enum_payload_bits(ptr, err_ty);
-            let payload = self.coerce_i64_to(raw, err_ty);
-            self.emit_alloc_result_variant(&output_ty, 1, err_ty, payload)
-        };
-        self.builder.def_var(result_var, unchanged);
-        self.builder.ins().jump(merge, &[]);
-
-        self.builder.switch_to_block(merge);
-        self.builder.seal_block(merge);
-        self.builder.use_var(result_var)
-    }
-
-    /// Emit Result<T,E>.or_else(f) where f: fn(E) -> Result<T,F>
-    pub(super) fn emit_result_or_else(
-        &mut self,
-        ptr: cranelift_codegen::ir::Value,
-        ok_ty: &Type,
-        err_ty: &Type,
-        f_val: cranelift_codegen::ir::Value,
-        f_ty: &Type,
-    ) -> cranelift_codegen::ir::Value {
-        let output_ty = match f_ty {
-            Type::Fn(_, ret) => (**ret).clone(),
-            _ => unreachable!("combinator callback must be a function"),
-        };
-        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
-        let tag = self.emit_load_enum_tag(ptr);
-        let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
-        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
-
-        let ok_block = self.builder.create_block();
-        let err_block = self.builder.create_block();
-        let merge = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(is_ok, ok_block, &[], err_block, &[]);
-
-        self.builder.switch_to_block(ok_block);
-        self.builder.seal_block(ok_block);
-        let unchanged = if self.builder.func.dfg.value_type(ptr) == self.clif_type(&output_ty) {
-            ptr
-        } else {
-            let raw = self.emit_enum_payload_bits(ptr, ok_ty);
-            let payload = self.coerce_i64_to(raw, ok_ty);
-            self.emit_alloc_result_variant(&output_ty, 0, ok_ty, payload)
-        };
-        self.builder.def_var(result_var, unchanged);
-        self.builder.ins().jump(merge, &[]);
-
-        self.builder.switch_to_block(err_block);
-        self.builder.seal_block(err_block);
-        let raw = self.emit_enum_payload_bits(ptr, err_ty);
-        let payload = self.coerce_i64_to(raw, err_ty);
-        let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
-        self.builder.def_var(result_var, result);
-        self.builder.ins().jump(merge, &[]);
-
-        self.builder.switch_to_block(merge);
-        self.builder.seal_block(merge);
-        self.builder.use_var(result_var)
+        let raw = self.emit_enum_payload_bits(ptr, payload_ty);
+        self.coerce_i64_to(raw, payload_ty)
     }
 
     /// Construct a scalar tagged pair, falling back to the boxed runtime layout.
@@ -656,5 +563,38 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .ins()
             .store(MemFlagsData::new(), none_tag, ptr, 0i32);
         ptr
+    }
+}
+
+/// The return type of a combinator's callback.
+fn callback_return_type(f_ty: &Type) -> Type {
+    match f_ty {
+        Type::Fn(_, ret) => (**ret).clone(),
+        _ => unreachable!("combinator callback must be a function"),
+    }
+}
+
+/// Which arm of a `Result` a combinator transforms.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResultSide {
+    Ok,
+    Err,
+}
+
+impl ResultSide {
+    /// The arm's enum tag.
+    fn tag(self) -> i64 {
+        match self {
+            ResultSide::Ok => 0,
+            ResultSide::Err => 1,
+        }
+    }
+
+    /// The arm's payload type.
+    fn payload_ty<'t>(self, ok_ty: &'t Type, err_ty: &'t Type) -> &'t Type {
+        match self {
+            ResultSide::Ok => ok_ty,
+            ResultSide::Err => err_ty,
+        }
     }
 }
