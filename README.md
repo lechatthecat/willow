@@ -11,9 +11,11 @@ Willow is statically typed and compiles to native code using [Cranelift](https:/
 
 Its premise is simple: **when a person or an AI agent changes a program, the compiler should do more than check syntax and types. It should reject certain unsafe behaviors and explain the program's semantics in a form the agent can use.**
 
+**Built for concurrent network services.** Willow is aimed at API servers and backends often written in Go or on the JVM. It combines lightweight tasks and familiar syntax with compile-time checks for specific concurrency hazards, such as unsafe task captures and waiting while holding a Willow lock.
+
 **Readable first, proven where it matters.** Willow code is meant to be read, by people and by AI agents alike. Its syntax is deliberately familiar, so anyone who knows Rust or Kotlin can follow it and agents can apply what they already know. Concurrency checks run in the compiler without adding concepts to everyday code, and proof is opt-in: mark the functions that matter with [`@verified`](#verified-prove-a-contract-with-z3) and leave the rest as ordinary code.
 
-**Status:** Experimental research/engineering project. **Not production-ready.** The guarantees below describe specific compiler-enforced properties, not a proof that arbitrary Willow programs are free of deadlocks, races, or other bugs.
+**Status:** Experimental research/engineering project. **Not production-ready.** The compiler rejects specific classes of concurrency mistakes—non-`Sync` references passed to async calls (E2402), modeled waits inside Willow lexical locks (E2604), and unsafe lock nesting or acquisition cycles (E2605)—but this is not a proof that arbitrary Willow programs are free of deadlocks, races, or other bugs. See [Current boundaries](#current-boundaries).
 
 This README describes the current `main` branch. Some features are newer than the latest prebuilt release; see [Try Willow](#try-willow).
 
@@ -72,7 +74,7 @@ async fn main() {
 
 A few things to notice:
 
-- **No ownership or lifetimes.** The garbage collector manages memory, so values can be shared freely.
+- **No ownership or lifetimes.** The garbage collector manages memory; sharing values across tasks is constrained by the compiler's inferred `Send`/`Sync` rules.
 - **No null.** Absence is `Option<T>`, and `T?` is sugar for it. Recoverable errors use `Result<T, E>` and the `?` operator.
 - **Classes are closed by default.** Inheritance needs `open`, and replacing a method needs `override`. A class without an `init` constructor can be created with its fields in declaration order.
 - **`async fn` returns a Task.** Calling one creates the Task; `await` waits for its result.
@@ -118,6 +120,59 @@ cargo build --release
 [`RELEASE_README.md`](RELEASE_README.md) covers installation, library layout, checksums and toolchain requirements.
 
 ## Concurrency: the compiler follows the wait
+
+### E2402: prevent unsafe sharing across tasks
+
+Willow infers `Send` and `Sync` structurally; user code cannot implement these
+markers manually. Calling an `async fn` captures its arguments into a Task.
+Shared reference arguments must be `Sync` even when the Task is immediately
+awaited. Mutable `Array` and `Map` values are not `Sync`, and neither is a class
+containing one:
+
+```willow
+import std::collections::Array;
+
+class Inbox { pub items: Array<i64>; }
+
+async fn add(inbox: Inbox, n: i64) {
+    inbox.items.push(n);
+}
+
+async fn main() {
+    let items: Array<i64> = [];
+    let inbox = new Inbox(items);
+    await add(inbox, 1); // error[E2402]: `Inbox` is not `Sync`
+}
+```
+
+Protect a shared mutable value with `Mutex<T>` instead:
+
+```willow
+import std::collections::Array;
+
+class Inbox { pub items: Array<i64>; }
+
+async fn add(inbox: Mutex<Inbox>, n: i64) {
+    lock inbox as data {
+        data.items.push(n);
+    }
+}
+
+async fn main() {
+    let inbox = Mutex::new(new Inbox([1, 2]));
+    await add(inbox, 3);
+}
+```
+
+`Mutex<T>` and `Channel<T>` can be shared when `T` is `Send`; `RwLock<T>`
+requires both `Send` and `Sync` because multiple readers can access its value.
+Atomics also support shared mutable state. For read-only data, `String`, scalars,
+`FrozenArray`/`FrozenMap` with `Sync` elements, and classes whose fields are all
+`Sync` and never reassigned after construction can be shared. These checks
+cover modeled task boundaries, not every possible data race.
+
+See [`send_sync.rs`](src/semantic/type_checker/send_sync.rs) and the
+[`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) tests.
 
 ### E2604: no suspension or blocking wait while holding a Willow lock
 
@@ -515,6 +570,7 @@ contract in normal compilation and exposes the same knowledge through its CLI.
 - [gopls MCP](https://go.dev/gopls/features/mcp) exposes analysis of Go programs to assistants. Willow also exposes compiler semantics, but its central argument is **language-level enforcement of particular concurrency rules**, not merely a new interface to an existing analyzer.
 - [Rust Clippy's `await_holding_lock` lint](https://rust-lang.github.io/rust-clippy/master/index.html#await_holding_lock) warns about holding certain non-async-aware guards across `await`. Willow instead rejects waiting effects inside its own lexical lock construct, including transitive calls. The two systems have different scopes; this is not a claim that Willow is generally safer than Rust.
 - [Koka](https://github.com/koka-lang/koka) illustrates that effect systems are a well-established research direction. Willow is not claiming to have invented effect tracking. Its emphasis is **connecting concrete effect checks, the native runtime, and agent-readable evidence** in one toolchain.
+- [Pony](https://www.ponylang.io/) uses actors and reference capabilities to prevent data races and avoids lock-based deadlocks by not exposing locks. Willow keeps familiar async tasks, locks, and channels, while rejecting selected cases of unsafe task sharing, waiting inside lexical locks, and cyclic or uncertain lock acquisition. Willow's guarantees are narrower; its tradeoff is a Go/Kotlin-like programming model rather than Pony's actor/capability model.
 
 ## Measurements
 
@@ -548,8 +604,9 @@ In the idle-spawn measurement, memory after parking 100,000 tasks was about **74
 
 ## Current boundaries
 
-Willow is an experimental language and compiler, **not yet suitable for production deployment**. Its effect guarantees are scoped to the supported language operations and available compiler/runtime knowledge. In particular:
+Willow is an experimental language and compiler, **not yet suitable for production deployment**. Its compiler checks and effect guarantees are scoped to supported language operations and available compiler/runtime knowledge. In particular:
 
+- E2402 checks `Send`/`Sync` constraints on async-call captures and movable Task frames, not arbitrary shared-memory accesses. Closure values are conservatively neither `Send` nor `Sync`; environment-free function pointers can be both. Foreign/native memory is outside this check.
 - E2604 prevents modeled blocking/suspending behavior in Willow lexical lock bodies; it does not prove arbitrary programs deadlock-free.
 - Conservative dynamic/indirect-call analysis may reject code that is actually safe. Unavailable evidence is not treated as proof of purity.
 - Lock-order analysis conservatively rejects uncertain identities and acquisition cycles (E2605); simultaneous acquisition handles runtime ordering of distinct objects in the same class.
