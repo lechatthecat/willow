@@ -11,7 +11,7 @@ Willow is statically typed and compiles to native code using [Cranelift](https:/
 
 Its premise is simple: **when a person or an AI agent changes a program, the compiler should do more than check syntax and types. It should reject certain unsafe behaviors and explain the program's semantics in a form the agent can use.**
 
-**Designed for API server development.** Willow was created with API servers in mind: concurrent network backends of the kind often written in Go or on the JVM. It combines lightweight tasks and familiar syntax with compile-time checks for specific concurrency hazards, such as unsafe task captures and waiting while holding a Willow lock.
+**Built for concurrent network services.** Willow is aimed at API servers and backends often written in Go or on the JVM. It combines lightweight tasks and familiar syntax with compile-time checks for specific concurrency hazards, such as unsafe task captures and waiting while holding a Willow lock.
 
 **Readable first, proven where it matters.** Willow code is meant to be read, by people and by AI agents alike. Its syntax is deliberately familiar, so anyone who knows Rust or Kotlin can follow it and agents can apply what they already know. Concurrency checks run in the compiler without adding concepts to everyday code, and proof is opt-in: mark the functions that matter with [`@verified`](#verified-prove-a-contract-with-z3) and leave the rest as ordinary code.
 
