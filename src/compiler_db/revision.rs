@@ -167,14 +167,14 @@ impl AnalysisRevision {
         );
         let snapshot_start = std::time::Instant::now();
         let changed_bodies = syntax.borrow().changed_bodies();
-        let update = if delta {
+        let update = if let Some(capture_scope) = &capture_scope {
             ai::incremental_snapshot(
                 &frontend,
                 &path,
                 &source,
                 session.project_root.as_deref(),
                 &mut snapshot_state,
-                &changed_bodies,
+                capture_scope,
             )?
         } else {
             ai::VerificationSnapshotUpdate::Full(ai::snapshot(

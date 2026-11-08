@@ -280,7 +280,16 @@ struct Plan {
     owner_checks: usize,
 }
 thread_local! { static PLAN: RefCell<Option<Rc<RefCell<Plan>>>> = const { RefCell::new(None) }; }
+/// Installs a revision's snapshot plan for the type-checker hooks below and
+/// restores the enclosing plan on drop.
+///
+/// The hooks (`record_*`, `capture_incremental`) run deep inside the frontend
+/// checking pass, which is shared with ordinary builds that never snapshot, so
+/// they reach the plan through `PLAN` instead of a parameter threaded through
+/// every checking entry point. Consumers after the frontend pass, such as
+/// [`incremental_snapshot`], take the plan explicitly from this scope.
 pub(crate) struct CaptureScope {
+    plan: Option<Rc<RefCell<Plan>>>,
     previous: Option<Rc<RefCell<Plan>>>,
 }
 impl Drop for CaptureScope {
@@ -364,7 +373,8 @@ impl VerificationSnapshotState {
             }))
         });
         CaptureScope {
-            previous: PLAN.with(|slot| slot.replace(plan)),
+            previous: PLAN.with(|slot| slot.replace(plan.clone())),
+            plan,
         }
     }
     fn current_function(&self, id: &str) -> Function {
@@ -1441,16 +1451,54 @@ fn relocate_projection(record: &mut Projection, maps: &RelocationBatch) {
     }
 }
 
+/// The frontend revision and source a snapshot is projected from.
+#[derive(Clone, Copy)]
+struct SnapshotInputs<'a> {
+    frontend: &'a crate::Frontend,
+    entry: &'a Path,
+    source: &'a str,
+    project: Option<&'a Path>,
+}
+impl SnapshotInputs<'_> {
+    fn snapshot(&self, boundary: SnapshotBoundary<'_>) -> Result<Snapshot> {
+        snapshot_with_boundary(
+            self.frontend,
+            self.entry,
+            self.source,
+            self.project,
+            boundary,
+        )
+    }
+}
+
+/// Rebuilds or patches the retained verification snapshot after a frontend
+/// revision. `scope` carries the plan the type checker recorded while this
+/// revision was checked; without retained metadata or a plan the snapshot is
+/// rebuilt in full.
 pub(crate) fn incremental_snapshot(
     frontend: &crate::Frontend,
     entry: &Path,
     source: &str,
     project: Option<&Path>,
     state: &mut VerificationSnapshotState,
-    _changed: &HashSet<BodyId>,
+    scope: &CaptureScope,
 ) -> Result<VerificationSnapshotUpdate> {
-    let plan = PLAN.with(|slot| slot.borrow().clone());
-    let own: Vec<_> = frontend
+    let inputs = SnapshotInputs {
+        frontend,
+        entry,
+        source,
+        project,
+    };
+    let own = own_effects(frontend);
+    match scope.plan.as_ref().filter(|_| state.metadata.is_some()) {
+        Some(plan) => delta_snapshot(inputs, state, &plan.borrow(), own),
+        None => full_snapshot(inputs, state, own),
+    }
+}
+
+/// Body-local runtime effects of every checked callable.
+fn own_effects(frontend: &crate::Frontend) -> Vec<(Key, u8)> {
+    frontend
         .db
         .effects
         .analysis
@@ -1463,533 +1511,252 @@ pub(crate) fn incremental_snapshot(
                 .iter()
                 .map(move |(&id, &bits)| ((unit, id), bits))
         })
-        .collect();
-    if state.metadata.is_none() || plan.is_none() {
-        let graph_keys: Vec<_> = frontend
+        .collect()
+}
+
+fn body_locations(snapshot: &Snapshot) -> HashMap<BodyId, usize> {
+    snapshot
+        .functions
+        .iter()
+        .filter_map(|function| Some((function.body_id?, function.locations.first()?.start)))
+        .collect()
+}
+
+/// The body-free projection used for synthetic owners: unresolved targets make
+/// it unknown, otherwise it has no runtime effects of its own.
+fn synthetic_function(state: &VerificationSnapshotState, id: &str) -> Function {
+    let mut function = state.current_function(id);
+    function.unknown = !function.unresolved.is_empty();
+    function.runtime_effects = if function.unknown {
+        RuntimeEffects::ALL.bits()
+    } else {
+        0
+    };
+    function
+}
+
+/// A retained callee outside the affected closure, fixed at its old value.
+fn compact_function(
+    state: &VerificationSnapshotState,
+    fixed_ids: &RefCell<HashSet<String>>,
+    id: &str,
+) -> Function {
+    fixed_ids.borrow_mut().insert(id.to_owned());
+    state.boundary_function(id)
+}
+
+/// Retained body-local effects joined with the current solved capabilities.
+fn runtime_bits(frontend: &crate::Frontend, state: &VerificationSnapshotState, key: Key) -> u8 {
+    state.own.get(&key).copied().unwrap_or(0)
+        | frontend
             .db
             .effects
-            .analysis
-            .borrow()
-            .as_ref()
-            .into_iter()
-            .flat_map(|captures| captures.iter())
-            .flat_map(|(&unit, capture)| capture.graph.ids().map(move |id| (unit, *id)))
-            .collect();
-        let mut indirect = super::incremental_indirect::State::default();
-        if let Some(captures) = frontend.db.effects.analysis.borrow().as_ref() {
-            indirect.seed(captures);
-        }
-        let dispatch = RefCell::new(None);
-        let instances = RefCell::new(Vec::new());
-        let full = snapshot_with_boundary(
-            frontend,
-            entry,
-            source,
-            project,
-            SnapshotBoundary {
-                instances: Some(&instances),
-                dispatch: Some(&dispatch),
-                ..SnapshotBoundary::default()
-            },
-        )?;
-        let (metadata, records) = split(&full);
-        *state = VerificationSnapshotState::default();
-        state.dispatch = dispatch.into_inner();
-        state.indirect = indirect;
-        state.replace_instances(instances.into_inner(), &HashSet::new());
-        state.bytes = bounded_encoded(&serde_json::to_value(&metadata)?)?;
-        state.header = Some(Header::from(&full));
-        for symbol in &full.semantic.symbols {
-            if !symbol.id.starts_with("builtin:") {
-                state
-                    .symbol_types
-                    .insert(symbol.id.clone(), Arc::new(symbol.ty.clone()));
-            }
-        }
-        state.metadata = Some(Arc::new(metadata));
-        for (id, record) in records {
-            let size = encoded(&record)?;
-            state.bytes += size;
-            state.encoded.insert(id.clone(), size);
-            if let Some(body) = record.function.body_id {
-                state
-                    .descendants
-                    .entry(frontend.db.bodies().root_body(body))
-                    .or_default()
-                    .insert(id.clone());
-            }
-            state.dirty_instance_owners.insert(id.clone());
-            state.records.insert(id, Arc::new(record));
-        }
-        for (key, bits) in own {
-            state.own.insert(key, bits);
-        }
-        for (unit, program, path) in std::iter::once((
-            UnitId::ENTRY,
-            &frontend.program,
-            entry.to_string_lossy().into_owned(),
-        ))
-        .chain(
-            frontend
-                .module_graph
-                .files
-                .iter()
-                .map(|m| (m.id, &m.program, m.path.to_string_lossy().into_owned())),
-        ) {
-            state.units.insert(
-                unit,
-                Unit {
-                    unique_roots: true,
-                    items: program.items.len(),
-                    imports: imports(program),
-                    import_names: Arc::new(
-                        program
-                            .imports
-                            .iter()
-                            .map(|import| {
-                                (
-                                    import.alias.clone().unwrap_or_else(|| {
-                                        QualifiedName::new(&import.path).last_segment().to_owned()
-                                    }),
-                                    import.clone(),
-                                )
-                            })
-                            .collect(),
-                    ),
-                    path,
-                },
-            );
-            let mut root_names = HashSet::new();
-            for (item, node) in program.items.iter().enumerate() {
-                let declaration = match node {
-                    Item::Class(value) => Some((format!("class:{}", value.name), value.span)),
-                    Item::Interface(value) => {
-                        Some((format!("interface:{}", value.name), value.span))
-                    }
-                    Item::Enum(value) => Some((format!("enum:{}", value.name), value.span)),
-                    _ => None,
-                };
-                if let Some((name, span)) = declaration {
-                    state.declarations.insert((unit, name), span);
-                }
-                match node {
-                    Item::Class(c) => {
-                        for (member, method) in c.methods.iter().enumerate() {
-                            state.roots.insert(
-                                method.body.id,
-                                Root {
-                                    item,
-                                    kind: RootKind::Method(member),
-                                    span: method.span,
-                                    key: (
-                                        unit,
-                                        FunctionId::method(
-                                            crate::semantic::ids::TypeId::local(&c.name),
-                                            &method.name,
-                                        ),
-                                    ),
-                                },
-                            );
-                        }
-                        for (member, constructor) in c.constructors.iter().enumerate() {
-                            state.roots.insert(
-                                constructor.body.id,
-                                Root {
-                                    item,
-                                    kind: RootKind::Constructor(member),
-                                    span: constructor.span,
-                                    key: (unit, FunctionId::method(TypeId::local(&c.name), "init")),
-                                },
-                            );
-                        }
-                        if c.constructors.is_empty() {
-                            state.bodyless.insert((unit, c.name.clone()), false);
-                        }
-                    }
-                    Item::Interface(interface) => {
-                        for (member, method) in interface.methods.iter().enumerate() {
-                            if let Some(body) = &method.default_body {
-                                state.roots.insert(
-                                    body.id,
-                                    Root {
-                                        item,
-                                        kind: RootKind::Default(member),
-                                        span: method.span,
-                                        key: (
-                                            unit,
-                                            FunctionId::method(
-                                                TypeId::local(&interface.name),
-                                                format!("$default${}", method.name),
-                                            ),
-                                        ),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    Item::Enum(e) => {
-                        state.bodyless.insert((unit, e.name.clone()), true);
-                    }
-                    _ => {}
-                }
-                if let Item::Function(f) = node {
-                    if !root_names.insert(&f.name) {
-                        state
-                            .units
-                            .get_mut(&unit)
-                            .expect("registered unit")
-                            .unique_roots = false;
-                    }
-                    state.roots.insert(
-                        f.body.id,
-                        Root {
-                            item,
-                            kind: RootKind::Function,
-                            span: f.span,
-                            key: (unit, FunctionId::free(&f.name)),
-                        },
-                    );
-                }
-            }
-        }
-        for (body, root) in &state.roots {
-            state.anchors.insert(
-                root_anchor(*body),
-                Location {
-                    path: state.units[&root.key.0].path.clone(),
-                    start: root.span.start,
-                    end: root.span.end,
-                },
-            );
-        }
-        for (key, span) in &state.declarations {
-            state.anchors.insert(
-                declaration_anchor(key),
-                Location {
-                    path: state.units[&key.0].path.clone(),
-                    start: span.start,
-                    end: span.end,
-                },
-            );
-        }
-        state.metadata_anchors = Arc::new(AnchorIndex::new(&state.anchors));
-        let body_locations: HashMap<_, _> = full
-            .functions
-            .iter()
-            .filter_map(|function| Some((function.body_id?, function.locations.first()?.start)))
-            .collect();
-        let record_ids: Vec<_> = state.records.keys().cloned().collect();
-        for id in record_ids {
-            let record = Arc::make_mut(state.records.get_mut(&id).expect("retained owner"));
-            record.order_path = order_path(
-                frontend.db.bodies(),
-                record.function.body_id,
-                &body_locations,
-            );
-            record.key = record
-                .function
-                .body_id
-                .and_then(|body| callable_owner(frontend.db.bodies(), body));
-            record.root = record
-                .function
-                .body_id
-                .map(|body| frontend.db.bodies().root_body(body));
-            record.anchor = record
-                .function
-                .locations
-                .first()
-                .and_then(|location| state.metadata_anchors.owner(location));
-        }
-        for f in &full.functions {
-            if let Some(body) = f.body_id
-                && let Some((unit, owner)) = frontend.db.bodies().owner(body)
-            {
-                let id = match owner {
-                    BodyOwner::Function(id) => Some(id),
-                    BodyOwner::InterfaceDefault(id) => Some(FunctionId::method(
-                        id.owner_type().unwrap(),
-                        format!("$default${}", id.name()),
-                    )),
-                    BodyOwner::Lambda { .. } => Some(FunctionId::lambda(body)),
-                    BodyOwner::Constructor { owner, .. } => Some(FunctionId::method(owner, "init")),
-                    _ => None,
-                };
-                if let Some(id) = id {
-                    state.keys.insert((unit, id), f.id.clone());
-                }
-                state
-                    .descendants
-                    .entry(frontend.db.bodies().root_body(body))
-                    .or_default()
-                    .insert(f.id.clone());
-            }
-            for callee in &f.callees {
-                state
-                    .reverse
-                    .entry(callee.clone())
-                    .or_default()
-                    .insert(f.id.clone());
-            }
-        }
-        for root in state.roots.values() {
-            let source = generics::source_spelling(&root.key.1.to_string());
-            if source != root.key.1.to_string() {
-                let id = hash(serde_json::to_vec(&(
-                    &state.units[&root.key.0].path,
-                    &source,
-                ))?);
-                if state.records.contains_key(&id) {
-                    state.keys.insert(root.key, id);
-                }
-            }
-        }
-        // Bodyless interface unions also serve as retained call targets.
-        for (unit, function) in graph_keys {
-            let id = hash(serde_json::to_vec(&(
-                &state.units[&unit].path,
-                function.to_string(),
-            ))?);
-            if state.records.contains_key(&id) {
-                state.keys.entry((unit, function)).or_insert(id);
-            }
-        }
-        for (body, root) in &state.roots {
-            if let Ok(inputs) = indirect_inputs_tree(&frontend.db.typed_bodies, *body) {
-                state.indirect.remember(root.key.0, *body, inputs);
-            }
-        }
-        state.enforce_size()?;
-        return Ok(VerificationSnapshotUpdate::Full(full));
+            .effect_capabilities(key.0, key.1)
+            .map_or(0, |c| c.runtime.intersection(RuntimeEffects::ALL).bits())
+}
+
+fn bodyless_effects(
+    state: &VerificationSnapshotState,
+    unit: UnitId,
+    function: FunctionId,
+) -> Option<RuntimeEffects> {
+    let is_enum = *state.bodyless.get(&(unit, function.owner()?.to_string()))?;
+    if is_enum {
+        Some(RuntimeEffects::MAY_ALLOCATE)
+    } else if function.name().as_ref() == "init" {
+        Some(RuntimeEffects::NONE)
+    } else {
+        None
     }
-    let plan = plan.unwrap();
-    let plan = plan.borrow();
-    state.projection_items_cloned.set(0);
-    state.boundary_functions.set(0);
-    state.owner_checks = plan.owner_checks;
-    state.coordinate_owners = plan.current_roots.len() + plan.declarations.len();
-    ensure!(!plan.cold_fallback, VerificationSnapshotColdFallback);
-    ensure!(
-        state
-            .dispatch
-            .as_ref()
-            .is_none_or(|dispatch| dispatch.supported()),
-        VerificationSnapshotFallback
-    );
-    ensure!(!plan.fallback, VerificationSnapshotFallback);
-    ensure!(
-        frontend.module_graph.files.len() + 1 == state.units.len(),
-        VerificationSnapshotFallback
-    );
-    for key in &plan.changed {
-        if !state.keys.contains_key(key) {
-            let path = &state.units[&key.0].path;
+}
+
+fn full_snapshot(
+    inputs: SnapshotInputs<'_>,
+    state: &mut VerificationSnapshotState,
+    own: Vec<(Key, u8)>,
+) -> Result<VerificationSnapshotUpdate> {
+    let frontend = inputs.frontend;
+    let graph_keys: Vec<_> = frontend
+        .db
+        .effects
+        .analysis
+        .borrow()
+        .as_ref()
+        .into_iter()
+        .flat_map(|captures| captures.iter())
+        .flat_map(|(&unit, capture)| capture.graph.ids().map(move |id| (unit, *id)))
+        .collect();
+    let mut indirect = super::incremental_indirect::State::default();
+    if let Some(captures) = frontend.db.effects.analysis.borrow().as_ref() {
+        indirect.seed(captures);
+    }
+    let dispatch = RefCell::new(None);
+    let instances = RefCell::new(Vec::new());
+    let full = inputs.snapshot(SnapshotBoundary {
+        instances: Some(&instances),
+        dispatch: Some(&dispatch),
+        ..SnapshotBoundary::default()
+    })?;
+    let (metadata, records) = split(&full);
+    *state = VerificationSnapshotState::default();
+    state.dispatch = dispatch.into_inner();
+    state.indirect = indirect;
+    state.replace_instances(instances.into_inner(), &HashSet::new());
+    state.bytes = bounded_encoded(&serde_json::to_value(&metadata)?)?;
+    state.header = Some(Header::from(&full));
+    state.insert_symbol_types(&full.semantic.symbols);
+    state.metadata = Some(Arc::new(metadata));
+    for (id, record) in records {
+        let size = encoded(&record)?;
+        state.bytes += size;
+        state.encoded.insert(id.clone(), size);
+        if let Some(body) = record.function.body_id {
             state
-                .keys
-                .insert(*key, hash(serde_json::to_vec(&(path, key.1.to_string()))?));
+                .descendants
+                .entry(frontend.db.bodies().root_body(body))
+                .or_default()
+                .insert(id.clone());
+        }
+        state.dirty_instance_owners.insert(id.clone());
+        state.records.insert(id, Arc::new(record));
+    }
+    for (key, bits) in own {
+        state.own.insert(key, bits);
+    }
+    state.register_units(frontend, inputs.entry);
+    state.anchor_owners();
+    state.bind_full_records(frontend, &full);
+    state.index_full_functions(frontend, &full);
+    state.register_retained_keys(graph_keys)?;
+    for (body, root) in &state.roots {
+        if let Ok(inputs) = indirect_inputs_tree(&frontend.db.typed_bodies, *body) {
+            state.indirect.remember(root.key.0, *body, inputs);
         }
     }
+    state.enforce_size()?;
+    Ok(VerificationSnapshotUpdate::Full(full))
+}
+
+/// Retained owners invalidated by a revision before the patch is projected.
+struct DeltaClosure {
+    affected: HashSet<String>,
+    removed_ids: HashSet<String>,
+    indirect_callers: HashSet<Key>,
+}
+
+/// The patch projected around the retained boundary, with the dispatch state
+/// and instance edges it produced.
+struct PatchProjection {
+    patch: Snapshot,
+    dispatch: Option<super::incremental_dispatch::State>,
+    dispatch_visits: usize,
+    dispatch_affected: HashSet<String>,
+    dispatch_removed: HashSet<String>,
+    instances: InstanceCapture,
+}
+
+fn delta_snapshot(
+    inputs: SnapshotInputs<'_>,
+    state: &mut VerificationSnapshotState,
+    plan: &Plan,
+    own: Vec<(Key, u8)>,
+) -> Result<VerificationSnapshotUpdate> {
+    let frontend = inputs.frontend;
+    state.begin_delta(frontend, plan)?;
     let retired_bodies: HashSet<_> = state
         .units
         .keys()
         .flat_map(|unit| frontend.db.effects.removed_roots(*unit))
         .collect();
-    let mut removed_functions: Vec<_> = plan
-        .removed
-        .iter()
-        .filter_map(|key| state.keys.get(key).cloned())
-        .collect();
-    for key in &plan.removed {
-        if let Some(id) = state.keys.get(key)
-            && let Some(body) = state
-                .records
-                .get(id)
-                .and_then(|record| record.function.body_id)
-            && let Some(descendants) = state.descendants.get(&body)
-        {
-            removed_functions.extend(descendants.iter().cloned());
-        }
-    }
+    let mut closure = state.affected_closure(frontend, plan, &retired_bodies)?;
+    let relocations = state.relocate_owners(plan);
+    let mut changed_ids = state.changed_ids(plan);
+    state.retire_declarations(plan);
+    let projection = project_patch(
+        inputs,
+        state,
+        plan,
+        &retired_bodies,
+        &mut closure,
+        &mut changed_ids,
+    )?;
+    let DeltaClosure {
+        mut affected,
+        mut removed_ids,
+        ..
+    } = closure;
+    state.dispatch = projection.dispatch;
+    state.dispatch_visits = projection.dispatch_visits;
+    affected.extend(projection.dispatch_affected);
+    removed_ids.extend(projection.dispatch_removed);
+    let mut patch = projection.patch;
+    state.mark_changed_projections(
+        frontend,
+        plan,
+        &patch,
+        &mut affected,
+        &mut changed_ids,
+        &mut removed_ids,
+    );
+    state.retire_indirect_buckets(&changed_ids, &mut removed_ids);
+    state.replace_instances(projection.instances, &removed_ids);
+    let mut removed_functions: Vec<_> = removed_ids.iter().cloned().collect();
     removed_functions.sort();
-    removed_functions.dedup();
-    let mut removed_ids: HashSet<_> = removed_functions.iter().cloned().collect();
-    let mut affected = HashSet::new();
-    let mut queue = VecDeque::new();
-    let mut indirect_callers = HashSet::new();
-    for body in &retired_bodies {
-        if let Some(root) = state.roots.get(body) {
-            indirect_callers.extend(state.indirect.replace(root.key.0, *body, None));
+    patch
+        .functions
+        .retain(|f| affected.contains(&f.id) && !removed_ids.contains(&f.id));
+    retain_changed_symbols(&mut patch, &changed_ids);
+    state.elide_unchanged_reference_types(&mut patch);
+    let removed_symbols = state.removed_symbols(&patch, &changed_ids, &removed_ids);
+    state.merge_effect_only_projections(frontend, &mut patch, &changed_ids);
+    let body_locations = body_locations(&patch);
+    let (_, records) = split(&patch);
+    state.remove_records(&removed_functions);
+    for key in &plan.removed {
+        state.keys.remove(key);
+        state.own.remove(key);
+    }
+    state.commit_records(frontend, records, &body_locations)?;
+    for id in &removed_symbols {
+        state.symbol_types.remove(id);
+    }
+    state.insert_symbol_types(&patch.semantic.symbols);
+    state.retire_bodies(plan, retired_bodies);
+    for (key, bits) in own {
+        state.own.insert(key, bits);
+    }
+    state.header = Some(Header::from(&patch));
+    for (unit, count) in &plan.unit_items {
+        if let Some(value) = state.units.get_mut(unit) {
+            value.items = *count;
         }
     }
+    state.enforce_size()?;
+    Ok(VerificationSnapshotUpdate::Delta {
+        patch,
+        removed_functions,
+        removed_symbols,
+        relocations,
+    })
+}
 
-    for body in &plan.projected_bodies {
-        if let Some(root) = plan.current_roots.get(body)
-            && plan.current_keys.get(&root.key) != Some(body)
-        {
-            indirect_callers.extend(state.indirect.replace(
-                root.key.0,
-                *body,
-                Some(indirect_inputs_tree(&frontend.db.typed_bodies, *body)?),
-            ));
-        }
-    }
-    for key in plan.changed.iter().chain(&plan.removed) {
-        let body = plan.current_keys.get(key).copied().or_else(|| {
-            state
-                .keys
-                .get(key)
-                .and_then(|id| state.records.get(id))
-                .and_then(|record| record.function.body_id)
-        });
-        if let Some(body) = body {
-            let inputs = if plan.removed.contains(key) {
-                None
-            } else {
-                Some(
-                    match indirect_inputs_tree(&frontend.db.typed_bodies, body) {
-                        Ok(inputs) => inputs,
-                        Err(_) if frontend.db.bodies().source_body(body) != body => {
-                            Default::default()
-                        }
-                        Err(error) => return Err(error),
-                    },
-                )
-            };
-            indirect_callers.extend(state.indirect.replace(key.0, body, inputs));
-            if let Some(ids) = state.descendants.get(&body) {
-                for id in ids {
-                    if affected.insert(id.clone()) {
-                        queue.push_back(id.clone());
-                    }
-                }
-            }
-        }
-    }
-    for caller in &indirect_callers {
-        if let Some(id) = state.keys.get(caller)
-            && affected.insert(id.clone())
-        {
-            queue.push_back(id.clone());
-        }
-    }
-
-    for key in plan.changed.iter().chain(&plan.removed) {
-        let id = state
-            .keys
-            .get(key)
-            .ok_or(VerificationSnapshotFallback)?
-            .clone();
-        if affected.insert(id.clone()) {
-            queue.push_back(id);
-        }
-    }
-    for unit in state.units.keys() {
-        for function in frontend.db.effects.affected_functions(*unit) {
-            if let Some(id) = state.keys.get(&(*unit, function))
-                && affected.insert(id.clone())
-            {
-                queue.push_back(id.clone());
-            }
-        }
-    }
-    while let Some(id) = queue.pop_front() {
-        for caller in state.reverse.get(&id).into_iter().flatten() {
-            if affected.insert(caller.clone()) {
-                queue.push_back(caller.clone());
-            }
-        }
-    }
-    affected.retain(|id| !removed_ids.contains(id));
-    let mut relocations = Vec::new();
-    for (body, root) in &plan.current_roots {
-        if let Some(old) = state.roots.get(body)
-            && old.span != root.span
-        {
-            relocations.push(VerificationRelocation {
-                path: state.units[&old.key.0].path.clone(),
-                old_start: old.span.start,
-                old_end: old.span.end,
-                new_start: root.span.start,
-                new_end: root.span.end,
-            });
-        }
-        state.anchors.insert(
-            root_anchor(*body),
-            Location {
-                path: state.units[&root.key.0].path.clone(),
-                start: root.span.start,
-                end: root.span.end,
-            },
-        );
-        state.roots.insert(*body, root.clone());
-    }
-    for (key, span) in &plan.declarations {
-        if let Some(old) = state.declarations.get(key)
-            && old != span
-        {
-            relocations.push(VerificationRelocation {
-                path: state.units[&key.0].path.clone(),
-                old_start: old.start,
-                old_end: old.end,
-                new_start: span.start,
-                new_end: span.end,
-            });
-        }
-        state.anchors.insert(
-            declaration_anchor(key),
-            Location {
-                path: state.units[&key.0].path.clone(),
-                start: span.start,
-                end: span.end,
-            },
-        );
-        state.declarations.insert(key.clone(), *span);
-    }
-    let mut changed_ids: HashSet<_> = plan
-        .changed
-        .iter()
-        .filter_map(|key| state.keys.get(key).cloned())
-        .collect();
-    for key in &plan.changed {
-        if let Some(body) = plan.current_keys.get(key)
-            && let Some(ids) = state.descendants.get(body)
-        {
-            changed_ids.extend(ids.iter().cloned());
-        }
-    }
-    for (key, is_enum) in &plan.bodyless {
-        state.bodyless.insert(key.clone(), *is_enum);
-    }
-    for key in plan
-        .pending_declarations
-        .keys()
-        .filter(|key| plan.unit_items.contains_key(&key.0))
-    {
-        state.declarations.remove(key);
-        state.anchors.remove(&declaration_anchor(key));
-        if let Some((_, name)) = key.1.split_once(':') {
-            state.bodyless.remove(&(key.0, name.to_owned()));
-        }
-    }
-    let fixed_ids = RefCell::new(HashSet::new());
-    let compact = |id: &str| {
-        fixed_ids.borrow_mut().insert(id.to_owned());
-        state.boundary_function(id)
-    };
+/// Fixes every unaffected callee of the affected closure, and every newly
+/// introduced direct target outside it, at its retained value.
+fn boundary_functions(
+    frontend: &crate::Frontend,
+    state: &VerificationSnapshotState,
+    affected: &HashSet<String>,
+    changed_ids: &HashSet<String>,
+    compact: &dyn Fn(&str) -> Function,
+) -> (HashMap<Key, Function>, Vec<Function>) {
     let mut boundary = HashMap::new();
     let mut synthetic = Vec::new();
-    for id in &affected {
+    for id in affected {
         let Some(record) = state.records.get(id) else {
             continue;
         };
         let Some(body) = record.function.body_id else {
-            let mut function = state.current_function(id);
-            function.unknown = !function.unresolved.is_empty();
-            function.runtime_effects = if function.unknown {
-                RuntimeEffects::ALL.bits()
-            } else {
-                0
-            };
-            synthetic.push(function);
+            synthetic.push(synthetic_function(state, id));
             continue;
         };
         let Some((unit, function)) = callable_owner(frontend.db.bodies(), body) else {
@@ -1997,12 +1764,7 @@ pub(crate) fn incremental_snapshot(
         };
         if !changed_ids.contains(id) {
             let mut f = state.current_function(id);
-            f.runtime_effects = state.own.get(&(unit, function)).copied().unwrap_or(0)
-                | frontend
-                    .db
-                    .effects
-                    .effect_capabilities(unit, function)
-                    .map_or(0, |c| c.runtime.intersection(RuntimeEffects::ALL).bits());
+            f.runtime_effects = runtime_bits(frontend, state, (unit, function));
             f.unknown = !f.unresolved.is_empty();
             if f.unknown {
                 f.runtime_effects |= RuntimeEffects::ALL.bits();
@@ -2039,6 +1801,24 @@ pub(crate) fn incremental_snapshot(
             }
         }
     }
+    (boundary, synthetic)
+}
+
+/// Projects the affected closure around the retained boundary. Workspace
+/// generic sources reached by the revision join the changed and affected sets.
+fn project_patch(
+    inputs: SnapshotInputs<'_>,
+    state: &VerificationSnapshotState,
+    plan: &Plan,
+    retired_bodies: &HashSet<BodyId>,
+    closure: &mut DeltaClosure,
+    changed_ids: &mut HashSet<String>,
+) -> Result<PatchProjection> {
+    let frontend = inputs.frontend;
+    let fixed_ids = RefCell::new(HashSet::new());
+    let compact = |id: &str| compact_function(state, &fixed_ids, id);
+    let (boundary, synthetic) =
+        boundary_functions(frontend, state, &closure.affected, changed_ids, &compact);
     let affected_synthetic: HashSet<_> = synthetic
         .iter()
         .map(|function| function.id.clone())
@@ -2046,40 +1826,87 @@ pub(crate) fn incremental_snapshot(
     let lookup = |unit, function| {
         state.keys.get(&(unit, function)).map(|id| {
             if affected_synthetic.contains(id) {
-                let mut function = state.current_function(id);
-                function.unknown = !function.unresolved.is_empty();
-                function.runtime_effects = if function.unknown {
-                    RuntimeEffects::ALL.bits()
-                } else {
-                    0
-                };
-                function
+                synthetic_function(state, id)
             } else {
                 compact(id)
             }
         })
     };
-    let bodyless = |unit, function: FunctionId| {
-        let is_enum = *state.bodyless.get(&(unit, function.owner()?.to_string()))?;
-        if is_enum {
-            Some(RuntimeEffects::MAY_ALLOCATE)
-        } else if function.name().as_ref() == "init" {
-            Some(RuntimeEffects::NONE)
-        } else {
-            None
-        }
-    };
-    for id in &affected {
+    let bodyless = |unit, function: FunctionId| bodyless_effects(state, unit, function);
+    for id in &closure.affected {
         if let Some(body) = state
             .records
             .get(id)
             .and_then(|record| record.function.body_id)
             && let Some(caller) = callable_owner(frontend.db.bodies(), body)
         {
-            indirect_callers.insert(caller);
+            closure.indirect_callers.insert(caller);
         }
     }
-    let indirect_inputs = state.indirect.inputs(&indirect_callers);
+    let indirect_inputs = state.indirect.inputs(&closure.indirect_callers);
+    let selected_generic_sources = select_generic_sources(
+        frontend,
+        state,
+        plan,
+        retired_bodies,
+        &mut closure.affected,
+        changed_ids,
+    )?;
+    let dispatch = RefCell::new(state.dispatch.clone());
+    let dispatch_affected = RefCell::new(HashSet::new());
+    let dispatch_visits = std::cell::Cell::new(0);
+    let dispatch_removed = RefCell::new(HashSet::new());
+    let retired_dispatch: HashSet<_> = changed_ids
+        .iter()
+        .chain(&closure.removed_ids)
+        .cloned()
+        .collect();
+    let compact_id = |id: &str| state.records.contains_key(id).then(|| compact(id));
+    let dispatch_dependents = |changed: &[Function], removed: &[String], visits: usize| {
+        dispatch_visits.set(visits);
+        let (result, ids) =
+            dispatch_dependent_functions(frontend, state, &fixed_ids, changed, removed);
+        dispatch_affected.borrow_mut().extend(ids);
+        dispatch_removed
+            .borrow_mut()
+            .extend(removed.iter().cloned());
+        result
+    };
+    let instances = RefCell::new(Vec::new());
+    let patch = inputs.snapshot(SnapshotBoundary {
+        instances: Some(&instances),
+        functions: boundary,
+        synthetic,
+        dispatch: Some(&dispatch),
+        dispatch_retired: Some(&retired_dispatch),
+        dispatch_dependents: Some(&dispatch_dependents),
+        retained_id: Some(&compact_id),
+        fixed_ids: Some(&fixed_ids),
+        retained: Some(&lookup),
+        bodyless: Some(&bodyless),
+        indirect: Some(&indirect_inputs),
+        generics: (!selected_generic_sources.is_empty()).then_some(&selected_generic_sources),
+    })?;
+    Ok(PatchProjection {
+        patch,
+        dispatch: dispatch.into_inner(),
+        dispatch_visits: dispatch_visits.get(),
+        dispatch_affected: dispatch_affected.into_inner(),
+        dispatch_removed: dispatch_removed.into_inner(),
+        instances: instances.into_inner(),
+    })
+}
+
+/// Selects the generic sources named by changed, affected and retired owners.
+/// Every function of a selected unit with workspace generics is re-projected.
+fn select_generic_sources(
+    frontend: &crate::Frontend,
+    state: &VerificationSnapshotState,
+    plan: &Plan,
+    retired_bodies: &HashSet<BodyId>,
+    affected: &mut HashSet<String>,
+    changed_ids: &mut HashSet<String>,
+) -> Result<HashMap<UnitId, generics::Source>> {
     let mut generic_names: HashMap<UnitId, HashSet<String>> = HashMap::new();
     for (unit, id) in &plan.changed {
         generic_names
@@ -2093,7 +1920,7 @@ pub(crate) fn incremental_snapshot(
                 .insert(owner.to_string());
         }
     }
-    for id in &affected {
+    for id in affected.iter() {
         if let Some(record) = state.records.get(id)
             && let Some((unit, _)) = record.key
         {
@@ -2103,7 +1930,7 @@ pub(crate) fn incremental_snapshot(
                 .insert(generics::source_spelling(&record.function.name));
         }
     }
-    for body in &retired_bodies {
+    for body in retired_bodies {
         if let Some(root) = state.roots.get(body) {
             generic_names
                 .entry(root.key.0)
@@ -2127,169 +1954,69 @@ pub(crate) fn incremental_snapshot(
             }
         }
     }
-    let dispatch = RefCell::new(state.dispatch.clone());
-    let dispatch_affected = RefCell::new(HashSet::new());
-    let dispatch_visits = std::cell::Cell::new(0);
-    let dispatch_removed = RefCell::new(HashSet::new());
-    let retired_dispatch: HashSet<_> = changed_ids.iter().chain(&removed_ids).cloned().collect();
-    let lookup_id = |id: &str| {
-        state
-            .records
-            .contains_key(id)
-            .then(|| state.current_function(id))
-    };
-    let compact_id = |id: &str| state.records.contains_key(id).then(|| compact(id));
-    let dispatch_dependents = |changed: &[Function], removed: &[String], visits: usize| {
-        dispatch_visits.set(visits);
-        let mut ids: HashSet<_> = changed
-            .iter()
-            .map(|function| function.id.clone())
-            .chain(removed.iter().cloned())
-            .collect();
-        let mut queue: VecDeque<_> = ids.iter().cloned().collect();
-        while let Some(id) = queue.pop_front() {
-            for caller in state.reverse.get(&id).into_iter().flatten() {
-                if ids.insert(caller.clone()) {
-                    queue.push_back(caller.clone());
-                }
-            }
-        }
-        let mut result = Vec::new();
-        let removed_set: HashSet<_> = removed.iter().collect();
-        for id in &ids {
-            if removed_set.contains(id) {
-                continue;
-            }
-            if let Some(mut function) = lookup_id(id) {
-                fixed_ids.borrow_mut().remove(id);
-                function.unknown = !function.unresolved.is_empty();
-                function.runtime_effects = if function.unknown {
-                    RuntimeEffects::ALL.bits()
-                } else {
-                    function
-                        .body_id
-                        .and_then(|body| callable_owner(frontend.db.bodies(), body))
-                        .map_or(0, |key| {
-                            state.own.get(&key).copied().unwrap_or(0)
-                                | frontend
-                                    .db
-                                    .effects
-                                    .effect_capabilities(key.0, key.1)
-                                    .map_or(0, |caps| {
-                                        caps.runtime.intersection(RuntimeEffects::ALL).bits()
-                                    })
-                        })
-                };
-                result.push(function);
-            }
-        }
-        let dependencies: HashSet<_> = changed
-            .iter()
-            .chain(result.iter())
-            .flat_map(|function| function.callees.iter())
-            .filter(|id| !ids.contains(*id))
-            .cloned()
-            .collect();
-        result.extend(dependencies.iter().filter_map(|id| compact_id(id)));
-        dispatch_affected.borrow_mut().extend(ids);
-        dispatch_removed
-            .borrow_mut()
-            .extend(removed.iter().cloned());
-        result
-    };
-    let instances = RefCell::new(Vec::new());
-    let mut patch = snapshot_with_boundary(
-        frontend,
-        entry,
-        source,
-        project,
-        SnapshotBoundary {
-            instances: Some(&instances),
-            functions: boundary,
-            synthetic,
-            dispatch: Some(&dispatch),
-            dispatch_retired: Some(&retired_dispatch),
-            dispatch_dependents: Some(&dispatch_dependents),
-            retained_id: Some(&compact_id),
-            fixed_ids: Some(&fixed_ids),
-            retained: Some(&lookup),
-            bodyless: Some(&bodyless),
-            indirect: Some(&indirect_inputs),
-            generics: (!selected_generic_sources.is_empty()).then_some(&selected_generic_sources),
-        },
-    )?;
-    state.dispatch = dispatch.into_inner();
-    state.dispatch_visits = dispatch_visits.get();
-    affected.extend(dispatch_affected.into_inner());
-    removed_ids.extend(dispatch_removed.into_inner());
-    let mut current_changed = HashSet::new();
-    for function in &patch.functions {
-        if let Some(body) = function.body_id {
-            let root = frontend.db.bodies().root_body(body);
-            if callable_owner(frontend.db.bodies(), root)
-                .is_some_and(|key| plan.changed.contains(&key))
-            {
-                affected.insert(function.id.clone());
-                changed_ids.insert(function.id.clone());
-                current_changed.insert(function.id.clone());
-                if let Some(key) = callable_owner(frontend.db.bodies(), body) {
-                    state.keys.insert(key, function.id.clone());
-                }
-            }
-        }
-        if function.id.starts_with("$indirect-arity:") {
-            affected.insert(function.id.clone());
-        }
-    }
-    for key in &plan.changed {
-        if let Some(body) = plan.current_keys.get(key)
-            && let Some(old) = state.descendants.get(body)
-        {
-            for id in old {
-                if !current_changed.contains(id) {
-                    removed_ids.insert(id.clone());
-                }
-            }
-        }
-    }
-    let mut bucket_queue: Vec<_> = changed_ids
+    Ok(selected_generic_sources)
+}
+
+/// Re-projects the retained callers of functions whose dispatch changed, plus
+/// their unaffected dependencies at their retained value. Also returns every
+/// owner the dispatch change reached.
+fn dispatch_dependent_functions(
+    frontend: &crate::Frontend,
+    state: &VerificationSnapshotState,
+    fixed_ids: &RefCell<HashSet<String>>,
+    changed: &[Function],
+    removed: &[String],
+) -> (Vec<Function>, HashSet<String>) {
+    let mut ids: HashSet<_> = changed
         .iter()
-        .chain(&removed_ids)
-        .filter_map(|id| state.records.get(id))
-        .flat_map(|record| {
-            record
-                .function
-                .callees
-                .iter()
-                .filter(|id| id.starts_with("$indirect-arity:"))
-                .cloned()
-        })
+        .map(|function| function.id.clone())
+        .chain(removed.iter().cloned())
         .collect();
-    let mut seen_buckets = HashSet::new();
-    while let Some(id) = bucket_queue.pop() {
-        if !seen_buckets.insert(id.clone()) {
+    let mut queue: VecDeque<_> = ids.iter().cloned().collect();
+    while let Some(id) = queue.pop_front() {
+        for caller in state.reverse.get(&id).into_iter().flatten() {
+            if ids.insert(caller.clone()) {
+                queue.push_back(caller.clone());
+            }
+        }
+    }
+    let mut result = Vec::new();
+    let removed_set: HashSet<_> = removed.iter().collect();
+    for id in &ids {
+        if removed_set.contains(id) || !state.records.contains_key(id) {
             continue;
         }
-        if !state.indirect.active(&id) {
-            removed_ids.insert(id.clone());
-        }
-        if let Some(record) = state.records.get(&id) {
-            bucket_queue.extend(
-                record
-                    .function
-                    .callees
-                    .iter()
-                    .filter(|id| id.starts_with("$indirect-arity:"))
-                    .cloned(),
-            );
-        }
+        let mut function = state.current_function(id);
+        fixed_ids.borrow_mut().remove(id);
+        function.unknown = !function.unresolved.is_empty();
+        function.runtime_effects = if function.unknown {
+            RuntimeEffects::ALL.bits()
+        } else {
+            function
+                .body_id
+                .and_then(|body| callable_owner(frontend.db.bodies(), body))
+                .map_or(0, |key| runtime_bits(frontend, state, key))
+        };
+        result.push(function);
     }
-    state.replace_instances(instances.into_inner(), &removed_ids);
-    removed_functions = removed_ids.iter().cloned().collect();
-    removed_functions.sort();
-    patch
-        .functions
-        .retain(|f| affected.contains(&f.id) && !removed_ids.contains(&f.id));
+    let dependencies: HashSet<_> = changed
+        .iter()
+        .chain(result.iter())
+        .flat_map(|function| function.callees.iter())
+        .filter(|id| !ids.contains(*id))
+        .cloned()
+        .collect();
+    result.extend(
+        dependencies
+            .iter()
+            .filter(|id| state.records.contains_key(id.as_str()))
+            .map(|id| compact_function(state, fixed_ids, id)),
+    );
+    (result, ids)
+}
+
+/// Keeps builtin symbols and the symbols declared inside changed functions.
+fn retain_changed_symbols(patch: &mut Snapshot, changed_ids: &HashSet<String>) {
     let mut changed_ranges: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
     for f in patch
         .functions
@@ -2320,198 +2047,794 @@ pub(crate) fn incremental_snapshot(
                 .is_some_and(|(_, end)| l.end <= *end)
         })
     });
-    let changed_types: HashMap<_, _> = patch
-        .semantic
-        .symbols
-        .iter()
-        .map(|symbol| (symbol.id.as_str(), &symbol.ty))
-        .collect();
-    for reference in &mut patch.semantic.references {
-        if reference.ty.is_some()
-            && changed_types
-                .get(reference.target.as_str())
-                .copied()
-                .or_else(|| state.symbol_types.get(&reference.target).map(AsRef::as_ref))
-                == Some(&reference.ty)
-        {
-            reference.ty = None;
+}
+
+/// Full-rebuild stages.
+impl VerificationSnapshotState {
+    fn insert_symbol_types(&mut self, symbols: &[symbols::Symbol]) {
+        for symbol in symbols {
+            if !symbol.id.starts_with("builtin:") {
+                self.symbol_types
+                    .insert(symbol.id.clone(), Arc::new(symbol.ty.clone()));
+            }
         }
     }
-    let present_symbols: HashSet<_> = patch
-        .semantic
-        .symbols
-        .iter()
-        .map(|s| s.id.as_str())
-        .collect();
-    let removed_symbols: Vec<_> = changed_ids
-        .iter()
-        .chain(&removed_ids)
-        .filter_map(|id| state.records.get(id))
-        .flat_map(|record| record.semantic.symbols.iter().map(|s| s.id.clone()))
-        .filter(|id| !present_symbols.contains(id.as_str()))
-        .collect();
-    // Effect-only projections reuse their body-local semantic data; only the
-    // solved effect value and source coordinates are refreshed.
-    for function in &patch.functions {
-        if changed_ids.contains(&function.id) || function.body_id.is_none() {
-            continue;
+
+    /// Registers every unit with its import identity, declarations and roots.
+    fn register_units(&mut self, frontend: &crate::Frontend, entry: &Path) {
+        for (unit, program, path) in std::iter::once((
+            UnitId::ENTRY,
+            &frontend.program,
+            entry.to_string_lossy().into_owned(),
+        ))
+        .chain(
+            frontend
+                .module_graph
+                .files
+                .iter()
+                .map(|m| (m.id, &m.program, m.path.to_string_lossy().into_owned())),
+        ) {
+            self.units.insert(
+                unit,
+                Unit {
+                    unique_roots: true,
+                    items: program.items.len(),
+                    imports: imports(program),
+                    import_names: Arc::new(
+                        program
+                            .imports
+                            .iter()
+                            .map(|import| {
+                                (
+                                    import.alias.clone().unwrap_or_else(|| {
+                                        QualifiedName::new(&import.path).last_segment().to_owned()
+                                    }),
+                                    import.clone(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                    path,
+                },
+            );
+            let mut root_names = HashSet::new();
+            for (item, node) in program.items.iter().enumerate() {
+                self.register_item(unit, item, node);
+                if let Item::Function(f) = node {
+                    if !root_names.insert(&f.name) {
+                        self.units
+                            .get_mut(&unit)
+                            .expect("registered unit")
+                            .unique_roots = false;
+                    }
+                    self.roots.insert(
+                        f.body.id,
+                        Root {
+                            item,
+                            kind: RootKind::Function,
+                            span: f.span,
+                            key: (unit, FunctionId::free(&f.name)),
+                        },
+                    );
+                }
+            }
         }
-        let mut cached = state.current_record(&function.id, true);
-        let body = function.body_id.unwrap();
-        let (unit, id) = callable_owner(frontend.db.bodies(), body).expect("callable body");
-        if let Some(e) = frontend.db.effects.effect_capabilities(unit, id) {
-            cached.semantic.compiler_effects.insert(
-                function.id.clone(),
-                e.runtime.intersection(RuntimeEffects::ALL).bits(),
+    }
+
+    /// Registers one item's declaration, member roots and bodyless constructors.
+    fn register_item(&mut self, unit: UnitId, item: usize, node: &Item) {
+        let declaration = match node {
+            Item::Class(value) => Some((format!("class:{}", value.name), value.span)),
+            Item::Interface(value) => Some((format!("interface:{}", value.name), value.span)),
+            Item::Enum(value) => Some((format!("enum:{}", value.name), value.span)),
+            _ => None,
+        };
+        if let Some((name, span)) = declaration {
+            self.declarations.insert((unit, name), span);
+        }
+        match node {
+            Item::Class(c) => {
+                for (member, method) in c.methods.iter().enumerate() {
+                    self.roots.insert(
+                        method.body.id,
+                        Root {
+                            item,
+                            kind: RootKind::Method(member),
+                            span: method.span,
+                            key: (
+                                unit,
+                                FunctionId::method(
+                                    crate::semantic::ids::TypeId::local(&c.name),
+                                    &method.name,
+                                ),
+                            ),
+                        },
+                    );
+                }
+                for (member, constructor) in c.constructors.iter().enumerate() {
+                    self.roots.insert(
+                        constructor.body.id,
+                        Root {
+                            item,
+                            kind: RootKind::Constructor(member),
+                            span: constructor.span,
+                            key: (unit, FunctionId::method(TypeId::local(&c.name), "init")),
+                        },
+                    );
+                }
+                if c.constructors.is_empty() {
+                    self.bodyless.insert((unit, c.name.clone()), false);
+                }
+            }
+            Item::Interface(interface) => {
+                for (member, method) in interface.methods.iter().enumerate() {
+                    if let Some(body) = &method.default_body {
+                        self.roots.insert(
+                            body.id,
+                            Root {
+                                item,
+                                kind: RootKind::Default(member),
+                                span: method.span,
+                                key: (
+                                    unit,
+                                    FunctionId::method(
+                                        TypeId::local(&interface.name),
+                                        format!("$default${}", method.name),
+                                    ),
+                                ),
+                            },
+                        );
+                    }
+                }
+            }
+            Item::Enum(e) => {
+                self.bodyless.insert((unit, e.name.clone()), true);
+            }
+            _ => {}
+        }
+    }
+
+    /// Anchors every root and declaration at its current source span.
+    fn anchor_owners(&mut self) {
+        for (body, root) in &self.roots {
+            self.anchors.insert(
+                root_anchor(*body),
+                Location {
+                    path: self.units[&root.key.0].path.clone(),
+                    start: root.span.start,
+                    end: root.span.end,
+                },
             );
         }
-        merge_semantic(&mut patch.semantic, cached.semantic);
+        for (key, span) in &self.declarations {
+            self.anchors.insert(
+                declaration_anchor(key),
+                Location {
+                    path: self.units[&key.0].path.clone(),
+                    start: span.start,
+                    end: span.end,
+                },
+            );
+        }
+        self.metadata_anchors = Arc::new(AnchorIndex::new(&self.anchors));
     }
-    let body_locations: HashMap<_, _> = patch
-        .functions
-        .iter()
-        .filter_map(|function| Some((function.body_id?, function.locations.first()?.start)))
-        .collect();
-    let (_, records) = split(&patch);
-    for id in &removed_functions {
-        state.dirty_instance_owners.insert(id.clone());
-        if let Some(old) = state.records.remove(id) {
-            for callee in &old.function.callees {
-                if let Some(callers) = state.reverse.get_mut(callee) {
-                    callers.remove(id);
+
+    /// Binds each record to its owner, root body, order and anchor.
+    fn bind_full_records(&mut self, frontend: &crate::Frontend, full: &Snapshot) {
+        let body_locations = body_locations(full);
+        let record_ids: Vec<_> = self.records.keys().cloned().collect();
+        for id in record_ids {
+            let record = Arc::make_mut(self.records.get_mut(&id).expect("retained owner"));
+            bind_record_owner(frontend, record, &body_locations);
+            record.anchor = record
+                .function
+                .locations
+                .first()
+                .and_then(|location| self.metadata_anchors.owner(location));
+        }
+    }
+
+    /// Indexes callable keys, root descendants and reverse call edges.
+    fn index_full_functions(&mut self, frontend: &crate::Frontend, full: &Snapshot) {
+        for f in &full.functions {
+            if let Some(body) = f.body_id
+                && let Some((unit, owner)) = frontend.db.bodies().owner(body)
+            {
+                let id = match owner {
+                    BodyOwner::Function(id) => Some(id),
+                    BodyOwner::InterfaceDefault(id) => Some(FunctionId::method(
+                        id.owner_type().unwrap(),
+                        format!("$default${}", id.name()),
+                    )),
+                    BodyOwner::Lambda { .. } => Some(FunctionId::lambda(body)),
+                    BodyOwner::Constructor { owner, .. } => Some(FunctionId::method(owner, "init")),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    self.keys.insert((unit, id), f.id.clone());
                 }
+                self.descendants
+                    .entry(frontend.db.bodies().root_body(body))
+                    .or_default()
+                    .insert(f.id.clone());
             }
-            if let Some(body) = old.function.body_id {
-                if let Some(key) = old.key
-                    && state.keys.get(&key).is_some_and(|current| current == id)
-                {
-                    state.keys.remove(&key);
-                    state.own.remove(&key);
-                }
-                let root = old.root.unwrap_or(body);
-                if let Some(ids) = state.descendants.get_mut(&root) {
-                    ids.remove(id);
-                }
-                if state
-                    .descendants
-                    .get(&root)
-                    .is_some_and(|ids| ids.is_empty())
-                {
-                    state.descendants.remove(&root);
-                }
-                state.roots.remove(&body);
-                state.anchors.remove(&root_anchor(body));
+            for callee in &f.callees {
+                self.reverse
+                    .entry(callee.clone())
+                    .or_default()
+                    .insert(f.id.clone());
             }
         }
-        state.reverse.remove(id);
-        state.bytes = state
-            .bytes
-            .saturating_sub(state.encoded.remove(id).unwrap_or(0));
     }
-    for key in &plan.removed {
-        state.keys.remove(key);
-        state.own.remove(key);
+
+    /// Keys generic roots by their source spelling, and bodyless interface
+    /// unions, which also serve as retained call targets, by graph identity.
+    fn register_retained_keys(&mut self, graph_keys: Vec<Key>) -> Result<()> {
+        for root in self.roots.values() {
+            let source = generics::source_spelling(&root.key.1.to_string());
+            if source != root.key.1.to_string() {
+                let id = hash(serde_json::to_vec(&(
+                    &self.units[&root.key.0].path,
+                    &source,
+                ))?);
+                if self.records.contains_key(&id) {
+                    self.keys.insert(root.key, id);
+                }
+            }
+        }
+        for (unit, function) in graph_keys {
+            let id = hash(serde_json::to_vec(&(
+                &self.units[&unit].path,
+                function.to_string(),
+            ))?);
+            if self.records.contains_key(&id) {
+                self.keys.entry((unit, function)).or_insert(id);
+            }
+        }
+        Ok(())
     }
-    for (id, mut record) in records {
-        record.order_path = order_path(
-            frontend.db.bodies(),
-            record.function.body_id,
-            &body_locations,
+}
+
+/// Sets a projection's order path, callable key and root body.
+fn bind_record_owner(
+    frontend: &crate::Frontend,
+    record: &mut Projection,
+    body_locations: &HashMap<BodyId, usize>,
+) {
+    record.order_path = order_path(
+        frontend.db.bodies(),
+        record.function.body_id,
+        body_locations,
+    );
+    record.key = record
+        .function
+        .body_id
+        .and_then(|body| callable_owner(frontend.db.bodies(), body));
+    record.root = record
+        .function
+        .body_id
+        .map(|body| frontend.db.bodies().root_body(body));
+}
+
+/// Delta stages, in the order `delta_snapshot` runs them.
+impl VerificationSnapshotState {
+    /// Resets per-revision counters and rejects revisions a delta cannot patch.
+    fn begin_delta(&mut self, frontend: &crate::Frontend, plan: &Plan) -> Result<()> {
+        self.projection_items_cloned.set(0);
+        self.boundary_functions.set(0);
+        self.owner_checks = plan.owner_checks;
+        self.coordinate_owners = plan.current_roots.len() + plan.declarations.len();
+        ensure!(!plan.cold_fallback, VerificationSnapshotColdFallback);
+        ensure!(
+            self.dispatch
+                .as_ref()
+                .is_none_or(|dispatch| dispatch.supported()),
+            VerificationSnapshotFallback
         );
-        record.key = record
-            .function
-            .body_id
-            .and_then(|body| callable_owner(frontend.db.bodies(), body));
-        record.root = record
-            .function
-            .body_id
-            .map(|body| frontend.db.bodies().root_body(body));
-        record.anchor = state
-            .records
-            .get(&id)
-            .and_then(|old| old.anchor.as_ref())
-            .and_then(|(key, _)| {
-                state
-                    .anchors
+        ensure!(!plan.fallback, VerificationSnapshotFallback);
+        ensure!(
+            frontend.module_graph.files.len() + 1 == self.units.len(),
+            VerificationSnapshotFallback
+        );
+        for key in &plan.changed {
+            if !self.keys.contains_key(key) {
+                let path = &self.units[&key.0].path;
+                self.keys
+                    .insert(*key, hash(serde_json::to_vec(&(path, key.1.to_string()))?));
+            }
+        }
+        Ok(())
+    }
+
+    /// Removed owners with their descendants, and the reverse-call closure of
+    /// every changed, removed, effect-affected or indirect-call-affected owner.
+    fn affected_closure(
+        &mut self,
+        frontend: &crate::Frontend,
+        plan: &Plan,
+        retired_bodies: &HashSet<BodyId>,
+    ) -> Result<DeltaClosure> {
+        let mut removed_functions: Vec<_> = plan
+            .removed
+            .iter()
+            .filter_map(|key| self.keys.get(key).cloned())
+            .collect();
+        for key in &plan.removed {
+            if let Some(id) = self.keys.get(key)
+                && let Some(body) = self
+                    .records
+                    .get(id)
+                    .and_then(|record| record.function.body_id)
+                && let Some(descendants) = self.descendants.get(&body)
+            {
+                removed_functions.extend(descendants.iter().cloned());
+            }
+        }
+        removed_functions.sort();
+        removed_functions.dedup();
+        let removed_ids: HashSet<_> = removed_functions.into_iter().collect();
+        let mut affected = HashSet::new();
+        let mut queue = VecDeque::new();
+        let indirect_callers = self.replace_indirect_inputs(
+            frontend,
+            plan,
+            retired_bodies,
+            &mut affected,
+            &mut queue,
+        )?;
+        for key in plan.changed.iter().chain(&plan.removed) {
+            let id = self
+                .keys
+                .get(key)
+                .ok_or(VerificationSnapshotFallback)?
+                .clone();
+            if affected.insert(id.clone()) {
+                queue.push_back(id);
+            }
+        }
+        for unit in self.units.keys() {
+            for function in frontend.db.effects.affected_functions(*unit) {
+                if let Some(id) = self.keys.get(&(*unit, function))
+                    && affected.insert(id.clone())
+                {
+                    queue.push_back(id.clone());
+                }
+            }
+        }
+        while let Some(id) = queue.pop_front() {
+            for caller in self.reverse.get(&id).into_iter().flatten() {
+                if affected.insert(caller.clone()) {
+                    queue.push_back(caller.clone());
+                }
+            }
+        }
+        affected.retain(|id| !removed_ids.contains(id));
+        Ok(DeltaClosure {
+            affected,
+            removed_ids,
+            indirect_callers,
+        })
+    }
+
+    /// Replaces the indirect-call inputs of retired, re-projected, changed and
+    /// removed bodies. Seeds the descendants of changed and removed bodies and
+    /// the callers whose indirect targets changed; returns those callers.
+    fn replace_indirect_inputs(
+        &mut self,
+        frontend: &crate::Frontend,
+        plan: &Plan,
+        retired_bodies: &HashSet<BodyId>,
+        affected: &mut HashSet<String>,
+        queue: &mut VecDeque<String>,
+    ) -> Result<HashSet<Key>> {
+        let mut indirect_callers = HashSet::new();
+        for body in retired_bodies {
+            if let Some(root) = self.roots.get(body) {
+                indirect_callers.extend(self.indirect.replace(root.key.0, *body, None));
+            }
+        }
+        for body in &plan.projected_bodies {
+            if let Some(root) = plan.current_roots.get(body)
+                && plan.current_keys.get(&root.key) != Some(body)
+            {
+                indirect_callers.extend(self.indirect.replace(
+                    root.key.0,
+                    *body,
+                    Some(indirect_inputs_tree(&frontend.db.typed_bodies, *body)?),
+                ));
+            }
+        }
+        for key in plan.changed.iter().chain(&plan.removed) {
+            let body = plan.current_keys.get(key).copied().or_else(|| {
+                self.keys
                     .get(key)
-                    .map(|location| (key.clone(), location.clone()))
+                    .and_then(|id| self.records.get(id))
+                    .and_then(|record| record.function.body_id)
+            });
+            if let Some(body) = body {
+                let inputs = if plan.removed.contains(key) {
+                    None
+                } else {
+                    Some(
+                        match indirect_inputs_tree(&frontend.db.typed_bodies, body) {
+                            Ok(inputs) => inputs,
+                            Err(_) if frontend.db.bodies().source_body(body) != body => {
+                                Default::default()
+                            }
+                            Err(error) => return Err(error),
+                        },
+                    )
+                };
+                indirect_callers.extend(self.indirect.replace(key.0, body, inputs));
+                if let Some(ids) = self.descendants.get(&body) {
+                    for id in ids {
+                        if affected.insert(id.clone()) {
+                            queue.push_back(id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for caller in &indirect_callers {
+            if let Some(id) = self.keys.get(caller)
+                && affected.insert(id.clone())
+            {
+                queue.push_back(id.clone());
+            }
+        }
+        Ok(indirect_callers)
+    }
+
+    /// Moves root and declaration anchors to their current spans and returns
+    /// the coordinate changes of owners that moved.
+    fn relocate_owners(&mut self, plan: &Plan) -> Vec<VerificationRelocation> {
+        let mut relocations = Vec::new();
+        for (body, root) in &plan.current_roots {
+            if let Some(old) = self.roots.get(body)
+                && old.span != root.span
+            {
+                relocations.push(VerificationRelocation {
+                    path: self.units[&old.key.0].path.clone(),
+                    old_start: old.span.start,
+                    old_end: old.span.end,
+                    new_start: root.span.start,
+                    new_end: root.span.end,
+                });
+            }
+            self.anchors.insert(
+                root_anchor(*body),
+                Location {
+                    path: self.units[&root.key.0].path.clone(),
+                    start: root.span.start,
+                    end: root.span.end,
+                },
+            );
+            self.roots.insert(*body, root.clone());
+        }
+        for (key, span) in &plan.declarations {
+            if let Some(old) = self.declarations.get(key)
+                && old != span
+            {
+                relocations.push(VerificationRelocation {
+                    path: self.units[&key.0].path.clone(),
+                    old_start: old.start,
+                    old_end: old.end,
+                    new_start: span.start,
+                    new_end: span.end,
+                });
+            }
+            self.anchors.insert(
+                declaration_anchor(key),
+                Location {
+                    path: self.units[&key.0].path.clone(),
+                    start: span.start,
+                    end: span.end,
+                },
+            );
+            self.declarations.insert(key.clone(), *span);
+        }
+        relocations
+    }
+
+    /// Projection ids of changed owners and their current descendants.
+    fn changed_ids(&self, plan: &Plan) -> HashSet<String> {
+        let mut changed_ids: HashSet<_> = plan
+            .changed
+            .iter()
+            .filter_map(|key| self.keys.get(key).cloned())
+            .collect();
+        for key in &plan.changed {
+            if let Some(body) = plan.current_keys.get(key)
+                && let Some(ids) = self.descendants.get(body)
+            {
+                changed_ids.extend(ids.iter().cloned());
+            }
+        }
+        changed_ids
+    }
+
+    /// Records current bodyless types and drops declarations that a rechecked
+    /// unit no longer declares.
+    fn retire_declarations(&mut self, plan: &Plan) {
+        for (key, is_enum) in &plan.bodyless {
+            self.bodyless.insert(key.clone(), *is_enum);
+        }
+        for key in plan
+            .pending_declarations
+            .keys()
+            .filter(|key| plan.unit_items.contains_key(&key.0))
+        {
+            self.declarations.remove(key);
+            self.anchors.remove(&declaration_anchor(key));
+            if let Some((_, name)) = key.1.split_once(':') {
+                self.bodyless.remove(&(key.0, name.to_owned()));
+            }
+        }
+    }
+
+    /// Marks patch functions under changed roots as changed and retires the old
+    /// descendants of changed roots that the patch no longer produces.
+    fn mark_changed_projections(
+        &mut self,
+        frontend: &crate::Frontend,
+        plan: &Plan,
+        patch: &Snapshot,
+        affected: &mut HashSet<String>,
+        changed_ids: &mut HashSet<String>,
+        removed_ids: &mut HashSet<String>,
+    ) {
+        let mut current_changed = HashSet::new();
+        for function in &patch.functions {
+            if let Some(body) = function.body_id {
+                let root = frontend.db.bodies().root_body(body);
+                if callable_owner(frontend.db.bodies(), root)
+                    .is_some_and(|key| plan.changed.contains(&key))
+                {
+                    affected.insert(function.id.clone());
+                    changed_ids.insert(function.id.clone());
+                    current_changed.insert(function.id.clone());
+                    if let Some(key) = callable_owner(frontend.db.bodies(), body) {
+                        self.keys.insert(key, function.id.clone());
+                    }
+                }
+            }
+            if function.id.starts_with("$indirect-arity:") {
+                affected.insert(function.id.clone());
+            }
+        }
+        for key in &plan.changed {
+            if let Some(body) = plan.current_keys.get(key)
+                && let Some(old) = self.descendants.get(body)
+            {
+                for id in old {
+                    if !current_changed.contains(id) {
+                        removed_ids.insert(id.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Removes indirect-arity buckets reachable from changed or removed owners
+    /// that no longer have an active indirect call.
+    fn retire_indirect_buckets(
+        &self,
+        changed_ids: &HashSet<String>,
+        removed_ids: &mut HashSet<String>,
+    ) {
+        let mut bucket_queue: Vec<_> = changed_ids
+            .iter()
+            .chain(removed_ids.iter())
+            .filter_map(|id| self.records.get(id))
+            .flat_map(|record| {
+                record
+                    .function
+                    .callees
+                    .iter()
+                    .filter(|id| id.starts_with("$indirect-arity:"))
+                    .cloned()
             })
-            .or_else(|| {
-                record.function.body_id.and_then(|body| {
-                    let key = root_anchor(frontend.db.bodies().root_body(body));
-                    state
-                        .anchors
-                        .get(&key)
+            .collect();
+        let mut seen_buckets = HashSet::new();
+        while let Some(id) = bucket_queue.pop() {
+            if !seen_buckets.insert(id.clone()) {
+                continue;
+            }
+            if !self.indirect.active(&id) {
+                removed_ids.insert(id.clone());
+            }
+            if let Some(record) = self.records.get(&id) {
+                bucket_queue.extend(
+                    record
+                        .function
+                        .callees
+                        .iter()
+                        .filter(|id| id.starts_with("$indirect-arity:"))
+                        .cloned(),
+                );
+            }
+        }
+    }
+
+    /// Omits reference types the client already holds for the same target.
+    fn elide_unchanged_reference_types(&self, patch: &mut Snapshot) {
+        let changed_types: HashMap<_, _> = patch
+            .semantic
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.id.as_str(), &symbol.ty))
+            .collect();
+        for reference in &mut patch.semantic.references {
+            if reference.ty.is_some()
+                && changed_types
+                    .get(reference.target.as_str())
+                    .copied()
+                    .or_else(|| self.symbol_types.get(&reference.target).map(AsRef::as_ref))
+                    == Some(&reference.ty)
+            {
+                reference.ty = None;
+            }
+        }
+    }
+
+    /// Symbols of changed or removed owners that the patch no longer declares.
+    fn removed_symbols(
+        &self,
+        patch: &Snapshot,
+        changed_ids: &HashSet<String>,
+        removed_ids: &HashSet<String>,
+    ) -> Vec<String> {
+        let present_symbols: HashSet<_> = patch
+            .semantic
+            .symbols
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        changed_ids
+            .iter()
+            .chain(removed_ids)
+            .filter_map(|id| self.records.get(id))
+            .flat_map(|record| record.semantic.symbols.iter().map(|s| s.id.clone()))
+            .filter(|id| !present_symbols.contains(id.as_str()))
+            .collect()
+    }
+
+    /// Effect-only projections reuse their body-local semantic data; only the
+    /// solved effect value and source coordinates are refreshed.
+    fn merge_effect_only_projections(
+        &self,
+        frontend: &crate::Frontend,
+        patch: &mut Snapshot,
+        changed_ids: &HashSet<String>,
+    ) {
+        for function in &patch.functions {
+            if changed_ids.contains(&function.id) || function.body_id.is_none() {
+                continue;
+            }
+            let mut cached = self.current_record(&function.id, true);
+            let body = function.body_id.unwrap();
+            let (unit, id) = callable_owner(frontend.db.bodies(), body).expect("callable body");
+            if let Some(e) = frontend.db.effects.effect_capabilities(unit, id) {
+                cached.semantic.compiler_effects.insert(
+                    function.id.clone(),
+                    e.runtime.intersection(RuntimeEffects::ALL).bits(),
+                );
+            }
+            merge_semantic(&mut patch.semantic, cached.semantic);
+        }
+    }
+
+    /// Drops removed projections with their call edges, keys and root anchors.
+    fn remove_records(&mut self, removed_functions: &[String]) {
+        for id in removed_functions {
+            self.dirty_instance_owners.insert(id.clone());
+            if let Some(old) = self.records.remove(id) {
+                for callee in &old.function.callees {
+                    if let Some(callers) = self.reverse.get_mut(callee) {
+                        callers.remove(id);
+                    }
+                }
+                if let Some(body) = old.function.body_id {
+                    if let Some(key) = old.key
+                        && self.keys.get(&key).is_some_and(|current| current == id)
+                    {
+                        self.keys.remove(&key);
+                        self.own.remove(&key);
+                    }
+                    let root = old.root.unwrap_or(body);
+                    if let Some(ids) = self.descendants.get_mut(&root) {
+                        ids.remove(id);
+                    }
+                    if self
+                        .descendants
+                        .get(&root)
+                        .is_some_and(|ids| ids.is_empty())
+                    {
+                        self.descendants.remove(&root);
+                    }
+                    self.roots.remove(&body);
+                    self.anchors.remove(&root_anchor(body));
+                }
+            }
+            self.reverse.remove(id);
+            self.bytes = self
+                .bytes
+                .saturating_sub(self.encoded.remove(id).unwrap_or(0));
+        }
+    }
+
+    /// Stores patched projections, keeping retained anchors and order, and
+    /// replaces their reverse call edges and encoded sizes.
+    fn commit_records(
+        &mut self,
+        frontend: &crate::Frontend,
+        records: HashMap<String, Projection>,
+        body_locations: &HashMap<BodyId, usize>,
+    ) -> Result<()> {
+        for (id, mut record) in records {
+            bind_record_owner(frontend, &mut record, body_locations);
+            record.anchor = self
+                .records
+                .get(&id)
+                .and_then(|old| old.anchor.as_ref())
+                .and_then(|(key, _)| {
+                    self.anchors
+                        .get(key)
                         .map(|location| (key.clone(), location.clone()))
                 })
-            });
-        if let Some(old) = state.records.get(&id) {
-            record.order = old.order;
-        }
-        if let Some(old) = state.records.get(&id) {
-            for callee in &old.function.callees {
-                if let Some(callers) = state.reverse.get_mut(callee) {
-                    callers.remove(&id);
+                .or_else(|| {
+                    record.function.body_id.and_then(|body| {
+                        let key = root_anchor(frontend.db.bodies().root_body(body));
+                        self.anchors
+                            .get(&key)
+                            .map(|location| (key.clone(), location.clone()))
+                    })
+                });
+            if let Some(old) = self.records.get(&id) {
+                record.order = old.order;
+            }
+            if let Some(old) = self.records.get(&id) {
+                for callee in &old.function.callees {
+                    if let Some(callers) = self.reverse.get_mut(callee) {
+                        callers.remove(&id);
+                    }
                 }
             }
+            for callee in &record.function.callees {
+                self.reverse
+                    .entry(callee.clone())
+                    .or_default()
+                    .insert(id.clone());
+            }
+            let size = encoded(&record)?;
+            self.bytes = self
+                .bytes
+                .saturating_sub(self.encoded.get(&id).copied().unwrap_or(0))
+                + size;
+            self.encoded.insert(id.clone(), size);
+            if let Some(body) = record.function.body_id {
+                self.descendants
+                    .entry(frontend.db.bodies().root_body(body))
+                    .or_default()
+                    .insert(id.clone());
+            }
+            self.dirty_instance_owners.insert(id.clone());
+            self.records.insert(id, Arc::new(record));
         }
-        for callee in &record.function.callees {
-            state
-                .reverse
-                .entry(callee.clone())
-                .or_default()
-                .insert(id.clone());
-        }
-        let size = encoded(&record)?;
-        state.bytes = state
-            .bytes
-            .saturating_sub(state.encoded.get(&id).copied().unwrap_or(0))
-            + size;
-        state.encoded.insert(id.clone(), size);
-        if let Some(body) = record.function.body_id {
-            state
-                .descendants
-                .entry(frontend.db.bodies().root_body(body))
-                .or_default()
-                .insert(id.clone());
-        }
-        state.dirty_instance_owners.insert(id.clone());
-        state.records.insert(id, Arc::new(record));
+        Ok(())
     }
-    for id in &removed_symbols {
-        state.symbol_types.remove(id);
-    }
-    for symbol in &patch.semantic.symbols {
-        if !symbol.id.starts_with("builtin:") {
-            state
-                .symbol_types
-                .insert(symbol.id.clone(), Arc::new(symbol.ty.clone()));
-        }
-    }
-    for body in retired_bodies {
-        if let Some(root) = state.roots.remove(&body)
-            && !plan.current_keys.contains_key(&root.key)
-        {
-            state.keys.remove(&root.key);
-            state.own.remove(&root.key);
-        }
-        state.anchors.remove(&root_anchor(body));
-        state.descendants.remove(&body);
-    }
-    for (key, bits) in own {
-        state.own.insert(key, bits);
-    }
-    state.header = Some(Header::from(&patch));
-    for (unit, count) in &plan.unit_items {
-        if let Some(value) = state.units.get_mut(unit) {
-            value.items = *count;
+
+    /// Forgets roots the revision removed, keeping keys a current root reuses.
+    fn retire_bodies(&mut self, plan: &Plan, retired_bodies: HashSet<BodyId>) {
+        for body in retired_bodies {
+            if let Some(root) = self.roots.remove(&body)
+                && !plan.current_keys.contains_key(&root.key)
+            {
+                self.keys.remove(&root.key);
+                self.own.remove(&root.key);
+            }
+            self.anchors.remove(&root_anchor(body));
+            self.descendants.remove(&body);
         }
     }
-    state.enforce_size()?;
-    Ok(VerificationSnapshotUpdate::Delta {
-        patch,
-        removed_functions,
-        removed_symbols,
-        relocations,
-    })
 }

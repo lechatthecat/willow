@@ -1034,616 +1034,751 @@ impl QuerySession {
                 symbol_kind,
                 limit,
                 ..
-            } => {
-                let matched: Vec<_> = self
-                    .snapshot
-                    .semantic
-                    .symbols
-                    .iter()
-                    .filter(|s| name.as_ref().is_none_or(|n| s.name == *n))
-                    .filter(|s| {
-                        prefix
-                            .as_ref()
-                            .is_none_or(|p| s.name.starts_with(p.as_str()))
-                    })
-                    .filter(|s| symbol_kind.as_ref().is_none_or(|k| s.kind == *k))
-                    .filter(|s| {
-                        module
-                            .as_ref()
-                            .is_none_or(|m| s.identity.as_ref().is_some_and(|i| i.module == *m))
-                    })
-                    .collect();
-                let total = matched.len();
-                let shown = limit.map_or(total, |l| l.min(total));
-                json!({"status":"ok","symbols":self.symbol_values(&matched[..shown]),
-                    "total":total,"truncated":shown < total})
-            }
+            } => self.matching_symbols(&name, &prefix, &module, &symbol_kind, limit),
             QueryRequest::SymbolAt { file, byte, .. } => self.symbol_at(&file, byte),
-            QueryRequest::TypeAt { file, byte, .. } => {
-                let file = if Path::new(&file).is_absolute() {
-                    file
-                } else {
-                    Path::new(&self.snapshot.workspace)
-                        .join(file)
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                let Some(segments) = self.positions.get(&file) else {
-                    return json!({"revision":self.revision(),"result":self.declared_type_at(&file,byte)});
-                };
-                let p = segments.partition_point(|s| {
-                    self.position_comparisons += 1;
-                    s.start <= byte
-                });
-                let Some(segment) = p
-                    .checked_sub(1)
-                    .map(|p| &segments[p])
-                    .filter(|s| byte < s.end)
+            QueryRequest::TypeAt { file, byte, .. } => self.type_at(file, byte),
+            QueryRequest::SymbolInfo { function, .. } => self.symbol_info(&function),
+            QueryRequest::References { function, .. } => self.function_references(&function),
+            QueryRequest::Effects { function, .. } => self.effects(&function),
+        };
+        json!({"revision":self.revision(),"result":data})
+    }
+
+    fn matching_symbols(
+        &self,
+        name: &Option<String>,
+        prefix: &Option<String>,
+        module: &Option<String>,
+        symbol_kind: &Option<String>,
+        limit: Option<usize>,
+    ) -> Value {
+        let matched: Vec<_> = self
+            .snapshot
+            .semantic
+            .symbols
+            .iter()
+            .filter(|s| name.as_ref().is_none_or(|n| s.name == *n))
+            .filter(|s| {
+                prefix
+                    .as_ref()
+                    .is_none_or(|p| s.name.starts_with(p.as_str()))
+            })
+            .filter(|s| symbol_kind.as_ref().is_none_or(|k| s.kind == *k))
+            .filter(|s| {
+                module
+                    .as_ref()
+                    .is_none_or(|m| s.identity.as_ref().is_some_and(|i| i.module == *m))
+            })
+            .collect();
+        let total = matched.len();
+        let shown = limit.map_or(total, |l| l.min(total));
+        json!({"status":"ok","symbols":self.symbol_values(&matched[..shown]),
+            "total":total,"truncated":shown < total})
+    }
+
+    /// The type answer at one source byte: the narrowest typing segment,
+    /// falling back to the declared type of the symbol there.
+    fn type_at(&mut self, file: String, byte: usize) -> Value {
+        let file = if Path::new(&file).is_absolute() {
+            file
+        } else {
+            Path::new(&self.snapshot.workspace)
+                .join(file)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let Some(segments) = self.positions.get(&file) else {
+            return self.declared_type_at(&file, byte);
+        };
+        let p = segments.partition_point(|s| {
+            self.position_comparisons += 1;
+            s.start <= byte
+        });
+        let Some(segment) = p
+            .checked_sub(1)
+            .map(|p| &segments[p])
+            .filter(|s| byte < s.end)
+        else {
+            return self.declared_type_at(&file, byte);
+        };
+        // Resolved source write tokens are authoritative: compound lowering
+        // can put several synthetic expressions on the same token span.
+        // A callee token or declaration name (parameter, pattern binding,
+        // let) can lie inside an expression; report its declared type
+        // unless the symbol itself is untyped.
+        if let Some(write) = segment.declared
+            && let Some(declared) = self.declared_token_type(&file, byte, segment, write)
+        {
+            return declared;
+        }
+        let Some(index) = segment.expression else {
+            return self.declared_type_at(&file, byte);
+        };
+        let Some(index) = index else {
+            return json!({"status":"ambiguous"});
+        };
+        let e = &self.snapshot.semantic.expressions[index];
+        if let Some(ty) = &e.ty {
+            let module = self.expression_module(index);
+            let display = self.names.render(ty, module);
+            json!({"status":"ok","type":ty,"type_display":display,"location":e.location})
+        } else {
+            let declared = self.declared_type_at(&file, byte);
+            if declared["status"] == "unknown" {
+                json!({"status":"unanalyzed","type":e.ty,"location":e.location})
+            } else {
+                declared
+            }
+        }
+    }
+
+    /// The answer for a declared token (`write` for a resolved write) when it
+    /// decides the type; `None` defers to the enclosing expression.
+    fn declared_token_type(
+        &self,
+        file: &str,
+        byte: usize,
+        segment: &Segment,
+        write: bool,
+    ) -> Option<Value> {
+        // The instantiated type is spelled in the calling body,
+        // whose enclosing expression names its module.
+        let caller = segment
+            .expression
+            .flatten()
+            .map(|i| self.expression_module(i));
+        if !write && let Some(typed) = self.typed_call_at(file, byte, caller.flatten()) {
+            return Some(typed);
+        }
+        let declared = self.declared_type_at(file, byte);
+        // A type token of `new Box<i64>(..)` keeps the
+        // instantiation its expression carries; the declaration
+        // only knows `Box<T>`.
+        let instantiated = !write
+            && segment.expression.flatten().is_some_and(|i| {
+                let Some(Type::Generic(name, _)) = &self.snapshot.semantic.expressions[i].ty
                 else {
-                    return json!({"revision":self.revision(),"result":self.declared_type_at(&file,byte)});
+                    return false;
                 };
-                // Resolved source write tokens are authoritative: compound lowering
-                // can put several synthetic expressions on the same token span.
-                // A callee token or declaration name (parameter, pattern binding,
-                // let) can lie inside an expression; report its declared type
-                // unless the symbol itself is untyped.
-                if let Some(write) = segment.declared {
-                    // The instantiated type is spelled in the calling body,
-                    // whose enclosing expression names its module.
-                    let caller = segment
-                        .expression
-                        .flatten()
-                        .map(|i| self.expression_module(i));
-                    if !write && let Some(typed) = self.typed_call_at(&file, byte, caller.flatten())
-                    {
-                        return json!({"revision":self.revision(),"result":typed});
-                    }
-                    let declared = self.declared_type_at(&file, byte);
-                    // A type token of `new Box<i64>(..)` keeps the
-                    // instantiation its expression carries; the declaration
-                    // only knows `Box<T>`.
-                    let instantiated = !write
-                        && segment.expression.flatten().is_some_and(|i| {
-                            let Some(Type::Generic(name, _)) =
-                                &self.snapshot.semantic.expressions[i].ty
-                            else {
-                                return false;
-                            };
-                            self.symbols_at(&file, byte).iter().any(|s| {
-                                matches!(&s.ty, Some(Type::Named(head) | Type::Generic(head, _)) if head == name)
-                            })
-                        });
-                    if !instantiated
-                        && (write
-                            || matches!(declared["status"].as_str(), Some("ok" | "ambiguous")))
-                    {
-                        return json!({"revision":self.revision(),"result":declared});
-                    }
-                }
-                let Some(index) = segment.expression else {
-                    return json!({"revision":self.revision(),"result":self.declared_type_at(&file,byte)});
-                };
-                let Some(index) = index else {
-                    return json!({"revision":self.revision(),"result":{"status":"ambiguous"}});
-                };
-                let e = &self.snapshot.semantic.expressions[index];
-                if let Some(ty) = &e.ty {
-                    let module = self.expression_module(index);
-                    let display = self.names.render(ty, module);
-                    json!({"status":"ok","type":ty,"type_display":display,"location":e.location})
-                } else {
-                    let declared = self.declared_type_at(&file, byte);
-                    if declared["status"] == "unknown" {
-                        json!({"status":"unanalyzed","type":e.ty,"location":e.location})
-                    } else {
-                        declared
-                    }
-                }
+                self.symbols_at(file, byte).iter().any(|s| {
+                    matches!(&s.ty, Some(Type::Named(head) | Type::Generic(head, _)) if head == name)
+                })
+            });
+        (!instantiated
+            && (write || matches!(declared["status"].as_str(), Some("ok" | "ambiguous"))))
+        .then_some(declared)
+    }
+
+    fn symbol_info(&self, function: &str) -> Value {
+        match self.functions.get(function) {
+            Some(&i) => {
+                let f = &self.snapshot.functions[i];
+                json!({"status":if f.synthetic {"unanalyzed"}else if f.locations.len()>1 {"ambiguous"}else{"ok"}, "symbol":f})
             }
-            QueryRequest::SymbolInfo { function, .. } => match self.functions.get(&function) {
+            None => match self.symbols.get(function) {
                 Some(&i) => {
-                    let f = &self.snapshot.functions[i];
-                    json!({"status":if f.synthetic {"unanalyzed"}else if f.locations.len()>1 {"ambiguous"}else{"ok"}, "symbol":f})
+                    json!({"status":"ok","symbol":self.names.symbol(&self.snapshot.semantic.symbols[i])})
                 }
-                None => match self.symbols.get(&function) {
-                    Some(&i) => {
-                        json!({"status":"ok","symbol":self.names.symbol(&self.snapshot.semantic.symbols[i])})
-                    }
-                    None => json!({"status":"unknown"}),
-                },
+                None => json!({"status":"unknown"}),
             },
-            QueryRequest::References { function, .. } => {
-                if let Some(indices) = self
-                    .symbol_references
-                    .get(&function)
-                    .filter(|_| !self.functions.contains_key(&function))
-                {
-                    let mut references: Vec<_> = indices
-                        .iter()
-                        .map(|&i| &self.snapshot.semantic.references[i])
-                        .collect();
-                    references
-                        .sort_by_key(|r| (&r.location.path, r.location.start, r.location.end));
-                    json!({"status":"ok", "references":references, "coverage":"compiler-resolved"})
-                } else if !self.functions.contains_key(&function) {
-                    json!({"status":if self.symbols.contains_key(&function) {"ok"} else {"unknown"},"references":[]})
-                } else {
-                    let root = self.functions[&function];
-                    let mut seen = std::collections::HashSet::from([root]);
-                    let mut pending = vec![root];
-                    let mut refs = Vec::new();
-                    while let Some(i) = pending.pop() {
-                        if let Some(indices) = self.references.get(&self.snapshot.functions[i].id) {
-                            for &j in indices {
-                                let mut reference =
-                                    serde_json::to_value(&self.snapshot.semantic.expressions[j])
-                                        .unwrap();
-                                reference["identity"] = json!(self.snapshot.functions[i].identity);
-                                reference["role"] = json!("call");
-                                reference["certainty"] = json!(if i == root {
-                                    "resolved"
-                                } else {
-                                    "possible-dispatch"
-                                });
-                                refs.push(reference);
-                            }
-                        }
-                        for &caller in &self.dispatch_callers[i] {
-                            if seen.insert(caller) {
-                                pending.push(caller);
-                            }
-                        }
-                    }
-                    // Include every compiler-resolved token, including values,
-                    // imports and constructor calls without expression records.
-                    if let Some(indices) = self.symbol_references.get(&function) {
-                        for &index in indices {
-                            let reference = &self.snapshot.semantic.references[index];
-                            let mut value = serde_json::to_value(reference).unwrap();
-                            value["certainty"] = json!("resolved");
-                            refs.push(value);
-                        }
-                    }
-                    // One source occurrence is reported once: a resolved fact
-                    // outranks possible dispatch, and records merge their fields.
-                    let mut by_location = HashMap::new();
-                    let mut unique: Vec<Value> = Vec::with_capacity(refs.len());
-                    for reference in refs {
-                        let key = reference["location"].to_string();
-                        match by_location.get(&key) {
-                            None => {
-                                by_location.insert(key, unique.len());
-                                unique.push(reference);
-                            }
-                            Some(&i) => {
-                                let resolved = reference["certainty"] == "resolved"
-                                    && unique[i]["certainty"] != "resolved";
-                                let existing = unique[i].as_object_mut().unwrap();
-                                for (field, value) in reference.as_object().unwrap() {
-                                    if resolved && !value.is_null() {
-                                        existing.insert(field.clone(), value.clone());
-                                    } else {
-                                        existing.entry(field.clone()).or_insert(value.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    unique.sort_by(|a, b| {
-                        let key = |v: &Value| {
-                            (
-                                v["location"]["start"].as_u64(),
-                                v["location"]["end"].as_u64(),
-                            )
-                        };
-                        a["location"]["path"]
-                            .as_str()
-                            .cmp(&b["location"]["path"].as_str())
-                            .then_with(|| key(a).cmp(&key(b)))
+        }
+    }
+
+    fn function_references(&self, function: &str) -> Value {
+        if let Some(indices) = self
+            .symbol_references
+            .get(function)
+            .filter(|_| !self.functions.contains_key(function))
+        {
+            let mut references: Vec<_> = indices
+                .iter()
+                .map(|&i| &self.snapshot.semantic.references[i])
+                .collect();
+            references.sort_by_key(|r| (&r.location.path, r.location.start, r.location.end));
+            return json!({"status":"ok", "references":references, "coverage":"compiler-resolved"});
+        }
+        let Some(&root) = self.functions.get(function) else {
+            return json!({"status":if self.symbols.contains_key(function) {"ok"} else {"unknown"},"references":[]});
+        };
+        let refs = merge_reference_locations(self.call_references(function, root));
+        let unresolved = self.signature_matched_candidates(function);
+        let mut coverage = String::from("compiler-resolved");
+        if refs.iter().any(|r| r["certainty"] == "possible-dispatch") {
+            coverage.push_str(" and possible virtual dispatch");
+        }
+        if !unresolved.is_empty() {
+            coverage.push_str("; indirect candidates are signature-matched, not resolved");
+        }
+        json!({"status":if unresolved.is_empty(){"ok"}else{"incomplete"}, "references":refs,
+            "unresolved_candidates":unresolved,"coverage":coverage})
+    }
+
+    /// Calls of `root` and of every override reachable through dispatch
+    /// callers, then every compiler-resolved token of `function`.
+    fn call_references(&self, function: &str, root: usize) -> Vec<Value> {
+        let mut seen = std::collections::HashSet::from([root]);
+        let mut pending = vec![root];
+        let mut refs = Vec::new();
+        while let Some(i) = pending.pop() {
+            if let Some(indices) = self.references.get(&self.snapshot.functions[i].id) {
+                for &j in indices {
+                    let mut reference =
+                        serde_json::to_value(&self.snapshot.semantic.expressions[j]).unwrap();
+                    reference["identity"] = json!(self.snapshot.functions[i].identity);
+                    reference["role"] = json!("call");
+                    reference["certainty"] = json!(if i == root {
+                        "resolved"
+                    } else {
+                        "possible-dispatch"
                     });
-                    let refs = unique;
-                    let unresolved: Vec<_> = self
-                        .symbols
-                        .get(&function)
-                        .and_then(|&i| self.snapshot.semantic.symbols[i].ty.as_ref())
-                        .and_then(|ty| self.indirect_references.get(ty))
-                        .into_iter()
-                        .flatten()
-                        .map(|&i| {
-                            let mut candidate =
-                                serde_json::to_value(&self.snapshot.semantic.references[i]).unwrap();
-                            candidate["certainty"] = json!("signature-matched");
-                            candidate["reason"] = json!("Indirect call through a binding or parameter with the same function type as the selected callable; the target is not resolved.");
-                            candidate
-                        })
-                        .collect();
-                    let mut coverage = String::from("compiler-resolved");
-                    if refs.iter().any(|r| r["certainty"] == "possible-dispatch") {
-                        coverage.push_str(" and possible virtual dispatch");
-                    }
-                    if !unresolved.is_empty() {
-                        coverage
-                            .push_str("; indirect candidates are signature-matched, not resolved");
-                    }
-                    json!({"status":if unresolved.is_empty(){"ok"}else{"incomplete"}, "references":refs,
-                        "unresolved_candidates":unresolved,"coverage":coverage})
+                    refs.push(reference);
                 }
             }
-            QueryRequest::Effects { function, .. } => match self.functions.get(&function) {
-                None => {
-                    json!({"schema":effect_states::SCHEMA,"effects":effect_states::Analysis::unavailable(),"status":if self.symbols.contains_key(&function) {"unanalyzed"} else {"unknown"},
-                        "reason":if self.symbols.get(&function).is_some_and(|&i| self.snapshot.semantic.symbols[i].kind == "method") {
-                            "This interface contract has no executable body. Query an implementing method for its effects; dispatch effects depend on the implementation."
-                        } else { "No executable body is available for this symbol in the selected source graph." }})
+            for &caller in &self.dispatch_callers[i] {
+                if seen.insert(caller) {
+                    pending.push(caller);
                 }
-                Some(&i) => {
-                    let states = self
-                        .effect_states
-                        .get_or_insert_with(|| effect_states::Analysis::new(&self.snapshot))
-                        .output(i);
-                    let f = &self.snapshot.functions[i];
-                    let mut seen = std::collections::HashSet::from([i]);
-                    let mut queue = std::collections::VecDeque::from([(i, None)]);
-                    // Function values from outside `f` are caller-supplied code:
-                    // keep their effect bounds, but cite the indirect call site in
-                    // the reaching function rather than the foreign body. They are
-                    // visited only after every directly reachable function, so a
-                    // body reachable both ways keeps its own evidence.
-                    // Queue provenance with the edge; do not assign it to a body
-                    // until that path wins against directly reachable paths.
-                    let mut foreign =
-                        std::collections::VecDeque::<(usize, usize, usize, Option<Value>)>::new();
-                    let mut unlocated_foreign = std::collections::VecDeque::new();
-                    let mut origins: HashMap<usize, usize> = HashMap::new();
-                    let mut call_sites: HashMap<usize, Option<Value>> = HashMap::new();
-                    let mut task_routes: HashMap<usize, Value> = HashMap::new();
-                    // Shared dispatch nodes carry a call site, not a task
-                    // boundary. Only an async executable candidate starts one.
-                    let mut dispatch_sites: HashMap<usize, Value> = HashMap::new();
-                    // Prefer a synchronous path when a body is reachable both
-                    // in this task and in a spawned task. Each body still runs
-                    // through the evidence walk only once.
-                    let mut tasks = std::collections::VecDeque::<(usize, usize, Value)>::new();
-                    // Some compiler graph edges bypass a shared dispatch node.
-                    // Defer these until its source-bearing path has been visited.
-                    let mut unlocated_tasks = std::collections::VecDeque::<(usize, usize)>::new();
-                    let nested = |k: usize| {
-                        self.snapshot.functions[k].locations.iter().any(|inner| {
-                            f.locations.iter().any(|outer| {
-                                inner.path == outer.path
-                                    && outer.start <= inner.start
-                                    && inner.end <= outer.end
-                            })
+            }
+        }
+        // Include every compiler-resolved token, including values,
+        // imports and constructor calls without expression records.
+        if let Some(indices) = self.symbol_references.get(function) {
+            for &index in indices {
+                let reference = &self.snapshot.semantic.references[index];
+                let mut value = serde_json::to_value(reference).unwrap();
+                value["certainty"] = json!("resolved");
+                refs.push(value);
+            }
+        }
+        refs
+    }
+
+    /// Indirect calls through a value of the selected callable's type.
+    fn signature_matched_candidates(&self, function: &str) -> Vec<Value> {
+        self
+            .symbols
+            .get(function)
+            .and_then(|&i| self.snapshot.semantic.symbols[i].ty.as_ref())
+            .and_then(|ty| self.indirect_references.get(ty))
+            .into_iter()
+            .flatten()
+            .map(|&i| {
+                let mut candidate =
+                    serde_json::to_value(&self.snapshot.semantic.references[i]).unwrap();
+                candidate["certainty"] = json!("signature-matched");
+                candidate["reason"] = json!("Indirect call through a binding or parameter with the same function type as the selected callable; the target is not resolved.");
+                candidate
+            })
+            .collect()
+    }
+
+    fn effects(&mut self, function: &str) -> Value {
+        let Some(&i) = self.functions.get(function) else {
+            return json!({"schema":effect_states::SCHEMA,"effects":effect_states::Analysis::unavailable(),"status":if self.symbols.contains_key(function) {"unanalyzed"} else {"unknown"},
+                "reason":if self.symbols.get(function).is_some_and(|&i| self.snapshot.semantic.symbols[i].kind == "method") {
+                    "This interface contract has no executable body. Query an implementing method for its effects; dispatch effects depend on the implementation."
+                } else { "No executable body is available for this symbol in the selected source graph." }});
+        };
+        let states = self
+            .effect_states
+            .get_or_insert_with(|| effect_states::Analysis::new(&self.snapshot))
+            .output(i);
+        let mut walk = EffectWalk::new(self, i);
+        walk.run();
+        let missing = walk.complete_missing_witnesses();
+        let EffectWalk {
+            witness,
+            evidence,
+            unknown_causes,
+            suspension_sites,
+            builtin_sites,
+            edge_visits,
+            ..
+        } = walk;
+        self.effect_edge_visits += edge_visits;
+        let f = &self.snapshot.functions[i];
+        let mut evidence: Vec<_> = evidence.into_values().collect();
+        evidence.extend(suspension_sites);
+        evidence.extend(builtin_sites);
+        deduplicate_evidence(&mut evidence);
+        self.present_lock_types(&mut evidence);
+        self.attach_call_chains(&witness, &mut evidence);
+        let compiler_witnesses = self.local_compiler_witnesses(f);
+        json!({"schema":effect_states::SCHEMA,"effects":states,
+            "status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
+            "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "bounds":{"runtime":f.runtime_effects,"compiler":self.snapshot.semantic.compiler_effects.get(&f.id)},"effect_evidence":evidence,
+            "witness":witness, "compiler_witnesses":compiler_witnesses,
+            "meaning":"compiler facts and conservative runtime capability bounds; indirect-call bounds cover checked function values in this workspace, not arbitrary values supplied by future callers; external business effects and predicate feasibility are not implied"})
+    }
+
+    /// The traversal is a parent-before-child spanning tree. Share parent
+    /// links, compress synthetic dispatch hops once, and materialize only the
+    /// paths actually emitted as evidence.
+    fn attach_call_chains(&self, witness: &[Value], evidence: &mut [Value]) {
+        let mut parents = HashMap::new();
+        let mut executable = HashMap::new();
+        for node in witness {
+            let id = node["function"].as_str().unwrap();
+            let parent = node["via"]
+                .as_str()
+                .and_then(|id| executable.get(id).copied())
+                .flatten();
+            if self
+                .functions
+                .get(id)
+                .is_some_and(|&k| !self.snapshot.functions[k].synthetic)
+            {
+                parents.insert(id, parent);
+                executable.insert(id, Some(id));
+            } else {
+                executable.insert(id, parent);
+            }
+        }
+        for fact in evidence {
+            let owner = fact["witness"]["owner"]
+                .as_str()
+                .filter(|id| parents.contains_key(id))
+                .or_else(|| fact["via_function"].as_str());
+            let mut chain = Vec::new();
+            let mut cursor = owner;
+            while let Some(id) = cursor {
+                let Some(parent) = parents.get(id) else { break };
+                chain.push(id);
+                cursor = *parent;
+            }
+            chain.reverse();
+            if !chain.is_empty() {
+                fact["call_chain"] = json!(chain);
+            }
+        }
+    }
+
+    /// Compiler witnesses located inside `f`'s own source ranges.
+    fn local_compiler_witnesses(&self, f: &Function) -> Option<Vec<Value>> {
+        let mut compiler_witnesses = self.snapshot.semantic.witnesses.get(&f.id).cloned();
+        if let Some(facts) = &mut compiler_witnesses {
+            let ranges = local_ranges(&f.locations);
+            facts.retain(|fact| {
+                let w = &fact["witness"];
+                let loc = &w["cause"]["location"];
+                let (Some(path), Some(start), Some(end)) = (
+                    loc["path"].as_str(),
+                    loc["start"].as_u64(),
+                    loc["end"].as_u64(),
+                ) else {
+                    return false;
+                };
+                let index = ranges.partition_point(|&(p, s, _)| (p, s as u64) <= (path, start));
+                w["owner"].as_str().is_none_or(|owner| owner == f.id)
+                    && index.checked_sub(1).is_some_and(|index| {
+                        let (p, _, e) = ranges[index];
+                        p == path && start <= end && end <= e as u64
+                    })
+            });
+            deduplicate_evidence(facts);
+            self.present_lock_types(facts);
+            // Every evidence line carries a status, local ones too.
+            for fact in facts.iter_mut() {
+                fact["status"] = json!(evidence_status(&fact["witness"]));
+                if fact["witness"]["cause"]["operation"] == "await"
+                    || fact["witness"].get("awaited_type").is_some()
+                {
+                    fact["task_relationship"] = json!({"kind":"await", "function":f.id,
+                        "location":fact["witness"]["cause"]["location"]});
+                }
+            }
+        }
+        compiler_witnesses
+    }
+}
+
+/// One source occurrence is reported once: a resolved fact outranks possible
+/// dispatch, and records merge their fields. Sorted by location.
+fn merge_reference_locations(refs: Vec<Value>) -> Vec<Value> {
+    let mut by_location = HashMap::new();
+    let mut unique: Vec<Value> = Vec::with_capacity(refs.len());
+    for reference in refs {
+        let key = reference["location"].to_string();
+        match by_location.get(&key) {
+            None => {
+                by_location.insert(key, unique.len());
+                unique.push(reference);
+            }
+            Some(&i) => {
+                let resolved =
+                    reference["certainty"] == "resolved" && unique[i]["certainty"] != "resolved";
+                let existing = unique[i].as_object_mut().unwrap();
+                for (field, value) in reference.as_object().unwrap() {
+                    if resolved && !value.is_null() {
+                        existing.insert(field.clone(), value.clone());
+                    } else {
+                        existing.entry(field.clone()).or_insert(value.clone());
+                    }
+                }
+            }
+        }
+    }
+    unique.sort_by(|a, b| {
+        let key = |v: &Value| {
+            (
+                v["location"]["start"].as_u64(),
+                v["location"]["end"].as_u64(),
+            )
+        };
+        a["location"]["path"]
+            .as_str()
+            .cmp(&b["location"]["path"].as_str())
+            .then_with(|| key(a).cmp(&key(b)))
+    });
+    unique
+}
+
+/// A deferred edge to a function value supplied from outside the queried
+/// function: target, reaching function, indirect-call origin and call site.
+type ForeignEdge = (usize, usize, usize, Option<Value>);
+
+/// The evidence walk of one `Effects` query: breadth-first over callees of
+/// `root`, each body visited once.
+struct EffectWalk<'a> {
+    session: &'a QuerySession,
+    root: &'a Function,
+    seen: std::collections::HashSet<usize>,
+    queue: std::collections::VecDeque<(usize, Option<usize>)>,
+    // Function values from outside `root` are caller-supplied code: keep
+    // their effect bounds, but cite the indirect call site in the reaching
+    // function rather than the foreign body. They are visited only after
+    // every directly reachable function, so a body reachable both ways keeps
+    // its own evidence. Queue provenance with the edge; do not assign it to a
+    // body until that path wins against directly reachable paths.
+    foreign: std::collections::VecDeque<ForeignEdge>,
+    unlocated_foreign: std::collections::VecDeque<ForeignEdge>,
+    origins: HashMap<usize, usize>,
+    call_sites: HashMap<usize, Option<Value>>,
+    task_routes: HashMap<usize, Value>,
+    // Shared dispatch nodes carry a call site, not a task boundary. Only an
+    // async executable candidate starts one.
+    dispatch_sites: HashMap<usize, Value>,
+    // Prefer a synchronous path when a body is reachable both in this task
+    // and in a spawned task. Each body still runs through the evidence walk
+    // only once.
+    tasks: std::collections::VecDeque<(usize, usize, Value)>,
+    // Some compiler graph edges bypass a shared dispatch node. Defer these
+    // until its source-bearing path has been visited.
+    unlocated_tasks: std::collections::VecDeque<(usize, usize)>,
+    witness: Vec<Value>,
+    evidence: BTreeMap<u64, Value>,
+    unknown_causes: Vec<Value>,
+    suspension_sites: Vec<Value>,
+    builtin_sites: Vec<Value>,
+    edge_visits: usize,
+}
+impl<'a> EffectWalk<'a> {
+    fn new(session: &'a QuerySession, root: usize) -> Self {
+        let f = &session.snapshot.functions[root];
+        Self {
+            session,
+            root: f,
+            seen: std::collections::HashSet::from([root]),
+            queue: std::collections::VecDeque::from([(root, None)]),
+            foreign: Default::default(),
+            unlocated_foreign: Default::default(),
+            origins: HashMap::new(),
+            call_sites: HashMap::new(),
+            task_routes: HashMap::new(),
+            dispatch_sites: HashMap::new(),
+            tasks: Default::default(),
+            unlocated_tasks: Default::default(),
+            witness: vec![
+                json!({"function":f.id,"via":null,"reason":f.unknown_reason(),"unresolved":f.unresolved}),
+            ],
+            evidence: BTreeMap::new(),
+            unknown_causes: Vec::new(),
+            suspension_sites: Vec::new(),
+            builtin_sites: Vec::new(),
+            edge_visits: 0,
+        }
+    }
+
+    fn run(&mut self) {
+        while let Some((j, via)) = self.next() {
+            let origin = self.origins.get(&j).copied();
+            self.record_unknown_cause(j, via);
+            self.record_witness_facts(j, origin);
+            self.enqueue_callees(j, via, origin);
+        }
+    }
+
+    /// The witness line of `k` reached from `j`.
+    fn reached(&self, k: usize, j: usize) -> Value {
+        let functions = &self.session.snapshot.functions;
+        json!({"function":functions[k].id,"via":functions[j].id,"runtime_effects":functions[k].runtime_effects,"reason":functions[k].unknown_reason(),"unresolved":functions[k].unresolved})
+    }
+
+    /// Next body to visit: direct callees first, then spawned tasks, then
+    /// foreign function values, then tasks without a source call site.
+    fn next(&mut self) -> Option<(usize, Option<usize>)> {
+        let session = self.session;
+        loop {
+            if let Some(next) = self.queue.pop_front() {
+                return Some(next);
+            } else if let Some((k, j, route)) = self.tasks.pop_front() {
+                if !self.seen.insert(k) {
+                    continue;
+                }
+                self.task_routes.insert(k, route);
+                self.witness.push(self.reached(k, j));
+                return Some((k, Some(j)));
+            } else if let Some((k, j, origin, call)) = self
+                .foreign
+                .pop_front()
+                .or_else(|| self.unlocated_foreign.pop_front())
+            {
+                if !self.seen.insert(k) {
+                    continue;
+                }
+                self.origins.insert(k, origin);
+                if let Some(route) = self.task_routes.get(&j) {
+                    self.task_routes.insert(k, route.clone());
+                } else if session.async_functions.contains(&k) {
+                    let mut route = call.unwrap_or_else(|| {
+                        json!({
+                            "kind":"spawn", "function":session.snapshot.functions[j].id,
+                            "location":null,
+                            "reason":"No source call site is available for this async graph edge."
                         })
-                    };
-                    let mut witness = vec![
-                        json!({"function":f.id,"via":null,"reason":f.unknown_reason(),"unresolved":f.unresolved}),
-                    ];
-                    let mut evidence = BTreeMap::new();
-                    let mut unknown_causes = Vec::new();
-                    let mut suspension_sites = Vec::new();
-                    let mut builtin_sites = Vec::new();
-                    loop {
-                        let (j, via) = if let Some(next) = queue.pop_front() {
-                            next
-                        } else if let Some((k, j, route)) = tasks.pop_front() {
-                            if !seen.insert(k) {
-                                continue;
-                            }
-                            task_routes.insert(k, route);
-                            witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
-                            (k, Some(j))
-                        } else if let Some((k, j, origin, call)) = foreign
-                            .pop_front()
-                            .or_else(|| unlocated_foreign.pop_front())
-                        {
-                            if !seen.insert(k) {
-                                continue;
-                            }
-                            origins.insert(k, origin);
-                            if let Some(route) = task_routes.get(&j) {
-                                task_routes.insert(k, route.clone());
-                            } else if self.async_functions.contains(&k) {
-                                let mut route = call.unwrap_or_else(|| json!({
-                                    "kind":"spawn", "function":self.snapshot.functions[j].id,
-                                    "location":null,
-                                    "reason":"No source call site is available for this async graph edge."
-                                }));
-                                route["target"] = json!(self.snapshot.functions[k].id);
-                                task_routes.insert(k, route);
-                            } else if self.snapshot.functions[k].synthetic
-                                && let Some(call) = call
-                            {
-                                dispatch_sites.insert(k, call);
-                            }
-                            witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
-                            (k, Some(j))
-                        } else if let Some((k, j)) = unlocated_tasks.pop_front() {
-                            if !seen.insert(k) {
-                                continue;
-                            }
-                            task_routes.insert(k, json!({"kind":"spawn", "function":self.snapshot.functions[j].id,
-                                "target":self.snapshot.functions[k].id, "location":null,
-                                "reason":"No source call site is available for this async graph edge."}));
-                            witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
-                            (k, Some(j))
-                        } else {
-                            break;
-                        };
-                        let origin = origins.get(&j).copied();
-                        let cause = &self.snapshot.functions[j];
-                        if cause.unknown
-                            && (!cause.unresolved.is_empty()
-                                || (cause.synthetic && self.callees[j].is_empty()))
-                        {
-                            unknown_causes.push(json!({"function":cause.id,
-                                "name":cause.name, "module":cause.module,
-                                "locations":cause.locations, "unresolved":cause.unresolved,
-                                "call_sites":self.snapshot.semantic.unresolved_calls.get(&cause.id),
-                                "caller_location":if cause.locations.is_empty() { via.and_then(|v: usize| self.snapshot.functions[v].locations.first()) } else { None },
-                                "reason":cause.unknown_reason()}));
-                        }
-                        if let Some(facts) = self
+                    });
+                    route["target"] = json!(session.snapshot.functions[k].id);
+                    self.task_routes.insert(k, route);
+                } else if session.snapshot.functions[k].synthetic
+                    && let Some(call) = call
+                {
+                    self.dispatch_sites.insert(k, call);
+                }
+                self.witness.push(self.reached(k, j));
+                return Some((k, Some(j)));
+            } else if let Some((k, j)) = self.unlocated_tasks.pop_front() {
+                if !self.seen.insert(k) {
+                    continue;
+                }
+                self.task_routes.insert(
+                    k,
+                    json!({"kind":"spawn", "function":session.snapshot.functions[j].id,
+                    "target":session.snapshot.functions[k].id, "location":null,
+                    "reason":"No source call site is available for this async graph edge."}),
+                );
+                self.witness.push(self.reached(k, j));
+                return Some((k, Some(j)));
+            } else {
+                return None;
+            }
+        }
+    }
+
+    fn record_unknown_cause(&mut self, j: usize, via: Option<usize>) {
+        let session = self.session;
+        let cause = &session.snapshot.functions[j];
+        if cause.unknown
+            && (!cause.unresolved.is_empty() || (cause.synthetic && session.callees[j].is_empty()))
+        {
+            self.unknown_causes.push(json!({"function":cause.id,
+                "name":cause.name, "module":cause.module,
+                "locations":cause.locations, "unresolved":cause.unresolved,
+                "call_sites":session.snapshot.semantic.unresolved_calls.get(&cause.id),
+                "caller_location":if cause.locations.is_empty() { via.and_then(|v: usize| session.snapshot.functions[v].locations.first()) } else { None },
+                "reason":cause.unknown_reason()}));
+        }
+    }
+
+    /// Folds the operation witnesses of body `j` into the evidence of the
+    /// root's runtime effects, citing the indirect call of `origin` for a
+    /// foreign body.
+    fn record_witness_facts(&mut self, j: usize, origin: Option<usize>) {
+        let session = self.session;
+        let f = self.root;
+        let Some(facts) = session
+            .snapshot
+            .semantic
+            .witnesses
+            .get(&session.snapshot.functions[j].id)
+        else {
+            return;
+        };
+        for fact in facts {
+            let Some(effect) = fact["effect"].as_u64() else {
+                continue;
+            };
+            if effect == 0 && fact["witness"]["kind"] == "builtin-effect-paths" {
+                let mut paths = fact["paths"].clone();
+                paths["operation"] = fact["witness"]["cause"]["operation"].clone();
+                paths["location"] = fact["witness"]["cause"]["location"].clone();
+                self.builtin_sites.push(json!({"effect":0,
+                    "paths":paths,
+                    "status":evidence_status(&fact["witness"]),
+                    "via_function":session.snapshot.functions[j].id,
+                    "witness":fact["witness"]}));
+                continue;
+            }
+            let (fact, via_function) = match origin {
+                None => (fact, j),
+                Some(origin) => {
+                    let site = self.call_sites.entry(origin).or_insert_with(|| {
+                        session
                             .snapshot
                             .semantic
                             .witnesses
-                            .get(&self.snapshot.functions[j].id)
-                        {
-                            for fact in facts {
-                                let Some(effect) = fact["effect"].as_u64() else {
-                                    continue;
-                                };
-                                if effect == 0 && fact["witness"]["kind"] == "builtin-effect-paths"
-                                {
-                                    let mut paths = fact["paths"].clone();
-                                    paths["operation"] =
-                                        fact["witness"]["cause"]["operation"].clone();
-                                    paths["location"] =
-                                        fact["witness"]["cause"]["location"].clone();
-                                    builtin_sites.push(json!({"effect":0,
-                                        "paths":paths,
-                                        "status":evidence_status(&fact["witness"]),
-                                        "via_function":self.snapshot.functions[j].id,
-                                        "witness":fact["witness"]}));
-                                    continue;
-                                }
-                                let (fact, via_function) = match origin {
-                                    None => (fact, j),
-                                    Some(origin) => {
-                                        let site = call_sites.entry(origin).or_insert_with(|| {
-                                            self.snapshot
-                                                .semantic
-                                                .witnesses
-                                                .get(&self.snapshot.functions[origin].id)?
-                                                .iter()
-                                                .find(|fact| {
-                                                    fact["witness"]["cause"]["operation"]
-                                                        == "indirect-call"
-                                                })
-                                                .map(|fact| {
-                                                    let mut witness = fact["witness"].clone();
-                                                    witness["reason"] = json!("Bound from function values reaching this indirect call; their bodies belong to the code that supplies them.");
-                                                    json!({"witness": witness})
-                                                })
-                                        });
-                                        // Without a recorded call site, the foreign
-                                        // body remains the only available citation.
-                                        match site {
-                                            Some(site) => (&*site, origin),
-                                            None => (fact, j),
-                                        }
-                                    }
-                                };
-                                if f.runtime_effects & effect as u8 == 0
-                                    || fact["witness"]["kind"] == "unavailable"
-                                {
-                                    continue;
-                                }
-                                let suspension =
-                                    effect == u64::from(RuntimeEffects::MAY_SUSPEND.bits());
-                                if !suspension
-                                    && evidence.get(&effect).is_some_and(|entry: &Value| {
-                                        !prefer_allocation(
-                                            effect as u8,
-                                            &fact["witness"],
-                                            &entry["witness"],
-                                        )
-                                    })
-                                {
-                                    continue;
-                                }
-                                let mut explained = json!({"effect":effect,
-                                    "status":evidence_status(&fact["witness"]),
-                                    "via_function":self.snapshot.functions[via_function].id,"witness":fact["witness"]});
-                                if let Some(route) = task_routes.get(&j) {
-                                    explained["task_relationship"] = route.clone();
-                                } else if fact["witness"]["cause"]["operation"] == "await"
-                                    || fact["witness"].get("awaited_type").is_some()
-                                {
-                                    explained["task_relationship"] = json!({"kind":"await", "function":self.snapshot.functions[via_function].id,
-                                        "location":fact["witness"]["cause"]["location"]});
-                                }
-                                if suspension {
-                                    suspension_sites.push(explained);
-                                } else {
-                                    evidence.insert(effect, explained);
-                                }
-                            }
-                        }
-                        let sites: HashMap<_, _> = self
-                            .snapshot
-                            .semantic
-                            .effect_calls
-                            .get(&cause.id)
-                            .into_iter()
-                            .flatten()
-                            .map(|site| (site.target.as_str(), site))
-                            .collect();
-                        let bucket = cause.id.starts_with("$indirect-arity:");
-                        for &k in &self.callees[j] {
-                            self.effect_edge_visits += 1;
-                            let origin = origin.or(via.filter(|_| bucket && !nested(k)));
-                            if seen.contains(&k) {
-                                continue;
-                            }
-                            let target = &self.snapshot.functions[k];
-                            let asynchronous = self.async_functions.contains(&k);
-                            let call = if asynchronous || target.synthetic {
-                                sites
-                                    .get(target.id.as_str())
-                                    .map(|site| {
-                                        json!({"kind":"spawn", "function":cause.id,
-                                            "target":target.id, "location":site.location})
-                                    })
-                                    .or_else(|| dispatch_sites.get(&j).cloned())
-                            } else {
-                                None
-                            };
-                            if let Some(origin) = origin {
-                                let pending = (k, j, origin, call);
-                                if asynchronous
-                                    && pending.3.is_none()
-                                    && !task_routes.contains_key(&j)
-                                {
-                                    unlocated_foreign.push_back(pending);
-                                } else {
-                                    foreign.push_back(pending);
-                                }
-                            } else {
-                                if asynchronous {
-                                    if let Some(mut route) = task_routes.get(&j).cloned().or(call) {
-                                        if !task_routes.contains_key(&j) {
-                                            route["target"] = json!(target.id);
-                                        }
-                                        tasks.push_back((k, j, route));
-                                    } else {
-                                        unlocated_tasks.push_back((k, j));
-                                    }
-                                    continue;
-                                } else if target.synthetic
-                                    && let Some(call) = call
-                                {
-                                    dispatch_sites.insert(k, call);
-                                }
-                                seen.insert(k);
-                                if let Some(route) = task_routes.get(&j) {
-                                    task_routes.insert(k, route.clone());
-                                }
-                                queue.push_back((k, Some(j)));
-                                witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
-                            }
-                        }
+                            .get(&session.snapshot.functions[origin].id)?
+                            .iter()
+                            .find(|fact| fact["witness"]["cause"]["operation"] == "indirect-call")
+                            .map(|fact| {
+                                let mut witness = fact["witness"].clone();
+                                witness["reason"] = json!("Bound from function values reaching this indirect call; their bodies belong to the code that supplies them.");
+                                json!({"witness": witness})
+                            })
+                    });
+                    // Without a recorded call site, the foreign
+                    // body remains the only available citation.
+                    match site {
+                        Some(site) => (&*site, origin),
+                        None => (fact, j),
                     }
-                    let mut missing = evidence
-                        .values()
-                        .chain(&suspension_sites)
-                        .any(|e| e["status"] == "missing-source");
-                    for bit in 0..RuntimeEffects::BIT_COUNT {
-                        let effect = RuntimeEffects::from_bit(bit).bits();
-                        if f.runtime_effects & effect == 0
-                            || (effect == RuntimeEffects::MAY_SUSPEND.bits()
-                                && !suspension_sites.is_empty())
-                        {
-                            continue;
-                        }
-                        evidence.entry(effect as u64).or_insert_with(|| {
-                            missing = true;
-                            json!({"effect":effect,"status":"missing-witness", "reason":
-                                if f.unknown {
-                                    "Retained as a conservative capability of an unresolved call or dispatch candidate; no operation witness is available. This does not prove that this function suspends or blocks, including when its declaration is synchronous."
-                                } else {
-                                    "Retained from the compiler/runtime capability summary, but no operation witness is available. This is an upper bound, not proof that this function performs the effect."
-                                }})
-                        });
-                    }
-                    let mut evidence: Vec<_> = evidence.into_values().collect();
-                    evidence.extend(suspension_sites);
-                    evidence.extend(builtin_sites);
-                    deduplicate_evidence(&mut evidence);
-                    self.present_lock_types(&mut evidence);
-                    // The traversal is a parent-before-child spanning tree. Share
-                    // parent links, compress synthetic dispatch hops once, and
-                    // materialize only the paths actually emitted as evidence.
-                    let mut parents = HashMap::new();
-                    let mut executable = HashMap::new();
-                    for node in &witness {
-                        let id = node["function"].as_str().unwrap();
-                        let parent = node["via"]
-                            .as_str()
-                            .and_then(|id| executable.get(id).copied())
-                            .flatten();
-                        if self
-                            .functions
-                            .get(id)
-                            .is_some_and(|&k| !self.snapshot.functions[k].synthetic)
-                        {
-                            parents.insert(id, parent);
-                            executable.insert(id, Some(id));
-                        } else {
-                            executable.insert(id, parent);
-                        }
-                    }
-                    for fact in &mut evidence {
-                        let owner = fact["witness"]["owner"]
-                            .as_str()
-                            .filter(|id| parents.contains_key(id))
-                            .or_else(|| fact["via_function"].as_str());
-                        let mut chain = Vec::new();
-                        let mut cursor = owner;
-                        while let Some(id) = cursor {
-                            let Some(parent) = parents.get(id) else { break };
-                            chain.push(id);
-                            cursor = *parent;
-                        }
-                        chain.reverse();
-                        if !chain.is_empty() {
-                            fact["call_chain"] = json!(chain);
-                        }
-                    }
-                    let mut compiler_witnesses =
-                        self.snapshot.semantic.witnesses.get(&f.id).cloned();
-                    if let Some(facts) = &mut compiler_witnesses {
-                        let ranges = local_ranges(&f.locations);
-                        facts.retain(|fact| {
-                            let w = &fact["witness"];
-                            let loc = &w["cause"]["location"];
-                            let (Some(path), Some(start), Some(end)) = (
-                                loc["path"].as_str(),
-                                loc["start"].as_u64(),
-                                loc["end"].as_u64(),
-                            ) else {
-                                return false;
-                            };
-                            let index =
-                                ranges.partition_point(|&(p, s, _)| (p, s as u64) <= (path, start));
-                            w["owner"].as_str().is_none_or(|owner| owner == f.id)
-                                && index.checked_sub(1).is_some_and(|index| {
-                                    let (p, _, e) = ranges[index];
-                                    p == path && start <= end && end <= e as u64
-                                })
-                        });
-                        deduplicate_evidence(facts);
-                        self.present_lock_types(facts);
-                        // Every evidence line carries a status, local ones too.
-                        for fact in facts.iter_mut() {
-                            fact["status"] = json!(evidence_status(&fact["witness"]));
-                            if fact["witness"]["cause"]["operation"] == "await"
-                                || fact["witness"].get("awaited_type").is_some()
-                            {
-                                fact["task_relationship"] = json!({"kind":"await", "function":f.id,
-                                    "location":fact["witness"]["cause"]["location"]});
-                            }
-                        }
-                    }
-                    json!({"schema":effect_states::SCHEMA,"effects":states,
-                        "status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
-                        "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "bounds":{"runtime":f.runtime_effects,"compiler":self.snapshot.semantic.compiler_effects.get(&f.id)},"effect_evidence":evidence,
-                        "witness":witness, "compiler_witnesses":compiler_witnesses,
-                        "meaning":"compiler facts and conservative runtime capability bounds; indirect-call bounds cover checked function values in this workspace, not arbitrary values supplied by future callers; external business effects and predicate feasibility are not implied"})
                 }
-            },
-        };
-        json!({"revision":self.revision(),"result":data})
+            };
+            if f.runtime_effects & effect as u8 == 0 || fact["witness"]["kind"] == "unavailable" {
+                continue;
+            }
+            let suspension = effect == u64::from(RuntimeEffects::MAY_SUSPEND.bits());
+            if !suspension
+                && self.evidence.get(&effect).is_some_and(|entry: &Value| {
+                    !prefer_allocation(effect as u8, &fact["witness"], &entry["witness"])
+                })
+            {
+                continue;
+            }
+            let mut explained = json!({"effect":effect,
+                "status":evidence_status(&fact["witness"]),
+                "via_function":session.snapshot.functions[via_function].id,"witness":fact["witness"]});
+            if let Some(route) = self.task_routes.get(&j) {
+                explained["task_relationship"] = route.clone();
+            } else if fact["witness"]["cause"]["operation"] == "await"
+                || fact["witness"].get("awaited_type").is_some()
+            {
+                explained["task_relationship"] = json!({"kind":"await", "function":session.snapshot.functions[via_function].id,
+                    "location":fact["witness"]["cause"]["location"]});
+            }
+            if suspension {
+                self.suspension_sites.push(explained);
+            } else {
+                self.evidence.insert(effect, explained);
+            }
+        }
+    }
+
+    /// Whether body `k` lies inside one of the root's source ranges.
+    fn nested(&self, k: usize) -> bool {
+        self.session.snapshot.functions[k]
+            .locations
+            .iter()
+            .any(|inner| {
+                self.root.locations.iter().any(|outer| {
+                    inner.path == outer.path && outer.start <= inner.start && inner.end <= outer.end
+                })
+            })
+    }
+
+    /// Queues each unseen callee of `j` by its task and provenance class.
+    fn enqueue_callees(&mut self, j: usize, via: Option<usize>, origin: Option<usize>) {
+        let session = self.session;
+        let cause = &session.snapshot.functions[j];
+        let sites: HashMap<_, _> = session
+            .snapshot
+            .semantic
+            .effect_calls
+            .get(&cause.id)
+            .into_iter()
+            .flatten()
+            .map(|site| (site.target.as_str(), site))
+            .collect();
+        let bucket = cause.id.starts_with("$indirect-arity:");
+        for &k in &session.callees[j] {
+            self.edge_visits += 1;
+            let origin = origin.or(via.filter(|_| bucket && !self.nested(k)));
+            if self.seen.contains(&k) {
+                continue;
+            }
+            let target = &session.snapshot.functions[k];
+            let asynchronous = session.async_functions.contains(&k);
+            let call = if asynchronous || target.synthetic {
+                sites
+                    .get(target.id.as_str())
+                    .map(|site| {
+                        json!({"kind":"spawn", "function":cause.id,
+                            "target":target.id, "location":site.location})
+                    })
+                    .or_else(|| self.dispatch_sites.get(&j).cloned())
+            } else {
+                None
+            };
+            if let Some(origin) = origin {
+                let pending = (k, j, origin, call);
+                if asynchronous && pending.3.is_none() && !self.task_routes.contains_key(&j) {
+                    self.unlocated_foreign.push_back(pending);
+                } else {
+                    self.foreign.push_back(pending);
+                }
+            } else {
+                if asynchronous {
+                    if let Some(mut route) = self.task_routes.get(&j).cloned().or(call) {
+                        if !self.task_routes.contains_key(&j) {
+                            route["target"] = json!(target.id);
+                        }
+                        self.tasks.push_back((k, j, route));
+                    } else {
+                        self.unlocated_tasks.push_back((k, j));
+                    }
+                    continue;
+                } else if target.synthetic
+                    && let Some(call) = call
+                {
+                    self.dispatch_sites.insert(k, call);
+                }
+                self.seen.insert(k);
+                if let Some(route) = self.task_routes.get(&j) {
+                    self.task_routes.insert(k, route.clone());
+                }
+                self.queue.push_back((k, Some(j)));
+                self.witness.push(self.reached(k, j));
+            }
+        }
+    }
+
+    /// Adds a missing-witness entry for each root effect without evidence and
+    /// reports whether any evidence is incomplete.
+    fn complete_missing_witnesses(&mut self) -> bool {
+        let f = self.root;
+        let mut missing = self
+            .evidence
+            .values()
+            .chain(&self.suspension_sites)
+            .any(|e| e["status"] == "missing-source");
+        for bit in 0..RuntimeEffects::BIT_COUNT {
+            let effect = RuntimeEffects::from_bit(bit).bits();
+            if f.runtime_effects & effect == 0
+                || (effect == RuntimeEffects::MAY_SUSPEND.bits()
+                    && !self.suspension_sites.is_empty())
+            {
+                continue;
+            }
+            self.evidence.entry(effect as u64).or_insert_with(|| {
+                missing = true;
+                json!({"effect":effect,"status":"missing-witness", "reason":
+                    if f.unknown {
+                        "Retained as a conservative capability of an unresolved call or dispatch candidate; no operation witness is available. This does not prove that this function suspends or blocks, including when its declaration is synchronous."
+                    } else {
+                        "Retained from the compiler/runtime capability summary, but no operation witness is available. This is an upper bound, not proof that this function performs the effect."
+                    }})
+            });
+        }
+        missing
     }
 }
 
