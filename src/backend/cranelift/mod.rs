@@ -2285,25 +2285,20 @@ fn gc_ref_mask_for_layout(layout: &[(String, Type)], enum_infos: &TypeMap<EnumIn
     .mask
 }
 
-// ─── Async frame GC metadata (willow-lpn.4) ──────────────────────────────────
+// ─── Async frame GC metadata ─────────────────────────────────────────────────
 //
-// An `async fn` whose locals are live across an `await` must spill them into a
-// heap-allocated frame (see requirements/willow_async_gc_requirements.md §6–7).
-// The runtime frame allocator `willow_async_frame_alloc(slot_count, gc_slot_mask)`
-// (crates/willow_runtime/src/async_frame.rs) was built by Stage 3 (willow-lpn.3);
-// it lays out `[state | slot_count | status | data slot 0 | data slot 1 | …]`
-// and shifts `gc_slot_mask` past the 3-word header internally. This stage is the compiler
-// side: compute, for an async fn, the ordered data-slot layout and the GC
-// reference mask the runtime needs to trace only the heap-reference slots.
-//
-// Slot-emission, live-across-await selection, and the suspend/resume state
-// machine are Stage 5 (willow-lpn.5); it consumes `AsyncFrameLayout`. Here the
-// mask computation is exact and the slot collector is the conservative initial
-// layout (parameters + annotated `let` locals).
+// An `async fn` whose locals are live across an `await` spills them into a
+// heap-allocated frame. The runtime allocator
+// `willow_async_frame_alloc(slot_count, gc_slot_mask)`
+// (crates/willow_runtime/src/async_frame.rs) lays out
+// `[state | slot_count | status | data slot 0 | data slot 1 | …]` and shifts
+// `gc_slot_mask` past the 3-word header internally. `AsyncFrameLayout` is the
+// compiler side: the ordered data-slot layout built by the async state-machine
+// emitter and the GC reference mask the runtime needs to trace only the
+// heap-reference slots.
 
 /// One data slot of an async fn's heap frame (excludes the fixed
 /// `state`/`slot_count`/`status` header words, which are never GC references).
-#[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AsyncFrameSlot {
     pub storage_kind: crate::ir::lowered::LirStorageKind,
@@ -2317,7 +2312,6 @@ pub struct AsyncFrameSlot {
 /// GC trace metadata for an async fn frame: the data-slot layout plus the GC
 /// reference mask consumed by `willow_async_frame_alloc`. Bit K of
 /// `gc_slot_mask` is set iff data slot K holds a GC-managed heap reference.
-#[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AsyncFrameLayout {
     pub slots: Vec<AsyncFrameSlot>,
@@ -2325,7 +2319,6 @@ pub struct AsyncFrameLayout {
     pub gc_payload_bitmap: Vec<u64>,
 }
 
-#[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
 impl AsyncFrameSlot {
     fn scalar_padding() -> Self {
         Self {
@@ -2349,10 +2342,6 @@ impl AsyncFrameLayout {
     /// pointers without a `GcHeader`, so they are NOT marked traceable here
     /// either (tracing them would crash the collector, see willow-lpn.9);
     /// JoinHandle is represented as a GC async-frame pointer and is traceable.
-    pub fn new(slots: Vec<AsyncFrameSlot>, enum_infos: &TypeMap<EnumInfo>) -> Self {
-        Self::try_new(slots, enum_infos).unwrap_or_else(|err| panic!("{err}"))
-    }
-
     pub fn try_new(slots: Vec<AsyncFrameSlot>, enum_infos: &TypeMap<EnumInfo>) -> Result<Self> {
         let mut gc_payload_bitmap =
             vec![0u64; (slots.len() + ASYNC_FRAME_HEADER_WORDS).div_ceil(64)];
@@ -2397,71 +2386,11 @@ impl AsyncFrameLayout {
     }
 
     /// Whether data slot `k` holds a GC-managed heap reference.
+    #[cfg(test)]
     pub fn slot_is_gc_ref(&self, k: usize) -> bool {
         k < self.slots.len() && {
             let word = k + ASYNC_FRAME_HEADER_WORDS;
             self.gc_payload_bitmap[word / 64] & (1 << (word % 64)) != 0
-        }
-    }
-}
-
-/// Collect the conservative initial frame slots for an async fn: parameters in
-/// declaration order, then `let`-bound locals discovered by walking the body
-/// (including nested `if`/`while` blocks) in source order, deduplicated by the
-/// binding's declaration span so shadowed same-name locals get distinct slots.
-///
-/// Locals whose type is only known by inference (no annotation) are skipped
-/// here; Stage 5 (willow-lpn.5) supplies resolved types and the precise
-/// live-across-await subset when it emits the frame. The GC reference mask
-/// produced from these slots is exact for whatever slots are included.
-#[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
-fn collect_async_frame_slots(params: &[Param], body: &Block) -> Vec<AsyncFrameSlot> {
-    let mut slots: Vec<AsyncFrameSlot> = params
-        .iter()
-        .map(|p| AsyncFrameSlot {
-            storage_kind: crate::ir::lowered::LirStorageKind::Value,
-            source_span: Some(p.span),
-            name: p.name.clone(),
-            ty: p.ty.clone().into(),
-        })
-        .collect();
-    let mut seen: HashSet<crate::diagnostics::Span> =
-        slots.iter().filter_map(|s| s.source_span).collect();
-    collect_let_slots(body, &mut slots, &mut seen);
-    slots
-}
-
-/// Walk a block collecting annotated `let` locals into `out` (deduped by span).
-#[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
-fn collect_let_slots(
-    block: &Block,
-    out: &mut Vec<AsyncFrameSlot>,
-    seen: &mut HashSet<crate::diagnostics::Span>,
-) {
-    let mut pending: Vec<&Stmt> = block.stmts.iter().rev().collect();
-    while let Some(stmt) = pending.pop() {
-        match stmt {
-            Stmt::Let(l) => {
-                if let Some(ty) = &l.ty
-                    && seen.insert(l.span)
-                {
-                    out.push(AsyncFrameSlot {
-                        storage_kind: crate::ir::lowered::LirStorageKind::Value,
-                        source_span: Some(l.span),
-                        name: l.name.clone(),
-                        ty: ty.into(),
-                    });
-                }
-            }
-            Stmt::If(s) => {
-                if let Some(block) = &s.else_block {
-                    pending.extend(block.stmts.iter().rev());
-                }
-                pending.extend(s.then_block.stmts.iter().rev());
-            }
-            Stmt::While(s) => pending.extend(s.body.stmts.iter().rev()),
-            Stmt::For(s) => pending.extend(s.body.stmts.iter().rev()),
-            _ => {}
         }
     }
 }
@@ -3191,7 +3120,7 @@ mod tests {
     #[test]
     fn opaque_gc_owner_frame_slots_are_traced_without_language_types() {
         use crate::ir::lowered::LirStorageKind;
-        let layout = AsyncFrameLayout::new(
+        let layout = AsyncFrameLayout::try_new(
             vec![
                 AsyncFrameSlot {
                     storage_kind: LirStorageKind::GcOwner,
@@ -3207,7 +3136,8 @@ mod tests {
                 },
             ],
             &TypeMap::new(),
-        );
+        )
+        .unwrap();
         assert!(layout.slot_is_gc_ref(0));
         assert!(!layout.slot_is_gc_ref(1));
         assert_eq!(layout.gc_slot_mask, 1);
@@ -3232,7 +3162,7 @@ mod tests {
                 ty: t.clone(),
             })
             .collect();
-        AsyncFrameLayout::new(slots, enum_infos)
+        AsyncFrameLayout::try_new(slots, enum_infos).unwrap()
     }
 
     /// Helper: an EnumInfo registry with one enum of the given (name, payload) variants.
@@ -3450,81 +3380,6 @@ mod tests {
         let layout = AsyncFrameLayout::try_new(too_many_slots, &TypeMap::new()).unwrap();
         assert!(layout.slot_is_gc_ref(ASYNC_FRAME_GC_SLOT_CAPACITY));
         assert_eq!(layout.gc_payload_bitmap[1], 1);
-    }
-
-    // 21. The collector lists parameters first, then annotated `let` locals,
-    //     including ones declared inside nested blocks. Each binding is keyed by
-    //     its (distinct) declaration span (willow-lpn.11).
-    #[test]
-    fn async_frame_21_collector_params_then_nested_lets() {
-        let params = vec![Param {
-            name: "x".to_string(),
-            ty: crate::parser::ast::Type::Named("Node".to_string()),
-            mode: ParamMode::Value,
-            span: Span::new(1, 1, 1, 1),
-            type_span: Span::dummy(),
-        }];
-        // body: let y: String = ...; while ... { let z: i64 = ...; }
-        let body = Block {
-            id: crate::parser::ast::BodyId::fresh(),
-            stmts: vec![
-                Stmt::Let(LetStmt {
-                    type_span: None,
-                    name: "y".to_string(),
-                    mutable: false,
-                    ty: Some(crate::parser::ast::Type::String),
-                    init: Expr::Integer(0, Span::dummy(), ExprId::fresh()),
-                    span: Span::new(2, 2, 2, 1),
-                }),
-                Stmt::While(WhileStmt {
-                    invariants: Vec::new(),
-                    variant: None,
-                    cond: Expr::Bool(true, Span::dummy(), ExprId::fresh()),
-                    body: Block {
-                        id: crate::parser::ast::BodyId::fresh(),
-                        stmts: vec![Stmt::Let(LetStmt {
-                            type_span: None,
-                            name: "z".to_string(),
-                            mutable: false,
-                            ty: Some(crate::parser::ast::Type::I64),
-                            init: Expr::Integer(0, Span::dummy(), ExprId::fresh()),
-                            span: Span::new(3, 3, 3, 1),
-                        })],
-                        span: Span::dummy(),
-                    },
-                    span: Span::dummy(),
-                }),
-            ],
-            span: Span::dummy(),
-        };
-        let slots = collect_async_frame_slots(&params, &body);
-        let names: Vec<&str> = slots.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["x", "y", "z"]);
-
-        // And the mask over those slots: x (Node) and y (String) are refs, z (i64) is not.
-        let enum_infos: TypeMap<EnumInfo> = TypeMap::new();
-        let layout = AsyncFrameLayout::new(slots, &enum_infos);
-        assert_eq!(layout.gc_slot_mask, 0b011);
-    }
-
-    // 22. Unannotated `let` locals are skipped by the conservative collector
-    //     (their inferred types are supplied by Stage 5, willow-lpn.5).
-    #[test]
-    fn async_frame_22_collector_skips_unannotated_lets() {
-        let body = Block {
-            id: crate::parser::ast::BodyId::fresh(),
-            stmts: vec![Stmt::Let(LetStmt {
-                type_span: None,
-                name: "inferred".to_string(),
-                mutable: false,
-                ty: None,
-                init: Expr::Integer(1, Span::dummy(), ExprId::fresh()),
-                span: Span::dummy(),
-            })],
-            span: Span::dummy(),
-        };
-        let slots = collect_async_frame_slots(&[], &body);
-        assert!(slots.is_empty());
     }
 
     #[test]
