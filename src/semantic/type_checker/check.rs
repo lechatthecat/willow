@@ -24,6 +24,35 @@ thread_local! {
 
 #[willow_continuations::checker]
 impl TypeChecker {
+    /// Async Rust adapters create a foreign wait even when their returned task
+    /// is not immediately awaited. Seed this at the call site so ordinary
+    /// async-constructor effect masking cannot erase the foreign wait.
+    pub(super) fn check_foreign_call(&mut self, span: Span, is_async: bool) {
+        self.record_direct_lock_effect(
+            span,
+            "extern rust",
+            if is_async {
+                LockEffectKind::Suspend
+            } else {
+                LockEffectKind::Block
+            },
+        );
+        if is_async && !self.local.current_async_context {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0801,
+                    "an async Rust bridge can only be called inside an async function",
+                )
+                .with_label(Label::primary(
+                    span,
+                    "async Rust call in a non-async function",
+                ))
+                .with_help("make the enclosing function `async` and await the returned task"),
+            );
+        }
+    }
+
     /// Introduce a local binding (let, parameter, loop variable, pattern
     /// binding, ...), rejecting the reserved builtin names first.
     ///
@@ -3290,11 +3319,7 @@ impl TypeChecker {
                         );
                     }
                     if info.foreign {
-                        self.record_direct_lock_effect(
-                            c.span,
-                            "extern rust",
-                            LockEffectKind::Block,
-                        );
+                        self.check_foreign_call(c.span, info.is_async);
                     }
                     self.check_call_args_against_param_infos(&info.param_infos, &c.args);
                     self.check_async_call_captures(&info.param_infos, &c.args, info.is_async);

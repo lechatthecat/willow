@@ -2800,7 +2800,7 @@ impl TypeChecker {
             return self.reject_constant_call(&qualified, &fi, args, span);
         }
         if fi.foreign {
-            self.record_direct_lock_effect(span, "extern rust", LockEffectKind::Block);
+            self.check_foreign_call(span, fi.is_async);
         }
         self.record_method_use(method_name, "function", span, fi.declaration_span, args);
         // `m::f(..)` is a call, unlike a `m::CONST` member read.

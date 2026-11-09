@@ -34,6 +34,7 @@ impl InteropGraph {
             "rust_adapter":self.rust_adapter,
             "abi_symbol":b.symbol.abi_symbol,
             "effects":b.symbol.effects,
+            "async":b.symbol.is_async,
             "nonblocking":b.symbol.nonblocking,
             "trust":if b.symbol.nonblocking.is_some() {"developer_declared"} else {"undeclared"},
             "official_verified":false,

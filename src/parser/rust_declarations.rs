@@ -188,6 +188,13 @@ impl Parser {
                 }));
                 continue;
             }
+            let is_async = self.eat(TokenKind::Async);
+            if is_async && nonblocking.is_some() {
+                return Err(self.err(
+                    ErrorCode::E0102,
+                    "async Rust bridge cannot declare nonblocking",
+                ));
+            }
             self.expect(TokenKind::Fn)?;
             let name = self.expect_ident()?;
             if name == "main" {
@@ -231,6 +238,11 @@ impl Parser {
             self.expect(TokenKind::Semicolon)?;
             let span = span.to(self.previous_span());
             let mut symbol = RustBridgeSymbol::new(name.clone(), inputs, output);
+            symbol.is_async = is_async;
+            if is_async {
+                symbol.effects &= !willow_abi::RuntimeEffects::MAY_BLOCK.bits();
+                symbol.effects |= willow_abi::RuntimeEffects::MAY_SUSPEND.bits();
+            }
             symbol.resolve_records(&self.rust_records);
             if let Some(fingerprint) = nonblocking {
                 symbol.declare_nonblocking(fingerprint);
@@ -244,7 +256,7 @@ impl Parser {
                 rust_bridge: Some(Box::new(symbol)),
                 name,
                 public: true,
-                is_async: false,
+                is_async,
                 params,
                 return_type,
                 body: Block {

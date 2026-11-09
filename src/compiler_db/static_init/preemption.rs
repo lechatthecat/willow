@@ -28,6 +28,11 @@ impl StaticInitQueries {
         let mut tasks = Vec::new();
         for item in &program.items {
             match item {
+                Item::Function(f) if f.is_async && f.rust_bridge.is_some() => {
+                    // Construction only copies boundary values and schedules the
+                    // foreign executor; no user Rust is polled on this worker.
+                    leaves.insert(FunctionId::free_from_source_name(&f.name));
+                }
                 Item::Function(f) if f.is_async => {
                     tasks.push((FunctionId::free_from_source_name(&f.name), f.span));
                 }
@@ -86,9 +91,9 @@ impl StaticInitQueries {
                 .iter()
                 .filter_map(|item| match item {
                     Item::Function(f)
-                        if f.rust_bridge
-                            .as_ref()
-                            .is_some_and(|bridge| bridge.nonblocking.is_none()) =>
+                        if f.rust_bridge.as_ref().is_some_and(|bridge| {
+                            !bridge.is_async && bridge.nonblocking.is_none()
+                        }) =>
                     {
                         Some(FunctionId::free_from_source_name(&f.name))
                     }

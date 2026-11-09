@@ -1,5 +1,6 @@
 //! Foreign-call admission; only explicitly reviewed bounded calls admit tasks.
 pub(crate) mod aggregate;
+mod asynchronous;
 #[cfg(test)]
 mod handles;
 #[unsafe(no_mangle)]

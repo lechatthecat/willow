@@ -116,11 +116,49 @@ impl Scalar {
             _ => output.push_str(self.rust()),
         }
     }
+    fn append_owned_type(&self, output: &mut String) {
+        match self {
+            Self::Opaque(name) => {
+                write!(output, "crate::AsyncHandle<crate::bridge::r#{name}>").unwrap()
+            }
+            Self::Record(name) => write!(output, "crate::record_owned::r#{name}").unwrap(),
+            Self::Option(t) | Self::Array(t) => {
+                output.push_str(if matches!(self, Self::Option(_)) {
+                    "::std::option::Option<"
+                } else {
+                    "::std::vec::Vec<"
+                });
+                t.append_owned_type(output);
+                output.push('>');
+            }
+            Self::Result(a, b) => {
+                output.push_str("::std::result::Result<");
+                a.append_owned_type(output);
+                output.push(',');
+                b.append_owned_type(output);
+                output.push('>');
+            }
+            _ => self.append_rust_type(output, false, Some("'static")),
+        }
+    }
     fn decode(&self, source: &mut String, value: &str, serial: &mut usize) -> String {
+        self.decode_mode(source, value, serial, false)
+    }
+    fn decode_mode(
+        &self,
+        source: &mut String,
+        value: &str,
+        serial: &mut usize,
+        owned: bool,
+    ) -> String {
         let n = *serial;
         *serial += 1;
         let out = format!("v{n}");
         match self {
+            Self::Opaque(name) if owned => writeln!(source, "let {out} = AsyncHandle::<bridge::r#{name}>::new(frame.payload({value}, false).low, std::any::TypeId::of::<opaque_tags::r#{name}>());").unwrap(),
+            Self::String if owned => writeln!(source, "let {out} = frame.string({value}.low).to_owned();").unwrap(),
+            Self::Bytes if owned => writeln!(source, "let {out} = frame.bytes({value}.low).to_vec();").unwrap(),
+            Self::Record(name) if owned => writeln!(source, "let {out} = decode_owned_record_{name}(&frame, {value});").unwrap(),
             Self::Opaque(name) => writeln!(source, "let {out} = frame.handle::<bridge::r#{name}>(frame.payload({value}, false).low, std::any::TypeId::of::<opaque_tags::r#{name}>());").unwrap(),
             Self::I64 => writeln!(source, "let {out} = {value}.low as i64;").unwrap(),
             Self::F64 => writeln!(source, "let {out} = f64::from_bits({value}.low);").unwrap(),
@@ -131,7 +169,7 @@ impl Scalar {
             Self::Record(name) => writeln!(source, "let {out} = decode_record_{name}(&frame, {value});").unwrap(),
             Self::Array(t) => {
                 writeln!(source, "frame.root({value}.low);\nlet mut {out} = Vec::with_capacity(frame.array_len({value}.low));\nfor i{n} in 0..frame.array_len({value}.low) {{\nlet e{n} = frame.array_get({value}.low, i{n});").unwrap();
-                let child = t.decode(source, &format!("e{n}"), serial);
+                let child = t.decode_mode(source, &format!("e{n}"), serial, owned);
                 writeln!(source, "{out}.push({child}); }}").unwrap();
             }
             Self::Option(t) => {
@@ -144,7 +182,7 @@ impl Scalar {
                 };
                 writeln!(source, "let {out} = if {tag} == 0 {{").unwrap();
                 self.decode_payload(source, value, t, n);
-                let child = t.decode(source, &format!("p{n}"), serial);
+                let child = t.decode_mode(source, &format!("p{n}"), serial, owned);
                 writeln!(source, "Some({child}) }} else {{ None }};").unwrap();
             }
             Self::Result(a, b) => {
@@ -155,10 +193,10 @@ impl Scalar {
                 };
                 writeln!(source, "let {out} = if {tag} == 0 {{").unwrap();
                 self.decode_payload(source, value, a, n);
-                let child = a.decode(source, &format!("p{n}"), serial);
+                let child = a.decode_mode(source, &format!("p{n}"), serial, owned);
                 writeln!(source, "Ok({child}) }} else {{").unwrap();
                 self.decode_payload(source, value, b, n);
-                let child = b.decode(source, &format!("p{n}"), serial);
+                let child = b.decode_mode(source, &format!("p{n}"), serial, owned);
                 writeln!(source, "Err({child}) }};").unwrap();
             }
         }
@@ -297,7 +335,32 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
     let mut serial = 0;
     let mut arguments = Vec::new();
     for (i, ty) in symbol.input_types.iter().enumerate() {
-        arguments.push(ty.decode(source, &format!("a{i}"), &mut serial));
+        arguments.push(ty.decode_mode(source, &format!("a{i}"), &mut serial, symbol.is_async));
+    }
+    if symbol.is_async {
+        // The task constructor copies inputs now; user Rust only runs on the executor.
+        for (i, _) in records.iter().enumerate() {
+            writeln!(
+                source,
+                "let descriptor{i} = unsafe {{ *records.add({i}) }} as usize;"
+            )
+            .unwrap();
+        }
+        writeln!(source, "let future = Box::pin(async move {{ let result: {} = bridge::r#{target}({}).await; Box::new(move |frame: &mut BridgeFrame| {{", symbol.output_type.rust_type(false), arguments.join(",")).unwrap();
+        // Descriptors are immutable process-lifetime metadata, not GC values.
+        if !records.is_empty() {
+            for (i, record) in records.iter().enumerate() {
+                writeln!(
+                    source,
+                    "frame.descriptors.insert({:?}, descriptor{i} as *const u64);",
+                    record.name
+                )
+                .unwrap();
+            }
+        }
+        let encoded = symbol.output_type.encode(source, "result", &mut serial);
+        writeln!(source, "{encoded} }}) as Completion }});\nlet task = spawn_future(future, {});\nunsafe {{ *output = task; }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}}", symbol.output_type.reference()).unwrap();
+        return;
     }
     write!(source, "let adapter: fn(").unwrap();
     for ty in &symbol.input_types {
@@ -380,6 +443,46 @@ pub(super) fn record_structs(source: &mut String, symbols: &[RustBridgeSymbol]) 
             source.push_str(";\n");
         }
         source.push_str("}\n");
+    }
+    if symbols.iter().any(|s| s.is_async) {
+        source.push_str("#[allow(dead_code)] pub mod record_owned {\n");
+        for record in &records {
+            write!(
+                source,
+                "pub type r#{} = crate::records::r#{}",
+                record.name, record.name
+            )
+            .unwrap();
+            if !record.fields.is_empty() {
+                source.push('<');
+                for (_, ty) in &record.fields {
+                    ty.append_owned_type(source);
+                    source.push(',');
+                }
+                source.push('>');
+            }
+            source.push_str(";\n");
+        }
+        source.push_str("}\n");
+        for record in &records {
+            let name = &record.name;
+            writeln!(source, "#[allow(non_snake_case, dead_code)] fn decode_owned_record_{name}(frame: &BridgeFrame, value: BridgeValue) -> record_owned::r#{name} {{ frame.root(value.low);").unwrap();
+            let mut offset = 1;
+            let mut serial = 0;
+            let mut values = Vec::new();
+            for (field, ty) in &record.fields {
+                writeln!(
+                    source,
+                    "let p{offset} = frame.record_get(value.low, {offset}, {});",
+                    ty.pair()
+                )
+                .unwrap();
+                let value = ty.decode_mode(source, &format!("p{offset}"), &mut serial, true);
+                values.push(format!("r#{field}: {value}"));
+                offset += if ty.pair() { 2 } else { 1 };
+            }
+            writeln!(source, "records::r#{name} {{ {} }} }}", values.join(",")).unwrap();
+        }
     }
     for record in &records {
         let super::Record { name, fields } = record;

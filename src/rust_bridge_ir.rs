@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
-pub(crate) const WRAPPER_SCHEMA: &str = "7";
+pub(crate) const WRAPPER_SCHEMA: &str = "8";
 
 pub type RustBridgeSymbols = Vec<((u32, String), RustBridgeSymbol)>;
 
@@ -124,6 +124,8 @@ pub struct Record {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RustBridgeSymbol {
+    #[serde(default)]
+    pub is_async: bool,
     pub rust_crate: String,
     pub willow_function: String,
     pub abi_symbol: String,
@@ -161,10 +163,12 @@ impl RustBridgeSymbol {
         self.records = records;
     }
     pub fn aggregate(&self) -> bool {
-        self.input_types
-            .iter()
-            .chain([&self.output_type])
-            .any(Scalar::aggregate)
+        self.is_async
+            || self
+                .input_types
+                .iter()
+                .chain([&self.output_type])
+                .any(Scalar::aggregate)
     }
 
     pub fn new(name: String, inputs: Vec<Scalar>, output: Scalar) -> Self {
@@ -172,6 +176,7 @@ impl RustBridgeSymbol {
             .union(willow_abi::RuntimeEffects::MAY_BLOCK)
             .union(willow_abi::RuntimeEffects::MAY_ALLOCATE);
         Self {
+            is_async: false,
             rust_crate: String::new(),
             close_handle: false,
             nonblocking: None,
@@ -189,7 +194,7 @@ impl RustBridgeSymbol {
     }
 
     pub fn entry_guard(&self) -> &'static str {
-        if self.nonblocking.is_some() {
+        if self.is_async || self.nonblocking.is_some() {
             "willow_rust_bridge_enter_nonblocking"
         } else {
             "willow_rust_bridge_enter"
@@ -214,6 +219,11 @@ impl RustBridgeSymbol {
         // exports. The symbol component keeps its readable leaf name plus a
         // digest of the full Willow name/signature, avoiding namespace and
         // signature collisions without lossy identifier escaping.
+        let bytes = if self.is_async {
+            serde_json::to_vec(&("async", bytes)).unwrap()
+        } else {
+            bytes
+        };
         let package_hash = Sha256::digest(identity.as_bytes());
         let name = QualifiedName::new(&self.willow_function).last_segment();
         bound.abi_symbol = format!(
@@ -272,6 +282,11 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
     if symbols.iter().any(RustBridgeSymbol::aggregate) {
         source.push_str(include_str!("rust_bridge_ir/support.rs"));
     }
+    if symbols.iter().any(|s| s.is_async) {
+        source.push_str(include_str!(
+            "../crates/willow_runtime/src/rust_bridge_abi/futures.rs"
+        ));
+    }
     aggregate::record_structs(&mut source, symbols);
     for symbol in symbols {
         if symbol.aggregate() {
@@ -310,3 +325,8 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
 
 mod aggregate;
 use aggregate::aggregate_wrapper;
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "rust_bridge_ir/async_executor_tests.rs"]
+mod async_executor_tests;

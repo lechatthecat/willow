@@ -489,6 +489,7 @@ runtime_abi_schema! {
     NONE; willow_blocking_queue_capacity => ([] -> Some(I64));
     // Scalar Rust bridge entry gate and contained-panic termination.
     BLOCK; willow_native_symbol_v1 => ([Ptr, Ptr] -> Some(Ptr));
+    ALLOC; willow_rust_bridge_async_spawn => ([Ptr, Ptr, Ptr, Ptr, I32] -> Some(Ptr));
     NONE; willow_rust_bridge_enter => ([I32] -> None);
     NONE; willow_rust_bridge_enter_nonblocking => ([I32] -> None);
     NONE; willow_rust_bridge_region_enter => ([] -> Some(I32));

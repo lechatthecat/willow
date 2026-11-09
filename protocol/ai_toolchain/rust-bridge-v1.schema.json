@@ -169,6 +169,7 @@
         "coverage": {
           "type": "string"
         },
+        "async": { "type": "boolean" },
         "effects": {
           "type": "integer",
           "minimum": 0,
