@@ -22,6 +22,10 @@ const CONTRACT_CONSTANTS: &[u64] = &[
     generated_context::SYNC_COUNTER_OFFSET as u64,
     generated_context::GC_STOP_OFFSET as u64,
     generated_context::BARRIER_BUFFER_OFFSET as u64,
+    generated_context::CARD_OWNER_OFFSET as u64,
+    generated_context::CARD_INDEX_OFFSET as u64,
+    generated_context::CARD_EPOCH_OFFSET as u64,
+    GC_ARRAY_CARD_BYTES as u64,
     barrier_buffer::BASE_OFFSET as u64,
     barrier_buffer::LENGTH_OFFSET as u64,
     barrier_buffer::LIMIT_OFFSET as u64,
@@ -172,6 +176,7 @@ const fn hash_contract(
         i += 1;
     }
     hash.string(GC_MARK_PHASE_SYMBOL);
+    hash.string(GC_CARD_EPOCH_SYMBOL);
     hash.word(symbols.len() as u64);
     i = 0;
     while i < symbols.len() {

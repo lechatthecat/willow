@@ -773,6 +773,32 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .ins()
             .atomic_load(types::I8, MemFlagsData::trusted(), phase_addr);
         let marking = self.builder.ins().icmp_imm_s(IntCC::NotEqual, phase, 0);
+        if destination == GcStoreDestination::ArrayElement {
+            let epoch_data = self
+                .module
+                .declare_data(
+                    willow_abi::GC_CARD_EPOCH_SYMBOL,
+                    cranelift_module::Linkage::Import,
+                    false,
+                    false,
+                )
+                .expect("GC card epoch symbol");
+            let epoch_global = self
+                .module
+                .declare_data_in_func(epoch_data, self.builder.func);
+            let epoch_addr = self.builder.ins().symbol_value(ptr_ty, epoch_global);
+            let epoch =
+                self.builder
+                    .ins()
+                    .atomic_load(types::I64, MemFlagsData::trusted(), epoch_addr);
+            let hit = emit_remembered_card_hit(self.builder, ptr_ty, owner, slot, epoch);
+            let inactive = self.builder.ins().icmp_imm_s(IntCC::Equal, phase, 0);
+            let skip = self.builder.ins().band(hit, inactive);
+            let filter = self.builder.create_block();
+            self.builder.ins().brif(skip, plain, &[], filter, &[]);
+            self.builder.switch_to_block(filter);
+            self.builder.seal_block(filter);
+        }
         let header = -(gc_header::size(ptr_ty.bytes()) as i32);
         let generation = self.builder.ins().load(
             types::I8,
@@ -893,6 +919,45 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(done);
         self.builder.seal_block(done);
     }
+}
+
+/// A context-local value proof, never a pointer into TLS or reclaimable memory.
+/// The caller supplies an in-bounds array element slot and must also require
+/// inactive marking. Collection/reclamation changes `epoch` before reuse;
+/// there is no safepoint between this check and the reference store.
+fn emit_remembered_card_hit(
+    builder: &mut FunctionBuilder<'_>,
+    ptr_ty: cranelift_codegen::ir::Type,
+    owner: Value,
+    slot: Value,
+    epoch: Value,
+) -> Value {
+    use willow_abi::generated_context as abi;
+    let context = builder.ins().get_pinned_reg(ptr_ty);
+    let flags = MemFlagsData::trusted();
+    let cached_owner = builder
+        .ins()
+        .load(ptr_ty, flags, context, abi::CARD_OWNER_OFFSET);
+    let cached_card = builder
+        .ins()
+        .load(ptr_ty, flags, context, abi::CARD_INDEX_OFFSET);
+    let cached_epoch = builder
+        .ins()
+        .load(types::I64, flags, context, abi::CARD_EPOCH_OFFSET);
+    let relative = builder.ins().isub(slot, owner);
+    let relative = builder.ins().iadd_imm_s(
+        relative,
+        -(willow_abi::array_layout::BUFFER_HEADER_WORDS as i64 * 8),
+    );
+    let card = builder.ins().ushr_imm_s(
+        relative,
+        willow_abi::GC_ARRAY_CARD_BYTES.trailing_zeros() as i64,
+    );
+    let same_owner = builder.ins().icmp(IntCC::Equal, cached_owner, owner);
+    let same_card = builder.ins().icmp(IntCC::Equal, cached_card, card);
+    let same_epoch = builder.ins().icmp(IntCC::Equal, cached_epoch, epoch);
+    let same = builder.ins().band(same_owner, same_card);
+    builder.ins().band(same, same_epoch)
 }
 
 /// Append both deletion and insertion roots to an admitted, owner-only buffer.
@@ -1330,6 +1395,60 @@ mod tests {
             assert_eq!(count, *per_site.get_or_insert(count) * sites);
             cranelift_codegen::verify_function(&ctx.func, codegen.output.module.isa()).unwrap();
             println!("sites={sites} inline_instructions={count} calls=0");
+        }
+    }
+
+    #[test]
+    fn remembered_card_hit_codegen_has_constant_work_and_no_calls_or_rmw() {
+        use cranelift_codegen::ir::Opcode;
+        for sites in [1, 16, 256] {
+            let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let codegen = codegen_build.declaration_context();
+            let mut ctx = codegen.output.module.make_context();
+            ctx.func
+                .signature
+                .params
+                .extend([AbiParam::new(types::I64); 3]);
+            let mut frontend = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut frontend);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let p = builder.block_params(entry).to_vec();
+            for _ in 0..sites {
+                emit_remembered_card_hit(&mut builder, types::I64, p[0], p[1], p[2]);
+            }
+            builder.ins().return_(&[]);
+            builder.finalize(codegen.output.module.target_config());
+            let ops: Vec<_> = ctx
+                .func
+                .layout
+                .block_insts(entry)
+                .map(|i| ctx.func.dfg.insts[i].opcode())
+                .collect();
+            for op in [
+                Opcode::Call,
+                Opcode::CallIndirect,
+                Opcode::AtomicRmw,
+                Opcode::AtomicCas,
+                Opcode::Store,
+                Opcode::AtomicStore,
+                Opcode::Fence,
+            ] {
+                assert!(!ops.contains(&op), "{op:?}");
+            }
+            assert_eq!(
+                ops.iter().filter(|&&op| op == Opcode::Load).count(),
+                3 * sites
+            );
+            assert_eq!(ops.len() - 1, 14 * sites);
+            cranelift_codegen::verify_function(&ctx.func, codegen.output.module.isa()).unwrap();
+            println!(
+                "sites={sites} card_proof_instructions={} loads={} calls=0 rmw=0",
+                ops.len() - 1,
+                3 * sites
+            );
         }
     }
 

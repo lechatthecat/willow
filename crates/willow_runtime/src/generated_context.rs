@@ -140,6 +140,9 @@ pub(crate) struct Context {
     sync_counter: Cell<*mut i32>,
     gc_stop: Cell<*const u8>,
     barrier_buffer: Cell<usize>,
+    card_owner: Cell<usize>,
+    card_index: Cell<usize>,
+    card_epoch: Cell<u64>,
     pub(crate) roots: ShadowRoots,
     parent: Cell<*const Context>,
     parent_depth: Cell<usize>,
@@ -156,6 +159,9 @@ impl Context {
             sync_counter: Cell::new(std::ptr::null_mut()),
             gc_stop: Cell::new(std::ptr::null()),
             barrier_buffer: Cell::new(0),
+            card_owner: Cell::new(0),
+            card_index: Cell::new(0),
+            card_epoch: Cell::new(0),
             roots: ShadowRoots::new(),
             parent: Cell::new(std::ptr::null()),
             parent_depth: Cell::new(0),
@@ -211,6 +217,16 @@ pub(crate) fn set_barrier_buffer(address: usize) {
     unsafe { &*active() }.barrier_buffer.set(address);
 }
 
+/// Install a proven remembered card in the running context. Unlike a worker
+/// buffer pointer this value proof can migrate: the global epoch invalidates
+/// it before remembered membership can disappear or the owner be reused.
+pub(crate) fn set_remembered_card(owner: usize, card: usize, epoch: u64) {
+    let context = unsafe { &*active() };
+    context.card_owner.set(owner);
+    context.card_index.set(card);
+    context.card_epoch.set(epoch);
+}
+
 pub(crate) fn revoke_barrier_buffers() {
     // Registration retirement can occur in a nested native callback. Revoke
     // ancestors before releasing the Arc that keeps their pointers alive.
@@ -223,6 +239,18 @@ pub(crate) fn revoke_barrier_buffers() {
 }
 
 const _: () = {
+    assert!(
+        std::mem::offset_of!(Context, card_owner)
+            == willow_abi::generated_context::CARD_OWNER_OFFSET as usize
+    );
+    assert!(
+        std::mem::offset_of!(Context, card_index)
+            == willow_abi::generated_context::CARD_INDEX_OFFSET as usize
+    );
+    assert!(
+        std::mem::offset_of!(Context, card_epoch)
+            == willow_abi::generated_context::CARD_EPOCH_OFFSET as usize
+    );
     assert!(
         std::mem::offset_of!(Context, barrier_buffer)
             == willow_abi::generated_context::BARRIER_BUFFER_OFFSET as usize
@@ -436,6 +464,45 @@ unsafe fn call_word(entry: *const (), argument: usize, context: *const Context) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remembered_card_proofs_are_context_owned_across_nesting_and_transfer() {
+        let _guard = crate::gc::runtime_test_guard();
+        let values = |context: &Context| {
+            (
+                context.card_owner.get(),
+                context.card_index.get(),
+                context.card_epoch.get(),
+            )
+        };
+        let outer = active();
+        let saved = values(unsafe { &*outer });
+        set_remembered_card(123, 4, 5);
+        let nested = Context::new();
+        let old = replace(&nested);
+        assert_eq!(values(&nested), (0, 0, 0));
+        set_remembered_card(456, 7, 8);
+        assert_eq!(values(unsafe { &*outer }), (123, 4, 5));
+        replace(old);
+        assert_eq!(values(unsafe { &*active() }), (123, 4, 5));
+        set_remembered_card(saved.0, saved.1, saved.2);
+        let address = Box::into_raw(Box::new(nested)) as usize;
+        std::thread::spawn(move || {
+            let context = unsafe { Box::from_raw(address as *mut Context) };
+            context.refresh();
+            // This is a value proof, not a pointer into the departed worker.
+            assert_eq!(
+                (
+                    context.card_owner.get(),
+                    context.card_index.get(),
+                    context.card_epoch.get()
+                ),
+                (456, 7, 8)
+            );
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn inline_satb_admission_is_revoked_across_nested_retirement_and_worker_transfer() {

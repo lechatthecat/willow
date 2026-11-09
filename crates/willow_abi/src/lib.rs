@@ -389,6 +389,11 @@ pub mod gc_header {
 /// 2 = stopped remark). Generated code reads it with acquire ordering.
 pub const GC_MARK_PHASE_SYMBOL: &str = "willow_gc_mark_phase";
 
+/// Acquire-loaded epoch invalidating remembered-card proofs on collection,
+/// whole-owner conversion and reclamation. Zero is never an admitted proof.
+pub const GC_CARD_EPOCH_SYMBOL: &str = "willow_gc_card_epoch";
+pub const GC_ARRAY_CARD_BYTES: usize = 512;
+
 /// Pointer-only interface boxes and dispatch tables. Scalar class identifiers
 /// keep their fixed i64 representation even when table entries are narrower.
 /// Interface tables contain composed method pointers (at least one word),
@@ -876,14 +881,19 @@ pub mod generated_context {
     pub const GC_STOP_OFFSET: i32 = 32;
     /// Current registered mutator SATB buffer; null requires runtime admission.
     pub const BARRIER_BUFFER_OFFSET: i32 = 40;
+    /// Last remembered array card, owned by this execution context. Only the
+    /// runtime fills the proof; generated stores compare all three words.
+    pub const CARD_OWNER_OFFSET: i32 = 48;
+    pub const CARD_INDEX_OFFSET: i32 = 56;
+    pub const CARD_EPOCH_OFFSET: i32 = 64;
     /// Pointer to the context-owned root-slot pointer array.
-    pub const ROOT_BASE_OFFSET: i32 = 48;
+    pub const ROOT_BASE_OFFSET: i32 = 72;
     /// Initialized slot count, updated only by the running context owner.
-    pub const ROOT_TOP_OFFSET: i32 = 56;
+    pub const ROOT_TOP_OFFSET: i32 = 80;
     /// Admitted capacity; zero forces cold ownership/capacity admission.
-    pub const ROOT_LIMIT_OFFSET: i32 = 64;
+    pub const ROOT_LIMIT_OFFSET: i32 = 88;
     /// Size of the generated-code-visible prefix; runtime storage follows it.
-    pub const SIZE: usize = 72;
+    pub const SIZE: usize = 96;
     pub const HELPER_DESCRIPTOR_SIZE: usize = 16;
     pub const HELPER_LENGTH_OFFSET: usize = 8;
 }

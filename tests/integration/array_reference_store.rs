@@ -39,6 +39,104 @@ fn array_reference_store_example_passes_barrier_verification() {
 const CARD_EXAMPLE_OUTPUT: &str = "true\ntrue\n-4030\ntrue\n-4000\n9096\n8383500\n8033426\n";
 
 #[test]
+fn array_card_inline_hits_count_cards_and_invalidate_after_minor() {
+    for slots in [64, 128, 512, 4096] {
+        let source = format!(
+            r#"
+import std::collections::Array;
+class Node {{ pub value: i64; }}
+fn main() {{
+    let xs: Array<Node> = [];
+    let old = new Node(0);
+    let mut i = 0;
+    while i < 8192 {{ xs.push(old); i = i + 1; }}
+    gc_collect();
+    let mut round = 0;
+    while round < 3 {{
+        let child = new Node(42);
+        i = 0;
+        while i < {slots} {{ xs[i] = child; i = i + 1; }}
+        gc_minor_collect();
+        println(xs[{slots} - 1].value);
+        round = round + 1;
+    }}
+}}
+"#
+        );
+        let trace = std::env::temp_dir().join(format!(
+            "willow-card-proof-{}-{slots}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&trace);
+        let (out, ok) = compile_and_run_with_runtime_env(
+            &source,
+            &[
+                ("WILLOW_GC_TRACE", trace.to_str().unwrap()),
+                ("WILLOW_GC_TRACE_VERSION", "3"),
+                ("WILLOW_GC_VERIFY_BARRIER", "1"),
+            ],
+            Duration::from_secs(30),
+        );
+        assert!(ok, "{out}");
+        assert_eq!(out, "42\n42\n42\n", "slots={slots}");
+        let records = std::fs::read_to_string(&trace).unwrap();
+        std::fs::remove_file(trace).unwrap();
+        let counts: Vec<_> = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["event"] == "gc_verification")
+            .map(|record| {
+                assert_eq!(record["barrier_variants_valid"], true);
+                record["barrier_variants"]
+                    [willow_abi::GcStoreDestination::ArrayElement as usize - 1]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert!(counts.len() >= 4, "{records}");
+        for pair in counts[counts.len() - 4..].windows(2) {
+            assert_eq!(pair[1] - pair[0], slots / 64, "slots={slots}: {counts:?}");
+        }
+        println!(
+            "stores={slots} barrier_calls={} inline_hits={}",
+            slots / 64,
+            slots - slots / 64
+        );
+    }
+}
+
+#[test]
+fn array_card_inline_proofs_distinguish_owners_and_card_boundaries() {
+    let source = r#"
+import std::collections::Array;
+class Node { pub value: i64; }
+fn main() {
+    let a: Array<Node> = [];
+    let b: Array<Node> = [];
+    let old = new Node(0);
+    let mut i = 0;
+    while i < 512 { a.push(old); b.push(old); i = i + 1; }
+    gc_collect();
+    let child = new Node(42);
+    a[63] = child;
+    a[64] = child;
+    b[64] = child;
+    a[65] = child;
+    b[65] = child;
+    gc_minor_collect();
+    println(a[63].value + a[64].value + a[65].value + b[64].value + b[65].value);
+}
+"#;
+    let (out, ok) = compile_and_run_with_runtime_env(
+        source,
+        &[("WILLOW_GC_VERIFY_BARRIER", "1")],
+        Duration::from_secs(30),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "210\n");
+}
+
+#[test]
 fn array_card_remembering_example_in_debug_release_stress_and_verification() {
     // Large old buffers are remembered per written card: several cards of one
     // buffer add one remembered entry, children survive across minors and
@@ -209,7 +307,10 @@ fn array_reference_store_during_concurrent_marking_preserves_snapshot() {
 import std::collections::Array;
 class Node { pub value: i64; }
 async fn churn(seed: i64) -> i64 {
-    let xs: Array<Node> = [new Node(0), new Node(0), new Node(0), new Node(0)];
+    // A large old buffer exercises a cached card while marking activates.
+    let xs: Array<Node> = [];
+    let mut fill = 0;
+    while fill < 512 { xs.push(new Node(0)); fill = fill + 1; }
     let mut i = 0;
     while i < 20000 {
         let moved = xs[(i + 1) % 4];

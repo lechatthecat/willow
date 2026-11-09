@@ -107,14 +107,17 @@ thread_local! {
     /// without taking the heap lock.
     pub(super) static CARD_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
-fn card_cache_hit(owner: usize, card: usize) -> bool {
+fn card_cache_hit(owner: usize, card: usize) -> Option<u64> {
     let epoch = super::remembered::card_epoch();
-    CARD_CACHE.with(|cache| cache[card_cache_index(owner, card)].get() == (owner, card, epoch))
+    CARD_CACHE
+        .with(|cache| cache[card_cache_index(owner, card)].get() == (owner, card, epoch))
+        .then_some(epoch)
 }
 /// Call under the heap lock after the card was recorded.
 fn card_cache_fill(owner: usize, card: usize) {
     let epoch = super::remembered::card_epoch();
     CARD_CACHE.with(|cache| cache[card_cache_index(owner, card)].set((owner, card, epoch)));
+    crate::generated_context::set_remembered_card(owner, card, epoch);
 }
 
 pub(super) fn barrier_owner_payload(
@@ -409,8 +412,11 @@ fn write_barrier(
         .then(|| slot_card(owner as usize, slot as usize))
         .flatten();
     if let Some(card) = cached_card
-        && card_cache_hit(owner as usize, card)
+        && let Some(epoch) = card_cache_hit(owner as usize, card)
     {
+        // Preserve the exact epoch observed by the TLS lookup, not a later
+        // reload that might follow an invalidation on another thread.
+        crate::generated_context::set_remembered_card(owner as usize, card, epoch);
         #[cfg(test)]
         CARD_CACHE_HITS.set(CARD_CACHE_HITS.get() + 1);
         return;
@@ -492,6 +498,7 @@ pub(crate) fn write_barrier_array_slot(
             buffer as usize,
             super::remembered::array_slot_card(buffer as usize, slot as usize),
         )
+        .is_some()
     {
         #[cfg(test)]
         CARD_CACHE_HITS.set(CARD_CACHE_HITS.get() + 1);

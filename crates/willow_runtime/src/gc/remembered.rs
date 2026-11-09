@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicU64;
 
 /// Slots per remembered card of a reference-array buffer.
 pub(crate) const ARRAY_CARD_SLOTS: usize = GC_CARD_SIZE / GC_STORAGE_WORD_BYTES;
+const _: () = assert!(GC_CARD_SIZE == willow_abi::GC_ARRAY_CARD_BYTES);
 /// Reference-array buffers with at least this many element slots use card
 /// remembering. Smaller buffers keep whole-owner remembering: their full scan
 /// is bounded by this constant, and the header flag lets stores skip the call.
@@ -45,6 +46,7 @@ pub(super) fn array_slot_card(owner: usize, slot: usize) -> usize {
 /// one value. Minors and resets run stopped; a swept owner is unreachable, so
 /// no mutator can store into its address until after reallocation, which
 /// follows this release increment.
+#[unsafe(export_name = "willow_gc_card_epoch")]
 static CARD_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn card_epoch() -> u64 {
