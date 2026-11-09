@@ -3,6 +3,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+// Statically selected internal interface: Backend owns native resources and
+// provides init/sync/poke/close; wait_ready_tasks releases the global lock while
+// blocking. Registration indexes and the exported ABI stay in this module.
+#[cfg(target_os = "linux")]
+#[path = "netpoll/linux.rs"]
+mod backend;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[path = "netpoll/apple.rs"]
+mod backend;
+#[cfg(target_os = "windows")]
+#[path = "netpoll/windows.rs"]
+mod backend;
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows"
+)))]
+#[path = "netpoll/unsupported.rs"]
+mod backend;
+#[cfg(any(target_os = "windows", test))]
+mod windows_snapshot;
+use backend::{PLATFORM_POLL_SUPPORTED, valid_native_handle};
+
 use crate::task::RuntimeTaskId;
 use crate::trace::{GcTrace, GcVisitor};
 
@@ -12,19 +36,6 @@ type RawFd = i64;
 
 pub const WILLOW_NETPOLL_READABLE: i32 = 1;
 pub const WILLOW_NETPOLL_WRITABLE: i32 = 2;
-
-#[cfg(not(target_os = "windows"))]
-fn valid_native_handle(handle: RawFd) -> bool {
-    handle >= 0 && i32::try_from(handle).is_ok()
-}
-
-#[cfg(target_os = "windows")]
-fn valid_native_handle(handle: RawFd) -> bool {
-    // WinSock SOCKET is an unsigned pointer-sized integer. A valid socket may
-    // therefore have bit 63 set when carried through the ABI's i64 word; only
-    // INVALID_SOCKET (all bits set) is reserved.
-    handle != -1
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IoInterest {
@@ -52,18 +63,6 @@ impl IoInterest {
                 | (Self::Writable, Self::Writable)
         )
     }
-
-    #[cfg(target_os = "linux")]
-    fn epoll_events(self) -> u32 {
-        let mut events = 0;
-        if self.overlaps(Self::Readable) {
-            events |= libc::EPOLLIN as u32;
-        }
-        if self.overlaps(Self::Writable) {
-            events |= libc::EPOLLOUT as u32;
-        }
-        events
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,24 +83,6 @@ impl IoRegistration {
         }
     }
 }
-
-/// Whether this build has a real netpoll backend. Linux uses epoll, Apple
-/// platforms use kqueue, and Windows uses WinSock's readiness poll. Unsupported
-/// targets fail registration instead of parking a task that can never wake.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "windows"
-))]
-const PLATFORM_POLL_SUPPORTED: bool = true;
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "windows"
-)))]
-const PLATFORM_POLL_SUPPORTED: bool = false;
 
 type RegistrationKey = (RawFd, RuntimeTaskId, IoInterest);
 
@@ -128,18 +109,7 @@ pub struct RuntimeNetPoll {
     #[cfg(test)]
     ready_visits: std::cell::Cell<usize>,
     ready_tokens: VecDeque<usize>,
-    #[cfg(target_os = "linux")]
-    epoll_fd: Option<i32>,
-    #[cfg(target_os = "linux")]
-    wake_fd: Option<i32>,
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    kqueue_fd: Option<i32>,
-    #[cfg(target_os = "windows")]
-    wake_receiver: Option<std::sync::Arc<std::net::UdpSocket>>,
-    #[cfg(target_os = "windows")]
-    wake_sender: Option<std::net::UdpSocket>,
-    #[cfg(target_os = "windows")]
-    poll_sockets: Vec<WsaPollFd>,
+    backend: backend::Backend,
 }
 
 fn remove_index_key<K: std::hash::Hash + Eq>(
@@ -177,23 +147,12 @@ impl RuntimeNetPoll {
             #[cfg(test)]
             ready_visits: std::cell::Cell::new(0),
             ready_tokens: VecDeque::new(),
-            #[cfg(target_os = "linux")]
-            epoll_fd: None,
-            #[cfg(target_os = "linux")]
-            wake_fd: None,
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            kqueue_fd: None,
-            #[cfg(target_os = "windows")]
-            wake_receiver: None,
-            #[cfg(target_os = "windows")]
-            wake_sender: None,
-            #[cfg(target_os = "windows")]
-            poll_sockets: Vec::new(),
+            backend: backend::Backend::default(),
         }
     }
 
     pub fn init(&mut self) -> i32 {
-        self.init_platform()
+        self.backend.init_platform()
     }
 
     pub fn register(&mut self, registration: IoRegistration) {
@@ -323,6 +282,11 @@ impl RuntimeNetPoll {
         rc
     }
 
+    fn sync_platform_fd(&mut self, fd: RawFd) -> i32 {
+        let interest = self.merged_interest(fd);
+        self.backend.sync_platform_fd(fd, interest)
+    }
+
     pub fn deregister_fd(&mut self, fd: RawFd) -> i32 {
         let keys: Vec<_> = self.by_fd.get(&fd).into_iter().flatten().copied().collect();
         for key in keys {
@@ -420,7 +384,7 @@ impl RuntimeNetPoll {
     fn wake_token(&mut self, token: usize) -> i64 {
         let ready_count = self.ready_tasks(token).len() as i64;
         self.ready_tokens.push_back(token);
-        self.poke_platform_waker();
+        self.backend.poke_platform_waker();
         ready_count
     }
 
@@ -456,13 +420,13 @@ impl RuntimeNetPoll {
         self.by_fd.clear();
         self.interest_counts.clear();
         self.ready_tokens.clear();
-        self.close_platform();
+        self.backend.close_platform();
     }
 }
 
 impl Drop for RuntimeNetPoll {
     fn drop(&mut self) {
-        self.close_platform();
+        self.backend.close_platform();
     }
 }
 
@@ -477,355 +441,6 @@ impl GcTrace for RuntimeNetPoll {
 struct ReadyEvent {
     token: usize,
     interest: Option<IoInterest>,
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "windows"
-))]
-const WAKE_TOKEN: usize = usize::MAX;
-
-#[cfg(target_os = "linux")]
-impl RuntimeNetPoll {
-    fn init_platform(&mut self) -> i32 {
-        if self.epoll_fd.is_some() {
-            return 0;
-        }
-        let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        if epoll_fd < 0 {
-            return -1;
-        }
-        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if wake_fd < 0 {
-            unsafe {
-                libc::close(epoll_fd);
-            }
-            return -1;
-        }
-        let mut event = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: WAKE_TOKEN as u64,
-        };
-        let added = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, wake_fd, &mut event) };
-        if added != 0 {
-            unsafe {
-                libc::close(wake_fd);
-                libc::close(epoll_fd);
-            }
-            return -1;
-        }
-        self.epoll_fd = Some(epoll_fd);
-        self.wake_fd = Some(wake_fd);
-        0
-    }
-
-    fn sync_platform_fd(&mut self, fd: RawFd) -> i32 {
-        let Some(epoll_fd) = self.epoll_fd else {
-            return 0;
-        };
-        let interest = self.merged_interest(fd);
-        let Some(interest) = interest else {
-            let mut event = libc::epoll_event { events: 0, u64: 0 };
-            unsafe {
-                libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd as i32, &mut event);
-            }
-            return 0;
-        };
-        let mut event = libc::epoll_event {
-            events: interest.epoll_events(),
-            u64: fd as u64,
-        };
-        let fd = fd as i32;
-        let add = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) };
-        if add == 0 {
-            return 0;
-        }
-        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
-            let modify = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut event) };
-            if modify == 0 {
-                return 0;
-            }
-        }
-        -1
-    }
-
-    fn poke_platform_waker(&self) {
-        let Some(wake_fd) = self.wake_fd else {
-            return;
-        };
-        let value = 1_u64;
-        unsafe {
-            libc::write(
-                wake_fd,
-                (&value as *const u64).cast::<libc::c_void>(),
-                std::mem::size_of::<u64>(),
-            );
-        }
-    }
-
-    fn drain_platform_waker(&self) {
-        let Some(wake_fd) = self.wake_fd else {
-            return;
-        };
-        loop {
-            let mut value = 0_u64;
-            let read = unsafe {
-                libc::read(
-                    wake_fd,
-                    (&mut value as *mut u64).cast::<libc::c_void>(),
-                    std::mem::size_of::<u64>(),
-                )
-            };
-            if read != std::mem::size_of::<u64>() as isize {
-                break;
-            }
-        }
-    }
-
-    fn close_platform(&mut self) {
-        if let Some(wake_fd) = self.wake_fd.take() {
-            unsafe {
-                libc::close(wake_fd);
-            }
-        }
-        if let Some(epoll_fd) = self.epoll_fd.take() {
-            unsafe {
-                libc::close(epoll_fd);
-            }
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-impl RuntimeNetPoll {
-    fn init_platform(&mut self) -> i32 {
-        if self.kqueue_fd.is_some() {
-            return 0;
-        }
-        let kqueue_fd = unsafe { libc::kqueue() };
-        if kqueue_fd < 0 {
-            return -1;
-        }
-        let wake = apple_kevent(
-            WAKE_TOKEN,
-            libc::EVFILT_USER,
-            libc::EV_ADD | libc::EV_CLEAR,
-            0,
-        );
-        let added = unsafe {
-            libc::kevent(
-                kqueue_fd,
-                &wake,
-                1,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        if added != 0 {
-            unsafe { libc::close(kqueue_fd) };
-            return -1;
-        }
-        self.kqueue_fd = Some(kqueue_fd);
-        0
-    }
-
-    fn sync_platform_fd(&mut self, fd: RawFd) -> i32 {
-        let Some(kqueue_fd) = self.kqueue_fd else {
-            return 0;
-        };
-        let interest = self.merged_interest(fd);
-        let mut failed = false;
-        for (filter, wanted) in [
-            (
-                libc::EVFILT_READ,
-                interest.is_some_and(|i| i.overlaps(IoInterest::Readable)),
-            ),
-            (
-                libc::EVFILT_WRITE,
-                interest.is_some_and(|i| i.overlaps(IoInterest::Writable)),
-            ),
-        ] {
-            let flags = if wanted {
-                // Keep descriptor readiness level-triggered, matching epoll's
-                // default and WSAPoll. EV_CLEAR would make this edge-triggered
-                // and could lose a wake if a task only partially drains an fd.
-                libc::EV_ADD
-            } else {
-                libc::EV_DELETE
-            };
-            let change = apple_kevent(fd as usize, filter, flags, 0);
-            let rc = unsafe {
-                libc::kevent(
-                    kqueue_fd,
-                    &change,
-                    1,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            if rc != 0 {
-                let error = std::io::Error::last_os_error().raw_os_error();
-                // Deleting a filter that was never installed is harmless.
-                if wanted || error != Some(libc::ENOENT) {
-                    failed = true;
-                }
-            }
-        }
-        if failed { -1 } else { 0 }
-    }
-
-    fn poke_platform_waker(&self) {
-        let Some(kqueue_fd) = self.kqueue_fd else {
-            return;
-        };
-        let trigger = apple_kevent(WAKE_TOKEN, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER);
-        unsafe {
-            libc::kevent(
-                kqueue_fd,
-                &trigger,
-                1,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-            );
-        }
-    }
-
-    fn drain_platform_waker(&self) {}
-
-    fn close_platform(&mut self) {
-        if let Some(kqueue_fd) = self.kqueue_fd.take() {
-            unsafe { libc::close(kqueue_fd) };
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn apple_kevent(ident: usize, filter: i16, flags: u16, fflags: u32) -> libc::kevent {
-    libc::kevent {
-        ident,
-        filter,
-        flags,
-        fflags,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    }
-}
-
-#[cfg(any(target_os = "windows", test))]
-#[derive(Debug)]
-#[repr(C)]
-struct WsaPollFd {
-    fd: usize,
-    events: i16,
-    revents: i16,
-}
-
-#[cfg(any(target_os = "windows", test))]
-const WSA_POLL_READ: i16 = 0x0100 | 0x0200;
-#[cfg(any(target_os = "windows", test))]
-const WSA_POLL_WRITE: i16 = 0x0010;
-#[cfg(target_os = "windows")]
-const WSA_POLL_ERROR: i16 = 0x0001 | 0x0002 | 0x0004;
-#[cfg(target_os = "windows")]
-const WSA_POLL_NVAL: i16 = 0x0004;
-
-#[cfg(target_os = "windows")]
-#[link(name = "ws2_32")]
-unsafe extern "system" {
-    fn WSAPoll(fd_array: *mut WsaPollFd, count: u32, timeout_ms: i32) -> i32;
-}
-
-#[cfg(target_os = "windows")]
-impl RuntimeNetPoll {
-    fn init_platform(&mut self) -> i32 {
-        if self.wake_receiver.is_some() {
-            return 0;
-        }
-        let receiver = match std::net::UdpSocket::bind(("127.0.0.1", 0)) {
-            Ok(socket) => socket,
-            Err(_) => return -1,
-        };
-        let address = match receiver.local_addr() {
-            Ok(address) => address,
-            Err(_) => return -1,
-        };
-        let sender = match std::net::UdpSocket::bind(("127.0.0.1", 0)) {
-            Ok(socket) => socket,
-            Err(_) => return -1,
-        };
-        if receiver.set_nonblocking(true).is_err()
-            || sender.set_nonblocking(true).is_err()
-            || sender.connect(address).is_err()
-        {
-            return -1;
-        }
-        self.wake_receiver = Some(std::sync::Arc::new(receiver));
-        self.wake_sender = Some(sender);
-        0
-    }
-
-    fn sync_platform_fd(&mut self, fd: RawFd) -> i32 {
-        if self.merged_interest(fd).is_none() {
-            return 0;
-        }
-        let mut probe = [WsaPollFd {
-            fd: fd as usize,
-            events: WSA_POLL_READ | WSA_POLL_WRITE,
-            revents: 0,
-        }];
-        let rc = unsafe { WSAPoll(probe.as_mut_ptr(), 1, 0) };
-        if rc < 0 || probe[0].revents & WSA_POLL_NVAL != 0 {
-            -1
-        } else {
-            0
-        }
-    }
-
-    fn poke_platform_waker(&self) {
-        if let Some(sender) = &self.wake_sender {
-            let _ = sender.send(&[1]);
-        }
-    }
-
-    fn drain_platform_waker(&self) {
-        let Some(receiver) = &self.wake_receiver else {
-            return;
-        };
-        let mut bytes = [0_u8; 64];
-        while receiver.recv(&mut bytes).is_ok() {}
-    }
-
-    fn close_platform(&mut self) {
-        self.wake_sender = None;
-        self.wake_receiver = None;
-    }
-}
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "windows"
-)))]
-impl RuntimeNetPoll {
-    fn init_platform(&mut self) -> i32 {
-        -1
-    }
-
-    fn sync_platform_fd(&mut self, _fd: RawFd) -> i32 {
-        -1
-    }
-
-    fn poke_platform_waker(&self) {}
-
-    fn drain_platform_waker(&self) {}
-
-    fn close_platform(&mut self) {}
 }
 
 static GLOBAL_NETPOLL: LazyLock<Mutex<RuntimeNetPoll>> =
@@ -898,252 +513,7 @@ fn wait_ready_tasks(timeout: Option<Duration>) -> Vec<RuntimeTaskId> {
         return initial;
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        let epoll_fd = with_global(|poll| {
-            if !poll.has_waiters() || poll.init() != 0 {
-                None
-            } else {
-                poll.epoll_fd
-            }
-        });
-        let Some(epoll_fd) = epoll_fd else {
-            return Vec::new();
-        };
-        let events = wait_platform_events(epoll_fd, timeout);
-        with_global(|poll| {
-            let mut ready = Vec::new();
-            for event in events {
-                if event.token == WAKE_TOKEN {
-                    poll.drain_platform_waker();
-                    ready.extend(poll.drain_ready_tokens());
-                } else {
-                    ready.push(event);
-                }
-            }
-            poll.tasks_for_ready_events(ready)
-        })
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        let kqueue_fd = with_global(|poll| {
-            if !poll.has_waiters() || poll.init() != 0 {
-                None
-            } else {
-                poll.kqueue_fd
-            }
-        });
-        let Some(kqueue_fd) = kqueue_fd else {
-            return Vec::new();
-        };
-        let events = wait_apple_events(kqueue_fd, timeout);
-        with_global(|poll| {
-            let mut ready = Vec::new();
-            for event in events {
-                if event.token == WAKE_TOKEN {
-                    ready.extend(poll.drain_ready_tokens());
-                } else {
-                    ready.push(event);
-                }
-            }
-            poll.tasks_for_ready_events(ready)
-        })
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::io::AsRawSocket;
-        let snapshot = with_global(|poll| {
-            if !poll.has_waiters() || poll.init() != 0 {
-                None
-            } else {
-                // Each in-flight wait owns its buffer; concurrent waiters never alias it.
-                let wake = std::sync::Arc::clone(poll.wake_receiver.as_ref()?);
-                let mut sockets = std::mem::take(&mut poll.poll_sockets);
-                fill_windows_sockets(&mut sockets, poll, wake.as_raw_socket() as usize);
-                Some((sockets, wake, poll.next_sequence))
-            }
-        });
-        let Some((mut sockets, _wake, sequence_limit)) = snapshot else {
-            return Vec::new();
-        };
-        let events = wait_windows_events(&mut sockets, timeout);
-        with_global(|poll| {
-            let mut tasks = Vec::new();
-            let mut seen = HashSet::new();
-            for event in events {
-                let ready = if event.token == WAKE_TOKEN {
-                    poll.drain_platform_waker();
-                    let queued = poll.drain_ready_tokens();
-                    poll.tasks_for_ready_events(queued)
-                } else {
-                    // A descriptor can be cancelled, closed and reused while WSAPoll
-                    // runs. Only registrations present in this snapshot may wake.
-                    poll.ready_tasks_before(event.token, event.interest, sequence_limit)
-                };
-                tasks.extend(ready.into_iter().filter(|task| seen.insert(*task)));
-            }
-            sockets.clear();
-            if sockets.capacity() > poll.poll_sockets.capacity() {
-                poll.poll_sockets = sockets;
-            }
-            tasks
-        })
-    }
-
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "windows"
-    )))]
-    {
-        if let Some(timeout) = timeout {
-            if !timeout.is_zero() {
-                std::thread::sleep(timeout);
-            }
-        }
-        Vec::new()
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn wait_apple_events(kqueue_fd: i32, timeout: Option<Duration>) -> Vec<ReadyEvent> {
-    let timeout_value = timeout.map(|duration| libc::timespec {
-        tv_sec: duration.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
-        tv_nsec: duration.subsec_nanos() as libc::c_long,
-    });
-    let timeout_ptr = timeout_value
-        .as_ref()
-        .map_or(std::ptr::null(), |value| value as *const libc::timespec);
-    let mut events: Vec<libc::kevent> = (0..64).map(|_| apple_kevent(0, 0, 0, 0)).collect();
-    let n = unsafe {
-        libc::kevent(
-            kqueue_fd,
-            std::ptr::null(),
-            0,
-            events.as_mut_ptr(),
-            events.len() as i32,
-            timeout_ptr,
-        )
-    };
-    if n <= 0 {
-        return Vec::new();
-    }
-    events
-        .into_iter()
-        .take(n as usize)
-        .map(|event| {
-            let interest = if event.flags & (libc::EV_EOF | libc::EV_ERROR) != 0 {
-                Some(IoInterest::ReadWrite)
-            } else if event.filter == libc::EVFILT_READ {
-                Some(IoInterest::Readable)
-            } else if event.filter == libc::EVFILT_WRITE {
-                Some(IoInterest::Writable)
-            } else {
-                None
-            };
-            ReadyEvent {
-                token: event.ident,
-                interest,
-            }
-        })
-        .collect()
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn fill_windows_sockets(sockets: &mut Vec<WsaPollFd>, poll: &RuntimeNetPoll, wake_socket: usize) {
-    sockets.clear();
-    sockets.reserve(poll.interest_counts.len() + 1);
-    sockets.push(WsaPollFd {
-        fd: wake_socket,
-        events: WSA_POLL_READ,
-        revents: 0,
-    });
-    sockets.extend(poll.interest_counts.keys().map(|&fd| WsaPollFd {
-        fd: fd as usize,
-        events: match poll.merged_interest(fd).unwrap() {
-            IoInterest::Readable => WSA_POLL_READ,
-            IoInterest::Writable => WSA_POLL_WRITE,
-            IoInterest::ReadWrite => WSA_POLL_READ | WSA_POLL_WRITE,
-        },
-        revents: 0,
-    }));
-}
-
-#[cfg(target_os = "windows")]
-fn wait_windows_events(sockets: &mut [WsaPollFd], timeout: Option<Duration>) -> Vec<ReadyEvent> {
-    let timeout_ms = match timeout {
-        None => -1,
-        Some(duration) => duration.as_millis().min(i32::MAX as u128) as i32,
-    };
-    let n = unsafe { WSAPoll(sockets.as_mut_ptr(), sockets.len() as u32, timeout_ms) };
-    if n <= 0 {
-        return Vec::new();
-    }
-    sockets
-        .iter()
-        .enumerate()
-        .filter(|(_, socket)| socket.revents != 0)
-        .map(|(index, socket)| {
-            let token = if index == 0 { WAKE_TOKEN } else { socket.fd };
-            let interest = if socket.revents & WSA_POLL_ERROR != 0 {
-                Some(IoInterest::ReadWrite)
-            } else {
-                match (
-                    socket.revents & WSA_POLL_READ != 0,
-                    socket.revents & WSA_POLL_WRITE != 0,
-                ) {
-                    (true, true) => Some(IoInterest::ReadWrite),
-                    (true, false) => Some(IoInterest::Readable),
-                    (false, true) => Some(IoInterest::Writable),
-                    (false, false) => None,
-                }
-            };
-            ReadyEvent { token, interest }
-        })
-        .collect()
-}
-
-#[cfg(target_os = "linux")]
-fn wait_platform_events(epoll_fd: i32, timeout: Option<Duration>) -> Vec<ReadyEvent> {
-    let timeout_ms = match timeout {
-        None => -1,
-        Some(duration) => duration.as_millis().min(i32::MAX as u128) as i32,
-    };
-    let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 64];
-    let n = unsafe {
-        libc::epoll_wait(
-            epoll_fd,
-            events.as_mut_ptr(),
-            events.len() as i32,
-            timeout_ms,
-        )
-    };
-    if n <= 0 {
-        return Vec::new();
-    }
-    events
-        .into_iter()
-        .take(n as usize)
-        .map(|event| {
-            let readable = event.events & (libc::EPOLLIN as u32) != 0;
-            let writable = event.events & (libc::EPOLLOUT as u32) != 0;
-            let closed_or_error = event.events & ((libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0;
-            let interest = match (readable, writable) {
-                _ if closed_or_error => Some(IoInterest::ReadWrite),
-                (true, true) => Some(IoInterest::ReadWrite),
-                (true, false) => Some(IoInterest::Readable),
-                (false, true) => Some(IoInterest::Writable),
-                (false, false) => None,
-            };
-            ReadyEvent {
-                token: event.u64 as usize,
-                interest,
-            }
-        })
-        .collect()
+    backend::wait_ready_tasks(timeout)
 }
 
 #[unsafe(no_mangle)]
@@ -1237,6 +607,11 @@ pub fn reset_global_netpoll_for_test() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::backend::wait_platform_events;
+    #[cfg(target_os = "windows")]
+    use super::backend::wait_windows_events;
+    use super::windows_snapshot::{WSA_POLL_READ, WSA_POLL_WRITE, fill_windows_sockets};
     #[test]
     fn windows_snapshot_reuses_storage_and_tracks_live_interests() {
         let mut poll = RuntimeNetPoll::new();
@@ -2043,7 +1418,9 @@ mod tests {
         );
 
         let events = wait_platform_events(
-            poll.epoll_fd.expect("epoll initialized by register_fd"),
+            poll.backend
+                .epoll_fd
+                .expect("epoll initialized by register_fd"),
             Some(Duration::from_millis(20)),
         );
         let socket_events: Vec<_> = events

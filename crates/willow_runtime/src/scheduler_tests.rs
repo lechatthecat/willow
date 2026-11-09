@@ -4602,6 +4602,10 @@ fn reaping_04_executable_task_keeps_netpoll_cleanup_even_without_channels() {
     let mut scheduler = RuntimeScheduler::with_worker_count(TEST_WORKERS);
     let id = scheduler.spawn_task(poll_ready_now, std::ptr::null_mut());
     assert_eq!(scheduler.claim_ready_for_worker(0), Some(id));
+    // Successful netpoll registration marks the task for terminal cleanup.
+    scheduler
+        .with_task_mut(id, |task| task.netpoll_registered = true)
+        .expect("spawned task exists");
     scheduler.complete(id);
     scheduler.clear_running();
 
