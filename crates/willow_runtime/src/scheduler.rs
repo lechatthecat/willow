@@ -3420,6 +3420,42 @@ pub extern "C" fn willow_sched_run_until(target: u64) -> i64 {
     completed
 }
 
+/// Program-entry drive: unlike an idle probe, an unfinished main cannot be
+/// returned to its caller as a successful program exit. `run_until` has waited
+/// for the outer workers and exhausted timers, I/O and blocking completions
+/// before returning an incomplete target. Keep ordinary idle/deadline drives
+/// unchanged: their callers may supply work after they return.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_sched_run_main(target: u64) -> i64 {
+    let completed = willow_sched_run_until(target);
+    let blocked = global_task_table()
+        .with(target as RuntimeTaskId, |task| {
+            (!task.state.lifecycle().is_terminal()).then(|| {
+                let operation = if task.awaiting_count() > 0 {
+                    "await"
+                } else if !task.wait_channels().is_empty() {
+                    "channel/select"
+                } else if task.lock_wait().is_some() {
+                    "lock"
+                } else {
+                    "parked operation"
+                };
+                format!(
+                    "task {target} ({}) blocked on {operation}; no runnable task or wake source remains",
+                    task.name().unwrap_or("main")
+                )
+            })
+        })
+        .flatten();
+    // Release the task shard before reporting/terminating. No graph walk or
+    // task-frame dereference is needed, even for a large cyclic wait graph.
+    if let Some(message) = blocked {
+        crate::failure::deadlock(format_args!("{message}"));
+    }
+    completed
+}
+
 /// Drive the scheduler, but no longer than until the absolute monotonic
 /// deadline `deadline_ms` (the `willow_monotonic_millis` base).
 ///

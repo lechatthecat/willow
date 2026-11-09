@@ -8,6 +8,14 @@ fn diagnostic(class: &str, message: std::fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr().lock(), "runtime {class}: {message}");
 }
 
+/// Global quiescence with an unfinished program entry is a program failure,
+/// not a runtime invariant violation. No task can resume to handle it.
+#[cold]
+pub(crate) fn deadlock(message: std::fmt::Arguments<'_>) -> ! {
+    diagnostic("deadlock", message);
+    crate::exit::terminate_without_teardown(1);
+}
+
 #[cold]
 pub(crate) fn fatal_invariant(message: &str) -> ! {
     crate::gc_telemetry::failure_record::emit("invariant", message);

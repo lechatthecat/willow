@@ -434,6 +434,7 @@ runtime_abi_schema! {
     NO_PREEMPT; willow_sched_require_single_worker_statics => ([] -> None);
     NONE; willow_sched_run => ([] -> Some(I64));
     NONE; willow_sched_run_until => ([I64] -> Some(I64));
+    NONE; willow_sched_run_main => ([I64] -> Some(I64));
     NONE; willow_sched_run_until_deadline => ([I64] -> Some(I64));
     BLOCK_PANIC_ALLOC; willow_select_idle_wait => ([] -> None);
     NONE; willow_sched_wake => ([I64] -> None);

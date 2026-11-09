@@ -921,7 +921,9 @@ impl UnitCodegenContext<'_> {
         // unawaited task to quiescence (which could hang on a non-terminating
         // background task). Programs that need a result await their tasks before main
         // returns, so nothing is left to run anyway.
-        let run_fid = self.func_id(rt::willow_sched_run_until);
+        // Global quiescence is not successful completion of main. The entry
+        // drive diagnoses an unfinished main instead of reading its result.
+        let run_fid = self.func_id(rt::willow_sched_run_main);
         let run_ref = self
             .output
             .module

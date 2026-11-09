@@ -203,6 +203,8 @@ fn assert_sync_preemption_capability(source: &str, expected: &[&str]) {
     }
 }
 
+#[path = "concurrency/async_deadlock.rs"]
+mod async_deadlock;
 #[path = "concurrency/async_defer.rs"]
 mod async_defer;
 #[path = "concurrency/async_execution.rs"]
